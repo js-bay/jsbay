@@ -587,7 +587,7 @@ public sealed class Engine : IDisposable
     public static int[] ListEngines()
     {
         var need = Native.ListEngines(IntPtr.Zero, 0);
-        if (need == 0) return Array.Empty<int>();
+        if (need == 0) return System.Array.Empty<int>();
         var ids = new int[checked((int)need)];
         unsafe
         {
@@ -596,7 +596,7 @@ public sealed class Engine : IDisposable
                 var n = Native.ListEngines((IntPtr)p, (nuint)ids.Length);
                 if (n < need)
                 {
-                    Array.Resize(ref ids, checked((int)n));
+                    System.Array.Resize(ref ids, checked((int)n));
                 }
                 else if (n > need)
                 {
@@ -605,7 +605,7 @@ public sealed class Engine : IDisposable
                     fixed (int* p2 = ids)
                     {
                         n = Native.ListEngines((IntPtr)p2, (nuint)ids.Length);
-                        if (n < (nuint)ids.Length) Array.Resize(ref ids, checked((int)n));
+                        if (n < (nuint)ids.Length) System.Array.Resize(ref ids, checked((int)n));
                     }
                 }
             }
@@ -762,6 +762,14 @@ public sealed class Engine : IDisposable
             }
         }
     }
+    private void ThrowIfDisposed()
+    {
+        if (!IsOpen)
+        {
+            throw new ObjectDisposedException(nameof(Engine));
+        }
+    }
+
     internal void RequireOwner()
     {
         if (Environment.CurrentManagedThreadId != ownerThreadId)

@@ -17,6 +17,7 @@ cat > "$OUT/main.pro" <<'EOF'
 -keep class io.jsbay.consumer.HostLoopMain { public static void main(java.lang.String[]); }
 -keep class android.os.Looper { *; }
 -keep class android.os.Handler { *; }
+-keep class android.os.HandlerThread { *; }
 EOF
 cat "$ROOT/sdk/android/jsbay/consumer-rules.pro" >> "$OUT/main.pro"
 "$JDK_HOME/bin/java" -cp "$R8_JAR" com.android.tools.r8.R8 --release --classfile \
