@@ -29,17 +29,13 @@ public class HandlerThread extends Thread {
   public Looper getLooper() {
     if (!started) return null;
     synchronized (this) {
-      while (looper == null) {
-        if (!isAlive() && !started) return null;
-        // Wait until run() publishes the looper, or the thread dies first.
-        if (!isAlive() && looper == null) return null;
+      while (looper == null && isAlive()) {
         try {
-          wait(50);
+          wait();
         } catch (InterruptedException error) {
           Thread.currentThread().interrupt();
           return null;
         }
-        if (!isAlive() && looper == null) return null;
       }
       return looper;
     }
@@ -53,9 +49,6 @@ public class HandlerThread extends Thread {
   }
 
   public boolean quitSafely() {
-    Looper l = getLooper();
-    if (l == null) return false;
-    l.quitSafely();
-    return true;
+    return quit();
   }
 }
