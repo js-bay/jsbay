@@ -40,13 +40,14 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() !void {
-    std.debug.print("usage: jsbay-tool <apple-archive|check-c-abi|check-r8|prepare-ios-stdlib> ...\n", .{});
+    std.debug.print("usage: jsbay-tool <apple-archive|check-c-abi|write-android-exports-map|check-r8|prepare-ios-stdlib> ...\n", .{});
     return error.Usage;
 }
 
 fn dispatch(command: []const u8, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, command, "check-r8")) return checkR8(args);
     if (std.mem.eql(u8, command, "check-c-abi")) return checkCAbi(args);
+    if (std.mem.eql(u8, command, "write-android-exports-map")) return writeAndroidExportsMap(args);
     _ = usage() catch {};
     return error.Usage;
 }
@@ -203,6 +204,41 @@ fn isHex(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value) |c| if (!std.ascii.isHex(c)) return false;
     return true;
+}
+
+fn writeAndroidExportsMap(args: []const []const u8) !u8 {
+    if (args.len != 1) {
+        std.debug.print("usage: jsbay-tool write-android-exports-map <exports.map>\n", .{});
+        return error.Usage;
+    }
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var symbols = try headerSymbols(allocator);
+    defer symbols.deinit();
+    if (symbols.count() == 0) return error.NoPublicSymbols;
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(allocator);
+    var it = symbols.keyIterator();
+    while (it.next()) |sym| try list.append(allocator, sym.*);
+    std.mem.sort([]const u8, list.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\n  global:\n");
+    for (list.items) |sym| {
+        try out.appendSlice(allocator, "  ");
+        try out.appendSlice(allocator, sym);
+        try out.appendSlice(allocator, ";\n");
+    }
+    try out.appendSlice(allocator, "  local: *;\n};\n");
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = args[0], .data = out.items });
+    return 0;
 }
 
 pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {

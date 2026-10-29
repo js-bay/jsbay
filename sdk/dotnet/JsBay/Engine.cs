@@ -764,10 +764,7 @@ public sealed class Engine : IDisposable
     }
     private void ThrowIfDisposed()
     {
-        if (!IsOpen)
-        {
-            throw new ObjectDisposedException(nameof(Engine));
-        }
+        ObjectDisposedException.ThrowIf(!IsOpen, this);
     }
 
     internal void RequireOwner()
