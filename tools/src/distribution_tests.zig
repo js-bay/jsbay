@@ -58,7 +58,8 @@ fn executable(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, name: [
 }
 
 fn pathEnv(allocator: std.mem.Allocator, tools: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "PATH={s}:/usr/bin:/bin:/usr/sbin:/sbin", .{tools});
+    const inherited = if (std.c.getenv("PATH")) |p| std.mem.span(p) else "/usr/bin:/bin:/usr/sbin:/sbin";
+    return std.fmt.allocPrint(allocator, "PATH={s}:{s}", .{ tools, inherited });
 }
 
 fn androidFixture(allocator: std.mem.Allocator, io: std.Io, fixture: []const u8) ![]u8 {
@@ -148,7 +149,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
     try write(io, try join(allocator, repo, &.{ "tests", "zig-consumer", "build.zig" }), "\n");
     try executable(allocator, io, fixture, try join(allocator, tools, &.{"zig"}),
         \\#!/bin/sh
-        \\if [ "$1" = build ] && [ "$2" = --build-file ]; then mkdir -p zig-out/bin; printf '#!/bin/sh\\nexit 0\\n' > zig-out/bin/jsbay-tool; chmod +x zig-out/bin/jsbay-tool; exit 0; fi
+        \\if [ "$1" = build ] && [ "$2" = --build-file ]; then mkdir -p zig-out/bin; printf '%s\\n' '#!/bin/sh' 'exit 0' > zig-out/bin/jsbay-tool; chmod +x zig-out/bin/jsbay-tool; exit 0; fi
         \\[ "$1" = build ] && [ "$2" = tool ] && exit 0
         \\prefix=""; previous=""; for arg in "$@"; do [ "$previous" = --prefix ] && prefix="$arg"; previous="$arg"; done
         \\[ -n "$prefix" ] || exit 0
@@ -162,7 +163,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
         \\if [ "$1" = simctl ] && [ "$2" = list ]; then if [ "$3" = devicetypes ]; then printf '{"devicetypes": []}'; else printf '{"runtimes": []}'; fi; exit 0; fi
         \\if [ "$1" = lipo ] && [ "$2" = -create ]; then source="$3"; out=""; previous=""; for arg in "$@"; do [ "$previous" = -output ] && out="$arg"; previous="$arg"; done; cp "$source" "$out"; exit 0; fi
         \\if [ "$1" = lipo ] && [ "$2" = -verify_arch ]; then exit 2; fi
-        \\if [ "$3" = clang ]; then out=""; previous=""; for arg in "$@"; do [ "$previous" = -o ] && out="$arg"; previous="$arg"; done; mkdir -p "$(dirname "$out")"; printf '#!/bin/sh\\necho JSBAY_APPLE_CONSUMER_PASS\\n' > "$out"; chmod +x "$out"; exit 0; fi
+        \\if [ "$3" = clang ]; then out=""; previous=""; for arg in "$@"; do [ "$previous" = -o ] && out="$arg"; previous="$arg"; done; mkdir -p "$(dirname "$out")"; printf '%s\\n' '#!/bin/sh' 'echo JSBAY_APPLE_CONSUMER_PASS' > "$out"; chmod +x "$out"; exit 0; fi
         \\if [ "$2" = codesign ]; then exit 0; fi
         \\exit 0
         \\
@@ -177,7 +178,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
         \\
     );
     try executable(allocator, io, fixture, try join(allocator, tools, &.{"codesign"}), "#!/bin/sh\nexit 0\n");
-    try executable(allocator, io, fixture, try join(allocator, tools, &.{"xcodebuild"}), "#!/bin/sh\nout=\"\"; previous=\"\"; for arg in \"$@\"; do [ \"$previous\" = -output ] && out=\"$arg\"; previous=\"$arg\"; done\nfor platform in macos-arm64 ios-arm64 ios-arm64_x86_64-simulator; do mkdir -p \"$out/$platform/Headers\"; cp \"$PWD\"/build/libjsbay-macos-arm64.a \"$out/$platform/libjsbay.a\"; done\n");
+    try executable(allocator, io, fixture, try join(allocator, tools, &.{"xcodebuild"}), "#!/bin/sh\nout=\"\"; previous=\"\"; for arg in \"$@\"; do [ \"$previous\" = -output ] && out=\"$arg\"; previous=\"$arg\"; done\nfor platform in macos-arm64 ios-arm64 ios-arm64_x86_64-simulator; do mkdir -p \"$out/$platform/Headers\"; src=\"$PWD\"/build/libjsbay-macos-arm64.a; [ -f \"$src\" ] || { mkdir -p \"$PWD\"/build; printf archive > \"$src\"; }; cp \"$src\" \"$out/$platform/libjsbay.a\"; done\n");
     return repo;
 }
 
@@ -201,6 +202,9 @@ test "test_apple_missing_simulator_runtime_fails_the_script" {
     const unavailable_out = try std.fmt.allocPrint(a, "{s}{s}", .{ unavailable.result.stderr, unavailable.result.stdout });
     const status = read(a, io, build_dir, &.{ "consumer-probes", "ios-simulator-consumer.status" }) catch null;
     const has_msg = std.mem.indexOf(u8, unavailable_out, "Simulator runtime unavailable") != null;
+    if (status == null and !has_msg) {
+        std.debug.print("apple missing-sim probe failed without status/msg\nstdout:\n{s}\nstderr:\n{s}\n", .{ unavailable.result.stdout, unavailable.result.stderr });
+    }
     try testing.expect(status != null or has_msg);
     if (status) |s| {
         try testing.expectEqualStrings("FAIL: iOS Simulator runtime unavailable\n", s);

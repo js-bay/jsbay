@@ -271,7 +271,6 @@ fn runOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8)
     return error.ExternalFailure;
 }
 
-
 fn requireExternal(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
     const result = std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(16 * 1024 * 1024) }) catch |err| {
         std.debug.print("external command failed: {s}\n", .{argv[0]});
