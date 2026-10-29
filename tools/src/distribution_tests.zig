@@ -150,7 +150,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
     try write(io, try join(allocator, repo, &.{ "tests", "zig-consumer", "build.zig" }), "\n");
     try executable(allocator, io, fixture, try join(allocator, tools, &.{"zig"}),
         \\#!/bin/sh
-        \\if [ "$1" = build ] && [ "$2" = --build-file ]; then mkdir -p zig-out/bin; printf '%s\\n' '#!/bin/sh' 'exit 0' > zig-out/bin/jsbay-tool; chmod +x zig-out/bin/jsbay-tool; exit 0; fi
+        \\if [ "$1" = build ] && [ "$2" = --build-file ]; then mkdir -p zig-out/bin; { echo '#!/bin/sh'; echo 'exit 0'; } > zig-out/bin/jsbay-tool; chmod +x zig-out/bin/jsbay-tool; exit 0; fi
         \\[ "$1" = build ] && [ "$2" = tool ] && exit 0
         \\prefix=""; previous=""; for arg in "$@"; do [ "$previous" = --prefix ] && prefix="$arg"; previous="$arg"; done
         \\[ -n "$prefix" ] || exit 0
@@ -164,7 +164,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
         \\if [ "$1" = simctl ] && [ "$2" = list ]; then if [ "$3" = devicetypes ]; then printf '{"devicetypes": []}'; else printf '{"runtimes": []}'; fi; exit 0; fi
         \\if [ "$1" = lipo ] && [ "$2" = -create ]; then source="$3"; out=""; previous=""; for arg in "$@"; do [ "$previous" = -output ] && out="$arg"; previous="$arg"; done; cp "$source" "$out"; exit 0; fi
         \\if [ "$1" = lipo ] && [ "$2" = -verify_arch ]; then exit 2; fi
-        \\if [ "$3" = clang ]; then out=""; previous=""; for arg in "$@"; do [ "$previous" = -o ] && out="$arg"; previous="$arg"; done; mkdir -p "$(dirname "$out")"; printf '%s\\n' '#!/bin/sh' 'echo JSBAY_APPLE_CONSUMER_PASS' > "$out"; chmod +x "$out"; exit 0; fi
+        \\if [ "$3" = clang ]; then out=""; previous=""; for arg in "$@"; do [ "$previous" = -o ] && out="$arg"; previous="$arg"; done; mkdir -p "$(dirname "$out")"; { echo '#!/bin/sh'; echo 'echo JSBAY_APPLE_CONSUMER_PASS'; } > "$out"; chmod +x "$out"; exit 0; fi
         \\if [ "$2" = codesign ]; then exit 0; fi
         \\exit 0
         \\
