@@ -1,8 +1,9 @@
 package android.os;
 
-/** Host-only Android HandlerThread substitute for JVM consumer compilation. */
+/** Host-only Android HandlerThread substitute for JVM consumer / host matrix tests. */
 public class HandlerThread extends Thread {
   private Looper looper;
+  private volatile boolean started;
 
   public HandlerThread(String name) {
     super(name);
@@ -10,25 +11,51 @@ public class HandlerThread extends Thread {
 
   @Override
   public synchronized void start() {
-    if (looper == null) {
-      looper = new Looper();
+    if (started) return;
+    started = true;
+    super.start();
+  }
+
+  @Override
+  public void run() {
+    Looper.prepare();
+    synchronized (this) {
+      looper = Looper.myLooper();
+      notifyAll();
     }
-    // Host stub: do not start a real thread; consumers only need the type/API surface.
+    Looper.loop();
   }
 
   public Looper getLooper() {
-    return looper;
+    if (!started) return null;
+    synchronized (this) {
+      while (looper == null) {
+        if (!isAlive() && !started) return null;
+        // Wait until run() publishes the looper, or the thread dies first.
+        if (!isAlive() && looper == null) return null;
+        try {
+          wait(50);
+        } catch (InterruptedException error) {
+          Thread.currentThread().interrupt();
+          return null;
+        }
+        if (!isAlive() && looper == null) return null;
+      }
+      return looper;
+    }
   }
 
   public boolean quit() {
-    if (looper == null) return false;
-    looper.quit();
+    Looper l = getLooper();
+    if (l == null) return false;
+    l.quit();
     return true;
   }
 
   public boolean quitSafely() {
-    if (looper == null) return false;
-    looper.quitSafely();
+    Looper l = getLooper();
+    if (l == null) return false;
+    l.quitSafely();
     return true;
   }
 }
