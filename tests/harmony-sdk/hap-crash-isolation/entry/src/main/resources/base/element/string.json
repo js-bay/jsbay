@@ -1,0 +1,7 @@
+{
+  "string": [
+    {"name": "module_desc", "value": "jsbay CrashIsolation entry"},
+    {"name": "EntryAbility_desc", "value": "CrashIsolation UI Ability"},
+    {"name": "ProbeAbility_desc", "value": "Separate-process Zig fault probe Ability (test-only path)"}
+  ]
+}

@@ -1,0 +1,177 @@
+diff --git a/quickjs.c b/quickjs.c
+index f613252..74e1da2 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -428,6 +428,8 @@ struct JSRuntime {
+     /* Debugger line hook. NULL unless a debugger is attached. */
+     JSLocationHandler *location_handler;
+     void *location_opaque;
++    JSBreakLocationHandler *break_location_handler;
++    void *break_location_opaque;
+     int location_last_line;
+     void *location_last_func;
+     int location_force_notify;
+@@ -2502,6 +2504,13 @@ void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque)
+     rt->location_last_func = NULL;
+ }
+ 
++void JS_SetBreakLocationHandler(JSRuntime *rt, JSBreakLocationHandler *cb,
++                                void *opaque)
++{
++    rt->break_location_handler = cb;
++    rt->break_location_opaque = opaque;
++}
++
+ void JS_RequestLocationCallback(JSRuntime *rt)
+ {
+     __atomic_store_n(&rt->location_force_notify, 1, __ATOMIC_SEQ_CST);
+@@ -8414,6 +8423,123 @@ fail:
+     return b->line_num;
+ }
+ 
++/* CDP asks for legal breakpoint locations before JS_EvalFunctionInternal
++   releases transient top-level bytecode. Reuse the engine pc2line map rather
++   than deriving executable positions from source text. */
++#define JS_BREAK_LOCATION_MAX 8192
++#define JS_BREAK_LOCATION_MAX_DEPTH 32
++
++static void js_collect_break_locations_one(JSContext *ctx,
++                                           JSFunctionBytecode *b,
++                                           JSFunctionBytecode **ancestors,
++                                           int depth, int *count,
++                                           int *truncated)
++{
++    const uint8_t *p, *p_end;
++    int i, line, col, pc, ret, new_line, new_col;
++    int32_t delta;
++    unsigned int op;
++    const char *filename = NULL;
++
++    if (depth >= JS_BREAK_LOCATION_MAX_DEPTH) {
++        *truncated = 1;
++        return;
++    }
++    for (i = 0; i < depth; i++) {
++        if (ancestors[i] == b)
++            return;
++    }
++    ancestors[depth] = b;
++    if (b->filename)
++        filename = JS_AtomToCString(ctx, b->filename);
++    if (b->byte_code_len > 0) {
++        line = b->line_num;
++        col = b->col_num;
++        if (line >= 1) {
++            if (*count >= JS_BREAK_LOCATION_MAX) {
++                *truncated = 1;
++            } else {
++                ctx->rt->break_location_handler(ctx, filename ? filename : "", line,
++                                                col, 0, 0,
++                                                ctx->rt->break_location_opaque);
++                (*count)++;
++            }
++        }
++        if (b->pc2line_buf) {
++            p = b->pc2line_buf;
++            p_end = p + b->pc2line_len;
++            pc = 0;
++            while (p < p_end && !*truncated) {
++                op = *p++;
++                if (op == 0) {
++                    uint32_t value;
++                    ret = get_leb128(&value, p, p_end);
++                    if (ret < 0)
++                        break;
++                    pc += value;
++                    p += ret;
++                    ret = get_sleb128(&delta, p, p_end);
++                    if (ret < 0)
++                        break;
++                    p += ret;
++                    new_line = line + delta;
++                } else {
++                    op -= PC2LINE_OP_FIRST;
++                    pc += op / PC2LINE_RANGE;
++                    new_line = line + (op % PC2LINE_RANGE) + PC2LINE_BASE;
++                }
++                ret = get_sleb128(&delta, p, p_end);
++                if (ret < 0)
++                    break;
++                p += ret;
++                new_col = col + delta;
++                if (pc >= b->byte_code_len)
++                    break;
++                line = new_line;
++                col = new_col;
++                if (line < 1)
++                    continue;
++                if (*count >= JS_BREAK_LOCATION_MAX) {
++                    *truncated = 1;
++                    break;
++                }
++                ctx->rt->break_location_handler(ctx, filename ? filename : "", line,
++                                                col, 0, 0,
++                                                ctx->rt->break_location_opaque);
++                (*count)++;
++            }
++        }
++    }
++    if (filename)
++        JS_FreeCString(ctx, filename);
++    for (i = 0; i < b->cpool_count && !*truncated; i++) {
++        JSValue value = b->cpool[i];
++        JSFunctionBytecode *child = NULL;
++        if (JS_VALUE_GET_TAG(value) == JS_TAG_FUNCTION_BYTECODE) {
++            child = JS_VALUE_GET_PTR(value);
++        } else if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT &&
++                   js_class_has_bytecode(JS_VALUE_GET_OBJ(value)->class_id)) {
++            child = JS_VALUE_GET_OBJ(value)->u.func.function_bytecode;
++        }
++        if (!child)
++            continue;
++        js_collect_break_locations_one(ctx, child, ancestors,
++                                       depth + 1, count, truncated);
++    }
++}
++
++static void js_collect_break_locations(JSContext *ctx, JSFunctionBytecode *b)
++{
++    JSFunctionBytecode *ancestors[JS_BREAK_LOCATION_MAX_DEPTH];
++    int count = 0, truncated = 0;
++
++    if (!ctx->rt->break_location_handler)
++        return;
++    js_collect_break_locations_one(ctx, b, ancestors, 0, &count, &truncated);
++    ctx->rt->break_location_handler(ctx, NULL, 0, 0, 1, truncated,
++                                    ctx->rt->break_location_opaque);
++}
++
+ /* in order to avoid executing arbitrary code during the stack trace
+    generation, we only look at simple 'name' properties containing a
+    string. */
+@@ -38482,6 +38560,7 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
+ 
+     tag = JS_VALUE_GET_TAG(fun_obj);
+     if (tag == JS_TAG_FUNCTION_BYTECODE) {
++        js_collect_break_locations(ctx, JS_VALUE_GET_PTR(fun_obj));
+         fun_obj = js_closure(ctx, fun_obj, var_refs, sf);
+         ret_val = JS_CallFree(ctx, fun_obj, this_obj, 0, NULL);
+     } else if (tag == JS_TAG_MODULE) {
+diff --git a/quickjs.h b/quickjs.h
+index b5344d7..f8c3596 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1199,6 +1199,14 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
+ typedef void JSLocationHandler(JSContext *ctx, const char *filename,
+                                int line, int column, int depth, void *opaque);
+ JS_EXTERN void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque);
++/* Evaluator-side bytecode positions. complete is non-zero on the final
++   callback; truncated reports the fixed collection budget was exceeded. */
++typedef void JSBreakLocationHandler(JSContext *ctx, const char *filename,
++                                    int line, int column, int complete,
++                                    int truncated, void *opaque);
++JS_EXTERN void JS_SetBreakLocationHandler(JSRuntime *rt,
++                                          JSBreakLocationHandler *cb,
++                                          void *opaque);
+ /* Force the next bytecode location notification, even on the same line. */
+ JS_EXTERN void JS_RequestLocationCallback(JSRuntime *rt);

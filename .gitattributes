@@ -1,0 +1,4 @@
+# Patch files contain leading diff markers and upstream context whitespace.
+vendor/*.patch -whitespace
+# Keep third-party license text as published, including blank-line spacing.
+THIRD_PARTY_NOTICES.md -whitespace

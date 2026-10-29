@@ -1,0 +1,114 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2733,7 +2733,7 @@
+         e->argv[i] = js_dup(argv[i]);
+     }
+     list_add_tail(&e->link, &rt->job_list);
+-    if (rt->jsbay_qjs_job_hook)
++    if (JSBAY_INSPECTOR && rt->jsbay_qjs_job_hook)
+         rt->jsbay_qjs_job_hook(ctx, 0, e->kind);
+     return 0;
+ }
+@@ -2769,10 +2769,10 @@
+     e = list_entry(rt->job_list.next, JSJobEntry, link);
+     list_del(&e->link);
+     ctx = e->ctx;
+-    if (rt->jsbay_qjs_job_hook)
++    if (JSBAY_INSPECTOR && rt->jsbay_qjs_job_hook)
+         rt->jsbay_qjs_job_hook(ctx, 1, e->kind);
+     res = e->job_func(e->ctx, e->argc, vc(e->argv));
+-    if (rt->jsbay_qjs_job_hook)
++    if (JSBAY_INSPECTOR && rt->jsbay_qjs_job_hook)
+         rt->jsbay_qjs_job_hook(ctx, 2, e->kind);
+     for(i = 0; i < e->argc; i++)
+         JS_FreeValue(ctx, e->argv[i]);
+@@ -8355,7 +8355,7 @@
+     JSRuntime *rt = ctx->rt;
+     JS_FreeValue(ctx, rt->current_exception);
+     rt->current_exception = obj;
+-    if (rt->exception_handler && !rt->in_exception_hook &&
++    if (JSBAY_INSPECTOR && rt->exception_handler && !rt->in_exception_hook &&
+         !JS_IsUncatchableError(obj)) {
+         JSStackFrame *sf;
+         int caught = 0;
+@@ -8366,7 +8366,7 @@
+             top->cur_pc = (uint8_t *)rt->debug_pc;
+         }
+         for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
+-            if (sf->catch_count > 0) {
++            if (JSBAY_INSPECTOR && sf->catch_count > 0) {
+                 caught = 1;
+                 break;
+             }
+@@ -18476,7 +18476,7 @@
+ #endif
+ 
+ #if !DIRECT_DISPATCH
+-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) if (unlikely(ctx->rt->location_handler)) js_notify_location(ctx, b, (pc)); switch (opcode = *pc++)
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) if (JSBAY_INSPECTOR && unlikely(ctx->rt->location_handler)) js_notify_location(ctx, b, (pc)); switch (opcode = *pc++)
+ #define CASE(op)        case op
+ #define DEFAULT         default
+ #define BREAK           break
+@@ -18487,7 +18487,7 @@
+ #include "quickjs-opcode.h"
+         [ OP_COUNT ... 255 ] = &&case_default
+     };
+-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) if (unlikely(ctx->rt->location_handler)) js_notify_location(ctx, b, (pc)); __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) if (JSBAY_INSPECTOR && unlikely(ctx->rt->location_handler)) js_notify_location(ctx, b, (pc)); __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+ #define CASE(op)        case_ ## op
+ #define DEFAULT         case_default
+ #define BREAK           SWITCH(pc)
+@@ -18548,7 +18548,7 @@
+ 
+     sf->is_strict_mode = b->is_strict_mode;
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+-    sf->catch_count = 0;
++    if (JSBAY_INSPECTOR) sf->catch_count = 0;
+     arg_buf = (JSValue *)argv;
+     sf->arg_count = argc;
+     sf->cur_func = unsafe_unconst(func_obj);
+@@ -19673,7 +19673,7 @@
+                 sp[0] = JS_NewCatchOffset(ctx, pc + diff - b->byte_code_buf);
+                 sp++;
+                 pc += 4;
+-                sf->catch_count++;
++                if (JSBAY_INSPECTOR) sf->catch_count++;
+             }
+             BREAK;
+         CASE(OP_gosub):
+@@ -19780,7 +19780,7 @@
+                     goto exception;
+                 }
+                 sp[-1] = ret_val;
+-                if (sf->catch_count > 0)
++                if (JSBAY_INSPECTOR && sf->catch_count > 0)
+                     sf->catch_count--;
+             }
+             BREAK;
+@@ -21290,7 +21290,7 @@
+             goto done_generator;
+ 
+         CASE(OP_debugger):
+-            if (unlikely(rt->debugger_handler)) {
++            if (JSBAY_INSPECTOR && unlikely(rt->debugger_handler)) {
+                 uint8_t *saved_pc = sf->cur_pc;
+                 sf->cur_pc = (uint8_t *)(pc - 1);
+                 rt->debugger_handler(ctx, rt->debugger_opaque);
+@@ -21372,7 +21372,7 @@
+                     JS_FreeValueRT(rt, ctx->error_back_trace);
+                     ctx->error_back_trace = JS_UNDEFINED;
+                     pc = b->byte_code_buf + pos;
+-                    if (sf->catch_count > 0)
++                    if (JSBAY_INSPECTOR && sf->catch_count > 0)
+                         sf->catch_count--;
+                     goto restart;
+                 }
+@@ -21595,7 +21595,7 @@
+     b = p->u.func.function_bytecode;
+     sf->is_strict_mode = b->is_strict_mode;
+     sf->is_constructor = false;
+-    sf->catch_count = 0;
++    if (JSBAY_INSPECTOR) sf->catch_count = 0;
+     sf->cur_pc = b->byte_code_buf;
+     arg_buf_len = max_int(b->arg_count, argc);
+     local_count = arg_buf_len + b->var_count + b->stack_size;

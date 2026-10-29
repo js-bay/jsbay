@@ -1,0 +1,8 @@
+.{
+    .name = .js_event_loop,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xde54b92f35571b2b,
+    .dependencies = .{ .zev = .{ .path = "../zev" } },
+    .paths = .{ "LICENSE", "readme.md", "build.zig", "build.zig.zon", "src" },
+}

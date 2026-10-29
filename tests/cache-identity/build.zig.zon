@@ -1,0 +1,8 @@
+.{
+    .name = .jsbay_cache_identity_probe,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0x38859453b3361e40,
+    .dependencies = .{ .jsbay = .{ .path = "../.." } },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

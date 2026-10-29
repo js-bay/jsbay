@@ -1,0 +1,30 @@
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -807,5 +807,8 @@ JS_BOOL JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, JS_BOOL val)
+ JSValue JS_NewArray(JSContext *ctx);
+ int JS_IsArray(JSContext *ctx, JSValueConst val);
++/* Embedding predicate: only actual JS_CLASS_ARRAY objects match.  Unlike
++   JS_IsArray it deliberately does not resolve Proxy targets. */
++int JS_IsArrayObject(JSValueConst val);
+ 
+ JSValue JS_NewDate(JSContext *ctx, double epoch_ms);
+ int JS_ThisDateValue(JSContext *ctx, double *valp, JSValueConst this_val);
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -14809,5 +14809,14 @@ int JS_IsArray(JSContext *ctx, JSValueConst val)
+     }
+ }
+ 
++int JS_IsArrayObject(JSValueConst val)
++{
++    if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
++        JSObject *p = JS_VALUE_GET_OBJ(val);
++        return p->class_id == JS_CLASS_ARRAY;
++    }
++    return FALSE;
++}
++
+ static double js_pow(double a, double b)
+ {

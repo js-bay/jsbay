@@ -1,0 +1,43 @@
+# These are hard gates: a number is emitted only after the tool succeeds. measure runs them without creating or changing a regression snapshot.
+dimensions:
+  - id: native-format
+    title: SDK C/C++/Objective-C formatting
+    direction: lower-is-better
+    command: bash scripts/quality/native-style.sh check >&2 && printf '0\n'
+    extract: number
+  - id: android-style
+    title: Kotlin, Gradle Kotlin DSL and Java formatting
+    direction: lower-is-better
+    command: bash scripts/quality/android-style.sh check >&2 && printf '0\n'
+    extract: number
+  - id: android-lint
+    title: Android Lint and Kotlin/Java compilation
+    direction: lower-is-better
+    timeout: 20m
+    command: bash scripts/quality/android-lint.sh >&2 && printf '0\n'
+    extract: number
+  - id: apple-style
+    title: Swift formatting and style
+    direction: lower-is-better
+    command: bash scripts/quality/apple-style.sh check >&2 && printf '0\n'
+    extract: number
+  - id: apple-lint
+    title: Swift/Objective-C diagnostics and Clang analyzer
+    direction: lower-is-better
+    command: bash scripts/quality/apple-lint.sh >&2 && printf '0\n'
+    extract: number
+  - id: harmony-style
+    title: Official ArkTS formatting and lint
+    direction: lower-is-better
+    command: bash scripts/quality/harmony-style.sh check >&2 && printf '0\n'
+    extract: number
+  - id: dotnet-style
+    title: C# formatting and style
+    direction: lower-is-better
+    command: bash scripts/quality/dotnet-style.sh check >&2 && printf '0\n'
+    extract: number
+  - id: dotnet-lint
+    title: C# recommended analyzers and compiler diagnostics
+    direction: lower-is-better
+    command: bash scripts/quality/dotnet-lint.sh check >&2 && printf '0\n'
+    extract: number

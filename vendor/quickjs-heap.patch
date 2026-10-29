@@ -1,0 +1,164 @@
+diff --git i/quickjs.c w/quickjs.c
+index 84f35f5..799c5e6 100644
+--- i/quickjs.c
++++ w/quickjs.c
+@@ -7330,6 +7333,125 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
+         s->js_func_size + s->js_func_code_size + s->js_func_pc2line_size;
+ }
+ 
++void JS_WalkHeapObjects(JSRuntime *rt, JSHeapObjectVisitor *visit, void *opaque)
++{
++    struct list_head *el;
++    char buf[ATOM_GET_STR_BUF_SIZE];
++
++    if (!visit)
++        return;
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSObject *p;
++        const char *name = "Object";
++        uint64_t size;
++
++        if (js_rc(gp)->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        p = (JSObject *)gp;
++        if (p->class_id > 0 && p->class_id < rt->class_count) {
++            name = JS_AtomGetStrRT(rt, buf, sizeof(buf),
++                                   rt->class_array[p->class_id].class_name);
++            if (!name || !name[0])
++                name = "Object";
++        }
++        size = sizeof(JSObject);
++        if ((p->class_id == JS_CLASS_ARRAY_BUFFER ||
++             p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER) &&
++            p->u.array_buffer && p->u.array_buffer->data)
++            size = (uint64_t)p->u.array_buffer->byte_length;
++        visit(opaque, name, (int)p->class_id, size);
++    }
++}
++
++static void js_walk_heap_graph_value(JSHeapGraphEdgeVisitor *visit_edge,
++                                     void *opaque, JSObject *from,
++                                     JSValueConst value, int type,
++                                     const char *name, uint32_t index)
++{
++    if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT)
++        visit_edge(opaque, from, JS_VALUE_GET_OBJ(value), type, name, index);
++}
++
++/* Reads physical object storage only: no JS_GetProperty, getter, or Proxy trap. */
++void JS_WalkHeapGraph(JSRuntime *rt, JSHeapGraphNodeVisitor *visit_node,
++                      JSHeapGraphEdgeVisitor *visit_edge, void *opaque)
++{
++    struct list_head *el;
++    char class_buf[ATOM_GET_STR_BUF_SIZE];
++    char prop_buf[ATOM_GET_STR_BUF_SIZE];
++    if (!visit_node || !visit_edge)
++        return;
++#if !JSBAY_HEAP_SNAPSHOT
++    (void)rt;
++    (void)opaque;
++    return;
++#else
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSObject *p;
++        const char *name = "Object";
++        uint64_t size;
++        if (js_rc(gp)->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        p = (JSObject *)gp;
++        if (p->class_id > 0 && p->class_id < rt->class_count) {
++            name = JS_AtomGetStrRT(rt, class_buf, sizeof(class_buf),
++                                   rt->class_array[p->class_id].class_name);
++            if (!name || !name[0]) name = "Object";
++        }
++        size = sizeof(JSObject);
++        if ((p->class_id == JS_CLASS_ARRAY_BUFFER ||
++             p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER) &&
++            p->u.array_buffer && p->u.array_buffer->data)
++            size = (uint64_t)p->u.array_buffer->byte_length;
++        visit_node(opaque, p, name, (int)p->class_id, size);
++    }
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSObject *p;
++        JSShapeProperty *prs;
++        int i;
++        if (js_rc(gp)->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        p = (JSObject *)gp;
++        if (p->shape && p->shape->proto)
++            visit_edge(opaque, p, p->shape->proto, JS_HEAP_EDGE_PROTOTYPE,
++                       "[[Prototype]]", 0);
++        if (p->shape && p->prop) {
++            prs = get_shape_prop(p->shape);
++            for (i = 0; i < p->shape->prop_count; i++, prs++) {
++                JSProperty *prop = &p->prop[i];
++                const char *name;
++                if (prs->atom == JS_ATOM_NULL)
++                    continue;
++                name = JS_AtomGetStrRT(rt, prop_buf, sizeof(prop_buf), prs->atom);
++                if (!name) name = "";
++                if (!(prs->flags & JS_PROP_TMASK))
++                    js_walk_heap_graph_value(visit_edge, opaque, p, prop->u.value,
++                                             JS_HEAP_EDGE_PROPERTY, name, 0);
++                else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
++                    if (prop->u.getset.getter)
++                        visit_edge(opaque, p, prop->u.getset.getter,
++                                   JS_HEAP_EDGE_INTERNAL, name, 0);
++                    if (prop->u.getset.setter)
++                        visit_edge(opaque, p, prop->u.getset.setter,
++                                   JS_HEAP_EDGE_INTERNAL, name, 0);
++                }
++            }
++        }
++        if (p->fast_array &&
++            (p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS) &&
++            p->u.array.u.values) {
++            for (i = 0; i < p->u.array.count; i++)
++                js_walk_heap_graph_value(visit_edge, opaque, p,
++                                         p->u.array.u.values[i],
++                                         JS_HEAP_EDGE_ELEMENT, NULL, i);
++        }
++    }
++#endif
++}
++
+ void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt)
+ {
+     fprintf(fp, "QuickJS memory usage -- " CONFIG_VERSION " version, %d-bit, malloc limit: %"PRId64"\n\n",
+diff --git i/quickjs.h w/quickjs.h
+index 32a54fb..2fff7c8 100644
+--- i/quickjs.h
++++ w/quickjs.h
+@@ -50,6 +50,19 @@ extern "C" {
+ typedef struct JSRuntime JSRuntime;
+ typedef struct JSContext JSContext;
+ typedef struct JSClass JSClass;
++typedef void JSHeapObjectVisitor(void *opaque, const char *name, int class_id,
++                                 uint64_t size);
++typedef void JSHeapGraphNodeVisitor(void *opaque, const void *object,
++                                    const char *name, int class_id, uint64_t size);
++typedef void JSHeapGraphEdgeVisitor(void *opaque, const void *from,
++                                    const void *to, int type, const char *name,
++                                    uint32_t index);
++enum {
++    JS_HEAP_EDGE_PROPERTY = 1,
++    JS_HEAP_EDGE_ELEMENT = 2,
++    JS_HEAP_EDGE_PROTOTYPE = 3,
++    JS_HEAP_EDGE_INTERNAL = 4,
++};
+ typedef uint32_t JSClassID;
+ typedef uint32_t JSAtom;
+ 
+@@ -464,6 +466,9 @@ typedef struct JSMemoryUsage {
+ 
+ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
+ void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
++void JS_WalkHeapObjects(JSRuntime *rt, JSHeapObjectVisitor *visit, void *opaque);
++void JS_WalkHeapGraph(JSRuntime *rt, JSHeapGraphNodeVisitor *visit_node,
++                      JSHeapGraphEdgeVisitor *visit_edge, void *opaque);
+ 
+ /* atom support */
+ #define JS_ATOM_NULL 0

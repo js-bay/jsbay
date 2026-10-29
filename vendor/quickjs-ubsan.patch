@@ -1,0 +1,17 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1960,8 +1960,13 @@ static inline int js_resize_array(JSContext *ctx, void **parray, int elem_size,
+     }
+ }
+ 
++static void *js_dbuf_realloc_rt(void *opaque, void *ptr, size_t size)
++{
++    return js_realloc_rt(opaque, ptr, size);
++}
++
+ static inline void js_dbuf_init(JSContext *ctx, DynBuf *s)
+ {
+-    dbuf_init2(s, ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
++    dbuf_init2(s, ctx->rt, js_dbuf_realloc_rt);
+ }

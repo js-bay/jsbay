@@ -1,0 +1,7 @@
+{
+  "name": "libjsbay_harmony.so",
+  "types": "./index.d.ts",
+  "version": "0.1.0",
+  "description": "N-API declarations for the js-bay Harmony addon",
+  "license": "MIT"
+}

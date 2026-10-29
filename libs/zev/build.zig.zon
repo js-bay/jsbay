@@ -1,0 +1,17 @@
+.{
+    .name = .zev,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0x7cb7f7f6fd909b7,
+    .paths = .{
+        "build.zig",
+        "build_support.zig",
+        "build.zig.zon",
+        "LICENSE",
+        "readme.md",
+        "src",
+        "platform-test/readme.md",
+        "platform-test/config.env.example",
+        "platform-test/cases",
+    },
+}

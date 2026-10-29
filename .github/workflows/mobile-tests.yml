@@ -1,0 +1,126 @@
+name: Mobile runtime tests
+
+on:
+  workflow_call:
+    inputs:
+      android_api:
+        required: false
+        type: number
+        default: 35
+      run_android:
+        required: false
+        type: boolean
+        default: true
+      run_ios:
+        required: false
+        type: boolean
+        default: true
+  workflow_dispatch:
+    inputs:
+      android_api:
+        description: Android emulator API level
+        required: false
+        type: number
+        default: 35
+      run_android:
+        description: Run the Android ART consumer
+        required: false
+        type: boolean
+        default: true
+      run_ios:
+        description: Run the iOS Simulator consumer
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-tests-${{ github.workflow }}-${{ github.ref }}-${{ inputs.android_api }}
+  cancel-in-progress: true
+
+jobs:
+  android-art:
+    if: ${{ inputs.run_android }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4.0.4
+      - name: Install Android build and emulator dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1' 'platform-tools' 'emulator' 'system-images;android-${{ inputs.android_api }};google_apis;x86_64'
+      - name: Download Gradle 8.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
+          test -x "$RUNNER_TEMP/gradle-8.9/bin/gradle"
+      - name: Test Android smoke builder staging
+        shell: bash
+        run: ANDROID_BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0" KOTLIN_GRADLE_LIB="$RUNNER_TEMP/gradle-8.9/lib" bash tests/ci/android-smoke-builder-test.sh
+      - name: Build core and JNI adapter
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANDROID_SMOKE_BUILD_ONLY=true GRADLE_BIN="$RUNNER_TEMP/gradle-8.9/bin/gradle" bash tests/ci/run-android-device-smoke.sh
+      - name: Enable KVM for the Android Emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run Android ART and R8 consumers
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ inputs.android_api }}
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: >-
+            ANDROID_SMOKE_SKIP_BUILD=true
+            ANDROID_SMOKE_JNI_LIBS="$GITHUB_WORKSPACE/build-android/jniLibs"
+            GRADLE_BIN="$RUNNER_TEMP/gradle-8.9/bin/gradle"
+            ANDROID_R8_TEST_OUT="$RUNNER_TEMP/jsbay-android-r8"
+            ANDROID_R8_TEST_REMOTE='/data/local/tmp/jsbay-android-r8'
+            bash tests/ci/run-android-device-smoke.sh
+
+  ios-simulator:
+    if: ${{ inputs.run_ios }}
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Verify arm64 Xcode environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-path
+      - name: Build, install, and run iOS Simulator consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build-apple.sh quickjs_ng
+          grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status

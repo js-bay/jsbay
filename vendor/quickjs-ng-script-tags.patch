@@ -1,0 +1,184 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -430,6 +430,8 @@
+     void *location_opaque;
+     JSBreakLocationHandler *break_location_handler;
+     void *break_location_opaque;
++    JSScriptTagHandler *script_tag_handler;
++    void *script_tag_opaque;
+     int location_last_line;
+     void *location_last_func;
+     int location_force_notify;
+@@ -909,6 +911,8 @@
+     int pc2line_len;
+     uint8_t *pc2line_buf;
+     char *source;
++    /* Runtime-only debugger identity; never part of bytecode serialization. */
++    uint64_t debugger_script_tag;
+ } JSFunctionBytecode;
+ 
+ typedef struct JSBoundFunction {
+@@ -2504,6 +2508,12 @@
+     rt->location_last_func = NULL;
+ }
+ 
++void JS_SetScriptTagHandler(JSRuntime *rt, JSScriptTagHandler *cb, void *opaque)
++{
++    rt->script_tag_handler = cb;
++    rt->script_tag_opaque = opaque;
++}
++
+ void JS_SetBreakLocationHandler(JSRuntime *rt, JSBreakLocationHandler *cb,
+                                 void *opaque)
+ {
+@@ -2570,6 +2580,7 @@
+             if (f && js_class_has_bytecode(f->class_id)) {
+                 b = f->u.func.function_bytecode;
+                 if (b) {
++                    frame->script_tag = b->debugger_script_tag;
+                     /* Sampled from the interrupt handler: copy into the caller
+                        buffer. JS_AtomToCString mallocs. */
+                     if (b->func_name != JS_ATOM_NULL) {
+@@ -8651,7 +8662,7 @@
+                 *truncated = 1;
+             } else {
+                 ctx->rt->break_location_handler(ctx, filename ? filename : "", line,
+-                                                col, 0, 0,
++                                                col, b->debugger_script_tag, 0, 0,
+                                                 ctx->rt->break_location_opaque);
+                 (*count)++;
+             }
+@@ -8695,7 +8706,7 @@
+                     break;
+                 }
+                 ctx->rt->break_location_handler(ctx, filename ? filename : "", line,
+-                                                col, 0, 0,
++                                                col, b->debugger_script_tag, 0, 0,
+                                                 ctx->rt->break_location_opaque);
+                 (*count)++;
+             }
+@@ -8727,10 +8738,71 @@
+     if (!ctx->rt->break_location_handler)
+         return;
+     js_collect_break_locations_one(ctx, b, ancestors, 0, &count, &truncated);
+-    ctx->rt->break_location_handler(ctx, NULL, 0, 0, 1, truncated,
++    ctx->rt->break_location_handler(ctx, NULL, 0, 0, b->debugger_script_tag, 1, truncated,
+                                     ctx->rt->break_location_opaque);
++}
++
++static int js_check_debugger_script_tag_tree(JSFunctionBytecode *b,
++                                             JSFunctionBytecode **ancestors, int depth)
++{
++    int i;
++    if (depth >= JS_BREAK_LOCATION_MAX_DEPTH) return -1;
++    for (i = 0; i < depth; i++) if (ancestors[i] == b) return 0;
++    ancestors[depth] = b;
++    for (i = 0; i < b->cpool_count; i++) {
++        JSValue value = b->cpool[i];
++        JSFunctionBytecode *child = NULL;
++        if (JS_VALUE_GET_TAG(value) == JS_TAG_FUNCTION_BYTECODE)
++            child = JS_VALUE_GET_PTR(value);
++        else if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT && js_class_has_bytecode(JS_VALUE_GET_OBJ(value)->class_id))
++            child = JS_VALUE_GET_OBJ(value)->u.func.function_bytecode;
++        if (child && js_check_debugger_script_tag_tree(child, ancestors, depth + 1)) return -1;
++    }
++    return 0;
++}
++
++static void js_set_debugger_script_tag_one(JSFunctionBytecode *b, uint64_t tag,
++                                           JSFunctionBytecode **ancestors, int depth)
++{
++    int i;
++    for (i = 0; i < depth; i++) if (ancestors[i] == b) return;
++    ancestors[depth] = b;
++    b->debugger_script_tag = tag;
++    for (i = 0; i < b->cpool_count; i++) {
++        JSValue value = b->cpool[i];
++        JSFunctionBytecode *child = NULL;
++        if (JS_VALUE_GET_TAG(value) == JS_TAG_FUNCTION_BYTECODE)
++            child = JS_VALUE_GET_PTR(value);
++        else if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT && js_class_has_bytecode(JS_VALUE_GET_OBJ(value)->class_id))
++            child = JS_VALUE_GET_OBJ(value)->u.func.function_bytecode;
++        if (child) js_set_debugger_script_tag_one(child, tag, ancestors, depth + 1);
++    }
++}
++
++static int js_set_debugger_script_tag(JSValueConst value, uint64_t tag)
++{
++    JSFunctionBytecode *ancestors[JS_BREAK_LOCATION_MAX_DEPTH];
++    if (!tag || JS_VALUE_GET_TAG(value) != JS_TAG_FUNCTION_BYTECODE) return -1;
++    if (js_check_debugger_script_tag_tree(JS_VALUE_GET_PTR(value), ancestors, 0)) return -1;
++    js_set_debugger_script_tag_one(JS_VALUE_GET_PTR(value), tag, ancestors, 0);
++    return 0;
+ }
+ 
++uint64_t JS_RebindScriptTag(JSContext *ctx, JSValueConst value, const char *filename,
++                            const char *source, size_t source_len)
++{
++    uint64_t tag;
++    if (!ctx->rt->script_tag_handler || !filename || !source) return 0;
++    if (JS_VALUE_GET_TAG(value) != JS_TAG_FUNCTION_BYTECODE) return 0;
++    {
++        JSFunctionBytecode *ancestors[JS_BREAK_LOCATION_MAX_DEPTH];
++        if (js_check_debugger_script_tag_tree(JS_VALUE_GET_PTR(value), ancestors, 0)) return 0;
++    }
++    tag = ctx->rt->script_tag_handler(ctx, filename, source, source_len, ctx->rt->script_tag_opaque);
++    if (js_set_debugger_script_tag(value, tag)) return 0;
++    return tag;
++}
++
+ /* in order to avoid executing arbitrary code during the stack trace
+    generation, we only look at simple 'name' properties containing a
+    string. */
+@@ -18673,7 +18745,7 @@
+             top->cur_pc = (uint8_t *)pc;
+         }
+         rt->location_handler(ctx, filename ? filename : "", line, col, depth,
+-                             rt->location_opaque);
++                             b->debugger_script_tag, rt->location_opaque);
+         if (top)
+             top->cur_pc = saved_pc;
+     }
+@@ -38926,6 +38998,8 @@
+     fun_obj = js_create_function(ctx, fd);
+     if (JS_IsException(fun_obj))
+         goto fail1;
++    if (JSBAY_INSPECTOR)
++        JS_RebindScriptTag(ctx, fun_obj, filename, input, input_len);
+     /* Could add a flag to avoid resolution if necessary */
+     if (m) {
+         m->func_obj = fun_obj;
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1217,16 +1217,21 @@
+    borrowed until the callback returns. depth is the number of JS frames.
+    The callback may block; it must not free the runtime. */
+ typedef void JSLocationHandler(JSContext *ctx, const char *filename,
+-                               int line, int column, int depth, void *opaque);
++                               int line, int column, int depth, uint64_t script_tag, void *opaque);
+ JS_EXTERN void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque);
+ /* Evaluator-side bytecode positions. complete is non-zero on the final
+    callback; truncated reports the fixed collection budget was exceeded. */
+ typedef void JSBreakLocationHandler(JSContext *ctx, const char *filename,
+-                                    int line, int column, int complete,
++                                    int line, int column, uint64_t script_tag, int complete,
+                                     int truncated, void *opaque);
+ JS_EXTERN void JS_SetBreakLocationHandler(JSRuntime *rt,
+                                           JSBreakLocationHandler *cb,
+                                           void *opaque);
++typedef uint64_t JSScriptTagHandler(JSContext *ctx, const char *filename,
++                                    const char *source, size_t source_len, void *opaque);
++JS_EXTERN void JS_SetScriptTagHandler(JSRuntime *rt, JSScriptTagHandler *cb, void *opaque);
++JS_EXTERN uint64_t JS_RebindScriptTag(JSContext *ctx, JSValueConst value,
++                                      const char *filename, const char *source, size_t source_len);
+ /* Force the next bytecode location notification, even on the same line. */
+ JS_EXTERN void JS_RequestLocationCallback(JSRuntime *rt);
+ 
+@@ -1243,6 +1248,7 @@
+     char filename[512];
+     int line;    /* 1-based, 0 if unknown */
+     int column;  /* 1-based, 0 if unknown */
++    uint64_t script_tag; /* 0 when native identity is unavailable */
+ } JSDebugFrameInfo;
+ 
+ /* Copies up to max live frames, innermost first. Returns the count. */

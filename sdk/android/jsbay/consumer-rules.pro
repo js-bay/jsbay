@@ -1,0 +1,12 @@
+# The JNI adapter resolves these public SDK classes and methods by JVM name.
+-keep class io.jsbay.Native { *; }
+-keep class io.jsbay.Engine { *; }
+-keep class io.jsbay.LoopDriver { *; }
+-keep class io.jsbay.Value { *; }
+-keep class io.jsbay.Callback { *; }
+-keep class io.jsbay.CallbackScope { *; }
+-keep class io.jsbay.JsBayException { *; }
+-keep class io.jsbay.Status { *; }
+-keep class io.jsbay.SyncStarter { *; }
+-keep class io.jsbay.SyncCall { *; }
+-keep class io.jsbay.SyncCompletion { *; }

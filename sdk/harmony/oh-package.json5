@@ -1,0 +1,11 @@
+{
+  "name": "@js-bay/harmony",
+  "version": "0.1.0",
+  "description": "js-bay ArkTS Worker SDK",
+  "main": "src/main/ets/index.ets",
+  "types": "index.d.ts",
+  "dependencies": {
+    "libjsbay_harmony.so": "file:./src/main/cpp/types/libjsbay_harmony"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,31 @@
+{
+  "version": "20.1.8",
+  "source": "https://pypi.org/pypi/clang-format/20.1.8/json",
+  "documentation": "https://clang.llvm.org/docs/ClangFormat.html",
+  "archives": {
+    "darwin-arm64": {
+      "url": "https://files.pythonhosted.org/packages/d8/4c/3efe4fe6910e1e00dcec0c8d9ef715164500f043e9911bdf253370ff917b/clang_format-20.1.8-py2.py3-none-macosx_11_0_arm64.whl",
+      "sha256": "c0cf62720247a7dd1e2d610816a2f7d7016433f9c2869880cba655449bd09616"
+    },
+    "darwin-x86_64": {
+      "url": "https://files.pythonhosted.org/packages/4f/cd/6dab2c15bb2f13ad13015fb92eda0b49b3bd866153072e4d9796f7b220e4/clang_format-20.1.8-py2.py3-none-macosx_10_9_x86_64.whl",
+      "sha256": "e9422bc81b3bea6c0ee773662fbe3bfd8a9479ae70e59008095dfae7001c5a84"
+    },
+    "linux-x86_64": {
+      "url": "https://files.pythonhosted.org/packages/a6/77/786aa0fc8a75d8ce94966bb33e44c63fec1964cbf343ee862ed6a5be38c1/clang_format-20.1.8-py2.py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "sha256": "7c6bcb7e01ba4f05a4c980fda147b330f7e4833c2aea8c92a0c2df9573ae7afe"
+    },
+    "linux-arm64": {
+      "url": "https://files.pythonhosted.org/packages/06/60/7c2ff3019599ad985d0a61f74ba8226d538c72485b0e3d25b1899601a9f5/clang_format-20.1.8-py2.py3-none-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "34de32fe53452a07497793d5faf3fd03f7cf8b960b915417471ae81227461a39"
+    },
+    "windows-x86_64": {
+      "url": "https://files.pythonhosted.org/packages/bd/ee/656287efdf58dccc7a7299fab547fe1313b49ca1ea1607ea475b262d640f/clang_format-20.1.8-py2.py3-none-win_amd64.whl",
+      "sha256": "346ac8cab571eaba4d6b89dfa30fdbbc512db82a66ab0eeb1763cacc5977e325"
+    },
+    "windows-arm64": {
+      "url": "https://files.pythonhosted.org/packages/8b/27/71cd96599d47229bd819dcc0c688a859764bb1b4960a23b8a75f8558c044/clang_format-20.1.8-py2.py3-none-win_arm64.whl",
+      "sha256": "d18b7b69697e97b6917a69f4bf48bf94e3827b016b491c90dd0f6ab917e37cf9"
+    }
+  }
+}

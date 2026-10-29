@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "target": "ES2020",
+    "module": "commonjs",
+    "baseUrl": ".",
+    "paths": {
+      "@js-bay/harmony": ["src/main/ets/index.ets"],
+      "libjsbay_harmony.so": ["src/main/cpp/types/libjsbay_harmony/index.d.ts"]
+    }
+  },
+  "files": [
+    "src/main/cpp/types/libjsbay_harmony/index.d.ts",
+    "src/main/ets/JsBay.ets",
+    "src/main/ets/index.ets",
+    "examples/Worker.ets",
+    "../../tests/harmony-sdk/recursive_callback.ets",
+    "../../tests/harmony-sdk/conformance.ets"
+  ]
+}

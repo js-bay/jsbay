@@ -1,0 +1,8 @@
+.{
+    .name = .bytecode_cache,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xc93ede0345efa048,
+    .dependencies = .{},
+    .paths = .{ "LICENSE", "readme.md", "build.zig", "build.zig.zon", "src" },
+}

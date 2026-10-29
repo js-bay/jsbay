@@ -1,0 +1,11 @@
+.{
+    .name = .inspector_transport,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xb614853f138f2ce3,
+    .dependencies = .{
+        .zev = .{ .path = "../zev" },
+        .inspector = .{ .path = "../inspector" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "LICENSE", "readme.md", "src" },
+}

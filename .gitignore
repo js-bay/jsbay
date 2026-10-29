@@ -1,0 +1,36 @@
+.zig-cache/
+.zig-cache-ios/
+zig-out/
+build-apple/
+build-android/
+build/
+.agent-extracts/
+.hvigor/
+.gradle/
+.cxx/
+.build/
+oh_modules/
+.DS_Store
+*.log
+*.pid
+/WORKLOG.md
+/sdk/harmony/BuildProfile.ets
+__pycache__/
+
+# Local package cache used by zig fetch / path deps
+zig-pkg/
+
+# .NET SDK consumer build artifacts
+**/bin/
+**/obj/
+
+# Local SDK / signing (never commit machine paths or cert material)
+**/local.properties
+**/*.p12
+**/*.cer
+**/*.p7b
+
+# Device / simulator hilog dumps and local capture dirs (regenerate locally)
+**/hilog-*-excerpt.txt
+*-hilog/
+artifacts/

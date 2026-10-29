@@ -1,0 +1,531 @@
+# JS Bay CI — see docs/testing.md#ci for the matrix rationale.
+# Aggressive aggregation: one large job per platform (linux / macos / windows).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Setup Go for actionlint
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4.0.4
+
+      - name: Install pawl
+        uses: tiangong-dev/pawl@v0.8.2
+        with:
+          version: v0.8.2
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+
+      - name: Check host tool dependencies
+        run: command -v git zig ruby tar zip unzip rg
+
+      - name: Privacy — candidate source paths
+        run: |
+          set -euo pipefail
+          zig build tool -- privacy
+
+      - name: Privacy — pull request commit messages
+        if: github.event_name == 'pull_request'
+        run: zig build tool -- privacy --commits "origin/${{ github.base_ref }}..HEAD"
+
+      - name: Lint workflows (actionlint)
+        run: |
+          set -euo pipefail
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -color=false
+
+      - name: Test repository tools
+        run: zig build test-tools --summary all
+
+      - name: Check Zig formatting
+        run: |
+          set -euo pipefail
+          zig build test-fmt --summary all
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+            (cd "libs/$package" && zig build test-fmt --summary all)
+          done
+
+      - name: Check public C and C++ headers
+        run: zig build tool -- check-c-abi
+
+      - name: Test independent packages
+        run: |
+          set -euo pipefail
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+            (cd "libs/$package" && zig build test --summary all)
+          done
+
+      - name: Check documentation and tooling policy
+        run: |
+          zig build tool -- check-docs
+          zig build tool -- check-tooling
+
+      - name: SDK quality — portable (native / Android style / .NET)
+        run: make check CHECKS=native-format,android-style,dotnet-style,dotnet-lint
+
+      - name: SDK quality — tool regression probes
+        run: |
+          bash scripts/quality/native-style.sh self-test
+          bash scripts/quality/dotnet-style.sh self-test
+          bash scripts/quality/dotnet-lint.sh self-test
+
+      - name: Engine tests (quickjs_ng)
+        run: zig build test-engine -Dbackend=quickjs_ng --summary all
+
+      - name: Host CDP transport without HTTP or WebSocket (quickjs_ng)
+        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector-transport=false -Dtest-filter="host transport" --summary all
+
+      - name: Inspector-disabled tests (quickjs_ng)
+        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector=false --summary all
+
+      - name: QuickJS-NG location dispatch contract
+        run: zig build test-ng-dispatch -Dbackend=quickjs_ng --summary all
+
+      - name: Pinned Test262 subset (quickjs_ng)
+        run: bash tests/test262/run.sh --backend quickjs_ng --output artifacts/test262-quickjs_ng.json
+
+      - name: Public Zig module consumer (quickjs_ng)
+        working-directory: tests/zig-consumer
+        run: zig build run -Dbackend=quickjs_ng --summary all
+
+      - name: Typed public C consumers (quickjs_ng)
+        run: |
+          set -euo pipefail
+          zig build -Dbackend=quickjs_ng -Dlibrary-only=true -Doptimize=ReleaseFast --prefix artifacts/typed-consumers-qjsng --summary all
+          bash tests/run-value-consumers.sh artifacts/typed-consumers-qjsng/lib/libjsbay.a artifacts/typed-consumers-qjsng
+
+      - name: Harmony N-API host consumers (quickjs_ng)
+        run: |
+          set -euo pipefail
+          node_root="$(dirname "$(dirname "$(command -v node)")")"
+          test -f "$node_root/include/node/node_api.h"
+          npm install --ignore-scripts --no-audit --no-fund --prefix "$RUNNER_TEMP/jsbay-typescript" typescript@5.6.3
+          NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers-qjsng/lib/libjsbay.a" TSC="$RUNNER_TEMP/jsbay-typescript/node_modules/typescript/lib/tsc.js" tests/harmony-sdk/run_facade_consumer.sh
+
+      - name: .NET SDK consumer (quickjs_ng)
+        run: tests/dotnet-sdk/run.sh quickjs_ng
+
+      - name: Engine tests (quickjs)
+        run: zig build test-engine -Dbackend=quickjs --summary all
+
+      - name: Host CDP transport without HTTP or WebSocket (quickjs)
+        run: zig build test-engine -Dbackend=quickjs -Dinspector-transport=false -Dtest-filter="host transport" --summary all
+
+      - name: Inspector-disabled tests (quickjs)
+        run: zig build test-engine -Dbackend=quickjs -Dinspector=false --summary all
+
+      - name: Pinned Test262 subset (quickjs)
+        run: bash tests/test262/run.sh --backend quickjs --output artifacts/test262-quickjs.json
+
+      - name: Public Zig module consumer (quickjs)
+        working-directory: tests/zig-consumer
+        run: zig build run -Dbackend=quickjs --summary all
+
+      - name: Typed public C consumers (quickjs)
+        run: |
+          set -euo pipefail
+          zig build -Dbackend=quickjs -Dlibrary-only=true -Doptimize=ReleaseFast --prefix artifacts/typed-consumers-qjs --summary all
+          bash tests/run-value-consumers.sh artifacts/typed-consumers-qjs/lib/libjsbay.a artifacts/typed-consumers-qjs
+
+      - name: Classic QuickJS ReleaseSafe public consumer
+        run: sh scripts/check-quickjs-release-safe-consumer.sh artifacts/quickjs-release-safe
+
+      - name: QuickJS GC stress
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test_filter in \
+            'Global and Weak are empty after engine.destroy' \
+            'Rooted: GC stress keeps object live until final unroot' \
+            'finalizer contract: deferred finalizer runs off the finalizer stack and can eval' \
+            'rejection: timer callback rejection is reported before teardown and tracker is clean after ID reuse' \
+            'timers: clearInterval from its own callback'; do
+            if output=$(zig build test-engine -Dbackend=quickjs_ng -Dquickjs-gc-stress=true -Dtest-filter="$test_filter" --summary all 2>&1); then
+              :
+            else
+              status=$?
+              printf '%s\n' "$output"
+              exit "$status"
+            fi
+            printf '%s\n' "$output"
+            if ! printf '%s\n' "$output" | grep -Eq '[1-9][0-9]*/[1-9][0-9]* tests passed'; then
+              echo "GC stress filter ran zero tests: $test_filter"
+              exit 1
+            fi
+          done
+
+      - name: Build inspector demo (quickjs_ng)
+        # `zig build inspector-demo` runs the demo (runnable step). Install artifacts only so CI does not hang on a long-lived server process.
+        run: zig build -Dbackend=quickjs_ng --summary all
+
+      - name: Build idle wake consumer
+        run: |
+          set -euo pipefail
+          link_flags=(-lm -pthread)
+          cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/host_wake_consumer.c zig-out/lib/libjsbay.a "${link_flags[@]}" -o zig-out/bin/host-wake-consumer
+
+      - name: Inspector e2e, idle wake and signal shutdown
+        run: node tests/inspector/ci_driver.cjs ./zig-out/bin/inspector-demo-quickjs_ng ./zig-out/bin/host-wake-consumer
+
+      - name: Upload inspector demo log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspector-demo-log-ubuntu-24.04
+          path: inspector-demo.log
+          if-no-files-found: ignore
+
+      - name: Upstream engine regression (quickjs_ng)
+        run: |
+          set -euo pipefail
+          bash tests/qjs-regression/run.sh --engine quickjs_ng
+          bash tests/qjs-regression/run.sh --engine quickjs_ng --inspector off
+
+      - name: Upstream engine regression (quickjs)
+        run: |
+          set -euo pipefail
+          bash tests/qjs-regression/run.sh --engine quickjs
+          bash tests/qjs-regression/run.sh --engine quickjs --inspector off
+
+      - name: Install Android build and emulator dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1' 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'
+
+      - name: Download Gradle 8.9
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
+          test -x "$RUNNER_TEMP/gradle-8.9/bin/gradle"
+
+      - name: Test Android smoke builder staging
+        shell: bash
+        run: ANDROID_BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0" KOTLIN_GRADLE_LIB="$RUNNER_TEMP/gradle-8.9/lib" bash tests/ci/android-smoke-builder-test.sh
+
+      - name: Build Android core and JNI adapter (smoke)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANDROID_SMOKE_BUILD_ONLY=true GRADLE_BIN="$RUNNER_TEMP/gradle-8.9/bin/gradle" bash tests/ci/run-android-device-smoke.sh
+
+      - name: Enable KVM for the Android Emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Android ART and R8 consumers (API 35)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: >-
+            ANDROID_SMOKE_SKIP_BUILD=true
+            ANDROID_SMOKE_JNI_LIBS="$GITHUB_WORKSPACE/build-android/jniLibs"
+            GRADLE_BIN="$RUNNER_TEMP/gradle-8.9/bin/gradle"
+            ANDROID_R8_TEST_OUT="$RUNNER_TEMP/jsbay-android-r8"
+            ANDROID_R8_TEST_REMOTE='/data/local/tmp/jsbay-android-r8'
+            bash tests/ci/run-android-device-smoke.sh
+
+  macos:
+    name: macos
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4.0.4
+
+      - name: Install pawl
+        uses: tiangong-dev/pawl@v0.8.2
+        with:
+          version: v0.8.2
+
+      - name: Ensure ripgrep
+        run: command -v rg || brew install ripgrep
+
+      - name: Check host tool dependencies
+        run: command -v git zig ruby tar zip unzip rg
+
+      - name: Test repository tools
+        run: zig build test-tools --summary all
+
+      - name: Check Zig formatting
+        run: |
+          set -euo pipefail
+          zig build test-fmt --summary all
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+            (cd "libs/$package" && zig build test-fmt --summary all)
+          done
+
+      - name: Check public C and C++ headers
+        run: zig build tool -- check-c-abi
+
+      - name: Test independent packages
+        run: |
+          set -euo pipefail
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+            (cd "libs/$package" && zig build test --summary all)
+          done
+
+      - name: Test262 runner contract
+        run: bash tests/test262_runner_contract.sh
+
+      - name: SDK quality — Apple style and lint
+        run: make check CHECKS=apple-style,apple-lint
+
+      - name: SDK quality — Swift formatter regression probe
+        run: bash scripts/quality/apple-style.sh self-test
+
+      - name: Engine tests (quickjs_ng)
+        run: zig build test-engine -Dbackend=quickjs_ng --summary all
+
+      - name: Host CDP transport without HTTP or WebSocket (quickjs_ng)
+        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector-transport=false -Dtest-filter="host transport" --summary all
+
+      - name: Inspector-disabled tests (quickjs_ng)
+        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector=false --summary all
+
+      - name: QuickJS-NG location dispatch contract
+        run: zig build test-ng-dispatch -Dbackend=quickjs_ng --summary all
+
+      - name: Pinned Test262 subset (quickjs_ng)
+        run: bash tests/test262/run.sh --backend quickjs_ng --output artifacts/test262-quickjs_ng.json
+
+      - name: Public Zig module consumer (quickjs_ng)
+        working-directory: tests/zig-consumer
+        run: zig build run -Dbackend=quickjs_ng --summary all
+
+      - name: Typed public C consumers (quickjs_ng)
+        run: |
+          set -euo pipefail
+          zig build -Dbackend=quickjs_ng -Dlibrary-only=true -Doptimize=ReleaseFast --prefix artifacts/typed-consumers-qjsng --summary all
+          bash tests/run-value-consumers.sh artifacts/typed-consumers-qjsng/lib/libjsbay.a artifacts/typed-consumers-qjsng
+
+      - name: Swift and Objective-C SDK consumers (quickjs_ng)
+        run: bash tests/apple-sdk/run.sh artifacts/typed-consumers-qjsng/lib/libjsbay.a artifacts/apple-sdk-qjsng quickjs_ng macosx
+
+      - name: .NET SDK consumer (quickjs_ng)
+        run: tests/dotnet-sdk/run.sh quickjs_ng
+
+      - name: Engine tests (jsc)
+        run: zig build test-engine -Dbackend=jsc --summary all
+
+      - name: Host CDP transport without HTTP or WebSocket (jsc)
+        run: zig build test-engine -Dbackend=jsc -Dinspector-transport=false -Dtest-filter="host transport" --summary all
+
+      - name: Inspector-disabled tests (jsc)
+        run: zig build test-engine -Dbackend=jsc -Dinspector=false --summary all
+
+      - name: Pinned Test262 subset (jsc)
+        run: bash tests/test262/run.sh --backend jsc --output artifacts/test262-jsc.json
+
+      - name: Public Zig module consumer (jsc)
+        working-directory: tests/zig-consumer
+        run: zig build run -Dbackend=jsc --summary all
+
+      - name: Typed public C consumers (jsc)
+        run: |
+          set -euo pipefail
+          zig build -Dbackend=jsc -Dlibrary-only=true -Doptimize=ReleaseFast --prefix artifacts/typed-consumers-jsc --summary all
+          bash tests/run-value-consumers.sh artifacts/typed-consumers-jsc/lib/libjsbay.a artifacts/typed-consumers-jsc
+
+      - name: Swift and Objective-C SDK consumers (jsc)
+        run: bash tests/apple-sdk/run.sh artifacts/typed-consumers-jsc/lib/libjsbay.a artifacts/apple-sdk-jsc jsc macosx
+
+      - name: .NET SDK consumer (jsc)
+        run: tests/dotnet-sdk/run.sh jsc
+
+      - name: Install Android build tools (AAR)
+        run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+
+      - name: Install Kotlin host compiler (Gradle 8.7)
+        run: |
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.7-bin.zip" https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle-8.7-bin.zip" -d "$RUNNER_TEMP"
+          echo "KOTLIN_GRADLE_LIB=$RUNNER_TEMP/gradle-8.7/lib" >> "$GITHUB_ENV"
+
+      - name: Build Android core for both shipped ABIs
+        run: ./build-android.sh artifacts/android/jniLibs
+
+      - name: Java and Kotlin consumers with strict JNI checks
+        run: |
+          set -euo pipefail
+          zig build -Dbackend=quickjs_ng -Dlibrary-only=true -Doptimize=ReleaseFast --prefix artifacts/android-host
+          tests/android-sdk/run-host.sh artifacts/android-host/lib/libjsbay.a
+
+      - name: Shrunk JVM consumers with strict JNI checks
+        run: tests/android-sdk/run-r8-host.sh artifacts/android-host/lib/libjsbay.a
+
+      - name: Shrink Android consumers with the AAR rules
+        run: |
+          set -euo pipefail
+          r8_out="$RUNNER_TEMP/android-r8"
+          mkdir -p "$r8_out/dex"
+          printf '%s\n' '-keep class io.jsbay.consumer.ConsumerMain { public static void main(java.lang.String[]); }' > "$r8_out/main.pro"
+          cat sdk/android/jsbay/consumer-rules.pro >> "$r8_out/main.pro"
+          java -cp "$ANDROID_SDK_ROOT/build-tools/35.0.0/lib/d8.jar" com.android.tools.r8.R8 --release --min-api 24 --lib "$ANDROID_SDK_ROOT/platforms/android-35/android.jar" --output "$r8_out/dex" --pg-conf "$r8_out/main.pro" --pg-map-output "$r8_out/mapping.txt" "$TMPDIR/jsbay-android-host/consumer.jar" "$KOTLIN_GRADLE_LIB/kotlin-stdlib-1.9.22.jar" "$KOTLIN_GRADLE_LIB/annotations-24.0.1.jar"
+          test -s "$r8_out/dex/classes.dex"
+          zig build tool -- check-r8 "$r8_out/mapping.txt" "$TMPDIR/jsbay-android-host/consumer.jar"
+
+      - name: Build and inspect Android AAR
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
+          cd sdk/android
+          env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" "$RUNNER_TEMP/gradle-8.9/bin/gradle" --no-daemon -PjsbayJniLibs="$GITHUB_WORKSPACE/artifacts/android/jniLibs" :jsbay:assembleRelease
+          env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" GRADLE="$RUNNER_TEMP/gradle-8.9/bin/gradle" JSBAY_JNI_LIBS="$GITHUB_WORKSPACE/artifacts/android/jniLibs" pawl measure --config "$GITHUB_WORKSPACE/pawl.yaml" --only android-lint
+          aar=jsbay/build/outputs/aar/jsbay-release.aar
+          test -f "$aar"
+          actual="$RUNNER_TEMP/android-aar-members"
+          unzip -Z1 "$aar" | grep '^jni/.*\.so$' | sort > "$actual"
+          printf '%s\n' jni/arm64-v8a/libjsbay.so jni/arm64-v8a/libjsbay_android.so jni/x86_64/libjsbay.so jni/x86_64/libjsbay_android.so | sort | diff -u - "$actual"
+          unzip -p "$aar" proguard.txt | grep -F -- '-keep class io.jsbay.Native { *; }'
+
+      - name: Build inspector demo (quickjs_ng)
+        run: zig build -Dbackend=quickjs_ng --summary all
+
+      - name: Build idle wake consumer
+        run: |
+          set -euo pipefail
+          link_flags=(-lm -framework Foundation -framework JavaScriptCore -lobjc -fsanitize=undefined)
+          cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/host_wake_consumer.c zig-out/lib/libjsbay.a "${link_flags[@]}" -o zig-out/bin/host-wake-consumer
+
+      - name: Inspector e2e, idle wake and signal shutdown
+        run: node tests/inspector/ci_driver.cjs ./zig-out/bin/inspector-demo-quickjs_ng ./zig-out/bin/host-wake-consumer
+
+      - name: Upload inspector demo log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspector-demo-log-macos-26
+          path: inspector-demo.log
+          if-no-files-found: ignore
+
+      - name: Verify arm64 Xcode environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-path
+
+      - name: iOS Simulator consumer smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build-apple.sh quickjs_ng
+          grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
+
+  windows:
+    name: windows
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Run engine tests without the POSIX inspector transport
+        shell: bash
+        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector-transport=false --summary all
+      - name: Build and run the public C consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build -Dtarget=x86_64-windows-gnu -Dlibrary-only=true -Doptimize=ReleaseFast -Dinspector-transport=false --prefix artifacts/windows --summary all
+          zig cc -target x86_64-windows-gnu -std=c11 -Wall -Wextra -Werror -Iinclude tests/c_consumer.c artifacts/windows/lib/jsbay.lib -o artifacts/windows/consumer.exe
+          ./artifacts/windows/consumer.exe
+      - name: Consume the public Zig module
+        shell: bash
+        working-directory: tests/zig-consumer
+        run: zig build run -Dbackend=quickjs_ng -Dinspector-transport=false --summary all
+      - name: Setup .NET consumer runtime
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Run .NET SDK consumer
+        shell: bash
+        run: tests/dotnet-sdk/run.sh quickjs_ng

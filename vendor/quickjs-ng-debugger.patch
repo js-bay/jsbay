@@ -1,0 +1,728 @@
+diff --git i/quickjs-opcode.h w/quickjs-opcode.h
+index ec2a5ad..b4a77d8 100644
+--- i/quickjs-opcode.h
++++ w/quickjs-opcode.h
+@@ -371,6 +371,7 @@ DEF(   is_undefined, 1, 1, 1, none)
+ DEF(        is_null, 1, 1, 1, none)
+ DEF(typeof_is_undefined, 1, 1, 1, none)
+ DEF( typeof_is_function, 1, 1, 1, none)
++DEF(         debugger, 1, 0, 0, none) /* debugger statement */
+ 
+ #undef DEF
+ #undef def
+diff --git i/quickjs.c w/quickjs.c
+index 6ca030b..f613252 100644
+--- i/quickjs.c
++++ w/quickjs.c
+@@ -392,6 +392,8 @@ struct JSRuntime {
+     void *host_promise_rejection_tracker_opaque;
+ 
+     struct list_head job_list; /* list of JSJobEntry.link */
++    JSJobHook *jsbay_qjs_job_hook;
++    const char *jsbay_qjs_next_job_kind;
+ 
+     bool module_normalize_has_attr;
+     union {
+@@ -422,6 +424,21 @@ struct JSRuntime {
+     void *user_opaque;
+     void *libc_opaque;
+     JSRuntimeFinalizerState *finalizers;
++
++    /* Debugger line hook. NULL unless a debugger is attached. */
++    JSLocationHandler *location_handler;
++    void *location_opaque;
++    int location_last_line;
++    void *location_last_func;
++    int location_force_notify;
++    JSExceptionHandler *exception_handler;
++    void *exception_opaque;
++    int in_exception_hook;
++    /* Bytecode pc of the last notified location. JS_Throw points the top
++       frame at it so the debugger sees the throw site. */
++    const uint8_t *debug_pc;
++    JSDebuggerHandler *debugger_handler;
++    void *debugger_opaque;
+ };
+ 
+ typedef struct JSStackFrame {
+@@ -445,6 +462,8 @@ typedef struct JSStackFrame {
+        the coroutine's locals keep the (suspended) coroutine reachable by
+        the cycle collector. */
+     struct JSGCObjectHeader *cur_gc_obj;
++    /* Number of OP_catch offsets still live on this frame's stack. */
++    int catch_count;
+ } JSStackFrame;
+ 
+ typedef enum {
+@@ -1074,6 +1093,7 @@ typedef struct JSJobEntry {
+     struct list_head link;
+     JSContext *ctx;
+     JSJobFunc *job_func;
++    const char *kind;
+     int argc;
+     JSValue argv[];
+ } JSJobEntry;
+@@ -2474,6 +2494,205 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
+     rt->interrupt_opaque = opaque;
+ }
+ 
++void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque)
++{
++    rt->location_handler = cb;
++    rt->location_opaque = opaque;
++    rt->location_last_line = -1;
++    rt->location_last_func = NULL;
++}
++
++void JS_RequestLocationCallback(JSRuntime *rt)
++{
++    __atomic_store_n(&rt->location_force_notify, 1, __ATOMIC_SEQ_CST);
++}
++
++void JS_SetExceptionHandler(JSRuntime *rt, JSExceptionHandler *cb, void *opaque)
++{
++    rt->exception_handler = cb;
++    rt->exception_opaque = opaque;
++}
++
++void JS_SetDebuggerHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque)
++{
++    rt->debugger_handler = cb;
++    rt->debugger_opaque = opaque;
++}
++
++static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
++                         uint32_t pc_value, int *col);
++static const char *JS_AtomGetStr(JSContext *ctx, char *buf, int buf_size, JSAtom atom);
++static bool js_class_has_bytecode(JSClassID class_id);
++
++static void js_debug_copy_cstr(char *dst, size_t dst_len, const char *src)
++{
++    size_t n;
++    if (!src)
++        src = "";
++    n = strlen(src);
++    if (n >= dst_len)
++        n = dst_len - 1;
++    memcpy(dst, src, n);
++    dst[n] = '\0';
++}
++
++static JSStackFrame *js_debug_frame(JSContext *ctx, int index)
++{
++    JSStackFrame *sf = ctx->rt->current_stack_frame;
++    while (sf && index-- > 0)
++        sf = sf->prev_frame;
++    return sf;
++}
++
++int JS_CopyDebugStack(JSContext *ctx, JSDebugFrameInfo *out, int max)
++{
++    JSStackFrame *sf;
++    int count = 0;
++
++    if (!out || max <= 0)
++        return 0;
++    for (sf = ctx->rt->current_stack_frame; sf != NULL && count < max; sf = sf->prev_frame) {
++        JSDebugFrameInfo *frame = &out[count];
++        memset(frame, 0, sizeof(*frame));
++        js_debug_copy_cstr(frame->name, sizeof(frame->name), "<anonymous>");
++        if (JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT) {
++            JSObject *f = JS_VALUE_GET_OBJ(sf->cur_func);
++            JSFunctionBytecode *b;
++            if (f && js_class_has_bytecode(f->class_id)) {
++                b = f->u.func.function_bytecode;
++                if (b) {
++                    /* Sampled from the interrupt handler: copy into the caller
++                       buffer. JS_AtomToCString mallocs. */
++                    if (b->func_name != JS_ATOM_NULL) {
++                        JS_AtomGetStr(ctx, frame->name, (int)sizeof(frame->name), b->func_name);
++                        if (!frame->name[0])
++                            js_debug_copy_cstr(frame->name, sizeof(frame->name), "<anonymous>");
++                    }
++                    if (b->filename != JS_ATOM_NULL)
++                        JS_AtomGetStr(ctx, frame->filename, (int)sizeof(frame->filename), b->filename);
++                    if (sf->cur_pc && b->byte_code_buf && sf->cur_pc >= b->byte_code_buf) {
++                        uint32_t off = (uint32_t)(sf->cur_pc - b->byte_code_buf);
++                        frame->line = find_line_num(ctx, b, off, &frame->column);
++                        if (frame->line < 0) {
++                            frame->line = 0;
++                            frame->column = 0;
++                        }
++                    }
++                }
++            }
++        }
++        count++;
++    }
++    return count;
++}
++
++static JSValue js_debug_local_variables(JSContext *ctx, JSStackFrame *sf)
++{
++    JSValue result = JS_NewObject(ctx);
++    JSObject *f;
++    JSFunctionBytecode *b;
++    uint32_t i;
++
++    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++        return result;
++    f = JS_VALUE_GET_OBJ(sf->cur_func);
++    if (!f || !js_class_has_bytecode(f->class_id))
++        return result;
++    b = f->u.func.function_bytecode;
++    if (!b)
++        return result;
++    for (i = 0; i < (uint32_t)(b->arg_count + b->var_count); i++) {
++        JSValue value = i < b->arg_count ? sf->arg_buf[i] : sf->var_buf[i - b->arg_count];
++        if (!JS_IsUninitialized(value))
++            JS_SetProperty(ctx, result, b->vardefs[i].var_name, JS_DupValue(ctx, value));
++    }
++    return result;
++}
++
++static JSValue js_debug_closure_variables(JSContext *ctx, JSStackFrame *sf)
++{
++    JSValue result = JS_NewObject(ctx);
++    JSObject *f;
++    JSFunctionBytecode *b;
++    uint32_t i;
++
++    if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++        return result;
++    f = JS_VALUE_GET_OBJ(sf->cur_func);
++    if (!f || !js_class_has_bytecode(f->class_id))
++        return result;
++    b = f->u.func.function_bytecode;
++    if (!b)
++        return result;
++    for (i = 0; i < (uint32_t)b->closure_var_count; i++) {
++        JSVarRef *var_ref = f->u.func.var_refs ? f->u.func.var_refs[i] : NULL;
++        JSValue value;
++        if (!var_ref || !var_ref->pvalue)
++            continue;
++        value = *var_ref->pvalue;
++        if (!JS_IsUninitialized(value))
++            JS_SetProperty(ctx, result, b->closure_var[i].var_name, JS_DupValue(ctx, value));
++    }
++    return result;
++}
++
++JSValue JS_CopyDebugScope(JSContext *ctx, int frame_index, int scope)
++{
++    JSStackFrame *sf = js_debug_frame(ctx, frame_index);
++    if (scope == 2 || !sf)
++        return JS_GetGlobalObject(ctx);
++    if (scope == 1)
++        return js_debug_closure_variables(ctx, sf);
++    return js_debug_local_variables(ctx, sf);
++}
++
++JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, size_t len)
++{
++    static const char helper_source[] =
++        "(function(__jsbayScope,__jsbayExpression){"
++        "return (function(){with(__jsbayScope){return eval(__jsbayExpression);}}).call(this);"
++        "})";
++    JSValue local = js_debug_local_variables(ctx, js_debug_frame(ctx, frame_index));
++    JSValue closure = js_debug_closure_variables(ctx, js_debug_frame(ctx, frame_index));
++    JSValue helper;
++    JSValue expression;
++    JSValue args[2];
++    JSValue global;
++    JSValue result;
++
++    if (JS_SetPrototype(ctx, local, closure) < 0) {
++        JS_FreeValue(ctx, closure);
++        JS_FreeValue(ctx, local);
++        return JS_EXCEPTION;
++    }
++    JS_FreeValue(ctx, closure);
++    helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, "<debugger>", JS_EVAL_TYPE_GLOBAL);
++    if (JS_IsException(helper)) {
++        JS_FreeValue(ctx, local);
++        return helper;
++    }
++    expression = JS_NewStringLen(ctx, expr, len);
++    if (JS_IsException(expression)) {
++        JS_FreeValue(ctx, helper);
++        JS_FreeValue(ctx, local);
++        return expression;
++    }
++    args[0] = local;
++    args[1] = expression;
++    /* `this` is a real binding in the frame. `with` does not change it. */
++    global = JS_GetPropertyStr(ctx, local, "this");
++    if (JS_IsException(global) || JS_IsUndefined(global) || JS_IsUninitialized(global)) {
++        JS_FreeValue(ctx, global);
++        global = JS_GetGlobalObject(ctx);
++    }
++    result = JS_Call(ctx, helper, global, 2, args);
++    JS_FreeValue(ctx, global);
++    JS_FreeValue(ctx, expression);
++    JS_FreeValue(ctx, helper);
++    JS_FreeValue(ctx, local);
++    return result;
++}
++
+ void JS_SetCanBlock(JSRuntime *rt, bool can_block)
+ {
+     rt->can_block = can_block;
+@@ -2485,6 +2704,11 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
+     rt->sab_funcs = *sf;
+ }
+ 
++void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook)
++{
++    rt->jsbay_qjs_job_hook = hook;
++}
++
+ /* return 0 if OK, < 0 if exception */
+ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                   int argc, JSValueConst *argv)
+@@ -2496,15 +2720,21 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+     assert(!rt->in_free);
+ 
+     e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+-    if (!e)
++    if (!e) {
++        rt->jsbay_qjs_next_job_kind = NULL;
+         return -1;
++    }
+     e->ctx = ctx;
+     e->job_func = job_func;
++    e->kind = rt->jsbay_qjs_next_job_kind ? rt->jsbay_qjs_next_job_kind : "Promise";
++    rt->jsbay_qjs_next_job_kind = NULL;
+     e->argc = argc;
+     for(i = 0; i < argc; i++) {
+         e->argv[i] = js_dup(argv[i]);
+     }
+     list_add_tail(&e->link, &rt->job_list);
++    if (rt->jsbay_qjs_job_hook)
++        rt->jsbay_qjs_job_hook(ctx, 0, e->kind);
+     return 0;
+ }
+ 
+@@ -2539,7 +2769,11 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+     e = list_entry(rt->job_list.next, JSJobEntry, link);
+     list_del(&e->link);
+     ctx = e->ctx;
++    if (rt->jsbay_qjs_job_hook)
++        rt->jsbay_qjs_job_hook(ctx, 1, e->kind);
+     res = e->job_func(e->ctx, e->argc, vc(e->argv));
++    if (rt->jsbay_qjs_job_hook)
++        rt->jsbay_qjs_job_hook(ctx, 2, e->kind);
+     for(i = 0; i < e->argc; i++)
+         JS_FreeValue(ctx, e->argv[i]);
+     if (JS_IsException(res))
+@@ -7576,6 +7810,125 @@ static void compute_value_size(JSValue val, JSMemoryUsage_helper *hp)
+     }
+ }
+ 
++void JS_WalkHeapObjects(JSRuntime *rt, JSHeapObjectVisitor *visit, void *opaque)
++{
++    struct list_head *el;
++    char buf[ATOM_GET_STR_BUF_SIZE];
++
++    if (!visit)
++        return;
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSObject *p;
++        const char *name = "Object";
++        uint64_t size;
++
++        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        p = (JSObject *)gp;
++        if (p->class_id > 0 && p->class_id < rt->class_count) {
++            name = JS_AtomGetStrRT(rt, buf, sizeof(buf),
++                                   rt->class_array[p->class_id].class_name);
++            if (!name || !name[0])
++                name = "Object";
++        }
++        size = sizeof(JSObject);
++        if ((p->class_id == JS_CLASS_ARRAY_BUFFER ||
++             p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER) &&
++            p->u.array_buffer && p->u.array_buffer->data)
++            size = (uint64_t)p->u.array_buffer->byte_length;
++        visit(opaque, name, (int)p->class_id, size);
++    }
++}
++
++static void js_walk_heap_graph_value(JSHeapGraphEdgeVisitor *visit_edge,
++                                     void *opaque, JSObject *from,
++                                     JSValueConst value, int type,
++                                     const char *name, uint32_t index)
++{
++    if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT)
++        visit_edge(opaque, from, JS_VALUE_GET_OBJ(value), type, name, index);
++}
++
++/* Reads physical object storage only: no JS_GetProperty, getter, or Proxy trap. */
++void JS_WalkHeapGraph(JSRuntime *rt, JSHeapGraphNodeVisitor *visit_node,
++                      JSHeapGraphEdgeVisitor *visit_edge, void *opaque)
++{
++    struct list_head *el;
++    char class_buf[ATOM_GET_STR_BUF_SIZE];
++    char prop_buf[ATOM_GET_STR_BUF_SIZE];
++    if (!visit_node || !visit_edge)
++        return;
++#if !JSBAY_HEAP_SNAPSHOT
++    (void)rt;
++    (void)opaque;
++    return;
++#else
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSObject *p;
++        const char *name = "Object";
++        uint64_t size;
++        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        p = (JSObject *)gp;
++        if (p->class_id > 0 && p->class_id < rt->class_count) {
++            name = JS_AtomGetStrRT(rt, class_buf, sizeof(class_buf),
++                                   rt->class_array[p->class_id].class_name);
++            if (!name || !name[0]) name = "Object";
++        }
++        size = sizeof(JSObject);
++        if ((p->class_id == JS_CLASS_ARRAY_BUFFER ||
++             p->class_id == JS_CLASS_SHARED_ARRAY_BUFFER) &&
++            p->u.array_buffer && p->u.array_buffer->data)
++            size = (uint64_t)p->u.array_buffer->byte_length;
++        visit_node(opaque, p, name, (int)p->class_id, size);
++    }
++    list_for_each(el, &rt->gc_obj_list) {
++        JSGCObjectHeader *gp = list_entry(el, JSGCObjectHeader, link);
++        JSObject *p;
++        JSShapeProperty *prs;
++        int i;
++        if (JS_GC_TYPE(gp) != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        p = (JSObject *)gp;
++        if (p->shape && p->shape->proto)
++            visit_edge(opaque, p, p->shape->proto, JS_HEAP_EDGE_PROTOTYPE,
++                       "[[Prototype]]", 0);
++        if (p->shape && p->prop) {
++            prs = get_shape_prop(p->shape);
++            for (i = 0; i < p->shape->prop_count; i++, prs++) {
++                JSProperty *prop = &p->prop[i];
++                const char *name;
++                if (prs->atom == JS_ATOM_NULL)
++                    continue;
++                name = JS_AtomGetStrRT(rt, prop_buf, sizeof(prop_buf), prs->atom);
++                if (!name) name = "";
++                if (!(prs->flags & JS_PROP_TMASK))
++                    js_walk_heap_graph_value(visit_edge, opaque, p, prop->u.value,
++                                             JS_HEAP_EDGE_PROPERTY, name, 0);
++                else if ((prs->flags & JS_PROP_TMASK) == JS_PROP_GETSET) {
++                    if (prop->u.getset.getter)
++                        visit_edge(opaque, p, prop->u.getset.getter,
++                                   JS_HEAP_EDGE_INTERNAL, name, 0);
++                    if (prop->u.getset.setter)
++                        visit_edge(opaque, p, prop->u.getset.setter,
++                                   JS_HEAP_EDGE_INTERNAL, name, 0);
++                }
++            }
++        }
++        if (p->fast_array &&
++            (p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS) &&
++            p->u.array.u.values) {
++            for (i = 0; i < p->u.array.count; i++)
++                js_walk_heap_graph_value(visit_edge, opaque, p,
++                                         p->u.array.u.values[i],
++                                         JS_HEAP_EDGE_ELEMENT, NULL, i);
++        }
++    }
++#endif
++}
++
+ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
+ {
+     struct list_head *el, *el1;
+@@ -8002,6 +8267,28 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
+     JSRuntime *rt = ctx->rt;
+     JS_FreeValue(ctx, rt->current_exception);
+     rt->current_exception = obj;
++    if (rt->exception_handler && !rt->in_exception_hook &&
++        !JS_IsUncatchableError(obj)) {
++        JSStackFrame *sf;
++        int caught = 0;
++        JSStackFrame *top = rt->current_stack_frame;
++        uint8_t *saved_pc = NULL;
++        if (top && rt->debug_pc) {
++            saved_pc = top->cur_pc;
++            top->cur_pc = (uint8_t *)rt->debug_pc;
++        }
++        for (sf = rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
++            if (sf->catch_count > 0) {
++                caught = 1;
++                break;
++            }
++        }
++        rt->in_exception_hook = 1;
++        rt->exception_handler(ctx, caught, rt->exception_opaque);
++        rt->in_exception_hook = 0;
++        if (top && rt->debug_pc)
++            top->cur_pc = saved_pc;
++    }
+     return JS_EXCEPTION;
+ }
+ 
+@@ -18035,6 +18322,48 @@ static bool needs_backtrace(JSValue exc)
+     return can_store_error_stack(exc) || can_add_backtrace(exc);
+ }
+ 
++static void js_notify_location(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *pc)
++{
++    JSRuntime *rt = ctx->rt;
++    int col, line, depth, force_notify;
++    JSStackFrame *frame;
++    const char *filename;
++
++    if (likely(!rt->location_handler))
++        return;
++    rt->debug_pc = pc;
++    line = find_line_num(ctx, b, (uint32_t)(pc - b->byte_code_buf), &col);
++    if (line < 0)
++        return;
++    force_notify = __atomic_exchange_n(&rt->location_force_notify, 0, __ATOMIC_SEQ_CST);
++    if (line == rt->location_last_line && rt->location_last_func == b &&
++        !force_notify)
++        return;
++    rt->location_last_line = line;
++    rt->location_last_func = b;
++    filename = NULL;
++    if (b->filename)
++        filename = JS_AtomToCString(ctx, b->filename);
++    depth = 0;
++    for (frame = rt->current_stack_frame; frame != NULL; frame = frame->prev_frame)
++        depth++;
++    /* Keep the current pc visible to JS_CopyDebugStack while the hook runs. */
++    {
++        JSStackFrame *top = rt->current_stack_frame;
++        uint8_t *saved_pc = NULL;
++        if (top) {
++            saved_pc = top->cur_pc;
++            top->cur_pc = (uint8_t *)pc;
++        }
++        rt->location_handler(ctx, filename ? filename : "", line, col, depth,
++                             rt->location_opaque);
++        if (top)
++            top->cur_pc = saved_pc;
++    }
++    if (filename)
++        JS_FreeCString(ctx, filename);
++}
++
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                JSValueConst this_obj, JSValueConst new_target,
+@@ -18059,7 +18388,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ #endif
+ 
+ #if !DIRECT_DISPATCH
+-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) if (unlikely(ctx->rt->location_handler)) js_notify_location(ctx, b, (pc)); switch (opcode = *pc++)
+ #define CASE(op)        case op
+ #define DEFAULT         default
+ #define BREAK           break
+@@ -18070,7 +18399,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ #include "quickjs-opcode.h"
+         [ OP_COUNT ... 255 ] = &&case_default
+     };
+-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) if (unlikely(ctx->rt->location_handler)) js_notify_location(ctx, b, (pc)); __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+ #define CASE(op)        case_ ## op
+ #define DEFAULT         case_default
+ #define BREAK           SWITCH(pc)
+@@ -18131,6 +18460,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ 
+     sf->is_strict_mode = b->is_strict_mode;
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
++    sf->catch_count = 0;
+     arg_buf = (JSValue *)argv;
+     sf->arg_count = argc;
+     sf->cur_func = unsafe_unconst(func_obj);
+@@ -19255,6 +19585,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                 sp[0] = JS_NewCatchOffset(ctx, pc + diff - b->byte_code_buf);
+                 sp++;
+                 pc += 4;
++                sf->catch_count++;
+             }
+             BREAK;
+         CASE(OP_gosub):
+@@ -19361,6 +19692,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     goto exception;
+                 }
+                 sp[-1] = ret_val;
++                if (sf->catch_count > 0)
++                    sf->catch_count--;
+             }
+             BREAK;
+ 
+@@ -20868,6 +21201,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             ret_val = JS_UNDEFINED;
+             goto done_generator;
+ 
++        CASE(OP_debugger):
++            if (unlikely(rt->debugger_handler)) {
++                uint8_t *saved_pc = sf->cur_pc;
++                sf->cur_pc = (uint8_t *)(pc - 1);
++                rt->debugger_handler(ctx, rt->debugger_opaque);
++                sf->cur_pc = saved_pc;
++            }
++            BREAK;
+         CASE(OP_nop):
+             BREAK;
+         CASE(OP_is_undefined_or_null):
+@@ -20943,6 +21284,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                     JS_FreeValueRT(rt, ctx->error_back_trace);
+                     ctx->error_back_trace = JS_UNDEFINED;
+                     pc = b->byte_code_buf + pos;
++                    if (sf->catch_count > 0)
++                        sf->catch_count--;
+                     goto restart;
+                 }
+             }
+@@ -21164,6 +21507,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
+     b = p->u.func.function_bytecode;
+     sf->is_strict_mode = b->is_strict_mode;
+     sf->is_constructor = false;
++    sf->catch_count = 0;
+     sf->cur_pc = b->byte_code_buf;
+     arg_buf_len = max_int(b->arg_count, argc);
+     local_count = arg_buf_len + b->var_count + b->stack_size;
+@@ -29442,6 +29786,10 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+             goto fail;
+         break;
+     case TOK_RETURN:
++        /* The return keyword needs its own source location. Without it the
++           following opcode keeps the previous statement's line, so a debugger
++           breakpoint on `return` never hits. */
++        emit_source_loc(s);
+         if (s->cur_func->is_eval) {
+             js_parse_error(s, "return not in a function");
+             goto fail;
+@@ -30258,11 +30606,13 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+         break;
+ 
+     case TOK_DEBUGGER:
+-        /* currently no debugger, so just skip the keyword */
++        /* Record the statement location, then pause if a debugger is attached. */
++        emit_source_loc(s);
+         if (next_token(s))
+             goto fail;
+         if (js_parse_expect_semi(s))
+             goto fail;
++        emit_op(s, OP_debugger);
+         break;
+ 
+     case TOK_ENUM:
+@@ -36454,11 +36804,15 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
+                 int idx;
+                 idx = get_u16(bc_buf + pos + 1);
+                 if (code_match(&cc, pos_next, op - 1, idx, -1)) {
+-                    if (cc.line_num >= 0) line_num = cc.line_num;
+-                    if (cc.col_num >= 0) col_num = cc.col_num;
++                    /* Keep the store on its own line. The matched get may
++                       belong to the next statement (`return n`), and taking
++                       that line here makes a breakpoint on `return` stop
++                       before the initializer runs. */
+                     add_pc2line_info(s, bc_out.size, line_num, col_num);
+                     put_short_code(&bc_out, op + 1, idx);
+                     pos_next = cc.pos;
++                    if (cc.line_num >= 0) line_num = cc.line_num;
++                    if (cc.col_num >= 0) col_num = cc.col_num;
+                     break;
+                 }
+                 add_pc2line_info(s, bc_out.size, line_num, col_num);
+@@ -41070,6 +41424,7 @@ static JSValue js_global_queueMicrotask(JSContext *ctx, JSValueConst this_val,
+ {
+     if (check_function(ctx, argv[0]))
+         return JS_EXCEPTION;
++    ctx->rt->jsbay_qjs_next_job_kind = "queueMicrotask";
+     if (JS_EnqueueJob(ctx, js_microtask_job, 1, &argv[0]))
+         return JS_EXCEPTION;
+     return JS_UNDEFINED;
+diff --git i/quickjs.h w/quickjs.h
+index b5e5576..b5344d7 100644
+--- i/quickjs.h
++++ w/quickjs.h
+@@ -606,6 +606,25 @@ typedef struct JSMemoryUsage {
+ JS_EXTERN void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s);
+ JS_EXTERN void JS_DumpMemoryUsage(FILE *fp, const JSMemoryUsage *s, JSRuntime *rt);
+ 
++/* Visit each live JS object. `name` is only valid until the visitor returns. */
++typedef void JSHeapObjectVisitor(void *opaque, const char *name, int class_id,
++                                 uint64_t self_size);
++typedef void JSHeapGraphNodeVisitor(void *opaque, const void *object,
++                                    const char *name, int class_id, uint64_t size);
++typedef void JSHeapGraphEdgeVisitor(void *opaque, const void *from,
++                                    const void *to, int type, const char *name,
++                                    uint32_t index);
++enum {
++    JS_HEAP_EDGE_PROPERTY = 1,
++    JS_HEAP_EDGE_ELEMENT = 2,
++    JS_HEAP_EDGE_PROTOTYPE = 3,
++    JS_HEAP_EDGE_INTERNAL = 4,
++};
++JS_EXTERN void JS_WalkHeapObjects(JSRuntime *rt, JSHeapObjectVisitor *visit,
++                                  void *opaque);
++JS_EXTERN void JS_WalkHeapGraph(JSRuntime *rt, JSHeapGraphNodeVisitor *visit_node,
++                                JSHeapGraphEdgeVisitor *visit_edge, void *opaque);
++
+ /* atom support */
+ #define JS_ATOM_NULL 0
+ 
+@@ -1186,6 +1192,38 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
+ /* return != 0 if the JS code needs to be interrupted */
+ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
+ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
++
++/* Called when execution moves to a different source line. filename is
++   borrowed until the callback returns. depth is the number of JS frames.
++   The callback may block; it must not free the runtime. */
++typedef void JSLocationHandler(JSContext *ctx, const char *filename,
++                               int line, int column, int depth, void *opaque);
++JS_EXTERN void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque);
++/* Force the next bytecode location notification, even on the same line. */
++JS_EXTERN void JS_RequestLocationCallback(JSRuntime *rt);
++
++/* caught != 0 when some live frame has an active try. The callback may block. */
++typedef void JSExceptionHandler(JSContext *ctx, int caught, void *opaque);
++JS_EXTERN void JS_SetExceptionHandler(JSRuntime *rt, JSExceptionHandler *cb, void *opaque);
++
++/* Called when a debugger statement runs. The callback may block. */
++typedef void JSDebuggerHandler(JSContext *ctx, void *opaque);
++JS_EXTERN void JS_SetDebuggerHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque);
++
++typedef struct JSDebugFrameInfo {
++    char name[128];
++    char filename[512];
++    int line;    /* 1-based, 0 if unknown */
++    int column;  /* 1-based, 0 if unknown */
++} JSDebugFrameInfo;
++
++/* Copies up to max live frames, innermost first. Returns the count. */
++JS_EXTERN int JS_CopyDebugStack(JSContext *ctx, JSDebugFrameInfo *out, int max);
++/* scope: 0 local, 1 closure, 2 global. Returns a fresh object. */
++JS_EXTERN JSValue JS_CopyDebugScope(JSContext *ctx, int frame_index, int scope);
++/* Evaluates expr with that frame's locals and closures in scope. */
++JS_EXTERN JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index,
++                                     const char *expr, size_t len);
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
+ /* set the [IsHTMLDDA] internal slot */
+@@ -1247,6 +1285,10 @@ typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
+ JS_EXTERN int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+                             int argc, JSValueConst *argv);
+ 
++/* phase 0: queued (kind is a stable literal). 1: before the job. 2: after. */
++typedef void JSJobHook(JSContext *ctx, int phase, const char *kind);
++JS_EXTERN void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook);
++
+ JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
+ JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);
+ JS_EXTERN int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

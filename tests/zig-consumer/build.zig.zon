@@ -1,0 +1,10 @@
+.{
+    .name = .jsbay_zig_consumer,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xe4d17703805b125b,
+    .dependencies = .{
+        .jsbay = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

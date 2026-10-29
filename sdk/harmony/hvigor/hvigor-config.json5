@@ -1,0 +1,7 @@
+{
+  "modelVersion": "6.0.0",
+  "execution": {
+    "daemon": false,
+    "typeCheck": true
+  }
+}

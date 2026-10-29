@@ -1,0 +1,336 @@
+{
+  "schema_version": 1,
+  "revision": "d53ebc8b1931d9f1541e43d59650776e4b766248",
+  "source": "https://github.com/tc39/test262",
+  "license": "LICENSE",
+  "files": [
+    {
+      "path": "test/built-ins/DataView/prototype/setUint16/index-check-before-value-conversion.js",
+      "sha256": "b472c128f3a020f73f6738c3c1ef3865c9c58b5cb94b7f1eab5ff7f09aa77c06"
+    },
+    {
+      "path": "test/built-ins/DataView/prototype/setUint16/range-check-after-value-conversion.js",
+      "sha256": "dc7d47100896b529adc6322c033e986ab32ba47811d16023654a44ce4c7d36d3"
+    },
+    {
+      "path": "test/built-ins/DataView/prototype/setUint16/return-abrupt-from-tonumber-value.js",
+      "sha256": "c748467f8f1023d48f9fe82a84c1265c1ffd05faead0b46da8a75b4cfc4548a4"
+    },
+    {
+      "path": "test/built-ins/DataView/prototype/setUint16/set-values-little-endian-order.js",
+      "sha256": "72acefda5740eede41c79bd9dca333bddb3b92ddb2df2cd63cfa95885c5c69b9"
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/array-arg-return-abrupt-from-src-get-value.js",
+      "sha256": "61885200925b87225423cf010a11ceaa359ee98cd7ccc6f56a541b577788bb50"
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/array-arg-set-values-in-order.js",
+      "sha256": "cb0079aefb7906686f2813c0f08bd43b03ff8a13d926c99ccc1d5df35905eb82"
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/typedarray-arg-offset-tointeger.js",
+      "sha256": "6771baabf6da172103e1557d700a331263106979b56141ccc469c0c0edfa7bc1"
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/typedarray-arg-return-abrupt-from-tointeger-offset.js",
+      "sha256": "4f3291b548b7c91e2d0383e023a7e72e619a52928c6154d8279d9544a1bfb4a3"
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/typedarray-arg-set-values-same-buffer-same-type.js",
+      "sha256": "30d499c1a6d40a768c6383a2a9c0ad1d4f9c240fad91d26a209c668190fa865a"
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/typedarray-arg-src-range-greather-than-target-throws-rangeerror.js",
+      "sha256": "e5bc723307fa88f8aad75668375abf65fcdc90c52026fb1046b75a1847477568"
+    },
+    {
+      "path": "test/language/expressions/async-function/expression-returns-promise.js",
+      "sha256": "dc25606ba498f839af9b840f3914cd6467faa33870ad0639b611dee1fc0b22fc"
+    },
+    {
+      "path": "test/language/expressions/async-function/try-reject-finally-throw.js",
+      "sha256": "20e410451361124e744a7df2e7dab1c3cc09208bb61c3df44cb2b115f415784c"
+    },
+    {
+      "path": "test/language/expressions/async-function/try-return-finally-return.js",
+      "sha256": "0cb322b74c89b0cd3abf9b889336f4af06004322393d3ab70a3c3ac5d030b5be"
+    },
+    {
+      "path": "test/language/expressions/async-function/try-throw-finally-return.js",
+      "sha256": "68b9c74d969182f8edb46d91630431573de0d8f1e446695143a324d93f4f94ba"
+    },
+    {
+      "path": "test/language/expressions/async-function/try-throw-finally-throw.js",
+      "sha256": "0b7f12aff21eb10f4cbd6da481646a6bd2d75a3fc2c81e454ef3ac43130bec9b"
+    },
+    {
+      "path": "test/language/statements/debugger/expression.js",
+      "sha256": "816143dc17ea2e1c96e854d2ecf3d0e17b5bfa592741914c11405710ead7f340"
+    },
+    {
+      "path": "test/language/statements/debugger/statement.js",
+      "sha256": "aae1662335c1f45173a73070e41b92d9152955b9282eaf91eecdff93a3998db2"
+    },
+    {
+      "path": "test/language/statements/try/completion-values-fn-finally-abrupt.js",
+      "sha256": "67cc09876139af0ab7562a0ef1265d04c2a58d26b3de84c79927c9e45be7681b"
+    },
+    {
+      "path": "test/language/statements/try/completion-values-fn-finally-return.js",
+      "sha256": "e5d15192edf61c61e8fc21c68f223571a7a0a809557cad5342d286829670af74"
+    },
+    {
+      "path": "test/language/statements/try/cptn-finally-from-catch.js",
+      "sha256": "1c9053ba0c444224b5f65a65f2746b920eb9d63cae14dc9c7c7e5dcd493644e2"
+    },
+    {
+      "path": "test/language/statements/try/optional-catch-binding-throws.js",
+      "sha256": "20a082a6a47c279e6dd18c7d7b7b994eaa4dbef3b0eec2fdd0f0a27ffeeb2ac8"
+    },
+    {
+      "path": "test/language/statements/try/scope-catch-block-lex-close.js",
+      "sha256": "fa1700a3681c2465a04ddbbc13de1e935141df11fac87fd0f2664f984529959f"
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "4dd9244dfe8197c75348c4b24ab53d29d3b1cfad143ac76b5a3d8942aa354ce0"
+    },
+    {
+      "path": "harness/sta.js",
+      "sha256": "1930c54af79455c484799f43e9a28e2b2f15c40d0917c9941ca54e26db243f35"
+    },
+    {
+      "path": "harness/assert.js",
+      "sha256": "206e274ca325eb8a652e3911c3fbd090e2480d11ed7579dc17a5d17a2360ed48"
+    },
+    {
+      "path": "harness/testTypedArray.js",
+      "sha256": "51eb50e53e6215f31f14d64d249bea2d08ad943c77835f63ba52ec694de2189a"
+    },
+    {
+      "path": "harness/compareArray.js",
+      "sha256": "3330423fe116cd96db70077d194471319ae9767ba1c8e2f73d7c133c5204509d"
+    }
+  ],
+  "tests": [
+    {
+      "path": "test/built-ins/DataView/prototype/setUint16/index-check-before-value-conversion.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/DataView/prototype/setUint16/range-check-after-value-conversion.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/DataView/prototype/setUint16/return-abrupt-from-tonumber-value.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/DataView/prototype/setUint16/set-values-little-endian-order.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/array-arg-return-abrupt-from-src-get-value.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [
+        "testTypedArray.js",
+        "compareArray.js"
+      ],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/array-arg-set-values-in-order.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [
+        "testTypedArray.js",
+        "compareArray.js"
+      ],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/typedarray-arg-offset-tointeger.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [
+        "testTypedArray.js",
+        "compareArray.js"
+      ],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/typedarray-arg-return-abrupt-from-tointeger-offset.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [
+        "testTypedArray.js"
+      ],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/typedarray-arg-set-values-same-buffer-same-type.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [
+        "testTypedArray.js",
+        "compareArray.js"
+      ],
+      "async": false
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/set/typedarray-arg-src-range-greather-than-target-throws-rangeerror.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [
+        "testTypedArray.js"
+      ],
+      "async": false
+    },
+    {
+      "path": "test/language/expressions/async-function/expression-returns-promise.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/language/expressions/async-function/try-reject-finally-throw.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": true
+    },
+    {
+      "path": "test/language/expressions/async-function/try-return-finally-return.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": true
+    },
+    {
+      "path": "test/language/expressions/async-function/try-throw-finally-return.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": true
+    },
+    {
+      "path": "test/language/expressions/async-function/try-throw-finally-throw.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": true
+    },
+    {
+      "path": "test/language/statements/debugger/expression.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false,
+      "negative": {
+        "phase": "parse",
+        "type": "SyntaxError"
+      }
+    },
+    {
+      "path": "test/language/statements/debugger/statement.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/language/statements/try/completion-values-fn-finally-abrupt.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/language/statements/try/completion-values-fn-finally-return.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/language/statements/try/cptn-finally-from-catch.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/language/statements/try/optional-catch-binding-throws.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    },
+    {
+      "path": "test/language/statements/try/scope-catch-block-lex-close.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": false
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+  name: "JsBaySPMConsumer",
+  platforms: [.macOS(.v11)],
+  dependencies: [.package(name: "JsBay", path: "@JSBAY_PACKAGE@")],
+  targets: [
+    .executableTarget(
+      name: "SwiftConsumer", dependencies: [.product(name: "JsBaySDK", package: "JsBay")]),
+    .executableTarget(
+      name: "ObjCConsumer", dependencies: [.product(name: "JsBayObjC", package: "JsBay")]),
+  ]
+)

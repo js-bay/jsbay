@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "id": "zev_stress",
+  "name": "Zig zev stress",
+  "description": "Four producer threads run 1e6 signals, 1e5 zero-timeout waits, and 2e4 create/signal/wait lifecycles through src/stress.zig.",
+  "platforms": ["macos", "linux", "android", "ios_sim", "windows", "harmony"],
+  "timeout_sec": 180,
+  "pass_markers": {
+    "all": ["result=PASS", "native_mutex_checks=PASS"],
+    "line_contains_sequence": [["mutex_contention", "measurement=available"]]
+  },
+  "fail_markers": {
+    "contains": ["result=FAIL"]
+  },
+  "sources": {
+    "kind": "zig_package",
+    "package": ".",
+    "entry": "src/stress.zig",
+    "install_artifact": "zev-stress",
+    "ios_plist": "platform-test/cases/zev_stress/ios_Info.plist"
+  },
+  "harmony": {
+    "mode": "hdc_native_executable",
+    "notes": "The adapter cross-builds the Zig executable, transfers that exact artifact with hdc, and executes it through the selected device shell. Existing HAP logs are never accepted as a pass."
+  },
+  "artifact_name": "zev_stress"
+}

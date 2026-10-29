@@ -1,0 +1,18 @@
+# Cases of tests/qjs-regression/run.sh that need a non-default command line or are not run.
+# Format: engine|kind|path|value   (engine: quickjs_ng, quickjs or *)
+#   skip  value is the reason; every skip must say why.
+#   args  value is extra qjs arguments (quickjs only; quickjs_ng goes through run-test262).
+# Paths are relative to the patched engine tree. quickjs_ng also skips what its
+# own tests.conf [exclude] lists. Any test file not named here is run.
+
+# quickjs: upstream `make test` runs these with extra flags.
+quickjs|args|tests/test_builtin.js|--std
+
+# quickjs: helpers imported by other tests, not cases of their own.
+quickjs|skip|tests/assert.js|helper module imported by the other tests
+quickjs|skip|tests/fixture_cyclic_import.js|fixture imported by test_cyclic_import.js
+quickjs|skip|tests/test_worker_module.js|worker script loaded by test_worker.js
+quickjs|skip|tests/microbench.js|benchmark, not a pass/fail test
+
+# quickjs: need a build option JS Bay does not use.
+quickjs|skip|tests/test_intl.js|needs CONFIG_TEMPORAL_INTL (Temporal and Intl); JS Bay's build does not compile intl/ or temporal/

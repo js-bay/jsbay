@@ -1,0 +1,485 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -392,8 +392,10 @@
+     void *host_promise_rejection_tracker_opaque;
+ 
+     struct list_head job_list; /* list of JSJobEntry.link */
++#if JSBAY_INSPECTOR
+     JSJobHook *jsbay_qjs_job_hook;
+     const char *jsbay_qjs_next_job_kind;
++#endif
+ 
+     bool module_normalize_has_attr;
+     union {
+@@ -426,7 +428,18 @@
+     JSRuntimeFinalizerState *finalizers;
+ 
+     /* Debugger line hook. NULL unless a debugger is attached. */
++#if JSBAY_INSPECTOR
+     JSLocationHandler *location_handler;
++#if DIRECT_DISPATCH
++    const void *location_dispatch[256];
++    const void * const *location_dispatch_cold;
++    const void * const *location_dispatch_hot;
++#else
++    int location_opcode_offset;
++#endif
++#if JSBAY_DISPATCH_PROBE
++    uint64_t location_dispatch_probe;
++#endif
+     void *location_opaque;
+     JSBreakLocationHandler *break_location_handler;
+     void *break_location_opaque;
+@@ -443,6 +456,7 @@
+     const uint8_t *debug_pc;
+     JSDebuggerHandler *debugger_handler;
+     void *debugger_opaque;
++#endif
+ };
+ 
+ typedef struct JSStackFrame {
+@@ -467,7 +481,9 @@
+        the cycle collector. */
+     struct JSGCObjectHeader *cur_gc_obj;
+     /* Number of OP_catch offsets still live on this frame's stack. */
++#if JSBAY_INSPECTOR
+     int catch_count;
++#endif
+ } JSStackFrame;
+ 
+ typedef enum {
+@@ -912,7 +928,9 @@
+     uint8_t *pc2line_buf;
+     char *source;
+     /* Runtime-only debugger identity; never part of bytecode serialization. */
++#if JSBAY_INSPECTOR
+     uint64_t debugger_script_tag;
++#endif
+ } JSFunctionBytecode;
+ 
+ typedef struct JSBoundFunction {
+@@ -1099,7 +1117,9 @@
+     struct list_head link;
+     JSContext *ctx;
+     JSJobFunc *job_func;
++#if JSBAY_INSPECTOR
+     const char *kind;
++#endif
+     int argc;
+     JSValue argv[];
+ } JSJobEntry;
+@@ -2500,14 +2520,28 @@
+     rt->interrupt_opaque = opaque;
+ }
+ 
++#if JSBAY_INSPECTOR
+ void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque)
+ {
+     rt->location_handler = cb;
++#if DIRECT_DISPATCH
++    if (rt->location_dispatch_cold)
++        memcpy(rt->location_dispatch, cb ? rt->location_dispatch_hot : rt->location_dispatch_cold, sizeof(rt->location_dispatch));
++#else
++    rt->location_opcode_offset = cb ? 256 : 0;
++#endif
+     rt->location_opaque = opaque;
+     rt->location_last_line = -1;
+     rt->location_last_func = NULL;
+ }
+ 
++#if JSBAY_DISPATCH_PROBE
++uint64_t JS_GetLocationDispatchProbe(JSRuntime *rt)
++{
++    return rt->location_dispatch_probe;
++}
++#endif
++
+ void JS_SetScriptTagHandler(JSRuntime *rt, JSScriptTagHandler *cb, void *opaque)
+ {
+     rt->script_tag_handler = cb;
+@@ -2537,12 +2571,14 @@
+     rt->debugger_handler = cb;
+     rt->debugger_opaque = opaque;
+ }
++#endif
+ 
+ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
+                          uint32_t pc_value, int *col);
+ static const char *JS_AtomGetStr(JSContext *ctx, char *buf, int buf_size, JSAtom atom);
+ static bool js_class_has_bytecode(JSClassID class_id);
+ 
++#if JSBAY_INSPECTOR
+ static void js_debug_copy_cstr(char *dst, size_t dst_len, const char *src)
+ {
+     size_t n;
+@@ -2713,6 +2749,7 @@
+     return result;
+ }
+ 
++#endif
+ void JS_SetCanBlock(JSRuntime *rt, bool can_block)
+ {
+     rt->can_block = can_block;
+@@ -2724,10 +2761,18 @@
+     rt->sab_funcs = *sf;
+ }
+ 
++#if JSBAY_INSPECTOR
+ void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook)
+ {
+     rt->jsbay_qjs_job_hook = hook;
+ }
++
++void JS_InvalidatePendingJobHooks(JSRuntime *rt)
++{
++    struct list_head *el;
++    list_for_each(el, &rt->job_list) list_entry(el, JSJobEntry, link)->kind = NULL;
++}
++#endif
+ 
+ /* return 0 if OK, < 0 if exception */
+ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
+@@ -2741,20 +2786,26 @@
+ 
+     e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+     if (!e) {
++#if JSBAY_INSPECTOR
+         rt->jsbay_qjs_next_job_kind = NULL;
++#endif
+         return -1;
+     }
+     e->ctx = ctx;
+     e->job_func = job_func;
+-    e->kind = rt->jsbay_qjs_next_job_kind ? rt->jsbay_qjs_next_job_kind : "Promise";
++#if JSBAY_INSPECTOR
++    e->kind = rt->jsbay_qjs_job_hook ? (rt->jsbay_qjs_next_job_kind ? rt->jsbay_qjs_next_job_kind : "Promise") : NULL;
+     rt->jsbay_qjs_next_job_kind = NULL;
++#endif
+     e->argc = argc;
+     for(i = 0; i < argc; i++) {
+         e->argv[i] = js_dup(argv[i]);
+     }
+     list_add_tail(&e->link, &rt->job_list);
+-    if (JSBAY_INSPECTOR && rt->jsbay_qjs_job_hook)
+-        rt->jsbay_qjs_job_hook(ctx, 0, e->kind);
++#if JSBAY_INSPECTOR
++    if (e->kind && rt->jsbay_qjs_job_hook && !rt->jsbay_qjs_job_hook(ctx, 0, e->kind))
++        e->kind = NULL;
++#endif
+     return 0;
+ }
+ 
+@@ -2778,6 +2829,9 @@
+     JSContext *ctx;
+     JSJobEntry *e;
+     JSValue res;
++#if JSBAY_INSPECTOR
++    JSJobHook *hook;
++#endif
+     int i, ret;
+ 
+     if (list_empty(&rt->job_list)) {
+@@ -2789,11 +2843,17 @@
+     e = list_entry(rt->job_list.next, JSJobEntry, link);
+     list_del(&e->link);
+     ctx = e->ctx;
+-    if (JSBAY_INSPECTOR && rt->jsbay_qjs_job_hook)
+-        rt->jsbay_qjs_job_hook(ctx, 1, e->kind);
++ #if JSBAY_INSPECTOR
++    hook = e->kind ? rt->jsbay_qjs_job_hook : NULL;
++    if (hook && !hook(ctx, 1, e->kind)) {
++        e->kind = NULL;
++        hook = NULL;
++    }
++#endif
+     res = e->job_func(e->ctx, e->argc, vc(e->argv));
+-    if (JSBAY_INSPECTOR && rt->jsbay_qjs_job_hook)
+-        rt->jsbay_qjs_job_hook(ctx, 2, e->kind);
++ #if JSBAY_INSPECTOR
++    if (hook) (void)hook(ctx, 2, e->kind);
++#endif
+     for(i = 0; i < e->argc; i++)
+         JS_FreeValue(ctx, e->argv[i]);
+     if (JS_IsException(res))
+@@ -8476,7 +8536,8 @@
+     JSRuntime *rt = ctx->rt;
+     JS_FreeValue(ctx, rt->current_exception);
+     rt->current_exception = obj;
+-    if (JSBAY_INSPECTOR && rt->exception_handler && !rt->in_exception_hook &&
++#if JSBAY_INSPECTOR
++    if (rt->exception_handler && !rt->in_exception_hook &&
+         !JS_IsUncatchableError(obj)) {
+         JSStackFrame *sf;
+         int caught = 0;
+@@ -8498,6 +8559,7 @@
+         if (top && rt->debug_pc)
+             top->cur_pc = saved_pc;
+     }
++#endif
+     return JS_EXCEPTION;
+ }
+ 
+@@ -8623,6 +8685,7 @@
+     return b->line_num;
+ }
+ 
++#if JSBAY_INSPECTOR
+ /* CDP asks for legal breakpoint locations before JS_EvalFunctionInternal
+    releases transient top-level bytecode. Reuse the engine pc2line map rather
+    than deriving executable positions from source text. */
+@@ -8800,6 +8863,7 @@
+     if (js_set_debugger_script_tag(value, tag)) return 0;
+     return tag;
+ }
++#endif
+ 
+ /* in order to avoid executing arbitrary code during the stack trace
+    generation, we only look at simple 'name' properties containing a
+@@ -18709,6 +18773,7 @@
+     return can_store_error_stack(exc) || can_add_backtrace(exc);
+ }
+ 
++#if JSBAY_INSPECTOR
+ static void js_notify_location(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *pc)
+ {
+     JSRuntime *rt = ctx->rt;
+@@ -18750,6 +18815,7 @@
+     if (filename)
+         JS_FreeCString(ctx, filename);
+ }
++#endif
+ 
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18774,11 +18840,16 @@
+ #define DUMP_BYTECODE_OR_DONT(pc)
+ #endif
+ 
+-#if !DIRECT_DISPATCH
+-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) if (JSBAY_INSPECTOR && unlikely(ctx->rt->location_handler)) js_notify_location(ctx, b, (pc)); switch (opcode = *pc++)
++#if JSBAY_INSPECTOR && !DIRECT_DISPATCH
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) opcode = *pc++ + rt->location_opcode_offset; dispatch_opcode: switch (opcode)
+ #define CASE(op)        case op
+ #define DEFAULT         default
+ #define BREAK           break
++#elif !DIRECT_DISPATCH
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
++#define CASE(op)        case op
++#define DEFAULT         default
++#define BREAK           break
+ #else
+     __extension__ static const void * const dispatch_table[256] = {
+ #define DEF(id, size, n_pop, n_push, f) && case_OP_ ## id,
+@@ -18786,7 +18857,22 @@
+ #include "quickjs-opcode.h"
+         [ OP_COUNT ... 255 ] = &&case_default
+     };
+-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) if (JSBAY_INSPECTOR && unlikely(ctx->rt->location_handler)) js_notify_location(ctx, b, (pc)); __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
++#if JSBAY_INSPECTOR
++    __extension__ static const void * const debug_dispatch_table[256] = {
++        [ 0 ... OP_COUNT - 1 ] = &&case_debug_location,
++        [ OP_COUNT ... 255 ] = &&case_default
++    };
++    /* Handler changes replace table entries without changing its base. */
++    if (!rt->location_dispatch_cold) {
++        rt->location_dispatch_cold = dispatch_table;
++        rt->location_dispatch_hot = debug_dispatch_table;
++        memcpy(rt->location_dispatch, rt->location_handler ? debug_dispatch_table : dispatch_table, sizeof(rt->location_dispatch));
++    }
++    const void * const *active_table = rt->location_dispatch;
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *active_table[opcode = *pc++]; });
++#else
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
++#endif
+ #define CASE(op)        case_ ## op
+ #define DEFAULT         case_default
+ #define BREAK           SWITCH(pc)
+@@ -18847,7 +18933,9 @@
+ 
+     sf->is_strict_mode = b->is_strict_mode;
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+-    if (JSBAY_INSPECTOR) sf->catch_count = 0;
++#if JSBAY_INSPECTOR
++    sf->catch_count = 0;
++#endif
+     arg_buf = (JSValue *)argv;
+     sf->arg_count = argc;
+     sf->cur_func = unsafe_unconst(func_obj);
+@@ -18896,6 +18984,25 @@
+         JSValue *call_argv;
+ 
+         SWITCH(pc) {
++#if JSBAY_INSPECTOR && DIRECT_DISPATCH
++        case_debug_location:
++            /* SWITCH consumed only the opcode, not its operands. */
++#if JSBAY_DISPATCH_PROBE
++            rt->location_dispatch_probe++;
++#endif
++            js_notify_location(ctx, b, pc - 1);
++            __extension__ ({ goto *dispatch_table[opcode]; });
++#elif JSBAY_INSPECTOR
++#define DEF(id, size, n_pop, n_push, f) case OP_ ## id + 256:
++#define def(id, size, n_pop, n_push, f)
++#include "quickjs-opcode.h"
++#if JSBAY_DISPATCH_PROBE
++            rt->location_dispatch_probe++;
++#endif
++            js_notify_location(ctx, b, pc - 1);
++            opcode -= 256;
++            goto dispatch_opcode;
++#endif
+         CASE(OP_push_i32):
+             *sp++ = js_int32(get_u32(pc));
+             pc += 4;
+@@ -19972,7 +20079,9 @@
+                 sp[0] = JS_NewCatchOffset(ctx, pc + diff - b->byte_code_buf);
+                 sp++;
+                 pc += 4;
+-                if (JSBAY_INSPECTOR) sf->catch_count++;
++#if JSBAY_INSPECTOR
++                sf->catch_count++;
++#endif
+             }
+             BREAK;
+         CASE(OP_gosub):
+@@ -20079,8 +20188,10 @@
+                     goto exception;
+                 }
+                 sp[-1] = ret_val;
+-                if (JSBAY_INSPECTOR && sf->catch_count > 0)
++#if JSBAY_INSPECTOR
++                if (sf->catch_count > 0)
+                     sf->catch_count--;
++#endif
+             }
+             BREAK;
+ 
+@@ -21589,12 +21700,14 @@
+             goto done_generator;
+ 
+         CASE(OP_debugger):
+-            if (JSBAY_INSPECTOR && unlikely(rt->debugger_handler)) {
++#if JSBAY_INSPECTOR
++            if (unlikely(rt->debugger_handler)) {
+                 uint8_t *saved_pc = sf->cur_pc;
+                 sf->cur_pc = (uint8_t *)(pc - 1);
+                 rt->debugger_handler(ctx, rt->debugger_opaque);
+                 sf->cur_pc = saved_pc;
+             }
++#endif
+             BREAK;
+         CASE(OP_nop):
+             BREAK;
+@@ -21642,6 +21755,9 @@
+             BREAK;
+         CASE(OP_invalid):
+         DEFAULT:
++#if JSBAY_INSPECTOR && !DIRECT_DISPATCH
++            opcode &= 255;
++#endif
+             JS_ThrowInternalError(ctx, "invalid opcode: pc=%u opcode=0x%02x",
+                                   (int)(pc - b->byte_code_buf - 1), opcode);
+             goto exception;
+@@ -21671,8 +21787,10 @@
+                     JS_FreeValueRT(rt, ctx->error_back_trace);
+                     ctx->error_back_trace = JS_UNDEFINED;
+                     pc = b->byte_code_buf + pos;
+-                    if (JSBAY_INSPECTOR && sf->catch_count > 0)
++#if JSBAY_INSPECTOR
++                    if (sf->catch_count > 0)
+                         sf->catch_count--;
++#endif
+                     goto restart;
+                 }
+             }
+@@ -21894,7 +22012,9 @@
+     b = p->u.func.function_bytecode;
+     sf->is_strict_mode = b->is_strict_mode;
+     sf->is_constructor = false;
+-    if (JSBAY_INSPECTOR) sf->catch_count = 0;
++#if JSBAY_INSPECTOR
++    sf->catch_count = 0;
++#endif
+     sf->cur_pc = b->byte_code_buf;
+     arg_buf_len = max_int(b->arg_count, argc);
+     local_count = arg_buf_len + b->var_count + b->stack_size;
+@@ -30994,12 +31114,16 @@
+ 
+     case TOK_DEBUGGER:
+         /* Record the statement location, then pause if a debugger is attached. */
++#if JSBAY_INSPECTOR
+         emit_source_loc(s);
++#endif
+         if (next_token(s))
+             goto fail;
+         if (js_parse_expect_semi(s))
+             goto fail;
++#if JSBAY_INSPECTOR
+         emit_op(s, OP_debugger);
++#endif
+         break;
+ 
+     case TOK_ENUM:
+@@ -38869,7 +38993,9 @@
+ 
+     tag = JS_VALUE_GET_TAG(fun_obj);
+     if (tag == JS_TAG_FUNCTION_BYTECODE) {
++#if JSBAY_INSPECTOR
+         js_collect_break_locations(ctx, JS_VALUE_GET_PTR(fun_obj));
++#endif
+         fun_obj = js_closure(ctx, fun_obj, var_refs, sf);
+         ret_val = JS_CallFree(ctx, fun_obj, this_obj, 0, NULL);
+     } else if (tag == JS_TAG_MODULE) {
+@@ -38996,8 +39122,9 @@
+     fun_obj = js_create_function(ctx, fd);
+     if (JS_IsException(fun_obj))
+         goto fail1;
+-    if (JSBAY_INSPECTOR)
+-        JS_RebindScriptTag(ctx, fun_obj, filename, input, input_len);
++#if JSBAY_INSPECTOR
++    JS_RebindScriptTag(ctx, fun_obj, filename, input, input_len);
++#endif
+     /* Could add a flag to avoid resolution if necessary */
+     if (m) {
+         m->func_obj = fun_obj;
+@@ -41814,7 +41941,9 @@
+ {
+     if (check_function(ctx, argv[0]))
+         return JS_EXCEPTION;
++#if JSBAY_INSPECTOR
+     ctx->rt->jsbay_qjs_next_job_kind = "queueMicrotask";
++#endif
+     if (JS_EnqueueJob(ctx, js_microtask_job, 1, &argv[0]))
+         return JS_EXCEPTION;
+     return JS_UNDEFINED;
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1213,6 +1213,7 @@
+ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
+ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+ 
++#if JSBAY_INSPECTOR
+ /* Called when execution moves to a different source line. filename is
+    borrowed until the callback returns. depth is the number of JS frames.
+    The callback may block; it must not free the runtime. */
+@@ -1258,6 +1259,7 @@
+ /* Evaluates expr with that frame's locals and closures in scope. */
+ JS_EXTERN JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index,
+                                      const char *expr, size_t len);
++#endif
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
+ /* set the [IsHTMLDDA] internal slot */
+@@ -1320,8 +1322,11 @@
+                             int argc, JSValueConst *argv);
+ 
+ /* phase 0: queued (kind is a stable literal). 1: before the job. 2: after. */
+-typedef void JSJobHook(JSContext *ctx, int phase, const char *kind);
++#if JSBAY_INSPECTOR
++typedef int JSJobHook(JSContext *ctx, int phase, const char *kind);
+ JS_EXTERN void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook);
++JS_EXTERN void JS_InvalidatePendingJobHooks(JSRuntime *rt);
++#endif
+ 
+ JS_EXTERN bool JS_IsJobPending(JSRuntime *rt);
+ JS_EXTERN JSContext *JS_GetPendingJobContext(JSRuntime *rt);

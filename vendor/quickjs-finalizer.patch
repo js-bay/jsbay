@@ -1,0 +1,12 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2484,5 +2484,8 @@ void JS_FreeRuntime(JSRuntime *rt)
+     /* don't remove the weak objects to avoid create new jobs with
+        FinalizationRegistry */
+     JS_RunGCInternal(rt, FALSE);
++    /* Keep the runtime-finalizer hook used by the embedding layer. */
++    extern void jsbay_qjs_JS_RunRuntimeFinalizers(JSRuntime *rt);
++    jsbay_qjs_JS_RunRuntimeFinalizers(rt);
+ 
+ #ifdef DUMP_LEAKS

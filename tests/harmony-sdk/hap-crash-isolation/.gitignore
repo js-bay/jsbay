@@ -1,0 +1,5 @@
+node_modules/
+*.hap
+local.properties.bak
+build-profile.local.json5
+signing/

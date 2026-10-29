@@ -1,0 +1,75 @@
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -937,4 +937,10 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
+                                size_t *pbyte_offset,
+                                size_t *pbyte_length,
+                                size_t *pbytes_per_element);
++/* Return a retained DataView backing ArrayBuffer plus its native window.
++   JS_UNDEFINED means that obj is not an attached, in-bounds DataView. */
++JSValue JS_GetDataViewBuffer(JSContext *ctx, JSValueConst obj,
++                             size_t *pbyte_offset,
++                             size_t *pbyte_length);
++int JS_IsDataView(JSValueConst val);
+ typedef struct {
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -61095,7 +61095,9 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
+     if (pbyte_offset)
+         *pbyte_offset = ta->offset;
+     if (pbyte_length)
+-        *pbyte_length = ta->length;
++        *pbyte_length = ta->track_rab
++            ? ((size_t)p->u.array.count << typed_array_size_log2(p->class_id))
++            : ta->length;
+     if (pbytes_per_element) {
+         *pbytes_per_element = 1 << typed_array_size_log2(p->class_id);
+     }
+@@ -61102,6 +61102,12 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
+     return JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
+ }
+ 
++int JS_IsDataView(JSValueConst val)
++{
++    return JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT &&
++           JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_DATAVIEW;
++}
++
+ static JSValue js_typed_array_get_toStringTag(JSContext *ctx,
+                                               JSValueConst this_val)
+ {
+@@ -63808,5 +63815,33 @@ static JSObject *get_dataview(JSContext *ctx, JSValueConst this_val)
+     return p;
+ }
+ 
++JSValue JS_GetDataViewBuffer(JSContext *ctx, JSValueConst obj,
++                             size_t *pbyte_offset,
++                             size_t *pbyte_length)
++{
++    JSObject *p;
++    JSTypedArray *ta;
++    JSArrayBuffer *abuf;
++
++    if (pbyte_offset)
++        *pbyte_offset = 0;
++    if (pbyte_length)
++        *pbyte_length = 0;
++
++    if (!JS_IsDataView(obj))
++        return JS_UNDEFINED;
++    p = JS_VALUE_GET_OBJ(obj);
++    if (dataview_is_oob(p))
++        return JS_UNDEFINED;
++    ta = p->u.typed_array;
++    if (pbyte_offset)
++        *pbyte_offset = ta->offset;
++    if (pbyte_length) {
++        abuf = ta->buffer->u.array_buffer;
++        *pbyte_length = ta->track_rab ? abuf->byte_length - ta->offset : ta->length;
++    }
++    return JS_DupValue(ctx, JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
++}
++
+ static JSValue js_dataview_get_buffer(JSContext *ctx, JSValueConst this_val)
+ {

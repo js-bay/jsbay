@@ -1,0 +1,141 @@
+diff --git i/quickjs.c w/quickjs.c
+index 84f35f5..c07a229 100644
+--- i/quickjs.c
++++ w/quickjs.c
+@@ -369,6 +369,8 @@ struct JSRuntime {
+     void *host_promise_rejection_tracker_opaque;
+ 
+     struct list_head job_list; /* list of JSJobEntry.link */
++    JSJobHook *jsbay_qjs_job_hook;
++    const char *jsbay_qjs_next_job_kind;
+ 
+     JSModuleNormalizeFunc *module_normalize_func;
+     BOOL module_loader_has_attr;
+@@ -950,6 +952,7 @@ typedef struct JSJobEntry {
+     struct list_head link;
+     JSContext *realm;
+     JSJobFunc *job_func;
++    const char *kind;
+     int argc;
+     JSValue argv[0];
+ } JSJobEntry;
+@@ -2299,6 +2302,16 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
+     rt->sab_funcs = *sf;
+ }
+ 
++void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook)
++{
++    rt->jsbay_qjs_job_hook = hook;
++}
++
++void JS_SetNextJobKind(JSContext *ctx, const char *kind)
++{
++    ctx->rt->jsbay_qjs_next_job_kind = kind;
++}
++
+ void JS_SetStripInfo(JSRuntime *rt, int flags)
+ {
+     rt->strip_flags = flags;
+@@ -2320,15 +2333,21 @@ static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
+         e = js_malloc_rt(ctx->rt, sizeof(*e) + argc * sizeof(JSValue));
+     else
+         e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+-    if (!e)
++    if (!e) {
++        rt->jsbay_qjs_next_job_kind = NULL;
+         return -1;
++    }
+     e->realm = JS_DupContext(ctx);
+     e->job_func = job_func;
++    e->kind = rt->jsbay_qjs_next_job_kind ? rt->jsbay_qjs_next_job_kind : "Promise";
++    rt->jsbay_qjs_next_job_kind = NULL;
+     e->argc = argc;
+     for(i = 0; i < argc; i++) {
+         e->argv[i] = JS_DupValue(ctx, argv[i]);
+     }
+     list_add_tail(&e->link, &rt->job_list);
++    if (rt->jsbay_qjs_job_hook)
++        rt->jsbay_qjs_job_hook(ctx, 0, e->kind);
+     return 0;
+ }
+ 
+@@ -2366,7 +2385,11 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
+     e = list_entry(rt->job_list.next, JSJobEntry, link);
+     list_del(&e->link);
+     ctx = e->realm;
++    if (rt->jsbay_qjs_job_hook)
++        rt->jsbay_qjs_job_hook(ctx, 1, e->kind);
+     res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
++    if (rt->jsbay_qjs_job_hook)
++        rt->jsbay_qjs_job_hook(ctx, 2, e->kind);
+     for(i = 0; i < e->argc; i++)
+         JS_FreeValue(ctx, e->argv[i]);
+     if (JS_IsException(res))
+@@ -7608,6 +7665,45 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
+     return 0;
+ }
+ 
++static void jsbay_qjs_copy_debug_string(char *dst, size_t dst_len, const char *src)
++{
++    if (!src)
++        src = "";
++    snprintf(dst, dst_len, "%s", src);
++}
++
++int JS_CopyDebugStack(JSContext *ctx, JSDebugFrameInfo *out, int max)
++{
++    JSStackFrame *sf;
++    int count = 0;
++
++    if (!ctx || !out || max <= 0)
++        return 0;
++    for (sf = ctx->rt->current_stack_frame; sf && count < max; sf = sf->prev_frame) {
++        JSDebugFrameInfo *frame = &out[count];
++        JSFunctionBytecode *b = JS_GetFunctionBytecode(sf->cur_func);
++        memset(frame, 0, sizeof(*frame));
++        jsbay_qjs_copy_debug_string(frame->name, sizeof(frame->name), "<anonymous>");
++        if (b) {
++            char buf[512];
++            if (b->func_name != JS_ATOM_NULL) {
++                jsbay_qjs_copy_debug_string(frame->name, sizeof(frame->name),
++                                       JS_AtomGetStr(ctx, buf, sizeof(buf), b->func_name));
++            }
++            if (b->debug.filename != JS_ATOM_NULL) {
++                jsbay_qjs_copy_debug_string(frame->filename, sizeof(frame->filename),
++                                       JS_AtomGetStr(ctx, buf, sizeof(buf), b->debug.filename));
++            }
++            if (sf->cur_pc && b->byte_code_buf && sf->cur_pc >= b->byte_code_buf) {
++                uint32_t off = (uint32_t)(sf->cur_pc - b->byte_code_buf);
++                frame->line = find_line_num(ctx, b, off, &frame->column);
++            }
++        }
++        count++;
++    }
++    return count;
++}
++
+ /* return a string property without executing arbitrary JS code (used
+    when dumping the stack trace or in debug print). */
+ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
+diff --git i/quickjs.h w/quickjs.h
+index 32a54fb..243c959 100644
+--- i/quickjs.h
++++ w/quickjs.h
+@@ -1008,6 +1011,17 @@ JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
+ 
+ typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
+ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv);
++typedef void JSJobHook(JSContext *ctx, int phase, const char *kind);
++void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook);
++void JS_SetNextJobKind(JSContext *ctx, const char *kind);
++
++typedef struct JSDebugFrameInfo {
++    char name[128];
++    char filename[512];
++    int line;
++    int column;
++} JSDebugFrameInfo;
++int JS_CopyDebugStack(JSContext *ctx, JSDebugFrameInfo *out, int max);
+ 
+ JS_BOOL JS_IsJobPending(JSRuntime *rt);
+ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

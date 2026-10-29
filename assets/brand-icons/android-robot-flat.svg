@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-147 -70 294 345"><g fill="#3DDC84">
+  <!-- body (#b) with white outer stroke -->
+  <ellipse cy="41" rx="91" ry="84" fill="none" stroke="#FFFFFF" stroke-width="14.4"/>
+  <rect rx="22" height="182" width="182" y="20" x="-91" fill="none" stroke="#FFFFFF" stroke-width="14.4"/>
+  <ellipse cy="41" rx="91" ry="84"/>
+  <rect rx="22" height="182" width="182" y="20" x="-91"/>
+  <!-- left arm+antenna group (#a) -->
+  <g stroke="#FFFFFF" stroke-width="7.2">
+    <rect rx="6.5" transform="rotate(29)" height="86" width="13" y="-86" x="14"/>
+    <rect rx="24" height="133" width="48" y="41" x="-143"/>
+  </g>
+  <!-- right arm+antenna = scale(-1,1) of #a -->
+  <g stroke="#FFFFFF" stroke-width="7.2" transform="scale(-1,1)">
+    <rect rx="6.5" transform="rotate(29)" height="86" width="13" y="-86" x="14"/>
+    <rect rx="24" height="133" width="48" y="41" x="-143"/>
+  </g>
+</g>
+<g stroke="#FFFFFF" stroke-width="7.2" fill="#FFFFFF">
+  <path d="m-95 44.5h190"/>
+  <circle cx="-42" r="4"/>
+  <circle cx="42" r="4"/>
+</g></svg>

@@ -1,0 +1,1259 @@
+# JS Bay release — L1 desktop static libs + L2 Apple/Android when buildable. Tiers and exclusions: docs/testing.md#ci. Never upload empty XCFramework / fake .so.
+# Aggressive aggregation: one L1 job per runner image; Apple L2 backends run sequentially in one macos job.
+# assemble + publish stay separate (artifact gate / contents:write).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for artifact names (e.g. 0.1.0); defaults to tag or run id"
+        required: false
+        type: string
+      build_android:
+        description: "Build Android jniLibs (needs NDK setup on Ubuntu)"
+        required: false
+        type: boolean
+        default: true
+      build_apple:
+        description: "Build Apple JsBay.xcframework on macOS"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # L1 — desktop static libraries (one job per runner image)
+  # ---------------------------------------------------------------------------
+  build-libs-linux:
+    name: L1 linux-x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Resolve version label
+        id: ver
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          label="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
+      - name: Build library quickjs_ng (linux-x86_64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=quickjs_ng \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "false" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=x86_64-linux-gnu" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=x86_64-linux-gnu"
+          fi
+
+      - name: Pack artifact quickjs_ng (linux-x86_64)
+        id: pack_qjsng
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-linux-x86_64-quickjs_ng"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "quickjs_ng" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (quickjs_ng / linux-x86_64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjsng.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs_ng"
+
+      - name: Upload build artifact (quickjs_ng / linux-x86_64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjsng.outputs.name }}
+          path: ${{ steps.pack_qjsng.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Build library quickjs (linux-x86_64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=quickjs \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "false" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=x86_64-linux-gnu" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=x86_64-linux-gnu"
+          fi
+
+      - name: Pack artifact quickjs (linux-x86_64)
+        id: pack_qjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-linux-x86_64-quickjs"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "quickjs" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (quickjs / linux-x86_64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjs.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs"
+
+      - name: Upload build artifact (quickjs / linux-x86_64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjs.outputs.name }}
+          path: ${{ steps.pack_qjs.outputs.archive }}
+          if-no-files-found: error
+
+  build-libs-linux-arm:
+    name: L1 linux-aarch64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Resolve version label
+        id: ver
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          label="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
+      - name: Build library quickjs_ng (linux-aarch64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=quickjs_ng \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "false" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=aarch64-linux-gnu" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=aarch64-linux-gnu"
+          fi
+
+      - name: Pack artifact quickjs_ng (linux-aarch64)
+        id: pack_qjsng
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-linux-aarch64-quickjs_ng"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "quickjs_ng" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (quickjs_ng / linux-aarch64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjsng.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs_ng"
+
+      - name: Upload build artifact (quickjs_ng / linux-aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjsng.outputs.name }}
+          path: ${{ steps.pack_qjsng.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Build library quickjs (linux-aarch64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=quickjs \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "false" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=aarch64-linux-gnu" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=aarch64-linux-gnu"
+          fi
+
+      - name: Pack artifact quickjs (linux-aarch64)
+        id: pack_qjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-linux-aarch64-quickjs"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "quickjs" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (quickjs / linux-aarch64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjs.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs"
+
+      - name: Upload build artifact (quickjs / linux-aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjs.outputs.name }}
+          path: ${{ steps.pack_qjs.outputs.archive }}
+          if-no-files-found: error
+
+  build-libs-macos:
+    name: L1 macos-aarch64
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Resolve version label
+        id: ver
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          label="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
+      - name: Build library quickjs_ng (macos-aarch64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=quickjs_ng \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "true" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=aarch64-macos.11.0" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=aarch64-macos.11.0"
+          fi
+
+      - name: Pack artifact quickjs_ng (macos-aarch64)
+        id: pack_qjsng
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-macos-aarch64-quickjs_ng"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "quickjs_ng" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (quickjs_ng / macos-aarch64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjsng.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs_ng"
+
+      - name: Upload build artifact (quickjs_ng / macos-aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjsng.outputs.name }}
+          path: ${{ steps.pack_qjsng.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Build library quickjs (macos-aarch64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=quickjs \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "true" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=aarch64-macos.11.0" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=aarch64-macos.11.0"
+          fi
+
+      - name: Pack artifact quickjs (macos-aarch64)
+        id: pack_qjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-macos-aarch64-quickjs"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "quickjs" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (quickjs / macos-aarch64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjs.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs"
+
+      - name: Upload build artifact (quickjs / macos-aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjs.outputs.name }}
+          path: ${{ steps.pack_qjs.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Build library jsc (macos-aarch64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=jsc \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "true" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=aarch64-macos.11.0" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=aarch64-macos.11.0"
+          fi
+
+      - name: Pack artifact jsc (macos-aarch64)
+        id: pack_jsc
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-macos-aarch64-jsc"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "jsc" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (jsc / macos-aarch64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_jsc.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "jsc"
+
+      - name: Upload build artifact (jsc / macos-aarch64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_jsc.outputs.name }}
+          path: ${{ steps.pack_jsc.outputs.archive }}
+          if-no-files-found: error
+
+  build-libs-macos-intel:
+    name: L1 macos-x86_64
+    runs-on: macos-26-intel
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Resolve version label
+        id: ver
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          label="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
+      - name: Build library quickjs_ng (macos-x86_64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=quickjs_ng \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "true" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=x86_64-macos.11.0" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=x86_64-macos.11.0"
+          fi
+
+      - name: Pack artifact quickjs_ng (macos-x86_64)
+        id: pack_qjsng
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-macos-x86_64-quickjs_ng"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "quickjs_ng" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (quickjs_ng / macos-x86_64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjsng.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs_ng"
+
+      - name: Upload build artifact (quickjs_ng / macos-x86_64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjsng.outputs.name }}
+          path: ${{ steps.pack_qjsng.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Build library quickjs (macos-x86_64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=quickjs \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "true" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=x86_64-macos.11.0" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=x86_64-macos.11.0"
+          fi
+
+      - name: Pack artifact quickjs (macos-x86_64)
+        id: pack_qjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-macos-x86_64-quickjs"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "quickjs" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (quickjs / macos-x86_64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjs.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs"
+
+      - name: Upload build artifact (quickjs / macos-x86_64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjs.outputs.name }}
+          path: ${{ steps.pack_qjs.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Build library jsc (macos-x86_64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_library() {
+            zig build \
+              -Dbackend=jsc \
+              -Doptimize=ReleaseFast \
+              -Dlibrary-only=true \
+              "$@" \
+              --summary all
+          }
+          if [ "true" = true ]; then
+            sysroot="$(xcrun --sdk macosx --show-sdk-path)"
+            test -d "$sysroot"
+            build_library "-Dtarget=x86_64-macos.11.0" "-Dapple-sysroot=$sysroot"
+          else
+            build_library "-Dtarget=x86_64-macos.11.0"
+          fi
+
+      - name: Pack artifact jsc (macos-x86_64)
+        id: pack_jsc
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          name="jsbay-${ver}-macos-x86_64-jsc"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/lib" "$stage/include"
+          if [ -f zig-out/lib/libjsbay.a ]; then
+            cp zig-out/lib/libjsbay.a "$stage/lib/"
+          elif [ -f zig-out/lib/jsbay.lib ]; then
+            cp zig-out/lib/jsbay.lib "$stage/lib/"
+          else
+            echo "No libjsbay.a / jsbay.lib under zig-out/lib:"
+            ls -la zig-out/lib || true
+            exit 1
+          fi
+          cp include/jsbay*.h include/module.modulemap "$stage/include/"
+          cp zig-out/include/jsbay.h "$stage/include/jsbay.h" 2>/dev/null || true
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "jsc" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Run consumers from desktop archive (jsc / macos-x86_64)
+        shell: bash
+        run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_jsc.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "jsc"
+
+      - name: Upload build artifact (jsc / macos-x86_64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_jsc.outputs.name }}
+          path: ${{ steps.pack_jsc.outputs.archive }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # L2 — Apple XCFramework (quickjs_ng, quickjs, jsc sequential; skips if input false)
+  # ---------------------------------------------------------------------------
+  build-apple:
+    name: L2 Apple XCFramework
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_apple }}
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Resolve version label
+        id: ver
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          label="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
+      - name: Show Apple SDKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphonesimulator --show-sdk-path
+      - name: Build JsBay.xcframework (quickjs_ng)
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.label }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ./build-apple.sh quickjs_ng
+          grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
+
+      - name: Pack XCFramework zip (quickjs_ng)
+        id: pack_qjsng
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          backend="quickjs_ng"
+          name="jsbay-${ver}-apple-${backend}"
+          archive="${name}-JsBay.xcframework.zip"
+          zig build tool -- package-apple-release "$ver" "$backend" "${{ github.sha }}" "$GITHUB_WORKSPACE/$archive"
+          unzip -Z1 "$archive" | grep -Fx "$name/Package.swift"
+          unzip -Z1 "$archive" | grep -Fx "$name/Sources/JsBaySDK/"
+          unzip -Z1 "$archive" | grep -Fx "$name/Frameworks/JsBay.xcframework/"
+          unzip -Z1 "$archive" | grep -Fx "$name/LICENSE"
+          unzip -Z1 "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Test Apple Git package consumer (quickjs_ng)
+        shell: bash
+        run: bash tests/apple-sdk/git-package-consumer.sh "$GITHUB_WORKSPACE/${{ steps.pack_qjsng.outputs.archive }}" "$RUNNER_TEMP/apple-git-consumer-qjsng"
+
+      - name: Upload Apple artifact (quickjs_ng)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjsng.outputs.name }}
+          path: ${{ steps.pack_qjsng.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Build JsBay.xcframework (quickjs)
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.label }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ./build-apple.sh quickjs
+          grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
+
+      - name: Pack XCFramework zip (quickjs)
+        id: pack_qjs
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          backend="quickjs"
+          name="jsbay-${ver}-apple-${backend}"
+          archive="${name}-JsBay.xcframework.zip"
+          zig build tool -- package-apple-release "$ver" "$backend" "${{ github.sha }}" "$GITHUB_WORKSPACE/$archive"
+          unzip -Z1 "$archive" | grep -Fx "$name/Package.swift"
+          unzip -Z1 "$archive" | grep -Fx "$name/Sources/JsBaySDK/"
+          unzip -Z1 "$archive" | grep -Fx "$name/Frameworks/JsBay.xcframework/"
+          unzip -Z1 "$archive" | grep -Fx "$name/LICENSE"
+          unzip -Z1 "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Test Apple Git package consumer (quickjs)
+        shell: bash
+        run: bash tests/apple-sdk/git-package-consumer.sh "$GITHUB_WORKSPACE/${{ steps.pack_qjs.outputs.archive }}" "$RUNNER_TEMP/apple-git-consumer-qjs"
+
+      - name: Upload Apple artifact (quickjs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_qjs.outputs.name }}
+          path: ${{ steps.pack_qjs.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Build JsBay.xcframework (jsc)
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.label }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ./build-apple.sh jsc
+          grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
+
+      - name: Pack XCFramework zip (jsc)
+        id: pack_jsc
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          backend="jsc"
+          name="jsbay-${ver}-apple-${backend}"
+          archive="${name}-JsBay.xcframework.zip"
+          zig build tool -- package-apple-release "$ver" "$backend" "${{ github.sha }}" "$GITHUB_WORKSPACE/$archive"
+          unzip -Z1 "$archive" | grep -Fx "$name/Package.swift"
+          unzip -Z1 "$archive" | grep -Fx "$name/Sources/JsBaySDK/"
+          unzip -Z1 "$archive" | grep -Fx "$name/Frameworks/JsBay.xcframework/"
+          unzip -Z1 "$archive" | grep -Fx "$name/LICENSE"
+          unzip -Z1 "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Test Apple Git package consumer (jsc)
+        shell: bash
+        run: bash tests/apple-sdk/git-package-consumer.sh "$GITHUB_WORKSPACE/${{ steps.pack_jsc.outputs.archive }}" "$RUNNER_TEMP/apple-git-consumer-jsc"
+
+      - name: Upload Apple artifact (jsc)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack_jsc.outputs.name }}
+          path: ${{ steps.pack_jsc.outputs.archive }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # L2 — Android SDK (kept separate so dispatch can skip without failing L1 linux)
+  # ---------------------------------------------------------------------------
+  build-android:
+    name: L2 Android SDK (${{ matrix.backend }})
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_android }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs_ng, quickjs]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r28c
+          add-to-path: false
+
+      - name: Setup JDK for Android Gradle Plugin 8.7.3
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK platform and build tools
+        uses: android-actions/setup-android@v4.0.4
+
+      - name: Install Android SDK packages used by the AAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
+
+      - name: Resolve version label
+        id: ver
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          label="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          echo "label=$label" >> "$GITHUB_OUTPUT"
+
+      - name: Build Android .so (arm64-v8a + x86_64)
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          QUICKJS_BACKEND: ${{ matrix.backend }}
+          RELEASE_VERSION: ${{ steps.ver.outputs.label }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_NDK_HOME"
+          test -d "$ANDROID_NDK_HOME"
+          ./build-android.sh "$GITHUB_WORKSPACE/build-android/jniLibs"
+
+      - name: Build and inspect Android AAR (core + JNI adapter)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
+          gradle="$RUNNER_TEMP/gradle-8.9/bin/gradle"
+          test -x "$gradle"
+          cd sdk/android
+          env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" "$gradle" --no-daemon \
+            -PjsbayVersion="${{ steps.ver.outputs.label }}" \
+            -PjsbayJniLibs="$GITHUB_WORKSPACE/build-android/jniLibs" \
+            :jsbay:assembleRelease
+          aar=jsbay/build/outputs/aar/jsbay-release.aar
+          test -f "$aar"
+          unzip -p "$aar" META-INF/LICENSE | cmp - "$GITHUB_WORKSPACE/LICENSE"
+          unzip -p "$aar" META-INF/THIRD_PARTY_NOTICES.md | cmp - "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md"
+          actual="$RUNNER_TEMP/android-aar-members"
+          unzip -Z1 "$aar" | grep '^jni/.*\.so$' | sort > "$actual"
+          printf '%s\n' \
+            jni/arm64-v8a/libjsbay.so \
+            jni/arm64-v8a/libjsbay_android.so \
+            jni/x86_64/libjsbay.so \
+            jni/x86_64/libjsbay_android.so | sort | diff -u - "$actual"
+          unzip -p "$aar" proguard.txt | grep -F -- '-keep class io.jsbay.Native { *; }'
+
+      - name: Publish Android Maven repository
+        id: maven
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          backend="${{ matrix.backend }}"
+          repo="$GITHUB_WORKSPACE/build-android/maven-repo"
+          rm -rf "$repo"
+          cd sdk/android
+          env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" "$RUNNER_TEMP/gradle-8.9/bin/gradle" --no-daemon \
+            -PjsbayJniLibs="$GITHUB_WORKSPACE/build-android/jniLibs" \
+            -PjsbayVersion="$ver" \
+            -PjsbayMavenRepo="$repo" \
+            :jsbay:publishReleasePublicationToStagingRepository
+          module="$repo/io/jsbay/js-bay-android/$ver"
+          test -s "$module/js-bay-android-$ver.aar"
+          test -s "$module/js-bay-android-$ver.pom"
+          test -s "$module/js-bay-android-$ver.module"
+          cmp "$module/js-bay-android-$ver.aar" jsbay/build/outputs/aar/jsbay-release.aar
+          unzip -p "$module/js-bay-android-$ver.aar" META-INF/LICENSE | cmp - "$GITHUB_WORKSPACE/LICENSE"
+          unzip -p "$module/js-bay-android-$ver.aar" META-INF/THIRD_PARTY_NOTICES.md | cmp - "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md"
+          grep -F 'org.jetbrains.kotlin' "$module/js-bay-android-$ver.pom"
+          grep -F 'kotlin-stdlib' "$module/js-bay-android-$ver.pom"
+          zig build --build-file "$GITHUB_WORKSPACE/build.zig" tool -- check-maven "$module" "$ver"
+          mkdir -p "$GITHUB_WORKSPACE/build-android/aar"
+          raw_aar="$GITHUB_WORKSPACE/build-android/aar/jsbay-${ver}-android-${backend}.aar"
+          cp "$module/js-bay-android-$ver.aar" "$raw_aar"
+          cmp "$raw_aar" "$module/js-bay-android-$ver.aar"
+          cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md" "$repo/"
+          archive="jsbay-${ver}-android-${backend}-maven.zip"
+          ( cd "$repo" && zip -qr "$GITHUB_WORKSPACE/$archive" io LICENSE THIRD_PARTY_NOTICES.md )
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Test Android Maven consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="$RUNNER_TEMP/jsbay-maven-consumer-repo"
+          mkdir -p "$repo"
+          unzip -q "${{ steps.maven.outputs.archive }}" -d "$repo"
+          env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" \
+            bash tests/android-sdk/maven-consumer.sh "$repo" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle"
+
+      - name: Enable KVM for packaged Android acceptance
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run the packaged Android Maven artifact on ART
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash tests/ci/release-android-consumer.sh "${{ steps.maven.outputs.archive }}" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle"
+
+      - name: Upload Android Maven repository
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsbay-${{ steps.ver.outputs.label }}-android-maven-${{ matrix.backend }}
+          path: ${{ steps.maven.outputs.archive }}
+          if-no-files-found: error
+
+      - name: Upload Android AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsbay-${{ steps.ver.outputs.label }}-android-aar-${{ matrix.backend }}
+          path: build-android/aar/jsbay-${{ steps.ver.outputs.label }}-android-${{ matrix.backend }}.aar
+          if-no-files-found: error
+
+      - name: Pack Android artifact
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.ver.outputs.label }}"
+          backend="${{ matrix.backend }}"
+          name="jsbay-${ver}-android-jniLibs-${backend}"
+          stage="$RUNNER_TEMP/$name"
+          rm -rf "$stage"
+          mkdir -p "$stage/jniLibs" "$stage/include"
+          expected_abis="$RUNNER_TEMP/js-bay-android-abis.expected"
+          actual_abis="$RUNNER_TEMP/js-bay-android-abis.actual"
+          printf '%s\n' arm64-v8a x86_64 > "$expected_abis"
+          find build-android/jniLibs -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort > "$actual_abis"
+          diff -u "$expected_abis" "$actual_abis"
+          for abi in arm64-v8a x86_64; do
+            test -f "build-android/jniLibs/$abi/libjsbay.so"
+            mkdir -p "$stage/jniLibs/$abi"
+            cp "build-android/jniLibs/$abi/libjsbay.so" "$stage/jniLibs/$abi/"
+          done
+          cp include/jsbay*.h "$stage/include/"
+          # Export only reviewed, tracked Android SDK sources. Gradle writes
+          # .gradle/ and build/ below sdk/android during the AAR build.
+          sdk_archive="$RUNNER_TEMP/js-bay-android-sdk.tar"
+          git archive --format=tar HEAD -- sdk/android > "$sdk_archive"
+          tar -xf "$sdk_archive" -C "$stage"
+          mv "$stage/sdk/android" "$stage/android-sdk"
+          rmdir "$stage/sdk"
+          mkdir -p "$stage/android-sdk/include"
+          cp include/jsbay*.h "$stage/android-sdk/include/"
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/"
+          cp LICENSE THIRD_PARTY_NOTICES.md "$stage/android-sdk/"
+          printf '%s\n' "$ver" > "$stage/VERSION"
+          printf '%s\n' "${{ github.sha }}" > "$stage/COMMIT"
+          printf '%s\n' "$backend" > "$stage/backend"
+          archive="$name.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$name"
+          tar -tzf "$archive" | grep -Fx "$name/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/THIRD_PARTY_NOTICES.md"
+          tar -tzf "$archive" | grep -Fx "$name/android-sdk/LICENSE"
+          tar -tzf "$archive" | grep -Fx "$name/android-sdk/THIRD_PARTY_NOTICES.md"
+          if tar -tzf "$archive" | grep -E "$name/android-sdk/(.*/)?(\.gradle|build|local\.properties)(/|$)"; then
+            echo "Android SDK archive contains generated or local files" >&2
+            exit 1
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: ${{ steps.pack.outputs.archive }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Assemble assets under read-only permissions. A separate tag-only job is the only place that receives contents: write to create a GitHub Release.
+  # ---------------------------------------------------------------------------
+  assemble-release-assets:
+    name: Assemble checked release assets
+    needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android]
+    # A tag is a complete release: both L2 jobs must succeed. Dispatch can explicitly opt out of either L2 tier, in which case that job is skipped.
+    if: >-
+      ${{ always() &&
+          needs.build-libs-linux.result == 'success' &&
+          needs.build-libs-linux-arm.result == 'success' &&
+          needs.build-libs-macos.result == 'success' &&
+          needs.build-libs-macos-intel.result == 'success' &&
+          ((github.event_name == 'push' && needs.build-apple.result == 'success' && needs.build-android.result == 'success') ||
+           (github.event_name == 'workflow_dispatch' &&
+            ((inputs.build_apple && needs.build-apple.result == 'success') || (!inputs.build_apple && needs.build-apple.result == 'skipped')) &&
+            ((inputs.build_android && needs.build-android.result == 'success') || (!inputs.build_android && needs.build-android.result == 'skipped')))) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout reviewed source snapshot
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install source-privacy checker dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+
+      - name: Export history-free source archive
+        id: source
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          archive="$RUNNER_TEMP/jsbay-${version}-source.tar.gz"
+          zig build tool -- export-public-source "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: false
+
+      - name: Flatten and checksum
+        id: sum
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          mkdir -p release-assets
+          find dist -type f \( -name 'jsbay-*.tar.gz' -o -name 'jsbay-*.zip' -o -name 'jsbay-*.aar' \) -exec cp {} release-assets/ \;
+          cp "${{ steps.source.outputs.archive }}" release-assets/
+          cd release-assets
+          ls -la
+          zig build --build-file "$GITHUB_WORKSPACE/build.zig" tool -- check-release-assets \
+            "$PWD" \
+            "$version" \
+            "${{ github.event_name != 'workflow_dispatch' || inputs.build_apple }}" \
+            "${{ github.event_name != 'workflow_dispatch' || inputs.build_android }}"
+          : > SHA256SUMS
+          for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+
+      - name: Upload checked archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: jsbay-release-assets
+          path: release-assets/
+          if-no-files-found: error
+
+  publish:
+    name: GitHub Release
+    needs: [assemble-release-assets]
+    if: ${{ needs.assemble-release-assets.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download checked archives
+        uses: actions/download-artifact@v4
+        with:
+          name: jsbay-release-assets
+          path: release-assets
+
+      - name: Create GitHub Release
+        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: JS Bay ${{ github.ref_name }}
+          body: |
+            **JS Bay** (`jsbay`) release built with Zig 0.17.0.
+
+            ### L1 — desktop static libraries
+            `jsbay-<ver>-<os>-<arch>-<backend>.tar.gz` with `lib/libjsbay.a`, public headers, `LICENSE`, `THIRD_PARTY_NOTICES.md`, plus `VERSION`, `COMMIT`, and `backend` text files. Linux ships `quickjs_ng` and `quickjs`; macOS ships `quickjs_ng`, `quickjs`, and `jsc`. C ABI entry points are declared in `include/jsbay.h`.
+
+            ### L2 — platform packages
+            - **Apple:** `jsbay-<ver>-apple-<backend>-JsBay.xcframework.zip` for `quickjs_ng`, `quickjs`, and `jsc`. Each zip is a Git-ready Swift package: extract the top-level directory, publish it as a fresh Git repository, and tag it. Xcode consumers add that repository URL. Distinct backends need distinct repository URLs.
+            - **Android:** `quickjs_ng` and `quickjs` each ship `jsbay-<ver>-android-<backend>-maven.zip` (Maven repo with AAR/POM/Gradle metadata and Kotlin stdlib), a standalone `.aar`, and `jsbay-<ver>-android-jniLibs-<backend>.tar.gz` for C hosts. Each maven zip uses `io.jsbay:js-bay-android:<ver>` for that backend alone — host one backend zip per Maven root.
+            - **Harmony:** stage `jsbay-<ver>-harmony-<backend>-arm64-v8a.har` locally with `QUICKJS_BACKEND=quickjs_ng|quickjs scripts/stage-harmony-har.sh <stage-dir> <ver>`. GitHub-hosted runners do not yet have a verified DevEco SDK 12/Hvigor/ohpm path, so this release does not upload a HAR.
+
+            ### Source snapshot
+            `jsbay-<ver>-source.tar.gz` is created from the reviewed release commit. It contains no Git metadata or repository history. Tag versions must equal `build.zig.zon`.
+
+            ### Not in this Release (L3 / deferred)
+            Windows `.lib`/`.dll` (inspector still POSIX), demo/bench binaries, docs site zip. See `docs/testing.md#ci`.
+
+            Verify with `SHA256SUMS`.
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true

@@ -1,0 +1,147 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -369,8 +369,10 @@
+     void *host_promise_rejection_tracker_opaque;
+ 
+     struct list_head job_list; /* list of JSJobEntry.link */
++#if JSBAY_INSPECTOR
+     JSJobHook *jsbay_qjs_job_hook;
+     const char *jsbay_qjs_next_job_kind;
++#endif
+ 
+     JSModuleNormalizeFunc *module_normalize_func;
+     BOOL module_loader_has_attr;
+@@ -952,7 +954,9 @@
+     struct list_head link;
+     JSContext *realm;
+     JSJobFunc *job_func;
++#if JSBAY_INSPECTOR
+     const char *kind;
++#endif
+     int argc;
+     JSValue argv[0];
+ } JSJobEntry;
+@@ -2307,15 +2311,23 @@
+     rt->sab_funcs = *sf;
+ }
+ 
++#if JSBAY_INSPECTOR
+ void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook)
+ {
+     rt->jsbay_qjs_job_hook = hook;
++}
++
++void JS_InvalidatePendingJobHooks(JSRuntime *rt)
++{
++    struct list_head *el;
++    list_for_each(el, &rt->job_list) list_entry(el, JSJobEntry, link)->kind = NULL;
+ }
+ 
+ void JS_SetNextJobKind(JSContext *ctx, const char *kind)
+ {
+     ctx->rt->jsbay_qjs_next_job_kind = kind;
+ }
++#endif
+ 
+ void JS_SetStripInfo(JSRuntime *rt, int flags)
+ {
+@@ -2339,20 +2351,26 @@
+     else
+         e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
+     if (!e) {
++#if JSBAY_INSPECTOR
+         rt->jsbay_qjs_next_job_kind = NULL;
++#endif
+         return -1;
+     }
+     e->realm = JS_DupContext(ctx);
+     e->job_func = job_func;
+-    e->kind = rt->jsbay_qjs_next_job_kind ? rt->jsbay_qjs_next_job_kind : "Promise";
++#if JSBAY_INSPECTOR
++    e->kind = rt->jsbay_qjs_job_hook ? (rt->jsbay_qjs_next_job_kind ? rt->jsbay_qjs_next_job_kind : "Promise") : NULL;
+     rt->jsbay_qjs_next_job_kind = NULL;
++#endif
+     e->argc = argc;
+     for(i = 0; i < argc; i++) {
+         e->argv[i] = JS_DupValue(ctx, argv[i]);
+     }
+     list_add_tail(&e->link, &rt->job_list);
+-    if (rt->jsbay_qjs_job_hook)
+-        rt->jsbay_qjs_job_hook(ctx, 0, e->kind);
++#if JSBAY_INSPECTOR
++    if (e->kind && rt->jsbay_qjs_job_hook && !rt->jsbay_qjs_job_hook(ctx, 0, e->kind))
++        e->kind = NULL;
++#endif
+     return 0;
+ }
+ 
+@@ -2378,6 +2396,9 @@
+     JSContext *ctx;
+     JSJobEntry *e;
+     JSValue res;
++#if JSBAY_INSPECTOR
++    JSJobHook *hook;
++#endif
+     int i, ret;
+ 
+     if (list_empty(&rt->job_list)) {
+@@ -2390,11 +2411,17 @@
+     e = list_entry(rt->job_list.next, JSJobEntry, link);
+     list_del(&e->link);
+     ctx = e->realm;
+-    if (rt->jsbay_qjs_job_hook)
+-        rt->jsbay_qjs_job_hook(ctx, 1, e->kind);
++#if JSBAY_INSPECTOR
++    hook = e->kind ? rt->jsbay_qjs_job_hook : NULL;
++    if (hook && !hook(ctx, 1, e->kind)) {
++        e->kind = NULL;
++        hook = NULL;
++    }
++#endif
+     res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
+-    if (rt->jsbay_qjs_job_hook)
+-        rt->jsbay_qjs_job_hook(ctx, 2, e->kind);
++#if JSBAY_INSPECTOR
++    if (hook) (void)hook(ctx, 2, e->kind);
++#endif
+     for(i = 0; i < e->argc; i++)
+         JS_FreeValue(ctx, e->argv[i]);
+     if (JS_IsException(res))
+@@ -7859,6 +7886,7 @@
+     return 0;
+ }
+ 
++#if JSBAY_INSPECTOR
+ static void jsbay_qjs_copy_debug_string(char *dst, size_t dst_len, const char *src)
+ {
+     if (!src)
+@@ -7897,6 +7925,7 @@
+     }
+     return count;
+ }
++#endif
+ 
+ /* return a string property without executing arbitrary JS code (used
+    when dumping the stack trace or in debug print). */
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1037,8 +1037,10 @@
+ 
+ typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
+ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv);
+-typedef void JSJobHook(JSContext *ctx, int phase, const char *kind);
++#if JSBAY_INSPECTOR
++typedef int JSJobHook(JSContext *ctx, int phase, const char *kind);
+ void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook);
++void JS_InvalidatePendingJobHooks(JSRuntime *rt);
+ void JS_SetNextJobKind(JSContext *ctx, const char *kind);
+ 
+ typedef struct JSDebugFrameInfo {
+@@ -1048,6 +1050,7 @@
+     int column;
+ } JSDebugFrameInfo;
+ int JS_CopyDebugStack(JSContext *ctx, JSDebugFrameInfo *out, int max);
++#endif
+ 
+ JS_BOOL JS_IsJobPending(JSRuntime *rt);
+ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

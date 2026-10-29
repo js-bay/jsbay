@@ -1,0 +1,53 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -428,6 +428,7 @@
+     void *location_opaque;
+     int location_last_line;
+     void *location_last_func;
++    int location_force_notify;
+     JSExceptionHandler *exception_handler;
+     void *exception_opaque;
+     int in_exception_hook;
+@@ -2496,6 +2497,11 @@
+     rt->location_opaque = opaque;
+     rt->location_last_line = -1;
+     rt->location_last_func = NULL;
++}
++
++void JS_RequestLocationCallback(JSRuntime *rt)
++{
++    __atomic_store_n(&rt->location_force_notify, 1, __ATOMIC_SEQ_CST);
+ }
+ 
+ void JS_SetExceptionHandler(JSRuntime *rt, JSExceptionHandler *cb, void *opaque)
+@@ -18322,7 +18328,7 @@
+ static void js_notify_location(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *pc)
+ {
+     JSRuntime *rt = ctx->rt;
+-    int col, line, depth;
++    int col, line, depth, force_notify;
+     JSStackFrame *frame;
+     const char *filename;
+ 
+@@ -18332,7 +18338,9 @@
+     line = find_line_num(ctx, b, (uint32_t)(pc - b->byte_code_buf), &col);
+     if (line < 0)
+         return;
+-    if (line == rt->location_last_line && rt->location_last_func == b)
++    force_notify = __atomic_exchange_n(&rt->location_force_notify, 0, __ATOMIC_SEQ_CST);
++    if (line == rt->location_last_line && rt->location_last_func == b &&
++        !force_notify)
+         return;
+     rt->location_last_line = line;
+     rt->location_last_func = b;
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1199,6 +1199,8 @@
+ typedef void JSLocationHandler(JSContext *ctx, const char *filename,
+                                int line, int column, int depth, void *opaque);
+ JS_EXTERN void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque);
++/* Force the next bytecode location notification, even on the same line. */
++JS_EXTERN void JS_RequestLocationCallback(JSRuntime *rt);
+ 
+ /* caught != 0 when some live frame has an active try. The callback may block. */
+ typedef void JSExceptionHandler(JSContext *ctx, int caught, void *opaque);

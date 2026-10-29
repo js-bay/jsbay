@@ -1,0 +1,8 @@
+{
+  "app": {
+    "bundleName": "com.jsbay.harmony.fixture",
+    "vendor": "js-bay",
+    "versionCode": 1,
+    "versionName": "1.0.0"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "entry",
+  "version": "1.0.0",
+  "dependencies": {
+    "@js-bay/harmony": "file:../../../../sdk/harmony/build/default/outputs/default/jsbay_harmony.har"
+  }
+}

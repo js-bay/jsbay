@@ -1,0 +1,1739 @@
+{
+  "version": {
+    "major": "1",
+    "minor": "3"
+  },
+  "domains": [
+    {
+      "domain": "Runtime",
+      "description": "Runtime domain exposes JavaScript runtime by means of remote evaluation and mirror objects.\nEvaluation results are returned as mirror object that expose object type, string representation\nand unique identifier that can be used for further object reference. Original objects are\nmaintained in memory unless they are either explicitly released or are released along with the\nother objects in their object group.",
+      "types": [
+        {
+          "id": "ScriptId",
+          "description": "Unique script identifier.",
+          "type": "string"
+        },
+        {
+          "id": "SerializationOptions",
+          "description": "Represents options for serialization. Overrides `generatePreview` and `returnByValue`.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "serialization",
+              "type": "string",
+              "enum": [
+                "deep",
+                "json",
+                "idOnly"
+              ]
+            },
+            {
+              "name": "maxDepth",
+              "description": "Deep serialization depth. Default is full depth. Respected only in `deep` serialization mode.",
+              "optional": true,
+              "type": "integer"
+            },
+            {
+              "name": "additionalParameters",
+              "description": "Embedder-specific parameters. For example if connected to V8 in Chrome these control DOM\nserialization via `maxNodeDepth: integer` and `includeShadowTree: \"none\" | \"open\" | \"all\"`.\nValues can be only of type string or integer.",
+              "optional": true,
+              "type": "object"
+            }
+          ]
+        },
+        {
+          "id": "DeepSerializedValue",
+          "description": "Represents deep serialized value.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "type",
+              "type": "string",
+              "enum": [
+                "undefined",
+                "null",
+                "string",
+                "number",
+                "boolean",
+                "bigint",
+                "regexp",
+                "date",
+                "symbol",
+                "array",
+                "object",
+                "function",
+                "map",
+                "set",
+                "weakmap",
+                "weakset",
+                "error",
+                "proxy",
+                "promise",
+                "typedarray",
+                "arraybuffer",
+                "node",
+                "window",
+                "generator"
+              ]
+            },
+            {
+              "name": "value",
+              "optional": true,
+              "type": "any"
+            },
+            {
+              "name": "objectId",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "weakLocalObjectReference",
+              "description": "Set if value reference met more then once during serialization. In such\ncase, value is provided only to one of the serialized values. Unique\nper value in the scope of one CDP call.",
+              "optional": true,
+              "type": "integer"
+            }
+          ]
+        },
+        {
+          "id": "RemoteObjectId",
+          "description": "Unique object identifier.",
+          "type": "string"
+        },
+        {
+          "id": "UnserializableValue",
+          "description": "Primitive value which cannot be JSON-stringified. Includes values `-0`, `NaN`, `Infinity`,\n`-Infinity`, and bigint literals.",
+          "type": "string"
+        },
+        {
+          "id": "RemoteObject",
+          "description": "Mirror object referencing original JavaScript object.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "type",
+              "description": "Object type.",
+              "type": "string",
+              "enum": [
+                "object",
+                "function",
+                "undefined",
+                "string",
+                "number",
+                "boolean",
+                "symbol",
+                "bigint"
+              ]
+            },
+            {
+              "name": "subtype",
+              "description": "Object subtype hint. Specified for `object` type values only.\nNOTE: If you change anything here, make sure to also update\n`subtype` in `ObjectPreview` and `PropertyPreview` below.",
+              "optional": true,
+              "type": "string",
+              "enum": [
+                "array",
+                "null",
+                "node",
+                "regexp",
+                "date",
+                "map",
+                "set",
+                "weakmap",
+                "weakset",
+                "iterator",
+                "generator",
+                "error",
+                "proxy",
+                "promise",
+                "typedarray",
+                "arraybuffer",
+                "dataview",
+                "webassemblymemory",
+                "wasmvalue",
+                "deferredmodule",
+                "trustedtype"
+              ]
+            },
+            {
+              "name": "className",
+              "description": "Object class (constructor) name. Specified for `object` type values only.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "value",
+              "description": "Remote object value in case of primitive values or JSON values (if it was requested).",
+              "optional": true,
+              "type": "any"
+            },
+            {
+              "name": "unserializableValue",
+              "description": "Primitive value which can not be JSON-stringified does not have `value`, but gets this\nproperty.",
+              "optional": true,
+              "$ref": "UnserializableValue"
+            },
+            {
+              "name": "description",
+              "description": "String representation of the object.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "deepSerializedValue",
+              "description": "Deep serialized value.",
+              "experimental": true,
+              "optional": true,
+              "$ref": "DeepSerializedValue"
+            },
+            {
+              "name": "objectId",
+              "description": "Unique object identifier (for non-primitive values).",
+              "optional": true,
+              "$ref": "RemoteObjectId"
+            },
+            {
+              "name": "preview",
+              "description": "Preview containing abbreviated property values. Specified for `object` type values only.",
+              "experimental": true,
+              "optional": true,
+              "$ref": "ObjectPreview"
+            },
+            {
+              "name": "customPreview",
+              "experimental": true,
+              "optional": true,
+              "$ref": "CustomPreview"
+            }
+          ]
+        },
+        {
+          "id": "CustomPreview",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "header",
+              "description": "The JSON-stringified result of formatter.header(object, config) call.\nIt contains json ML array that represents RemoteObject.",
+              "type": "string"
+            },
+            {
+              "name": "bodyGetterId",
+              "description": "If formatter returns true as a result of formatter.hasBody call then bodyGetterId will\ncontain RemoteObjectId for the function that returns result of formatter.body(object, config) call.\nThe result value is json ML array.",
+              "optional": true,
+              "$ref": "RemoteObjectId"
+            }
+          ]
+        },
+        {
+          "id": "ObjectPreview",
+          "description": "Object containing abbreviated remote object value.",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "type",
+              "description": "Object type.",
+              "type": "string",
+              "enum": [
+                "object",
+                "function",
+                "undefined",
+                "string",
+                "number",
+                "boolean",
+                "symbol",
+                "bigint"
+              ]
+            },
+            {
+              "name": "subtype",
+              "description": "Object subtype hint. Specified for `object` type values only.",
+              "optional": true,
+              "type": "string",
+              "enum": [
+                "array",
+                "null",
+                "node",
+                "regexp",
+                "date",
+                "map",
+                "set",
+                "weakmap",
+                "weakset",
+                "iterator",
+                "generator",
+                "error",
+                "proxy",
+                "promise",
+                "typedarray",
+                "arraybuffer",
+                "dataview",
+                "webassemblymemory",
+                "wasmvalue",
+                "deferredmodule",
+                "trustedtype"
+              ]
+            },
+            {
+              "name": "description",
+              "description": "String representation of the object.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "overflow",
+              "description": "True iff some of the properties or entries of the original object did not fit.",
+              "type": "boolean"
+            },
+            {
+              "name": "properties",
+              "description": "List of the properties.",
+              "type": "array",
+              "items": {
+                "$ref": "PropertyPreview"
+              }
+            },
+            {
+              "name": "entries",
+              "description": "List of the entries. Specified for `map` and `set` subtype values only.",
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "EntryPreview"
+              }
+            }
+          ]
+        },
+        {
+          "id": "PropertyPreview",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "name",
+              "description": "Property name.",
+              "type": "string"
+            },
+            {
+              "name": "type",
+              "description": "Object type. Accessor means that the property itself is an accessor property.",
+              "type": "string",
+              "enum": [
+                "object",
+                "function",
+                "undefined",
+                "string",
+                "number",
+                "boolean",
+                "symbol",
+                "accessor",
+                "bigint"
+              ]
+            },
+            {
+              "name": "value",
+              "description": "User-friendly property value string.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "valuePreview",
+              "description": "Nested value preview.",
+              "optional": true,
+              "$ref": "ObjectPreview"
+            },
+            {
+              "name": "subtype",
+              "description": "Object subtype hint. Specified for `object` type values only.",
+              "optional": true,
+              "type": "string",
+              "enum": [
+                "array",
+                "null",
+                "node",
+                "regexp",
+                "date",
+                "map",
+                "set",
+                "weakmap",
+                "weakset",
+                "iterator",
+                "generator",
+                "error",
+                "proxy",
+                "promise",
+                "typedarray",
+                "arraybuffer",
+                "dataview",
+                "webassemblymemory",
+                "wasmvalue",
+                "deferredmodule",
+                "trustedtype"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "EntryPreview",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "key",
+              "description": "Preview of the key. Specified for map-like collection entries.",
+              "optional": true,
+              "$ref": "ObjectPreview"
+            },
+            {
+              "name": "value",
+              "description": "Preview of the value.",
+              "$ref": "ObjectPreview"
+            }
+          ]
+        },
+        {
+          "id": "PropertyDescriptor",
+          "description": "Object property descriptor.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "name",
+              "description": "Property name or symbol description.",
+              "type": "string"
+            },
+            {
+              "name": "value",
+              "description": "The value associated with the property.",
+              "optional": true,
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "writable",
+              "description": "True if the value associated with the property may be changed (data descriptors only).",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "get",
+              "description": "A function which serves as a getter for the property, or `undefined` if there is no getter\n(accessor descriptors only).",
+              "optional": true,
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "set",
+              "description": "A function which serves as a setter for the property, or `undefined` if there is no setter\n(accessor descriptors only).",
+              "optional": true,
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "configurable",
+              "description": "True if the type of this property descriptor may be changed and if the property may be\ndeleted from the corresponding object.",
+              "type": "boolean"
+            },
+            {
+              "name": "enumerable",
+              "description": "True if this property shows up during enumeration of the properties on the corresponding\nobject.",
+              "type": "boolean"
+            },
+            {
+              "name": "wasThrown",
+              "description": "True if the result was thrown during the evaluation.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "isOwn",
+              "description": "True if the property is owned for the object.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "symbol",
+              "description": "Property symbol object, if the property is of the `symbol` type.",
+              "optional": true,
+              "$ref": "RemoteObject"
+            }
+          ]
+        },
+        {
+          "id": "InternalPropertyDescriptor",
+          "description": "Object internal property descriptor. This property isn't normally visible in JavaScript code.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "name",
+              "description": "Conventional property name.",
+              "type": "string"
+            },
+            {
+              "name": "value",
+              "description": "The value associated with the property.",
+              "optional": true,
+              "$ref": "RemoteObject"
+            }
+          ]
+        },
+        {
+          "id": "PrivatePropertyDescriptor",
+          "description": "Object private field descriptor.",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "name",
+              "description": "Private property name.",
+              "type": "string"
+            },
+            {
+              "name": "value",
+              "description": "The value associated with the private property.",
+              "optional": true,
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "get",
+              "description": "A function which serves as a getter for the private property,\nor `undefined` if there is no getter (accessor descriptors only).",
+              "optional": true,
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "set",
+              "description": "A function which serves as a setter for the private property,\nor `undefined` if there is no setter (accessor descriptors only).",
+              "optional": true,
+              "$ref": "RemoteObject"
+            }
+          ]
+        },
+        {
+          "id": "CallArgument",
+          "description": "Represents function call argument. Either remote object id `objectId`, primitive `value`,\nunserializable primitive value or neither of (for undefined) them should be specified.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "value",
+              "description": "Primitive value or serializable javascript object.",
+              "optional": true,
+              "type": "any"
+            },
+            {
+              "name": "unserializableValue",
+              "description": "Primitive value which can not be JSON-stringified.",
+              "optional": true,
+              "$ref": "UnserializableValue"
+            },
+            {
+              "name": "objectId",
+              "description": "Remote object handle.",
+              "optional": true,
+              "$ref": "RemoteObjectId"
+            }
+          ]
+        },
+        {
+          "id": "ExecutionContextId",
+          "description": "Id of an execution context.",
+          "type": "integer"
+        },
+        {
+          "id": "ExecutionContextDescription",
+          "description": "Description of an isolated world.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "id",
+              "description": "Unique id of the execution context. It can be used to specify in which execution context\nscript evaluation should be performed.",
+              "$ref": "ExecutionContextId"
+            },
+            {
+              "name": "origin",
+              "description": "Execution context origin.",
+              "type": "string"
+            },
+            {
+              "name": "name",
+              "description": "Human readable name describing given context.",
+              "type": "string"
+            },
+            {
+              "name": "uniqueId",
+              "description": "A system-unique execution context identifier. Unlike the id, this is unique across\nmultiple processes, so can be reliably used to identify specific context while backend\nperforms a cross-process navigation.",
+              "experimental": true,
+              "type": "string"
+            },
+            {
+              "name": "auxData",
+              "description": "Embedder-specific auxiliary data likely matching {isDefault: boolean, type: 'default'|'isolated'|'worker', frameId: string}",
+              "optional": true,
+              "type": "object"
+            }
+          ]
+        },
+        {
+          "id": "ExceptionDetails",
+          "description": "Detailed information about exception (or error) that was thrown during script compilation or\nexecution.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "exceptionId",
+              "description": "Exception id.",
+              "type": "integer"
+            },
+            {
+              "name": "text",
+              "description": "Exception text, which should be used together with exception object when available.",
+              "type": "string"
+            },
+            {
+              "name": "lineNumber",
+              "description": "Line number of the exception location (0-based).",
+              "type": "integer"
+            },
+            {
+              "name": "columnNumber",
+              "description": "Column number of the exception location (0-based).",
+              "type": "integer"
+            },
+            {
+              "name": "scriptId",
+              "description": "Script ID of the exception location.",
+              "optional": true,
+              "$ref": "ScriptId"
+            },
+            {
+              "name": "url",
+              "description": "URL of the exception location, to be used when the script was not reported.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "stackTrace",
+              "description": "JavaScript stack trace if available.",
+              "optional": true,
+              "$ref": "StackTrace"
+            },
+            {
+              "name": "exception",
+              "description": "Exception object if available.",
+              "optional": true,
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "executionContextId",
+              "description": "Identifier of the context where exception happened.",
+              "optional": true,
+              "$ref": "ExecutionContextId"
+            },
+            {
+              "name": "exceptionMetaData",
+              "description": "Dictionary with entries of meta data that the client associated\nwith this exception, such as information about associated network\nrequests, etc.",
+              "experimental": true,
+              "optional": true,
+              "type": "object"
+            }
+          ]
+        },
+        {
+          "id": "Timestamp",
+          "description": "Number of milliseconds since epoch.",
+          "type": "number"
+        },
+        {
+          "id": "TimeDelta",
+          "description": "Number of milliseconds.",
+          "type": "number"
+        },
+        {
+          "id": "CallFrame",
+          "description": "Stack entry for runtime errors and assertions.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "functionName",
+              "description": "JavaScript function name.",
+              "type": "string"
+            },
+            {
+              "name": "scriptId",
+              "description": "JavaScript script id.",
+              "$ref": "ScriptId"
+            },
+            {
+              "name": "url",
+              "description": "JavaScript script name or url.",
+              "type": "string"
+            },
+            {
+              "name": "lineNumber",
+              "description": "JavaScript script line number (0-based).",
+              "type": "integer"
+            },
+            {
+              "name": "columnNumber",
+              "description": "JavaScript script column number (0-based).",
+              "type": "integer"
+            }
+          ]
+        },
+        {
+          "id": "StackTrace",
+          "description": "Call frames for assertions or error messages.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "description",
+              "description": "String label of this stack trace. For async traces this may be a name of the function that\ninitiated the async call.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "callFrames",
+              "description": "JavaScript function name.",
+              "type": "array",
+              "items": {
+                "$ref": "CallFrame"
+              }
+            },
+            {
+              "name": "parent",
+              "description": "Asynchronous JavaScript stack trace that preceded this stack, if available.",
+              "optional": true,
+              "$ref": "StackTrace"
+            },
+            {
+              "name": "parentId",
+              "description": "Asynchronous JavaScript stack trace that preceded this stack, if available.",
+              "experimental": true,
+              "optional": true,
+              "$ref": "StackTraceId"
+            }
+          ]
+        },
+        {
+          "id": "UniqueDebuggerId",
+          "description": "Unique identifier of current debugger.",
+          "experimental": true,
+          "type": "string"
+        },
+        {
+          "id": "StackTraceId",
+          "description": "If `debuggerId` is set stack trace comes from another debugger and can be resolved there. This\nallows to track cross-debugger calls. See `Runtime.StackTrace` and `Debugger.paused` for usages.",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "id",
+              "type": "string"
+            },
+            {
+              "name": "debuggerId",
+              "optional": true,
+              "$ref": "UniqueDebuggerId"
+            }
+          ]
+        }
+      ],
+      "commands": [
+        {
+          "name": "awaitPromise",
+          "description": "Add handler to promise with given promise object id.",
+          "parameters": [
+            {
+              "name": "promiseObjectId",
+              "description": "Identifier of the promise.",
+              "$ref": "RemoteObjectId"
+            },
+            {
+              "name": "returnByValue",
+              "description": "Whether the result is expected to be a JSON object that should be sent by value.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "generatePreview",
+              "description": "Whether preview should be generated for the result.",
+              "optional": true,
+              "type": "boolean"
+            }
+          ],
+          "returns": [
+            {
+              "name": "result",
+              "description": "Promise result. Will contain rejected value if promise was rejected.",
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "exceptionDetails",
+              "description": "Exception details if stack strace is available.",
+              "optional": true,
+              "$ref": "ExceptionDetails"
+            }
+          ]
+        },
+        {
+          "name": "callFunctionOn",
+          "description": "Calls function with given declaration on the given object. Object group of the result is\ninherited from the target object.",
+          "parameters": [
+            {
+              "name": "functionDeclaration",
+              "description": "Declaration of the function to call.",
+              "type": "string"
+            },
+            {
+              "name": "objectId",
+              "description": "Identifier of the object to call function on. Either objectId or executionContextId should\nbe specified.",
+              "optional": true,
+              "$ref": "RemoteObjectId"
+            },
+            {
+              "name": "arguments",
+              "description": "Call arguments. All call arguments must belong to the same JavaScript world as the target\nobject.",
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "CallArgument"
+              }
+            },
+            {
+              "name": "silent",
+              "description": "In silent mode exceptions thrown during evaluation are not reported and do not pause\nexecution. Overrides `setPauseOnException` state.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "returnByValue",
+              "description": "Whether the result is expected to be a JSON object which should be sent by value.\nCan be overriden by `serializationOptions`.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "generatePreview",
+              "description": "Whether preview should be generated for the result.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "userGesture",
+              "description": "Whether execution should be treated as initiated by user in the UI.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "awaitPromise",
+              "description": "Whether execution should `await` for resulting value and return once awaited promise is\nresolved.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "executionContextId",
+              "description": "Specifies execution context which global object will be used to call function on. Either\nexecutionContextId or objectId should be specified.",
+              "optional": true,
+              "$ref": "ExecutionContextId"
+            },
+            {
+              "name": "objectGroup",
+              "description": "Symbolic group name that can be used to release multiple objects. If objectGroup is not\nspecified and objectId is, objectGroup will be inherited from object.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "throwOnSideEffect",
+              "description": "Whether to throw an exception if side effect cannot be ruled out during evaluation.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "uniqueContextId",
+              "description": "An alternative way to specify the execution context to call function on.\nCompared to contextId that may be reused across processes, this is guaranteed to be\nsystem-unique, so it can be used to prevent accidental function call\nin context different than intended (e.g. as a result of navigation across process\nboundaries).\nThis is mutually exclusive with `executionContextId`.",
+              "experimental": true,
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "serializationOptions",
+              "description": "Specifies the result serialization. If provided, overrides\n`generatePreview` and `returnByValue`.",
+              "experimental": true,
+              "optional": true,
+              "$ref": "SerializationOptions"
+            }
+          ],
+          "returns": [
+            {
+              "name": "result",
+              "description": "Call result.",
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "exceptionDetails",
+              "description": "Exception details.",
+              "optional": true,
+              "$ref": "ExceptionDetails"
+            }
+          ]
+        },
+        {
+          "name": "disable",
+          "description": "Disables reporting of execution contexts creation."
+        },
+        {
+          "name": "discardConsoleEntries",
+          "description": "Discards collected exceptions and console API calls."
+        },
+        {
+          "name": "enable",
+          "description": "Enables reporting of execution contexts creation by means of `executionContextCreated` event.\nWhen the reporting gets enabled the event will be sent immediately for each existing execution\ncontext."
+        },
+        {
+          "name": "evaluate",
+          "description": "Evaluates expression on global object.",
+          "parameters": [
+            {
+              "name": "expression",
+              "description": "Expression to evaluate.",
+              "type": "string"
+            },
+            {
+              "name": "objectGroup",
+              "description": "Symbolic group name that can be used to release multiple objects.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "includeCommandLineAPI",
+              "description": "Determines whether Command Line API should be available during the evaluation.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "silent",
+              "description": "In silent mode exceptions thrown during evaluation are not reported and do not pause\nexecution. Overrides `setPauseOnException` state.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "contextId",
+              "description": "Specifies in which execution context to perform evaluation. If the parameter is omitted the\nevaluation will be performed in the context of the inspected page.\nThis is mutually exclusive with `uniqueContextId`, which offers an\nalternative way to identify the execution context that is more reliable\nin a multi-process environment.",
+              "optional": true,
+              "$ref": "ExecutionContextId"
+            },
+            {
+              "name": "returnByValue",
+              "description": "Whether the result is expected to be a JSON object that should be sent by value.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "generatePreview",
+              "description": "Whether preview should be generated for the result.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "userGesture",
+              "description": "Whether execution should be treated as initiated by user in the UI.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "awaitPromise",
+              "description": "Whether execution should `await` for resulting value and return once awaited promise is\nresolved.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "throwOnSideEffect",
+              "description": "Whether to throw an exception if side effect cannot be ruled out during evaluation.\nThis implies `disableBreaks` below.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "timeout",
+              "description": "Terminate execution after timing out (number of milliseconds).",
+              "experimental": true,
+              "optional": true,
+              "$ref": "TimeDelta"
+            },
+            {
+              "name": "disableBreaks",
+              "description": "Disable breakpoints during execution.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "replMode",
+              "description": "Setting this flag to true enables `let` re-declaration and top-level `await`.\nNote that `let` variables can only be re-declared if they originate from\n`replMode` themselves.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "allowUnsafeEvalBlockedByCSP",
+              "description": "The Content Security Policy (CSP) for the target might block 'unsafe-eval'\nwhich includes eval(), Function(), setTimeout() and setInterval()\nwhen called with non-callable arguments. This flag bypasses CSP for this\nevaluation and allows unsafe-eval. Defaults to true.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "uniqueContextId",
+              "description": "An alternative way to specify the execution context to evaluate in.\nCompared to contextId that may be reused across processes, this is guaranteed to be\nsystem-unique, so it can be used to prevent accidental evaluation of the expression\nin context different than intended (e.g. as a result of navigation across process\nboundaries).\nThis is mutually exclusive with `contextId`.",
+              "experimental": true,
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "serializationOptions",
+              "description": "Specifies the result serialization. If provided, overrides\n`generatePreview` and `returnByValue`.",
+              "experimental": true,
+              "optional": true,
+              "$ref": "SerializationOptions"
+            }
+          ],
+          "returns": [
+            {
+              "name": "result",
+              "description": "Evaluation result.",
+              "$ref": "RemoteObject"
+            },
+            {
+              "name": "exceptionDetails",
+              "description": "Exception details.",
+              "optional": true,
+              "$ref": "ExceptionDetails"
+            }
+          ]
+        },
+        {
+          "name": "getIsolateId",
+          "description": "Returns the isolate id.",
+          "experimental": true,
+          "returns": [
+            {
+              "name": "id",
+              "description": "The isolate id.",
+              "type": "string"
+            }
+          ]
+        },
+        {
+          "name": "getHeapUsage",
+          "description": "Returns the JavaScript heap usage.\nIt is the total usage of the corresponding isolate not scoped to a particular Runtime.",
+          "experimental": true,
+          "returns": [
+            {
+              "name": "usedSize",
+              "description": "Used JavaScript heap size in bytes.",
+              "type": "number"
+            },
+            {
+              "name": "totalSize",
+              "description": "Allocated JavaScript heap size in bytes.",
+              "type": "number"
+            },
+            {
+              "name": "embedderHeapUsedSize",
+              "description": "Used size in bytes in the embedder's garbage-collected heap.",
+              "type": "number"
+            },
+            {
+              "name": "backingStorageSize",
+              "description": "Size in bytes of backing storage for array buffers and external strings.",
+              "type": "number"
+            }
+          ]
+        },
+        {
+          "name": "getProperties",
+          "description": "Returns properties of a given object. Object group of the result is inherited from the target\nobject.",
+          "parameters": [
+            {
+              "name": "objectId",
+              "description": "Identifier of the object to return properties for.",
+              "$ref": "RemoteObjectId"
+            },
+            {
+              "name": "ownProperties",
+              "description": "If true, returns properties belonging only to the element itself, not to its prototype\nchain.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "accessorPropertiesOnly",
+              "description": "If true, returns accessor properties (with getter/setter) only; internal properties are not\nreturned either.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "generatePreview",
+              "description": "Whether preview should be generated for the results.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "nonIndexedPropertiesOnly",
+              "description": "If true, returns non-indexed properties only.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            }
+          ],
+          "returns": [
+            {
+              "name": "result",
+              "description": "Object properties.",
+              "type": "array",
+              "items": {
+                "$ref": "PropertyDescriptor"
+              }
+            },
+            {
+              "name": "internalProperties",
+              "description": "Internal object properties (only of the element itself).",
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "InternalPropertyDescriptor"
+              }
+            },
+            {
+              "name": "privateProperties",
+              "description": "Object private properties.",
+              "experimental": true,
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "PrivatePropertyDescriptor"
+              }
+            },
+            {
+              "name": "exceptionDetails",
+              "description": "Exception details.",
+              "optional": true,
+              "$ref": "ExceptionDetails"
+            }
+          ]
+        },
+        {
+          "name": "releaseObject",
+          "description": "Releases remote object with given id.",
+          "parameters": [
+            {
+              "name": "objectId",
+              "description": "Identifier of the object to release.",
+              "$ref": "RemoteObjectId"
+            }
+          ]
+        },
+        {
+          "name": "releaseObjectGroup",
+          "description": "Releases all remote objects that belong to a given group.",
+          "parameters": [
+            {
+              "name": "objectGroup",
+              "description": "Symbolic object group name.",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "name": "consoleAPICalled",
+          "description": "Issued when console API was called.",
+          "parameters": [
+            {
+              "name": "type",
+              "description": "Type of the call.",
+              "type": "string",
+              "enum": [
+                "log",
+                "debug",
+                "info",
+                "error",
+                "warning",
+                "dir",
+                "dirxml",
+                "table",
+                "trace",
+                "clear",
+                "startGroup",
+                "startGroupCollapsed",
+                "endGroup",
+                "assert",
+                "profile",
+                "profileEnd",
+                "count",
+                "timeEnd"
+              ]
+            },
+            {
+              "name": "args",
+              "description": "Call arguments.",
+              "type": "array",
+              "items": {
+                "$ref": "RemoteObject"
+              }
+            },
+            {
+              "name": "executionContextId",
+              "description": "Identifier of the context where the call was made.",
+              "$ref": "ExecutionContextId"
+            },
+            {
+              "name": "timestamp",
+              "description": "Call timestamp.",
+              "$ref": "Timestamp"
+            },
+            {
+              "name": "stackTrace",
+              "description": "Stack trace captured when the call was made. The async stack chain is automatically reported for\nthe following call types: `assert`, `error`, `trace`, `warning`. For other types the async call\nchain can be retrieved using `Debugger.getStackTrace` and `stackTrace.parentId` field.",
+              "optional": true,
+              "$ref": "StackTrace"
+            },
+            {
+              "name": "context",
+              "description": "Console context descriptor for calls on non-default console context (not console.*):\n'anonymous#unique-logger-id' for call on unnamed context, 'name#unique-logger-id' for call\non named context.",
+              "experimental": true,
+              "optional": true,
+              "type": "string"
+            }
+          ]
+        },
+        {
+          "name": "exceptionRevoked",
+          "description": "Issued when unhandled exception was revoked.",
+          "parameters": [
+            {
+              "name": "reason",
+              "description": "Reason describing why exception was revoked.",
+              "type": "string"
+            },
+            {
+              "name": "exceptionId",
+              "description": "The id of revoked exception, as reported in `exceptionThrown`.",
+              "type": "integer"
+            }
+          ]
+        },
+        {
+          "name": "exceptionThrown",
+          "description": "Issued when exception was thrown and unhandled.",
+          "parameters": [
+            {
+              "name": "timestamp",
+              "description": "Timestamp of the exception.",
+              "$ref": "Timestamp"
+            },
+            {
+              "name": "exceptionDetails",
+              "$ref": "ExceptionDetails"
+            }
+          ]
+        },
+        {
+          "name": "executionContextCreated",
+          "description": "Issued when new execution context is created.",
+          "parameters": [
+            {
+              "name": "context",
+              "description": "A newly created execution context.",
+              "$ref": "ExecutionContextDescription"
+            }
+          ]
+        },
+        {
+          "name": "executionContextDestroyed",
+          "description": "Issued when execution context is destroyed.",
+          "parameters": [
+            {
+              "name": "executionContextId",
+              "description": "Id of the destroyed context",
+              "deprecated": true,
+              "$ref": "ExecutionContextId"
+            },
+            {
+              "name": "executionContextUniqueId",
+              "description": "Unique Id of the destroyed context",
+              "experimental": true,
+              "type": "string"
+            }
+          ]
+        },
+        {
+          "name": "executionContextsCleared",
+          "description": "Issued when all executionContexts were cleared in browser"
+        }
+      ]
+    },
+    {
+      "domain": "Profiler",
+      "dependencies": [
+        "Runtime",
+        "Debugger"
+      ],
+      "types": [
+        {
+          "id": "ProfileNode",
+          "description": "Profile node. Holds callsite information, execution statistics and child nodes.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "id",
+              "description": "Unique id of the node.",
+              "type": "integer"
+            },
+            {
+              "name": "callFrame",
+              "description": "Function location.",
+              "$ref": "Runtime.CallFrame"
+            },
+            {
+              "name": "hitCount",
+              "description": "Number of samples where this node was on top of the call stack.",
+              "optional": true,
+              "type": "integer"
+            },
+            {
+              "name": "children",
+              "description": "Child node ids.",
+              "optional": true,
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            {
+              "name": "deoptReason",
+              "description": "The reason of being not optimized. The function may be deoptimized or marked as don't\noptimize.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "positionTicks",
+              "description": "An array of source position ticks.",
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "PositionTickInfo"
+              }
+            }
+          ]
+        },
+        {
+          "id": "Profile",
+          "description": "Profile.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "nodes",
+              "description": "The list of profile nodes. First item is the root node.",
+              "type": "array",
+              "items": {
+                "$ref": "ProfileNode"
+              }
+            },
+            {
+              "name": "startTime",
+              "description": "Profiling start timestamp in microseconds.",
+              "type": "number"
+            },
+            {
+              "name": "endTime",
+              "description": "Profiling end timestamp in microseconds.",
+              "type": "number"
+            },
+            {
+              "name": "samples",
+              "description": "Ids of samples top nodes.",
+              "optional": true,
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            {
+              "name": "timeDeltas",
+              "description": "Time intervals between adjacent samples in microseconds. The first delta is relative to the\nprofile startTime.",
+              "optional": true,
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          ]
+        },
+        {
+          "id": "PositionTickInfo",
+          "description": "Specifies a number of samples attributed to a certain source position.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "line",
+              "description": "Source line number (1-based).",
+              "type": "integer"
+            },
+            {
+              "name": "ticks",
+              "description": "Number of samples attributed to the source line.",
+              "type": "integer"
+            }
+          ]
+        },
+        {
+          "id": "CoverageRange",
+          "description": "Coverage data for a source range.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "startOffset",
+              "description": "JavaScript script source offset for the range start.",
+              "type": "integer"
+            },
+            {
+              "name": "endOffset",
+              "description": "JavaScript script source offset for the range end.",
+              "type": "integer"
+            },
+            {
+              "name": "count",
+              "description": "Collected execution count of the source range.",
+              "type": "integer"
+            }
+          ]
+        },
+        {
+          "id": "FunctionCoverage",
+          "description": "Coverage data for a JavaScript function.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "functionName",
+              "description": "JavaScript function name.",
+              "type": "string"
+            },
+            {
+              "name": "ranges",
+              "description": "Source ranges inside the function with coverage data.",
+              "type": "array",
+              "items": {
+                "$ref": "CoverageRange"
+              }
+            },
+            {
+              "name": "isBlockCoverage",
+              "description": "Whether coverage data for this function has block granularity.",
+              "type": "boolean"
+            }
+          ]
+        },
+        {
+          "id": "ScriptCoverage",
+          "description": "Coverage data for a JavaScript script.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "scriptId",
+              "description": "JavaScript script id.",
+              "$ref": "Runtime.ScriptId"
+            },
+            {
+              "name": "url",
+              "description": "JavaScript script name or url.",
+              "type": "string"
+            },
+            {
+              "name": "functions",
+              "description": "Functions contained in the script that has coverage data.",
+              "type": "array",
+              "items": {
+                "$ref": "FunctionCoverage"
+              }
+            }
+          ]
+        }
+      ],
+      "commands": [
+        {
+          "name": "disable"
+        },
+        {
+          "name": "enable"
+        },
+        {
+          "name": "setSamplingInterval",
+          "description": "Changes CPU profiler sampling interval. Must be called before CPU profiles recording started.",
+          "parameters": [
+            {
+              "name": "interval",
+              "description": "New sampling interval in microseconds.",
+              "type": "integer"
+            }
+          ]
+        },
+        {
+          "name": "start"
+        },
+        {
+          "name": "stop",
+          "returns": [
+            {
+              "name": "profile",
+              "description": "Recorded profile.",
+              "$ref": "Profile"
+            }
+          ]
+        }
+      ],
+      "events": []
+    },
+    {
+      "domain": "HeapProfiler",
+      "experimental": true,
+      "dependencies": [
+        "Runtime"
+      ],
+      "types": [
+        {
+          "id": "HeapSnapshotObjectId",
+          "description": "Heap snapshot object id.",
+          "type": "string"
+        },
+        {
+          "id": "SamplingHeapProfileNode",
+          "description": "Sampling Heap Profile node. Holds callsite information, allocation statistics and child nodes.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "callFrame",
+              "description": "Function location.",
+              "$ref": "Runtime.CallFrame"
+            },
+            {
+              "name": "selfSize",
+              "description": "Allocations size in bytes for the node excluding children.",
+              "type": "number"
+            },
+            {
+              "name": "id",
+              "description": "Node id. Ids are unique across all profiles collected between startSampling and stopSampling.",
+              "type": "integer"
+            },
+            {
+              "name": "children",
+              "description": "Child nodes.",
+              "type": "array",
+              "items": {
+                "$ref": "SamplingHeapProfileNode"
+              }
+            }
+          ]
+        },
+        {
+          "id": "SamplingHeapProfileSample",
+          "description": "A single sample from a sampling profile.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "size",
+              "description": "Allocation size in bytes attributed to the sample.",
+              "type": "number"
+            },
+            {
+              "name": "nodeId",
+              "description": "Id of the corresponding profile tree node.",
+              "type": "integer"
+            },
+            {
+              "name": "ordinal",
+              "description": "Time-ordered sample ordinal number. It is unique across all profiles retrieved\nbetween startSampling and stopSampling.",
+              "type": "number"
+            }
+          ]
+        },
+        {
+          "id": "SamplingHeapProfile",
+          "description": "Sampling profile.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "head",
+              "$ref": "SamplingHeapProfileNode"
+            },
+            {
+              "name": "samples",
+              "type": "array",
+              "items": {
+                "$ref": "SamplingHeapProfileSample"
+              }
+            }
+          ]
+        }
+      ],
+      "commands": [
+        {
+          "name": "takeHeapSnapshot",
+          "parameters": [
+            {
+              "name": "reportProgress",
+              "description": "If true 'reportHeapSnapshotProgress' events will be generated while snapshot is being taken.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "treatGlobalObjectsAsRoots",
+              "description": "If true, a raw snapshot without artificial roots will be generated.\nDeprecated in favor of `exposeInternals`.",
+              "deprecated": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "captureNumericValue",
+              "description": "If true, numerical values are included in the snapshot",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "exposeInternals",
+              "description": "If true, exposes internals of the snapshot.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "name": "addHeapSnapshotChunk",
+          "parameters": [
+            {
+              "name": "chunk",
+              "type": "string"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "domain": "Performance",
+      "types": [
+        {
+          "id": "Metric",
+          "description": "Run-time execution metric.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "name",
+              "description": "Metric name.",
+              "type": "string"
+            },
+            {
+              "name": "value",
+              "description": "Metric value.",
+              "type": "number"
+            }
+          ]
+        }
+      ],
+      "commands": [
+        {
+          "name": "disable",
+          "description": "Disable collecting and reporting metrics."
+        },
+        {
+          "name": "enable",
+          "description": "Enable collecting and reporting metrics.",
+          "parameters": [
+            {
+              "name": "timeDomain",
+              "description": "Time domain to use for collecting and reporting duration metrics.",
+              "optional": true,
+              "type": "string",
+              "enum": [
+                "timeTicks",
+                "threadTicks"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "setTimeDomain",
+          "description": "Sets time domain to use for collecting and reporting duration metrics.\nNote that this must be called before enabling metrics collection. Calling\nthis method while metrics collection is enabled returns an error.",
+          "experimental": true,
+          "deprecated": true,
+          "parameters": [
+            {
+              "name": "timeDomain",
+              "description": "Time domain",
+              "type": "string",
+              "enum": [
+                "timeTicks",
+                "threadTicks"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "getMetrics",
+          "description": "Retrieve current values of run-time metrics.",
+          "returns": [
+            {
+              "name": "metrics",
+              "description": "Current values for run-time metrics.",
+              "type": "array",
+              "items": {
+                "$ref": "Metric"
+              }
+            }
+          ]
+        }
+      ],
+      "events": []
+    },
+    {
+      "domain": "Schema",
+      "description": "This domain is deprecated.",
+      "deprecated": true,
+      "types": [
+        {
+          "id": "Domain",
+          "description": "Description of the protocol domain.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "name",
+              "description": "Domain name.",
+              "type": "string"
+            },
+            {
+              "name": "version",
+              "description": "Domain version.",
+              "type": "string"
+            }
+          ]
+        }
+      ],
+      "commands": [
+        {
+          "name": "getDomains",
+          "description": "Returns supported domains.",
+          "returns": [
+            {
+              "name": "domains",
+              "description": "List of supported domains.",
+              "type": "array",
+              "items": {
+                "$ref": "Domain"
+              }
+            }
+          ]
+        }
+      ],
+      "events": []
+    }
+  ]
+}

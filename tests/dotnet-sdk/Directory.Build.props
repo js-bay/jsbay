@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup Condition="'$(JSBAY_DOTNET_ARTIFACTS)' != ''">
+    <BaseOutputPath>$(JSBAY_DOTNET_ARTIFACTS)/consumer/bin/</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(JSBAY_DOTNET_ARTIFACTS)/consumer/obj/</BaseIntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>$(JSBAY_DOTNET_ARTIFACTS)/consumer/obj/</MSBuildProjectExtensionsPath>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(JSBAY_DOTNET_ARTIFACTS)' != ''">
+    <Compile Remove="$(BaseIntermediateOutputPath)**/*.cs" />
+  </ItemGroup>
+</Project>

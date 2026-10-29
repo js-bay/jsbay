@@ -1,0 +1,33 @@
+{
+  "source": {
+    "repository": "ChromeDevTools/devtools-protocol",
+    "commit": "7245ec551bc9d450170193456ab3965bb7e716cb",
+    "files": {
+      "js_protocol.json": "3716f86e2228f9414ffff43551249bc6a5783388c3fbdba5226f14e6941774f1",
+      "browser_protocol.json": "03d8ea21b8554155ef26f7b1ab54d34ad96c0f9a59560978f6e06d6a2dac8027"
+    }
+  },
+  "variants": {
+    "quickjs_ng": {
+      "Runtime": { "commands": ["awaitPromise", "callFunctionOn", "disable", "discardConsoleEntries", "enable", "evaluate", "getIsolateId", "getHeapUsage", "getProperties", "releaseObject", "releaseObjectGroup"], "events": ["consoleAPICalled", "exceptionRevoked", "exceptionThrown", "executionContextCreated", "executionContextDestroyed", "executionContextsCleared"] },
+      "Debugger": { "commands": ["disable", "enable", "evaluateOnCallFrame", "getPossibleBreakpoints", "getScriptSource", "pause", "removeBreakpoint", "resume", "setAsyncCallStackDepth", "setBlackboxPatterns", "setBreakpointByUrl", "setBreakpointsActive", "setPauseOnExceptions", "setSkipAllPauses", "stepInto", "stepOut", "stepOver"], "events": ["breakpointResolved", "paused", "resumed", "scriptParsed"] },
+      "Profiler": { "commands": ["disable", "enable", "setSamplingInterval", "start", "stop"], "events": [] },
+      "HeapProfiler": { "commands": ["takeHeapSnapshot"], "events": ["addHeapSnapshotChunk"] },
+      "Performance": { "commands": ["disable", "enable", "getMetrics", "setTimeDomain"], "events": [] },
+      "Schema": { "commands": ["getDomains"], "events": [] }
+    },
+    "quickjs": {
+      "Runtime": { "commands": ["awaitPromise", "callFunctionOn", "disable", "discardConsoleEntries", "enable", "evaluate", "getIsolateId", "getHeapUsage", "getProperties", "releaseObject", "releaseObjectGroup"], "events": ["consoleAPICalled", "exceptionRevoked", "exceptionThrown", "executionContextCreated", "executionContextDestroyed", "executionContextsCleared"] },
+      "Profiler": { "commands": ["disable", "enable", "setSamplingInterval", "start", "stop"], "events": [] },
+      "HeapProfiler": { "commands": ["takeHeapSnapshot"], "events": ["addHeapSnapshotChunk"] },
+      "Performance": { "commands": ["disable", "enable", "getMetrics", "setTimeDomain"], "events": [] },
+      "Schema": { "commands": ["getDomains"], "events": [] }
+    },
+    "jsc": {
+      "Runtime": { "commands": ["callFunctionOn", "disable", "discardConsoleEntries", "enable", "evaluate", "getIsolateId", "getProperties", "releaseObject", "releaseObjectGroup"], "events": ["consoleAPICalled", "exceptionThrown", "executionContextCreated", "executionContextDestroyed", "executionContextsCleared"] },
+      "Performance": { "commands": ["disable", "enable", "getMetrics", "setTimeDomain"], "events": [] },
+      "Schema": { "commands": ["getDomains"], "events": [] }
+    }
+  },
+  "withoutHeapSnapshot": ["quickjs_ng", "quickjs"]
+}

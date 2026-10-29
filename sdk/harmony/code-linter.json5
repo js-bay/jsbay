@@ -1,0 +1,27 @@
+{
+  "files": ["**/*.ets", "**/*.ts"],
+  "ignore": [],
+  "ruleSet": [],
+  "rules": {
+    "semi": ["error", "always"],
+    "@typescript-eslint/semi": ["error", "always"],
+    "@typescript-eslint/member-delimiter-style": "error",
+    "indent": ["error", 2, { "SwitchCase": 1 }],
+    "brace-style": ["error", "1tbs"],
+    "curly": ["error", "all"],
+    "quotes": ["error", "single", { "avoidEscape": true }],
+    "no-trailing-spaces": "error",
+    "eol-last": ["error", "always"],
+    "keyword-spacing": "error",
+    "space-infix-ops": "error",
+    "comma-spacing": "error",
+    "padding-line-between-statements": ["error", { "blankLine": "always", "prev": "*", "next": "return" }],
+    "no-var": "error",
+    "eqeqeq": ["error", "always"],
+    "no-debugger": "error",
+    "no-duplicate-case": "error",
+    "no-constant-condition": "error",
+    "@typescript-eslint/no-explicit-any": "error"
+  },
+  "overrides": []
+}

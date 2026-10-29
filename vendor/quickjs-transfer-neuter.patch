@@ -1,0 +1,15 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -60676,6 +60676,11 @@
+         abuf->data = NULL;
+         abuf->byte_length = 0;
+         abuf->detached = TRUE;
++        /* The store was either handed to the new buffer together with
++           free_func/opaque, or already released above; the finalizer of
++           the detached source must not release it a second time. */
++        abuf->free_func = NULL;
++        abuf->opaque = NULL;
+         js_array_buffer_update_typed_arrays(abuf);
+     }
+     return res;

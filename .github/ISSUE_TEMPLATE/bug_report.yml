@@ -1,0 +1,78 @@
+name: Bug report
+description: Report broken behavior in JS Bay or a platform SDK
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please fill in the sections below. For security vulnerabilities, use a [private Security Advisory](https://github.com/js-bay/jsbay/security/advisories/new) instead of this form.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What went wrong in one or two sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps or a short code sample that triggers the bug.
+      placeholder: |
+        1. Build with …
+        2. Call …
+        3. Observe …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include logs, stack traces, or error codes when useful.
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      description: Engine backend selected at build time, if known.
+      options:
+        - quickjs
+        - quickjs_ng
+        - jsc
+        - unknown / not applicable
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Desktop (Zig / C)
+        - Apple SDK
+        - Android SDK
+        - Harmony SDK
+        - .NET SDK
+        - Documentation / other
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: JS Bay commit or release tag, Zig version, and OS / SDK versions.
+      placeholder: "jsbay @ abc1234 · Zig 0.17.0 · macOS 15 / iOS 18"
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Additional context
+      description: Workarounds, related PRs, or anything else maintainers should know.
