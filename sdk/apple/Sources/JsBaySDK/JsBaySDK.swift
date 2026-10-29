@@ -91,12 +91,15 @@ public final class SyncCompletion: @unchecked Sendable {
     let status = tryReject(message)
     if status != JsBayStatus.ok { throw JsBayError.status(status) }
   }
-  private func complete(_ outcome: jsbay_status_t, _ kind: jsbay_sync_payload_kind_t, _ bytes: [UInt8]) -> Int32 {
+  private func complete(
+    _ outcome: jsbay_status_t, _ kind: jsbay_sync_payload_kind_t, _ bytes: [UInt8]
+  ) -> Int32 {
     lock.lock()
     defer { lock.unlock() }
     if terminal { return JsBayStatus.staleValue }
     let status: jsbay_status_t = bytes.withUnsafeBufferPointer {
-      jsbay_sync_complete(requestID, outcome, kind, jsbay_utf8_t(data: $0.baseAddress, len: $0.count))
+      jsbay_sync_complete(
+        requestID, outcome, kind, jsbay_utf8_t(data: $0.baseAddress, len: $0.count))
     }
     let raw = Int32(status.rawValue)
     if raw == JsBayStatus.ok || raw == JsBayStatus.staleValue { terminal = true }
@@ -392,8 +395,12 @@ public struct ResourceLimits: Equatable, Sendable {
     self.maxPendingTasks = maxPendingTasks
   }
 
-  fileprivate func withCLimits<R>(_ body: (UnsafePointer<jsbay_resource_limits_t>) throws -> R) throws -> R {
-    guard maxTimers >= 0, maxTsfnHandles >= 0, maxPendingCalls >= 0, maxPendingBytes >= 0, maxPendingTasks >= 0 else {
+  fileprivate func withCLimits<R>(_ body: (UnsafePointer<jsbay_resource_limits_t>) throws -> R)
+    throws -> R
+  {
+    guard maxTimers >= 0, maxTsfnHandles >= 0, maxPendingCalls >= 0, maxPendingBytes >= 0,
+      maxPendingTasks >= 0
+    else {
       throw JsBayError.status(JsBayStatus.invalidArgument)
     }
     var limits = jsbay_resource_limits_t(
@@ -930,8 +937,10 @@ public final class Engine {
     try requireOpen()
     var usage = jsbay_resource_usage_t(
       struct_size: UInt32(MemoryLayout<jsbay_resource_usage_t>.size),
-      timers: 0, tsfn_handles: 0, pending_calls: 0, native_tasks: 0, script_tasks: 0, pending_bytes: 0,
-      max_timers: 0, max_tsfn_handles: 0, max_pending_calls: 0, max_pending_bytes: 0, max_pending_tasks: 0)
+      timers: 0, tsfn_handles: 0, pending_calls: 0, native_tasks: 0, script_tasks: 0,
+      pending_bytes: 0,
+      max_timers: 0, max_tsfn_handles: 0, max_pending_calls: 0, max_pending_bytes: 0,
+      max_pending_tasks: 0)
     guard jsbay_engine_get_resource_usage(id, &usage) else {
       throw JsBayError.status(JsBayStatus.invalidArgument)
     }
@@ -953,13 +962,17 @@ public final class Engine {
   public static func globalResourceUsage() throws -> ResourceGlobalUsage {
     var usage = jsbay_resource_global_usage_t(
       struct_size: UInt32(MemoryLayout<jsbay_resource_global_usage_t>.size),
-      timers: 0, tsfn_handles: 0, pending_calls: 0, native_tasks: 0, script_tasks: 0, pending_bytes: 0,
-      max_timers: 0, max_tsfn_handles: 0, max_pending_calls: 0, max_native_tasks: 0, max_script_tasks: 0,
+      timers: 0, tsfn_handles: 0, pending_calls: 0, native_tasks: 0, script_tasks: 0,
+      pending_bytes: 0,
+      max_timers: 0, max_tsfn_handles: 0, max_pending_calls: 0, max_native_tasks: 0,
+      max_script_tasks: 0,
       max_pending_bytes: 0,
       fg_headroom_timers: 0, fg_headroom_tsfn_handles: 0, fg_headroom_pending_calls: 0,
       fg_headroom_native_tasks: 0, fg_headroom_script_tasks: 0, fg_headroom_pending_bytes: 0,
-      bg_effective_max_timers: 0, bg_effective_max_tsfn_handles: 0, bg_effective_max_pending_calls: 0,
-      bg_effective_max_native_tasks: 0, bg_effective_max_script_tasks: 0, bg_effective_max_pending_bytes: 0)
+      bg_effective_max_timers: 0, bg_effective_max_tsfn_handles: 0,
+      bg_effective_max_pending_calls: 0,
+      bg_effective_max_native_tasks: 0, bg_effective_max_script_tasks: 0,
+      bg_effective_max_pending_bytes: 0)
     guard jsbay_resource_global_usage(&usage) else {
       throw JsBayError.status(JsBayStatus.invalidArgument)
     }
@@ -1022,9 +1035,10 @@ public final class Engine {
     return jsbay_engine_run_gc(id)
   }
 
-  public typealias EventHandler = @convention(c) (
-    UnsafePointer<jsbay_engine_event_t>?, UnsafeMutableRawPointer?
-  ) -> Void
+  public typealias EventHandler =
+    @convention(c) (
+      UnsafePointer<jsbay_engine_event_t>?, UnsafeMutableRawPointer?
+    ) -> Void
 
   @discardableResult public func setEventHandler(
     _ handler: EventHandler?, userData: UnsafeMutableRawPointer? = nil
@@ -1107,8 +1121,7 @@ public final class Engine {
     }
     throw JsBayError.status(Int32(status.rawValue))
   }
-  fileprivate func withUTF8<T>(_ string: String, _ body: (jsbay_utf8_t) throws -> T) rethrows -> T
-  {
+  fileprivate func withUTF8<T>(_ string: String, _ body: (jsbay_utf8_t) throws -> T) rethrows -> T {
     try Array(string.utf8).withUnsafeBufferPointer { bytes in
       try body(jsbay_utf8_t(data: bytes.baseAddress, len: bytes.count))
     }

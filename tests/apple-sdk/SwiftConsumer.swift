@@ -476,7 +476,8 @@ struct SwiftConsumer {
       fatalError("P0 snapshot missing")
     }
 
-    let syncBytes = try engine.bindSync("p0SyncBytes", timeoutMilliseconds: 2_000) { _, _, completion in
+    let syncBytes = try engine.bindSync("p0SyncBytes", timeoutMilliseconds: 2_000) {
+      _, _, completion in
       DispatchQueue.global().async { try? completion.resolveBytes([9, 8, 7]) }
     }
     defer { try? syncBytes.close() }
