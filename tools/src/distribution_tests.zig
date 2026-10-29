@@ -58,8 +58,9 @@ fn executable(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, name: [
 }
 
 fn pathEnv(allocator: std.mem.Allocator, tools: []const u8) ![]u8 {
-    const inherited = if (std.c.getenv("PATH")) |p| std.mem.span(p) else "/usr/bin:/bin:/usr/sbin:/sbin";
-    return std.fmt.allocPrint(allocator, "PATH={s}:{s}", .{ tools, inherited });
+    // Keep this libc-free: `zig build test-tools` does not link libc on CI.
+    // tools/ must stay first so fixture stubs win over host binaries.
+    return std.fmt.allocPrint(allocator, "PATH={s}:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin", .{tools});
 }
 
 fn androidFixture(allocator: std.mem.Allocator, io: std.Io, fixture: []const u8) ![]u8 {
