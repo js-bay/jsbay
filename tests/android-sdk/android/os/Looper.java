@@ -11,7 +11,7 @@ public final class Looper {
   private long sequence;
   private volatile boolean quit;
 
-  private Looper() {}
+  Looper() {}
 
   public static void prepare() {
     if (CURRENT.get() != null) throw new IllegalStateException("Looper already prepared");

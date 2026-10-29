@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const repository = @import("repository.zig");
 const ios_stdlib = @import("ios_stdlib.zig");
 const apple_archive = @import("apple_archive.zig");
@@ -148,10 +149,14 @@ fn checkCAbi(args: []const []const u8) !u8 {
     }
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
+    // Prefer the system compilers. Android NDK setup often puts a target-clang
+    // named `cc` ahead on PATH, which breaks these host syntax-only probes.
+    const cc: []const u8 = if (builtin.os.tag == .windows) "cc" else "/usr/bin/cc";
+    const cxx: []const u8 = if (builtin.os.tag == .windows) "c++" else "/usr/bin/c++";
     const consumers = [_][]const u8{ "tests/c_consumer.c", "tests/bytecode_consumer.c", "tests/native_sync_consumer.c", "tests/host_wake_consumer.c" };
     for (consumers) |consumer| {
-        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
-        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ "c++", "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
+        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
+        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
     }
     const lib = library orelse return 0;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -266,12 +271,20 @@ fn runOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8)
     return error.ExternalFailure;
 }
 
+
 fn requireExternal(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    const output = runOutput(allocator, io, argv) catch |err| {
+    const result = std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(16 * 1024 * 1024) }) catch |err| {
         std.debug.print("external command failed: {s}\n", .{argv[0]});
         return err;
     };
-    allocator.free(output);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    std.debug.print("external command failed: {s}\n{s}{s}\n", .{ argv[0], result.stdout, result.stderr });
+    return error.ExternalFailure;
 }
 
 fn checkDiagnosticExports(init: std.process.Init, args: []const []const u8) !void {
