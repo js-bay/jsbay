@@ -1,5 +1,5 @@
 # JS Bay CI — see docs/testing.md#ci for the matrix rationale.
-# Aggressive aggregation: one large job per platform (linux / macos / windows).
+# Jobs: linux / linux-android / macos / macos-android / windows (Android matrix split for parallelism).
 name: CI
 
 on:
@@ -233,6 +233,44 @@ jobs:
           bash tests/qjs-regression/run.sh --engine quickjs
           bash tests/qjs-regression/run.sh --engine quickjs --inspector off
 
+  linux-android:
+    name: linux-android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4.0.4
+
+      - name: Install pawl
+        uses: tiangong-dev/pawl@v0.8.2
+        with:
+          version: v0.8.2
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+
+      - name: Check host tool dependencies
+        run: command -v git zig ruby tar zip unzip rg
+
       - name: Install Android build and emulator dependencies
         shell: bash
         run: |
@@ -415,6 +453,76 @@ jobs:
       - name: .NET SDK consumer (jsc)
         run: tests/dotnet-sdk/run.sh jsc
 
+      - name: Build inspector demo (quickjs_ng)
+        run: zig build -Dbackend=quickjs_ng --summary all
+
+      - name: Build idle wake consumer
+        run: |
+          set -euo pipefail
+          link_flags=(-lm -framework Foundation -framework JavaScriptCore -lobjc -fsanitize=undefined)
+          cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/host_wake_consumer.c zig-out/lib/libjsbay.a "${link_flags[@]}" -o zig-out/bin/host-wake-consumer
+
+      - name: Inspector e2e, idle wake and signal shutdown
+        run: node tests/inspector/ci_driver.cjs ./zig-out/bin/inspector-demo-quickjs_ng ./zig-out/bin/host-wake-consumer
+
+      - name: Upload inspector demo log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspector-demo-log-macos-26
+          path: inspector-demo.log
+          if-no-files-found: ignore
+
+      - name: Verify arm64 Xcode environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-path
+
+      - name: iOS Simulator consumer smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build-apple.sh quickjs_ng
+          grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
+
+  macos-android:
+    name: macos-android
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4.0.4
+
+      - name: Install pawl
+        uses: tiangong-dev/pawl@v0.8.2
+        with:
+          version: v0.8.2
+
+      - name: Ensure ripgrep
+        run: command -v rg || brew install ripgrep
+
+      - name: Check host tool dependencies
+        run: command -v git zig ruby tar zip unzip rg
+
       - name: Install Android build tools (AAR)
         run: sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
 
@@ -461,41 +569,6 @@ jobs:
           unzip -Z1 "$aar" | grep '^jni/.*\.so$' | sort > "$actual"
           printf '%s\n' jni/arm64-v8a/libjsbay.so jni/arm64-v8a/libjsbay_android.so jni/x86_64/libjsbay.so jni/x86_64/libjsbay_android.so | sort | diff -u - "$actual"
           unzip -p "$aar" proguard.txt | grep -F -- '-keep class io.jsbay.Native { *; }'
-
-      - name: Build inspector demo (quickjs_ng)
-        run: zig build -Dbackend=quickjs_ng --summary all
-
-      - name: Build idle wake consumer
-        run: |
-          set -euo pipefail
-          link_flags=(-lm -framework Foundation -framework JavaScriptCore -lobjc -fsanitize=undefined)
-          cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/host_wake_consumer.c zig-out/lib/libjsbay.a "${link_flags[@]}" -o zig-out/bin/host-wake-consumer
-
-      - name: Inspector e2e, idle wake and signal shutdown
-        run: node tests/inspector/ci_driver.cjs ./zig-out/bin/inspector-demo-quickjs_ng ./zig-out/bin/host-wake-consumer
-
-      - name: Upload inspector demo log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: inspector-demo-log-macos-26
-          path: inspector-demo.log
-          if-no-files-found: ignore
-
-      - name: Verify arm64 Xcode environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(uname -m)" = arm64
-          xcodebuild -version
-          xcrun --sdk iphonesimulator --show-sdk-path
-
-      - name: iOS Simulator consumer smoke
-        shell: bash
-        run: |
-          set -euo pipefail
-          ./build-apple.sh quickjs_ng
-          grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
 
   windows:
     name: windows

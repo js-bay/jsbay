@@ -149,6 +149,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
     try executable(allocator, io, fixture, try join(allocator, tools, &.{"zig"}),
         \\#!/bin/sh
         \\if [ "$1" = build ] && [ "$2" = --build-file ]; then mkdir -p zig-out/bin; printf '#!/bin/sh\\nexit 0\\n' > zig-out/bin/jsbay-tool; chmod +x zig-out/bin/jsbay-tool; exit 0; fi
+        \\[ "$1" = build ] && [ "$2" = tool ] && exit 0
         \\prefix=""; previous=""; for arg in "$@"; do [ "$previous" = --prefix ] && prefix="$arg"; previous="$arg"; done
         \\[ -n "$prefix" ] || exit 0
         \\mkdir -p "$prefix/lib"; printf archive > "$prefix/lib/libjsbay.a"
@@ -158,7 +159,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
         \\#!/bin/sh
         \\if [ "$3" = --show-sdk-path ]; then printf /sdk; exit 0; fi
         \\if [ "$1" = otool ] && [ "$2" = -l ]; then case "$3" in *macos*) minos=11.0 ;; *ios-sim-arm64*) minos=14.0 ;; *) minos=13.0 ;; esac; printf '      cmd LC_BUILD_VERSION\n    minos %s\n' "$minos"; exit 0; fi
-        \\if [ "$1" = simctl ] && [ "$2" = list ]; then printf '{"runtimes": []}'; exit 0; fi
+        \\if [ "$1" = simctl ] && [ "$2" = list ]; then if [ "$3" = devicetypes ]; then printf '{"devicetypes": []}'; else printf '{"runtimes": []}'; fi; exit 0; fi
         \\if [ "$1" = lipo ] && [ "$2" = -create ]; then source="$3"; out=""; previous=""; for arg in "$@"; do [ "$previous" = -output ] && out="$arg"; previous="$arg"; done; cp "$source" "$out"; exit 0; fi
         \\if [ "$1" = lipo ] && [ "$2" = -verify_arch ]; then exit 2; fi
         \\if [ "$3" = clang ]; then out=""; previous=""; for arg in "$@"; do [ "$previous" = -o ] && out="$arg"; previous="$arg"; done; mkdir -p "$(dirname "$out")"; printf '#!/bin/sh\\necho JSBAY_APPLE_CONSUMER_PASS\\n' > "$out"; chmod +x "$out"; exit 0; fi
@@ -197,8 +198,10 @@ test "test_apple_missing_simulator_runtime_fails_the_script" {
     var unavailable = try sdk.run(a, io, &base, repo);
     defer unavailable.deinit();
     try testing.expect(!unavailable.succeeded());
-    try contains(unavailable.result.stderr, "Simulator runtime unavailable");
     try testing.expectEqualStrings("FAIL: iOS Simulator runtime unavailable\n", try read(a, io, build_dir, &.{ "consumer-probes", "ios-simulator-consumer.status" }));
+    // Some hosts surface the script diagnostic on stdout instead of stderr.
+    const unavailable_out = try std.fmt.allocPrint(a, "{s}{s}", .{ unavailable.result.stderr, unavailable.result.stdout });
+    try contains(unavailable_out, "Simulator runtime unavailable");
     var bigint = try sdk.run(a, io, &.{ "env", env_path, try std.fmt.allocPrint(a, "BUILD_DIR={s}", .{build_dir}), "FAKE_JSC_IOS18_IMPORT=1", script, "jsc" }, repo);
     defer bigint.deinit();
     try testing.expect(!bigint.succeeded());

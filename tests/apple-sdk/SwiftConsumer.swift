@@ -482,7 +482,9 @@ struct SwiftConsumer {
     defer { try? syncBytes.close() }
     guard
       try engine.evaluate(
-        "(function(){ var u = new Uint8Array(p0SyncBytes()); return u.length===3 && u[0]===9 && u[1]===8 && u[2]===7 })()",
+        """
+        (function(){ var u = new Uint8Array(p0SyncBytes()); return u.length===3 && u[0]===9 && u[1]===8 && u[2]===7 })()
+        """,
         filename: "p0-sync-bytes.js"
       ).bool()
     else {

@@ -1124,6 +1124,7 @@ public final class Engine {
     }
   }
 }
+}
 
 private func jsbaySwiftCallback(
   _ instance: Int32, _ userData: UnsafeMutableRawPointer?, _ thisHandle: UInt64, _ argc: Int,

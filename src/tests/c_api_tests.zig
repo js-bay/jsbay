@@ -907,7 +907,7 @@ test "c_api: inspector start and stop preserve the build-mode contract" {
     defer c_api.jsbay_engine_destroy(id);
 
     var port: u16 = 99;
-    if (comptime !build_options.inspector) {
+    if (comptime !build_options.inspector or !build_options.inspector_transport) {
         const original_port = port;
         try testing.expect(!c_api.jsbay_engine_inspector_start(id, 0, &port));
         try testing.expectEqual(original_port, port);
