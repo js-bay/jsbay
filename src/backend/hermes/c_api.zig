@@ -29,9 +29,9 @@ pub extern fn hermes_eval(ctx: ?*Context, src: [*]const u8, src_len: usize, file
 pub extern fn hermes_eval_result_free(r: EvalResultC) void;
 pub extern fn hermes_undefined() Value;
 pub extern fn hermes_null() Value;
-pub extern fn hermes_new_bool(v: bool) Value;
-pub extern fn hermes_new_int32(v: i32) Value;
-pub extern fn hermes_new_float64(v: f64) Value;
+pub extern fn hermes_new_bool(ctx: ?*Context, v: bool) Value;
+pub extern fn hermes_new_int32(ctx: ?*Context, v: i32) Value;
+pub extern fn hermes_new_float64(ctx: ?*Context, v: f64) Value;
 pub extern fn hermes_new_string(ctx: ?*Context, utf8: [*]const u8, len: usize) Value;
 pub extern fn hermes_new_object(ctx: ?*Context) Value;
 pub extern fn hermes_new_array(ctx: ?*Context, len: u32) Value;
@@ -138,6 +138,7 @@ pub const BoolOpResult = extern struct {
 pub const ExternalFinalizer = *const fn (?*anyopaque) callconv(.c) void;
 pub const WeakFinalizer = *const fn (?*anyopaque) callconv(.c) void;
 
+pub extern fn hermes_set_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8, val: Value) OpResult;
 pub extern fn hermes_construct(ctx: ?*Context, ctor: Value, args: ?[*]const Value, argc: usize) OpResult;
 pub extern fn hermes_has_in(ctx: ?*Context, obj: Value, key: [*:0]const u8) BoolOpResult;
 pub extern fn hermes_delete_property(ctx: ?*Context, obj: Value, key: [*:0]const u8) BoolOpResult;

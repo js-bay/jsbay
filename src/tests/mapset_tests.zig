@@ -457,7 +457,7 @@ fn currentCtx() ?backend.ActiveEngine.Context {
     while (id < 20_000) : (id += 1) {
         const maybe = instance_map.withInstanceReturn(id, struct {
             pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?backend.ActiveEngine.Context {
-                return inst.ctx;
+                return inst.monoCtx();
             }
         }{});
         if (maybe) |c| return c;

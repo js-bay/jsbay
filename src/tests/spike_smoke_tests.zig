@@ -73,13 +73,12 @@ fn nhFin(ptr: ?*anyopaque) void {
 }
 
 fn nhCall(ctx: native_handle.Context, this: native_handle.Value, args: []const native_handle.Value) native_handle.Value {
-    _ = ctx;
     _ = this;
     _ = args;
     // return 42
     return switch (backend.active_backend) {
         .escargot => @import("../backend/escargot/c_api.zig").escargot_new_int32(42),
-        .hermes => @import("../backend/hermes/c_api.zig").hermes_new_int32(42),
+        .hermes => @import("../backend/hermes/c_api.zig").hermes_new_int32(ctx, 42),
         else => null,
     };
 }
@@ -143,7 +142,7 @@ fn nhMethodInc(ctx: native_handle.Context, this: native_handle.Value, args: []co
     counter.* += 1;
     return switch (backend.active_backend) {
         .escargot => @import("../backend/escargot/c_api.zig").escargot_new_int32(counter.*),
-        .hermes => @import("../backend/hermes/c_api.zig").hermes_new_int32(counter.*),
+        .hermes => @import("../backend/hermes/c_api.zig").hermes_new_int32(ctx, counter.*),
         else => null,
     };
 }

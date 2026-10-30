@@ -189,6 +189,7 @@ typedef struct {
     EscargotValue exception;
 } EscargotBoolOpResult;
 
+EscargotOpResult escargot_set_property_result(EscargotContext *ctx, EscargotValue obj, const char *key, EscargotValue val);
 EscargotOpResult escargot_construct(EscargotContext *ctx, EscargotValue ctor,
                                     const EscargotValue *args, size_t argc);
 EscargotBoolOpResult escargot_has_in(EscargotContext *ctx, EscargotValue obj, const char *key);

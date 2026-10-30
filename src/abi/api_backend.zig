@@ -48,7 +48,17 @@ pub fn get(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsGet(ctx, object, key),
         .jsc => jscGet(ctx, object, key[0..key.len]),
-        .escargot, .hermes => if (ActiveEngine.getPropertyVal(ctx, object, key.ptr)) |v| .{ .value = v } else .{},
+        // Keep owned undefined for missing properties (empty Result is OOM at the C ABI boundary).
+        .escargot => blk: {
+            const c = @import("../backend/escargot/c_api.zig");
+            const v = c.escargot_get_property(ctx, object, key.ptr);
+            break :blk if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+        },
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            const v = c.hermes_get_property(ctx, object, key.ptr);
+            break :blk if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+        },
     };
 }
 
@@ -65,9 +75,18 @@ pub fn set(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsSet(ctx, object, key, value),
         .jsc => jscSet(ctx, object, key[0..key.len], value),
-        .escargot, .hermes => blk: {
-            ActiveEngine.setPropertyStr(ctx, object, key.ptr, value);
-            break :blk .{};
+        .escargot => blk: {
+            const c = @import("../backend/escargot/c_api.zig");
+            const r = c.escargot_set_property_result(ctx, object, key.ptr, value);
+            // Consume value like setPropertyStr (bridge copies into the engine).
+            ActiveEngine.freeValue(ctx, value);
+            break :blk escargotOp(r);
+        },
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            const r = c.hermes_set_property_result(ctx, object, key.ptr, value);
+            ActiveEngine.freeValue(ctx, value);
+            break :blk hermesOp(r);
         },
     };
 }

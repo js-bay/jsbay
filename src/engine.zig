@@ -125,8 +125,7 @@ pub fn create(instance_id: i32, config: types.EngineConfig) bool {
     instance.* = .{
         .resources = resources,
         .instance_id = instance_id,
-        .runtime = runtime,
-        .ctx = ctx,
+        .engine_handles = .{ .mono = .{ .runtime = runtime, .ctx = ctx } },
         .loop = loop,
         .timers = timers.TimerRegistry.init(),
         .log_handler = config.log_handler,
@@ -515,11 +514,11 @@ pub fn runGc(instance_id: i32) void {
     if (!lease.allowed) return;
     const inst = instance_map.getInstance(instance_id) orelse return;
     switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => ActiveEngine.runGc(inst.runtime),
+        .quickjs, .quickjs_ng => ActiveEngine.runGc(inst.monoRuntime().?),
         .jsc => {
             const jsc_mod = @import("backend/jsc.zig");
-            jsc_mod.JSSynchronousEdenCollectForDebugging(@ptrCast(inst.ctx));
-            jsc_mod.JSSynchronousGarbageCollectForDebugging(@ptrCast(inst.ctx));
+            jsc_mod.JSSynchronousEdenCollectForDebugging(@ptrCast(inst.monoCtx().?));
+            jsc_mod.JSSynchronousGarbageCollectForDebugging(@ptrCast(inst.monoCtx().?));
         },
         .escargot, .hermes => {},
     }
@@ -635,11 +634,16 @@ pub fn destroyRuntime(instance_id: i32) void {
 
     // 4. Free JS context and runtime
     debugger_mod.detach(instance_id);
-    if (instance.ctx != null and instance.runtime != null) {
-        ActiveEngine.runGc(instance.runtime);
-        ActiveEngine.freeContext(instance.ctx);
-        ActiveEngine.runGc(instance.runtime);
-        ActiveEngine.freeRuntime(instance.runtime);
+    switch (instance.engine_handles) {
+        .mono => |m| {
+            if (m.ctx != null and m.runtime != null) {
+                ActiveEngine.runGc(m.runtime);
+                ActiveEngine.freeContext(m.ctx);
+                ActiveEngine.runGc(m.runtime);
+                ActiveEngine.freeRuntime(m.runtime);
+            }
+        },
+        .packed_alt => |a| @import("backend_dispatch.zig").destroyPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }),
     }
     @import("inspector/async_stack.zig").deinitInstance(instance_id);
 
@@ -664,7 +668,7 @@ pub fn getContext(instance_id: i32) ?ActiveEngine.Context {
 /// Get the JS runtime for an instance. Inspector startup uses this to create a short-lived clean realm in the same runtime before retaining reflection intrinsics for its own lifetime.
 pub fn getRuntime(instance_id: i32) ?ActiveEngine.Runtime {
     const instance = instance_map.getInstance(instance_id) orelse return null;
-    return instance.runtime;
+    return instance.monoRuntime();
 }
 
 /// Walk the bookkeeping list, popping each entry and invoking its reset_fn so it can release its retained JS value before the runtime is freed. We unlink entries ourselves so reset_fn does not need to interact with the bookkeeping list (it's already detached by the time it runs).

@@ -178,15 +178,14 @@ fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, ca
         return .out_of_memory;
     }
     defer backend.ActiveEngine.freeValue(ctx, global);
-    backend.ActiveEngine.setPropertyStr(ctx, global, name_z.ptr, function);
-    // Return a distinct retain for the public handle (global keeps its own).
+    // Hermes/Escargot setPropertyStr consumes `function`; dup the public handle first.
     const returned = backend.ActiveEngine.dupValue(ctx, function);
     if (returned == null) {
         backend.ActiveEngine.freeValue(ctx, function);
         kill(slot);
         return .out_of_memory;
     }
-    backend.ActiveEngine.freeValue(ctx, function);
+    backend.ActiveEngine.setPropertyStr(ctx, global, name_z.ptr, function);
     return .{ .installed = .{ .function = returned, .binding = binding } };
 }
 

@@ -135,6 +135,7 @@ pub fn build(b: *std.Build) void {
     // Build options module passed to source code
     const build_options = b.addOptions();
     build_options.addOption(Backend, "backend", backend);
+    build_options.addOption(u32, "packed_backend_bits", 0); // mono backend builds
     build_options.addOption(bool, "stress_tests", stress_tests);
     build_options.addOption(bool, "inspector", inspector_enabled);
     build_options.addOption(bool, "inspector_transport", inspector_transport_enabled);

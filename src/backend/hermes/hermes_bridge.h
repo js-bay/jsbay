@@ -36,9 +36,9 @@ void hermes_eval_result_free(HermesEvalResult r);
 
 HermesValue hermes_undefined(void);
 HermesValue hermes_null(void);
-HermesValue hermes_new_bool(bool v);
-HermesValue hermes_new_int32(int32_t v);
-HermesValue hermes_new_float64(double v);
+HermesValue hermes_new_bool(JsbayHermesContext *ctx, bool v);
+HermesValue hermes_new_int32(JsbayHermesContext *ctx, int32_t v);
+HermesValue hermes_new_float64(JsbayHermesContext *ctx, double v);
 HermesValue hermes_new_string(JsbayHermesContext *ctx, const char *utf8, size_t len);
 HermesValue hermes_new_object(JsbayHermesContext *ctx);
 HermesValue hermes_new_array(JsbayHermesContext *ctx, uint32_t len);
@@ -178,6 +178,7 @@ typedef struct {
     HermesValue exception;
 } HermesBoolOpResult;
 
+HermesOpResult hermes_set_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key, HermesValue val);
 HermesOpResult hermes_construct(JsbayHermesContext *ctx, HermesValue ctor,
                                 const HermesValue *args, size_t argc);
 HermesBoolOpResult hermes_has_in(JsbayHermesContext *ctx, HermesValue obj, const char *key);

@@ -113,7 +113,7 @@ pub fn setStringProp(ctx: Context, obj: Value, name: [*:0]const u8, value: []con
 
 pub fn setIntProp(ctx: Context, obj: Value, name: [*:0]const u8, value: i32) void {
     if (obj == null) return;
-    const n = c_api.hermes_new_int32(value);
+    const n = c_api.hermes_new_int32(ctx, value);
     defer c_api.hermes_free_value(ctx, n);
     _ = c_api.hermes_set_property(ctx, obj, name, n);
 }

@@ -444,9 +444,18 @@ extern "C" HermesValue hermes_null(void) {
     static jsi::Value kNull = jsi::Value::null();
     return &kNull;
 }
-extern "C" HermesValue hermes_new_bool(bool v) { return new jsi::Value(v); }
-extern "C" HermesValue hermes_new_int32(int32_t v) { return new jsi::Value((double)v); }
-extern "C" HermesValue hermes_new_float64(double v) { return new jsi::Value(v); }
+extern "C" HermesValue hermes_new_bool(JsbayHermesContext *c, bool v) {
+    if (!c) return nullptr;
+    return retainMove(c, jsi::Value(v));
+}
+extern "C" HermesValue hermes_new_int32(JsbayHermesContext *c, int32_t v) {
+    if (!c) return nullptr;
+    return retainMove(c, jsi::Value((double)v));
+}
+extern "C" HermesValue hermes_new_float64(JsbayHermesContext *c, double v) {
+    if (!c) return nullptr;
+    return retainMove(c, jsi::Value(v));
+}
 
 extern "C" HermesValue hermes_new_string(JsbayHermesContext *c, const char *utf8, size_t len) {
     if (!c || !c->rt) return nullptr;
@@ -620,10 +629,11 @@ extern "C" HermesValue hermes_call(JsbayHermesContext *c, HermesValue fn, Hermes
             if (args && args[i]) argv.emplace_back(jsi::Value(*c->rt, *asVal(args[i])));
             else argv.emplace_back(jsi::Value::undefined());
         }
-        jsi::Object thisObj = (this_val && asVal(this_val)->isObject())
-            ? asVal(this_val)->getObject(*c->rt)
-            : c->rt->global();
-        jsi::Value result = f.callWithThis(*c->rt, thisObj, (const jsi::Value *)argv.data(), argc);
+        // Preserve null/undefined/primitive this (strict-mode semantics via Runtime::call).
+        jsi::Value thisArg = (this_val && asVal(this_val))
+            ? jsi::Value(*c->rt, *asVal(this_val))
+            : jsi::Value::undefined();
+        jsi::Value result = c->rt->call(f, thisArg, (const jsi::Value *)argv.data(), argc);
         return retainMove(c, std::move(result));
     } catch (const jsi::JSError &e) {
         if (out_err) *out_err = dupCString(e.getMessage());
@@ -1481,6 +1491,23 @@ static bool hermesIsConstructor(jsi::Runtime &rt, const jsi::Value &v) {
         return true; // Reflect said yes; keep that if introspection fails
     }
     return false;
+}
+
+extern "C" HermesOpResult hermes_set_property_result(JsbayHermesContext *c, HermesValue obj, const char *key, HermesValue val) {
+    HermesOpResult out{nullptr, nullptr};
+    if (!c || !c->rt || !obj || !key) return out;
+    try {
+        if (!asVal(obj)->isObject()) {
+            return hopFail(c, makeTypeError(*c->rt, "cannot set property of non-object"));
+        }
+        jsi::Value v = val ? jsi::Value(*c->rt, *asVal(val)) : jsi::Value::undefined();
+        asVal(obj)->getObject(*c->rt).setProperty(*c->rt, key, v);
+        return hopOk(c, jsi::Value::undefined());
+    } catch (const jsi::JSError &e) {
+        return hopFail(c, jsi::Value(*c->rt, e.value()));
+    } catch (...) {
+        return out;
+    }
 }
 
 extern "C" HermesOpResult hermes_construct(JsbayHermesContext *c, HermesValue ctor,

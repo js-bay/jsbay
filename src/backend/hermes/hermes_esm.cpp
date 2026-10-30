@@ -100,11 +100,22 @@ static std::string rewriteIdents(const std::string &src,
             continue;
         }
         if (isIdentStart(c)) {
+            // Only rewrite free identifier references — not object keys or member names after `.`.
+            bool after_dot = false;
+            if (!out.empty()) {
+                size_t k = out.size();
+                while (k > 0 && std::isspace(static_cast<unsigned char>(out[k - 1]))) --k;
+                if (k > 0 && out[k - 1] == '.') after_dot = true;
+            }
             size_t j = i + 1;
             while (j < src.size() && isIdent(src[j])) ++j;
+            size_t k = j;
+            while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
+            // Object-literal key `ident:` (but not `ident::` labels / TypeScript).
+            bool object_key = (k < src.size() && src[k] == ':' && !(k + 1 < src.size() && src[k + 1] == ':'));
             std::string id = src.substr(i, j - i);
             auto it = repl.find(id);
-            if (it != repl.end())
+            if (!after_dot && !object_key && it != repl.end())
                 out += it->second;
             else
                 out += id;
@@ -631,12 +642,14 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
     std::string source(src, src_len);
     try {
         auto &rt = *hermes_context_rt(c);
-        // Ensure a loader exists for require during entry
-        HermesModLoader ephemeral;
+        // Ensure a loader exists for require during entry. makeRequire closures capture the
+        // loader pointer, so it must outlive this stack frame (heap / context map).
         HermesModLoader *use = loader;
         if (!use) {
-            ephemeral = HermesModLoader{};
-            use = &ephemeral;
+            auto owned = std::make_unique<HermesModLoader>();
+            use = owned.get();
+            std::lock_guard<std::mutex> lock(g_mod_mu);
+            g_mod_loaders.emplace(c, std::move(owned));
         }
         // Entry: register synthetic module under filename, evaluate
         auto rec = std::make_shared<HermesModuleRecord>(HermesModuleRecord{jsi::Object(rt), true, false});

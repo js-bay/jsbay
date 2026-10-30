@@ -101,13 +101,13 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
             // Safe: the two extern structs have identical layout.
             const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
-            qjs_mod.qjsInstallInterruptHandler(inst.runtime, qjs_state);
+            qjs_mod.qjsInstallInterruptHandler(inst.monoRuntime().?, qjs_state);
         },
         .jsc => {
             const jsc_mod = @import("../backend/jsc.zig");
             const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
             // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
-            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.ctx));
+            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.monoCtx().?));
             jsc_mod.jscInstallInterruptHandler(group, jsc_state);
         },
         .escargot, .hermes => {},
@@ -127,11 +127,11 @@ pub fn deinit(instance_id: i32) bool {
         switch (backend.active_backend) {
             .quickjs, .quickjs_ng => {
                 const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsUninstallInterruptHandler(inst.runtime);
+                qjs_mod.qjsUninstallInterruptHandler(inst.monoRuntime().?);
             },
             .jsc => {
                 const jsc_mod = @import("../backend/jsc.zig");
-                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.ctx));
+                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.monoCtx().?));
                 jsc_mod.jscUninstallInterruptHandler(group);
             },
             .escargot, .hermes => {},
@@ -147,7 +147,7 @@ fn hermesTriggerTimeout(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
     const inst = instance_map.getInstance(instance_id) orelse return;
     const her = @import("../backend/hermes.zig");
-    her.c_api_mod.hermes_runtime_async_trigger_timeout(inst.runtime);
+    her.c_api_mod.hermes_runtime_async_trigger_timeout(inst.monoRuntime().?);
 }
 
 fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
@@ -155,18 +155,18 @@ fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
     const inst = instance_map.getInstance(instance_id) orelse return;
     const her = @import("../backend/hermes.zig");
     if (millis == 0) {
-        her.c_api_mod.hermes_runtime_unwatch_time_limit(inst.runtime);
+        her.c_api_mod.hermes_runtime_unwatch_time_limit(inst.monoRuntime().?);
         return;
     }
     const capped: u32 = if (millis > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(millis);
-    her.c_api_mod.hermes_runtime_watch_time_limit(inst.runtime, capped);
+    her.c_api_mod.hermes_runtime_watch_time_limit(inst.monoRuntime().?, capped);
 }
 
 fn hermesDrainAsyncTimeout(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
     const inst = instance_map.getInstance(instance_id) orelse return;
     const her = @import("../backend/hermes.zig");
-    her.c_api_mod.hermes_runtime_drain_async_timeout(inst.runtime);
+    her.c_api_mod.hermes_runtime_drain_async_timeout(inst.monoRuntime().?);
 }
 
 /// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from
@@ -338,20 +338,20 @@ pub fn runGc(instance_id: i32) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsRunGc(inst.runtime);
+            qjs_mod.qjsRunGc(inst.monoRuntime().?);
         },
         .jsc => {
             const jsc_mod = @import("../backend/jsc.zig");
-            jsc_mod.jscRunGc(inst.ctx);
+            jsc_mod.jscRunGc(inst.monoCtx().?);
         },
         .escargot => {
             const esc = @import("../backend/escargot.zig");
-            esc.EscargotBackend.runGc(inst.runtime);
+            esc.EscargotBackend.runGc(inst.monoRuntime().?);
         },
         .hermes => {
             const her = @import("../backend/hermes.zig");
             // Bridge stub today; still invoke so the host path is wired.
-            her.HermesBackend.runGc(inst.runtime);
+            her.HermesBackend.runGc(inst.monoRuntime().?);
         },
     }
     return true;
@@ -363,7 +363,7 @@ pub fn setMemoryLimit(instance_id: i32, bytes: u64) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsSetMemoryLimit(inst.runtime, @intCast(bytes));
+            qjs_mod.qjsSetMemoryLimit(inst.monoRuntime().?, @intCast(bytes));
         },
         .jsc => {
             // No public JSC heap-cap API. Do not claim an unenforced cap.
@@ -490,7 +490,7 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            const snap = qjs_mod.qjsMemoryUsage(inst.runtime);
+            const snap = qjs_mod.qjsMemoryUsage(inst.monoRuntime().?);
             return .{
                 .malloc_count = snap.malloc_count,
                 .malloc_size = snap.malloc_size,
@@ -511,8 +511,8 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
         .escargot => {
             // Soft approximation: bdwgc heapSize/totalSize (not QJS malloc_* shape).
             const esc = @import("../backend/escargot.zig");
-            const heap = esc.c_api_mod.escargot_runtime_heap_size(inst.runtime);
-            const total = esc.c_api_mod.escargot_runtime_total_size(inst.runtime);
+            const heap = esc.c_api_mod.escargot_runtime_heap_size(inst.monoRuntime().?);
+            const total = esc.c_api_mod.escargot_runtime_total_size(inst.monoRuntime().?);
             return .{
                 .malloc_size = heap,
                 .memory_used_size = total,
@@ -521,8 +521,8 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
         .hermes => {
             // Soft approximation: JSI instrumentation getHeapInfo.
             const her = @import("../backend/hermes.zig");
-            const allocated = her.c_api_mod.hermes_runtime_allocated_bytes(inst.runtime);
-            const heap = her.c_api_mod.hermes_runtime_heap_size(inst.runtime);
+            const allocated = her.c_api_mod.hermes_runtime_allocated_bytes(inst.monoRuntime().?);
+            const heap = her.c_api_mod.hermes_runtime_heap_size(inst.monoRuntime().?);
             return .{
                 .malloc_size = allocated,
                 .memory_used_size = heap,

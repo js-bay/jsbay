@@ -139,6 +139,7 @@ pub const BoolOpResult = extern struct {
 pub const ExternalFinalizer = *const fn (?*anyopaque) callconv(.c) void;
 pub const WeakFinalizer = *const fn (?*anyopaque) callconv(.c) void;
 
+pub extern fn escargot_set_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8, val: Value) OpResult;
 pub extern fn escargot_construct(ctx: ?*Context, ctor: Value, args: ?[*]const Value, argc: usize) OpResult;
 pub extern fn escargot_has_in(ctx: ?*Context, obj: Value, key: [*:0]const u8) BoolOpResult;
 pub extern fn escargot_delete_property(ctx: ?*Context, obj: Value, key: [*:0]const u8) BoolOpResult;

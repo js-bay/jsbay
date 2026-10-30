@@ -42,8 +42,7 @@ host_object, ESM (ModuleLoader), text CJS/`require` (no QJS-shaped bytecode CJS 
 | rejection tracker | **yes** | `registerPromiseRejectCallback`; report after microtask drain |
 | buffer copy / transferable | **partial** | native transfer green; C `copyBuffer` imported; DataView OOB-after-resize → INVALID (aligned with QJS) |
 
-`zig build test-engine -Dbackend=escargot`: **491 pass / 61 skip / 0 fail**
-(2026-10-31 Asia/Shanghai; soft getMemoryUsage; after-stop/nested/filename peeled; ET host + interrupt + DestroyDefer permanent).
+`zig build test-engine -Dbackend=escargot`: **491 pass / 61 skip / 0 fail** (soft getMemoryUsage; ET host + interrupt + DestroyDefer permanent).
 
 ## Hermes (`-Dbackend=hermes`)
 
@@ -81,11 +80,9 @@ bytecode (hermesc + JSI), text CJS/`require`, host-side ESM ModuleLoader shim
 | native_function host-throw | **yes** | NativeResult.err / nested throw / CJS missing-module / value `.err` OK; getPropertyString loop green (`var` across Hermes evals) |
 | async / async generators in fixtures | **no** | this Hermes build strips them |
 
-`zig build test-engine -Dbackend=hermes`: **531 pass / 30 skip / 0 fail**
-(2026-10-31 Asia/Shanghai; create-time MaxHeapSize + soft getMemoryUsage; destroy-defer/nested/filename/after-stop green; resize permanent; setMemoryLimit false).
+`zig build test-engine -Dbackend=hermes`: **531 pass / 30 skip / 0 fail** (create-time MaxHeapSize + soft getMemoryUsage; resize permanent; setMemoryLimit false).
 
-`zig build test-engine` (QuickJS-NG default): **1059 pass / 13 skip / 0 fail**
-(same day, same tree).
+`zig build test-engine` (QuickJS-NG default): **1059 pass / 13 skip / 0 fail**.
 
 `JSBAY_HERMESC` overrides hermesc if it is not on `PATH` / `vendor/hermes-install/bin/hermesc`.
 
@@ -193,27 +190,27 @@ Smoke `engine_thread post/wait eval` **un-Skipped and green**. Non-threaded back
 - Hermes `ArrayBuffer.resize` — **permanent Skip**
 - inspector / CDP; CJS bytecode cache (QJS-only); Hermes ESM beyond TLA; native_handle class_id
 
-### Gated counts (2026-10-31 Asia/Shanghai)
+### Gated counts
 
 | Backend | pass | skip | fail |
 |---------|------|------|------|
 | Escargot | 491 | 61 | 0 |
 | Hermes | 531 | 30 | 0 |
 
-## 能力快照（相对 QuickJS-NG；**非生产标签** / diminishing returns）
+## Capability snapshot (vs QuickJS-NG; **not a production tag** / diminishing returns)
 
-**已接近 QJS 体验（spike 可用主路径）**
-- eval / value / object_ops / Promise / CJS 文本 / host throw / native_handle（method+finalize）
-- Hermes：engine_thread 全契约含 destroy-defer、interrupt（soft）、bind_sync、exotic TypedArray copy
-- Escargot：THREADING smoke、same-thread host、ESM ModuleLoader、基本 buffer
-- 两边：`runGc` + **软** `getMemoryUsage`（观测用，非 QJS malloc 形）
-- Hermes：创建时堆顶 `EngineConfig.max_heap_size` / `-Dhermes-max-heap` / **`js_bay_engine_create2.max_heap_size`**（**非**运行时 `setMemoryLimit`）
-- spike：`requestInterrupt` **返回 false**（不宣称 mid-script）
+**Near QuickJS experience (usable spike main paths)**
+- eval / value / object_ops / Promise / text CJS / host throw / native_handle (method + finalize)
+- Hermes: engine_thread contracts including destroy-defer, soft interrupt, bind_sync, exotic TypedArray copy
+- Escargot: THREADING smoke, same-thread host, ESM ModuleLoader, basic buffers
+- Both: `runGc` + soft `getMemoryUsage` (observation-only; not QuickJS malloc layout)
+- Hermes: create-time heap cap via `EngineConfig.max_heap_size` / `-Dhermes-max-heap` / `js_bay_engine_create2.max_heap_size` (not runtime `setMemoryLimit`)
+- Spike: `requestInterrupt` returns `false` (no mid-script claim)
 
-**仍硬缺口（打生产标签前需接受或换引擎）**
-- Escargot：**无** mid-script interrupt；ET×host 跨线程不可（需 Shell 式 per-thread VM）
-- 两边：**无** 运行时 `setMemoryLimit`（Hermes 仅创建时 MaxHeapSize；Escargot 无 cap）；无 inspector/CDP；无 QJS 形 CJS bytecode cache
-- Hermes：无 `ArrayBuffer.resize`；ESM 为 shim 非原生 module codegen
-- Escargot DestroyDefer / 精确 weak：bdwgc 限制
+**Hard gaps (accept or switch engines before a production tag)**
+- Escargot: no mid-script interrupt; ET×host cannot cross threads (needs per-thread VM)
+- Both: no runtime `setMemoryLimit` (Hermes create-time MaxHeapSize only; Escargot has no cap); no inspector/CDP; no QuickJS-shaped CJS bytecode cache
+- Hermes: no `ArrayBuffer.resize`; ESM is a shim, not native module codegen
+- Escargot DestroyDefer / precise weak: bdwgc limits
 
-**判断**：本 spike 树对「廉价 Skip→pass」已接近 **diminishing returns**；剩余多为上游/架构级永久缺口。
+**Assessment**: cheap Skip→pass work on this spike is at **diminishing returns**; remaining gaps are mostly upstream or architectural.

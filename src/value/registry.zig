@@ -26,7 +26,7 @@ pub fn registerFunction(
         instance_id,
         struct {
             pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?ActiveEngine.Context {
-                return inst.ctx;
+                return inst.monoCtx();
             }
         }{},
     ) orelse return;
@@ -52,7 +52,7 @@ pub fn registerObjectWithFunctions(
         instance_id,
         struct {
             pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?ActiveEngine.Context {
-                return inst.ctx;
+                return inst.monoCtx();
             }
         }{},
     ) orelse return;
@@ -194,8 +194,8 @@ fn HermesWrapper(comptime handler: NativeHandler) type {
             switch (result) {
                 .null_val => return c_api.hermes_null(),
                 .undefined_val => return c_api.hermes_undefined(),
-                .boolean => |v| return c_api.hermes_new_bool(v),
-                .number => |v| return c_api.hermes_new_float64(v),
+                .boolean => |v| return c_api.hermes_new_bool(ctx, v),
+                .number => |v| return c_api.hermes_new_float64(ctx, v),
                 .string => |s| {
                     defer std.heap.c_allocator.free(@constCast(s));
                     return c_api.hermes_new_string(ctx, s.ptr, s.len);

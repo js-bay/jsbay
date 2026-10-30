@@ -1,6 +1,6 @@
 //! Reference lifecycle — Local / Global(T) / Weak(T) / Scope / StackFrameScope.
 //!
-//! This is the Zig/js-bay analog of ScriptX's Local/Global/Weak and JSI's `jsi::Value`/`jsi::Function::createFromHostFunction` machinery. Users who need to hold a JS `Value` across scope boundaries (e.g. store a callback in a Zig data structure) should reach for `Global(T)`; temporary in-scope values are the backend-native `Local` (aka `ActiveEngine.Value`).
+//! Users who need to hold a JS `Value` across scope boundaries (e.g. store a callback in a Zig data structure) should reach for `Global(T)`; temporary in-scope values are the backend-native `Local` (aka `ActiveEngine.Value`).
 //!
 //! ## Lifetime summary
 //!
@@ -8,8 +8,8 @@
 //! - `Global(T)` — retained across scopes. `init` duplicates the value; the retained value is released on `reset` (or when the owning engine is destroyed, see `engine.destroy` → bookkeeping walk).
 //! - `Weak(T)` — **true weak** reference on JS objects. `get()` returns null once the target has been garbage collected. See "Weak semantics" below.
 //! - `Rooted` — refcounted GC root. `root` calls the backend protect only on the 0→1 edge; `unroot` releases only when the count returns to 0. `Global` is unchanged and still protects exactly once.
-//! - `Scope` — threadlocal stack that `currentInstanceId()` reads. Not yet required before every API call; exists so consumers can query the active engine id without passing it everywhere (mirrors ScriptX).
-//! - `StackFrameScope` — thin wrapper around `dupValue` for values that need to escape a frame. Matches ScriptX semantics.
+//! - `Scope` — threadlocal stack that `currentInstanceId()` reads. Not yet required before every API call; exists so consumers can query the active engine id without passing it everywhere.
+//! - `StackFrameScope` — thin wrapper around `dupValue` for values that need to escape a frame.
 //!
 //! ## Weak semantics
 //!
@@ -294,7 +294,7 @@ fn rootBackendUnprotect(ctx: ActiveEngine.Context, v: Local) void {
 // Global(T)
 // ----------------------------------------------------------------------
 
-/// Retained reference to a JS value, safe to hold across scope boundaries. `T` is a phantom marker kept for API parity with ScriptX (Global<Value>, Global<Function>, ...). The Zig implementation does not currently distinguish on T at runtime; consumers may still use it for clarity at the type site.
+/// Retained reference to a JS value, safe to hold across scope boundaries. `T` is a phantom type marker (e.g. Global(Value), Global(Function)); the Zig implementation does not currently distinguish on T at runtime; consumers may still use it for clarity at the type site.
 ///
 /// Ownership: a Global is a unique handle to the underlying heap cell. Copying the struct aliases the cell; deinit'ing one copy leaves any other copies with a dangling pointer. Pass Globals by pointer, or move them (do not use the source after assignment).
 pub fn Global(comptime T: type) type {

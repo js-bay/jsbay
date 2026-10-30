@@ -70,14 +70,14 @@ pub fn toFloat64(_: Context, v: Value) ?f64 {
     if (v == null) return null;
     return c_api.hermes_to_float64(v);
 }
-pub fn newBoolVal(_: Context, v: bool) Value {
-    return c_api.hermes_new_bool(v);
+pub fn newBoolVal(ctx: Context, v: bool) Value {
+    return c_api.hermes_new_bool(ctx, v);
 }
-pub fn newInt32Val(_: Context, v: i32) Value {
-    return c_api.hermes_new_int32(v);
+pub fn newInt32Val(ctx: Context, v: i32) Value {
+    return c_api.hermes_new_int32(ctx, v);
 }
-pub fn newFloat64Val(_: Context, v: f64) Value {
-    return c_api.hermes_new_float64(v);
+pub fn newFloat64Val(ctx: Context, v: f64) Value {
+    return c_api.hermes_new_float64(ctx, v);
 }
 pub fn newStringVal(ctx: Context, s: []const u8) Value {
     return c_api.hermes_new_string(ctx, s.ptr, s.len);

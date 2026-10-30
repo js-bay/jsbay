@@ -211,7 +211,16 @@ fn deleteGlobalProperty(ctx: ActiveEngine.Context, global: ActiveEngine.Value, k
             var exception: jsc_mod.jsc.JSValueRef = null;
             _ = jsc_mod.jsc.JSObjectDeleteProperty(@ptrCast(ctx), @ptrCast(@constCast(global)), property, &exception);
         },
-        .escargot, .hermes => {},
+        .escargot => {
+            const c = @import("../backend/escargot/c_api.zig");
+            const r = c.escargot_delete_property(ctx, global, key.ptr);
+            if (r.exception) |e| ActiveEngine.freeValue(ctx, e);
+        },
+        .hermes => {
+            const c = @import("../backend/hermes/c_api.zig");
+            const r = c.hermes_delete_property(ctx, global, key.ptr);
+            if (r.exception) |e| ActiveEngine.freeValue(ctx, e);
+        },
     }
 }
 

@@ -1378,6 +1378,25 @@ static ValueRef *retainedErrorOrNull(EscargotContextOpaque *c, const Evaluator::
     return nullptr;
 }
 
+extern "C" EscargotOpResult escargot_set_property_result(EscargotContext *c, EscargotValue obj, const char *key, EscargotValue val) {
+    EscargotOpResult out{nullptr, nullptr};
+    if (!c || !obj || !key) return out;
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, ValueRef *o, const char *k, ValueRef *v) -> ValueRef * {
+            if (!o->isObject()) {
+                state->throwException(ErrorObjectRef::create(state, ErrorObjectRef::Code::TypeError,
+                    StringRef::createFromUTF8("cannot set property of non-object", 33)));
+                return ValueRef::createUndefined();
+            }
+            o->asObject()->set(state, StringRef::createFromUTF8(k, std::strlen(k)),
+                v ? v : ValueRef::createUndefined());
+            return ValueRef::createUndefined();
+        },
+        asVal(obj), key, asVal(val));
+    if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
+    return opOk(c, ValueRef::createUndefined());
+}
+
 extern "C" EscargotOpResult escargot_construct(EscargotContext *c, EscargotValue ctor,
                                                const EscargotValue *args, size_t argc) {
     EscargotOpResult out{nullptr, nullptr};
