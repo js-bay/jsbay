@@ -8,7 +8,9 @@ dotnet_bin=${DOTNET:-dotnet}
 command -v "$dotnet_bin" >/dev/null
 optimize=${JSBAY_CI_OPTIMIZE:-Debug}
 case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) zig build "-Dbackend=$backend" "-Doptimize=$optimize" -Dlibrary-only=true -Dshared=true -Dinspector-transport=false --summary all ;;
+  # Pin mingw: windows-gnu shared exports match DllImport cdecl names. Native MSVC builds
+  # on GHA have produced jsbay.dll without a resolvable jsbay_engine_create entry point.
+  MINGW*|MSYS*|CYGWIN*) zig build "-Dbackend=$backend" "-Doptimize=$optimize" -Dtarget=x86_64-windows-gnu -Dlibrary-only=true -Dshared=true -Dinspector-transport=false --summary all ;;
   *) zig build "-Dbackend=$backend" "-Doptimize=$optimize" -Dlibrary-only=true -Dshared=true --summary all ;;
 esac
 created_artifacts=0

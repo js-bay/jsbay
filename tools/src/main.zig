@@ -178,8 +178,8 @@ fn checkCAbi(args: []const []const u8) !u8 {
         const symbol_raw = it.next() orelse continue;
         if (!isHex(address) or kind.len != 1 or (kind[0] >= 'a' and kind[0] <= 'z' and kind[0] == 'u') or kind[0] == 'U') continue;
         const symbol = if (std.mem.startsWith(u8, symbol_raw, "_")) symbol_raw[1..] else symbol_raw;
-        // QuickJS C shims (jsbay_qjs_*) are engine-private wrappers for Zig; not public ABI.
-        if (std.mem.startsWith(u8, symbol, "jsbay_") and !std.mem.startsWith(u8, symbol, "jsbay_qjs_")) try actual.put(symbol, {});
+        // QuickJS/JSC C shims (jsbay_qjs_*, jsbay_jsc_*) are engine-private wrappers for Zig; not public ABI.
+        if (std.mem.startsWith(u8, symbol, "jsbay_") and !std.mem.startsWith(u8, symbol, "jsbay_qjs_") and !std.mem.startsWith(u8, symbol, "jsbay_jsc_")) try actual.put(symbol, {});
         if (std.mem.startsWith(u8, symbol, "no" ++ "ok_engine_") or std.mem.startsWith(u8, symbol, "z" ++ "je_") or std.mem.startsWith(u8, symbol, "z" ++ "jse_") or std.mem.startsWith(u8, symbol, "Java_") or std.mem.eql(u8, symbol, "JNI_OnLoad")) try forbidden.append(allocator, symbol);
     }
     var failed = false;

@@ -3,10 +3,10 @@
 #include <jni.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdatomic.h>
 
 /* This adapter is deliberately separate from libjsbay: RegisterNatives binds the library-owned io.jsbay.Native class and the core exports no Java symbol. */
 static jlongArray result(JNIEnv *e, int status, uint64_t value, uint64_t exception) {
@@ -162,8 +162,7 @@ static jboolean install_event_handler(JNIEnv *e, host_hooks *h, jint id, jobject
         return jsbay_engine_set_event_handler(id, NULL, NULL);
     }
     jclass cls = (*e)->GetObjectClass(e, eventHandler);
-    h->event_mid =
-        cls ? (*e)->GetMethodID(e, cls, "onEvent", "(IIIJLjava/lang/String;)V") : NULL;
+    h->event_mid = cls ? (*e)->GetMethodID(e, cls, "onEvent", "(IIIJLjava/lang/String;)V") : NULL;
     if (cls)
         (*e)->DeleteLocalRef(e, cls);
     if (!h->event_mid)
@@ -194,9 +193,9 @@ static bool fill_limits(jsbay_resource_limits_t *out, jlong max_timers, jlong ma
     };
     return true;
 }
-static jboolean create_with_limits(JNIEnv *e, jclass c, jint id, jlong max_timers, jlong max_tsfn_handles,
-                                   jlong max_pending_calls, jlong max_pending_bytes,
-                                   jlong max_pending_tasks) {
+static jboolean create_with_limits(JNIEnv *e, jclass c, jint id, jlong max_timers,
+                                   jlong max_tsfn_handles, jlong max_pending_calls,
+                                   jlong max_pending_bytes, jlong max_pending_tasks) {
     (void)e;
     (void)c;
     jsbay_resource_limits_t limits;
@@ -205,9 +204,9 @@ static jboolean create_with_limits(JNIEnv *e, jclass c, jint id, jlong max_timer
         return JNI_FALSE;
     return jsbay_engine_create_with_limits(id, NULL, NULL, &limits);
 }
-static jboolean set_resource_limits(JNIEnv *e, jclass c, jint id, jlong max_timers, jlong max_tsfn_handles,
-                                    jlong max_pending_calls, jlong max_pending_bytes,
-                                    jlong max_pending_tasks) {
+static jboolean set_resource_limits(JNIEnv *e, jclass c, jint id, jlong max_timers,
+                                    jlong max_tsfn_handles, jlong max_pending_calls,
+                                    jlong max_pending_bytes, jlong max_pending_tasks) {
     (void)e;
     (void)c;
     jsbay_resource_limits_t limits;
@@ -289,8 +288,7 @@ static jboolean create_with_handlers(JNIEnv *e, jclass c, jint id, jobject logHa
     void *log_ud = NULL;
     if (logHandler) {
         jclass cls = (*e)->GetObjectClass(e, logHandler);
-        h->log_mid =
-            cls ? (*e)->GetMethodID(e, cls, "onLog", "(IILjava/lang/String;)V") : NULL;
+        h->log_mid = cls ? (*e)->GetMethodID(e, cls, "onLog", "(IILjava/lang/String;)V") : NULL;
         if (cls)
             (*e)->DeleteLocalRef(e, cls);
         if (!h->log_mid) {
@@ -356,9 +354,9 @@ static jlongArray get_memory_usage(JNIEnv *e, jclass c, jint id) {
     u.struct_size = (uint32_t)sizeof(u);
     if (!jsbay_engine_get_memory_usage(id, &u))
         return NULL;
-    jlong vals[10] = {(jlong)u.malloc_count,     (jlong)u.malloc_size,  (jlong)u.malloc_limit,
+    jlong vals[10] = {(jlong)u.malloc_count,      (jlong)u.malloc_size,      (jlong)u.malloc_limit,
                       (jlong)u.memory_used_count, (jlong)u.memory_used_size, (jlong)u.atom_count,
-                      (jlong)u.atom_size,         (jlong)u.obj_count,   (jlong)u.obj_size,
+                      (jlong)u.atom_size,         (jlong)u.obj_count,        (jlong)u.obj_size,
                       (jlong)u.shape_count};
     jlongArray out = (*e)->NewLongArray(e, 10);
     if (out)
@@ -838,8 +836,8 @@ static jlongArray string_constructor(JNIEnv *e, jint id, jstring text, int which
     jsbay_utf8_t s = utf(e, text, &h);
     uint64_t o = 0, x = 0;
     jsbay_status_t status = which == 0   ? jsbay_value_new_string(id, s, &o)
-                             : which == 1 ? jsbay_value_new_json(id, s, &o, &x)
-                                          : jsbay_value_new_error(id, s, &o);
+                            : which == 1 ? jsbay_value_new_json(id, s, &o, &x)
+                                         : jsbay_value_new_error(id, s, &o);
     done(e, h, s);
     return result(e, status, o, x);
 }
@@ -950,7 +948,7 @@ static int jni_failed(JNIEnv *e) {
     return 1;
 }
 static jsbay_status_t callback_throwable_error(JNIEnv *e, int id, jobject throwable,
-                                                jsbay_value_t *out_exception) {
+                                               jsbay_value_t *out_exception) {
     if (!throwable)
         return callback_error(id, "Java callback threw", out_exception);
     jclass c = (*e)->GetObjectClass(e, throwable);
@@ -1027,8 +1025,8 @@ static int test_fault(int stage) {
     return 0;
 }
 static jsbay_status_t bridge(int id, void *raw, jsbay_value_t self, size_t argc,
-                              const jsbay_value_t *args, jsbay_value_t *out_value,
-                              jsbay_value_t *out_exception) {
+                             const jsbay_value_t *args, jsbay_value_t *out_value,
+                             jsbay_value_t *out_exception) {
     binding_t *binding = raw;
     JNIEnv *e = NULL;
     *out_value = 0;
@@ -1305,7 +1303,7 @@ static void inspector_stop(JNIEnv *e, jclass c, jint id) {
 static void sync_complete_error(uint64_t request) {
     static const char message[] = "Android sync starter threw";
     (void)jsbay_sync_complete(request, JSBAY_EXCEPTION, JSBAY_SYNC_PAYLOAD_UTF8_STRING,
-                               (jsbay_utf8_t){(const uint8_t *)message, sizeof(message) - 1});
+                              (jsbay_utf8_t){(const uint8_t *)message, sizeof(message) - 1});
 }
 static void sync_start(int id, void *raw, uint64_t request, jsbay_value_t self, size_t argc,
                        const jsbay_value_t *args) {
@@ -1463,21 +1461,22 @@ static jlongArray bind_sync(JNIEnv *e, jclass c, jint id, jstring name, jobject 
         return result(e, JSBAY_INVALID_ARGUMENT, 0, 0);
     }
     jsbay_status_t s = jsbay_engine_bind_sync(id, n, sync_start, binding, finalize_binding,
-                                                (uint64_t)timeout, &fn, &x);
+                                              (uint64_t)timeout, &fn, &x);
     done(e, h, n);
     if (s != JSBAY_OK)
         finalize_binding(binding);
     return result(e, s, fn, x);
 }
-static jint sync_complete(JNIEnv *e, jclass c, jlong request, jint outcome, jint kind, jbyteArray data) {
+static jint sync_complete(JNIEnv *e, jclass c, jlong request, jint outcome, jint kind,
+                          jbyteArray data) {
     (void)c;
     jsize n = data ? (*e)->GetArrayLength(e, data) : 0;
     jbyte *p = n ? (*e)->GetByteArrayElements(e, data, NULL) : NULL;
     if (n && !p)
         return JSBAY_OUT_OF_MEMORY;
     jsbay_status_t s = jsbay_sync_complete((uint64_t)request, (jsbay_status_t)outcome,
-                                             (jsbay_sync_payload_kind_t)kind,
-                                             (jsbay_utf8_t){(const uint8_t *)p, (size_t)n});
+                                           (jsbay_sync_payload_kind_t)kind,
+                                           (jsbay_utf8_t){(const uint8_t *)p, (size_t)n});
     if (p)
         (*e)->ReleaseByteArrayElements(e, data, p, JNI_ABORT);
     return (jint)s;
@@ -1533,7 +1532,8 @@ static JNINativeMethod methods[] = {
     {"setResourceLimits", "(IJJJJJ)Z", set_resource_limits},
     {"resourceUsage", "(I)[J", resource_usage},
     {"globalResourceUsage", "()[J", global_resource_usage},
-    {"createWithHandlers", "(ILio/jsbay/LogHandler;Lio/jsbay/EventHandler;)Z", create_with_handlers},
+    {"createWithHandlers", "(ILio/jsbay/LogHandler;Lio/jsbay/EventHandler;)Z",
+     create_with_handlers},
     {"destroy", "(I)V", destroy},
     {"setEventHandler", "(ILio/jsbay/EventHandler;)Z", set_event_handler},
     {"getMemoryUsage", "(I)[J", get_memory_usage},
