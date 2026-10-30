@@ -92,6 +92,21 @@ pub fn build(b: *std.Build) void {
     }
 
     // This executable is deliberately owned by the zev package: applications may call it, but the reusable package never imports root-project tools.
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zev", .module = zev }},
+    });
+    const bench = b.addExecutable(.{
+        .name = "zev-bench",
+        .root_module = bench_module,
+    });
+    b.installArtifact(bench);
+    const run_bench = b.addRunArtifact(bench);
+    const bench_step = b.step("bench", "Run zev Notifier/Timer microbenchmarks");
+    bench_step.dependOn(&run_bench.step);
+
     const platform_test = b.addExecutable(.{
         .name = "zev-platform-test",
         .root_module = b.createModule(.{
