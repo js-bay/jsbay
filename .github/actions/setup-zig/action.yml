@@ -91,10 +91,11 @@ runs:
         echo "Downloading ${url}"
         curl -fsSL "$url" -o "$archive"
 
+        # stdin: Windows sha256sum escapes lines when the path has backslashes.
         if command -v sha256sum >/dev/null 2>&1; then
-          got="$(sha256sum "$archive" | awk '{print $1}')"
+          got="$(sha256sum < "$archive" | awk '{print $1}')"
         elif command -v shasum >/dev/null 2>&1; then
-          got="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          got="$(shasum -a 256 < "$archive" | awk '{print $1}')"
         else
           echo "Neither sha256sum nor shasum is available"
           exit 1
