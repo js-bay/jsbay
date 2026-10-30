@@ -178,6 +178,8 @@ typedef struct {
     HermesValue exception;
 } HermesBoolOpResult;
 
+HermesOpResult hermes_get_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key);
+HermesOpResult hermes_json_parse_result(JsbayHermesContext *ctx, const char *utf8, size_t len);
 HermesOpResult hermes_set_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key, HermesValue val);
 HermesOpResult hermes_call_result(JsbayHermesContext *ctx, HermesValue fn, HermesValue this_val,
                                   const HermesValue *args, size_t argc);
@@ -195,6 +197,8 @@ bool hermes_is_promise(JsbayHermesContext *ctx, HermesValue v);
 int hermes_promise_state(JsbayHermesContext *ctx, HermesValue v);
 HermesValue hermes_promise_result(JsbayHermesContext *ctx, HermesValue v);
 void hermes_promise_note_settled(JsbayHermesContext *ctx, HermesValue promise, int state, HermesValue result);
+void hermes_promise_forget(JsbayHermesContext *ctx, HermesValue promise);
+uint64_t hermes_object_identity(JsbayHermesContext *ctx, HermesValue v);
 
 typedef void (*HermesExternalFinalizer)(void *ptr);
 HermesValue hermes_new_external(JsbayHermesContext *ctx, void *ptr, HermesExternalFinalizer fin);

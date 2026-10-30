@@ -292,7 +292,7 @@ pub fn getBufferView(instance_id: i32, value: ActiveEngine.Value) ?BufferView {
 var pin_counts: std.AutoHashMap(usize, u32) = std.AutoHashMap(usize, u32).init(std.heap.c_allocator);
 var pin_mutex: @import("zev").Mutex = .{};
 
-fn bufferObjectKey(value: ActiveEngine.Value) ?usize {
+fn bufferObjectKey(ctx: ActiveEngine.Context, value: ActiveEngine.Value) ?usize {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
@@ -303,9 +303,17 @@ fn bufferObjectKey(value: ActiveEngine.Value) ?usize {
             const ptr = value orelse return null;
             return @intFromPtr(ptr);
         },
-        .escargot, .hermes => {
+        .escargot => {
+            // Escargot retained handles are ValueRef* identity for the live object.
             const ptr = value orelse return null;
             return @intFromPtr(ptr);
+        },
+        .hermes => {
+            // Distinct retained jsi::Value wrappers must share one key for the same JS object.
+            const c = @import("../backend/hermes/c_api.zig");
+            const id = c.hermes_object_identity(ctx, value);
+            if (id == 0) return null;
+            return @intCast(id);
         },
     }
 }
@@ -314,7 +322,7 @@ fn bufferObjectKey(value: ActiveEngine.Value) ?usize {
 pub fn pin(instance_id: i32, value: ActiveEngine.Value) bool {
     const ctx = engine.getContext(instance_id) orelse return false;
     if (!ActiveEngine.isArrayBufferVal(ctx, value)) return false;
-    const key = bufferObjectKey(value) orelse return false;
+    const key = bufferObjectKey(ctx, value) orelse return false;
     pin_mutex.lock();
     defer pin_mutex.unlock();
     const entry = pin_counts.getPtr(key);
@@ -328,8 +336,8 @@ pub fn pin(instance_id: i32, value: ActiveEngine.Value) bool {
 
 /// Drop one pin taken by `pin`. Returns false if it was not pinned.
 pub fn unpin(instance_id: i32, value: ActiveEngine.Value) bool {
-    _ = instance_id;
-    const key = bufferObjectKey(value) orelse return false;
+    const ctx = engine.getContext(instance_id) orelse return false;
+    const key = bufferObjectKey(ctx, value) orelse return false;
     pin_mutex.lock();
     defer pin_mutex.unlock();
     const count = pin_counts.getPtr(key) orelse return false;
@@ -343,8 +351,8 @@ pub fn unpin(instance_id: i32, value: ActiveEngine.Value) bool {
 
 /// True while at least one `pin` is outstanding for this ArrayBuffer.
 pub fn isPinned(instance_id: i32, value: ActiveEngine.Value) bool {
-    _ = instance_id;
-    const key = bufferObjectKey(value) orelse return false;
+    const ctx = engine.getContext(instance_id) orelse return false;
+    const key = bufferObjectKey(ctx, value) orelse return false;
     pin_mutex.lock();
     defer pin_mutex.unlock();
     const count = pin_counts.get(key) orelse return false;

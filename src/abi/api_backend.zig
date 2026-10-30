@@ -48,17 +48,9 @@ pub fn get(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsGet(ctx, object, key),
         .jsc => jscGet(ctx, object, key[0..key.len]),
-        // Keep owned undefined for missing properties (empty Result is OOM at the C ABI boundary).
-        .escargot => blk: {
-            const c = @import("../backend/escargot/c_api.zig");
-            const v = c.escargot_get_property(ctx, object, key.ptr);
-            break :blk if (v == null) .{ .out_of_memory = true } else .{ .value = v };
-        },
-        .hermes => blk: {
-            const c = @import("../backend/hermes/c_api.zig");
-            const v = c.hermes_get_property(ctx, object, key.ptr);
-            break :blk if (v == null) .{ .out_of_memory = true } else .{ .value = v };
-        },
+        // Exception-preserving property reads (getter throws must not collapse to OOM).
+        .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_get_property_result(ctx, object, key.ptr)),
+        .hermes => hermesOp(@import("../backend/hermes/c_api.zig").hermes_get_property_result(ctx, object, key.ptr)),
     };
 }
 
@@ -146,7 +138,14 @@ pub fn parseJson(ctx: ActiveEngine.Context, input: []const u8) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsParseJson(ctx, input),
         .jsc => jscParseJson(ctx, input),
-        .escargot, .hermes => if (ActiveEngine.jsonParseVal(ctx, input)) |v| .{ .value = v } else .{},
+        .escargot => escargotOp(blk: {
+            const c = @import("../backend/escargot/c_api.zig");
+            break :blk c.escargot_json_parse_result(ctx, input.ptr, input.len);
+        }),
+        .hermes => hermesOp(blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            break :blk c.hermes_json_parse_result(ctx, input.ptr, input.len);
+        }),
     };
 }
 
@@ -759,7 +758,7 @@ fn jscToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
 fn escargotOp(result: @import("../backend/escargot/c_api.zig").OpResult) Result {
     if (result.exception != null) return .{ .exception = result.exception };
     if (result.value != null) return .{ .value = result.value };
-    return .{};
+    return .{ .out_of_memory = true };
 }
 
 fn escargotBoolOp(result: @import("../backend/escargot/c_api.zig").BoolOpResult) BoolResult {
@@ -805,7 +804,7 @@ fn escargotCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_va
 
 fn hermesNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const c = @import("../backend/hermes/c_api.zig");
-    const msg_z = std.heap.c_allocator.dupeZ(u8, message) catch return .{ .out_of_memory = true };
+    const msg_z = std.heap.c_allocator.dupeSentinel(u8, message, 0) catch return .{ .out_of_memory = true };
     defer std.heap.c_allocator.free(msg_z);
     const v = c.hermes_new_error(ctx, 0, msg_z.ptr);
     return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
@@ -813,7 +812,7 @@ fn hermesNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
 
 fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const c = @import("../backend/escargot/c_api.zig");
-    const msg_z = std.heap.c_allocator.dupeZ(u8, message) catch return .{ .out_of_memory = true };
+    const msg_z = std.heap.c_allocator.dupeSentinel(u8, message, 0) catch return .{ .out_of_memory = true };
     defer std.heap.c_allocator.free(msg_z);
     const v = c.escargot_new_error(ctx, 0, msg_z.ptr);
     return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
@@ -822,7 +821,7 @@ fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
 fn hermesOp(result: @import("../backend/hermes/c_api.zig").OpResult) Result {
     if (result.exception != null) return .{ .exception = result.exception };
     if (result.value != null) return .{ .value = result.value };
-    return .{};
+    return .{ .out_of_memory = true };
 }
 fn hermesBoolOp(result: @import("../backend/hermes/c_api.zig").BoolOpResult) BoolResult {
     if (result.exception != null) return .{ .exception = result.exception };

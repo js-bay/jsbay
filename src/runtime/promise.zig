@@ -130,6 +130,12 @@ pub const Deferred = struct {
         if (backend.isJscApiBackend(backend.active_backend)) {
             if (ctxFor(self.instance_id)) |ctx| forgetJscPromise(ctx, self.promise);
         }
+        if (comptime backend.active_backend == .hermes) {
+            if (ctxFor(self.instance_id)) |ctx| {
+                const c = @import("../backend/hermes/c_api.zig");
+                c.hermes_promise_forget(ctx, self.promise);
+            }
+        }
         self.promise_keep.reset();
         self.promise = ActiveEngine.undefinedValue();
         self.resolve_fn.reset();

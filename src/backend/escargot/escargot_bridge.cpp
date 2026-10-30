@@ -62,6 +62,8 @@ struct EscargotContextOpaque {
     std::mutex protect_mu;
     std::unordered_map<ValueRef *, std::pair<int, PersistentRefHolder<ValueRef>>> protect;
     std::string pending_throw;
+    // Owned exception Value for host trampoline (takes precedence over pending_throw string).
+    EscargotValue pending_throw_value = nullptr;
     std::mutex buffers_mu;
     std::vector<NoCopyPack *> pending_buffers;
     struct PendingFinal {
@@ -1430,6 +1432,36 @@ extern "C" EscargotOpResult escargot_call_result(EscargotContext *c, EscargotVal
     return opOk(c, er.result);
 }
 
+
+extern "C" EscargotOpResult escargot_get_property_result(EscargotContext *c, EscargotValue obj, const char *key) {
+    EscargotOpResult out{nullptr, nullptr};
+    if (!c || !obj || !key) return out;
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, ValueRef *o, const char *k) -> ValueRef * {
+            if (!o->isObject()) return ValueRef::createUndefined();
+            return o->asObject()->get(state, StringRef::createFromUTF8(k, std::strlen(k)));
+        },
+        asVal(obj), key);
+    if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
+    return opOk(c, er.result);
+}
+
+extern "C" EscargotOpResult escargot_json_parse_result(EscargotContext *c, const char *utf8, size_t len) {
+    EscargotOpResult out{nullptr, nullptr};
+    if (!c) return out;
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, const char *u, size_t n) -> ValueRef * {
+            auto *JSON = state->context()->globalObject()->get(
+                state, StringRef::createFromASCII("JSON"));
+            auto *parse = JSON->asObject()->get(
+                state, StringRef::createFromASCII("parse"));
+            ValueRef *args[] = {StringRef::createFromUTF8(u ? u : "", n)};
+            return parse->call(state, JSON, 1, args);
+        },
+        utf8, len);
+    if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
+    return opOk(c, er.result);
+}
 
 extern "C" EscargotOpResult escargot_set_property_result(EscargotContext *c, EscargotValue obj, const char *key, EscargotValue val) {
     EscargotOpResult out{nullptr, nullptr};

@@ -52,12 +52,19 @@ struct JsbayHermesContextOpaque {
     // Captured at context_new before user code can replace page Object.keys / DataView.
     std::unique_ptr<jsi::Function> pristine_object_keys;
     std::unique_ptr<jsi::Object> pristine_dataview_proto;
+    // Pristine DataView.prototype getters (captured once; ignore mutated prototype accessors).
+    std::unique_ptr<jsi::Function> pristine_dv_buffer_get;
+    std::unique_ptr<jsi::Function> pristine_dv_byte_offset_get;
+    std::unique_ptr<jsi::Function> pristine_dv_byte_length_get;
     // Pristine %TypedArray%.prototype getters (ignore instance exotic own getters).
     std::unique_ptr<jsi::Function> pristine_ta_buffer_get;
     std::unique_ptr<jsi::Function> pristine_ta_byte_offset_get;
     std::unique_ptr<jsi::Function> pristine_ta_byte_length_get;
     // %TypedArray% intrinsic (Uint8Array.__proto__) — instanceof brand check without global Uint8Array.
     std::unique_ptr<jsi::Function> pristine_typed_array_ctor;
+    // Host WeakMap for stable JS object identity across distinct retained Value wrappers.
+    std::unique_ptr<jsi::Object> identity_wm;
+    uint64_t next_identity_id = 1;
     // Host Promise rejection tracker (Escargot-style queue + flush after microtasks)
     HermesRejectionTrackerFn rejection_fn = nullptr;
     void *rejection_ud = nullptr;
@@ -85,10 +92,29 @@ static HermesValue retainMove(JsbayHermesContextOpaque *c, jsi::Value &&v) {
 
 static void release(JsbayHermesContextOpaque *c, jsi::Value *v) {
     if (!c || !v) return;
-    std::lock_guard<std::mutex> lock(c->protect_mu);
-    auto it = c->protect.find(v);
-    if (it == c->protect.end()) return;
-    if (--it->second.first <= 0) c->protect.erase(it);
+    bool gone = false;
+    {
+        std::lock_guard<std::mutex> lock(c->protect_mu);
+        auto it = c->protect.find(v);
+        if (it == c->protect.end()) return;
+        if (--it->second.first <= 0) {
+            c->protect.erase(it);
+            gone = true;
+        }
+    }
+    if (!gone) return;
+    // Drop Deferred tracking when the retained promise wrapper dies so settled
+    // result graphs are not kept for the whole engine lifetime.
+    jsi::Value *result = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(c->promise_mu);
+        auto pit = c->promise_state.find(v);
+        if (pit != c->promise_state.end()) {
+            result = pit->second.second;
+            c->promise_state.erase(pit);
+        }
+    }
+    if (result) release(c, result);
 }
 
 static char *dupCString(const std::string &s) {
@@ -325,6 +351,36 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
         c->pristine_dataview_proto = std::make_unique<jsi::Object>(std::move(proto));
     } catch (...) {
         c->pristine_dataview_proto.reset();
+    }
+    try {
+        const char *kGrabDv = R"JS(
+            (function () {
+              var P = DataView.prototype;
+              return [
+                Object.getOwnPropertyDescriptor(P, 'buffer').get,
+                Object.getOwnPropertyDescriptor(P, 'byteOffset').get,
+                Object.getOwnPropertyDescriptor(P, 'byteLength').get
+              ];
+            })()
+        )JS";
+        auto arrVal = c->rt->evaluateJavaScript(std::make_shared<jsi::StringBuffer>(kGrabDv), "<jsbay-dv-getters>");
+        auto arr = arrVal.asObject(*c->rt).asArray(*c->rt);
+        c->pristine_dv_buffer_get = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 0).asObject(*c->rt).asFunction(*c->rt));
+        c->pristine_dv_byte_offset_get = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 1).asObject(*c->rt).asFunction(*c->rt));
+        c->pristine_dv_byte_length_get = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 2).asObject(*c->rt).asFunction(*c->rt));
+    } catch (...) {
+        c->pristine_dv_buffer_get.reset();
+        c->pristine_dv_byte_offset_get.reset();
+        c->pristine_dv_byte_length_get.reset();
+    }
+    try {
+        auto WM = c->rt->global().getPropertyAsFunction(*c->rt, "WeakMap");
+        c->identity_wm = std::make_unique<jsi::Object>(WM.callAsConstructor(*c->rt).asObject(*c->rt));
+    } catch (...) {
+        c->identity_wm.reset();
     }
     try {
         // Evaluate once so we grab real accessor .get functions off %TypedArray%.prototype.
@@ -1111,14 +1167,12 @@ extern "C" bool hermes_is_typed_array(JsbayHermesContext *c, HermesValue v) {
 }
 static jsi::Value hermesDataViewProtoGet(JsbayHermesContext *c, jsi::Object &o, const char *prop) {
     auto &rt = *c->rt;
-    if (!c->pristine_dataview_proto) return jsi::Value::undefined();
-    auto Object = rt.global().getPropertyAsFunction(rt, "Object");
-    auto getDesc = Object.getPropertyAsFunction(rt, "getOwnPropertyDescriptor");
-    auto descVal = getDesc.call(rt, *c->pristine_dataview_proto, prop);
-    if (!descVal.isObject()) return jsi::Value::undefined();
-    auto getter = descVal.getObject(rt).getProperty(rt, "get");
-    if (!getter.isObject() || !getter.getObject(rt).isFunction(rt)) return jsi::Value::undefined();
-    return getter.getObject(rt).asFunction(rt).callWithThis(rt, o);
+    jsi::Function *getter = nullptr;
+    if (std::strcmp(prop, "buffer") == 0) getter = c->pristine_dv_buffer_get.get();
+    else if (std::strcmp(prop, "byteOffset") == 0) getter = c->pristine_dv_byte_offset_get.get();
+    else if (std::strcmp(prop, "byteLength") == 0) getter = c->pristine_dv_byte_length_get.get();
+    if (!getter) return jsi::Value::undefined();
+    return getter->callWithThis(rt, o);
 }
 
 // Call cached pristine %TypedArray%.prototype getters (ignore instance exotic own getters).
@@ -1283,6 +1337,9 @@ extern "C" uint8_t *hermes_data_view_data(JsbayHermesContext *c, HermesValue dv,
         auto buf = bufVal.getObject(*c->rt).getArrayBuffer(*c->rt);
         size_t off = offVal.isNumber() ? (size_t)offVal.getNumber() : 0;
         size_t len = lenVal.isNumber() ? (size_t)lenVal.getNumber() : 0;
+        size_t cap = buf.size(*c->rt);
+        // Reject attacker-controlled lengths that exceed the backing ArrayBuffer.
+        if (off > cap || len > cap - off) return nullptr;
         if (byte_offset) *byte_offset = off;
         if (byte_length) *byte_length = len;
         uint8_t *data = buf.data(*c->rt);
@@ -1446,6 +1503,67 @@ static HermesBoolOpResult hboolFail(JsbayHermesContextOpaque *c, jsi::Value &&ex
     return out;
 }
 static HermesBoolOpResult hboolOk(bool v) { return HermesBoolOpResult{v, nullptr}; }
+
+extern "C" HermesOpResult hermes_get_property_result(JsbayHermesContext *c, HermesValue obj, const char *key) {
+    HermesOpResult out{nullptr, nullptr};
+    if (!c || !c->rt || !obj || !key || !asVal(obj)->isObject()) return out;
+    try {
+        return hopOk(c, asVal(obj)->getObject(*c->rt).getProperty(*c->rt, key));
+    } catch (const jsi::JSError &e) {
+        return hopFail(c, jsi::Value(*c->rt, e.value()));
+    } catch (...) {
+        return out;
+    }
+}
+
+extern "C" HermesOpResult hermes_json_parse_result(JsbayHermesContext *c, const char *utf8, size_t len) {
+    HermesOpResult out{nullptr, nullptr};
+    if (!c || !c->rt) return out;
+    try {
+        auto JSON = c->rt->global().getPropertyAsObject(*c->rt, "JSON");
+        auto parse = JSON.getPropertyAsFunction(*c->rt, "parse");
+        auto s = jsi::String::createFromUtf8(*c->rt, std::string(utf8 ? utf8 : "", len));
+        return hopOk(c, parse.call(*c->rt, s));
+    } catch (const jsi::JSError &e) {
+        return hopFail(c, jsi::Value(*c->rt, e.value()));
+    } catch (...) {
+        return out;
+    }
+}
+
+extern "C" uint64_t hermes_object_identity(JsbayHermesContext *c, HermesValue v) {
+    if (!c || !c->rt || !v || !asVal(v)->isObject() || !c->identity_wm) return 0;
+    try {
+        auto &rt = *c->rt;
+        auto o = asVal(v)->getObject(rt);
+        auto has = c->identity_wm->getPropertyAsFunction(rt, "has");
+        if (has.call(rt, *c->identity_wm, o).getBool()) {
+            auto get = c->identity_wm->getPropertyAsFunction(rt, "get");
+            auto idVal = get.call(rt, *c->identity_wm, o);
+            return idVal.isNumber() ? (uint64_t)idVal.getNumber() : 0;
+        }
+        uint64_t id = c->next_identity_id++;
+        if (id == 0) id = c->next_identity_id++;
+        auto set = c->identity_wm->getPropertyAsFunction(rt, "set");
+        set.call(rt, *c->identity_wm, o, (double)id);
+        return id;
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" void hermes_promise_forget(JsbayHermesContext *c, HermesValue promise) {
+    if (!c || !promise) return;
+    jsi::Value *result = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(c->promise_mu);
+        auto it = c->promise_state.find(asVal(promise));
+        if (it == c->promise_state.end()) return;
+        result = it->second.second;
+        c->promise_state.erase(it);
+    }
+    if (result) release(c, result);
+}
 
 static jsi::Value makeTypeError(jsi::Runtime &rt, const char *msg) {
     // Prefer a real TypeError even if the page replaced globalThis.TypeError.
@@ -2485,11 +2603,14 @@ extern "C" HermesValue hermes_native_handle_create(JsbayHermesContext *c, void *
         }
         auto state = std::make_shared<HermesNhState>(claim);
         if (call_fn) {
+            // Closure retains HermesNhState independently of the JS-mutable __jsbay_nh holder,
+            // so deleting/overwriting that property cannot free the box while h is still callable.
             auto host = jsi::Function::createFromHostFunction(
                 *c->rt, jsi::PropNameID::forUtf8(*c->rt, "NativeHandle"), 0,
-                [box](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+                [state](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
+                    HermesNhBox *box = (state && state->claim) ? state->claim->box : nullptr;
+                    if (!box || !box->call_fn || !box->owner) return jsi::Value::undefined();
                     JsbayHermesContextOpaque *ctx = box->owner;
-                    if (!ctx || !box->call_fn) return jsi::Value::undefined();
                     std::vector<HermesValue> argv;
                     argv.reserve(count);
                     for (size_t i = 0; i < count; ++i) argv.push_back(retainMove(ctx, jsi::Value(rt, args[i])));

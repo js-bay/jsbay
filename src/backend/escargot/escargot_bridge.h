@@ -192,6 +192,8 @@ typedef struct {
 EscargotOpResult escargot_call_result(EscargotContext *ctx, EscargotValue fn, EscargotValue this_val,
                                       const EscargotValue *args, size_t argc);
 void escargot_throw_value(EscargotContext *ctx, EscargotValue exception);
+EscargotOpResult escargot_get_property_result(EscargotContext *ctx, EscargotValue obj, const char *key);
+EscargotOpResult escargot_json_parse_result(EscargotContext *ctx, const char *utf8, size_t len);
 EscargotOpResult escargot_set_property_result(EscargotContext *ctx, EscargotValue obj, const char *key, EscargotValue val);
 EscargotOpResult escargot_construct(EscargotContext *ctx, EscargotValue ctor,
                                     const EscargotValue *args, size_t argc);

@@ -138,6 +138,8 @@ pub const WeakFinalizer = *const fn (?*anyopaque) callconv(.c) void;
 
 pub extern fn hermes_call_result(ctx: ?*Context, fn_val: Value, this_val: Value, args: ?[*]const Value, argc: usize) OpResult;
 pub extern fn hermes_throw_value(ctx: ?*Context, exception: Value) void;
+pub extern fn hermes_get_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8) OpResult;
+pub extern fn hermes_json_parse_result(ctx: ?*Context, utf8: [*]const u8, len: usize) OpResult;
 pub extern fn hermes_set_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8, val: Value) OpResult;
 pub extern fn hermes_construct(ctx: ?*Context, ctor: Value, args: ?[*]const Value, argc: usize) OpResult;
 pub extern fn hermes_has_in(ctx: ?*Context, obj: Value, key: [*:0]const u8) BoolOpResult;
@@ -150,6 +152,8 @@ pub extern fn hermes_is_promise(ctx: ?*Context, v: Value) bool;
 pub extern fn hermes_promise_state(ctx: ?*Context, v: Value) c_int;
 pub extern fn hermes_promise_result(ctx: ?*Context, v: Value) Value;
 pub extern fn hermes_promise_note_settled(ctx: ?*Context, promise: Value, state: c_int, result: Value) void;
+pub extern fn hermes_promise_forget(ctx: ?*Context, promise: Value) void;
+pub extern fn hermes_object_identity(ctx: ?*Context, v: Value) u64;
 
 pub extern fn hermes_new_external(ctx: ?*Context, ptr: ?*anyopaque, fin: ?ExternalFinalizer) Value;
 pub extern fn hermes_get_external(ctx: ?*Context, v: Value) ?*anyopaque;
