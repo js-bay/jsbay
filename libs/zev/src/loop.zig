@@ -19,7 +19,7 @@ pub const RunOptions = struct {
 };
 
 pub const Notifier = struct {
-    const State = enum { idle, pending, ready, executing, closed };
+    const State = enum { idle, pending, ready, closed };
 
     loop: ?*Loop = null,
     ctx: ?*anyopaque = null,
@@ -52,10 +52,6 @@ pub const Notifier = struct {
                     self.again = true;
                     loop.wakeForEvent();
                 }
-            },
-            .executing => {
-                loop.appendNotifierPendingLocked(self);
-                loop.wakeForEvent();
             },
         }
         return true;
@@ -276,8 +272,9 @@ pub const Loop = struct {
     /// Returns false if another driver already called `beginRun` (state was not idle).
     /// External drivers such as `js_event_loop.Driver.run` / `runFor` must pair a successful call with `endRun`.
     pub fn beginRun(self: *Loop) bool {
+        if (self.run_state.cmpxchgStrong(.idle, .running, .seq_cst, .seq_cst) != null) return false;
         self.bindOwnerThread();
-        return self.run_state.cmpxchgStrong(.idle, .running, .seq_cst, .seq_cst) == null;
+        return true;
     }
     /// Clears the driving session started by `beginRun` (from `.running` or `.stopped`).
     pub fn endRun(self: *Loop) void {
@@ -328,8 +325,7 @@ pub const Loop = struct {
         self.snapshotEventsLocked(now_ms);
         self.events_mutex.unlock();
         var remaining = budget;
-        // Sample the clock only when a time budget is active. Count-only and unlimited
-        // drains must not pay clock_gettime (or virtual-clock) per callback.
+        // Sample the clock only when a time budget is active. Count-only and unlimited drains must not pay clock_gettime (or virtual-clock) per callback.
         const turn_started: u64 = if (time_budget_ms != null) self.nowMs() else 0;
         self.runReadyNotifier(&remaining, time_budget_ms, turn_started);
         if (!self.isStopRequested()) self.runReadyTimers(&remaining, time_budget_ms, turn_started);
@@ -395,9 +391,7 @@ pub const Loop = struct {
                 const remaining = if (limit <= now) 0 else limit - now;
                 timeout = if (timeout) |current| @min(current, remaining) else remaining;
             }
-            // A virtual clock must not translate virtual delays into real sleeps. When the next
-            // deadline is still in the future under a custom clock, park only for an external wake
-            // (notify / requestStop / wake) so the harness can advance time on another thread.
+            // A virtual clock must not translate virtual delays into real sleeps. When the next deadline is still in the future under a custom clock, park only for an external wake (notify / requestStop / wake) so the harness can advance time on another thread.
             if (self.clock_fn != null) {
                 if (timeout == null or timeout.? > 0) {
                     _ = self.waitForWake(seen, null);
@@ -561,17 +555,10 @@ pub const Loop = struct {
         }
     }
     fn runReadyNotifier(self: *Loop, remaining: *?usize, time_budget_ms: ?u64, turn_started: u64) void {
-        // Fold idle restore into the next dequeue lock so a multi-callback drain pays one
-        // mutex round-trip per callback instead of two. The final callback still needs a
-        // trailing lock to leave `.idle` (P0 state-machine invariant).
-        var previous: ?*Notifier = null;
+        // Leave `.idle` (or `.pending` when `again`) under the dequeue lock before the callback, matching Timer. Do not touch the handle after return: the callback may `close` and free it.
         while (!self.isStopRequested()) {
-            if (!self.budgetAllows(remaining, time_budget_ms, turn_started)) break;
+            if (!self.budgetAllows(remaining, time_budget_ms, turn_started)) return;
             self.events_mutex.lock();
-            if (previous) |prior| {
-                if (prior.state == .executing) prior.state = .idle;
-                previous = null;
-            }
             const handle = self.notifier_ready_head orelse {
                 self.events_mutex.unlock();
                 return;
@@ -582,18 +569,12 @@ pub const Loop = struct {
             if (handle.again) {
                 handle.again = false;
                 self.appendNotifierPendingLocked(handle);
-            } else handle.state = .executing;
+            } else handle.state = .idle;
             const callback = handle.callback.?;
             const ctx = handle.ctx;
             self.events_mutex.unlock();
             consumeBudget(remaining);
             callback(ctx, handle);
-            previous = handle;
-        }
-        if (previous) |prior| {
-            self.events_mutex.lock();
-            if (prior.state == .executing) prior.state = .idle;
-            self.events_mutex.unlock();
         }
     }
     fn runReadyTimers(self: *Loop, remaining: *?usize, time_budget_ms: ?u64, turn_started: u64) void {

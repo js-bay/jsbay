@@ -809,8 +809,7 @@ test "virtual clock drives startAfter without wall time" {
 }
 
 test "idle owner notify wakes a different waiting thread" {
-    // Regression: owner wake-skip must not apply while the create thread is idle, or a
-    // manual waiter on another thread starves.
+    // Regression: owner wake-skip must not apply while the create thread is idle, or a manual waiter on another thread starves.
     const State = struct {
         const Self = @This();
         calls: u8 = 0,
@@ -1034,6 +1033,38 @@ test "beginRun enables owner wake-skip for the blocking-run window" {
     try std.testing.expectEqual(after_stop, loop.wakeGeneration());
     loop.endRun();
     try std.testing.expect(!loop.isRunning());
+}
+
+test "rejected beginRun does not steal owner_thread" {
+    const State = struct {
+        const Self = @This();
+        loop: *zev.Loop,
+        go: std.atomic.Value(bool) = .init(false),
+        accepted: std.atomic.Value(bool) = .init(true),
+        saw_owner: std.atomic.Value(bool) = .init(true),
+        fn worker(self: *Self) void {
+            while (!self.go.load(.acquire)) {
+                std.Thread.yield() catch {};
+            }
+            self.accepted.store(self.loop.beginRun(), .release);
+            self.saw_owner.store(self.loop.isOwnerThread(), .release);
+        }
+    };
+    const loop = try zev.Loop.create(std.testing.allocator);
+    defer loop.destroy();
+    // Bind owner on the create thread without opening a beginRun session.
+    _ = loop.runOnce(.{});
+    try std.testing.expect(loop.isOwnerThread());
+
+    var state: State = .{ .loop = loop };
+    const thread = try std.Thread.spawn(.{}, State.worker, .{&state});
+    try std.testing.expect(loop.beginRun());
+    state.go.store(true, .release);
+    thread.join();
+    try std.testing.expect(!state.accepted.load(.acquire));
+    try std.testing.expect(!state.saw_owner.load(.acquire));
+    try std.testing.expect(loop.isOwnerThread());
+    loop.endRun();
 }
 
 test "dispatchEvents uses nowMs for timer due checks" {

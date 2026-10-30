@@ -1,8 +1,6 @@
 //! Microbenchmarks for zev Notifier/Timer P0–P1 changes.
 //! `wake_delta` is `Loop.wakeGeneration()` growth and equals Waiter.signal / futexWake count.
-//! Idle owner `notify`/`startAt` still wake (so other waiters are not starved); wake-skip applies
-//! while the owner is driving (`run` / `runOnce` / `dispatchEvents`). Pending coalesce still
-//! suppresses extra wakes. `*_force_wake` variants call `Loop.wake()` after each op for contrast.
+//! Idle owner `notify`/`startAt` still wake (so other waiters are not starved); wake-skip applies while the owner is driving (`run` / `runOnce` / `dispatchEvents`). Pending coalesce still suppresses extra wakes. `*_force_wake` variants call `Loop.wake()` after each op for contrast.
 
 const std = @import("std");
 const zev = @import("zev");

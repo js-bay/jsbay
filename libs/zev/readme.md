@@ -136,8 +136,7 @@ State (owner dispatches; `notify` is the cross-thread entry):
 - `idle` → `pending` on first notify
 - further `pending` notifies coalesce (no extra wake)
 - snapshot: `pending` → `ready`
-- dispatch: `executing` (or back to `pending` if `again` was set while `ready`)
-- after callback → `idle`, unless a nested `notify` already re-armed to `pending`
+- dispatch: leave `idle` under the dequeue lock before the callback (or `pending` if `again` was set while `ready`); the callback may close and free the handle, so the loop does not touch it after return
 
 Wake skip: while the owner is driving (`run` / `beginRun` / `runOnce` / `dispatchEvents`), same-thread `notify` / timer starts skip `Waiter.signal`. External blocking drivers wrap their wait loop with `beginRun` / `endRun`. Remote threads still wake. Idle owner always wakes so a create-thread `notify` cannot starve a waiter on another thread. Explicit `Loop.wake()` always signals. Mutex stays on every notify (queues are shared).
 
