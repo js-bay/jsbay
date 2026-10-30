@@ -15,6 +15,8 @@ if [ "$MODE" = self-test ]; then
     cp "$ROOT/global.json" "$WORK/"
     cp "$ROOT/scripts/quality/"dotnet-*.sh "$WORK/scripts/quality/"
     export JSBAY_DOTNET_ARTIFACTS="$WORK/artifacts"
+    # Intentional failures must not emit Actions workflow commands as PR annotations.
+    unset GITHUB_ACTIONS CI TF_BUILD
     cat >> "$WORK/sdk/dotnet/JsBay/Status.cs" <<'CS'
 
 internal static class AnalyzerProbe
@@ -29,11 +31,11 @@ CS
         echo "Expected rejection exit: $?"
     fi
     if ! grep -q 'CA2249' "$WORK/expected-diagnostics.log"; then
-        cat "$WORK/expected-diagnostics.log" >&2
+        sed 's/##\[/## [/g' "$WORK/expected-diagnostics.log" >&2
         echo 'Analyzer check failed without the expected CA2249 diagnostic.' >&2
         exit 1
     fi
-    cat "$WORK/expected-diagnostics.log"
+    sed 's/##\[/## [/g' "$WORK/expected-diagnostics.log"
     "$WORK/scripts/quality/dotnet-lint.sh" fix
     find "$WORK/sdk" "$WORK/tests" -type f -name '*.cs' -exec cksum {} \; | sort > "$WORK/once.checksums"
     "$WORK/scripts/quality/dotnet-lint.sh" fix
