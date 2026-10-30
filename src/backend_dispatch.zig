@@ -1,10 +1,6 @@
-//! Create-time select dispatch for packed backends (spike).
+//! Create-time select dispatch for packed backends.
 //!
-//! Shared hot paths remain monomorphic on `build_options.backend` (pack primary).
-//! Non-primary packed instances store erased runtime/context pointers and call through
-//! these helpers for bare lifecycle: create, eval (string or typed value), destroy, timers,
-//! and typed value ops (retain/release/type/to_bool/to_number/to_utf8/get/set/call/construct/
-//! has/delete/keys/instanceof/new_*/global/array_buffer/JSON/copy_buffer/new_error).
+//! Shared hot paths remain monomorphic on `build_options.backend` (pack primary). Non-primary packed instances store erased runtime/context pointers and call through these helpers for bare lifecycle: create, eval (string or typed value), destroy, timers, and typed value ops (retain/release/type/to_bool/to_number/to_utf8/get/set/call/construct/has/delete/keys/instanceof/new_*/global/array_buffer/JSON/copy_buffer/new_error).
 
 const std = @import("std");
 const backend = @import("backend.zig");
@@ -89,7 +85,6 @@ pub fn finishCreate(tag: Backend, handles: Handles, instance_id: i32, max_stack_
         }
     }
 }
-
 
 /// Largest packed-engine Value footprint (QJS JSValue is 16B; JSC JSValueRef is a pointer).
 pub const value_storage_size: usize = blk: {
@@ -243,7 +238,26 @@ pub fn processPendingJobsPacked(tag: Backend, handles: Handles) void {
     }
 }
 
-
+pub fn runGcPacked(tag: Backend, handles: Handles) void {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+        if (cand == tag) {
+            if (comptime multi_pack.isPacked(cand) or cand == backend.active_backend) {
+                if (comptime backend.isQuickJsApiBackend(cand)) {
+                    const E = backend.Engine(cand);
+                    const Mod = backend.EngineModule(cand);
+                    const rt = restorePtr(E.Runtime, handles.runtime_addr);
+                    Mod.qjsRunGc(rt);
+                } else {
+                    const jsc_mod = @import("backend/jsc.zig");
+                    const E = backend.Engine(cand);
+                    const ctx = restorePtr(E.Context, handles.ctx_addr);
+                    jsc_mod.jscRunGc(@ptrCast(ctx));
+                }
+            }
+            return;
+        }
+    }
+}
 
 pub const ErasedValue = struct {
     bytes: [value_storage_size]u8 = undefined,
@@ -495,7 +509,6 @@ pub fn valueGetProperty(tag: Backend, ctx_addr: usize, object_bytes: []const u8,
     }
     return .{ .out_of_memory = true };
 }
-
 
 fn valueNewPrimitiveReal(comptime tag: Backend, ctx_addr: usize, kind: enum { undefined_v, null_v, bool_v, number_v }, bool_val: bool, number_val: f64) EvalValueResult {
     const E = backend.Engine(tag);
@@ -1313,8 +1326,6 @@ pub fn valueToJson(tag: Backend, ctx_addr: usize, value_bytes: []const u8) Bytes
 pub fn valueCopyBuffer(tag: Backend, ctx_addr: usize, value_bytes: []const u8) BytesValueResult {
     return dispatchBytesValue(tag, valueCopyBufferReal, .{ ctx_addr, value_bytes });
 }
-
-
 
 test "backend_dispatch: create/eval/destroy via erased handles for each packed tag" {
     const testing = std.testing;

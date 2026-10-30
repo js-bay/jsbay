@@ -184,9 +184,7 @@ fn ctxToAddr(ctx: ActiveEngine.Context) usize {
     }
 }
 
-
-/// Type-erased schedule for primary and packed-alt timer bridges.
-/// `callback_bytes` must match `valueByteSize(instance.backendTag())`.
+/// Type-erased schedule for primary and packed-alt timer bridges. `callback_bytes` must match `valueByteSize(instance.backendTag())`.
 pub fn scheduleOpaque(
     instance_id: i32,
     ctx_addr: usize,
@@ -472,6 +470,6 @@ fn destroyTimerData(data: *TimerData) void {
 }
 
 test "scheduleOpaque rejects wrong-sized callback" {
-    const junk: [3]u8 = .{0, 0, 0};
+    const junk: [3]u8 = .{ 0, 0, 0 };
     try std.testing.expect(scheduleOpaque(1, 0, &junk, 0, false, null) == null);
 }

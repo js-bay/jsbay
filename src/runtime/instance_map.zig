@@ -367,6 +367,25 @@ pub fn listIds(out_ids: ?[*]i32, cap: usize) usize {
     return total;
 }
 
+/// Match a raw JS context pointer against mono or packed-alt instance handles.
+/// Used by scheduler_gate callbacks that may receive a non-primary packed context.
+pub fn findByContextAddr(ctx_addr: usize) ?i32 {
+    if (ctx_addr == 0) return null;
+    mutex.lock();
+    defer mutex.unlock();
+    var it = instances.iterator();
+    while (it.next()) |entry| {
+        const inst = entry.value_ptr.*;
+        if (inst.teardown_pending) continue;
+        const match = switch (inst.engine_handles) {
+            .mono => |m| @intFromPtr(m.ctx) == ctx_addr,
+            .packed_alt => |a| a.ctx_addr == ctx_addr,
+        };
+        if (match) return entry.key_ptr.*;
+    }
+    return null;
+}
+
 /// Recover instance_id from a raw context via the backend's opaque data slot.
 pub fn instanceIdFromCtx(ctx: ActiveEngine.Context) i32 {
     return ActiveEngine.instanceIdFromCtx(ctx);

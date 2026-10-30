@@ -138,7 +138,7 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
         return true;
     }
 
-    // Non-primary packed backend: bare lifecycle sufficient for create/eval/destroy spike.
+    // Non-primary packed backend: bare lifecycle for create/eval/destroy plus the typed Value surface.
     const handles = backend_dispatch.createPacked(tag) orelse {
         loop.destroy();
         return false;
@@ -544,13 +544,19 @@ pub fn runGc(instance_id: i32) void {
     defer finishEvalEntry(instance_id, lease);
     if (!lease.allowed) return;
     const inst = instance_map.getInstance(instance_id) orelse return;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => ActiveEngine.runGc(inst.monoRuntime() orelse return),
-        .jsc => {
-            const jsc_mod = @import("backend/jsc.zig");
-            jsc_mod.JSSynchronousEdenCollectForDebugging(@ptrCast(inst.monoCtx() orelse return));
-            jsc_mod.JSSynchronousGarbageCollectForDebugging(@ptrCast(inst.monoCtx() orelse return));
+    switch (inst.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => ActiveEngine.runGc(m.runtime),
+            .jsc => {
+                const jsc_mod = @import("backend/jsc.zig");
+                jsc_mod.JSSynchronousEdenCollectForDebugging(@ptrCast(m.ctx));
+                jsc_mod.JSSynchronousGarbageCollectForDebugging(@ptrCast(m.ctx));
+            },
         },
+        .packed_alt => |a| @import("backend_dispatch.zig").runGcPacked(a.tag, .{
+            .runtime_addr = a.runtime_addr,
+            .ctx_addr = a.ctx_addr,
+        }),
     }
 }
 
@@ -758,7 +764,6 @@ fn runOneAsync(instance_id: i32) bool {
     _ = queued.end();
     return true;
 }
-
 
 test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Linux dispatch proof)" {
     // Force the erase/dispatch path even for the pack primary so Linux single-pack CI proves

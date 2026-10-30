@@ -1,9 +1,6 @@
 //! Multi-engine pack: create-time backend select helpers.
 //!
-//! Shared layers stay monomorphic on `build_options.backend` (pack primary / first entry).
-//! This module owns packed-engine bare create/destroy. Dual-engine packs are verified on
-//! Apple with `-Dbackends=quickjs_ng,jsc`. Linux single-pack builds still cover create-time
-//! select through primary `createWithBackend` and forced primary-tag packed_alt tests.
+//! Shared layers stay monomorphic on `build_options.backend` (pack primary / first entry). This module owns packed-engine bare create/destroy. Dual-engine packs are verified on Apple with `-Dbackends=quickjs_ng,jsc`. Linux single-pack builds still cover create-time select through primary `createWithBackend` and forced primary-tag packed_alt tests.
 
 const std = @import("std");
 const build_options = @import("build_options");

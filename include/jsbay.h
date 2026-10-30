@@ -64,7 +64,7 @@ typedef struct {
 jsbay_backend_t jsbay_library_backend(void);
 /* out must be non-NULL; set struct_size to sizeof(*out) before the call. Returns false if out is NULL or struct_size < 4. */
 bool jsbay_library_capabilities(jsbay_engine_capabilities_t *out);
-/* Writes packed engines into out[0..cap). Returns count written (may be < packed count if cap is small). out may be NULL when cap is 0. */
+/* Writes up to cap packed engines into out[0..cap). Returns the packed count (required capacity), even when cap is smaller; clamp iteration to min(returned, cap). out may be NULL when cap is 0. */
 size_t jsbay_available_backends(jsbay_backend_t *out, size_t cap);
 /* Create with an explicit packed backend. options must be non-NULL; struct_size >= sizeof(*options).
  * JSBAY_BACKEND_PRIMARY selects the pack primary. Any backend returned by

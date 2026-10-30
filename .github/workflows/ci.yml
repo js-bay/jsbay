@@ -1,6 +1,6 @@
 # JS Bay CI — see docs/testing.md#ci for the matrix rationale.
 # PR jobs: linux (governance) / linux-engine×2 / linux-android / macos / macos-ios / macos-android / windows.
-# Modest splits only: peel iOS and parallelize Linux backends; keep platforms aggregated.
+# Modest splits only: peel iOS and parallelize Linux backends; keep platforms aggregated. Dual-pack (-Dbackends=quickjs_ng,jsc) stays on macos (JSC needs Apple).
 name: CI
 
 on:
@@ -453,6 +453,28 @@ jobs:
 
       - name: .NET SDK consumer (jsc)
         run: tests/dotnet-sdk/run.sh jsc
+
+      - name: Multi-engine pack filters (quickjs_ng,jsc)
+        run: |
+          set -euo pipefail
+          for test_filter in             "packed"             "create_with_options"             "adversarial"
+          do
+            zig build test-engine -Dbackends=quickjs_ng,jsc -Dtest-filter="$test_filter" --summary all
+          done
+
+      - name: Multi-engine pack rejects quickjs+quickjs_ng
+        run: |
+          set -euo pipefail
+          if output=$(zig build -Dbackends=quickjs,quickjs_ng 2>&1); then
+            echo "$output"
+            echo "::error::expected -Dbackends=quickjs,quickjs_ng to fail configure" >&2
+            exit 1
+          fi
+          echo "$output" | rg -q "QuickJS|quickjs|backends" || {
+            echo "$output"
+            echo "::error::configure failed but without an expected backends conflict message" >&2
+            exit 1
+          }
 
       - name: Build inspector demo (quickjs_ng)
         run: zig build -Dbackend=quickjs_ng --summary all

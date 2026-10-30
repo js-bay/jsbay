@@ -247,15 +247,21 @@ pub fn isStopRequested(instance_id: i32) bool {
 /// Force a GC pass on the runtime. Must be called on the engine's owning thread. Returns false if the instance was never created.
 pub fn runGc(instance_id: i32) bool {
     const inst = instance_map.getInstance(instance_id) orelse return false;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsRunGc(inst.monoRuntime().?);
+    switch (inst.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                qjs_mod.qjsRunGc(m.runtime);
+            },
+            .jsc => {
+                const jsc_mod = @import("../backend/jsc.zig");
+                jsc_mod.jscRunGc(@ptrCast(m.ctx));
+            },
         },
-        .jsc => {
-            const jsc_mod = @import("../backend/jsc.zig");
-            jsc_mod.jscRunGc(inst.monoCtx().?);
-        },
+        .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
+            .runtime_addr = a.runtime_addr,
+            .ctx_addr = a.ctx_addr,
+        }),
     }
     return true;
 }
@@ -263,17 +269,27 @@ pub fn runGc(instance_id: i32) bool {
 /// Cap the QuickJS-managed heap of this runtime at `bytes` (0 = unlimited). This does not cap allocations outside QuickJS, so it is not a process-RSS limit. Must be called on the engine's owning thread before the script it should bound runs. QuickJS: enforced via `JS_SetMemoryLimit` (GC is triggered on the next allocation past the cap). JSC: no public C API exists, so this operation is unsupported and returns false. Returns false when the instance was never created.
 pub fn setMemoryLimit(instance_id: i32, bytes: u64) bool {
     const inst = instance_map.getInstance(instance_id) orelse return false;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
+    switch (inst.engine_handles) {
+        .mono => |m| {
+            if (!backend.isQuickJsApiBackend(backend.active_backend)) return false;
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsSetMemoryLimit(inst.monoRuntime().?, @intCast(bytes));
+            qjs_mod.qjsSetMemoryLimit(m.runtime, @intCast(bytes));
+            return true;
         },
-        .jsc => {
-            // No public JSC heap-cap API. Do not claim an unenforced cap.
+        .packed_alt => |a| {
+            if (!backend.isQuickJsApiBackend(a.tag)) return false;
+            inline for (.{ .quickjs_ng, .quickjs }) |cand| {
+                if (a.tag == cand) {
+                    const E = backend.Engine(cand);
+                    const Mod = backend.EngineModule(cand);
+                    const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
+                    Mod.qjsSetMemoryLimit(rt, @intCast(bytes));
+                    return true;
+                }
+            }
             return false;
         },
     }
-    return true;
 }
 
 /// Ask for one idle collection. Does not collect now and does not retain the JS runtime — `engine.destroy` can still free it while the request is queued. Extra requests before the next idle collection collapse into a single pending collection (one idle pass drains the whole queue). Returns false if the instance does not exist.
@@ -376,25 +392,48 @@ fn idleSlot(instance_id: i32) ?*IdleSlot {
 /// Snapshot memory usage. Returns null if the instance was never created. Backends that don't expose memory stats populate zeros.
 pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
     const inst = instance_map.getInstance(instance_id) orelse return null;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            const snap = qjs_mod.qjsMemoryUsage(inst.monoRuntime().?);
-            return .{
-                .malloc_count = snap.malloc_count,
-                .malloc_size = snap.malloc_size,
-                .malloc_limit = snap.malloc_limit,
-                .memory_used_count = snap.memory_used_count,
-                .memory_used_size = snap.memory_used_size,
-                .atom_count = snap.atom_count,
-                .atom_size = snap.atom_size,
-                .obj_count = snap.obj_count,
-                .obj_size = snap.obj_size,
-                .shape_count = snap.shape_count,
-            };
+    switch (inst.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                const snap = qjs_mod.qjsMemoryUsage(m.runtime);
+                return .{
+                    .malloc_count = snap.malloc_count,
+                    .malloc_size = snap.malloc_size,
+                    .malloc_limit = snap.malloc_limit,
+                    .memory_used_count = snap.memory_used_count,
+                    .memory_used_size = snap.memory_used_size,
+                    .atom_count = snap.atom_count,
+                    .atom_size = snap.atom_size,
+                    .obj_count = snap.obj_count,
+                    .obj_size = snap.obj_size,
+                    .shape_count = snap.shape_count,
+                };
+            },
+            .jsc => return .{},
         },
-        .jsc => {
-            // JSC's public C API does not expose heap introspection. Returning all-zeros keeps the API shape consistent.
+        .packed_alt => |a| {
+            if (!backend.isQuickJsApiBackend(a.tag)) return .{};
+            inline for (.{ .quickjs_ng, .quickjs }) |cand| {
+                if (a.tag == cand) {
+                    const E = backend.Engine(cand);
+                    const Mod = backend.EngineModule(cand);
+                    const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
+                    const snap = Mod.qjsMemoryUsage(rt);
+                    return .{
+                        .malloc_count = snap.malloc_count,
+                        .malloc_size = snap.malloc_size,
+                        .malloc_limit = snap.malloc_limit,
+                        .memory_used_count = snap.memory_used_count,
+                        .memory_used_size = snap.memory_used_size,
+                        .atom_count = snap.atom_count,
+                        .atom_size = snap.atom_size,
+                        .obj_count = snap.obj_count,
+                        .obj_size = snap.obj_size,
+                        .shape_count = snap.shape_count,
+                    };
+                }
+            }
             return .{};
         },
     }

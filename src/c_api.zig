@@ -36,7 +36,7 @@ pub const EngineCapabilitiesC = extern struct {
 
 /// Which `-Dbackend` was compiled into this linked library.
 pub export fn jsbay_library_backend() c_int {
-    return @intFromEnum(backend.libraryBackendC());
+    return @backingInt(backend.libraryBackendC());
 }
 
 /// Fill capability bits for this linked build. No instance required.
@@ -61,9 +61,9 @@ pub export fn jsbay_library_capabilities(out_caps: ?*EngineCapabilitiesC) bool {
 test "c_api: library_backend and capabilities match compile-time backend" {
     const tag = jsbay_library_backend();
     switch (backend.active_backend) {
-        .quickjs_ng => try std.testing.expectEqual(@as(c_int, @intFromEnum(BackendC.quickjs_ng)), tag),
-        .quickjs => try std.testing.expectEqual(@as(c_int, @intFromEnum(BackendC.quickjs)), tag),
-        .jsc => try std.testing.expectEqual(@as(c_int, @intFromEnum(BackendC.jsc)), tag),
+        .quickjs_ng => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.quickjs_ng)), tag),
+        .quickjs => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.quickjs)), tag),
+        .jsc => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.jsc)), tag),
     }
 
     try std.testing.expect(!jsbay_library_capabilities(null));
@@ -95,7 +95,7 @@ test "c_api: library_backend and capabilities match compile-time backend" {
         try std.testing.expect((caps.flags & F.persistent_bytecode_cache) == 0);
         try std.testing.expect((caps.flags & F.safari_web_inspector) != 0);
     }
-    if (backend.supportsDebugger(backend.active_backend)) {
+    if (backend.supportsDebugger(backend.active_backend) and @import("build_options").inspector) {
         try std.testing.expect((caps.flags & F.cdp_source_debugger) != 0);
     } else {
         try std.testing.expect((caps.flags & F.cdp_source_debugger) == 0);
@@ -111,8 +111,7 @@ pub const EngineCreateOptionsC = extern struct {
     log_user_data: ?*anyopaque = null,
 };
 
-/// Packed backends in this artifact (create-time select candidates).
-/// Writes up to `cap` tags into `out` when non-NULL; always returns the packed count.
+/// Packed backends in this artifact (create-time select candidates). Writes up to `cap` tags into `out` when non-NULL; always returns the packed count (required capacity). Callers must clamp iteration to `min(returned, cap)`.
 pub export fn jsbay_available_backends(out_backends: ?[*]BackendC, cap: usize) usize {
     var buf: [4]multi_pack.Backend = undefined;
     const n = multi_pack.availableBackends(&buf);
@@ -126,9 +125,7 @@ pub export fn jsbay_available_backends(out_backends: ?[*]BackendC, cap: usize) u
     return n;
 }
 
-/// Create-time engine select. `backend == .primary` (0) selects the pack primary.
-/// Any packed backend (including non-primary) creates an instance; non-packed tags fail.
-/// Non-primary packed instances support create/eval/destroy plus the typed Value surface wired through packed_api_value; bytecode cache and bind/inspector remain primary-only.
+/// Create-time engine select. `backend == .primary` (0) selects the pack primary. Any packed backend (including non-primary) creates an instance; non-packed tags fail. Non-primary packed instances support create/eval/destroy plus the typed Value surface wired through packed_api_value; bytecode cache and bind/inspector remain primary-only.
 pub export fn jsbay_engine_create_with_options(
     instance_id: c_int,
     options_arg: ?*const EngineCreateOptionsC,
@@ -137,7 +134,7 @@ pub export fn jsbay_engine_create_with_options(
     if (options.struct_size < @sizeOf(u32)) return false;
     if (options.struct_size < 8) return false;
 
-    const raw_backend: c_int = @intFromEnum(options.backend);
+    const raw_backend: c_int = @backingInt(options.backend);
     const requested = backend.backendFromC(raw_backend) orelse return false;
     if (!backend.isPacked(requested)) return false;
 
@@ -179,7 +176,7 @@ test "c_api: available_backends matches packed bits" {
     try std.testing.expectEqual(n, written);
     var i: usize = 0;
     while (i < written) : (i += 1) {
-        const tag = backend.backendFromC(@intFromEnum(buf[i])) orelse return error.BadBackendTag;
+        const tag = backend.backendFromC(@backingInt(buf[i])) orelse return error.BadBackendTag;
         try std.testing.expect(backend.isPacked(tag));
         try std.testing.expect(buf[i] != .primary);
     }
@@ -224,7 +221,7 @@ test "c_api: create_with_options primary packed succeeds; non-packed fails" {
     const candidates = [_]BackendC{ .quickjs_ng, .quickjs, .jsc };
     var found_unpacked = false;
     for (candidates) |cand| {
-        const tag = backend.backendFromC(@intFromEnum(cand)).?;
+        const tag = backend.backendFromC(@backingInt(cand)).?;
         if (backend.isPacked(tag)) continue;
         found_unpacked = true;
         var opts = EngineCreateOptionsC{
@@ -240,7 +237,7 @@ test "c_api: create_with_options primary packed succeeds; non-packed fails" {
     // Unknown backend enum value.
     var bogus = EngineCreateOptionsC{
         .struct_size = @sizeOf(EngineCreateOptionsC),
-        .backend = @enumFromInt(99),
+        .backend = @fromBackingInt(@intCast(99)),
     };
     try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), &bogus));
 }
@@ -260,7 +257,7 @@ test "c_api: create_with_options non-primary packed create eval destroy" {
         };
         try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
         defer jsbay_engine_destroy(id);
-        const tag = backend.backendFromC(@intFromEnum(buf[i])).?;
+        const tag = backend.backendFromC(@backingInt(buf[i])).?;
         const ev = engine.evalScript(id, "1+1", "<c-api-alt>");
         defer {
             if (ev.result) |s| std.heap.c_allocator.free(@constCast(s));
@@ -1964,8 +1961,11 @@ pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         out_value.* = packed_api_value.retain(value) orelse return API_OUT_OF_MEMORY;
         return API_OK;
     }
@@ -1988,8 +1988,11 @@ pub export fn jsbay_value_release(value: u64) c_int {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return if (packed_api_value.release(value)) API_OK else API_STALE_VALUE;
     }
     const instance_id = api_value.instanceFor(value) orelse return API_STALE_VALUE;
@@ -2012,8 +2015,11 @@ pub export fn jsbay_engine_global(instance_id_raw: c_int, out_value: *u64) c_int
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(instance_id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueGetGlobal(ready.tag, ready.ctx_addr);
         return packedPublish(instance_id, ready.tag, ready.ctx_addr, result, out_value, null);
     }
@@ -2048,8 +2054,11 @@ pub export fn jsbay_value_undefined(instance_id: c_int, out_value: *u64) c_int {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewUndefined(ready.tag, ready.ctx_addr), ready.tag, ready.ctx_addr, out_value);
     }
     return apiNewSimple(instance_id, out_value, struct {
@@ -2067,8 +2076,11 @@ pub export fn jsbay_value_null(instance_id: c_int, out_value: *u64) c_int {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewNull(ready.tag, ready.ctx_addr), ready.tag, ready.ctx_addr, out_value);
     }
     return apiNewSimple(instance_id, out_value, struct {
@@ -2086,8 +2098,11 @@ pub export fn jsbay_value_new_bool(instance_id: c_int, input: bool, out_value: *
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewBool(ready.tag, ready.ctx_addr, input), ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
@@ -2106,8 +2121,11 @@ pub export fn jsbay_value_new_number(instance_id: c_int, input: f64, out_value: 
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewNumber(ready.tag, ready.ctx_addr, input), ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
@@ -2128,8 +2146,11 @@ pub export fn jsbay_value_new_string(instance_id: c_int, input: Utf8, out_value:
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewString(ready.tag, ready.ctx_addr, bytes), ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
@@ -2155,8 +2176,11 @@ pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         var exc: u64 = 0;
         const status = packedPublish(id, ready.tag, ready.ctx_addr, @import("backend_dispatch.zig").valueNewArrayBuffer(ready.tag, ready.ctx_addr, bytes), out_value, &exc);
         if (status == 1) {
@@ -2189,8 +2213,11 @@ pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
     if (packed_api_value.isPackedHandle(value)) {
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         out_kind.* = @import("backend_dispatch.zig").valueTypeKind(entry.tag, entry.ctx_addr, entry.bytes());
         return API_OK;
     }
@@ -2208,8 +2235,11 @@ pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
     if (packed_api_value.isPackedHandle(value)) {
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         if (!@import("backend_dispatch.zig").valueIsBool(entry.tag, entry.ctx_addr, entry.bytes())) return API_INVALID_ARGUMENT;
         out_value.* = @import("backend_dispatch.zig").valueToBool(entry.tag, entry.ctx_addr, entry.bytes()) orelse return API_INVALID_ARGUMENT;
         return API_OK;
@@ -2229,8 +2259,11 @@ pub export fn jsbay_value_to_number(value: u64, out_value: *f64) c_int {
     if (packed_api_value.isPackedHandle(value)) {
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         if (!@import("backend_dispatch.zig").valueIsNumber(entry.tag, entry.ctx_addr, entry.bytes())) return API_INVALID_ARGUMENT;
         out_value.* = @import("backend_dispatch.zig").valueToFloat64(entry.tag, entry.ctx_addr, entry.bytes()) orelse return API_INVALID_ARGUMENT;
         return API_OK;
@@ -2253,8 +2286,11 @@ pub export fn jsbay_value_new_object(instance_id: c_int, out_value: *u64) c_int 
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewObject(ready.tag, ready.ctx_addr), ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
@@ -2279,8 +2315,11 @@ pub export fn jsbay_value_new_array(instance_id: c_int, out_value: *u64) c_int {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewArray(ready.tag, ready.ctx_addr), ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
@@ -2306,7 +2345,6 @@ fn duplicateKey(key: []const u8) ?[:0]u8 {
     if (key_fault.consume()) return null;
     return std.heap.c_allocator.dupeSentinel(u8, key, 0) catch null;
 }
-
 
 /// Host-owned UTF-8 results (legacy); packed-alt evaluate now publishes typed packed_api_value handles.
 const host_string_values = struct {
@@ -2376,6 +2414,53 @@ fn packedHandlesOf(instance_id: i32) ?@import("backend_dispatch.zig").Handles {
     };
 }
 
+const PackedJsOp = struct {
+    id: i32,
+    tag: backend.BackendType,
+    ctx_addr: usize,
+    lease: engine_thread.EvalLease,
+    entered_js: bool,
+    execution: ?@import("js_event_loop").Scheduler.Execution = null,
+
+    fn endExecution(self: *PackedJsOp) void {
+        if (self.execution) |*guard| guard.end();
+        self.execution = null;
+    }
+
+    fn deinit(self: *PackedJsOp) void {
+        if (self.execution != null) {
+            self.endExecution();
+            @import("runtime/js_scheduler.zig").checkpointInstance(self.id);
+        }
+        if (self.entered_js) @import("backend_dispatch.zig").leaveJsPacked(self.tag, self.ctx_addr);
+        engine.finishEvalEntry(self.id, self.lease);
+    }
+};
+
+/// Admission lease for packed-alt value ops that may execute JavaScript (mirrors beginApiOp / beginValueOp).
+fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) union(enum) { ok: PackedJsOp, status: c_int } {
+    if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
+    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
+    if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
+        if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
+    }
+    const lease = engine_thread.beginEval(instance_id);
+    if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    if (!@import("backend_dispatch.zig").enterJsPacked(tag, ctx_addr)) {
+        engine.finishEvalEntry(instance_id, lease);
+        return .{ .status = API_WRONG_THREAD };
+    }
+    return .{ .ok = .{
+        .id = instance_id,
+        .tag = tag,
+        .ctx_addr = ctx_addr,
+        .lease = lease,
+        .entered_js = true,
+        .execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id),
+    } };
+}
+
 fn packedTagOf(instance_id: i32) ?backend.BackendType {
     const inst = @import("runtime/instance_map.zig").getInstance(instance_id) orelse return null;
     return switch (inst.engine_handles) {
@@ -2396,7 +2481,6 @@ fn packedStore(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, eras
     };
     return API_OK;
 }
-
 
 fn packedPublish(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").EvalValueResult, out_value: *u64, out_exception: ?*u64) c_int {
     if (out_exception) |exc| exc.* = 0;
@@ -2645,10 +2729,12 @@ pub export fn jsbay_value_new_json(instance_id_raw: c_int, input_arg: Utf8, out_
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueNewJson(ready.tag, ready.ctx_addr, input);
-        @import("runtime/js_scheduler.zig").checkpointInstance(id);
         return packedPublish(id, ready.tag, ready.ctx_addr, result, out_value, out_exception);
     }
     var op = switch (beginApiOp(id)) {
@@ -2678,8 +2764,11 @@ pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, o
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        if (!@import("backend_dispatch.zig").enterJsPacked(ready.tag, ready.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(ready.tag, ready.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewError(ready.tag, ready.ctx_addr, message), ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
@@ -2707,10 +2796,12 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
     if (packed_api_value.isPackedHandle(value)) {
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueToUtf8(entry.tag, entry.ctx_addr, entry.bytes());
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         const status = packedPublishBytes(entry.instance_id, entry.tag, entry.ctx_addr, result, out_bytes, out_exception);
         if (status != API_OK) return status;
         // QuickJS may surface WTF-8; public ABI promises UTF-8.
@@ -2759,10 +2850,12 @@ pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: 
     if (packed_api_value.isPackedHandle(value)) {
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueToJson(entry.tag, entry.ctx_addr, entry.bytes());
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         return packedPublishBytes(entry.instance_id, entry.tag, entry.ctx_addr, result, out_bytes, out_exception);
     }
     var data = switch (beginValueOp(value)) {
@@ -2791,10 +2884,12 @@ pub export fn jsbay_value_copy_buffer(value: u64, out_bytes: *Bytes, out_excepti
     if (packed_api_value.isPackedHandle(value)) {
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueCopyBuffer(entry.tag, entry.ctx_addr, entry.bytes());
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         return packedPublishBytes(entry.instance_id, entry.tag, entry.ctx_addr, result, out_bytes, out_exception);
     }
     var data = switch (beginValueOp(value)) {
@@ -2830,10 +2925,12 @@ pub export fn jsbay_value_get(object: u64, key_arg: Utf8, out_value: *u64, out_e
         if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
         const key_z = std.heap.c_allocator.dupeSentinel(u8, key, 0) catch return API_OUT_OF_MEMORY;
         defer std.heap.c_allocator.free(key_z);
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueGetProperty(entry.tag, entry.ctx_addr, entry.bytes(), key_z);
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         if (result.out_of_memory) {
             if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, v.slice());
             if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, e.slice());
@@ -2877,13 +2974,15 @@ pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_except
         defer std.heap.c_allocator.free(key_z);
         var value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
         const value_len = packedDupBytes(value, entry.instance_id, entry.tag, value_buf[0..]) orelse return API_STALE_VALUE;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) {
-            @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, value_buf[0..value_len]);
-            return API_WRONG_THREAD;
-        }
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| {
+                @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, value_buf[0..value_len]);
+                return status;
+            },
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueSetProperty(entry.tag, entry.ctx_addr, entry.bytes(), key_z, value_buf[0..value_len]);
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         var dummy: u64 = 0;
         return packedPublish(entry.instance_id, entry.tag, entry.ctx_addr, result, &dummy, out_exception);
     }
@@ -2955,10 +3054,12 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         while (ai < arg_storage.items.len) : (ai += 1) {
             arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
         }
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueCall(entry.tag, entry.ctx_addr, entry.bytes(), this_buf[0..this_len], arg_slices.items);
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         return packedPublish(entry.instance_id, entry.tag, entry.ctx_addr, result, out_value, out_exception);
     }
     var function_data = switch (beginValueOp(function)) {
@@ -3034,10 +3135,12 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
         while (ai < arg_storage.items.len) : (ai += 1) {
             arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
         }
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueConstruct(entry.tag, entry.ctx_addr, entry.bytes(), arg_slices.items);
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         return packedPublish(entry.instance_id, entry.tag, entry.ctx_addr, result, out_value, out_exception);
     }
     var function_data = switch (beginValueOp(function)) {
@@ -3122,13 +3225,15 @@ fn packedKeyedBoolOp(
     if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
     const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
     defer std.heap.c_allocator.free(key_z);
-    if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-    defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+    var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        .status => |status| return status,
+        .ok => |ok| ok,
+    };
+    defer packed_js.deinit();
     const result = switch (which) {
         .has => @import("backend_dispatch.zig").valueHas(entry.tag, entry.ctx_addr, entry.bytes(), key_z),
         .delete => @import("backend_dispatch.zig").valueDelete(entry.tag, entry.ctx_addr, entry.bytes(), key_z),
     };
-    @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
     return packedPublishBool(entry.instance_id, entry.tag, entry.ctx_addr, result, out_flag, out_exception);
 }
 
@@ -3148,10 +3253,12 @@ pub export fn jsbay_value_keys(object: u64, out_array: *u64, out_exception: *u64
     if (packed_api_value.isPackedHandle(object)) {
         const entry = packed_api_value.get(object) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueKeys(entry.tag, entry.ctx_addr, entry.bytes());
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         return packedPublish(entry.instance_id, entry.tag, entry.ctx_addr, result, out_array, out_exception);
     }
     var data = switch (beginValueOp(object)) {
@@ -3182,10 +3289,12 @@ pub export fn jsbay_value_instance_of(value: u64, constructor: u64, out_result: 
         var ctor_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
         const ctor_len = packedDupBytes(constructor, entry.instance_id, entry.tag, ctor_buf[0..]) orelse return API_STALE_VALUE;
         defer @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, ctor_buf[0..ctor_len]);
-        if (!@import("backend_dispatch.zig").enterJsPacked(entry.tag, entry.ctx_addr)) return API_WRONG_THREAD;
-        defer @import("backend_dispatch.zig").leaveJsPacked(entry.tag, entry.ctx_addr);
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueInstanceOf(entry.tag, entry.ctx_addr, entry.bytes(), ctor_buf[0..ctor_len]);
-        @import("runtime/js_scheduler.zig").checkpointInstance(entry.instance_id);
         return packedPublishBool(entry.instance_id, entry.tag, entry.ctx_addr, result, out_result, out_exception);
     }
     var data = switch (beginValueOp(value)) {

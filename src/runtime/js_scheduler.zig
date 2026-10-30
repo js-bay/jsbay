@@ -128,19 +128,17 @@ pub fn checkpointInstance(instance_id: i32) void {
 }
 
 pub fn backendDrainAllowed(raw_ctx: ?*anyopaque) bool {
-    const ctx: ActiveEngine.Context = @ptrCast(raw_ctx);
-    const id = ActiveEngine.instanceIdFromCtx(ctx);
+    // Resolve by stored context address so packed-alt (non-primary) contexts are not passed through the primary ActiveEngine.instanceIdFromCtx.
+    const id = instance_map.findByContextAddr(@intFromPtr(raw_ctx orelse return true)) orelse return true;
     const instance = instance_map.getInstance(id) orelse return true;
-    if (instance.monoCtx()) |mc| { if (mc != ctx) return true; } else return true;
     if (engine_thread.ownerHasYielded(id)) return false;
     return instance.loop.scheduler.consumeBackendDrain();
 }
 
 pub fn backendDrainFinished(raw_ctx: ?*anyopaque) void {
-    const ctx: ActiveEngine.Context = @ptrCast(raw_ctx);
-    const id = ActiveEngine.instanceIdFromCtx(ctx);
+    const id = instance_map.findByContextAddr(@intFromPtr(raw_ctx orelse return)) orelse return;
     const instance = instance_map.getInstance(id) orelse return;
-    if (instance.monoCtx()) |mc| { if (mc == ctx) instance.loop.scheduler.endBackendDrain(); }
+    instance.loop.scheduler.endBackendDrain();
 }
 
 pub fn runTurn(instance_id: i32, hooks: @import("js_event_loop").Scheduler.TurnHooks) bool {

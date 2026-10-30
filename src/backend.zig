@@ -74,14 +74,13 @@ pub fn backendToC(tag: BackendType) BackendC {
     };
 }
 
-/// Map a C backend tag to Zig. `primary` (0) resolves to the pack primary.
-/// Unknown integers return null.
+/// Map a C backend tag to Zig. `primary` (0) resolves to the pack primary. Unknown integers return null.
 pub fn backendFromC(raw: c_int) ?BackendType {
-    if (raw == @intFromEnum(BackendC.primary)) return active_backend;
+    if (raw == @backingInt(BackendC.primary)) return active_backend;
     return switch (raw) {
-        @intFromEnum(BackendC.quickjs_ng) => .quickjs_ng,
-        @intFromEnum(BackendC.quickjs) => .quickjs,
-        @intFromEnum(BackendC.jsc) => .jsc,
+        @backingInt(BackendC.quickjs_ng) => .quickjs_ng,
+        @backingInt(BackendC.quickjs) => .quickjs,
+        @backingInt(BackendC.jsc) => .jsc,
         else => null,
     };
 }
@@ -113,7 +112,7 @@ pub fn libraryCapabilityFlags() u32 {
             flags |= CapabilityFlags.persistent_bytecode_cache;
         }
     }
-    if (supportsDebugger(active_backend)) {
+    if (supportsDebugger(active_backend) and build_options.inspector) {
         flags |= CapabilityFlags.cdp_source_debugger;
     }
     if (active_backend == .jsc) {
