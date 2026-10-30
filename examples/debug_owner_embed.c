@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define TEXT(value) ((jsbay_utf8_t){(const uint8_t *)(value), sizeof(value) - 1})
@@ -187,7 +188,8 @@ int main(int argc, char **argv) {
 
     if (ctx.self_test) {
         /* Brief settle so listeners can bind; no CDP required for smoke. */
-        usleep(150 * 1000);
+        const struct timespec settle = {.tv_sec = 0, .tv_nsec = 150L * 1000L * 1000L};
+        (void)nanosleep(&settle, NULL);
         if (!jsbay_engine_stop_loop(ctx.instance_id)) {
             fprintf(stderr, "stop_loop failed\n");
             pthread_join(owner, NULL);
