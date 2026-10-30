@@ -123,7 +123,7 @@ pub fn destroyBare(inst: BareInstance) void {
 
 test "multi_pack: availableBackends matches packed bits" {
     if (packedCount() == 0) return error.SkipZigTest;
-    var buf: [4]Backend = undefined;
+    var buf: [8]Backend = undefined;
     const n = availableBackends(&buf);
     try std.testing.expect(n >= 1);
     try std.testing.expectEqual(packedCount(), n);

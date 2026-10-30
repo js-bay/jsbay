@@ -20,7 +20,7 @@ pub const EvalResult = struct {
 /// Log handler callback type. Consumers provide this to receive console.log output.
 pub const LogHandler = *const fn (i32, LogLevel, [*:0]const u8, ?*anyopaque) callconv(.c) void;
 
-/// Telemetry event kinds for `EngineEventHandler` (mirrors js_bay_engine_event_kind_t).
+/// Telemetry event kinds for `EngineEventHandler` (mirrors jsbay_engine_event_kind_t).
 pub const EngineEventKind = enum(c_int) {
     log = 0,
     execution_interrupted = 1,
@@ -28,7 +28,7 @@ pub const EngineEventKind = enum(c_int) {
     loop_failed = 3,
 };
 
-/// Payload delivered to `EngineEventHandler` (mirrors js_bay_engine_event_t).
+/// Payload delivered to `EngineEventHandler` (mirrors jsbay_engine_event_t).
 pub const EngineEvent = extern struct {
     struct_size: u32,
     kind: EngineEventKind,

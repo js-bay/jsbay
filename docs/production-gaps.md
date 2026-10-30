@@ -11,7 +11,7 @@ Fact source: `docs/capability.md`. Gaps ranked by impact on embedding hosts. Thi
 | Hermes host-throw stability | `NativeResult.err` / CJS missing-module / value `.err` | `libhermes_bridge.so` + `throw jsi::JSError` | Stable when bridge shares libstdc++/libgcc_s with hermesvm |
 | `native_handle` (opaque + call + finalize + method) | SDK / host-callable objects | `*/native_handle.zig` + ExtraData/NativeState; MethodBox `*_dup` on setMethod | Method this-binding works; finalize is teardown-forced |
 | Thick C ABI / `engine_thread` contract | Multi-instance / host threading | Smoke + full suite | Hermes hostInstall / destroy-defer / nested / filename / after-stop green; Escargot host/dispatch skipped (Context is thread-affine; same-thread only) |
-| Heap limit / interrupt | Resource guardrails | `runtime_control` parity | Hermes stop/destroy can mid-script; user `requestInterrupt` does not guarantee mid-script stop on either backend (Escargot has no public hook; Hermes does not arm sticky `asyncTriggerTimeout` for user interrupt); `setMemoryLimit` always false; Hermes create-time `MaxHeapSize` via Zig/`js_bay_engine_create2`; soft `getMemoryUsage` |
+| Heap limit / interrupt | Resource guardrails | `runtime_control` parity | Hermes stop/destroy can mid-script; user `requestInterrupt` does not guarantee mid-script stop on either backend (Escargot has no public hook; Hermes does not arm sticky `asyncTriggerTimeout` for user interrupt); `setMemoryLimit` always false; Hermes create-time `MaxHeapSize` via Zig/`jsbay_engine_create_with_options`; soft `getMemoryUsage` |
 
 ## Should (closer to QuickJS / JSC experience)
 
@@ -32,7 +32,7 @@ Fact source: `docs/capability.md`. Gaps ranked by impact on embedding hosts. Thi
 | GC-precise weak / external | Teardown-forced today |
 | Escargot interrupt (permanent) | `EscargotPublic` has no interrupt / ExecutionTimeLimit / async-break API; approximate only at job/host boundaries |
 | Both `setMemoryLimit` (permanent false) | Escargot has no cap API; Hermes has no runtime set — use create-time `EngineConfig.max_heap_size` / `-Dhermes-max-heap` → `GCConfig.MaxHeapSize` |
-| Hermes create-time MaxHeapSize | `hermes_runtime_new(max)` + `EngineConfig` + `js_bay_engine_create2`; `0` → `-Dhermes-max-heap` → 3GiB |
+| Hermes create-time MaxHeapSize | `hermes_runtime_new(max)` + `EngineConfig` + `jsbay_engine_create_with_options`; `0` → `-Dhermes-max-heap` → 3GiB |
 | Honest `requestInterrupt` | Spike returns `false` (`supportsMidScriptUserInterrupt`); stop/destroy can still mid-script on Hermes |
 | Fresh-clone rebuild scripts | `scripts/rebuild-{icu,hermes,escargot}-install.sh` |
 | Soft `getMemoryUsage` | Non-QJS field layout; `malloc_size` ≈ heap/allocated; `setMemoryLimit` still refused |

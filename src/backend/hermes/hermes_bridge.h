@@ -179,6 +179,9 @@ typedef struct {
 } HermesBoolOpResult;
 
 HermesOpResult hermes_set_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key, HermesValue val);
+HermesOpResult hermes_call_result(JsbayHermesContext *ctx, HermesValue fn, HermesValue this_val,
+                                  const HermesValue *args, size_t argc);
+void hermes_throw_value(JsbayHermesContext *ctx, HermesValue exception);
 HermesOpResult hermes_construct(JsbayHermesContext *ctx, HermesValue ctor,
                                 const HermesValue *args, size_t argc);
 HermesBoolOpResult hermes_has_in(JsbayHermesContext *ctx, HermesValue obj, const char *key);

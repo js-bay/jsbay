@@ -1,4 +1,4 @@
-//! Weak-callback / finalize registration — N-API `napi_wrap` + finalize equivalent, or the V8 weak-persistent-with-finalizer pattern.
+//! Weak-callback / finalize registration for host-owned resources tied to a JS object lifetime.
 //!
 //! Use this when native code needs to release a resource at the same moment a JavaScript object becomes unreachable. Common cases:
 //!   - clean up native state tied to a host object

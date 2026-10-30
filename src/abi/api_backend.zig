@@ -66,7 +66,8 @@ pub fn call(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value:
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsCall(ctx, function, this_value, args),
         .jsc => jscCall(ctx, function, this_value, args),
-        .escargot, .hermes => if (ActiveEngine.callFunction(ctx, function, this_value, args)) |v| .{ .value = v } else .{},
+        .escargot => escargotCall(ctx, function, this_value, args),
+        .hermes => hermesCall(ctx, function, this_value, args),
     };
 }
 
@@ -153,7 +154,8 @@ pub fn newError(ctx: ActiveEngine.Context, message: []const u8) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsNewError(ctx, message),
         .jsc => jscNewError(ctx, message),
-        .escargot, .hermes => .{},
+        .escargot => escargotNewError(ctx, message),
+        .hermes => hermesNewError(ctx, message),
     };
 }
 
@@ -790,6 +792,33 @@ fn escargotKeys(ctx: ActiveEngine.Context, object: ActiveEngine.Value) Result {
 fn escargotInstanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, constructor: ActiveEngine.Value) BoolResult {
     const c = @import("../backend/escargot/c_api.zig");
     return escargotBoolOp(c.escargot_instance_of(ctx, value, constructor));
+}
+
+
+fn hermesCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+    const c = @import("../backend/hermes/c_api.zig");
+    return hermesOp(c.hermes_call_result(ctx, function, this_value, if (args.len > 0) args.ptr else null, args.len));
+}
+
+fn escargotCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+    const c = @import("../backend/escargot/c_api.zig");
+    return escargotOp(c.escargot_call_result(ctx, function, this_value, if (args.len > 0) args.ptr else null, args.len));
+}
+
+fn hermesNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
+    const c = @import("../backend/hermes/c_api.zig");
+    const msg_z = std.heap.c_allocator.dupeZ(u8, message) catch return .{ .out_of_memory = true };
+    defer std.heap.c_allocator.free(msg_z);
+    const v = c.hermes_new_error(ctx, 0, msg_z.ptr);
+    return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+}
+
+fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
+    const c = @import("../backend/escargot/c_api.zig");
+    const msg_z = std.heap.c_allocator.dupeZ(u8, message) catch return .{ .out_of_memory = true };
+    defer std.heap.c_allocator.free(msg_z);
+    const v = c.escargot_new_error(ctx, 0, msg_z.ptr);
+    return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
 }
 
 fn hermesOp(result: @import("../backend/hermes/c_api.zig").OpResult) Result {

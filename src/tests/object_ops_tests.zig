@@ -31,14 +31,14 @@ const Fixture = struct {
 
     fn init() !Fixture {
         const id = helpers.nextInstanceId();
-        try testing.expect(c_api.js_bay_engine_create(id, null, null));
+        try testing.expect(c_api.jsbay_engine_create(id, null, null));
         return .{ .id = id };
     }
 
     fn deinit(self: *Fixture) void {
-        for (self.owned.items) |handle| _ = c_api.js_bay_value_release(handle);
+        for (self.owned.items) |handle| _ = c_api.jsbay_value_release(handle);
         self.owned.deinit(testing.allocator);
-        c_api.js_bay_engine_destroy(self.id);
+        c_api.jsbay_engine_destroy(self.id);
     }
 
     /// Track a handle so the fixture releases it exactly once.
@@ -51,9 +51,9 @@ const Fixture = struct {
     fn eval(self: *Fixture, source: []const u8) !u64 {
         var value: u64 = poison;
         var exception: u64 = poison;
-        const status = c_api.js_bay_engine_evaluate(self.id, utf8(source), utf8("object-ops.js"), null, &value, &exception);
+        const status = c_api.jsbay_engine_evaluate(self.id, utf8(source), utf8("object-ops.js"), null, &value, &exception);
         if (status != ok) {
-            if (exception != 0 and exception != poison) _ = c_api.js_bay_value_release(exception);
+            if (exception != 0 and exception != poison) _ = c_api.jsbay_value_release(exception);
             return error.EvaluateFailed;
         }
         return self.keep(value);
@@ -63,27 +63,27 @@ const Fixture = struct {
     fn evalUntracked(self: *Fixture, source: []const u8) !u64 {
         var value: u64 = poison;
         var exception: u64 = poison;
-        try testing.expectEqual(ok, c_api.js_bay_engine_evaluate(self.id, utf8(source), utf8("object-ops.js"), null, &value, &exception));
+        try testing.expectEqual(ok, c_api.jsbay_engine_evaluate(self.id, utf8(source), utf8("object-ops.js"), null, &value, &exception));
         try testing.expect(value != 0 and value != poison);
         return value;
     }
 
     fn number(self: *Fixture, input: f64) !u64 {
         var value: u64 = poison;
-        try testing.expectEqual(ok, c_api.js_bay_value_new_number(self.id, input, &value));
+        try testing.expectEqual(ok, c_api.jsbay_value_new_number(self.id, input, &value));
         return self.keep(value);
     }
 
     fn string(self: *Fixture, input: []const u8) !u64 {
         var value: u64 = poison;
-        try testing.expectEqual(ok, c_api.js_bay_value_new_string(self.id, utf8(input), &value));
+        try testing.expectEqual(ok, c_api.jsbay_value_new_string(self.id, utf8(input), &value));
         return self.keep(value);
     }
 
     fn get(self: *Fixture, object: u64, key: []const u8) !u64 {
         var value: u64 = poison;
         var exception: u64 = poison;
-        try testing.expectEqual(ok, c_api.js_bay_value_get(object, utf8(key), &value, &exception));
+        try testing.expectEqual(ok, c_api.jsbay_value_get(object, utf8(key), &value, &exception));
         try testing.expectEqual(@as(u64, 0), exception);
         return self.keep(value);
     }
@@ -91,9 +91,9 @@ const Fixture = struct {
     fn text(_: *Fixture, handle: u64) ![]u8 {
         var bytes: c_api.Bytes = .{ .data = null, .len = 0 };
         var exception: u64 = poison;
-        try testing.expectEqual(ok, c_api.js_bay_value_to_utf8(handle, &bytes, &exception));
+        try testing.expectEqual(ok, c_api.jsbay_value_to_utf8(handle, &bytes, &exception));
         try testing.expectEqual(@as(u64, 0), exception);
-        defer c_api.js_bay_free_bytes(bytes);
+        defer c_api.jsbay_free_bytes(bytes);
         const data = bytes.data orelse return testing.allocator.alloc(u8, 0);
         return testing.allocator.dupe(u8, data[0..bytes.len]);
     }
@@ -107,15 +107,15 @@ const Fixture = struct {
     fn expectJson(_: *Fixture, handle: u64, expected: []const u8) !void {
         var bytes: c_api.Bytes = .{ .data = null, .len = 0 };
         var exception: u64 = poison;
-        try testing.expectEqual(ok, c_api.js_bay_value_to_json(handle, &bytes, &exception));
-        defer c_api.js_bay_free_bytes(bytes);
+        try testing.expectEqual(ok, c_api.jsbay_value_to_json(handle, &bytes, &exception));
+        defer c_api.jsbay_free_bytes(bytes);
         try testing.expectEqualStrings(expected, (bytes.data orelse return error.MissingJson)[0..bytes.len]);
     }
 
     fn construct(_: *Fixture, function: u64, args: []const u64, out_value: *u64, out_exception: *u64) c_int {
         out_value.* = poison;
         out_exception.* = poison;
-        return c_api.js_bay_value_construct(function, if (args.len == 0) null else args.ptr, args.len, out_value, out_exception);
+        return c_api.jsbay_value_construct(function, if (args.len == 0) null else args.ptr, args.len, out_value, out_exception);
     }
 
     /// `new function(...args)` that must succeed; the instance is fixture-owned.
@@ -143,7 +143,7 @@ const Fixture = struct {
     fn has(_: *Fixture, object: u64, key: []const u8, out_has: *bool, out_exception: *u64) c_int {
         out_has.* = true;
         out_exception.* = poison;
-        return c_api.js_bay_value_has(object, utf8(key), out_has, out_exception);
+        return c_api.jsbay_value_has(object, utf8(key), out_has, out_exception);
     }
 
     fn expectHas(self: *Fixture, object: u64, key: []const u8, expected: bool) !void {
@@ -157,7 +157,7 @@ const Fixture = struct {
     fn delete(_: *Fixture, object: u64, key: []const u8, out_deleted: *bool, out_exception: *u64) c_int {
         out_deleted.* = true;
         out_exception.* = poison;
-        return c_api.js_bay_value_delete(object, utf8(key), out_deleted, out_exception);
+        return c_api.jsbay_value_delete(object, utf8(key), out_deleted, out_exception);
     }
 
     fn expectDeleted(self: *Fixture, object: u64, key: []const u8, expected: bool) !void {
@@ -171,7 +171,7 @@ const Fixture = struct {
     fn keys(_: *Fixture, object: u64, out_array: *u64, out_exception: *u64) c_int {
         out_array.* = poison;
         out_exception.* = poison;
-        return c_api.js_bay_value_keys(object, out_array, out_exception);
+        return c_api.jsbay_value_keys(object, out_array, out_exception);
     }
 
     fn expectKeys(self: *Fixture, object: u64, expected_json: []const u8) !void {
@@ -186,7 +186,7 @@ const Fixture = struct {
     fn instanceOf(_: *Fixture, value: u64, constructor: u64, out_result: *bool, out_exception: *u64) c_int {
         out_result.* = true;
         out_exception.* = poison;
-        return c_api.js_bay_value_instance_of(value, constructor, out_result, out_exception);
+        return c_api.jsbay_value_instance_of(value, constructor, out_result, out_exception);
     }
 
     fn expectInstanceOf(self: *Fixture, value: u64, constructor: u64, expected: bool) !void {
@@ -202,7 +202,7 @@ const Fixture = struct {
 fn destroyInstanceCallback(instance_id: i32, _: ?*anyopaque, _: u64, _: usize, _: ?[*]const u64, out_value: *u64, out_exception: *u64) callconv(.c) c_int {
     out_value.* = 0;
     out_exception.* = 0;
-    c_api.js_bay_engine_destroy(instance_id);
+    c_api.jsbay_engine_destroy(instance_id);
     return invalid_argument;
 }
 
@@ -210,13 +210,13 @@ fn destroyInstanceCallback(instance_id: i32, _: ?*anyopaque, _: u64, _: usize, _
 fn destroyHookTarget(f: *Fixture, source: []const u8) !u64 {
     var function: u64 = poison;
     var exception: u64 = poison;
-    try testing.expectEqual(ok, c_api.js_bay_engine_bind(f.id, utf8("destroyNow"), destroyInstanceCallback, null, null, &function, &exception));
+    try testing.expectEqual(ok, c_api.jsbay_engine_bind(f.id, utf8("destroyNow"), destroyInstanceCallback, null, null, &function, &exception));
     _ = try f.keep(function);
     return f.eval(source);
 }
 
 test "object ops: construct reports a missing instance when a constructor destroys it" {
-    // Spike: js_bay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
+    // Spike: jsbay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
     var f = try Fixture.init();
     defer f.deinit();
     const target = try destroyHookTarget(&f, "(function F() { destroyNow(); })");
@@ -229,7 +229,7 @@ test "object ops: construct reports a missing instance when a constructor destro
 }
 
 test "object ops: has reports a missing instance when a Proxy trap destroys it" {
-    // Spike: js_bay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
+    // Spike: jsbay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
     var f = try Fixture.init();
     defer f.deinit();
     const target = try destroyHookTarget(&f, "new Proxy({}, { has() { destroyNow(); return true; } })");
@@ -241,7 +241,7 @@ test "object ops: has reports a missing instance when a Proxy trap destroys it" 
 }
 
 test "object ops: delete reports a missing instance when a Proxy trap destroys it" {
-    // Spike: js_bay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
+    // Spike: jsbay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
     var f = try Fixture.init();
     defer f.deinit();
     const target = try destroyHookTarget(&f, "new Proxy({ a: 1 }, { deleteProperty() { destroyNow(); return true; } })");
@@ -253,7 +253,7 @@ test "object ops: delete reports a missing instance when a Proxy trap destroys i
 }
 
 test "object ops: keys reports a missing instance when a Proxy trap destroys it" {
-    // Spike: js_bay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
+    // Spike: jsbay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
     var f = try Fixture.init();
     defer f.deinit();
     const target = try destroyHookTarget(&f, "new Proxy({ a: 1 }, { ownKeys() { destroyNow(); return ['a']; } })");
@@ -265,7 +265,7 @@ test "object ops: keys reports a missing instance when a Proxy trap destroys it"
 }
 
 test "object ops: instance_of reports a missing instance when Symbol.hasInstance destroys it" {
-    // Spike: js_bay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
+    // Spike: jsbay_engine_bind trampoline via makeNativeFunction (api_bind.spikeInstall).
     var f = try Fixture.init();
     defer f.deinit();
     const target = try destroyHookTarget(&f, "({ [Symbol.hasInstance]() { destroyNow(); return true; } })");
@@ -350,7 +350,7 @@ test "object ops: construct supports builtin constructors" {
     const to_iso = try f.get(date, "toISOString");
     var iso: u64 = 0;
     var exception: u64 = 0;
-    try testing.expectEqual(ok, c_api.js_bay_value_call(to_iso, date, null, 0, &iso, &exception));
+    try testing.expectEqual(ok, c_api.jsbay_value_call(to_iso, date, null, 0, &iso, &exception));
     try f.expectText(try f.keep(iso), "1970-01-02T00:00:00.000Z");
 }
 
@@ -385,7 +385,7 @@ test "object ops: construct reports non-constructors and constructor throws as e
     try testing.expectEqual(@as(u64, 0), value);
     _ = try f.keep(exception);
     var as_number: f64 = 0;
-    try testing.expectEqual(ok, c_api.js_bay_value_to_number(exception, &as_number));
+    try testing.expectEqual(ok, c_api.jsbay_value_to_number(exception, &as_number));
     try testing.expectEqual(@as(f64, 42), as_number);
 
     const throws_object = try f.eval("(function () { throw { code: 'E' }; })");
@@ -420,7 +420,7 @@ test "object ops: construct validates arguments and handles" {
     const A = try f.eval("(class A {})");
     var value: u64 = poison;
     var exception: u64 = poison;
-    try testing.expectEqual(invalid_argument, c_api.js_bay_value_construct(A, null, 1, &value, &exception));
+    try testing.expectEqual(invalid_argument, c_api.jsbay_value_construct(A, null, 1, &value, &exception));
     try testing.expectEqual(@as(u64, 0), value);
     try testing.expectEqual(@as(u64, 0), exception);
 
@@ -497,7 +497,7 @@ test "object ops: has and delete reject invalid keys" {
 
     var flag = true;
     var exception: u64 = poison;
-    try testing.expectEqual(invalid_argument, c_api.js_bay_value_has(object, .{ .data = null, .len = 1 }, &flag, &exception));
+    try testing.expectEqual(invalid_argument, c_api.jsbay_value_has(object, .{ .data = null, .len = 1 }, &flag, &exception));
     try testing.expect(!flag);
     // An empty key is valid and names the "" property.
     try f.expectHas(object, "", false);
@@ -700,16 +700,16 @@ test "object ops: handles are released and operations reject released handles" {
     var f = try Fixture.init();
     defer f.deinit();
     var object: u64 = 0;
-    try testing.expectEqual(ok, c_api.js_bay_value_new_object(f.id, &object));
+    try testing.expectEqual(ok, c_api.jsbay_value_new_object(f.id, &object));
     var array: u64 = 0;
     var exception: u64 = 0;
     try testing.expectEqual(ok, f.keys(object, &array, &exception));
-    try testing.expectEqual(ok, c_api.js_bay_value_release(array));
+    try testing.expectEqual(ok, c_api.jsbay_value_release(array));
     // The array handle is gone for good; operating on it is STALE_VALUE.
     var flag = true;
     try testing.expectEqual(stale_value, f.has(array, "length", &flag, &exception));
-    try testing.expectEqual(stale_value, c_api.js_bay_value_release(array));
-    try testing.expectEqual(ok, c_api.js_bay_value_release(object));
+    try testing.expectEqual(stale_value, c_api.jsbay_value_release(array));
+    try testing.expectEqual(ok, c_api.jsbay_value_release(object));
     try testing.expectEqual(stale_value, f.has(object, "a", &flag, &exception));
 }
 
@@ -792,7 +792,7 @@ const Sweep = struct {
     }
 
     fn release(handle: u64) void {
-        if (handle != 0 and handle != poison) _ = c_api.js_bay_value_release(handle);
+        if (handle != 0 and handle != poison) _ = c_api.jsbay_value_release(handle);
     }
 
     fn expectPair(status: c_int, value: u64, exception: u64) !void {
@@ -817,7 +817,7 @@ test "object ops: memory pressure yields only typed statuses and leaks no object
     defer f.deinit();
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) {
         // JSC exposes no heap cap, so allocation pressure cannot be injected.
-        try testing.expect(!c_api.js_bay_engine_set_memory_limit(f.id, 1));
+        try testing.expect(!c_api.jsbay_engine_set_memory_limit(f.id, 1));
         return;
     }
     var sweep: Sweep = .{
@@ -841,9 +841,9 @@ test "object ops: memory pressure yields only typed statuses and leaks no object
         sweep.object = try f.evalUntracked(object_source);
         _ = rc.runGc(f.id);
         const usage = rc.getMemoryUsage(f.id) orelse return error.NoUsage;
-        try testing.expect(c_api.js_bay_engine_set_memory_limit(f.id, usage.malloc_size + headroom));
+        try testing.expect(c_api.jsbay_engine_set_memory_limit(f.id, usage.malloc_size + headroom));
         try sweep.run();
-        try testing.expect(c_api.js_bay_engine_set_memory_limit(f.id, 0));
+        try testing.expect(c_api.jsbay_engine_set_memory_limit(f.id, 0));
         Sweep.release(sweep.object);
     }
     try testing.expect(sweep.ok_count > 0);

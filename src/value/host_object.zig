@@ -1,6 +1,6 @@
 //! Host object with arbitrary get / set / enumerate traps.
 //!
-//! Mirrors the JSI HostObject shape used by React Native and Hermes: unknown gets are `undefined`, a missing set trap throws a plain Error whose message starts with "TypeError: " (the error name is not "TypeError"), enumeration is only the names from `get_property_names` with canonical integer indices ascending first, and `in` / `hasOwnProperty` are true for every name. There is no decorator chain.
+//! Host-object traps for arbitrary property names: unknown gets are `undefined`, a missing set trap throws a plain Error whose message starts with "TypeError: " (the error name is not "TypeError"), enumeration is only the names from `get_property_names` with canonical integer indices ascending first, and `in` / `hasOwnProperty` are true for every name. There is no decorator chain.
 //!
 //! Callback signatures are structural and must stay identical to the copies in `backend/quickjs/host_object.zig` and `backend/jsc/host_object.zig`.
 //!

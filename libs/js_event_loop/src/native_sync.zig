@@ -6,19 +6,28 @@ const builtin = @import("builtin");
 
 pub const Outcome = enum { ok, exception, timeout, cancelled };
 
+pub const PayloadKind = enum(u8) {
+    utf8_string = 0,
+    bytes = 1,
+    json = 2,
+};
+
+pub const CompleteResult = enum { ok, stale, out_of_memory };
+
 const Request = struct {
     instance_id: i32,
     mutex: zev.Mutex = .{},
     changed: zev.Condition = .init,
     outcome: ?Outcome = null,
-    json: ?[]u8 = null,
+    payload: ?[]u8 = null,
+    kind: PayloadKind = .utf8_string,
     completed_at_ms: u64 = 0,
     deadline_ms: u64 = std.math.maxInt(u64),
     delivered: bool = false,
     refs: std.atomic.Value(usize) = .init(2),
 
     fn deinit(self: *Request) void {
-        if (self.json) |bytes| std.heap.c_allocator.free(bytes);
+        if (self.payload) |bytes| std.heap.c_allocator.free(bytes);
         self.changed.deinit();
         self.mutex.deinit();
         std.heap.c_allocator.destroy(self);
@@ -31,7 +40,7 @@ var next_id: u64 = 1;
 var ids_exhausted = false;
 
 pub const Started = struct { id: u64, request: *Request };
-pub const Completed = struct { outcome: Outcome, json: ?[]u8 };
+pub const Completed = struct { outcome: Outcome, payload: ?[]u8, kind: PayloadKind };
 
 pub fn start(instance_id: i32) ?Started {
     const request = std.heap.c_allocator.create(Request) catch return null;
@@ -59,14 +68,13 @@ fn release(request: *Request) void {
     if (request.refs.fetchSub(1, .acq_rel) == 1) request.deinit();
 }
 
-pub fn complete(id: u64, outcome: Outcome, json: []const u8) enum { ok, stale, out_of_memory } {
+/// Copy `data` once into the request. Completer threads must not enter a VM.
+/// Lookup (and stale/deadline checks) run before allocating the payload copy.
+pub fn complete(id: u64, outcome: Outcome, kind: PayloadKind, data: []const u8) CompleteResult {
     if (id == 0) return .stale;
-    const copy = std.heap.c_allocator.alloc(u8, json.len) catch return .out_of_memory;
-    @memcpy(copy, json);
     registry_mutex.lock();
     const request = requests.get(id) orelse {
         registry_mutex.unlock();
-        std.heap.c_allocator.free(copy);
         return .stale;
     };
     _ = request.refs.fetchAdd(1, .acq_rel);
@@ -77,18 +85,17 @@ pub fn complete(id: u64, outcome: Outcome, json: []const u8) enum { ok, stale, o
         request.mutex.unlock();
         release(request);
     }
-    if (request.outcome != null) {
-        std.heap.c_allocator.free(copy);
-        return .stale;
-    }
+    if (request.outcome != null) return .stale;
     const now = zev.monotonicMilliseconds();
     if (now >= request.deadline_ms) {
         request.outcome = .timeout;
         request.changed.broadcast();
-        std.heap.c_allocator.free(copy);
         return .stale;
     }
-    request.json = copy;
+    const copy = std.heap.c_allocator.alloc(u8, data.len) catch return .out_of_memory;
+    @memcpy(copy, data);
+    request.payload = copy;
+    request.kind = kind;
     request.outcome = outcome;
     request.completed_at_ms = now;
     request.changed.broadcast();
@@ -102,8 +109,8 @@ fn tightenDeadlineLocked(request: *Request, deadline_ms: u64) void {
     if (request.outcome) |outcome| {
         if (outcome == .ok or outcome == .exception) {
             if (request.completed_at_ms >= request.deadline_ms) {
-                if (request.json) |bytes| std.heap.c_allocator.free(bytes);
-                request.json = null;
+                if (request.payload) |bytes| std.heap.c_allocator.free(bytes);
+                request.payload = null;
                 request.outcome = .timeout;
                 request.changed.broadcast();
             }
@@ -148,9 +155,18 @@ pub fn wait(request: *Request) Completed {
         if (builtin.is_test) test_only.notifyWaitObserver();
         _ = request.changed.waitTimeout(&request.mutex, request.deadline_ms - now);
     }
-    const completed = Completed{ .outcome = request.outcome.?, .json = request.json };
+    const completed = Completed{ .outcome = request.outcome.?, .payload = request.payload, .kind = request.kind };
     request.delivered = true;
     return completed;
+}
+
+/// Detach the stored payload from the request so the owner can free or adopt it. Call after wait on the owner thread.
+pub fn takePayload(request: *Request) ?[]u8 {
+    request.mutex.lock();
+    defer request.mutex.unlock();
+    const payload = request.payload;
+    request.payload = null;
+    return payload;
 }
 
 pub fn finish(id: u64, request: *Request) void {

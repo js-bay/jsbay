@@ -176,7 +176,7 @@ test "spike smoke: engine_thread start / id / stop" {
     if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
     // Minimal contract only: post/wait still throws on Escargot spike (status=exception) — leave full suite to non-spike.
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer {
         engine_thread.threadStop(id);
         engine.destroy(id);
@@ -196,7 +196,7 @@ test "spike smoke: engine_thread post/wait eval" {
     // Escargot: vendor rebuilt with ENABLE_THREADING + TLS_ACCESS_BY_PTHREAD_KEY;
     // escargot_thread_enter/leave call Globals::initializeThread/finalizeThread.
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer {
         engine_thread.threadStop(id);
         engine.destroy(id);
@@ -261,20 +261,21 @@ test "spike smoke: Hermes create-time MaxHeapSize; setMemoryLimit still false" {
     }.run);
 }
 
-test "spike smoke: C ABI create2 MaxHeapSize; set_memory_limit false; request_interrupt false" {
+test "spike smoke: C ABI create_with_options MaxHeapSize; set_memory_limit false; request_interrupt false" {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
-    var opts = c_api.CreateOptions{
-        .struct_size = @sizeOf(c_api.CreateOptions),
+    var opts = c_api.EngineCreateOptionsC{
+        .struct_size = @sizeOf(c_api.EngineCreateOptionsC),
+        .backend = .primary,
         .log_handler = null,
         .log_user_data = null,
         .max_heap_size = 64 * 1024 * 1024,
     };
-    try testing.expect(c_api.js_bay_engine_create2(id, &opts));
+    try testing.expect(c_api.jsbay_engine_create_with_options(id, &opts));
     defer engine.destroy(id);
     try helpers.expectEvalEquals(id, "2+2", "4");
-    try testing.expect(!c_api.js_bay_engine_set_memory_limit(id, 1));
-    try testing.expect(!c_api.js_bay_engine_request_interrupt(id));
+    try testing.expect(!c_api.jsbay_engine_set_memory_limit(id, 1));
+    try testing.expect(!c_api.jsbay_engine_request_interrupt(id));
     try testing.expect(!runtime_control.supportsMidScriptUserInterrupt());
 }
 

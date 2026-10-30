@@ -1,10 +1,10 @@
 //! External values — wrap a raw native pointer as an opaque JS value.
 //!
-//! Analogous to napi-rs `env.create_external(value, finalize)` and V8's `v8::External::New`. Use this when JavaScript only needs to carry a native pointer through a one-shot FFI bridge.
+//! Use this when JavaScript only needs to carry a native pointer through a one-shot FFI bridge.
 //!
 //! The resulting JS value is an object of a private class. It has no properties and is not callable from JS — it exists solely as a container the engine can GC-track. When the value is collected, the user-supplied finalizer (if any) runs with the native pointer so the owner can release the backing resource.
 //!
-//! Contract mirrors the rest of the engine API: operations on a given `instance_id` MUST happen on the owning thread.
+//! Contract: operations on a given `instance_id` MUST happen on the owning thread.
 
 const std = @import("std");
 const backend = @import("../backend.zig");

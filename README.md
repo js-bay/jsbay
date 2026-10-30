@@ -18,28 +18,28 @@ zig build test
 
 Supported backend tags are `quickjs_ng`, `quickjs`, and `jsc`. JavaScriptCore requires an Apple target. Experimental Escargot / Hermes spikes also live as submodules (`vendor/escargot`, `vendor/hermes`); see below.
 
-The public C header is [`include/js_bay.h`](include/js_bay.h). Create and use each engine on one owner thread, release every owned `js_bay_value_t`, and destroy the engine on that same thread. `js_bay_engine_request_interrupt` and `js_bay_engine_stop_loop` are the ordinary cross-thread controls.
+The public C header is [`include/jsbay.h`](include/jsbay.h). Create and use each engine on one owner thread, release every owned `jsbay_value_t`, and destroy the engine on that same thread. `jsbay_engine_request_interrupt` and `jsbay_engine_stop_loop` are the ordinary cross-thread controls.
 
 ```c
-#include "js_bay.h"
+#include "jsbay.h"
 
 const uint8_t source[] = "1 + 2";
 const uint8_t filename[] = "app.js";
-js_bay_value_t value = 0;
-js_bay_value_t exception = 0;
+jsbay_value_t value = 0;
+jsbay_value_t exception = 0;
 
-if (!js_bay_engine_create(1, NULL, NULL)) return 1;
-js_bay_status_t status = js_bay_engine_evaluate(
+if (!jsbay_engine_create(1, NULL, NULL)) return 1;
+jsbay_status_t status = jsbay_engine_evaluate(
     1,
-    (js_bay_utf8_t){source, sizeof(source) - 1},
-    (js_bay_utf8_t){filename, sizeof(filename) - 1},
+    (jsbay_utf8_t){source, sizeof(source) - 1},
+    (jsbay_utf8_t){filename, sizeof(filename) - 1},
     NULL, &value, &exception);
-if (status == JS_BAY_OK) js_bay_value_release(value);
-if (status == JS_BAY_EXCEPTION) js_bay_value_release(exception);
-js_bay_engine_destroy(1);
+if (status == JS_BAY_OK) jsbay_value_release(value);
+if (status == JS_BAY_EXCEPTION) jsbay_value_release(exception);
+jsbay_engine_destroy(1);
 ```
 
-The JavaScript event loop owns its monotonic clock, timers, waiting, and wakeups. Call `js_bay_engine_run_loop` on a dedicated owner thread, or let the SDK connect it to the platform owner thread. `js_bay_engine_stop_loop` is thread-safe. Each queued JavaScript task finishes with a microtask checkpoint; callers do not supply timestamps or compute deadlines.
+The JavaScript event loop owns its monotonic clock, timers, waiting, and wakeups. Call `jsbay_engine_run_loop` on a dedicated owner thread, or let the SDK connect it to the platform owner thread. `jsbay_engine_stop_loop` is thread-safe. Each queued JavaScript task finishes with a microtask checkpoint; callers do not supply timestamps or compute deadlines.
 
 ## SDKs and integration
 

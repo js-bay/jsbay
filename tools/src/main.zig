@@ -174,7 +174,7 @@ fn checkCAbi(args: []const []const u8) !u8 {
         const symbol_raw = it.next() orelse continue;
         if (!isHex(address) or kind.len != 1 or (kind[0] >= 'a' and kind[0] <= 'z' and kind[0] == 'u') or kind[0] == 'U') continue;
         const symbol = if (std.mem.startsWith(u8, symbol_raw, "_")) symbol_raw[1..] else symbol_raw;
-        if (std.mem.startsWith(u8, symbol, "js_bay_")) try actual.put(symbol, {});
+        if (std.mem.startsWith(u8, symbol, "jsbay_")) try actual.put(symbol, {});
         if (std.mem.startsWith(u8, symbol, "no" ++ "ok_engine_") or std.mem.startsWith(u8, symbol, "z" ++ "je_") or std.mem.startsWith(u8, symbol, "z" ++ "jse_") or std.mem.startsWith(u8, symbol, "Java_") or std.mem.eql(u8, symbol, "JNI_OnLoad")) try forbidden.append(std.heap.page_allocator, symbol);
     }
     var failed = false;
@@ -202,7 +202,7 @@ fn isHex(value: []const u8) bool {
 }
 
 pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
-    const names = [_][]const u8{ "js_bay.h", "js_bay_bytecode.h", "js_bay_sync.h" };
+    const names = [_][]const u8{ "jsbay.h", "jsbay_bytecode.h", "jsbay_sync.h" };
     var result = std.StringHashMap(void).init(allocator);
     errdefer result.deinit();
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -211,7 +211,7 @@ pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
     defer include.close(threaded.io());
     var iterator = include.iterate();
     while (try iterator.next(threaded.io())) |entry| {
-        if (!std.mem.startsWith(u8, entry.name, "js_bay") or !std.mem.endsWith(u8, entry.name, ".h")) continue;
+        if (!std.mem.startsWith(u8, entry.name, "jsbay") or !std.mem.endsWith(u8, entry.name, ".h")) continue;
         var allowed = false;
         for (names) |name| if (std.mem.eql(u8, name, entry.name)) {
             allowed = true;
@@ -234,10 +234,10 @@ pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
                 i += std.mem.indexOfScalar(u8, text[i..], '\n') orelse (text.len - i);
                 continue;
             }
-            if (!std.mem.startsWith(u8, text[i..], "js_bay_")) continue;
+            if (!std.mem.startsWith(u8, text[i..], "jsbay_")) continue;
             if (i > 0 and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_')) continue;
             const start = i;
-            i += "js_bay_".len;
+            i += "jsbay_".len;
             while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_')) : (i += 1) {}
             const end = i;
             if (std.mem.endsWith(u8, text[start..end], "_t")) continue;
@@ -248,13 +248,13 @@ pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
     return result;
 }
 
-test "header symbols include functions following js_bay typedef return types" {
+test "header symbols include functions following jsbay typedef return types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var symbols = try headerSymbols(arena.allocator());
     defer symbols.deinit();
-    try std.testing.expect(symbols.contains("js_bay_engine_evaluate"));
-    try std.testing.expect(symbols.contains("js_bay_sync_complete"));
+    try std.testing.expect(symbols.contains("jsbay_engine_evaluate"));
+    try std.testing.expect(symbols.contains("jsbay_sync_complete"));
 }
 
 fn runOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {

@@ -30,14 +30,14 @@ Host `vendor/{escargot,hermes,icu}-install` trees are **linux glibc** — do not
 | Escargot | yes | yes (do not re-link `escargot_bridge.o`; already in the Zig archive) | pass (`jsbay-escargot-android-smoke-ok`) | pass |
 | Hermes | yes | yes (push x86_64 `libc++_shared.so`, not i686) | pass (`jsbay-hermes-android-smoke-ok`) | pass |
 
-`js_bay_engine_create2` is force-exported from library-only builds via `@export` in `src/root.zig`. Zig 0.17 `process.run` does not PATH-search relative `cc`/`c++`; `tools/src/main.zig` `resolvePathCmd` uses absolute compiler paths for `check-c-abi`.
+`jsbay_engine_create_with_options` is force-exported from library-only builds via `@export` in `src/root.zig`. Zig 0.17 `process.run` does not PATH-search relative `cc`/`c++`; `tools/src/main.zig` `resolvePathCmd` uses absolute compiler paths for `check-c-abi`.
 
 ## Escargot Android link sketch
 
 ```bash
 # Zig: -Dbackend=escargot -Dshared=false -Dlibrary-only=true -Dtarget=x86_64-linux-android.24
 #      -Descargot-install=vendor/escargot-android-install-x86_64 -Dandroid-sysroot=… -Dlibstdcxx=libc++_static.a
-# NDK: clang++ -shared -Wl,--whole-archive libjs_bay.a -Wl,--no-whole-archive \
+# NDK: clang++ -shared -Wl,--whole-archive libjsbay.a -Wl,--no-whole-archive \
 #      libescargot.a libgc-lib.a liblibbf.a liblibsimdutf.a libruntime-icu-binder-static.a \
 #      -static-libstdc++ libatomic.a -llog -lm -ldl
 ```
@@ -47,7 +47,7 @@ Host `vendor/{escargot,hermes,icu}-install` trees are **linux glibc** — do not
 ```bash
 # Zig: -Dbackend=hermes -Dshared=false -Dlibrary-only=true -Dtarget=x86_64-linux-android.24
 #      -Dhermes-install=vendor/hermes-android-install-x86_64 -Dicu-lib-dir=vendor/icu-android-prefix-x86_64/lib
-# NDK: clang++ -shared -Wl,--whole-archive libjs_bay.a -Wl,--no-whole-archive \
+# NDK: clang++ -shared -Wl,--whole-archive libjsbay.a -Wl,--no-whole-archive \
 #      -lhermes_bridge -lhermesvm -ljsi -static-libstdc++ -llog -lm -ldl
 # Device: LD_LIBRARY_PATH must include libhermes_{bridge,vm}.so, libjsi.so, libc++_shared.so
 ```

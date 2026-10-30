@@ -367,7 +367,7 @@ const InspectorEnabledTests = if (build_options.inspector) struct {
         if (ran.err) |v| std.heap.c_allocator.free(v);
         try send(&session, "Profiler.stop", "", 3);
         try pumpResponse(&session, 3);
-        try testing.expect(std.mem.indexOf(u8, session.got.items, "\"jsBaySampling\":{") != null);
+        try testing.expect(std.mem.indexOf(u8, session.got.items, "\"jsbaySampling\":{") != null);
         try testing.expect(std.mem.indexOf(u8, session.got.items, "\"retainedSamples\":") != null);
         try testing.expect(std.mem.indexOf(u8, session.got.items, "\"droppedSamples\":") != null);
         try testing.expect(std.mem.indexOf(u8, session.got.items, "\"truncatedStacks\":") != null);
@@ -473,7 +473,7 @@ const InspectorEnabledTests = if (build_options.inspector) struct {
         try send(&session, "HeapProfiler.takeHeapSnapshot", "", 2);
         try pumpResponse(&session, 2);
         try testing.expect(std.mem.indexOf(u8, session.got.items, "HeapProfiler.addHeapSnapshotChunk") != null);
-        try testing.expect(std.mem.indexOf(u8, session.got.items, "\"id\":2,\"result\":{\"jsBaySnapshot\":") != null);
+        try testing.expect(std.mem.indexOf(u8, session.got.items, "\"id\":2,\"result\":{\"jsbaySnapshot\":") != null);
     }
 
     test "cdp diagnostics: JSC reports CPU profiling as unsupported" {
@@ -560,10 +560,10 @@ comptime {
 const InspectorDisabledTests = if (!build_options.inspector) struct {
     test "c api diagnostics: inspector-disabled build retains ABI and refuses to listen" {
         const id = helpers.nextInstanceId();
-        try testing.expect(c_api.js_bay_engine_create(id, null, null));
-        defer c_api.js_bay_engine_destroy(id);
+        try testing.expect(c_api.jsbay_engine_create(id, null, null));
+        defer c_api.jsbay_engine_destroy(id);
         var port: u16 = 99;
-        try testing.expect(!c_api.js_bay_engine_inspector_start(id, 0, &port));
+        try testing.expect(!c_api.jsbay_engine_inspector_start(id, 0, &port));
         try testing.expectEqual(@as(u16, 99), port);
     }
 };

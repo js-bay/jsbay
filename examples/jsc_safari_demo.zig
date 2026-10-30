@@ -9,7 +9,7 @@
 //! Under QJS or on non-Apple platforms this binary is not built (the build step is gated in build.zig). If it somehow runs under QJS it bails out with a helpful message.
 
 const std = @import("std");
-const zjs = @import("js_bay_tools");
+const zjs = @import("jsbay_tools");
 
 const engine = zjs.engine;
 const SignalStop = @import("signal_stop.zig").SignalStop;

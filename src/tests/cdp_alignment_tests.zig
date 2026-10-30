@@ -33,7 +33,7 @@ const Session = struct {
         self.stream.close();
         inspector.stop(self.handle);
         if (self.c_api_owned) {
-            c_api.js_bay_engine_destroy(self.id);
+            c_api.jsbay_engine_destroy(self.id);
         } else {
             engine.destroy(self.id);
         }
@@ -103,8 +103,8 @@ fn openSessionWithId(alloc: std.mem.Allocator, id: i32, target_id: []const u8) !
 
 fn openCapiSession(alloc: std.mem.Allocator, target_id: []const u8) !Session {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.js_bay_engine_create(id, null, null));
-    errdefer c_api.js_bay_engine_destroy(id);
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    errdefer c_api.jsbay_engine_destroy(id);
     const handle = try inspector.start(id, .{ .port = 0, .target_id = target_id });
     errdefer inspector.stop(handle);
     const stream = try wire.connect(inspector.boundPort(handle));
@@ -271,19 +271,19 @@ fn waitForSessionRemoval(state: *inspector_state.InspectorState, session_id: u64
 
 fn cApiHostileThrowCoercesReason() !bool {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.js_bay_engine_create(id, null, null));
-    defer c_api.js_bay_engine_destroy(id);
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
     const hostile = "throw { toString: function(){ globalThis.__cdpToStringCalled = true; throw new Error('must-not-coerce'); } };";
     const filename = "public-abi-hostile-baseline.js";
     var value: u64 = 0;
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 1), c_api.js_bay_engine_evaluate(id, .{ .data = hostile.ptr, .len = hostile.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
-    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_release(exception));
+    try testing.expectEqual(@as(c_int, 1), c_api.jsbay_engine_evaluate(id, .{ .data = hostile.ptr, .len = hostile.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_release(exception));
     const check = "globalThis.__cdpToStringCalled === undefined";
-    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_evaluate(id, .{ .data = check.ptr, .len = check.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
-    defer testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_release(value)) catch {};
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_evaluate(id, .{ .data = check.ptr, .len = check.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
+    defer testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_release(value)) catch {};
     var uncoerced = false;
-    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_to_bool(value, &uncoerced));
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_to_bool(value, &uncoerced));
     return !uncoerced;
 }
 
@@ -502,7 +502,7 @@ test "cdp alignment: async depth without Debugger.enable keeps an explicitly att
     defer session.deinit();
 
     const instance = instance_map.getInstance(session.id) orelse return error.MissingEngine;
-    _ = debugger_mod.attach(session.id, @ptrCast(@constCast(instance.runtime)));
+    _ = debugger_mod.attach(session.id, @ptrCast(@constCast(instance.monoRuntime().?)));
     try testing.expect(debugger_mod.handlerInstallThreadId(session.id) != 0);
 
     const at = try send(&session, "Debugger.setAsyncCallStackDepth", "{\"maxDepth\":1}", 3011);
@@ -680,8 +680,8 @@ test "cdp alignment: Runtime.exceptionThrown reports a public C ABI evaluate exc
     // JSC itself coerces a thrown object while producing a native exception. The inspector may not add another coercion; compare the inspector path with an otherwise identical C ABI evaluation without an inspector.
     const baseline_coerced = try cApiHostileThrowCoercesReason();
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.js_bay_engine_create(id, null, null));
-    defer c_api.js_bay_engine_destroy(id);
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
     const handle = try inspector.start(id, .{ .port = 0, .target_id = "cdp-alignment-public-abi-exception" });
     defer inspector.stop(handle);
     const stream = try wire.connect(inspector.boundPort(handle));
@@ -700,7 +700,7 @@ test "cdp alignment: Runtime.exceptionThrown reports a public C ABI evaluate exc
     const filename = "public-abi-throw.js";
     var value: u64 = 0;
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 1), c_api.js_bay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
+    try testing.expectEqual(@as(c_int, 1), c_api.jsbay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
     try testing.expect(value == 0 and exception != 0);
     try testing.expect(try pumpFor(&session, from, "Runtime.exceptionThrown", 40));
     const event = session.got.items[from..];
@@ -717,20 +717,20 @@ test "cdp alignment: Runtime.exceptionThrown reports a public C ABI evaluate exc
         try testing.expect(responseIsSuccess(message, 65));
         try testing.expect(std.mem.indexOf(u8, message, "public-abi-marker") != null);
     }
-    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_release(exception));
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_release(exception));
 
     const hostile = "throw { marker: 'public-abi-hostile', toString: function(){ globalThis.__cdpToStringCalled = true; throw new Error('must-not-coerce'); } };";
     value = 0;
     exception = 0;
     const hostile_from = session.got.items.len;
-    try testing.expectEqual(@as(c_int, 1), c_api.js_bay_engine_evaluate(id, .{ .data = hostile.ptr, .len = hostile.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
+    try testing.expectEqual(@as(c_int, 1), c_api.jsbay_engine_evaluate(id, .{ .data = hostile.ptr, .len = hostile.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
     try testing.expect(try pumpFor(&session, hostile_from, "Runtime.exceptionThrown", 40));
     const check_at = try send(&session, "Runtime.evaluate", "{\"expression\":\"globalThis.__cdpToStringCalled === undefined\",\"returnByValue\":true}", 64);
     const check = try pumpResponse(&session, check_at, 64);
     try testing.expect(responseIsSuccess(check, 64));
     const inspector_coerced = std.mem.indexOf(u8, check, "\"value\":true") == null;
     try testing.expectEqual(baseline_coerced, inspector_coerced);
-    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_release(exception));
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_release(exception));
 }
 
 test "cdp alignment: Runtime.exceptionThrown reports an uncaught timer callback throw" {
@@ -1280,7 +1280,7 @@ test "cdp governance: a cached C ABI closure keeps its script identity after a s
         var value: u64 = 0;
         var exception: u64 = 0;
         cache_hit = false;
-        try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_evaluate(
+        try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_evaluate(
             session.id,
             .{ .data = source.ptr, .len = source.len },
             .{ .data = filename.ptr, .len = filename.len },
@@ -1288,7 +1288,7 @@ test "cdp governance: a cached C ABI closure keeps its script identity after a s
             &value,
             &exception,
         ));
-        defer _ = c_api.js_bay_value_release(value);
+        defer _ = c_api.jsbay_value_release(value);
         try testing.expectEqual(@as(u64, 0), exception);
         try testing.expectEqual(run == 1, cache_hit);
     }

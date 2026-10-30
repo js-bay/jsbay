@@ -189,6 +189,9 @@ typedef struct {
     EscargotValue exception;
 } EscargotBoolOpResult;
 
+EscargotOpResult escargot_call_result(EscargotContext *ctx, EscargotValue fn, EscargotValue this_val,
+                                      const EscargotValue *args, size_t argc);
+void escargot_throw_value(EscargotContext *ctx, EscargotValue exception);
 EscargotOpResult escargot_set_property_result(EscargotContext *ctx, EscargotValue obj, const char *key, EscargotValue val);
 EscargotOpResult escargot_construct(EscargotContext *ctx, EscargotValue ctor,
                                     const EscargotValue *args, size_t argc);

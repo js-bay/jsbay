@@ -277,6 +277,11 @@ extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
 
 extern "C" void escargot_context_free(EscargotContext *ctx) {
     if (!ctx) return;
+    ctx->pending_throw.clear();
+    if (ctx->pending_throw_value) {
+        escargot_free_value(ctx, ctx->pending_throw_value);
+        ctx->pending_throw_value = nullptr;
+    }
     {
         std::lock_guard<std::mutex> lock(g_ctx_map_mu);
         g_ctx_map.erase(ctx->ctx.get());
@@ -1242,10 +1247,24 @@ static ValueRef *nativeTrampoline(ExecutionStateRef *state, ValueRef *thisValue,
     std::vector<EscargotValue> args(argc);
     for (size_t i = 0; i < argc; i++) args[i] = argv[i];
     data->ctx->pending_throw.clear();
+    if (data->ctx->pending_throw_value) {
+        // Drop any stale retained exception before the callback.
+        escargot_free_value(data->ctx, data->ctx->pending_throw_value);
+        data->ctx->pending_throw_value = nullptr;
+    }
     EscargotValue result = data->fn(data->ctx, thisValue, args.data(), argc, data->user_data);
+    if (data->ctx->pending_throw_value) {
+        ValueRef *exc = asVal(data->ctx->pending_throw_value);
+        data->ctx->pending_throw_value = nullptr;
+        data->ctx->pending_throw.clear();
+        if (result) escargot_free_value(data->ctx, result);
+        state->throwException(exc);
+        return ValueRef::createUndefined();
+    }
     if (!data->ctx->pending_throw.empty()) {
         std::string msg = data->ctx->pending_throw;
         data->ctx->pending_throw.clear();
+        if (result) escargot_free_value(data->ctx, result);
         state->throwException(ErrorObjectRef::create(state, ErrorObjectRef::Code::TypeError,
             StringRef::createFromUTF8(msg.data(), msg.size())));
         return ValueRef::createUndefined();
@@ -1272,9 +1291,25 @@ extern "C" EscargotValue escargot_make_function(EscargotContext *c, const char *
     return retain(c, er.result);
 }
 
+extern "C" void escargot_throw_value(EscargotContext *c, EscargotValue exception) {
+    if (!c) return;
+    c->pending_throw.clear();
+    if (c->pending_throw_value) {
+        escargot_free_value(c, c->pending_throw_value);
+        c->pending_throw_value = nullptr;
+    }
+    // Caller transferred ownership of the handle.
+    c->pending_throw_value = exception;
+    if (!exception) c->pending_throw = "Error";
+}
+
 extern "C" void escargot_throw(EscargotContext *c, const char *message) {
     // Do not throw across Evaluator here — that would be caught. Record pending for trampoline.
     if (!c) return;
+    if (c->pending_throw_value) {
+        escargot_free_value(c, c->pending_throw_value);
+        c->pending_throw_value = nullptr;
+    }
     c->pending_throw = message ? message : "Error";
 }
 
@@ -1377,6 +1412,24 @@ static ValueRef *retainedErrorOrNull(EscargotContextOpaque *c, const Evaluator::
     if (er.error) return const_cast<ValueRef *>(er.error.value());
     return nullptr;
 }
+
+extern "C" EscargotOpResult escargot_call_result(EscargotContext *c, EscargotValue fn, EscargotValue this_val,
+                                                 const EscargotValue *args, size_t argc) {
+    EscargotOpResult out{nullptr, nullptr};
+    if (!c || !fn) return out;
+    std::vector<ValueRef *> argv(argc);
+    for (size_t i = 0; i < argc; i++) argv[i] = asVal(args[i]);
+    CallPack pack{asVal(fn), this_val ? asVal(this_val) : nullptr, argv.data(), argc};
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, CallPack *p) -> ValueRef * {
+            ValueRef *recv = p->this_val ? p->this_val : ValueRef::createUndefined();
+            return p->fn->call(state, recv, p->argc, p->argv);
+        },
+        &pack);
+    if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
+    return opOk(c, er.result);
+}
+
 
 extern "C" EscargotOpResult escargot_set_property_result(EscargotContext *c, EscargotValue obj, const char *key, EscargotValue val) {
     EscargotOpResult out{nullptr, nullptr};

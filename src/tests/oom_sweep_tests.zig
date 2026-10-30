@@ -34,8 +34,8 @@ const Fixture = struct {
     tally: [op_count]Tally = @splat(.{}),
 
     fn deinit(self: *Fixture) void {
-        _ = c_api.js_bay_value_release(self.big_object);
-        _ = c_api.js_bay_value_release(self.big_string);
+        _ = c_api.jsbay_value_release(self.big_object);
+        _ = c_api.jsbay_value_release(self.big_string);
         testing.allocator.free(self.expected_json);
         testing.allocator.free(self.expected_utf8);
     }
@@ -44,7 +44,7 @@ const Fixture = struct {
         // Poison the outputs: the API must clear them before doing any work.
         out_value.* = 0xdead;
         out_exception.* = 0xbeef;
-        return c_api.js_bay_engine_evaluate(
+        return c_api.jsbay_engine_evaluate(
             self.id,
             .{ .data = source.ptr, .len = source.len },
             .{ .data = "oom-sweep.js", .len = 12 },
@@ -66,9 +66,9 @@ const Fixture = struct {
 
     fn expectAnswer(self: *Fixture) !void {
         const value = try self.evaluateOk("6 * 7");
-        defer _ = c_api.js_bay_value_release(value);
+        defer _ = c_api.jsbay_value_release(value);
         var number: f64 = 0;
-        try testing.expectEqual(api_ok, c_api.js_bay_value_to_number(value, &number));
+        try testing.expectEqual(api_ok, c_api.jsbay_value_to_number(value, &number));
         try testing.expectEqual(@as(f64, 42), number);
     }
 
@@ -77,7 +77,7 @@ const Fixture = struct {
         var bytes: c_api.Bytes = .{ .data = null, .len = 0 };
         var exception: u64 = 0;
         try testing.expectEqual(api_ok, to_text(value, &bytes, &exception));
-        defer c_api.js_bay_free_bytes(bytes);
+        defer c_api.jsbay_free_bytes(bytes);
         try testing.expectEqual(@as(u64, 0), exception);
         const data = bytes.data orelse return error.NoBytes;
         return testing.allocator.dupe(u8, data[0..bytes.len]);
@@ -90,8 +90,8 @@ const Fixture = struct {
             \\   rows: Array.from({ length: 1500 }, (_, i) => ({ i, label: 'row-' + i, nested: { even: i % 2 === 0 } })) })
         );
         self.big_string = try self.evaluateOk("'h\\u00e9llo-\\u4e16\\u754c-'.repeat(8000)");
-        self.expected_json = try self.textOf(c_api.js_bay_value_to_json, self.big_object);
-        self.expected_utf8 = try self.textOf(c_api.js_bay_value_to_utf8, self.big_string);
+        self.expected_json = try self.textOf(c_api.jsbay_value_to_json, self.big_object);
+        self.expected_utf8 = try self.textOf(c_api.jsbay_value_to_utf8, self.big_string);
         try testing.expect(self.expected_json.len > 40000);
         try testing.expect(self.expected_utf8.len > 100000);
     }
@@ -134,12 +134,12 @@ const Fixture = struct {
         var exception: u64 = 0xbeef;
         const status = to_text(value, &bytes, &exception);
         defer if (exception != 0) {
-            _ = c_api.js_bay_value_release(exception);
+            _ = c_api.jsbay_value_release(exception);
         };
         self.record(op, status);
         switch (status) {
             api_ok => {
-                defer c_api.js_bay_free_bytes(bytes);
+                defer c_api.jsbay_free_bytes(bytes);
                 try testing.expectEqual(@as(u64, 0), exception);
                 const data = bytes.data orelse return error.NoBytes;
                 try testing.expectEqualSlices(u8, expected, data[0..bytes.len]);
@@ -161,17 +161,17 @@ const Fixture = struct {
         var exception: u64 = 0;
         const status = self.evaluate(source, &value, &exception);
         defer if (value != 0 and value != 0xdead) {
-            _ = c_api.js_bay_value_release(value);
+            _ = c_api.jsbay_value_release(value);
         };
         defer if (exception != 0 and exception != 0xbeef) {
-            _ = c_api.js_bay_value_release(exception);
+            _ = c_api.jsbay_value_release(exception);
         };
         self.record(op, status);
         try expectPair(status, value, exception);
         if (status == api_ok) {
             if (expect_number) |want| {
                 var number: f64 = 0;
-                try testing.expectEqual(api_ok, c_api.js_bay_value_to_number(value, &number));
+                try testing.expectEqual(api_ok, c_api.jsbay_value_to_number(value, &number));
                 try testing.expectEqual(want, number);
             }
         }
@@ -181,11 +181,11 @@ const Fixture = struct {
         // Native constructor first: it only allocates an Error object.
         var made: u64 = 0xdead;
         const message = "constructed-under-limit";
-        const made_status = c_api.js_bay_value_new_error(self.id, .{ .data = message, .len = message.len }, &made);
+        const made_status = c_api.jsbay_value_new_error(self.id, .{ .data = message, .len = message.len }, &made);
         self.record(.error_stack, made_status);
         switch (made_status) {
             api_ok => {
-                defer _ = c_api.js_bay_value_release(made);
+                defer _ = c_api.jsbay_value_release(made);
                 try testing.expect(made != 0);
             },
             else => try testing.expectEqual(@as(u64, 0), made),
@@ -203,24 +203,24 @@ const Fixture = struct {
         var exception: u64 = 0;
         const status = self.evaluate(source, &value, &exception);
         defer if (value != 0 and value != 0xdead) {
-            _ = c_api.js_bay_value_release(value);
+            _ = c_api.jsbay_value_release(value);
         };
         defer if (exception != 0 and exception != 0xbeef) {
-            _ = c_api.js_bay_value_release(exception);
+            _ = c_api.jsbay_value_release(exception);
         };
         self.record(.error_stack, status);
         try expectPair(status, value, exception);
         if (status == api_ok) {
             var flag = false;
-            try testing.expectEqual(api_ok, c_api.js_bay_value_to_bool(value, &flag));
+            try testing.expectEqual(api_ok, c_api.jsbay_value_to_bool(value, &flag));
             try testing.expect(flag);
         }
     }
 
     /// Runs every operation once under the current cap.
     fn runAll(self: *Fixture) !void {
-        try self.convertText(.to_json, c_api.js_bay_value_to_json, self.big_object, self.expected_json);
-        try self.convertText(.to_utf8, c_api.js_bay_value_to_utf8, self.big_string, self.expected_utf8);
+        try self.convertText(.to_json, c_api.jsbay_value_to_json, self.big_object, self.expected_json);
+        try self.convertText(.to_utf8, c_api.jsbay_value_to_utf8, self.big_string, self.expected_utf8);
         try self.errorWithStack();
         try self.evalUnderLimit(
             .array_build,
@@ -248,13 +248,13 @@ const Steps = struct {
 
 test "oom sweep: host APIs stay valid and the engine recovers at every memory headroom" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.js_bay_engine_create(id, null, null));
-    defer c_api.js_bay_engine_destroy(id);
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
 
     if (comptime backend.isJscApiBackend(backend.active_backend)) {
         // JSC has no heap cap; the rejection itself is the contract (see runtime_control_tests).
         try testing.expect(!rc.setMemoryLimit(id, 1));
-        try testing.expect(!c_api.js_bay_engine_set_memory_limit(id, 1));
+        try testing.expect(!c_api.jsbay_engine_set_memory_limit(id, 1));
         return;
     }
 
@@ -271,13 +271,13 @@ test "oom sweep: host APIs stay valid and the engine recovers at every memory he
     for (Steps.values) |headroom| {
         _ = rc.runGc(id);
         const usage = rc.getMemoryUsage(id) orelse return error.NoUsage;
-        try testing.expect(c_api.js_bay_engine_set_memory_limit(id, usage.malloc_size + headroom));
+        try testing.expect(c_api.jsbay_engine_set_memory_limit(id, usage.malloc_size + headroom));
         const limited = rc.getMemoryUsage(id) orelse return error.NoUsage;
         try testing.expectEqual(usage.malloc_size + headroom, limited.malloc_limit);
 
         try fixture.runAll();
 
-        try testing.expect(c_api.js_bay_engine_set_memory_limit(id, 0));
+        try testing.expect(c_api.jsbay_engine_set_memory_limit(id, 0));
         const lifted = rc.getMemoryUsage(id) orelse return error.NoUsage;
         try testing.expectEqual(@as(u64, 0), lifted.malloc_limit);
         try fixture.expectAnswer();
@@ -310,6 +310,6 @@ test "oom sweep: host APIs stay valid and the engine recovers at every memory he
     }
 
     // Same engine, same inputs: the unlimited results match the pre-sweep ones.
-    try fixture.convertText(.to_json, c_api.js_bay_value_to_json, fixture.big_object, fixture.expected_json);
-    try fixture.convertText(.to_utf8, c_api.js_bay_value_to_utf8, fixture.big_string, fixture.expected_utf8);
+    try fixture.convertText(.to_json, c_api.jsbay_value_to_json, fixture.big_object, fixture.expected_json);
+    try fixture.convertText(.to_utf8, c_api.jsbay_value_to_utf8, fixture.big_string, fixture.expected_utf8);
 }

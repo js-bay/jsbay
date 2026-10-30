@@ -1,11 +1,10 @@
 # Brand icon sources
 
-> **中文摘要（引擎标）**
-> - **Meta Hermes**：官方矢量，来自 `vendor/hermes/doc/img/logo.svg`（MIT 仓库资源；商标属 Meta）。**用于 banner。**
-> - **JavaScriptCore**：用 WebKit 指南针身份。完整标存 `webkit-logo.svg`（Wikimedia）；banner 内嵌简化平面版 `webkit-mark.svg`。Apple 商标，仅作识别。
-> - **QuickJS / QuickJS-NG / Escargot**：上游无官方 logo → banner **只用实心圆点**，不用自绘替身。
-
 Icons used in `assets/banner.svg` (and stored here for reuse). Trademarks remain with their owners; inclusion is for platform / engine identification only and does not imply endorsement.
+
+Hermes mark: official vector from `vendor/hermes/doc/img/logo.svg` (MIT-licensed repo asset; Hermes/Meta trademark). Used in the banner.
+JavaScriptCore: WebKit compass identity. Full mark in `webkit-logo.svg` (Wikimedia); banner embeds the simplified flat `webkit-mark.svg`. Apple trademark; identification only.
+QuickJS / QuickJS-NG / Escargot: no official upstream logos — the banner uses solid dots for those pills, not custom substitute marks.
 
 ## Host platforms
 
@@ -35,9 +34,3 @@ Icons used in `assets/banner.svg` (and stored here for reuse). Trademarks remain
 | `webkit-compass-box.svg` | [Wikimedia: Compass in a box.svg](https://commons.wikimedia.org/wiki/File:Compass_in_a_box.svg) | Related WebKit-compass artwork; archived, not used in banner. |
 
 QuickJS, QuickJS-NG, and Escargot have **no official marks** upstream; the banner uses animated solid dots for those pills (not separate SVG files).
-
-## Download / copy dates
-
-- Host marks: 2026-10-22 from Wikimedia Commons (`Special:FilePath`) and jsDelivr Simple Icons.
-- Hermes mark: 2026-10-30 from `vendor/hermes` (facebook/hermes submodule) `doc/img/logo.svg`.
-- WebKit full logo + compass-box + simplified mark: 2026-10-30 from Wikimedia Commons / derived for banner.

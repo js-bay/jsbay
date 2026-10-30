@@ -152,6 +152,20 @@ fn spikeThrow(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) backend
     return null;
 }
 
+fn spikeThrowValue(ctx: backend.ActiveEngine.Context, exception: backend.ActiveEngine.Value) backend.ActiveEngine.Value {
+    if (comptime backend.isSpikeBackend(backend.active_backend)) {
+        if (comptime backend.active_backend == .escargot) {
+            @import("../backend/escargot/c_api.zig").escargot_throw_value(ctx, exception);
+        } else {
+            @import("../backend/hermes/c_api.zig").hermes_throw_value(ctx, exception);
+        }
+        return null;
+    }
+    backend.ActiveEngine.freeValue(ctx, exception);
+    return null;
+}
+
+
 fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const binding = std.heap.c_allocator.create(Binding) catch {
@@ -226,9 +240,8 @@ fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEn
             api_value.freeTaken(owned);
             return spikeThrow(ctx, "native callback returned foreign exception");
         }
-        // Spike bridges only accept string pending_throw; drop the Error value and throw a generic message.
-        api_value.freeTaken(owned);
-        return spikeThrow(ctx, "native callback exception");
+        // Transfer the owned exception into the spike bridge pending-throw slot (value, not string).
+        return spikeThrowValue(ctx, owned.value);
     }
     // destroy-during-trap returns INVALID_ARGUMENT with empty outs — surface as a throw; caller APIs see a dead instance.
     return spikeThrow(ctx, "native callback returned invalid status");

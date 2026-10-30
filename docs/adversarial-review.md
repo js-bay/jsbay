@@ -19,7 +19,7 @@ Hostile review snapshot of the Escargot / Hermes dual-backend spike (`-Dbackend=
 
 | Severity | Finding | Mitigation / note |
 |----------|---------|-------------------|
-| Major | `setMemoryLimit` always false. Hermes heap cap is create-time `GCConfig.MaxHeapSize` via Zig `EngineConfig` / `-Dhermes-max-heap` / `js_bay_engine_create2` — not `js_bay_engine_create`. | Document; C hosts must use create2 for a heap cap. |
+| Major | `setMemoryLimit` always false. Hermes heap cap is create-time `GCConfig.MaxHeapSize` via Zig `EngineConfig` / `-Dhermes-max-heap` / `jsbay_engine_create_with_options` — not `jsbay_engine_create`. | Document; C hosts must use create2 for a heap cap. |
 | Major | Soft `getMemoryUsage` reuses fields (`malloc_size` ← heap/allocated); not QuickJS layout. | Observation-only; warn SDK consumers. |
 | Major | Hermes ESM is a host shim (not native module codegen); CJS is text-only (no QJS bytecode CJS cache). | Keep capability rows partial / text-only. |
 | Major | Importing the full `engine_thread` suite ≠ all green: Hermes mostly green; Escargot has many EtHost / Interrupt / DestroyDefer Skips. | Publish Skip class tables, not only pass counts. |
@@ -38,7 +38,7 @@ Hostile review snapshot of the Escargot / Hermes dual-backend spike (`-Dbackend=
 
 | Severity | Finding | Mitigation / note |
 |----------|---------|-------------------|
-| Blocker | Spike tree vs public `js_bay_*` ABI: merge as experimental backends; keep the public ABI name. | No second product brand in-tree. |
+| Blocker | Spike tree vs public `jsbay_*` ABI: merge as experimental backends; keep the public ABI name. | No second product brand in-tree. |
 | Major | Capability tables are easy to over-read as a production tag. | Title/docs say non-production / diminishing returns. |
 | Major | Escargot is LGPL; Hermes/ICU need LICENSE redistribution with linked artifacts. | Compliance is a merge blocker. |
 | Minor | Brand icons for upstream engines need careful trademark use. | Attribution; caution in marketing. |
@@ -54,6 +54,6 @@ NDK r27c + AVD `jsbay_api34` (TCG): QuickJS / Escargot / Hermes x86_64 evaluate 
 2. Keep `requestInterrupt` semantics honest (false ≠ mid-script stop).
 3. Escargot cross-thread ET+host remains UB (Skip is not a fix).
 4. Escargot LGPL + missing CI.
-5. C ABI heap cap only via `js_bay_engine_create2`, not `js_bay_engine_create`.
+5. C ABI heap cap only via `jsbay_engine_create_with_options`, not `jsbay_engine_create`.
 
 Cheap Skip→pass work on this tree is at diminishing returns; remaining gaps are mostly upstream or architectural.

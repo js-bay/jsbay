@@ -18,7 +18,7 @@ host_object, ESM (ModuleLoader), text CJS/`require` (no QJS-shaped bytecode CJS 
 |------|--------|-------|
 | eval / script | **yes** | `initializeScript` + `Evaluator::execute` |
 | value / object / atoms | **yes** | primitives, objects, arrays, construct, keys, delete, instanceof |
-| object_ops suite | **yes** | imported; destroy-during-trap green (`js_bay_engine_bind` spikeInstall trampoline) |
+| object_ops suite | **yes** | imported; destroy-during-trap green (`jsbay_engine_bind` spikeInstall trampoline) |
 | strictEquals (`===`) | **yes** | `ValueRef::equalsTo` |
 | arrayGet / arraySet / arrayClear | **yes** | holes → `undefined` |
 | defineDataProperty | **yes** | writable true/false |
@@ -73,7 +73,7 @@ bytecode (hermesc + JSI), text CJS/`require`, host-side ESM ModuleLoader shim
 | host `throwError` | **yes** | `hermes_throw` + HostFunction `throw jsi::JSError` via `libhermes_bridge.so` (shared libstdc++/libgcc_s with hermesvm; avoids Zig libunwind ABRT) |
 | native_handle | **partial** | NativeState opaque + call + finalize (NativeState dtor + pending_finals claim); MethodBox this-binding (hermes_dup on setMethod); no QJS class_id suite |
 | engine_thread / thick C ABI | **partial** | full suite; hostInstall + destroy-defer + nested + filename + after-stop + stop-interrupt green; bind_sync 5/5 |
-| heap limit / interrupt | **partial** | soft `getMemoryUsage` via `getHeapInfo`; **create-time** `MaxHeapSize` via Zig `EngineConfig.max_heap_size` / `-Dhermes-max-heap` (**not** in `js_bay_engine_create` C ABI); `setMemoryLimit`→false; **user** `requestInterrupt` = bit only (no mid-script); stop/destroy mid-script via `asyncTriggerTimeout` + softRearm/drain |
+| heap limit / interrupt | **partial** | soft `getMemoryUsage` via `getHeapInfo`; **create-time** `MaxHeapSize` via Zig `EngineConfig.max_heap_size` / `-Dhermes-max-heap` (**not** in `jsbay_engine_create` C ABI); `setMemoryLimit`→false; **user** `requestInterrupt` = bit only (no mid-script); stop/destroy mid-script via `asyncTriggerTimeout` + softRearm/drain |
 | inspector / CDP / debugger | **no** | |
 | rejection tracker | **yes** | `HermesInternal.enablePromiseRejectionTracker` + host queue/flush after microtask drain; setTimeout(100|2000) → cancellable double-microtask (Escargot-style sync-catch silence); module-shim top-level throw via `hermes_report_unhandled_rejection` |
 | buffer copy / transferable | **partial** | transfer polyfill green; C `copyBuffer` imported; exotic-getter green (pristine `%TypedArray%` brand+getters); Hermes `.resize` windows still Skip |
@@ -181,7 +181,7 @@ Smoke `engine_thread post/wait eval` **un-Skipped and green**. Non-threaded back
 ## Remaining skips (engine / API limits)
 
 - **Escargot mid-script interrupt — permanent**: no hook in `EscargotPublic.h` (this pin)
-- **`setMemoryLimit` — permanent false** both backends; Hermes **create-time** max heap via Zig `EngineConfig.max_heap_size` or `-Dhermes-max-heap=N` (bytes; 0=default 3GiB). **`js_bay_engine_create2`** exposes create-time `max_heap_size` (Hermes); plain `create` leaves 0. `set_memory_limit` still false on spike.
+- **`setMemoryLimit` — permanent false** both backends; Hermes **create-time** max heap via Zig `EngineConfig.max_heap_size` or `-Dhermes-max-heap=N` (bytes; 0=default 3GiB). **`jsbay_engine_create_with_options`** exposes create-time `max_heap_size` (Hermes); plain `create` leaves 0. `set_memory_limit` still false on spike.
 - **User `requestInterrupt`**: spike returns **false** (`supportsMidScriptUserInterrupt()==false`); Hermes mid-script remains stop/destroy only. `runtime_control_tests` not imported on spike.
 - **`getMemoryUsage` soft stats landed** (Escargot `Memory::heapSize`/`totalSize`; Hermes `instrumentation().getHeapInfo`)
 - Hermes stop/destroy: soft `watchTimeLimit` + `softRearmHermesStopAfterHost` + idle drain
@@ -204,7 +204,7 @@ Smoke `engine_thread post/wait eval` **un-Skipped and green**. Non-threaded back
 - Hermes: engine_thread contracts including destroy-defer, soft interrupt, bind_sync, exotic TypedArray copy
 - Escargot: THREADING smoke, same-thread host, ESM ModuleLoader, basic buffers
 - Both: `runGc` + soft `getMemoryUsage` (observation-only; not QuickJS malloc layout)
-- Hermes: create-time heap cap via `EngineConfig.max_heap_size` / `-Dhermes-max-heap` / `js_bay_engine_create2.max_heap_size` (not runtime `setMemoryLimit`)
+- Hermes: create-time heap cap via `EngineConfig.max_heap_size` / `-Dhermes-max-heap` / `jsbay_engine_create_with_options.max_heap_size` (not runtime `setMemoryLimit`)
 - Spike: `requestInterrupt` returns `false` (no mid-script claim)
 
 **Hard gaps (accept or switch engines before a production tag)**

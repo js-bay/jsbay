@@ -38,7 +38,103 @@ pub const InstanceToken = extern struct {
 pub const NativeTaskQueue = struct {
     mutex: sync.Mutex = .{},
     items: std.ArrayList(NativeTask) = .empty,
+    head: usize = 0,
     closed: bool = false,
+
+    pub fn pendingLen(self: *const NativeTaskQueue) usize {
+        return self.items.items.len - self.head;
+    }
+
+    pub fn pendingSlice(self: *NativeTaskQueue) []NativeTask {
+        return self.items.items[self.head..];
+    }
+
+    fn compact(self: *NativeTaskQueue) void {
+        if (self.head == 0) return;
+        const n = self.pendingLen();
+        if (n == 0) {
+            self.items.clearRetainingCapacity();
+            self.head = 0;
+            return;
+        }
+        var write: usize = 0;
+        while (write < n) : (write += 1) {
+            self.items.items[write] = self.items.items[self.head + write];
+        }
+        self.items.shrinkRetainingCapacity(n);
+        self.head = 0;
+    }
+
+    pub fn push(self: *NativeTaskQueue, allocator: std.mem.Allocator, task: NativeTask) !void {
+        try self.items.append(allocator, task);
+    }
+
+    pub fn popFront(self: *NativeTaskQueue) ?NativeTask {
+        if (self.head >= self.items.items.len) return null;
+        const task = self.items.items[self.head];
+        self.head += 1;
+        if (self.head == self.items.items.len) {
+            self.items.clearRetainingCapacity();
+            self.head = 0;
+        } else if (self.head >= 32) {
+            self.compact();
+        }
+        return task;
+    }
+
+    /// Remove the first matching pending task with one stable compress (keeps FIFO of the rest).
+    pub fn takeFirst(self: *NativeTaskQueue, comptime pred: fn (NativeTask) bool) ?NativeTask {
+        self.compact();
+        const items = self.items.items;
+        var idx: ?usize = null;
+        for (items, 0..) |task, i| {
+            if (pred(task)) {
+                idx = i;
+                break;
+            }
+        }
+        const remove_at = idx orelse return null;
+        const found = items[remove_at];
+        var write: usize = 0;
+        for (items, 0..) |task, i| {
+            if (i == remove_at) continue;
+            items[write] = task;
+            write += 1;
+        }
+        self.items.shrinkRetainingCapacity(write);
+        return found;
+    }
+
+    /// Runtime-predicate variant — used when the match key is not comptime-known.
+    pub fn takeFirstMatch(self: *NativeTaskQueue, ctx: *anyopaque, pred: *const fn (*anyopaque, NativeTask) bool) ?NativeTask {
+        self.compact();
+        const items = self.items.items;
+        var idx: ?usize = null;
+        for (items, 0..) |task, i| {
+            if (pred(ctx, task)) {
+                idx = i;
+                break;
+            }
+        }
+        const remove_at = idx orelse return null;
+        const found = items[remove_at];
+        var write: usize = 0;
+        for (items, 0..) |task, i| {
+            if (i == remove_at) continue;
+            items[write] = task;
+            write += 1;
+        }
+        self.items.shrinkRetainingCapacity(write);
+        return found;
+    }
+
+    pub fn takeAll(self: *NativeTaskQueue) std.ArrayList(NativeTask) {
+        self.compact();
+        const pending = self.items;
+        self.items = .empty;
+        self.head = 0;
+        return pending;
+    }
 };
 
 var post_checked_hook: ?*const fn (?*anyopaque) void = null;
@@ -144,7 +240,7 @@ fn postTaskChecked(instance_id: i32, expected_generation: ?u64, task: NativeTask
             if (!inst.resources.reserve(.native_task, 0)) return false;
             var admitted_task = self.task;
             admitted_task.resources = inst.resources;
-            inst.native_task_queue.items.append(std.heap.c_allocator, admitted_task) catch {
+            inst.native_task_queue.push(std.heap.c_allocator, admitted_task) catch {
                 inst.resources.release(.native_task, 0);
                 return false;
             };
@@ -165,8 +261,7 @@ pub fn releaseAllTasksForInstance(instance_id: i32) void {
         pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?std.ArrayList(NativeTask) {
             inst.native_task_queue.mutex.lock();
             defer inst.native_task_queue.mutex.unlock();
-            const pending = inst.native_task_queue.items;
-            inst.native_task_queue.items = .empty;
+            const pending = inst.native_task_queue.takeAll();
             return pending;
         }
     }{}) orelse return;
@@ -188,8 +283,7 @@ pub fn closeInstanceTasks(instance_id: i32) bool {
             inst.native_task_queue.mutex.lock();
             defer inst.native_task_queue.mutex.unlock();
             inst.native_task_queue.closed = true;
-            self.pending.* = inst.native_task_queue.items;
-            inst.native_task_queue.items = .empty;
+            self.pending.* = inst.native_task_queue.takeAll();
             return true;
         }
     };
@@ -219,8 +313,15 @@ pub fn releaseTasksForOwner(instance_id: i32, owner: *anyopaque) void {
             pub fn call(self: @This(), inst: *instance_map.EngineInstance) ?NativeTask {
                 inst.native_task_queue.mutex.lock();
                 defer inst.native_task_queue.mutex.unlock();
-                for (inst.native_task_queue.items.items, 0..) |task, index| if (task.owner == self.owner) return inst.native_task_queue.items.orderedRemove(index);
-                return null;
+                const Ctx = struct {
+                    owner: *anyopaque,
+                    fn pred(ctx: *anyopaque, task: NativeTask) bool {
+                        const self_ctx: *@This() = @ptrCast(@alignCast(ctx));
+                        return task.owner == self_ctx.owner;
+                    }
+                };
+                var ctx_val: Ctx = .{ .owner = self.owner };
+                return inst.native_task_queue.takeFirstMatch(@ptrCast(&ctx_val), Ctx.pred);
             }
         }{ .owner = owner }) orelse return;
         defer if (task.resources) |resources| resources.release(.native_task, 0);
@@ -254,8 +355,7 @@ pub fn runOneTask(instance_id: i32, completion: *?TaskCompletion) bool {
         pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?NativeTask {
             inst.native_task_queue.mutex.lock();
             defer inst.native_task_queue.mutex.unlock();
-            if (inst.native_task_queue.items.items.len == 0) return null;
-            return inst.native_task_queue.items.orderedRemove(0);
+            return inst.native_task_queue.popFront();
         }
     }{}) orelse {
         _ = queued.end();
@@ -294,10 +394,11 @@ pub fn drainPausedDebuggerControl(instance_id: i32) usize {
             pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?NativeTask {
                 inst.native_task_queue.mutex.lock();
                 defer inst.native_task_queue.mutex.unlock();
-                for (inst.native_task_queue.items.items, 0..) |queued, index| {
-                    if (queued.debugger_control) return inst.native_task_queue.items.orderedRemove(index);
-                }
-                return null;
+                return inst.native_task_queue.takeFirst(struct {
+                    fn pred(task: NativeTask) bool {
+                        return task.debugger_control;
+                    }
+                }.pred);
             }
         }{}) orelse return executed;
         defer if (task.resources) |resources| resources.release(.native_task, 0);
@@ -452,7 +553,6 @@ fn withTestContext(comptime test_fn: fn (ActiveEngine.Context, ActiveEngine.Runt
 }
 
 test "dispatch: emitGlobal calls global function with typed args" {
-    // Native Escargot/Hermes facades support eval + call + task queue used below.
     try withTestContext(struct {
         fn run(ctx: ActiveEngine.Context, _: ActiveEngine.Runtime) !void {
             const eval_result = ActiveEngine.eval(
@@ -490,7 +590,6 @@ test "dispatch: emitGlobal calls global function with typed args" {
 }
 
 test "dispatch: missing global function returns false" {
-    // Native Escargot/Hermes facades support eval + call + task queue used below.
     try withTestContext(struct {
         fn run(ctx: ActiveEngine.Context, _: ActiveEngine.Runtime) !void {
             try testing.expect(!emitGlobal(ctx, "__dispatch_missing__", &.{}));
@@ -512,7 +611,6 @@ fn markTaskCancelled(_: ?*anyopaque) void {
 }
 
 test "dispatch: postTask runs closure on tickInstance" {
-    // Native Escargot/Hermes facades support eval + call + task queue used below.
     const engine = @import("../engine.zig");
     // Use a high id to avoid collision with engine_tests helpers (those start at 10_000 and only grow). We pick a distinct namespace.
     const instance_id: i32 = 5_551;
@@ -538,7 +636,6 @@ test "dispatch: postTask runs closure on tickInstance" {
 }
 
 test "dispatch: postTask after engine destroy does not crash" {
-    // Native Escargot/Hermes facades support eval + call + task queue used below.
     // 12345 is intentionally bogus — no engine.create() for this id.
     const bogus_id: i32 = 12_345;
     defer releaseAllTasksForInstance(bogus_id);
@@ -555,7 +652,6 @@ test "dispatch: postTask after engine destroy does not crash" {
 }
 
 test "dispatch: token rejects completion from a reused instance id" {
-    // Native Escargot/Hermes facades support eval + call + task queue used below.
     const engine = @import("../engine.zig");
     const instance_id: i32 = 5_554;
     task_flag.store(0, .seq_cst);
@@ -584,7 +680,6 @@ test "dispatch: token rejects completion from a reused instance id" {
 }
 
 test "dispatch: token rejects closed instance and cannot cross instances" {
-    // Native Escargot/Hermes facades support eval + call + task queue used below.
     const engine = @import("../engine.zig");
     const first: i32 = 5_555;
     const second: i32 = 5_556;
@@ -609,7 +704,6 @@ test "dispatch: token rejects closed instance and cannot cross instances" {
 }
 
 test "dispatch: releaseAllTasksForInstance drops pending work" {
-    // Native Escargot/Hermes facades support eval + call + task queue used below.
     const engine = @import("../engine.zig");
     // Distinct id from the other postTask test so they don't interfere.
     const instance_id: i32 = 5_552;
@@ -633,7 +727,6 @@ test "dispatch: releaseAllTasksForInstance drops pending work" {
 }
 
 test "dispatch: releasing queued tasks invokes their cancellation cleanup" {
-    // Native Escargot/Hermes facades support eval + call + task queue used below.
     const engine = @import("../engine.zig");
     const instance_id: i32 = 5_553;
     task_flag.store(0, .seq_cst);

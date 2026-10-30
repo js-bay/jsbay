@@ -24,7 +24,7 @@
 //!   - `--json`: one JSON line per workload for CI consumption.
 
 const std = @import("std");
-const zjs = @import("js_bay_tools");
+const zjs = @import("jsbay_tools");
 const comma_format = @import("comma_format.zig");
 
 const engine = zjs.engine;

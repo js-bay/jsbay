@@ -19,21 +19,21 @@ Build with `-Dbackend=quickjs_ng`, `-Dbackend=quickjs`, or `-Dbackend=jsc`. All 
 
 ## Zig
 
-Import `js_bay`, choose a backend with `-Dbackend=quickjs_ng`, `quickjs`, or `jsc`, then use the typed `js_bay.c_api` namespace. The instance ID is supplied by the host and must be unique while the instance is alive.
+Import `jsbay`, choose a backend with `-Dbackend=quickjs_ng`, `quickjs`, or `jsc`, then use the typed `jsbay.c_api` namespace. The instance ID is supplied by the host and must be unique while the instance is alive.
 
 ```zig
-const js = @import("js_bay");
+const js = @import("jsbay");
 
 const id = 1;
-if (!js.c_api.js_bay_engine_create(id, null, null)) return error.EngineCreateFailed;
-defer js.c_api.js_bay_engine_destroy(id);
+if (!js.c_api.jsbay_engine_create(id, null, null)) return error.EngineCreateFailed;
+defer js.c_api.jsbay_engine_destroy(id);
 ```
 
-The public Zig API mirrors the typed C ABI. Owner-thread observability includes `js_bay_engine_get_memory_usage`, `js_bay_engine_run_gc`, and `js_bay_engine_set_event_handler` (see [host-isolation.md](host-isolation.md)). Use `js.c_api.js_bay_engine_evaluate` and release every returned value with `js.c_api.js_bay_value_release`. The header and [api-contract.md](api-contract.md) define output ownership and exceptions.
+The public Zig API mirrors the typed C ABI. Owner-thread observability includes `jsbay_engine_get_memory_usage`, `jsbay_engine_run_gc`, and `jsbay_engine_set_event_handler` (see [host-isolation.md](host-isolation.md)). Use `js.c_api.jsbay_engine_evaluate` and release every returned value with `js.c_api.jsbay_value_release`. The header and [api-contract.md](api-contract.md) define output ownership and exceptions.
 
 ## Thread and lifetime rules
 
-Create, evaluate, run the loop, access values, and destroy on the owner thread. Do not store a value handle in work that may run on another thread. The ordinary cross-thread controls are `js_bay_engine_request_interrupt` and `js_bay_engine_stop_loop`; the synchronous-native extension has its own completion boundary.
+Create, evaluate, run the loop, access values, and destroy on the owner thread. Do not store a value handle in work that may run on another thread. The ordinary cross-thread controls are `jsbay_engine_request_interrupt` and `jsbay_engine_stop_loop`; the synchronous-native extension has its own completion boundary.
 
 `destroy` closes the instance to new public work. If it is called from JavaScript or a native callback, cleanup may wait until the callback unwinds. A destroyed value is never valid again, even if the same instance ID is reused.
 
@@ -41,15 +41,15 @@ The advanced `reference` helpers are available to Zig consumers that need retain
 
 ## Event-loop progress
 
-The JavaScript event loop owns its monotonic clock, timers, waiting, and wakeups. Call `js_bay_engine_run_loop` on a dedicated owner thread, or let the SDK connect it to the platform owner thread. `js_bay_engine_stop_loop` is thread-safe. Each queued JavaScript task finishes with a microtask checkpoint; callers do not supply timestamps or compute deadlines.
+The JavaScript event loop owns its monotonic clock, timers, waiting, and wakeups. Call `jsbay_engine_run_loop` on a dedicated owner thread, or let the SDK connect it to the platform owner thread. `jsbay_engine_stop_loop` is thread-safe. Each queued JavaScript task finishes with a microtask checkpoint; callers do not supply timestamps or compute deadlines.
 
 Do not run a second scheduler for the same instance.
 
 ## C and SDKs
 
-The stable C declarations are in `include/js_bay.h`. Android, Apple, .NET, and Harmony are wrappers over that ABI; their READMEs provide installation and linker settings. Create an engine on its owner thread, use it there, release every owned `js_bay_value_t`, then destroy it there. Do not let a finalizer or garbage collector call destroy or value-release APIs.
+The stable C declarations are in `include/jsbay.h`. Android, Apple, .NET, and Harmony are wrappers over that ABI; their READMEs provide installation and linker settings. Create an engine on its owner thread, use it there, release every owned `jsbay_value_t`, then destroy it there. Do not let a finalizer or garbage collector call destroy or value-release APIs.
 
-All C text input is length-delimited UTF-8. `data == NULL && len == 0` is an empty string; a null pointer with a nonzero length is invalid. Returned `js_bay_bytes_t` storage belongs to the library and must be released with `js_bay_free_bytes` exactly once (double free aborts). Check every `js_bay_status_t`; a JavaScript exception is an owned value, not necessarily a string.
+All C text input is length-delimited UTF-8. `data == NULL && len == 0` is an empty string; a null pointer with a nonzero length is invalid. Returned `jsbay_bytes_t` storage belongs to the library and must be released with `jsbay_free_bytes` exactly once (double free aborts). Check every `jsbay_status_t`; a JavaScript exception is an owned value, not necessarily a string.
 
 ## Modules and native functions
 
@@ -62,6 +62,6 @@ The C and SDK contract, including ownership and status semantics, is in [api-con
 These backends are **not** production-default. Hard rules:
 
 - **Escargot engine_thread × host**: Context is **thread-affine**. `hostInstall` is refused while the engine thread is running; `threadStart` is refused if hosts are already installed. Crossing that boundary historically SEGV'd (AtomicString/GC) — the refuse path is intentional, not a temporary Skip.
-- **`js_bay_engine_request_interrupt`**: returns **false** on Escargot/Hermes (no mid-script user interrupt). Hermes stop/destroy still cancels via lifecycle interrupt.
-- **`js_bay_engine_set_memory_limit`**: always **false** on spike. Hermes create-time heap: `js_bay_engine_create2` / Zig `EngineConfig.max_heap_size` / `-Dhermes-max-heap`.
+- **`jsbay_engine_request_interrupt`**: returns **false** on Escargot/Hermes (no mid-script user interrupt). Hermes stop/destroy still cancels via lifecycle interrupt.
+- **`jsbay_engine_set_memory_limit`**: always **false** on spike. Hermes create-time heap: `jsbay_engine_create_with_options` / Zig `EngineConfig.max_heap_size` / `-Dhermes-max-heap`.
 - Rebuild prefixes: `scripts/rebuild-icu-prefix.sh`, `scripts/rebuild-hermes-install.sh`, `scripts/rebuild-escargot-install.sh`. See [capability.md](capability.md).

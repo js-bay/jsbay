@@ -37,6 +37,8 @@ struct JsbayHermesContextOpaque {
     std::mutex protect_mu;
     std::unordered_map<jsi::Value *, std::pair<int, std::unique_ptr<jsi::Value>>> protect;
     std::string pending_throw;
+    // Owned exception value for host trampoline (takes precedence over pending_throw string).
+    std::unique_ptr<jsi::Value> pending_throw_value;
     struct PendingFinal {
         void (*fire)(void *);
         void *data;
@@ -364,6 +366,8 @@ extern "C" void hermes_uninstall_module_loader(JsbayHermesContext *ctx);
 
 extern "C" void hermes_context_free(JsbayHermesContext *ctx) {
     if (!ctx) return;
+    ctx->pending_throw.clear();
+    ctx->pending_throw_value.reset();
     // Drop ESM cache (jsi::Object) before tearing down the Runtime / protect table.
     hermes_uninstall_module_loader(ctx);
     {
@@ -1140,15 +1144,11 @@ extern "C" bool hermes_is_data_view(JsbayHermesContext *c, HermesValue v) {
 extern "C" HermesValue hermes_new_array_buffer_copy(JsbayHermesContext *c, const uint8_t *bytes, size_t len) {
     if (!c || !c->rt) return nullptr;
     try {
-        // Prefer JS ArrayBuffer constructor — empty MutableBuffer path is unreliable on Hermes.
-        auto AB = c->rt->global().getPropertyAsFunction(*c->rt, "ArrayBuffer");
-        jsi::Value ab = AB.callAsConstructor(*c->rt, (double)len);
-        if (len > 0 && bytes) {
-            auto buf = ab.getObject(*c->rt).getArrayBuffer(*c->rt);
-            uint8_t *dst = buf.data(*c->rt);
-            if (dst) std::memcpy(dst, bytes, len);
-        }
-        return retainMove(c, std::move(ab));
+        // Allocate through a trusted MutableBuffer — never the replaceable global ArrayBuffer ctor
+        // (JS can shrink the returned buffer and OOB our memcpy).
+        auto buf = std::make_shared<VectorBuffer>(bytes, len);
+        if (buf->size() != len) return nullptr;
+        return retainMove(c, jsi::Value(jsi::ArrayBuffer(*c->rt, std::move(buf))));
     } catch (...) { return nullptr; }
 }
 extern "C" HermesValue hermes_new_array_buffer_no_copy(JsbayHermesContext *c, uint8_t *bytes, size_t len,
@@ -1314,9 +1314,17 @@ extern "C" HermesValue hermes_make_function(JsbayHermesContext *c, const char *n
                 }
                 HermesValue this_h = retainMove(ctx, jsi::Value(rt, thisVal));
                 ctx->pending_throw.clear();
+                ctx->pending_throw_value.reset();
                 HermesValue out = state->fn(ctx, this_h, argv.data(), count, state->user_data);
                 hermes_free_value(ctx, this_h);
                 for (auto a : argv) hermes_free_value(ctx, a);
+                if (ctx->pending_throw_value) {
+                    jsi::Value exc = std::move(*ctx->pending_throw_value);
+                    ctx->pending_throw_value.reset();
+                    ctx->pending_throw.clear();
+                    if (out) hermes_free_value(ctx, out);
+                    throw jsi::JSError(rt, std::move(exc));
+                }
                 if (!ctx->pending_throw.empty()) {
                     std::string msg = ctx->pending_throw;
                     ctx->pending_throw.clear();
@@ -1334,8 +1342,23 @@ extern "C" HermesValue hermes_make_function(JsbayHermesContext *c, const char *n
     } catch (...) { return nullptr; }
 }
 
+
+extern "C" void hermes_throw_value(JsbayHermesContext *c, HermesValue exception) {
+    if (!c) return;
+    c->pending_throw.clear();
+    c->pending_throw_value.reset();
+    if (exception && asVal(exception)) {
+        c->pending_throw_value = std::make_unique<jsi::Value>(*c->rt, *asVal(exception));
+        // Caller transferred ownership of the handle; release the shell.
+        hermes_free_value(c, exception);
+    } else {
+        c->pending_throw = "Error";
+    }
+}
+
 extern "C" void hermes_throw(JsbayHermesContext *c, const char *message) {
     if (!c) return;
+    c->pending_throw_value.reset();
     c->pending_throw = message ? message : "Error";
 }
 
@@ -1449,6 +1472,36 @@ static jsi::Value makeTypeError(jsi::Runtime &rt, const char *msg) {
         return jsi::String::createFromUtf8(rt, msg ? msg : "TypeError");
     }
 }
+
+extern "C" HermesOpResult hermes_call_result(JsbayHermesContext *c, HermesValue fn, HermesValue this_val,
+                                             const HermesValue *args, size_t argc) {
+    HermesOpResult out{nullptr, nullptr};
+    if (!c || !c->rt || !fn) return out;
+    try {
+        if (!asVal(fn)->isObject() || !asVal(fn)->getObject(*c->rt).isFunction(*c->rt)) {
+            return hopFail(c, makeTypeError(*c->rt, "not a function"));
+        }
+        auto f = asVal(fn)->getObject(*c->rt).asFunction(*c->rt);
+        std::vector<jsi::Value> argv;
+        argv.reserve(argc);
+        for (size_t i = 0; i < argc; ++i) {
+            if (args && args[i]) argv.emplace_back(jsi::Value(*c->rt, *asVal(args[i])));
+            else argv.emplace_back(jsi::Value::undefined());
+        }
+        jsi::Value thisArg = (this_val && asVal(this_val))
+            ? jsi::Value(*c->rt, *asVal(this_val))
+            : jsi::Value::undefined();
+        jsi::Value result = c->rt->call(f, thisArg, (const jsi::Value *)argv.data(), argc);
+        return hopOk(c, std::move(result));
+    } catch (const jsi::JSError &e) {
+        return hopFail(c, jsi::Value(*c->rt, e.value()));
+    } catch (const std::exception &e) {
+        return hopFail(c, makeTypeError(*c->rt, e.what()));
+    } catch (...) {
+        return hopFail(c, makeTypeError(*c->rt, "call failed"));
+    }
+}
+
 
 
 static bool hermesIsConstructor(jsi::Runtime &rt, const jsi::Value &v) {
@@ -2324,30 +2377,41 @@ extern "C" HermesEvalResult hermes_run_bytecode_ex(JsbayHermesContext *c, const 
         if (out_decode_failed) *out_decode_failed = 1;
         return out;
     }
+    // Validate HBC header before execution. Script exceptions must never set decode_failed
+    // (cache.zig would delete+retry and re-run side effects).
+    if (len < 8) {
+        out.err = dupCString("bytecode buffer too short for HBC header");
+        if (out_decode_failed) *out_decode_failed = 1;
+        return out;
+    }
+    {
+        uint64_t magic = 0;
+        std::memcpy(&magic, bytes, sizeof(magic));
+        // facebook::hermes hbc::MAGIC / MAGIC2 (see hermes/BCGen/HBC/BytecodeFileFormat.h)
+        constexpr uint64_t kHbcMagic = 0x1F1903C103BC1FC6ull;
+        constexpr uint64_t kHbcMagic2 = 0x1F1903C103BC1FC7ull;
+        if (magic != kHbcMagic && magic != kHbcMagic2) {
+            out.err = dupCString("invalid HBC magic");
+            if (out_decode_failed) *out_decode_failed = 1;
+            return out;
+        }
+    }
     try {
         auto buf = std::make_shared<HbcBuffer>(bytes, len);
         jsi::Value result = c->rt->evaluateJavaScript(std::move(buf), "<bytecode>");
         if (result.isUndefined() || result.isNull()) return out;
         out.result = dupCString(valueToDisplayString(*c->rt, result));
     } catch (const jsi::JSError &e) {
-        // Hermes throws JSError both for corrupt bytecode and for script throws.
-        // Heuristic: messages mentioning bytecode/HBC/magic/format => decode_failed.
+        // Executing (or post-validate load) script threw — not a decode failure.
+        if (out_decode_failed) *out_decode_failed = 0;
         std::string msg = e.getMessage();
-        std::string stack;
-        try { stack = e.getStack(); } catch (...) {}
-        if (!stack.empty()) {
-            msg.push_back('\n');
-            msg += stack;
-        }
-        bool decode = false;
-        const char *needles[] = {"bytecode", "Bytecode", "HBC", "magic", "buffer", "format", "truncated", nullptr};
-        for (int i = 0; needles[i]; ++i) {
-            if (msg.find(needles[i]) != std::string::npos) { decode = true; break; }
-        }
-        if (stack.empty() && len < 64) decode = true;
-        if (out_decode_failed) *out_decode_failed = decode ? 1 : 0;
+        try {
+            std::string stack = e.getStack();
+            if (!stack.empty()) { msg.push_back('\n'); msg += stack; }
+        } catch (...) {}
         out.err = dupCString(msg);
     } catch (const std::exception &e) {
+        // Non-JS failures during load/execute after magic check: treat as decode.
         if (out_decode_failed) *out_decode_failed = 1;
         out.err = dupCString(e.what());
     } catch (...) {
@@ -2376,14 +2440,14 @@ static void fireHermesNhBox(void *data) {
     bx->handle_data = nullptr;
     delete bx;
 }
-// Shared claim: NativeState may finalize GC-precisely; pending_finals always
-// owns claim lifetime (delete). Never delete claim from NativeState.
+// Shared claim: NativeState + pending_finals each hold one ref. First release
+// fires the finalizer; last release deletes the claim shell (no UAF).
 struct HermesNhClaim {
     HermesNhBox *box = nullptr;
     bool fired = false;
+    int refs = 2; // NativeState + pending_finals
 };
-static void fireHermesNhClaim(void *data) {
-    auto *cl = static_cast<HermesNhClaim *>(data);
+static void releaseHermesNhClaim(HermesNhClaim *cl) {
     if (!cl) return;
     if (!cl->fired) {
         cl->fired = true;
@@ -2392,20 +2456,18 @@ static void fireHermesNhClaim(void *data) {
             cl->box = nullptr;
         }
     }
-    delete cl; // pending_finals path only
+    if (--cl->refs == 0) delete cl;
+}
+static void fireHermesNhClaim(void *data) {
+    releaseHermesNhClaim(static_cast<HermesNhClaim *>(data));
 }
 struct HermesNhState : jsi::NativeState {
     HermesNhClaim *claim;
     explicit HermesNhState(HermesNhClaim *cl) : claim(cl) {}
     ~HermesNhState() override {
-        // GC-precise: claim finalize without freeing the claim shell (teardown owns it).
-        if (!claim || claim->fired) return;
-        claim->fired = true;
-        if (claim->box) {
-            fireHermesNhBox(claim->box);
-            claim->box = nullptr;
-        }
-        claim = nullptr; // do not touch again; pending_finals will delete shell
+        auto *cl = claim;
+        claim = nullptr;
+        releaseHermesNhClaim(cl);
     }
 };
 
@@ -2433,9 +2495,17 @@ extern "C" HermesValue hermes_native_handle_create(JsbayHermesContext *c, void *
                     for (size_t i = 0; i < count; ++i) argv.push_back(retainMove(ctx, jsi::Value(rt, args[i])));
                     HermesValue this_h = retainMove(ctx, jsi::Value(rt, thisVal));
                     ctx->pending_throw.clear();
+                    ctx->pending_throw_value.reset();
                     HermesValue out = box->call_fn(ctx, this_h, argv.data(), count, box->handle_data);
                     hermes_free_value(ctx, this_h);
                     for (auto a : argv) hermes_free_value(ctx, a);
+                    if (ctx->pending_throw_value) {
+                        jsi::Value exc = std::move(*ctx->pending_throw_value);
+                        ctx->pending_throw_value.reset();
+                        ctx->pending_throw.clear();
+                        if (out) hermes_free_value(ctx, out);
+                        throw jsi::JSError(rt, std::move(exc));
+                    }
                     if (!ctx->pending_throw.empty()) {
                         std::string msg = ctx->pending_throw;
                         ctx->pending_throw.clear();

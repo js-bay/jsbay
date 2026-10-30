@@ -42,9 +42,9 @@ const CjsState = struct {
     cache: std.StringHashMap(CacheEntry),
     /// Tracks whether the global `require` has been registered on the JS context — prevents duplicate registration on repeat install() calls.
     require_installed: bool = false,
-    /// Tracks whether the global `__js_bay_cjsCache` has been registered.
+    /// Tracks whether the global `__jsbay_cjsCache` has been registered.
     cjs_cache_installed: bool = false,
-    /// In-process bytecode cache for `__js_bay_cjsCache`: sourceHash + filenameHash → bytes. Both keys and bytes are c_allocator-owned and freed on uninstall. This lets repeat mounts of the same module body at the same source location skip re-compile without conflating filename metadata.
+    /// In-process bytecode cache for `__jsbay_cjsCache`: sourceHash + filenameHash → bytes. Both keys and bytes are c_allocator-owned and freed on uninstall. This lets repeat mounts of the same module body at the same source location skip re-compile without conflating filename metadata.
     bytecode_cache: std.StringHashMap([]u8),
 };
 
@@ -916,10 +916,10 @@ fn stringifyValue(ctx: ActiveEngine.Context, val: ActiveEngine.Value) ?[]const u
 }
 
 // --------------------------------------------------------------------------
-// Global `__js_bay_cjsCache` registration — bytecode-cached CommonJS
+// Global `__jsbay_cjsCache` registration — bytecode-cached CommonJS
 // --------------------------------------------------------------------------
 
-/// Register a JS-callable global `__js_bay_cjsCache(source, requireFn, filename, cacheDir?)` on the QuickJS context. The host's `loadModuleExports` uses this INSTEAD of `new Function("module","exports", "require", source)` so a widget/system-app body that costs hundreds of milliseconds to compile is compiled once and replayed from bytecode.
+/// Register a JS-callable global `__jsbay_cjsCache(source, requireFn, filename, cacheDir?)` on the QuickJS context. The host's `loadModuleExports` uses this INSTEAD of `new Function("module","exports", "require", source)` so a widget/system-app body that costs hundreds of milliseconds to compile is compiled once and replayed from bytecode.
 ///
 /// Unlike `evalCachedCjs` (which returns a string and uses the engine's global `require`), this callback:
 /// * preserves the caller's injected `require` (the widget runtime's restricted `requireSharedWidgetModule`) by passing the JS `requireFn` straight into the wrapper's argument list;
@@ -932,9 +932,9 @@ fn registerGlobalCjsCache(ctx: ActiveEngine.Context) bool {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
             const global = qjs_mod.qjs.JS_GetGlobalObject(ctx);
             defer qjs_mod.jsbay_qjs_JS_FreeValue(ctx, global);
-            const fn_val = qjs_mod.jsbay_qjs_JS_NewCFunction(ctx, &qjsCjsCacheCb, "__js_bay_cjsCache", 4);
+            const fn_val = qjs_mod.jsbay_qjs_JS_NewCFunction(ctx, &qjsCjsCacheCb, "__jsbay_cjsCache", 4);
             // JS_SetPropertyStr consumes fn_val's reference.
-            _ = qjs_mod.qjs.JS_SetPropertyStr(ctx, global, "__js_bay_cjsCache", fn_val);
+            _ = qjs_mod.qjs.JS_SetPropertyStr(ctx, global, "__jsbay_cjsCache", fn_val);
             return true;
         },
         .jsc => return false,
@@ -944,7 +944,7 @@ fn registerGlobalCjsCache(ctx: ActiveEngine.Context) bool {
 
 const CjsCacheCbError = error{ OutOfMemory, CompileFailed, CallFailed };
 
-/// Backend for the global `__js_bay_cjsCache` callback. See `registerGlobalCjsCache` for semantics.
+/// Backend for the global `__jsbay_cjsCache` callback. See `registerGlobalCjsCache` for semantics.
 fn qjsCjsCacheCb(
     ctx: ?*@import("../backend.zig").ActiveEngineModule.qjs.JSContext,
     _this: @import("../backend.zig").ActiveEngineModule.qjs.JSValue,
@@ -954,21 +954,21 @@ fn qjsCjsCacheCb(
     _ = _this;
     const qjs_mod = @import("../backend.zig").ActiveEngineModule;
     if (argc < 1) {
-        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__js_bay_cjsCache: source required");
+        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__jsbay_cjsCache: source required");
     }
     const state = stateFromCtx(ctx) orelse {
-        return qjs_mod.qjs.JS_ThrowReferenceError(ctx, "__js_bay_cjsCache: not installed");
+        return qjs_mod.qjs.JS_ThrowReferenceError(ctx, "__jsbay_cjsCache: not installed");
     };
     // argv[0] source (string, required)
     const src_cstr = qjs_mod.jsbay_qjs_JS_ToCString(ctx, argv[0]) orelse {
-        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__js_bay_cjsCache: source must be a string");
+        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__jsbay_cjsCache: source must be a string");
     };
     defer qjs_mod.jsbay_qjs_JS_FreeCString(ctx, src_cstr);
     const source = std.mem.span(src_cstr);
 
     // argv[1] requireFn (callable, required)
     if (argc < 2 or qjs_mod.jsbay_qjs_JS_IsFunction(ctx, argv[1]) == 0) {
-        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__js_bay_cjsCache: require function required");
+        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__jsbay_cjsCache: require function required");
     }
     const require_fn = qjs_mod.jsbay_qjs_JS_DupValue(ctx, argv[1]);
     defer qjs_mod.jsbay_qjs_JS_FreeValue(ctx, require_fn);
@@ -1000,7 +1000,7 @@ fn qjsCjsCacheCb(
     ) catch |e| {
         return switch (e) {
             error.OutOfMemory => qjs_mod.qjs.JS_ThrowOutOfMemory(ctx),
-            error.CompileFailed => qjs_mod.qjs.JS_ThrowSyntaxError(ctx, "__js_bay_cjsCache: failed to compile module"),
+            error.CompileFailed => qjs_mod.qjs.JS_ThrowSyntaxError(ctx, "__jsbay_cjsCache: failed to compile module"),
             error.CallFailed => qjs_mod.JS_EXCEPTION,
         };
     };
@@ -1178,5 +1178,5 @@ fn runWrapperWithRequire(
     return current_exports;
 }
 
-/// Cache version salt for `__js_bay_cjsCache` persisted artifacts. Bump with the engine whenever the QuickJS bytecode format changes, so stale files are dropped and rebuilt rather than replayed.
+/// Cache version salt for `__jsbay_cjsCache` persisted artifacts. Bump with the engine whenever the QuickJS bytecode format changes, so stale files are dropped and rebuilt rather than replayed.
 const CJS_CACHE_VERSION = "jsbay-cjs-1";

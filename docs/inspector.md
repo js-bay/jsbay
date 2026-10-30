@@ -13,7 +13,7 @@ zig build -Dbackend=quickjs_ng
 
 Add `localhost:9229` in `chrome://inspect`, then select the target. A port of zero asks the operating system to choose a port; query `boundPort` after startup.
 
-The Zig facade exposes `start`, `startWithTransport`, `stop`, and `dropInstance`. Start and stop on the instance owner thread. `start` requires the bundled transport and returns `UnsupportedFeature` when `-Dinspector-transport=false` is selected. The C `js_bay_engine_inspector_start` API returns `false` for ownership, lifecycle, configuration, or startup failure.
+The Zig facade exposes `start`, `startWithTransport`, `stop`, and `dropInstance`. Start and stop on the instance owner thread. `start` requires the bundled transport and returns `UnsupportedFeature` when `-Dinspector-transport=false` is selected. The C `jsbay_engine_inspector_start` API returns `false` for ownership, lifecycle, configuration, or startup failure.
 
 Hosts may supply their own transport through `startWithTransport`. The generic transport callback, ownership, and shutdown contract belongs to [the Inspector package](../libs/inspector/readme.md). This engine integration must receive session closure so it can release engine-owned Inspector state.
 
