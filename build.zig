@@ -5,109 +5,17 @@ const quickjs_root = "vendor/quickjs";
 const quickjs_ng_root = "vendor/quickjs-ng";
 
 pub const Backend = enum {
-    quickjs,
     quickjs_ng,
+    quickjs,
     jsc,
+    escargot,
+    hermes,
 };
-
-/// Bitmask for build_options.packed_backend_bits (stable for Zig comptime).
-pub const PackedBit = struct {
-    pub const quickjs_ng: u32 = 1 << 0;
-    pub const quickjs: u32 = 1 << 1;
-    pub const jsc: u32 = 1 << 2;
-};
-
-fn backendBit(tag: Backend) u32 {
-    return switch (tag) {
-        .quickjs_ng => PackedBit.quickjs_ng,
-        .quickjs => PackedBit.quickjs,
-        .jsc => PackedBit.jsc,
-    };
-}
-
-fn parseBackendName(name: []const u8) ?Backend {
-    if (std.mem.eql(u8, name, "quickjs_ng")) return .quickjs_ng;
-    if (std.mem.eql(u8, name, "quickjs")) return .quickjs;
-    if (std.mem.eql(u8, name, "jsc")) return .jsc;
-    return null;
-}
-
-const ResolvedBackends = struct {
-    /// Engines linked into this artifact (explicit -Dbackends=… or single -Dbackend=…).
-    list: []const Backend,
-    /// Temporary monomorphic default for the shared layer (first packed / -Dbackend=).
-    primary: Backend,
-    bits: u32,
-};
-
-/// Resolve pack set. `-Dbackends=` is the multi-pack selector (no implicit quickjs_ng).
-/// `-Dbackend=` remains the single-engine shorthand (default quickjs to match product builds).
-fn resolveBackends(b: *std.Build, os: std.Target.Os.Tag) ResolvedBackends {
-    const backends_str = b.option([]const u8, "backends", "Comma-separated engines to pack into one artifact (e.g. quickjs_ng,jsc). Do not pass with -Dbackend.");
-    const backend_opt = b.option(Backend, "backend", "Single JS engine backend shorthand (quickjs_ng, quickjs, or jsc). Do not pass with -Dbackends.");
-
-    if (backends_str) |raw| {
-        if (backend_opt != null) {
-            std.process.fatal("Pass either -Dbackends=… or -Dbackend=…, not both", .{});
-        }
-        var buf: [8]Backend = undefined;
-        var n: usize = 0;
-        var seen_qjs = false;
-        var seen_ng = false;
-        var it = std.mem.splitScalar(u8, raw, ',');
-        while (it.next()) |part_raw| {
-            const part = std.mem.trim(u8, part_raw, " \t");
-            if (part.len == 0) continue;
-            const tag = parseBackendName(part) orelse {
-                std.process.fatal("Unknown backend in -Dbackends=: '{s}' (expected quickjs_ng, quickjs, or jsc)", .{part});
-            };
-            // Dedup
-            var dup = false;
-            for (buf[0..n]) |existing| {
-                if (existing == tag) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (dup) continue;
-            if (n >= buf.len) std.process.fatal("-Dbackends=: too many backends", .{});
-            buf[n] = tag;
-            n += 1;
-            if (tag == .quickjs) seen_qjs = true;
-            if (tag == .quickjs_ng) seen_ng = true;
-        }
-        if (n == 0) {
-            std.process.fatal("-Dbackends= is empty; list at least one of: quickjs_ng, quickjs, jsc", .{});
-        }
-        if (seen_qjs and seen_ng) {
-            std.process.fatal(
-                \\Cannot pack both 'quickjs' and 'quickjs_ng' in one artifact: they export the same JS_* C symbols (JS_NewRuntime, JS_Eval, …) and would collide at link time.
-                \\Pick one QuickJS-family engine, e.g. -Dbackends=quickjs_ng,jsc or -Dbackends=quickjs,jsc.
-            , .{});
-        }
-        var bits: u32 = 0;
-        for (buf[0..n]) |tag| {
-            if (tag == .jsc and os != .macos and os != .ios) {
-                std.process.fatal(
-                    \\-Dbackends=… includes 'jsc', which requires an Apple target (macOS/iOS) to link JavaScriptCore.framework.
-                    \\This host OS cannot pack jsc. Use -Dbackends=quickjs_ng (or quickjs) here, or build on/for Apple with jsc included.
-                , .{});
-            }
-            bits |= backendBit(tag);
-        }
-        const list = b.allocator.dupe(Backend, buf[0..n]) catch @panic("OOM resolving -Dbackends=");
-        return .{ .list = list, .primary = list[0], .bits = bits };
-    }
-
-    const primary = backend_opt orelse .quickjs;
-    const list = b.allocator.dupe(Backend, &[_]Backend{primary}) catch @panic("OOM resolving -Dbackend=");
-    return .{ .list = list, .primary = primary, .bits = backendBit(primary) };
-}
 
 /// Link the public module and core with the compiler configuration they require.
 pub fn linkConsumer(consumer: *std.Build.Step.Compile, dependency: *std.Build.Dependency) void {
-    const core = dependency.artifact("jsbay");
-    consumer.root_module.addImport("jsbay", dependency.module("jsbay"));
+    const core = dependency.artifact("js_bay");
+    consumer.root_module.addImport("js_bay", dependency.module("js_bay"));
     consumer.root_module.linkLibrary(core);
     for (core.root_module.include_dirs.items) |include| switch (include) {
         .framework_path => |path| consumer.root_module.addFrameworkPath(path),
@@ -152,11 +60,7 @@ pub fn build(b: *std.Build) void {
     run_tool_tests.step.dependOn(&install_tool.step);
     b.step("test-tools", "Run repository-tool tests").dependOn(&run_tool_tests.step);
 
-    const resolved = resolveBackends(b, target.result.os.tag);
-    const backend = resolved.primary;
-    const packed_backends = resolved.list;
-    const packed_backend_bits = resolved.bits;
-    const multi_pack = packed_backends.len > 1;
+    const backend = b.option(Backend, "backend", "JS engine backend (quickjs_ng, quickjs, jsc, escargot, or hermes)") orelse .quickjs_ng;
     const quickjs_gc_stress = b.option(bool, "quickjs-gc-stress", "Force a QuickJS GC before every allocation (QuickJS-NG or QuickJS only)") orelse false;
     const shared = b.option(bool, "shared", "Build shared library instead of static") orelse false;
     const apple_sysroot = b.option([]const u8, "apple-sysroot", "Apple SDK sysroot path for cross-compilation");
@@ -168,14 +72,21 @@ pub fn build(b: *std.Build) void {
     const heap_snapshot = inspector_enabled and requested_heap_snapshot;
     const bytecode_cache_enabled = b.option(bool, "bytecode-cache", "Include persistent bytecode-cache reads and writes") orelse true;
     const stress_tests = b.option(bool, "stress-tests", "Run tests whose names include stress, including high-load event-loop and timer tests") orelse false;
-    // Test-only: exports jsbay_test_trigger_native_fault. NEVER enable for publish / library-only ReleaseFast product builds.
-    const fault_injection = b.option(bool, "fault-injection", "Export test-only native fault probe (jsbay_test_trigger_native_fault); default OFF") orelse false;
+    // Test-only: exports js_bay_test_trigger_native_fault. NEVER enable for publish / library-only ReleaseFast product builds.
+    const fault_injection = b.option(bool, "fault-injection", "Export test-only native fault probe (js_bay_test_trigger_native_fault); default OFF") orelse false;
     const asan = b.option(bool, "asan", "Compile QuickJS/NG C sources with -fsanitize=address for harsh ASan consumers") orelse false;
     const apple_package = b.option(bool, "apple-package", "Build a stripped Apple XCFramework library without Zig error tracing") orelse false;
     const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const android_sysroot = b.option([]const u8, "android-sysroot", "NDK sysroot whose usr/include provides Bionic headers");
     const android_lib_dir = b.option([]const u8, "android-lib-dir", "Directory of static stubs Zig can resolve while linking a static archive. The NDK clang step links the real Bionic libraries.");
     const ohos_sysroot = b.option([]const u8, "ohos-sysroot", "OpenHarmony native sysroot (the native/sysroot directory from the SDK)");
+
+    const escargot_install_opt = b.option([]const u8, "escargot-install", "Escargot install prefix (default vendor/escargot-install)");
+    const hermes_install_opt = b.option([]const u8, "hermes-install", "Hermes install prefix (default vendor/hermes-install)");
+    const libstdcxx_opt = b.option([]const u8, "libstdcxx", "Absolute path to libstdc++.a (else JSBAY_LIBSTDCXX); required for -Dbackend=escargot|hermes");
+    const icu_lib_dir_opt = b.option([]const u8, "icu-lib-dir", "Directory with libicuuc/icui18n/icudata (else JSBAY_ICU_LIB_DIR); required for -Dbackend=hermes");
+    // Hermes create-time GCConfig.MaxHeapSize default when EngineConfig.max_heap_size==0. 0 = Hermes built-in default (3GiB).
+    const hermes_max_heap = b.option(u64, "hermes-max-heap", "Hermes create-time MaxHeapSize bytes (0=Hermes default 3GiB); EngineConfig.max_heap_size overrides") orelse 0;
 
     const os = target.result.os.tag;
     const ohos = target.result.abi == .ohos or target.result.abi == .ohoseabi;
@@ -185,6 +96,17 @@ pub fn build(b: *std.Build) void {
     }
     if (fault_injection and apple_package) {
         std.process.fatal("-Dfault-injection=true must not be combined with -Dapple-package (product packaging)", .{});
+    }
+
+    const spike_libstdcxx: ?[]const u8 = libstdcxx_opt orelse b.graph.environ_map.get("JSBAY_LIBSTDCXX");
+    const spike_icu_lib_dir: ?[]const u8 = icu_lib_dir_opt orelse b.graph.environ_map.get("JSBAY_ICU_LIB_DIR");
+    const spike_escargot_install: []const u8 = escargot_install_opt orelse "vendor/escargot-install";
+    const spike_hermes_install: []const u8 = hermes_install_opt orelse "vendor/hermes-install";
+    if ((backend == .escargot or backend == .hermes) and spike_libstdcxx == null) {
+        std.process.fatal("-Dbackend={s} needs -Dlibstdcxx=/path/to/libstdc++.a or JSBAY_LIBSTDCXX (g++ local-exec TLS; Zig must not use libc++)", .{@tagName(backend)});
+    }
+    if (backend == .hermes and spike_icu_lib_dir == null) {
+        std.process.fatal("-Dbackend=hermes needs -Dicu-lib-dir=/path/to/icu/lib or JSBAY_ICU_LIB_DIR", .{});
     }
 
     const zev_dep = b.dependency("zev", .{
@@ -203,41 +125,29 @@ pub fn build(b: *std.Build) void {
     const bytecode_cache = bytecode_cache_dep.module("bytecode_cache");
 
     // The checked-in gitlinks are copied into the build cache before patching, leaving both the submodule checkout and an imported source snapshot intact.
-    // Prepare QuickJS tree if any packed engine needs it (first QJS-family wins for translate-c).
-    var qjs_family: ?Backend = null;
-    for (packed_backends) |tag| {
-        if (tag == .quickjs_ng or tag == .quickjs) {
-            qjs_family = tag;
-            break;
-        }
-    }
-    const qjs_root: ?std.Build.LazyPath = if (qjs_family) |fam| switch (fam) {
+    const qjs_root: ?std.Build.LazyPath = switch (backend) {
         .quickjs_ng => preparePatchedQuickJsNg(b, tool),
         .quickjs => preparePatchedQuickJs(b, tool),
         .jsc => null,
-    } else null;
+        .escargot, .hermes => null,
+    };
 
     // Build options module passed to source code
     const build_options = b.addOptions();
     build_options.addOption(Backend, "backend", backend);
-    build_options.addOption(u32, "packed_backend_bits", packed_backend_bits);
-    build_options.addOption(bool, "multi_pack", multi_pack);
     build_options.addOption(bool, "stress_tests", stress_tests);
     build_options.addOption(bool, "inspector", inspector_enabled);
     build_options.addOption(bool, "inspector_transport", inspector_transport_enabled);
     build_options.addOption(bool, "heap_snapshot", heap_snapshot);
     build_options.addOption(bool, "bytecode_cache", bytecode_cache_enabled);
     build_options.addOption(bool, "fault_injection", fault_injection);
+    build_options.addOption(u64, "hermes_max_heap", hermes_max_heap);
     build_options.addOption([]const u8, "bytecode_fingerprint", bytecodeFingerprint(b, target.result, backend, optimize, quickjs_gc_stress, inspector_enabled, heap_snapshot));
-    build_options.addOption([]const u8, "package_version", packageVersionFromZon());
-    const git_commit = b.option([]const u8, "git-commit", "Git commit recorded by jsbay_engine_version (empty when unknown)") orelse resolveGitCommit(b);
-    build_options.addOption([]const u8, "git_commit", git_commit);
-    build_options.addOption([]const u8, "backend_name", @tagName(backend));
 
     // Translate quickjs.h once and import it as "qjs".
     const qjs_mod = if (qjs_root) |root| blk: {
         const android = target.result.abi.isAndroid();
-        const header = if (qjs_family == .quickjs_ng)
+        const header = if (backend == .quickjs_ng)
             root.path(b, "quickjs.h")
         else
             b.path("src/backend/quickjs/quickjs_shim.h");
@@ -248,8 +158,8 @@ pub fn build(b: *std.Build) void {
             // -lc on a Darwin host appends the macOS SDK, causing Bionic limits.h to include_next into that SDK and fail translation.
             .link_libc = !android and !ohos,
         });
-        translate_c.defineCMacro("JSBAY_INSPECTOR", if (inspector_enabled) "1" else "0");
-        translate_c.defineCMacro("JSBAY_HEAP_SNAPSHOT", if (heap_snapshot) "1" else "0");
+        translate_c.defineCMacro("JS_BAY_INSPECTOR", if (inspector_enabled) "1" else "0");
+        translate_c.defineCMacro("JS_BAY_HEAP_SNAPSHOT", if (heap_snapshot) "1" else "0");
         translate_c.addIncludePath(root);
         if (android) {
             if (android_sysroot) |sysroot| {
@@ -263,8 +173,8 @@ pub fn build(b: *std.Build) void {
                 // The host SDK can still sit later on the search path. This header ends the limits.h include_next chain before it.
                 const limits_stub = b.addWriteFiles();
                 _ = limits_stub.add("limits.h",
-                    \\#ifndef JSBAY_ANDROID_LIMITS_STUB_H
-                    \\#define JSBAY_ANDROID_LIMITS_STUB_H
+                    \\#ifndef JS_BAY_ANDROID_LIMITS_STUB_H
+                    \\#define JS_BAY_ANDROID_LIMITS_STUB_H
                     \\#endif
                     \\
                 );
@@ -337,11 +247,11 @@ pub fn build(b: *std.Build) void {
     lib_module.addImport("inspector_transport", inspector_transport);
     lib_module.addImport("bytecode_cache", bytecode_cache);
     addPlatformCompatSources(b, lib_module);
-    addBackendSources(b, lib_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, lib_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
 
     lib_module.linkSystemLibrary("m", .{});
     const lib = b.addLibrary(.{
-        .name = "jsbay",
+        .name = "js_bay",
         .root_module = lib_module,
         .linkage = if (shared) .dynamic else .static,
         .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
@@ -351,13 +261,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     // Install C header
-    b.installFile("include/jsbay.h", "include/jsbay.h");
-    for ([_][]const u8{ "jsbay_bytecode.h", "jsbay_sync.h", "module.modulemap" }) |header| {
+    b.installFile("include/js_bay.h", "include/js_bay.h");
+    for ([_][]const u8{ "js_bay_bytecode.h", "js_bay_sync.h", "module.modulemap" }) |header| {
         b.installFile(b.fmt("include/{s}", .{header}), b.fmt("include/{s}", .{header}));
     }
 
     // --- Zig module for consumers ---
-    const mod = b.addModule("jsbay", .{
+    const mod = b.addModule("js_bay", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -371,7 +281,7 @@ pub fn build(b: *std.Build) void {
     if (qjs_mod) |qjs| mod.addImport("qjs", qjs);
     if (qjs_root) |root| mod.addIncludePath(root);
 
-    // Demos and benchmarks use this repository-private implementation module. It stays out of the public `jsbay` module so product consumers use the typed C ABI or the documented Zig expert modules instead.
+    // Demos and benchmarks use this repository-private implementation module. It stays out of the public `js_bay` module so product consumers use the typed C ABI or the documented Zig expert modules instead.
     const internal_tools_module = b.createModule(.{
         .root_source_file = b.path("src/internal_tools.zig"),
         .target = target,
@@ -403,11 +313,13 @@ pub fn build(b: *std.Build) void {
     if (qjs_mod) |qjs| test_module.addImport("qjs", qjs);
 
     addPlatformCompatSources(b, test_module);
-    addBackendSources(b, test_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, test_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
 
     const unit_tests = b.addTest(.{
         .root_module = test_module,
         .filters = if (stress_tests) &.{"stress"} else if (test_filter) |filter| &.{filter} else &.{},
+        // Escargot/gcc TLSDESC needs GNU ld; lld mishandles _TLS_MODULE_BASE_/thread_local from libescargot.a
+        .use_lld = false,
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -415,7 +327,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
     b.step("test-engine", "Run engine tests without independent package suites").dependOn(&run_unit_tests.step);
     b.step("test-compile", "Compile engine tests without running them").dependOn(&unit_tests.step);
-
     if (!stress_tests) {
         const zev_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -500,9 +411,9 @@ pub fn build(b: *std.Build) void {
     conformance_module.addImport("bytecode_cache", bytecode_cache);
     if (qjs_mod) |qjs| conformance_module.addImport("qjs", qjs);
     addPlatformCompatSources(b, conformance_module);
-    addBackendSources(b, conformance_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, conformance_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
     const conformance_library = b.addLibrary(.{
-        .name = "jsbay_test262",
+        .name = "js_bay_test262",
         .root_module = conformance_module,
         .linkage = .static,
     });
@@ -546,14 +457,14 @@ pub fn build(b: *std.Build) void {
     if (library_only) return;
 
     // --- Benchmark executable ---
-    // Separate binary that imports jsbay and measures eval, native-call, promise, and typed-array throughput.
+    // Separate binary that imports js_bay and measures eval, native-call, promise, and typed-array throughput.
     const bench_module = b.createModule(.{
         .root_source_file = b.path("bench/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    bench_module.addImport("jsbay_tools", internal_tools_module);
+    bench_module.addImport("js_bay_tools", internal_tools_module);
     bench_module.addOptions("build_options", build_options);
     bench_module.addImport("zev", zev);
     bench_module.addImport("js_event_loop", js_event_loop);
@@ -563,7 +474,7 @@ pub fn build(b: *std.Build) void {
     if (qjs_mod) |qjs| bench_module.addImport("qjs", qjs);
 
     addPlatformCompatSources(b, bench_module);
-    addBackendSources(b, bench_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, bench_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
 
     const bench_exe = b.addExecutable(.{
         .name = b.fmt("bench-{s}", .{@tagName(backend)}),
@@ -585,7 +496,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    demo_module.addImport("jsbay_tools", internal_tools_module);
+    demo_module.addImport("js_bay_tools", internal_tools_module);
     demo_module.addOptions("build_options", build_options);
     demo_module.addImport("zev", zev);
     demo_module.addImport("js_event_loop", js_event_loop);
@@ -595,7 +506,7 @@ pub fn build(b: *std.Build) void {
     if (qjs_mod) |qjs| demo_module.addImport("qjs", qjs);
 
     addPlatformCompatSources(b, demo_module);
-    addBackendSources(b, demo_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, demo_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
 
     const demo_exe = b.addExecutable(.{
         .name = b.fmt("inspector-demo-{s}", .{@tagName(backend)}),
@@ -609,55 +520,6 @@ pub fn build(b: *std.Build) void {
     const demo_step = b.step("inspector-demo", "Run CDP inspector demo harness");
     demo_step.dependOn(&run_demo.step);
 
-    // --- Pauseable DevTools owner-thread C embed sample ---
-    // Dedicated owner pthread: create → inspector_start → run_loop → destroy.
-    // Main/client only calls stop_loop. Prefer -Dbackend=quickjs_ng for Debugger.
-    // `--self-test` is the automated smoke; interactive mode waits for stdin.
-    if (inspector_enabled and inspector_transport_enabled) {
-        const embed_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        embed_module.addCSourceFile(.{
-            .file = b.path("examples/debug_owner_embed.c"),
-            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
-        });
-        embed_module.addIncludePath(b.path("include"));
-        embed_module.linkLibrary(lib);
-        for (lib.root_module.include_dirs.items) |include| switch (include) {
-            .framework_path => |p| embed_module.addFrameworkPath(p),
-            .framework_path_system => |p| embed_module.addSystemFrameworkPath(p),
-            else => {},
-        };
-        if (backend == .jsc and (os == .macos or os == .ios)) {
-            embed_module.linkFramework("JavaScriptCore", .{});
-            embed_module.linkFramework("Foundation", .{});
-        }
-        const embed_exe = b.addExecutable(.{
-            .name = b.fmt("debug-owner-embed-{s}", .{@tagName(backend)}),
-            .root_module = embed_module,
-        });
-        if (lib.zig_lib_dir) |compiler_lib| {
-            embed_exe.zig_lib_dir = compiler_lib;
-            compiler_lib.addStepDependencies(&embed_exe.step);
-        }
-        b.installArtifact(embed_exe);
-
-        const run_embed = b.addRunArtifact(embed_exe);
-        forwardRunArgs(b, run_embed);
-        const embed_step = b.step("debug-owner-embed", "Run pauseable owner-thread C inspector embed sample");
-        embed_step.dependOn(&run_embed.step);
-
-        const embed_self_test = b.addRunArtifact(embed_exe);
-        embed_self_test.addArg("--port");
-        embed_self_test.addArg("0");
-        embed_self_test.addArg("--self-test");
-        embed_self_test.expectExitCode(0);
-        const embed_test_step = b.step("debug-owner-embed-test", "Smoke-test owner-thread C embed (--self-test)");
-        embed_test_step.dependOn(&embed_self_test.step);
-    }
-
     // --- JSC Safari-attachable inspector demo ---
     // Uses JavaScriptCore's built-in WebKit Inspector. Only meaningful on JSC + Darwin; under QJS or non-Apple targets we skip the entire step so `zig build` stays green.
     if (backend == .jsc and (os == .macos or os == .ios)) {
@@ -667,7 +529,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        safari_module.addImport("jsbay_tools", internal_tools_module);
+        safari_module.addImport("js_bay_tools", internal_tools_module);
         safari_module.addOptions("build_options", build_options);
         safari_module.addImport("zev", zev);
         safari_module.addImport("js_event_loop", js_event_loop);
@@ -743,16 +605,24 @@ fn preparePatchedQuickJs(b: *std.Build, tool: *std.Build.Step.Compile) std.Build
     return out;
 }
 
-/// Adds one engine's C sources / system libraries to `m`.
-fn addOneBackendSources(
+/// Adds the selected engine's C sources / system libraries to `m`.
+fn addBackendSources(
     b: *std.Build,
     m: *std.Build.Module,
     backend: Backend,
     quickjs_gc_stress: bool,
     os: std.Target.Os.Tag,
     qjs_root: ?std.Build.LazyPath,
+    inspector_enabled: bool,
+    heap_snapshot: bool,
     asan: bool,
+    escargot_install: []const u8,
+    hermes_install: []const u8,
+    libstdcxx: ?[]const u8,
+    icu_lib_dir: ?[]const u8,
 ) void {
+    m.addCMacro("JS_BAY_INSPECTOR", if (inspector_enabled) "1" else "0");
+    m.addCMacro("JS_BAY_HEAP_SNAPSHOT", if (heap_snapshot) "1" else "0");
     switch (backend) {
         .quickjs_ng => addQuickJsNgSources(b, m, quickjs_gc_stress, qjs_root.?, asan),
         .quickjs => addQuickJsSources(b, m, quickjs_gc_stress, qjs_root.?, asan),
@@ -771,26 +641,60 @@ fn addOneBackendSources(
                 m.linkSystemLibrary("JavaScriptCore", .{});
             }
         },
+        .escargot => addEscargotSources(b, m, escargot_install, libstdcxx.?),
+        .hermes => addHermesSources(b, m, hermes_install, libstdcxx.?, icu_lib_dir.?),
     }
 }
 
-/// Adds every packed engine's sources (multi-pack) or the single selected backend.
-fn addBackendSources(
-    b: *std.Build,
-    m: *std.Build.Module,
-    engines: []const Backend,
-    quickjs_gc_stress: bool,
-    os: std.Target.Os.Tag,
-    qjs_root: ?std.Build.LazyPath,
-    inspector_enabled: bool,
-    heap_snapshot: bool,
-    asan: bool,
-) void {
-    m.addCMacro("JSBAY_INSPECTOR", if (inspector_enabled) "1" else "0");
-    m.addCMacro("JSBAY_HEAP_SNAPSHOT", if (heap_snapshot) "1" else "0");
-    for (engines) |tag| {
-        addOneBackendSources(b, m, tag, quickjs_gc_stress, os, qjs_root, asan);
+fn addEscargotSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8) void {
+    // EscargotPublic C bridge + libescargot (g++/local-exec TLS).
+    // Zig's linkSystemLibrary("stdc++") is special-cased to libc++ — link libstdc++.a by path.
+    const install = b.path(install_prefix);
+    m.addIncludePath(install.path(b, "include"));
+    m.addIncludePath(b.path("src/backend/escargot"));
+    m.addObjectFile(install.path(b, "lib/escargot_bridge.o"));
+    const libs = [_][]const u8{
+        "lib/libescargot.a",
+        "lib/libgc-lib.a",
+        "lib/liblibbf.a",
+        "lib/liblibsimdutf.a",
+        "lib/libruntime-icu-binder-static.a",
+    };
+    for (libs) |rel| {
+        m.addObjectFile(install.path(b, rel));
     }
+    m.link_libcpp = false;
+    m.addObjectFile(.{ .cwd_relative = libstdcxx });
+    m.linkSystemLibrary("pthread", .{});
+    m.linkSystemLibrary("dl", .{});
+    m.linkSystemLibrary("m", .{});
+    m.linkSystemLibrary("rt", .{});
+    m.linkSystemLibrary("gcc_s", .{});
+}
+
+fn addHermesSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8, icu_lib_dir: []const u8) void {
+    // Hermes/JSI C bridge as a shared lib (libhermes_bridge.so), not a .o into the Zig
+    // binary. HostFunction `throw jsi::JSError` must unwind with GCC libstdc++/libgcc_s
+    // that hermesvm.so uses; Zig's libunwind + a static/second libstdc++ ABRTs across DSO.
+    _ = libstdcxx; // required by outer guard / Escargot parity of env
+    const install = b.path(install_prefix);
+    m.addIncludePath(b.path("src/backend/hermes"));
+    m.addIncludePath(install.path(b, "include"));
+    m.addLibraryPath(install.path(b, "lib"));
+    m.addLibraryPath(.{ .cwd_relative = icu_lib_dir });
+    m.addRPath(install.path(b, "lib"));
+    m.addRPath(.{ .cwd_relative = icu_lib_dir });
+    m.linkSystemLibrary("hermes_bridge", .{});
+    m.linkSystemLibrary("hermesvm", .{});
+    m.linkSystemLibrary("jsi", .{});
+    m.linkSystemLibrary("icuuc", .{});
+    m.linkSystemLibrary("icui18n", .{});
+    m.linkSystemLibrary("icudata", .{});
+    m.link_libcpp = false;
+    m.linkSystemLibrary("pthread", .{});
+    m.linkSystemLibrary("dl", .{});
+    m.linkSystemLibrary("m", .{});
+    m.linkSystemLibrary("gcc_s", .{});
 }
 
 fn addQuickJsNgSources(b: *std.Build, m: *std.Build.Module, gc_stress: bool, qjs_root: std.Build.LazyPath, asan: bool) void {
@@ -864,34 +768,6 @@ fn addPlatformCompatSources(b: *std.Build, m: *std.Build.Module) void {
 }
 
 /// Cache identity follows the pinned engine, patches, target and compiler options.
-fn packageVersionFromZon() []const u8 {
-    const zon = @embedFile("build.zig.zon");
-    const key = ".version = \"";
-    const start = std.mem.indexOf(u8, zon, key) orelse std.process.fatal("build.zig.zon missing .version", .{});
-    const value_start = start + key.len;
-    const end = std.mem.indexOfScalar(u8, zon[value_start..], '"') orelse std.process.fatal("build.zig.zon .version missing closing quote", .{});
-    return zon[value_start..][0..end];
-}
-
-fn resolveGitCommit(b: *std.Build) []const u8 {
-    const root = b.root.root_dir.path orelse ".";
-    switch (b.runFallible(&.{ "git", "-C", root, "rev-parse", "HEAD" }, .{
-        .stderr_behavior = .ignore,
-        .stdout_limit = .limited(128),
-    })) {
-        .success => |stdout| {
-            const trimmed = std.mem.trim(u8, stdout, " \t\r\n");
-            if (trimmed.len == 0) return "";
-            for (trimmed) |c| {
-                const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
-                if (!ok) return "";
-            }
-            return trimmed;
-        },
-        else => return "",
-    }
-}
-
 fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, optimize: std.builtin.OptimizeMode, gc_stress: bool, inspector_enabled: bool, heap_snapshot: bool) []const u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("js-bay-bytecode-cache-v1\x00");
@@ -932,6 +808,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
         },
         .jsc => {},
+        .escargot, .hermes => {},
     }
     const triple = target.zigTriple(b.allocator) catch @panic("out of memory");
     hash.update(b.fmt("\x00{s}\x00{s}\x00{s}\x00{s}\x00{}\x00{}\x00{}", .{

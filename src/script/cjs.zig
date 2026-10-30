@@ -42,9 +42,9 @@ const CjsState = struct {
     cache: std.StringHashMap(CacheEntry),
     /// Tracks whether the global `require` has been registered on the JS context — prevents duplicate registration on repeat install() calls.
     require_installed: bool = false,
-    /// Tracks whether the global `__jsbay_cjsCache` has been registered.
+    /// Tracks whether the global `__js_bay_cjsCache` has been registered.
     cjs_cache_installed: bool = false,
-    /// In-process bytecode cache for `__jsbay_cjsCache`: sourceHash + filenameHash → bytes. Both keys and bytes are c_allocator-owned and freed on uninstall. This lets repeat mounts of the same module body at the same source location skip re-compile without conflating filename metadata.
+    /// In-process bytecode cache for `__js_bay_cjsCache`: sourceHash + filenameHash → bytes. Both keys and bytes are c_allocator-owned and freed on uninstall. This lets repeat mounts of the same module body at the same source location skip re-compile without conflating filename metadata.
     bytecode_cache: std.StringHashMap([]u8),
 };
 
@@ -295,6 +295,15 @@ fn compileWrapper(
             // Protect so the caller can freeValue (JSValueUnprotect) symmetrically.
             return ActiveEngine.dupValue(ctx, raw);
         },
+        .escargot, .hermes => {
+            const r = ActiveEngine.evalValue(ctx, source, filename);
+            if (r.err_text) |e| {
+                std.heap.c_allocator.free(e);
+                if (r.exception) |ex| ActiveEngine.freeValue(ctx, ex);
+                return error.Compile;
+            }
+            return r.value orelse return error.Compile;
+        },
     }
 }
 
@@ -437,6 +446,11 @@ pub fn runCommonJS(instance_id: i32, bytes: []const u8, filename: []const u8) Cj
         .jsc => {
             return .{ .err = "runCommonJS not supported on JSC", .err_is_heap = false };
         },
+        .escargot, .hermes => {
+            // No stable bytecode blob on Escargot; Hermes .hbc path is separate (hermesCompileBytecode).
+            // Text CJS goes through require()/evalAsCjs + evalValue.
+            return .{ .err = "runCommonJS bytecode path not supported on Escargot/Hermes", .err_is_heap = false };
+        },
     }
 }
 
@@ -457,8 +471,11 @@ pub fn evalCachedCjs(
     version: []const u8,
 ) CjsCacheResult {
     if (!@import("build_options").bytecode_cache) return plainCjs(instance_id, source, filename);
-    // JSC has no portable bytecode decode/execute path. Bypass persistent cache lookup entirely so an old cache entry cannot block plain CJS.
-    if (backend.active_backend == .jsc) return plainCjs(instance_id, source, filename);
+    // JSC/Escargot have no QJS-shaped CJS bytecode replay; Hermes .hbc is a different format
+    // (hermesCompileBytecode / hermesRunBytecode). Bypass so stale or engine-native blobs cannot
+    // block plain require()/evalAsCjs.
+    if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend))
+        return plainCjs(instance_id, source, filename);
     // Small modules are cheaper to parse than to read/deserialize back.
     if (source.len < 4 * 1024) return plainCjs(instance_id, source, filename);
     if (!cache.isSafeVersion(version) or cache_dir.len == 0) return plainCjs(instance_id, source, filename);
@@ -547,6 +564,13 @@ fn registerGlobalRequire(ctx: ActiveEngine.Context) bool {
             jsc_mod.JscBackend.setProperty(jsc_ctx, global, "require", @ptrCast(fn_obj));
             return true;
         },
+        .escargot, .hermes => {
+            const fn_obj = ActiveEngine.makeNativeFunction(ctx, "require", &spikeRequireCb, null) orelse return false;
+            const global = ActiveEngine.getGlobalObject(ctx);
+            defer ActiveEngine.freeValue(ctx, global);
+            ActiveEngine.setPropertyStr(ctx, global, "require", fn_obj);
+            return true;
+        },
     }
 }
 
@@ -568,6 +592,12 @@ fn getGlobalRequire(ctx: ActiveEngine.Context) ActiveEngine.Value {
             const val = jsc_mod.jsc.JSObjectGetProperty(jsc_ctx, global, js_name, &exc);
             if (val != null) jsc_mod.jsc.JSValueProtect(jsc_ctx, val);
             return val;
+        },
+        .escargot, .hermes => {
+            const global = ActiveEngine.getGlobalObject(ctx);
+            defer ActiveEngine.freeValue(ctx, global);
+            // getPropertyVal returns ?Value; Value is already optional-pointer.
+            return ActiveEngine.getPropertyVal(ctx, global, "require") orelse null;
         },
     }
 }
@@ -674,6 +704,62 @@ fn jscThrowRequireError(
             return jsc_mod.JscBackend.throwError(ctx_ref, exception, "require: module threw during evaluation");
         },
         error.OutOfMemory => return jsc_mod.JscBackend.throwError(ctx_ref, exception, "require: out of memory"),
+    }
+}
+
+fn spikeRequireCb(
+    ctx: ActiveEngine.Context,
+    _this: ActiveEngine.Value,
+    args_ptr: ?[*]const ActiveEngine.Value,
+    argc: usize,
+    _: ?*anyopaque,
+) callconv(.c) ActiveEngine.Value {
+    _ = _this;
+    if (argc < 1) {
+        _ = ActiveEngine.throwError(ctx, "require: specifier required");
+        return null;
+    }
+    const state = stateFromCtx(ctx) orelse {
+        _ = ActiveEngine.throwError(ctx, "require: not installed");
+        return null;
+    };
+    const argv = args_ptr orelse {
+        _ = ActiveEngine.throwError(ctx, "require: specifier required");
+        return null;
+    };
+    const spec_owned = ActiveEngine.valueToString(ctx, argv[0]) orelse {
+        _ = ActiveEngine.throwError(ctx, "require: specifier must be a string");
+        return null;
+    };
+    defer std.heap.c_allocator.free(@constCast(spec_owned));
+
+    const loaded = doRequire(state, spec_owned, "<cjs>") catch |e| {
+        return spikeThrowRequireError(ctx, spec_owned, e);
+    };
+    return loaded;
+}
+
+fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: DoRequireError) ActiveEngine.Value {
+    switch (e) {
+        error.NotFound => {
+            var msg_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Cannot find module '{s}'", .{specifier}) catch
+                "Cannot find module";
+            _ = ActiveEngine.throwError(ctx, msg);
+            return null;
+        },
+        error.CompileFailed => {
+            _ = ActiveEngine.throwError(ctx, "require: failed to compile module");
+            return null;
+        },
+        error.CallFailed => {
+            _ = ActiveEngine.throwError(ctx, "require: module threw during evaluation");
+            return null;
+        },
+        error.OutOfMemory => {
+            _ = ActiveEngine.throwError(ctx, "require: out of memory");
+            return null;
+        },
     }
 }
 
@@ -830,10 +916,10 @@ fn stringifyValue(ctx: ActiveEngine.Context, val: ActiveEngine.Value) ?[]const u
 }
 
 // --------------------------------------------------------------------------
-// Global `__jsbay_cjsCache` registration — bytecode-cached CommonJS
+// Global `__js_bay_cjsCache` registration — bytecode-cached CommonJS
 // --------------------------------------------------------------------------
 
-/// Register a JS-callable global `__jsbay_cjsCache(source, requireFn, filename, cacheDir?)` on the QuickJS context. The host's `loadModuleExports` uses this INSTEAD of `new Function("module","exports", "require", source)` so a widget/system-app body that costs hundreds of milliseconds to compile is compiled once and replayed from bytecode.
+/// Register a JS-callable global `__js_bay_cjsCache(source, requireFn, filename, cacheDir?)` on the QuickJS context. The host's `loadModuleExports` uses this INSTEAD of `new Function("module","exports", "require", source)` so a widget/system-app body that costs hundreds of milliseconds to compile is compiled once and replayed from bytecode.
 ///
 /// Unlike `evalCachedCjs` (which returns a string and uses the engine's global `require`), this callback:
 /// * preserves the caller's injected `require` (the widget runtime's restricted `requireSharedWidgetModule`) by passing the JS `requireFn` straight into the wrapper's argument list;
@@ -846,18 +932,19 @@ fn registerGlobalCjsCache(ctx: ActiveEngine.Context) bool {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
             const global = qjs_mod.qjs.JS_GetGlobalObject(ctx);
             defer qjs_mod.jsbay_qjs_JS_FreeValue(ctx, global);
-            const fn_val = qjs_mod.jsbay_qjs_JS_NewCFunction(ctx, &qjsCjsCacheCb, "__jsbay_cjsCache", 4);
+            const fn_val = qjs_mod.jsbay_qjs_JS_NewCFunction(ctx, &qjsCjsCacheCb, "__js_bay_cjsCache", 4);
             // JS_SetPropertyStr consumes fn_val's reference.
-            _ = qjs_mod.qjs.JS_SetPropertyStr(ctx, global, "__jsbay_cjsCache", fn_val);
+            _ = qjs_mod.qjs.JS_SetPropertyStr(ctx, global, "__js_bay_cjsCache", fn_val);
             return true;
         },
         .jsc => return false,
+        .escargot, .hermes => return false,
     }
 }
 
 const CjsCacheCbError = error{ OutOfMemory, CompileFailed, CallFailed };
 
-/// Backend for the global `__jsbay_cjsCache` callback. See `registerGlobalCjsCache` for semantics.
+/// Backend for the global `__js_bay_cjsCache` callback. See `registerGlobalCjsCache` for semantics.
 fn qjsCjsCacheCb(
     ctx: ?*@import("../backend.zig").ActiveEngineModule.qjs.JSContext,
     _this: @import("../backend.zig").ActiveEngineModule.qjs.JSValue,
@@ -867,21 +954,21 @@ fn qjsCjsCacheCb(
     _ = _this;
     const qjs_mod = @import("../backend.zig").ActiveEngineModule;
     if (argc < 1) {
-        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__jsbay_cjsCache: source required");
+        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__js_bay_cjsCache: source required");
     }
     const state = stateFromCtx(ctx) orelse {
-        return qjs_mod.qjs.JS_ThrowReferenceError(ctx, "__jsbay_cjsCache: not installed");
+        return qjs_mod.qjs.JS_ThrowReferenceError(ctx, "__js_bay_cjsCache: not installed");
     };
     // argv[0] source (string, required)
     const src_cstr = qjs_mod.jsbay_qjs_JS_ToCString(ctx, argv[0]) orelse {
-        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__jsbay_cjsCache: source must be a string");
+        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__js_bay_cjsCache: source must be a string");
     };
     defer qjs_mod.jsbay_qjs_JS_FreeCString(ctx, src_cstr);
     const source = std.mem.span(src_cstr);
 
     // argv[1] requireFn (callable, required)
     if (argc < 2 or qjs_mod.jsbay_qjs_JS_IsFunction(ctx, argv[1]) == 0) {
-        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__jsbay_cjsCache: require function required");
+        return qjs_mod.qjs.JS_ThrowTypeError(ctx, "__js_bay_cjsCache: require function required");
     }
     const require_fn = qjs_mod.jsbay_qjs_JS_DupValue(ctx, argv[1]);
     defer qjs_mod.jsbay_qjs_JS_FreeValue(ctx, require_fn);
@@ -913,7 +1000,7 @@ fn qjsCjsCacheCb(
     ) catch |e| {
         return switch (e) {
             error.OutOfMemory => qjs_mod.qjs.JS_ThrowOutOfMemory(ctx),
-            error.CompileFailed => qjs_mod.qjs.JS_ThrowSyntaxError(ctx, "__jsbay_cjsCache: failed to compile module"),
+            error.CompileFailed => qjs_mod.qjs.JS_ThrowSyntaxError(ctx, "__js_bay_cjsCache: failed to compile module"),
             error.CallFailed => qjs_mod.JS_EXCEPTION,
         };
     };
@@ -1091,5 +1178,5 @@ fn runWrapperWithRequire(
     return current_exports;
 }
 
-/// Cache version salt for `__jsbay_cjsCache` persisted artifacts. Bump with the engine whenever the QuickJS bytecode format changes, so stale files are dropped and rebuilt rather than replayed.
+/// Cache version salt for `__js_bay_cjsCache` persisted artifacts. Bump with the engine whenever the QuickJS bytecode format changes, so stale files are dropped and rebuilt rather than replayed.
 const CJS_CACHE_VERSION = "jsbay-cjs-1";

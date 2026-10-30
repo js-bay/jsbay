@@ -50,108 +50,74 @@ pub fn finishEvalEntry(instance_id: i32, lease: @import("runtime/engine_thread.z
 }
 
 pub fn create(instance_id: i32, config: types.EngineConfig) bool {
-    return createWithBackend(instance_id, config, backend.active_backend);
-}
-
-/// Create-time engine select. `tag` must be packed into this artifact. The pack primary uses the monomorphic ActiveEngine path; other packed tags use erased handles + `backend_dispatch`.
-pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: backend.BackendType) bool {
     @import("runtime/scheduler_gate.zig").set(.{ .enter = @import("runtime/js_scheduler.zig").backendDrainAllowed, .leave = @import("runtime/js_scheduler.zig").backendDrainFinished });
+    // Check if instance already exists
     if (instance_map.getPtrs(instance_id) != null) return false;
-    if (!backend.isPacked(tag)) return false;
 
     const loop = event_loop.Driver.create(std.heap.c_allocator) catch return false;
-    const backend_dispatch = @import("backend_dispatch.zig");
 
-    if (tag == backend.active_backend) {
-        const runtime = ActiveEngine.newRuntime() orelse {
-            loop.destroy();
-            return false;
-        };
-        ActiveEngine.setMaxStackSize(runtime, config.max_stack_size);
-
-        const ctx = ActiveEngine.newContext(runtime) orelse {
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            return false;
-        };
-
-        ActiveEngine.setContextOpaque(ctx, @ptrFromInt(@as(usize, @intCast(@as(u32, @bitCast(instance_id))))));
-
-        if (config.module_loader) |ml| {
-            switch (backend.active_backend) {
-                .quickjs, .quickjs_ng => {
-                    const qjs_mod = @import("backend.zig").ActiveEngineModule;
-                    qjs_mod.installModuleLoader(runtime, ml);
-                },
-                .jsc => {
-                    const jsc_mod = @import("backend/jsc.zig");
-                    jsc_mod.installModuleLoader(ctx, ml);
-                },
-            }
+    const runtime = blk: {
+        // Hermes MaxHeapSize is create-time only (GCConfig); other backends ignore max_heap_size here.
+        if (comptime backend.isHermesBackend(backend.active_backend)) {
+            const build_opts = @import("build_options");
+            const from_config: u64 = config.max_heap_size;
+            const from_build: u64 = build_opts.hermes_max_heap;
+            const max_heap: u64 = if (from_config != 0) from_config else from_build;
+            break :blk @import("backend/hermes/lifecycle.zig").newRuntimeWithMaxHeap(max_heap);
         }
-
-        ActiveEngine.registerConsole(ctx);
-        ActiveEngine.registerTimers(ctx);
-
-        const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-            ActiveEngine.freeContext(ctx);
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            return false;
-        };
-        const resources = @import("runtime/resource_limits.zig").Budget.create(config.resource_limits) orelse {
-            ActiveEngine.freeContext(ctx);
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            std.heap.c_allocator.destroy(instance);
-            return false;
-        };
-        instance.* = .{
-            .resources = resources,
-            .instance_id = instance_id,
-            .engine_handles = .{ .mono = .{ .runtime = runtime, .ctx = ctx } },
-            .loop = loop,
-            .timers = timers.TimerRegistry.init(),
-            .log_handler = config.log_handler,
-            .log_user_data = config.log_user_data,
-        };
-
-        if (!@import("builtin").is_test) instance.timers.clock_now = loop.now();
-
-        if (create_before_debugger_attach_hook_for_testing) |hook| hook(instance_id, create_hook_context_for_testing);
-
-        if (!instance_map.insertWith(instance, struct {
-            pub fn call(_: @This(), registered: *instance_map.EngineInstance) bool {
-                if (!@import("runtime/runtime_control.zig").initForInstance(registered.instance_id, registered)) return false;
-                if (create_after_insert_hook_for_testing) |hook| hook(registered.instance_id, create_after_insert_context_for_testing);
-                return true;
-            }
-        }{})) {
-            ActiveEngine.freeContext(ctx);
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            resources.deinit();
-            instance.deinitSynchronization();
-            std.heap.c_allocator.destroy(instance);
-            return false;
-        }
-        return true;
-    }
-
-    // Non-primary packed backend: bare lifecycle for create/eval/destroy plus the typed Value surface.
-    const handles = backend_dispatch.createPacked(tag) orelse {
+        break :blk ActiveEngine.newRuntime();
+    } orelse {
         loop.destroy();
         return false;
     };
-    backend_dispatch.finishCreate(tag, handles, instance_id, config.max_stack_size);
+    ActiveEngine.setMaxStackSize(runtime, config.max_stack_size);
+
+    const ctx = ActiveEngine.newContext(runtime) orelse {
+        ActiveEngine.freeRuntime(runtime);
+        loop.destroy();
+        return false;
+    };
+
+    ActiveEngine.setContextOpaque(ctx, @ptrFromInt(@as(usize, @intCast(@as(u32, @bitCast(instance_id))))));
+
+    // Wire up module loader if configured.
+    if (config.module_loader) |ml| {
+        switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("backend.zig").ActiveEngineModule;
+                qjs_mod.installModuleLoader(runtime, ml);
+            },
+            .jsc => {
+                // JSC's C API has no module hooks, but the ObjC JSModuleLoaderDelegate protocol does. Install a bridge delegate that forwards into the user's ModuleLoaderVTable.
+                const jsc_mod = @import("backend/jsc.zig");
+                jsc_mod.installModuleLoader(ctx, ml);
+            },
+            .escargot => {
+                if (comptime backend.isEscargotBackend(backend.active_backend)) {
+                    @import("backend/escargot.zig").installModuleLoader(ctx, ml);
+                }
+            },
+            .hermes => {
+                if (comptime backend.isHermesBackend(backend.active_backend)) {
+                    @import("backend/hermes.zig").installModuleLoader(ctx, ml);
+                }
+            }
+        }
+    }
+
+    // Register standard JS APIs (console, timers)
+    ActiveEngine.registerConsole(ctx);
+    ActiveEngine.registerTimers(ctx);
 
     const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles);
+        ActiveEngine.freeContext(ctx);
+        ActiveEngine.freeRuntime(runtime);
         loop.destroy();
         return false;
     };
     const resources = @import("runtime/resource_limits.zig").Budget.create(config.resource_limits) orelse {
-        backend_dispatch.destroyPacked(tag, handles);
+        ActiveEngine.freeContext(ctx);
+        ActiveEngine.freeRuntime(runtime);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
         return false;
@@ -159,15 +125,18 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
     instance.* = .{
         .resources = resources,
         .instance_id = instance_id,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
+        .runtime = runtime,
+        .ctx = ctx,
         .loop = loop,
         .timers = timers.TimerRegistry.init(),
         .log_handler = config.log_handler,
         .log_user_data = config.log_user_data,
     };
+
     if (!@import("builtin").is_test) instance.timers.clock_now = loop.now();
 
-    // Install interrupt/time-limit control for packed-alt by instance backend (same as primary). Debugger attach remains primary-only.
+    if (create_before_debugger_attach_hook_for_testing) |hook| hook(instance_id, create_hook_context_for_testing);
+
     if (!instance_map.insertWith(instance, struct {
         pub fn call(_: @This(), registered: *instance_map.EngineInstance) bool {
             if (!@import("runtime/runtime_control.zig").initForInstance(registered.instance_id, registered)) return false;
@@ -175,7 +144,8 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
             return true;
         }
     }{})) {
-        backend_dispatch.destroyPacked(tag, handles);
+        ActiveEngine.freeContext(ctx);
+        ActiveEngine.freeRuntime(runtime);
         loop.destroy();
         resources.deinit();
         instance.deinitSynchronization();
@@ -206,22 +176,14 @@ pub fn evalScript(instance_id: i32, script: []const u8, filename: []const u8) Ev
     }
     const ptrs = instance_map.getPtrs(instance_id) orelse
         return missingInstanceResult();
-    const inst = instance_map.getInstance(instance_id) orelse return missingInstanceResult();
     var execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse return missingInstanceResult();
     @import("inspector/root.zig").drainRetired(instance_id);
     reconcileInspectorBeforeEvaluation(instance_id);
     debugger_mod.noteScript(instance_id, filename, script);
     debugger_mod.clearExceptionHold(instance_id);
-    const result = switch (inst.engine_handles) {
-        .mono => |m| ActiveEngine.eval(m.ctx, script, filename),
-        .packed_alt => |a| @import("backend_dispatch.zig").evalPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }, script, filename),
-    };
+    const result = ActiveEngine.eval(ptrs.ctx, script, filename);
     execution.end();
-    switch (inst.engine_handles) {
-        .mono => |m| @import("runtime/js_scheduler.zig").checkpoint(instance_id, m.ctx),
-        .packed_alt => |a| @import("backend_dispatch.zig").processPendingJobsPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }),
-    }
-    _ = ptrs;
+    @import("runtime/js_scheduler.zig").checkpoint(instance_id, ptrs.ctx);
     if (result.err) |message| @import("inspector/root.zig").exceptions.reportUncaught(instance_id, message, filename);
     return result;
 }
@@ -256,6 +218,19 @@ pub fn evalModule(instance_id: i32, source: []const u8, filename: []const u8) Ev
     const result = switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("backend.zig").ActiveEngineModule.evalAsModule(ptrs.ctx, source, filename),
         .jsc => @import("backend/jsc.zig").jscEvalModule(ptrs.ctx, source, filename),
+        .escargot => blk: {
+            // Escargot ESM via PlatformRef onLoadModule (only analyzed when -Dbackend=escargot).
+            if (comptime !backend.isEscargotBackend(backend.active_backend)) {
+                break :blk @as(EvalResult, .{ .result = null, .err = "ES modules not supported on this backend", .err_is_heap = false });
+            }
+            break :blk @import("backend/escargot.zig").escargotEvalModule(ptrs.ctx, source, filename);
+        },
+        .hermes => blk: {
+            if (comptime !backend.isHermesBackend(backend.active_backend)) {
+                break :blk @as(EvalResult, .{ .result = null, .err = "ES modules not supported on this backend", .err_is_heap = false });
+            }
+            break :blk @import("backend/hermes.zig").hermesEvalModule(ptrs.ctx, source, filename);
+        },
     };
     execution.end();
     @import("runtime/js_scheduler.zig").checkpoint(instance_id, ptrs.ctx);
@@ -287,6 +262,18 @@ pub fn importModule(instance_id: i32, entry_specifier: []const u8) EvalResult {
         .jsc => {
             const jsc_mod = @import("backend/jsc.zig");
             return jsc_mod.jscImportModule(ptrs.ctx, entry_specifier);
+        },
+        .escargot => {
+            if (comptime !backend.isEscargotBackend(backend.active_backend)) {
+                return .{ .result = null, .err = "ES modules not supported on this backend", .err_is_heap = false };
+            }
+            return @import("backend/escargot.zig").escargotImportModule(ptrs.ctx, entry_specifier);
+        },
+        .hermes => {
+            if (comptime !backend.isHermesBackend(backend.active_backend)) {
+                return .{ .result = null, .err = "ES modules not supported on this backend", .err_is_heap = false };
+            }
+            return @import("backend/hermes.zig").hermesImportModule(ptrs.ctx, entry_specifier);
         },
     }
 }
@@ -373,7 +360,7 @@ const TurnContext = struct {
     }
     fn checkpoint(context: ?*anyopaque) void {
         const id = self(context).instance_id;
-        if (!instance_map.isTeardownPending(id)) @import("runtime/js_scheduler.zig").checkpointInstance(id);
+        if (!instance_map.isTeardownPending(id)) if (instance_map.getPtrs(id)) |ptrs| @import("runtime/js_scheduler.zig").checkpoint(id, ptrs.ctx);
     }
     fn finishTask(context: ?*anyopaque) void {
         if (self(context).native_completion) |*completion| completion.finish();
@@ -383,11 +370,11 @@ const TurnContext = struct {
         return instance_map.withInstanceReturn(self(context).instance_id, struct {
             pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?u64 {
                 inst.task_mutex.lock();
-                const has_host_task = inst.task_queue.pendingLen() != 0;
+                const has_host_task = inst.task_queue.items.items.len != 0;
                 inst.task_mutex.unlock();
                 if (has_host_task) return 0;
                 inst.native_task_queue.mutex.lock();
-                const has_native_task = inst.native_task_queue.pendingLen() != 0;
+                const has_native_task = inst.native_task_queue.items.items.len != 0;
                 inst.native_task_queue.mutex.unlock();
                 if (has_native_task or @import("runtime/tsfn.zig").hasPending(inst.instance_id)) return 0;
                 return timers.nextDeadline(inst);
@@ -502,24 +489,6 @@ pub fn stopEventLoop(instance_id: i32) void {
     ptrs.loop.requestStop();
 }
 
-/// Pause JS scheduling for Hide/Show keep-alive. Safe from any thread.
-/// Keeps the VM, binds, timers, and task queues; does not detach the platform Host.
-pub fn suspendEventLoop(instance_id: i32) void {
-    const ptrs = instance_map.getPtrs(instance_id) orelse return;
-    ptrs.loop.suspendScheduling();
-}
-
-/// Resume after `suspendEventLoop`. Safe from any thread. Does not recreate state.
-pub fn resumeEventLoop(instance_id: i32) void {
-    const ptrs = instance_map.getPtrs(instance_id) orelse return;
-    ptrs.loop.resumeScheduling();
-}
-
-pub fn isEventLoopSuspended(instance_id: i32) bool {
-    const ptrs = instance_map.getPtrs(instance_id) orelse return false;
-    return ptrs.loop.isSuspended();
-}
-
 /// The owned wait primitive remains alive for the lifetime of the instance.
 pub fn loopAlive(instance_id: i32) bool {
     return instance_map.getPtrs(instance_id) != null;
@@ -545,19 +514,14 @@ pub fn runGc(instance_id: i32) void {
     defer finishEvalEntry(instance_id, lease);
     if (!lease.allowed) return;
     const inst = instance_map.getInstance(instance_id) orelse return;
-    switch (inst.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => ActiveEngine.runGc(m.runtime),
-            .jsc => {
-                const jsc_mod = @import("backend/jsc.zig");
-                jsc_mod.JSSynchronousEdenCollectForDebugging(@ptrCast(m.ctx));
-                jsc_mod.JSSynchronousGarbageCollectForDebugging(@ptrCast(m.ctx));
-            },
+    switch (backend.active_backend) {
+        .quickjs, .quickjs_ng => ActiveEngine.runGc(inst.runtime),
+        .jsc => {
+            const jsc_mod = @import("backend/jsc.zig");
+            jsc_mod.JSSynchronousEdenCollectForDebugging(@ptrCast(inst.ctx));
+            jsc_mod.JSSynchronousGarbageCollectForDebugging(@ptrCast(inst.ctx));
         },
-        .packed_alt => |a| @import("backend_dispatch.zig").runGcPacked(a.tag, .{
-            .runtime_addr = a.runtime_addr,
-            .ctx_addr = a.ctx_addr,
-        }),
+        .escargot, .hermes => {},
     }
 }
 
@@ -574,7 +538,7 @@ pub fn dispatchTask(instance_id: i32, script: [*:0]const u8) bool {
                 inst.resources.release(.script_task, self.script.len);
                 return false;
             };
-            inst.task_queue.push(std.heap.c_allocator, owned) catch {
+            inst.task_queue.items.append(std.heap.c_allocator, owned) catch {
                 std.heap.c_allocator.free(owned);
                 inst.resources.release(.script_task, self.script.len);
                 return false;
@@ -616,11 +580,6 @@ fn deferredDestroyTask(ctx: ?*anyopaque) void {
 fn destroyNow(instance_id: i32) void {
     // From this point teardown may detach the engine-thread State before it reaches destroyRuntime. Close public JS admission first so it cannot recreate that State against a runtime being dismantled.
     instance_map.markTeardownPending(instance_id);
-    // Mirror stop_loop so a blocking run sees both the teardown latch and the driver's stop bit. shouldStop already watches teardown_pending; requestStop covers hosts that only observe the driver flag and wakes the waiter promptly.
-    if (instance_map.getPtrs(instance_id)) |ptrs| {
-        ptrs.loop.requestStop();
-        ptrs.loop.wake();
-    }
     // Synchronous native calls own no JS values, but their owner callback may be asleep on a native condition. Wake it before deferred teardown waits for that callback to unwind.
     @import("js_event_loop").native_sync.cancelForInstance(instance_id);
     // A paused debugger blocks the engine thread inside the current eval. Release that wait before teardown tries to join the thread.
@@ -639,19 +598,18 @@ pub fn destroyRuntime(instance_id: i32) void {
 
     if (!dispatch.closeInstanceTasks(instance_id)) return;
     @import("js_event_loop").host_wake.drop(instance_id);
-    // Drain Hide/Show/stop leases before touching the Driver (R3 getPtrs∩destroy).
-    instance_map.waitForControlOps(instance_id);
     const instance = instance_map.getInstance(instance_id) orelse return;
     instance.loop.detach();
     // No NativeTask or TSFN callback admitted before closure may still be using this context when runtime teardown starts.
     dispatch.waitForInstanceTasks(instance_id);
     // Stop script dispatch before the JS context is released. A dispatch racing the admission close is serialized by the instance-map mutex.
     instance.task_mutex.lock();
-    for (instance.task_queue.pendingSlice()) |task| {
+    for (instance.task_queue.items.items) |task| {
         std.heap.c_allocator.free(task);
         instance.resources.release(.script_task, task.len);
     }
-    instance.task_queue.clear(std.heap.c_allocator);
+    instance.task_queue.items.deinit(std.heap.c_allocator);
+    instance.task_queue.items = .empty;
     instance.task_mutex.unlock();
 
     // Release inspector sockets and the console buffer while the JS context can still free retained remote objects.
@@ -663,7 +621,6 @@ pub fn destroyRuntime(instance_id: i32) void {
     // Public handles retain backend values and must be invalidated before the context or the reference bookkeeping is released.
     @import("abi/api_bind.zig").dropInstance(instance_id);
     @import("abi/api_value.zig").dropInstance(instance_id);
-    @import("abi/packed_api_value.zig").dropInstance(instance_id);
     // TSFN handles pin JS functions and may be called by foreign completion threads. Detach them while this context is live so later completions are rejected instead of touching a destroyed runtime.
     @import("runtime/tsfn.zig").releaseAllForInstance(instance_id);
 
@@ -678,16 +635,11 @@ pub fn destroyRuntime(instance_id: i32) void {
 
     // 4. Free JS context and runtime
     debugger_mod.detach(instance_id);
-    switch (instance.engine_handles) {
-        .mono => |m| {
-            if (m.ctx != null and m.runtime != null) {
-                ActiveEngine.runGc(m.runtime);
-                ActiveEngine.freeContext(m.ctx);
-                ActiveEngine.runGc(m.runtime);
-                ActiveEngine.freeRuntime(m.runtime);
-            }
-        },
-        .packed_alt => |a| @import("backend_dispatch.zig").destroyPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }),
+    if (instance.ctx != null and instance.runtime != null) {
+        ActiveEngine.runGc(instance.runtime);
+        ActiveEngine.freeContext(instance.ctx);
+        ActiveEngine.runGc(instance.runtime);
+        ActiveEngine.freeRuntime(instance.runtime);
     }
     @import("inspector/async_stack.zig").deinitInstance(instance_id);
 
@@ -705,14 +657,14 @@ pub fn destroyRuntime(instance_id: i32) void {
 
 /// Get the JS context for an instance. Used by consumers to register custom APIs.
 pub fn getContext(instance_id: i32) ?ActiveEngine.Context {
-    const instance = instance_map.getInstance(instance_id) orelse return null;
-    return instance.monoCtx();
+    const ptrs = instance_map.getPtrs(instance_id) orelse return null;
+    return ptrs.ctx;
 }
 
 /// Get the JS runtime for an instance. Inspector startup uses this to create a short-lived clean realm in the same runtime before retaining reflection intrinsics for its own lifetime.
 pub fn getRuntime(instance_id: i32) ?ActiveEngine.Runtime {
     const instance = instance_map.getInstance(instance_id) orelse return null;
-    return instance.monoRuntime();
+    return instance.runtime;
 }
 
 /// Walk the bookkeeping list, popping each entry and invoking its reset_fn so it can release its retained JS value before the runtime is freed. We unlink entries ourselves so reset_fn does not need to interact with the bookkeeping list (it's already detached by the time it runs).
@@ -747,8 +699,8 @@ fn runOneAsync(instance_id: i32) bool {
         pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?PendingScript {
             inst.task_mutex.lock();
             defer inst.task_mutex.unlock();
-            const script = inst.task_queue.popFront() orelse return null;
-            return .{ .script = script, .resources = inst.resources };
+            if (inst.task_queue.items.items.len == 0) return null;
+            return .{ .script = inst.task_queue.items.orderedRemove(0), .resources = inst.resources };
         }
     }{}) orelse {
         _ = queued.end();
@@ -764,83 +716,4 @@ fn runOneAsync(instance_id: i32) bool {
     if (result.err_is_heap) if (result.err) |value| std.heap.c_allocator.free(@constCast(value));
     _ = queued.end();
     return true;
-}
-
-test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Linux dispatch proof)" {
-    // Force the erase/dispatch path even for the pack primary so Linux single-pack CI proves
-    // EngineInstance.packed_alt without needing a second real engine (JSC is Apple-only).
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    const tag = backend.active_backend;
-    const backend_dispatch = @import("backend_dispatch.zig");
-    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    const handles = backend_dispatch.createPacked(tag) orelse {
-        loop.destroy();
-        return error.CreatePackedFailed;
-    };
-    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        return error.Oom;
-    };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return error.BudgetFailed;
-    };
-    instance.* = .{
-        .resources = resources,
-        .instance_id = id,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
-        .loop = loop,
-        .timers = timers.TimerRegistry.init(),
-    };
-    if (!instance_map.insert(instance)) {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        resources.deinit();
-        instance.deinitSynchronization();
-        std.heap.c_allocator.destroy(instance);
-        return error.InsertFailed;
-    }
-    defer destroy(id);
-
-    try std.testing.expect(!instance_map.getInstance(id).?.isPrimaryBackend());
-    try std.testing.expectEqual(tag, instance_map.getInstance(id).?.backendTag());
-    const res = evalScript(id, "40+2", "<packed-alt-proof>");
-    defer {
-        if (res.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (res.err_is_heap) {
-            if (res.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(res.err == null);
-    try std.testing.expectEqualStrings("42", res.result.?);
-
-    // Timers on packed-alt: schedule + one event-loop turn must fire the callback.
-    const timed = evalScript(
-        id,
-        "var __packedAltTimer__ = 0; setTimeout(function () { __packedAltTimer__ = 7; }, 0); __packedAltTimer__;",
-        "<packed-alt-timer-arm>",
-    );
-    defer {
-        if (timed.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (timed.err_is_heap) {
-            if (timed.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(timed.err == null);
-    try std.testing.expectEqualStrings("0", timed.result.?);
-    runEventLoopOnce(id);
-    const after = evalScript(id, "__packedAltTimer__", "<packed-alt-timer-check>");
-    defer {
-        if (after.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (after.err_is_heap) {
-            if (after.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(after.err == null);
-    try std.testing.expectEqualStrings("7", after.result.?);
 }

@@ -7,13 +7,14 @@ pub const EventHandler = @import("transport.zig").EventHandler;
 pub const DiscoveryTarget = @import("transport.zig").DiscoveryTarget;
 pub const protocol = @import("inspector_protocol.zig");
 
-pub const ProtocolBackend = enum { quickjs_ng, quickjs, jsc };
+pub const ProtocolBackend = enum { quickjs_ng, quickjs, jsc, escargot, hermes };
 
 pub fn protocolJson(comptime backend: ProtocolBackend, comptime heap_snapshot: bool) []const u8 {
     return switch (backend) {
         .quickjs_ng => if (heap_snapshot) @embedFile("protocol-quickjs-ng.json") else @embedFile("protocol-quickjs-ng-no-heap.json"),
         .quickjs => if (heap_snapshot) @embedFile("protocol-quickjs.json") else @embedFile("protocol-quickjs-no-heap.json"),
         .jsc => @embedFile("protocol-jsc.json"),
+        .escargot, .hermes => @embedFile("protocol-jsc.json"),
     };
 }
 

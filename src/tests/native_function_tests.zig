@@ -3,6 +3,7 @@
 const std = @import("std");
 const testing = std.testing;
 const helpers = @import("test_helpers.zig");
+const backend = @import("../backend.zig");
 const value = @import("../value/root.zig");
 const engine = @import("../engine.zig");
 
@@ -246,8 +247,8 @@ test "native: register with non-existent parent name" {
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
-            value.registerFunction(inst, "host", "fn", &retConstNum);
-            try helpers.expectEvalEquals(inst, "host.fn()", "42");
+            value.registerFunction(inst, "wx", "fn", &retConstNum);
+            try helpers.expectEvalEquals(inst, "wx.fn()", "42");
         }
     }.run);
 }
@@ -257,10 +258,10 @@ test "native: register with existing parent preserves existing props" {
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
-            try helpers.evalOk(inst, "globalThis.host = { existing: 1 };");
-            value.registerFunction(inst, "host", "fn", &retConstNum);
-            try helpers.expectEvalEquals(inst, "host.existing", "1");
-            try helpers.expectEvalEquals(inst, "host.fn()", "42");
+            try helpers.evalOk(inst, "globalThis.wx = { existing: 1 };");
+            value.registerFunction(inst, "wx", "fn", &retConstNum);
+            try helpers.expectEvalEquals(inst, "wx.existing", "1");
+            try helpers.expectEvalEquals(inst, "wx.fn()", "42");
         }
     }.run);
 }
@@ -428,7 +429,12 @@ test "native: NativeResult.number 3.14" {
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
             value.registerFunction(inst, null, "pi", &retPi);
-            try helpers.expectEvalEquals(inst, "pi()", "3.14");
+            // Hermes String(number) uses more digits; compare numerically.
+            if (comptime backend.isHermesBackend(backend.active_backend)) {
+                try helpers.expectEvalEquals(inst, "Number(pi()) === 3.14", "true");
+            } else {
+                try helpers.expectEvalEquals(inst, "pi()", "3.14");
+            }
         }
     }.run);
 }
@@ -526,7 +532,7 @@ test "native: NativeResult.json valid" {
 }
 
 test "native: NativeResult.json invalid → null" {
-    resetState();
+        resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
@@ -537,7 +543,7 @@ test "native: NativeResult.json invalid → null" {
 }
 
 test "native: NativeResult.err thrown and caught" {
-    resetState();
+        resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
@@ -565,7 +571,7 @@ test "native: large string result (100KB)" {
 }
 
 test "native: throw from native, subsequent evals still work" {
-    resetState();
+        resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
@@ -582,7 +588,7 @@ test "native: throw from native, subsequent evals still work" {
 }
 
 test "native: throw from nested call chain caught at outer's caller" {
-    resetState();
+        resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
@@ -635,14 +641,16 @@ test "native: recursion — JS calls native which evals JS that mutates global" 
 }
 
 test "native: string ownership — getPropertyString + freeString in loop (1000)" {
+    // Hermes: top-level `let` does not persist across evaluateJavaScript; use var.
+    // getPropertyString+freeString in the hot loop is fine (was misdiagnosed as JSI lifetime).
     resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
             value.registerFunction(inst, null, "rx", &readXProp);
             try helpers.evalOk(inst,
-                \\let acc = 0;
-                \\for (let i = 0; i < 1000; i++) { acc += rx({ x: "abcdef" }); }
+                \\var acc = 0;
+                \\for (var i = 0; i < 1000; i++) { acc += rx({ x: "abcdef" }); }
             );
             try helpers.expectEvalEquals(inst, "acc", "6000");
             try testing.expectEqual(@as(usize, 1000), g_call_count);

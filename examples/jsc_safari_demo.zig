@@ -9,7 +9,7 @@
 //! Under QJS or on non-Apple platforms this binary is not built (the build step is gated in build.zig). If it somehow runs under QJS it bails out with a helpful message.
 
 const std = @import("std");
-const zjs = @import("jsbay_tools");
+const zjs = @import("js_bay_tools");
 
 const engine = zjs.engine;
 const SignalStop = @import("signal_stop.zig").SignalStop;
@@ -27,7 +27,7 @@ fn logHandler(_: i32, level: types.LogLevel, msg: [*:0]const u8, _: ?*anyopaque)
 }
 
 pub fn main() !void {
-    if (backend.active_backend != .jsc) {
+    if (!backend.isJscApiBackend(backend.active_backend)) {
         std.debug.print(
             "jsc-safari-demo requires -Dbackend=jsc (current: {s}). " ++
                 "Use `zig build safari-demo -Dbackend=jsc` on macOS/iOS.\n",

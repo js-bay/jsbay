@@ -61,12 +61,12 @@ fn expectMissingInstanceError(err: ?[*:0]const u8) !void {
 
 test "c_api: lifecycle arms and tears down runtime interrupt control" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
     try testing.expect(runtime_control.requestInterrupt(id));
-    try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
-    try testing.expect(c_api.jsbay_engine_set_execution_time_limit(id, 25));
+    try testing.expect(c_api.js_bay_engine_clear_interrupt(id));
+    try testing.expect(c_api.js_bay_engine_set_execution_time_limit(id, 25));
 
-    c_api.jsbay_engine_destroy(id);
+    c_api.js_bay_engine_destroy(id);
     try testing.expect(!runtime_control.requestInterrupt(id));
 }
 
@@ -105,14 +105,14 @@ test "c_api: missing instances are errors across public evaluation entry points"
 
     var bytecode_value: u64 = 1;
     var bytecode_exception: u64 = 1;
-    try testing.expectEqual(@as(c_int, 4), c_api.jsbay_engine_run_bytecode(id, "bad".ptr, 3, &bytecode_value, &bytecode_exception));
+    try testing.expectEqual(@as(c_int, 4), c_api.js_bay_engine_run_bytecode(id, "bad".ptr, 3, &bytecode_value, &bytecode_exception));
     try testing.expect(bytecode_value == 0 and bytecode_exception == 0);
 }
 
 test "c_api: live undefined remains a successful empty result" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     var err: ?[*:0]const u8 = @ptrFromInt(1);
     defer if (err) |message| c_api.test_only.freeCString(message);
@@ -122,7 +122,7 @@ test "c_api: live undefined remains a successful empty result" {
 
 test "c_api: destroyed instance cannot report a cached bytecode hit" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(testing.io, "cache");
@@ -136,7 +136,7 @@ test "c_api: destroyed instance cannot report a cached bytecode hit" {
     const cold = c_api.test_only.evalCStringCached(id, &source, source.len, "<cached-missing>", cache_dir.ptr, cache_dir.len, "test".ptr, "test".len, &err, &hit);
     defer c_api.test_only.freeCString(cold);
     try testing.expect(err == null and !hit);
-    c_api.jsbay_engine_destroy(id);
+    c_api.js_bay_engine_destroy(id);
 
     err = @ptrFromInt(1);
     hit = true;
@@ -147,8 +147,8 @@ test "c_api: destroyed instance cannot report a cached bytecode hit" {
 
 test "c_api: destroyed instances are errors across public evaluation entry points" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    c_api.js_bay_engine_destroy(id);
     const sentinel: [*:0]const u8 = @ptrFromInt(1);
 
     var err: ?[*:0]const u8 = sentinel;
@@ -182,7 +182,7 @@ test "c_api: destroyed instances are errors across public evaluation entry point
 
     var bytecode_value: u64 = 1;
     var bytecode_exception: u64 = 1;
-    try testing.expectEqual(@as(c_int, 4), c_api.jsbay_engine_run_bytecode(id, "bad".ptr, 3, &bytecode_value, &bytecode_exception));
+    try testing.expectEqual(@as(c_int, 4), c_api.js_bay_engine_run_bytecode(id, "bad".ptr, 3, &bytecode_value, &bytecode_exception));
     try testing.expect(bytecode_value == 0 and bytecode_exception == 0);
 }
 
@@ -217,21 +217,21 @@ test "c_api: log handler receives engine info output" {
             got = true;
         }
     };
-    try testing.expect(c_api.jsbay_engine_create(id, LogProbe.cb, null));
+    try testing.expect(c_api.js_bay_engine_create(id, LogProbe.cb, null));
     try testing.expect(LogProbe.got);
-    c_api.jsbay_engine_destroy(id);
+    c_api.js_bay_engine_destroy(id);
 }
 
 test "c_api: interrupt request aborts an infinite evaluation from another thread" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     const Interrupt = struct {
         fn run(instance_id: i32) void {
             io.sleepMs(50);
-            _ = c_api.jsbay_engine_request_interrupt(instance_id);
+            _ = c_api.js_bay_engine_request_interrupt(instance_id);
         }
     };
     var thread = try std.Thread.spawn(.{}, Interrupt.run, .{id});
@@ -242,7 +242,7 @@ test "c_api: interrupt request aborts an infinite evaluation from another thread
 
     try testing.expect(result.err != null);
     try testing.expect(io.milliTimestamp() - started < 5_000);
-    try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
+    try testing.expect(c_api.js_bay_engine_clear_interrupt(id));
 }
 
 const cjs = @import("../script/cjs.zig");
@@ -257,8 +257,8 @@ const cjs_test_loader = @import("../types.zig").ModuleLoader{
 
 test "c_api: create installs standard scheduling globals without product module globals" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
     try helpers.expectEvalEquals(id, "typeof require", "undefined");
     try helpers.expectEvalEquals(id, "typeof setTimeout + ',' + typeof setInterval + ',' + typeof queueMicrotask", "function,function,function");
     try helpers.evalOk(id, "globalThis.microtaskRan = false; queueMicrotask(() => microtaskRan = true)");
@@ -275,26 +275,26 @@ test "c_api: create installs standard scheduling globals without product module 
 
 test "c_api: destroy releases explicitly installed CJS state before same-id recreate" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
     try testing.expect(cjs.install(id, &cjs_test_loader));
     try helpers.expectEvalEquals(id, "typeof require", "function");
-    c_api.jsbay_engine_destroy(id);
+    c_api.js_bay_engine_destroy(id);
 
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
     try helpers.expectEvalEquals(id, "typeof require", "undefined");
     try testing.expect(cjs.install(id, &cjs_test_loader));
     try helpers.expectEvalEquals(id, "typeof require", "function");
     if (backend.isQuickJsApiBackend(backend.active_backend)) {
-        try helpers.expectEvalEquals(id, "typeof __jsbay_cjsCache", "function");
+        try helpers.expectEvalEquals(id, "typeof __js_bay_cjsCache", "function");
     }
 }
 
 test "engine: destroy keeps interrupt state alive until an active evaluation unwinds" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
 
     var probe = InterruptDestroyProbe{ .instance_id = id };
     active_interrupt_destroy_probe = &probe;
@@ -351,7 +351,7 @@ test "engine: destroy keeps interrupt state alive until an active evaluation unw
 
 test "engine: host-callback deferred destroy releases explicit CJS before same-id recreate" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
 
     try testing.expect(cjs.install(id, &cjs_test_loader));
     const DestroyFromHost = struct {
@@ -375,16 +375,16 @@ test "engine: host-callback deferred destroy releases explicit CJS before same-i
     try testing.expect(status == 2 or status == 4);
 
     const deadline = io.monotonicMilliseconds() + 3_000;
-    while (!c_api.jsbay_engine_create(id, null, null)) {
+    while (!c_api.js_bay_engine_create(id, null, null)) {
         if (io.monotonicMilliseconds() >= deadline) return error.TimedOutWaitingForDeferredDestroy;
         std.Thread.yield() catch {};
     }
-    defer c_api.jsbay_engine_destroy(id);
+    defer c_api.js_bay_engine_destroy(id);
     try helpers.expectEvalEquals(id, "typeof require", "undefined");
     try testing.expect(cjs.install(id, &cjs_test_loader));
     try helpers.expectEvalEquals(id, "typeof require", "function");
     if (backend.isQuickJsApiBackend(backend.active_backend)) {
-        try helpers.evalOk(id, "globalThis.__cjs_cache_after_host_destroy__ = typeof __jsbay_cjsCache;");
+        try helpers.evalOk(id, "globalThis.__cjs_cache_after_host_destroy__ = typeof __js_bay_cjsCache;");
         try helpers.expectEvalEquals(id, "globalThis.__cjs_cache_after_host_destroy__", "function");
     }
 }
@@ -463,88 +463,88 @@ test "c_api: direct error inspection releases owned copies" {
 
 test "c_api: typed bytecode compile and run preserve value ownership" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
     var bytes: c_api.Bytes = .{ .data = @ptrFromInt(1), .len = 99 };
     var exception: u64 = 1;
-    const compile_status = c_api.jsbay_engine_compile_bytecode(
+    const compile_status = c_api.js_bay_engine_compile_bytecode(
         id,
         .{ .data = "({ answer: 42 })".ptr, .len = "({ answer: 42 })".len },
         .{ .data = "bytecode-test.js".ptr, .len = "bytecode-test.js".len },
         &bytes,
         &exception,
     );
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         try testing.expectEqual(@as(c_int, 7), compile_status);
         try testing.expect(bytes.data == null and bytes.len == 0 and exception == 0);
         return;
     }
     try testing.expectEqual(@as(c_int, 0), compile_status);
     try testing.expect(bytes.data != null and bytes.len > 0 and exception == 0);
-    defer c_api.jsbay_free_bytes(bytes);
+    defer c_api.js_bay_free_bytes(bytes);
 
     var value: u64 = 1;
-    const run_status = c_api.jsbay_engine_run_bytecode(id, bytes.data, bytes.len, &value, &exception);
+    const run_status = c_api.js_bay_engine_run_bytecode(id, bytes.data, bytes.len, &value, &exception);
     try testing.expectEqual(@as(c_int, 0), run_status);
     try testing.expect(value != 0 and exception == 0);
-    defer _ = c_api.jsbay_value_release(value);
+    defer _ = c_api.js_bay_value_release(value);
     var answer: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_get(value, .{ .data = "answer".ptr, .len = 6 }, &answer, &exception));
-    defer _ = c_api.jsbay_value_release(answer);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_get(value, .{ .data = "answer".ptr, .len = 6 }, &answer, &exception));
+    defer _ = c_api.js_bay_value_release(answer);
     var number: f64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_to_number(answer, &number));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_to_number(answer, &number));
     try testing.expectEqual(@as(f64, 42), number);
 }
 
 test "c_api: typed bytecode returns raw compile and run exceptions" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
     var bytes: c_api.Bytes = .{ .data = @ptrFromInt(1), .len = 99 };
     var syntax_exception: u64 = 1;
-    const syntax_status = c_api.jsbay_engine_compile_bytecode(
+    const syntax_status = c_api.js_bay_engine_compile_bytecode(
         id,
         .{ .data = "function {".ptr, .len = 10 },
         .{ .data = "bad.js".ptr, .len = 6 },
         &bytes,
         &syntax_exception,
     );
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         try testing.expectEqual(@as(c_int, 7), syntax_status);
         try testing.expect(bytes.data == null and bytes.len == 0 and syntax_exception == 0);
         return;
     }
     try testing.expectEqual(@as(c_int, 1), syntax_status);
     try testing.expect(bytes.data == null and bytes.len == 0 and syntax_exception != 0);
-    defer _ = c_api.jsbay_value_release(syntax_exception);
+    defer _ = c_api.js_bay_value_release(syntax_exception);
 
     bytes = .{ .data = null, .len = 0 };
     var run_exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_compile_bytecode(
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_compile_bytecode(
         id,
         .{ .data = "throw 42".ptr, .len = 8 },
         .{ .data = "throw.js".ptr, .len = 8 },
         &bytes,
         &run_exception,
     ));
-    defer c_api.jsbay_free_bytes(bytes);
+    defer c_api.js_bay_free_bytes(bytes);
     var value: u64 = 1;
-    try testing.expectEqual(@as(c_int, 1), c_api.jsbay_engine_run_bytecode(id, bytes.data, bytes.len, &value, &run_exception));
+    try testing.expectEqual(@as(c_int, 1), c_api.js_bay_engine_run_bytecode(id, bytes.data, bytes.len, &value, &run_exception));
     try testing.expect(value == 0 and run_exception != 0);
-    defer _ = c_api.jsbay_value_release(run_exception);
+    defer _ = c_api.js_bay_value_release(run_exception);
     var number: f64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_to_number(run_exception, &number));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_to_number(run_exception, &number));
     try testing.expectEqual(@as(f64, 42), number);
 }
 
 test "c_api: typed bytecode clears outputs for invalid bytecode" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
     var value: u64 = 1;
     var exception: u64 = 1;
-    const status = c_api.jsbay_engine_run_bytecode(id, null, 0, &value, &exception);
-    if (comptime backend.active_backend == .jsc) {
+    const status = c_api.js_bay_engine_run_bytecode(id, null, 0, &value, &exception);
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         try testing.expectEqual(@as(c_int, 7), status);
     } else {
         try testing.expect(status != 0);
@@ -743,8 +743,8 @@ test "c_api: direct promise new + resolve reaches JS then" {
 
 test "c_api: eval_bytes returns the value of a pointer+length script" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     // The length stops before the tail. A C-string read would execute the throw.
     const src = "40+2;throw new Error('tail')";
@@ -760,8 +760,8 @@ test "c_api: eval_bytes returns the value of a pointer+length script" {
 
 test "c_api: eval_cached clears a reused error pointer on fallback and cache hits" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     var path_buf: [96]u8 = undefined;
     const cache_dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/c-api-cache-{d}", .{id});
@@ -880,8 +880,8 @@ test "c_api: eval_cached clears a reused error pointer on fallback and cache hit
 
 test "c_api: eval_file returns the value of a script on disk" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -903,55 +903,55 @@ test "c_api: eval_file returns the value of a script on disk" {
 
 test "c_api: inspector start and stop preserve the build-mode contract" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     var port: u16 = 99;
-    if (comptime !build_options.inspector or !build_options.inspector_transport) {
+    if (comptime !build_options.inspector) {
         const original_port = port;
-        try testing.expect(!c_api.jsbay_engine_inspector_start(id, 0, &port));
+        try testing.expect(!c_api.js_bay_engine_inspector_start(id, 0, &port));
         try testing.expectEqual(original_port, port);
-        c_api.jsbay_engine_inspector_stop(id);
-        c_api.jsbay_engine_inspector_stop(id);
+        c_api.js_bay_engine_inspector_stop(id);
+        c_api.js_bay_engine_inspector_stop(id);
         return;
     }
     port = 0;
-    try testing.expect(c_api.jsbay_engine_inspector_start(id, 0, &port));
+    try testing.expect(c_api.js_bay_engine_inspector_start(id, 0, &port));
     try testing.expect(port != 0);
-    try testing.expect(!c_api.jsbay_engine_inspector_start(id, 0, &port));
-    c_api.jsbay_engine_inspector_stop(id);
-    c_api.jsbay_engine_inspector_stop(id);
+    try testing.expect(!c_api.js_bay_engine_inspector_start(id, 0, &port));
+    c_api.js_bay_engine_inspector_stop(id);
+    c_api.js_bay_engine_inspector_stop(id);
 
     port = 0;
-    try testing.expect(c_api.jsbay_engine_inspector_start(id, 0, &port));
+    try testing.expect(c_api.js_bay_engine_inspector_start(id, 0, &port));
     try testing.expect(port != 0);
-    c_api.jsbay_engine_inspector_stop(id);
+    c_api.js_bay_engine_inspector_stop(id);
 
-    try testing.expect(!c_api.jsbay_engine_inspector_start(id + 100000, 0, &port));
+    try testing.expect(!c_api.js_bay_engine_inspector_start(id + 100000, 0, &port));
 }
 
 test "typed constructors clear outputs and leave the engine usable after allocation failure" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
     var value: u64 = 99;
     var exception: u64 = 98;
 
     api_backend.failNextConstructorForTesting();
-    try testing.expectEqual(@as(c_int, 6), c_api.jsbay_value_new_string(id, .{ .data = "constructor", .len = 11 }, &value));
+    try testing.expectEqual(@as(c_int, 6), c_api.js_bay_value_new_string(id, .{ .data = "constructor", .len = 11 }, &value));
     try testing.expectEqual(@as(u64, 0), value);
 
     value = 99;
     api_backend.failNextConstructorForTesting();
-    try testing.expectEqual(@as(c_int, 6), c_api.jsbay_value_new_object(id, &value));
+    try testing.expectEqual(@as(c_int, 6), c_api.js_bay_value_new_object(id, &value));
     try testing.expectEqual(@as(u64, 0), value);
 
     value = 99;
     api_backend.failNextConstructorForTesting();
-    try testing.expectEqual(@as(c_int, 6), c_api.jsbay_value_new_array(id, &value));
+    try testing.expectEqual(@as(c_int, 6), c_api.js_bay_value_new_array(id, &value));
     try testing.expectEqual(@as(u64, 0), value);
 
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_evaluate(
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_evaluate(
         id,
         .{ .data = "6 * 7", .len = 5 },
         .{ .data = "constructor-recovery.js", .len = 23 },
@@ -959,7 +959,7 @@ test "typed constructors clear outputs and leave the engine usable after allocat
         &value,
         &exception,
     ));
-    defer _ = c_api.jsbay_value_release(value);
+    defer _ = c_api.js_bay_value_release(value);
     try testing.expect(value != 0);
     try testing.expectEqual(@as(u64, 0), exception);
 }
@@ -967,12 +967,13 @@ test "typed constructors clear outputs and leave the engine usable after allocat
 // ---------------------------------------------------------------------------
 // Exception identity across the C ABI.
 //
+// Reference cases: ScriptX `ExceptionTest.Cross`.
 // ---------------------------------------------------------------------------
 
 fn expectEvalTrue(id: i32, source: []const u8) !void {
     var value: u64 = 0;
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_evaluate(
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_evaluate(
         id,
         .{ .data = source.ptr, .len = source.len },
         .{ .data = "identity-check.js", .len = 17 },
@@ -980,21 +981,21 @@ fn expectEvalTrue(id: i32, source: []const u8) !void {
         &value,
         &exception,
     ));
-    defer _ = c_api.jsbay_value_release(value);
+    defer _ = c_api.js_bay_value_release(value);
     var flag = false;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_to_bool(value, &flag));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_to_bool(value, &flag));
     try testing.expect(flag);
 }
 
 test "c_api: thrown object returned through out_exception is the same JS object" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     const source = "globalThis.__thrown = { marker: 'original' }; throw globalThis.__thrown;";
     var value: u64 = 99;
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 1), c_api.jsbay_engine_evaluate(
+    try testing.expectEqual(@as(c_int, 1), c_api.js_bay_engine_evaluate(
         id,
         .{ .data = source.ptr, .len = source.len },
         .{ .data = "identity.js", .len = 11 },
@@ -1004,28 +1005,28 @@ test "c_api: thrown object returned through out_exception is the same JS object"
     ));
     try testing.expectEqual(@as(u64, 0), value);
     try testing.expect(exception != 0);
-    defer _ = c_api.jsbay_value_release(exception);
+    defer _ = c_api.js_bay_value_release(exception);
 
     // Publishing the handle back into JS lets the engine itself decide ===.
     var global: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_global(id, &global));
-    defer _ = c_api.jsbay_value_release(global);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_global(id, &global));
+    defer _ = c_api.js_bay_value_release(global);
     var set_exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_set(global, .{ .data = "__returned", .len = 10 }, exception, &set_exception));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_set(global, .{ .data = "__returned", .len = 10 }, exception, &set_exception));
     try expectEvalTrue(id, "__returned === __thrown");
 
     // A host-side write through the handle lands on the original object.
     var flag: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_new_bool(id, true, &flag));
-    defer _ = c_api.jsbay_value_release(flag);
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_set(exception, .{ .data = "hostSeen", .len = 8 }, flag, &set_exception));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_new_bool(id, true, &flag));
+    defer _ = c_api.js_bay_value_release(flag);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_set(exception, .{ .data = "hostSeen", .len = 8 }, flag, &set_exception));
     try expectEvalTrue(id, "__thrown.hostSeen === true && __thrown.marker === 'original'");
 }
 
 test "c_api: thrown Error instance keeps its identity and own properties across out_exception" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     const source =
         \\class TaggedError extends Error {}
@@ -1035,7 +1036,7 @@ test "c_api: thrown Error instance keeps its identity and own properties across 
     ;
     var value: u64 = 0;
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 1), c_api.jsbay_engine_evaluate(
+    try testing.expectEqual(@as(c_int, 1), c_api.js_bay_engine_evaluate(
         id,
         .{ .data = source.ptr, .len = source.len },
         .{ .data = "identity-error.js", .len = 17 },
@@ -1044,13 +1045,13 @@ test "c_api: thrown Error instance keeps its identity and own properties across 
         &exception,
     ));
     try testing.expect(exception != 0);
-    defer _ = c_api.jsbay_value_release(exception);
+    defer _ = c_api.js_bay_value_release(exception);
 
     var global: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_global(id, &global));
-    defer _ = c_api.jsbay_value_release(global);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_global(id, &global));
+    defer _ = c_api.js_bay_value_release(global);
     var set_exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_set(global, .{ .data = "__returned", .len = 10 }, exception, &set_exception));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_set(global, .{ .data = "__returned", .len = 10 }, exception, &set_exception));
     try expectEvalTrue(id, "__returned === __thrown && __returned instanceof TaggedError && __returned.code === 'E_TAGGED'");
 }
 
@@ -1061,7 +1062,7 @@ test "c_api: thrown Error instance keeps its identity and own properties across 
 fn evalHandle(id: i32, source: []const u8) !u64 {
     var value: u64 = 0;
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_evaluate(
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_evaluate(
         id,
         .{ .data = source.ptr, .len = source.len },
         .{ .data = "handle.js", .len = 9 },
@@ -1076,21 +1077,21 @@ fn evalHandle(id: i32, source: []const u8) !u64 {
 
 fn publish(global: u64, name: []const u8, value: u64) !void {
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_set(global, .{ .data = name.ptr, .len = name.len }, value, &exception));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_set(global, .{ .data = name.ptr, .len = name.len }, value, &exception));
     try testing.expectEqual(@as(u64, 0), exception);
 }
 
 fn expectKind(handle: u64, expected: c_int) !void {
     var kind: c_int = -1;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_type(handle, &kind));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_type(handle, &kind));
     try testing.expectEqual(expected, kind);
 }
 
 // Numeric values are the C ABI: the original eight never move and Symbol and BigInt are appended after them.
 test "c_api: value kinds keep their ABI numbers and Symbol/BigInt are not Object" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     const Case = struct { source: []const u8, kind: c_int };
     const cases = [_]Case{
@@ -1115,7 +1116,7 @@ test "c_api: value kinds keep their ABI numbers and Symbol/BigInt are not Object
     };
     for (cases) |case| {
         const handle = try evalHandle(id, case.source);
-        defer _ = c_api.jsbay_value_release(handle);
+        defer _ = c_api.js_bay_value_release(handle);
         expectKind(handle, case.kind) catch |err| {
             std.debug.print("kind mismatch for `{s}`\n", .{case.source});
             return err;
@@ -1126,19 +1127,19 @@ test "c_api: value kinds keep their ABI numbers and Symbol/BigInt are not Object
 // A Symbol or BigInt handle reports its own kind and stays a usable, releasable reference to the original primitive: it survives being stored, passed through a call and handed back, and the engine is clean afterwards.
 test "c_api: Symbol and BigInt handles round-trip to the same primitive" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     var global: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_global(id, &global));
-    defer _ = c_api.jsbay_value_release(global);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_global(id, &global));
+    defer _ = c_api.js_bay_value_release(global);
 
     const sym = try evalHandle(id, "globalThis.__sym = Symbol.for('round-trip'); __sym");
-    defer _ = c_api.jsbay_value_release(sym);
+    defer _ = c_api.js_bay_value_release(sym);
     const unique_sym = try evalHandle(id, "globalThis.__usym = Symbol('local'); __usym");
-    defer _ = c_api.jsbay_value_release(unique_sym);
+    defer _ = c_api.js_bay_value_release(unique_sym);
     const big = try evalHandle(id, "globalThis.__big = -123456789012345678901234567890n; __big");
-    defer _ = c_api.jsbay_value_release(big);
+    defer _ = c_api.js_bay_value_release(big);
 
     const symbol_kind: c_int = 8;
     const bigint_kind: c_int = 9;
@@ -1155,18 +1156,18 @@ test "c_api: Symbol and BigInt handles round-trip to the same primitive" {
 
     // Through an argument and a return value the same primitive comes back.
     const identity = try evalHandle(id, "(function (x) { return x; })");
-    defer _ = c_api.jsbay_value_release(identity);
+    defer _ = c_api.js_bay_value_release(identity);
     var undef: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_undefined(id, &undef));
-    defer _ = c_api.jsbay_value_release(undef);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_undefined(id, &undef));
+    defer _ = c_api.js_bay_value_release(undef);
     const args = [_]u64{ sym, big };
     for (args, 0..) |arg, i| {
         const one = [_]u64{arg};
         var result: u64 = 0;
         var exception: u64 = 0;
-        try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_call(identity, undef, &one, 1, &result, &exception));
+        try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_call(identity, undef, &one, 1, &result, &exception));
         try testing.expectEqual(@as(u64, 0), exception);
-        defer _ = c_api.jsbay_value_release(result);
+        defer _ = c_api.js_bay_value_release(result);
         try publish(global, "__called", result);
         try expectEvalTrue(id, if (i == 0) "__called === __sym" else "__called === __big");
     }
@@ -1177,55 +1178,55 @@ test "c_api: Symbol and BigInt handles round-trip to the same primitive" {
 // A host call that passes undefined as the receiver follows the callee's language rules: a sloppy function sees globalThis and a strict one sees undefined.
 test "c_api: call with an undefined receiver follows the callee's strictness" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     var undef: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_undefined(id, &undef));
-    defer _ = c_api.jsbay_value_release(undef);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_undefined(id, &undef));
+    defer _ = c_api.js_bay_value_release(undef);
     var global: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_global(id, &global));
-    defer _ = c_api.jsbay_value_release(global);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_global(id, &global));
+    defer _ = c_api.js_bay_value_release(global);
 
     const sloppy = try evalHandle(id, "(function () { return this; })");
-    defer _ = c_api.jsbay_value_release(sloppy);
+    defer _ = c_api.js_bay_value_release(sloppy);
     const strict = try evalHandle(id, "(function () { 'use strict'; return this; })");
-    defer _ = c_api.jsbay_value_release(strict);
+    defer _ = c_api.js_bay_value_release(strict);
 
     var sloppy_this: u64 = 0;
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_call(sloppy, undef, null, 0, &sloppy_this, &exception));
-    defer _ = c_api.jsbay_value_release(sloppy_this);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_call(sloppy, undef, null, 0, &sloppy_this, &exception));
+    defer _ = c_api.js_bay_value_release(sloppy_this);
     try publish(global, "__sloppyThis", sloppy_this);
     try expectEvalTrue(id, "__sloppyThis === globalThis");
 
     var strict_this: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_call(strict, undef, null, 0, &strict_this, &exception));
-    defer _ = c_api.jsbay_value_release(strict_this);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_call(strict, undef, null, 0, &strict_this, &exception));
+    defer _ = c_api.js_bay_value_release(strict_this);
     var kind: c_int = -1;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_type(strict_this, &kind));
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_type(strict_this, &kind));
     try testing.expectEqual(@as(c_int, 0), kind);
 }
 
 test "c_api: to_utf8 of an object whose toString throws reports the thrown value" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     const hostile = try evalHandle(id, "globalThis.__thrower = { marker: 'boom' }; ({ toString() { throw __thrower; } })");
-    defer _ = c_api.jsbay_value_release(hostile);
+    defer _ = c_api.js_bay_value_release(hostile);
 
     var bytes: c_api.Bytes = .{ .data = @ptrFromInt(1), .len = 7 };
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 1), c_api.jsbay_value_to_utf8(hostile, &bytes, &exception));
+    try testing.expectEqual(@as(c_int, 1), c_api.js_bay_value_to_utf8(hostile, &bytes, &exception));
     try testing.expect(bytes.data == null);
     try testing.expectEqual(@as(usize, 0), bytes.len);
     try testing.expect(exception != 0);
-    defer _ = c_api.jsbay_value_release(exception);
+    defer _ = c_api.js_bay_value_release(exception);
 
     var global: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_global(id, &global));
-    defer _ = c_api.jsbay_value_release(global);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_global(id, &global));
+    defer _ = c_api.js_bay_value_release(global);
     try publish(global, "__reported", exception);
     try expectEvalTrue(id, "__reported === __thrower");
     try expectEvalTrue(id, "1 + 1 === 2");
@@ -1234,8 +1235,8 @@ test "c_api: to_utf8 of an object whose toString throws reports the thrown value
 // docs/api-contract.md: JSON text conversion must not depend on the script-visible globalThis.JSON.
 test "c_api: to_json and new_json ignore a script that replaces JSON" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     const value = try evalHandle(id,
         \\JSON.stringify = function () { return 'HACKED'; };
@@ -1243,36 +1244,36 @@ test "c_api: to_json and new_json ignore a script that replaces JSON" {
         \\globalThis.JSON = { stringify() { return 'HACKED2'; }, parse() { return 'HACKED2'; } };
         \\({ a: [1, 2], s: 'x' })
     );
-    defer _ = c_api.jsbay_value_release(value);
+    defer _ = c_api.js_bay_value_release(value);
 
     var bytes: c_api.Bytes = .{ .data = null, .len = 0 };
     var exception: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_to_json(value, &bytes, &exception));
-    defer c_api.jsbay_free_bytes(bytes);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_to_json(value, &bytes, &exception));
+    defer c_api.js_bay_free_bytes(bytes);
     try testing.expectEqualStrings("{\"a\":[1,2],\"s\":\"x\"}", bytes.data.?[0..bytes.len]);
 
     const text = "{\"q\":[true,null,3]}";
     var parsed: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_new_json(id, .{ .data = text.ptr, .len = text.len }, &parsed, &exception));
-    defer _ = c_api.jsbay_value_release(parsed);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_value_new_json(id, .{ .data = text.ptr, .len = text.len }, &parsed, &exception));
+    defer _ = c_api.js_bay_value_release(parsed);
     var global: u64 = 0;
-    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_global(id, &global));
-    defer _ = c_api.jsbay_value_release(global);
+    try testing.expectEqual(@as(c_int, 0), c_api.js_bay_engine_global(id, &global));
+    defer _ = c_api.js_bay_value_release(global);
     try publish(global, "__parsed", parsed);
     try expectEvalTrue(id, "Array.isArray(__parsed.q) && __parsed.q.length === 3 && __parsed.q[0] === true && __parsed.q[1] === null && __parsed.q[2] === 3");
 }
 
 test "c_api: to_json of a symbol is an invalid argument with no output" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     const sym = try evalHandle(id, "Symbol('no-json')");
-    defer _ = c_api.jsbay_value_release(sym);
+    defer _ = c_api.js_bay_value_release(sym);
     var bytes: c_api.Bytes = .{ .data = @ptrFromInt(1), .len = 7 };
     var exception: u64 = 99;
-    // JSBAY_INVALID_ARGUMENT
-    const status = c_api.jsbay_value_to_json(sym, &bytes, &exception);
+    // JS_BAY_INVALID_ARGUMENT
+    const status = c_api.js_bay_value_to_json(sym, &bytes, &exception);
     try testing.expect(status != 0);
     try testing.expect(bytes.data == null);
     try testing.expectEqual(@as(usize, 0), bytes.len);
@@ -1280,15 +1281,15 @@ test "c_api: to_json of a symbol is an invalid argument with no output" {
 
 test "c_api: get_memory_usage and run_gc are owner-thread observability hooks" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
-    try testing.expect(!c_api.jsbay_engine_get_memory_usage(id, null));
-    try testing.expect(!c_api.jsbay_engine_run_gc(99_992));
+    try testing.expect(!c_api.js_bay_engine_get_memory_usage(id, null));
+    try testing.expect(!c_api.js_bay_engine_run_gc(99_992));
 
     var usage = c_api.MemoryUsageC{ .struct_size = @sizeOf(c_api.MemoryUsageC) };
-    try testing.expect(c_api.jsbay_engine_get_memory_usage(id, &usage));
-    try testing.expect(c_api.jsbay_engine_run_gc(id));
+    try testing.expect(c_api.js_bay_engine_get_memory_usage(id, &usage));
+    try testing.expect(c_api.js_bay_engine_run_gc(id));
 
     _ = try helpers.evalOk(id,
         \\const xs = [];
@@ -1296,10 +1297,11 @@ test "c_api: get_memory_usage and run_gc are owner-thread observability hooks" {
         \\xs.length;
     );
     usage = .{ .struct_size = @sizeOf(c_api.MemoryUsageC) };
-    try testing.expect(c_api.jsbay_engine_get_memory_usage(id, &usage));
+    try testing.expect(c_api.js_bay_engine_get_memory_usage(id, &usage));
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => try testing.expect(usage.obj_count > 0 or usage.malloc_size > 0),
         .jsc => {},
+        .escargot, .hermes => {},
     }
 }
 
@@ -1310,20 +1312,20 @@ const EventCapture = struct {
     fn handler(event: *const types.EngineEvent, user_data: ?*anyopaque) callconv(.c) void {
         const self: *EventCapture = @ptrCast(@alignCast(user_data.?));
         _ = self.count.fetchAdd(1, .seq_cst);
-        self.last_kind.store(@backingInt(event.kind), .seq_cst);
+        self.last_kind.store(@intFromEnum(event.kind), .seq_cst);
     }
 };
 
 test "c_api: set_event_handler receives interrupt telemetry" {
     const id = helpers.nextInstanceId();
-    try testing.expect(c_api.jsbay_engine_create(id, null, null));
-    defer c_api.jsbay_engine_destroy(id);
+    try testing.expect(c_api.js_bay_engine_create(id, null, null));
+    defer c_api.js_bay_engine_destroy(id);
 
     var capture: EventCapture = .{};
-    try testing.expect(c_api.jsbay_engine_set_event_handler(id, EventCapture.handler, &capture));
-    try testing.expect(c_api.jsbay_engine_request_interrupt(id));
+    try testing.expect(c_api.js_bay_engine_set_event_handler(id, EventCapture.handler, &capture));
+    try testing.expect(c_api.js_bay_engine_request_interrupt(id));
     try testing.expect(capture.count.load(.seq_cst) >= 1);
-    try testing.expectEqual(@as(i32, @backingInt(types.EngineEventKind.execution_interrupted)), capture.last_kind.load(.seq_cst));
-    try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
-    try testing.expect(c_api.jsbay_engine_set_event_handler(id, null, null));
+    try testing.expectEqual(@as(i32, @intFromEnum(types.EngineEventKind.execution_interrupted)), capture.last_kind.load(.seq_cst));
+    try testing.expect(c_api.js_bay_engine_clear_interrupt(id));
+    try testing.expect(c_api.js_bay_engine_set_event_handler(id, null, null));
 }

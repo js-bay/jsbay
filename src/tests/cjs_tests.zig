@@ -264,13 +264,22 @@ test "cjs: compile+run round-trips a module body and returns module.exports" {
     ;
     const compiled = cjs.compileCommonJS(id, src, "entry.js");
     defer bytecode.freeCompileResult(compiled);
-    if (backend.active_backend == .jsc) {
-        try testing.expect(compiled.bytes == null);
-        try testing.expectEqualStrings("bytecode cache is not supported on JSC backend (use QuickJS)", compiled.err.?);
-        const run = cjs.runCommonJS(id, &.{0}, "entry.js");
+    if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend)) {
+        try testing.expect(compiled.bytes == null or backend.isHermesBackend(backend.active_backend));
+        if (backend.isJscApiBackend(backend.active_backend)) {
+            try testing.expectEqualStrings("bytecode cache is not supported on JSC backend (use QuickJS)", compiled.err.?);
+        } else if (backend.isEscargotBackend(backend.active_backend)) {
+            try testing.expectEqualStrings("bytecode cache is not supported on Escargot backend", compiled.err.?);
+        }
+        // Hermes may produce .hbc via hermesc; runCommonJS (QJS-shaped replay) still unsupported.
+        const run = cjs.runCommonJS(id, compiled.bytes orelse &.{0}, "entry.js");
         defer freeCjsCacheResult(run);
         try testing.expect(run.result == null);
-        try testing.expectEqualStrings("runCommonJS not supported on JSC", run.err.?);
+        if (backend.isJscApiBackend(backend.active_backend)) {
+            try testing.expectEqualStrings("runCommonJS not supported on JSC", run.err.?);
+        } else {
+            try testing.expectEqualStrings("runCommonJS bytecode path not supported on Escargot/Hermes", run.err.?);
+        }
         return;
     }
     try testing.expect(compiled.bytes != null);
@@ -363,7 +372,7 @@ test "cjs: evalCachedCjs reassigned module.exports round-trips" {
 }
 
 test "cjs: JSC ignores an old bytecode cache and evaluates large source" {
-    if (backend.active_backend != .jsc) return;
+    if (!backend.isJscApiBackend(backend.active_backend)) return;
     var ctx = CjsLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
     const loader = types.ModuleLoader{ .vtable = &cjs_vtable, .user_data = &ctx };
@@ -412,10 +421,10 @@ fn freeCjsCacheResult(res: cjs.CjsCacheResult) void {
 }
 
 // --------------------------------------------------------------------------
-// Global `__jsbay_cjsCache` (bytecode-cached CommonJS with caller require)
+// Global `__js_bay_cjsCache` (bytecode-cached CommonJS with caller require)
 // --------------------------------------------------------------------------
 
-test "cjs: global __jsbay_cjsCache returns live exports with caller require" {
+test "cjs: global __js_bay_cjsCache returns live exports with caller require" {
     var ctx = CjsLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
 
@@ -427,9 +436,9 @@ test "cjs: global __jsbay_cjsCache returns live exports with caller require" {
     try testing.expect(cjs.install(id, &loader));
     defer cjs.uninstall(id);
 
-    if (backend.active_backend == .jsc) {
-        // JSC has no stable bytecode serialization API, so this best-effort helper is deliberately absent. The runtime's documented fallback is an ordinary Function wrapper with the caller's require.
-        try helpers.expectEvalEquals(id, "typeof __jsbay_cjsCache", "undefined");
+    if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend)) {
+        // No __js_bay_cjsCache on JSC/Escargot/Hermes (QJS bytecode helper). Fallback: Function wrapper + caller require.
+        try helpers.expectEvalEquals(id, "typeof __js_bay_cjsCache", "undefined");
         try helpers.evalOk(id,
             \\const localRequire = (name) => name === "@jsbay/protocol" ? { answer: 42 } : null;
             \\const module = { exports: {} };
@@ -448,7 +457,7 @@ test "cjs: global __jsbay_cjsCache returns live exports with caller require" {
         \\module.exports = { kind: "app", answer: protocol.answer };
     ;
 
-    // Embed the bundle body into a driver script that installs the caller's restricted require and calls the global __jsbay_cjsCache.
+    // Embed the bundle body into a driver script that installs the caller's restricted require and calls the global __js_bay_cjsCache.
     var driver = std.ArrayList(u8).empty;
     defer driver.deinit(testing.allocator);
     try driver.appendSlice(testing.allocator,
@@ -463,7 +472,7 @@ test "cjs: global __jsbay_cjsCache returns live exports with caller require" {
     try appendJsStringLiteral(&driver, bundle_src);
     try driver.appendSlice(testing.allocator,
         \\";
-        \\globalThis.__bundle__ = __jsbay_cjsCache(src, localRequire, "system-app.js");
+        \\globalThis.__bundle__ = __js_bay_cjsCache(src, localRequire, "system-app.js");
         \\
     );
 
@@ -476,7 +485,7 @@ test "cjs: global __jsbay_cjsCache returns live exports with caller require" {
     try testing.expectEqual(@as(i64, 42), ans);
 }
 
-test "cjs: __jsbay_cjsCache reuses process bytecode cache per source and keeps object identity" {
+test "cjs: __js_bay_cjsCache reuses process bytecode cache per source and keeps object identity" {
     var ctx = CjsLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
 
@@ -488,13 +497,13 @@ test "cjs: __jsbay_cjsCache reuses process bytecode cache per source and keeps o
     try testing.expect(cjs.install(id, &loader));
     defer cjs.uninstall(id);
 
-    if (backend.active_backend == .jsc) {
-        try helpers.expectEvalEquals(id, "typeof __jsbay_cjsCache", "undefined");
-        const r = cjs.evalCachedCjs(id, "module.exports = { tag: 'jsc' };", "s.js", "", kCjsVersion);
+    if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend)) {
+        try helpers.expectEvalEquals(id, "typeof __js_bay_cjsCache", "undefined");
+        const r = cjs.evalCachedCjs(id, "module.exports = { tag: 'spike' };", "s.js", "", kCjsVersion);
         defer freeCjsCacheResult(r);
         try testing.expect(r.err == null);
         try testing.expect(!r.cache_hit);
-        try testing.expect(std.mem.indexOf(u8, r.result.?, "jsc") != null);
+        try testing.expect(std.mem.indexOf(u8, r.result.?, "spike") != null);
         return;
     }
 
@@ -513,8 +522,8 @@ test "cjs: __jsbay_cjsCache reuses process bytecode cache per source and keeps o
     try helpers.expectEvalEquals(id, "String(globalThis.__a1__ === globalThis.__b__)", "false");
 }
 
-test "cjs: __jsbay_cjsCache isolates identical bodies by filename on disk and in memory" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+test "cjs: __js_bay_cjsCache isolates identical bodies by filename on disk and in memory" {
+    if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
 
     var ctx = CjsLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
@@ -543,7 +552,7 @@ test "cjs: __jsbay_cjsCache isolates identical bodies by filename on disk and in
     try testing.expectEqual(@as(usize, if (persistent_cache) 2 else 0), cjsCacheFileCount(cdir));
 }
 
-/// Run `__jsbay_cjsCache(<src>, noopRequire, <filename>)` and stash the returned exports on `globalThis.<slot>`.
+/// Run `__js_bay_cjsCache(<src>, noopRequire, <filename>)` and stash the returned exports on `globalThis.<slot>`.
 fn evalCjsCacheCall(id: i32, src: []const u8, filename: []const u8, slot: []const u8) !void {
     var driver = std.ArrayList(u8).empty;
     defer driver.deinit(testing.allocator);
@@ -555,10 +564,10 @@ fn evalCjsCacheCall(id: i32, src: []const u8, filename: []const u8, slot: []cons
     try appendJsStringLiteral(&driver, src);
     try driver.appendSlice(testing.allocator, "\";\n");
 
-    // __jsbay_cjsCache(src, noopRequire, "<filename>")
+    // __js_bay_cjsCache(src, noopRequire, "<filename>")
     try driver.appendSlice(testing.allocator, "globalThis.");
     try driver.appendSlice(testing.allocator, slot);
-    try driver.appendSlice(testing.allocator, " = __jsbay_cjsCache(src, noopRequire, \"");
+    try driver.appendSlice(testing.allocator, " = __js_bay_cjsCache(src, noopRequire, \"");
     try driver.appendSlice(testing.allocator, filename);
     try driver.appendSlice(testing.allocator, "\");\n");
 
@@ -577,7 +586,7 @@ fn evalCjsCacheThrow(id: i32, src: []const u8, filename: []const u8, cache_dir: 
     defer driver.deinit(testing.allocator);
     try driver.appendSlice(testing.allocator, "var noopRequire = () => {}; var src = \"");
     try appendJsStringLiteral(&driver, src);
-    try driver.appendSlice(testing.allocator, "\"; __jsbay_cjsCache(src, noopRequire, \"");
+    try driver.appendSlice(testing.allocator, "\"; __js_bay_cjsCache(src, noopRequire, \"");
     try appendJsStringLiteral(&driver, filename);
     try driver.appendSlice(testing.allocator, "\", \"");
     try appendJsStringLiteral(&driver, cache_dir);

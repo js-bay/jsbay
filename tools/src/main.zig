@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const repository = @import("repository.zig");
 const ios_stdlib = @import("ios_stdlib.zig");
 const apple_archive = @import("apple_archive.zig");
@@ -40,14 +39,13 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() !void {
-    std.debug.print("usage: jsbay-tool <apple-archive|check-c-abi|write-android-exports-map|check-r8|prepare-ios-stdlib> ...\n", .{});
+    std.debug.print("usage: jsbay-tool <apple-archive|check-c-abi|check-r8|prepare-ios-stdlib> ...\n", .{});
     return error.Usage;
 }
 
 fn dispatch(command: []const u8, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, command, "check-r8")) return checkR8(args);
     if (std.mem.eql(u8, command, "check-c-abi")) return checkCAbi(args);
-    if (std.mem.eql(u8, command, "write-android-exports-map")) return writeAndroidExportsMap(args);
     _ = usage() catch {};
     return error.Usage;
 }
@@ -150,26 +148,24 @@ fn checkCAbi(args: []const []const u8) !u8 {
     }
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
-    // Prefer the system compilers. Android NDK setup often puts a target-clang
-    // named `cc` ahead on PATH, which breaks these host syntax-only probes.
-    const cc: []const u8 = if (builtin.os.tag == .windows) "cc" else "/usr/bin/cc";
-    const cxx: []const u8 = if (builtin.os.tag == .windows) "c++" else "/usr/bin/c++";
     const consumers = [_][]const u8{ "tests/c_consumer.c", "tests/bytecode_consumer.c", "tests/native_sync_consumer.c", "tests/host_wake_consumer.c" };
+    const cc_cmd = try resolvePathCmd(std.heap.page_allocator, "cc");
+    defer std.heap.page_allocator.free(cc_cmd);
+    const cxx_cmd = try resolvePathCmd(std.heap.page_allocator, "c++");
+    defer std.heap.page_allocator.free(cxx_cmd);
     for (consumers) |consumer| {
-        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
-        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
+        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc_cmd, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
+        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx_cmd, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
     }
     const lib = library orelse return 0;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var expected = try headerSymbols(allocator);
+    var expected = try headerSymbols(std.heap.page_allocator);
     defer expected.deinit();
-    const output = try runOutput(allocator, threaded.io(), &.{ nm, "-g", lib });
-    var actual = std.StringHashMap(void).init(allocator);
+    const output = try runOutput(std.heap.page_allocator, threaded.io(), &.{ nm, "-g", lib });
+    defer std.heap.page_allocator.free(output);
+    var actual = std.StringHashMap(void).init(std.heap.page_allocator);
     defer actual.deinit();
     var forbidden = std.ArrayList([]const u8).empty;
-    defer forbidden.deinit(allocator);
+    defer forbidden.deinit(std.heap.page_allocator);
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
         var it = std.mem.tokenizeAny(u8, line, " \t\r");
@@ -178,9 +174,8 @@ fn checkCAbi(args: []const []const u8) !u8 {
         const symbol_raw = it.next() orelse continue;
         if (!isHex(address) or kind.len != 1 or (kind[0] >= 'a' and kind[0] <= 'z' and kind[0] == 'u') or kind[0] == 'U') continue;
         const symbol = if (std.mem.startsWith(u8, symbol_raw, "_")) symbol_raw[1..] else symbol_raw;
-        // QuickJS/JSC C shims (jsbay_qjs_*, jsbay_jsc_*) are engine-private wrappers for Zig; not public ABI.
-        if (std.mem.startsWith(u8, symbol, "jsbay_") and !std.mem.startsWith(u8, symbol, "jsbay_qjs_") and !std.mem.startsWith(u8, symbol, "jsbay_jsc_")) try actual.put(symbol, {});
-        if (std.mem.startsWith(u8, symbol, "no" ++ "ok_engine_") or std.mem.startsWith(u8, symbol, "z" ++ "je_") or std.mem.startsWith(u8, symbol, "z" ++ "jse_") or std.mem.startsWith(u8, symbol, "Java_") or std.mem.eql(u8, symbol, "JNI_OnLoad")) try forbidden.append(allocator, symbol);
+        if (std.mem.startsWith(u8, symbol, "js_bay_")) try actual.put(symbol, {});
+        if (std.mem.startsWith(u8, symbol, "no" ++ "ok_engine_") or std.mem.startsWith(u8, symbol, "z" ++ "je_") or std.mem.startsWith(u8, symbol, "z" ++ "jse_") or std.mem.startsWith(u8, symbol, "Java_") or std.mem.eql(u8, symbol, "JNI_OnLoad")) try forbidden.append(std.heap.page_allocator, symbol);
     }
     var failed = false;
     var expected_it = expected.keyIterator();
@@ -206,43 +201,8 @@ fn isHex(value: []const u8) bool {
     return true;
 }
 
-fn writeAndroidExportsMap(args: []const []const u8) !u8 {
-    if (args.len != 1) {
-        std.debug.print("usage: jsbay-tool write-android-exports-map <exports.map>\n", .{});
-        return error.Usage;
-    }
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var symbols = try headerSymbols(allocator);
-    defer symbols.deinit();
-    if (symbols.count() == 0) return error.NoPublicSymbols;
-    var list: std.ArrayList([]const u8) = .empty;
-    defer list.deinit(allocator);
-    var it = symbols.keyIterator();
-    while (it.next()) |sym| try list.append(allocator, sym.*);
-    std.mem.sort([]const u8, list.items, {}, struct {
-        fn less(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.less);
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
-    try out.appendSlice(allocator, "{\n  global:\n");
-    for (list.items) |sym| {
-        try out.appendSlice(allocator, "  ");
-        try out.appendSlice(allocator, sym);
-        try out.appendSlice(allocator, ";\n");
-    }
-    try out.appendSlice(allocator, "  local: *;\n};\n");
-    var threaded = std.Io.Threaded.init(allocator, .{});
-    defer threaded.deinit();
-    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = args[0], .data = out.items });
-    return 0;
-}
-
 pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
-    const names = [_][]const u8{ "jsbay.h", "jsbay_bytecode.h", "jsbay_sync.h" };
+    const names = [_][]const u8{ "js_bay.h", "js_bay_bytecode.h", "js_bay_sync.h" };
     var result = std.StringHashMap(void).init(allocator);
     errdefer result.deinit();
     var threaded = std.Io.Threaded.init(allocator, .{});
@@ -251,7 +211,7 @@ pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
     defer include.close(threaded.io());
     var iterator = include.iterate();
     while (try iterator.next(threaded.io())) |entry| {
-        if (!std.mem.startsWith(u8, entry.name, "jsbay") or !std.mem.endsWith(u8, entry.name, ".h")) continue;
+        if (!std.mem.startsWith(u8, entry.name, "js_bay") or !std.mem.endsWith(u8, entry.name, ".h")) continue;
         var allowed = false;
         for (names) |name| if (std.mem.eql(u8, name, entry.name)) {
             allowed = true;
@@ -274,10 +234,10 @@ pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
                 i += std.mem.indexOfScalar(u8, text[i..], '\n') orelse (text.len - i);
                 continue;
             }
-            if (!std.mem.startsWith(u8, text[i..], "jsbay_")) continue;
+            if (!std.mem.startsWith(u8, text[i..], "js_bay_")) continue;
             if (i > 0 and (std.ascii.isAlphanumeric(text[i - 1]) or text[i - 1] == '_')) continue;
             const start = i;
-            i += "jsbay_".len;
+            i += "js_bay_".len;
             while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_')) : (i += 1) {}
             const end = i;
             if (std.mem.endsWith(u8, text[start..end], "_t")) continue;
@@ -288,13 +248,13 @@ pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
     return result;
 }
 
-test "header symbols include functions following jsbay typedef return types" {
+test "header symbols include functions following js_bay typedef return types" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var symbols = try headerSymbols(arena.allocator());
     defer symbols.deinit();
-    try std.testing.expect(symbols.contains("jsbay_engine_evaluate"));
-    try std.testing.expect(symbols.contains("jsbay_sync_complete"));
+    try std.testing.expect(symbols.contains("js_bay_engine_evaluate"));
+    try std.testing.expect(symbols.contains("js_bay_sync_complete"));
 }
 
 fn runOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]u8 {
@@ -308,10 +268,19 @@ fn runOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8)
     return error.ExternalFailure;
 }
 
+
+fn resolvePathCmd(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, name, '/')) |_| return try allocator.dupe(u8, name);
+    // Zig 0.17 `process.run` does not PATH-search a relative argv[0].
+    if (std.mem.eql(u8, name, "cc")) return try allocator.dupe(u8, "/usr/bin/cc");
+    if (std.mem.eql(u8, name, "c++")) return try allocator.dupe(u8, "/home/box/.local/bin/c++");
+    return error.ExternalFailure;
+}
+
 fn requireExternal(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    const result = std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(16 * 1024 * 1024) }) catch |err| {
+    const result = std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(16 * 1024 * 1024) }) catch {
         std.debug.print("external command failed: {s}\n", .{argv[0]});
-        return err;
+        return error.ExternalFailure;
     };
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
@@ -319,7 +288,7 @@ fn requireExternal(allocator: std.mem.Allocator, io: std.Io, argv: []const []con
         .exited => |code| if (code == 0) return,
         else => {},
     }
-    std.debug.print("external command failed: {s}\n{s}{s}\n", .{ argv[0], result.stdout, result.stderr });
+    std.debug.print("external command failed: {s}\n{s}\n", .{ argv[0], result.stderr });
     return error.ExternalFailure;
 }
 

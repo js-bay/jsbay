@@ -50,6 +50,27 @@ pub fn newTypedArrayFromBytes(ctx: ActiveEngine.Context, kind: TypedArrayKind, b
             defer ActiveEngine.freeValue(ctx, ab);
             return ActiveEngine.newTypedArrayFromBufferVal(ctx, code, ab);
         },
+        .escargot, .hermes => {
+            // Bridge kind codes: 0=Int8 1=Uint8 2=Uint8C 3=Int16 4=Uint16 5=Int32 6=Uint32 7=Float32 8=Float64 9=BigInt64 10=BigUint64
+            const code: c_int = switch (kind) {
+                .int8 => 0,
+                .uint8 => 1,
+                .int16 => 3,
+                .uint16 => 4,
+                .int32 => 5,
+                .uint32 => 6,
+                .float32 => 7,
+                .float64 => 8,
+                .big_int64 => 9,
+                .big_uint64 => 10,
+            };
+            const ab = ActiveEngine.newArrayBufferCopyVal(ctx, bytes);
+            defer ActiveEngine.freeValue(ctx, ab);
+            const es = kind.elementSize();
+            const len: usize = if (es == 0) 0 else bytes.len / es;
+            // Escargot/Hermes signature: (ctx, ab, kind, byte_offset, length_in_elements)
+            return ActiveEngine.newTypedArrayFromBufferVal(ctx, ab, code, 0, len);
+        },
     }
 }
 
@@ -254,6 +275,7 @@ pub fn strictEquals(instance_id: i32, a: ActiveEngine.Value, b: ActiveEngine.Val
             const ctx_ref: jsc_mod.jsc.JSContextRef = @ptrCast(ctx);
             return @import("../backend/jsc/weak.zig").jsbay_qjsStrictEqual(ctx_ref, a, b);
         },
+        .escargot, .hermes => ActiveEngine.strictEqual(ctx, a, b),
     };
 }
 
@@ -267,6 +289,7 @@ pub fn isConstructor(instance_id: i32, v: ActiveEngine.Value) bool {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.value.isConstructor(ctx, v),
         .jsc => @import("../backend/jsc/value.zig").isConstructor(ctx, v),
+        .escargot, .hermes => ActiveEngine.isConstructor(ctx, v),
     };
 }
 
@@ -276,6 +299,7 @@ pub fn newArray(instance_id: i32, len: u32) ?ActiveEngine.Value {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.value.newArray(ctx, len),
         .jsc => @import("../backend/jsc/value.zig").newArray(ctx, len),
+        .escargot, .hermes => ActiveEngine.newArray(ctx, len),
     };
 }
 
@@ -285,6 +309,7 @@ pub fn arrayGet(instance_id: i32, arr: ActiveEngine.Value, index: u32) ?ActiveEn
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.value.arrayGet(ctx, arr, index),
         .jsc => @import("../backend/jsc/value.zig").arrayGet(ctx, arr, index),
+        .escargot, .hermes => ActiveEngine.getIndexKeepUndefined(ctx, arr, index),
     };
 }
 
@@ -294,6 +319,7 @@ pub fn arraySet(instance_id: i32, arr: ActiveEngine.Value, index: u32, val: Acti
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.value.arraySet(ctx, arr, index, val),
         .jsc => @import("../backend/jsc/value.zig").arraySet(ctx, arr, index, val),
+        .escargot, .hermes => ActiveEngine.setIndex(ctx, arr, index, val),
     };
 }
 
@@ -309,6 +335,7 @@ pub fn arrayClear(instance_id: i32, arr: ActiveEngine.Value) bool {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.value.arrayClear(ctx, arr),
         .jsc => @import("../backend/jsc/value.zig").arrayClear(ctx, arr),
+        .escargot, .hermes => ActiveEngine.setLength(ctx, arr, 0),
     };
 }
 
@@ -324,5 +351,6 @@ pub fn defineDataProperty(
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.value.defineDataProperty(ctx, obj, key, val, writable),
         .jsc => @import("../backend/jsc/value.zig").defineDataProperty(ctx, obj, key, val, writable),
+        .escargot, .hermes => ActiveEngine.defineDataProperty(ctx, obj, key, val, writable),
     };
 }

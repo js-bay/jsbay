@@ -78,17 +78,13 @@ pub fn Module(comptime Host: type) type {
             const ctx = engine.getContext(state.instance_id) orelse return error.InstanceUnavailable;
             const is_object = if (comptime backend.isQuickJsApiBackend(backend.active_backend))
                 backend.ActiveEngineModule.c_api.jsbay_qjs_JS_IsObject(value) != 0
+            else if (comptime backend.isJscApiBackend(backend.active_backend))
+                backend.ActiveEngineModule.jsc.JSValueIsObject(@ptrCast(ctx), value)
             else
-                backend.ActiveEngineModule.jsc.JSValueIsObject(@ptrCast(ctx), value);
+                ActiveEngine.isObjectVal(ctx, value);
             if (is_object) {
-                const object_pending = state.exception_object_ids.items.len - state.exception_object_ids_head;
-                if (object_pending == rejection_limit) {
-                    const old = state.exception_object_ids.items[state.exception_object_ids_head];
-                    state.exception_object_ids_head += 1;
-                    if (state.exception_object_ids_head == state.exception_object_ids.items.len) {
-                        state.exception_object_ids.clearRetainingCapacity();
-                        state.exception_object_ids_head = 0;
-                    }
+                if (state.exception_object_ids.items.len == rejection_limit) {
+                    const old = state.exception_object_ids.orderedRemove(0);
                     _ = state.object_table.release(ctx, old);
                 }
                 const object_id = state.object_table.retain(ctx, value, null) orelse return error.OutOfMemory;
@@ -96,15 +92,6 @@ pub fn Module(comptime Host: type) type {
                     _ = state.object_table.release(ctx, object_id);
                     return error.OutOfMemory;
                 };
-                if (state.exception_object_ids_head >= 32) {
-                    const pend = state.exception_object_ids.items[state.exception_object_ids_head..];
-                    var write: usize = 0;
-                    while (write < pend.len) : (write += 1) {
-                        state.exception_object_ids.items[write] = pend[write];
-                    }
-                    state.exception_object_ids.shrinkRetainingCapacity(pend.len);
-                    state.exception_object_ids_head = 0;
-                }
                 // Do not enumerate or classify arbitrary objects: Proxy traps, getters and custom coercion are user code. The explicit objectId permits the frontend to inspect the original value on a subsequent user request.
                 try writer.print("{{\"type\":\"{s}\",\"description\":\"Uncaught exception\",\"objectId\":\"{d}\"}}", .{ if (ActiveEngine.isFunction(ctx, value)) @as([]const u8, "function") else "object", object_id });
             } else {
@@ -146,28 +133,10 @@ pub fn Module(comptime Host: type) type {
             defer dispatch.leaveTaskOwnerFrame(&owner_frame);
             const ctx = engine.getContext(instance_id) orelse return;
             const identity = @intFromPtr(promise.u.ptr);
-            // Compact consumed prefix so identity scan/removal runs over the live set only.
-            if (state.reported_rejections_head != 0) {
-                const pend = state.reported_rejections.items[state.reported_rejections_head..];
-                var write: usize = 0;
-                while (write < pend.len) : (write += 1) {
-                    state.reported_rejections.items[write] = pend[write];
-                }
-                state.reported_rejections.shrinkRetainingCapacity(pend.len);
-                state.reported_rejections_head = 0;
-            }
             for (state.reported_rejections.items, 0..) |entry, index| {
                 if (entry.identity != identity) continue;
                 if (!handled) return;
-                // Stable compress (not swapRemove): keep oldest-first eviction order for the rest.
-                const removed = entry;
-                var write: usize = 0;
-                for (state.reported_rejections.items, 0..) |keep, i| {
-                    if (i == index) continue;
-                    state.reported_rejections.items[write] = keep;
-                    write += 1;
-                }
-                state.reported_rejections.shrinkRetainingCapacity(write);
+                const removed = state.reported_rejections.orderedRemove(index);
                 defer ActiveEngine.freeValue(ctx, removed.promise);
                 var sessions: std.ArrayList(transport.SessionId) = .empty;
                 defer sessions.deinit(state.allocator);
@@ -179,14 +148,8 @@ pub fn Module(comptime Host: type) type {
             }
             if (handled or !isEnabled(instance_id)) return;
             // Keep the Promise itself alive until revocation/eviction; a recycled object address must never revoke an unrelated exception.
-            const rejection_pending = state.reported_rejections.items.len - state.reported_rejections_head;
-            if (rejection_pending == rejection_limit) {
-                const removed = state.reported_rejections.items[state.reported_rejections_head];
-                state.reported_rejections_head += 1;
-                if (state.reported_rejections_head == state.reported_rejections.items.len) {
-                    state.reported_rejections.clearRetainingCapacity();
-                    state.reported_rejections_head = 0;
-                }
+            if (state.reported_rejections.items.len == rejection_limit) {
+                const removed = state.reported_rejections.orderedRemove(0);
                 ActiveEngine.freeValue(ctx, removed.promise);
             }
             const retained = ActiveEngine.dupValue(ctx, promise);
@@ -199,28 +162,17 @@ pub fn Module(comptime Host: type) type {
                 ActiveEngine.freeValue(ctx, retained);
                 return;
             };
-            if (state.reported_rejections_head >= 32) {
-                const pend = state.reported_rejections.items[state.reported_rejections_head..];
-                var write: usize = 0;
-                while (write < pend.len) : (write += 1) {
-                    state.reported_rejections.items[write] = pend[write];
-                }
-                state.reported_rejections.shrinkRetainingCapacity(pend.len);
-                state.reported_rejections_head = 0;
-            }
             const message = nativeErrorMessage(ctx, reason);
             defer if (message) |owned| std.heap.c_allocator.free(owned);
             sendThrown(state, id, message orelse "Unhandled Promise rejection", "", reason);
         }
 
         pub fn deinit(state: *InspectorState, ctx: ActiveEngine.Context) void {
-            for (state.reported_rejections.items[state.reported_rejections_head..]) |entry| ActiveEngine.freeValue(ctx, entry.promise);
+            for (state.reported_rejections.items) |entry| ActiveEngine.freeValue(ctx, entry.promise);
             state.reported_rejections.deinit(state.allocator);
             state.reported_rejections = .empty;
-            state.reported_rejections_head = 0;
             state.exception_object_ids.deinit(state.allocator);
             state.exception_object_ids = .empty;
-            state.exception_object_ids_head = 0;
         }
     };
 }

@@ -2,6 +2,8 @@
 //!
 //! This self-contained binary prints an ops/sec table. Both backends share the same source; the active backend is selected at build time via `-Dbackend=quickjs_ng|quickjs|jsc`.
 //!
+//! Reference cases: ScriptX `PressureTest`.
+//!
 //! Workloads (see `workloads` array below):
 //!   1. eval_throughput            — hot-loop `1+1`
 //!   2. eval_complex               — larger expression / function body
@@ -22,7 +24,7 @@
 //!   - `--json`: one JSON line per workload for CI consumption.
 
 const std = @import("std");
-const zjs = @import("jsbay_tools");
+const zjs = @import("js_bay_tools");
 const comma_format = @import("comma_format.zig");
 
 const engine = zjs.engine;
@@ -527,6 +529,8 @@ pub fn main(proc_init: std.process.Init.Minimal) !void {
         .quickjs_ng => "quickjs_ng",
         .quickjs => "quickjs",
         .jsc => "jsc",
+        .escargot => "escargot",
+        .hermes => "hermes",
     };
 
     const optimize_mode = comptime switch (@import("builtin").mode) {

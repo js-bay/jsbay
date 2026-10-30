@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="WebKit / JavaScriptCore">
+  <title>WebKit compass mark (simplified)</title>
+  <!-- Simplified flat derivative of Wikimedia File:WebKit_logo.svg compass face for small sizes.
+       Apple WebKit / JavaScriptCore trademark; identification only, no endorsement. -->
+  <circle cx="16" cy="16" r="15.5" fill="#0B5FFF"/>
+  <circle cx="16" cy="16" r="11.5" fill="#E8F1FF"/>
+  <!-- cardinal ticks -->
+  <g stroke="#0B5FFF" stroke-width="1.6" stroke-linecap="round">
+    <path d="M16 6.5 V9.2"/><path d="M16 22.8 V25.5"/>
+    <path d="M6.5 16 H9.2"/><path d="M22.8 16 H25.5"/>
+  </g>
+  <!-- needle (N red tip, S blue) -->
+  <path d="M16 7.0 L19.2 16 L16 16 L12.8 16 Z" fill="#FF3B30"/>
+  <path d="M16 25.0 L19.2 16 L16 16 L12.8 16 Z" fill="#082B97"/>
+  <circle cx="16" cy="16" r="2.2" fill="#082B97"/>
+  <circle cx="16" cy="16" r="1" fill="#E8F1FF"/>
+</svg>

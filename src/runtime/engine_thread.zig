@@ -248,6 +248,11 @@ fn detach(instance_id: i32) ?*State {
 
 pub fn threadStart(instance_id: i32) bool {
     if (instance_map.isTeardownPending(instance_id)) return false;
+    // Escargot Context is thread-affine: hosts installed on the create thread must not
+    // be evaluated on the engine thread (AtomicString/GC SEGV). Refuse ET start instead.
+    if (comptime backend.active_backend == .escargot) {
+        if (@import("../abi/spike_host_abi.zig").hasBindings(instance_id)) return false;
+    }
     const gate = destroyGate(instance_id);
     var gate_lease: DestroyGateLease = undefined;
     lockDestroyGate(gate, &gate_lease);
@@ -442,6 +447,28 @@ pub fn isEvalActiveOnCurrentThread(instance_id: i32) bool {
         if (entry.depth != 0 and entry.instance_id == instance_id) return true;
     }
     return false;
+}
+
+/// Invoke `cb` once per distinct instance with an active eval frame on this thread.
+pub fn forEachEvalActiveOnCurrentThread(cb: *const fn (i32) void) void {
+    var seen: [64]i32 = undefined;
+    var n: usize = 0;
+    for (tls_eval_depths) |entry| {
+        if (entry.depth == 0) continue;
+        var dup = false;
+        for (seen[0..n]) |id| {
+            if (id == entry.instance_id) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        if (n < seen.len) {
+            seen[n] = entry.instance_id;
+            n += 1;
+        }
+        cb(entry.instance_id);
+    }
 }
 
 /// Mark teardown requested by a native callback inside this thread's eval. The per-instance bit survives nested evals for other instances and is consumed only when the owning outermost lease exits.
@@ -722,7 +749,7 @@ pub fn isDestroying(instance_id: i32) bool {
 
 /// Let another thread `evalScript` this instance. Only the engine thread may call it, and only after `threadStart`. Before the engine thread exists this is a no-op and returns true. A foreign caller returns false and does not abort.
 ///
-/// The owner drops its claim so another thread can enter; `reacquire` takes the claim back.
+/// Mirrors ScriptX `ExitEngineScope`: the owner drops its claim, the other thread enters, then `reacquire` takes the claim back.
 pub fn releaseForExternalEval(instance_id: i32) bool {
     const state = retain(instance_id) orelse return true;
     defer release(state);
@@ -747,14 +774,12 @@ pub fn reacquire(instance_id: i32) bool {
     if (state.yield_depth == 0) {
         // Block foreign eval before this thread owns the runtime again.
         state.yielded.store(false, .seq_cst);
-        if (backend.active_backend == .jsc) {
+        if (backend.isJscApiBackend(backend.active_backend)) {
             // Wait for an evaluation already admitted during the yield. Any queued caller rechecks `yielded` after acquiring the mutex.
             state.external_eval_mu.lock();
             state.external_eval_mu.unlock();
         }
         resumeBackend(instance_id);
-        // While yielded the loop reports no runnable work, so work queued meanwhile needs a wake to run.
-        engine.wakeAsync(instance_id);
     }
     return true;
 }
@@ -766,6 +791,7 @@ fn suspendBackend(instance_id: i32) void {
             @import("../backend.zig").ActiveEngineModule.lifecycle.suspendJsOwner(ctx);
         },
         .jsc => {},
+        .escargot, .hermes => {},
     }
 }
 
@@ -776,6 +802,7 @@ fn resumeBackend(instance_id: i32) void {
             @import("../backend.zig").ActiveEngineModule.lifecycle.resumeJsOwner(ctx);
         },
         .jsc => {},
+        .escargot, .hermes => {},
     }
 }
 
@@ -801,7 +828,7 @@ const NativeTask = struct {
     data: ?*anyopaque,
 };
 
-/// Ask the engine thread to run `func` outside any JavaScript call so the owner can yield while in native code, not inside eval. Returns false when the thread is not running or a task is already queued.
+/// Ask the engine thread to run `func` outside any JavaScript call. Used to yield the way ScriptX `ExitEngineScope` does: the owner is in native code, not inside eval. Returns false when the thread is not running or a task is already queued.
 pub fn postToEngineThread(instance_id: i32, func: *const fn (?*anyopaque) void, data: ?*anyopaque) bool {
     const state = retain(instance_id) orelse return false;
     defer release(state);
@@ -1046,6 +1073,7 @@ pub fn hostInstall(
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => return backend.ActiveEngineModule.host_abi.install(instance_id, name, func, user_data),
         .jsc => return @import("../backend/jsc/host_abi.zig").install(instance_id, name, func, user_data),
+        .escargot, .hermes => return @import("../abi/spike_host_abi.zig").install(instance_id, name, func, user_data),
     }
 }
 
@@ -1132,6 +1160,7 @@ fn releaseHostBindings(instance_id: i32) void {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => backend.ActiveEngineModule.host_abi.releaseInstance(instance_id),
         .jsc => @import("../backend/jsc/host_abi.zig").releaseInstance(instance_id),
+        .escargot, .hermes => @import("../abi/spike_host_abi.zig").releaseInstance(instance_id),
     }
 }
 
@@ -1187,6 +1216,13 @@ fn shutdown(state: *State) void {
 
 fn threadMain(state: *State) void {
     state.thread_id.store(currentThreadId(), .seq_cst);
+    // Escargot requires Globals::initializeThread on every OS thread that touches the VM.
+    if (comptime backend.active_backend == .escargot) {
+        if (@hasDecl(ActiveEngine, "threadEnter")) ActiveEngine.threadEnter();
+    }
+    defer if (comptime backend.active_backend == .escargot) {
+        if (@hasDecl(ActiveEngine, "threadLeave")) ActiveEngine.threadLeave();
+    };
 
     while (!state.stopping.load(.seq_cst)) {
         if (dequeue(state)) |job| {

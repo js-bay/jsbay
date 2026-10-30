@@ -14,7 +14,7 @@ const value = @import("../value/root.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
-const boundary_message = "error 👍";
+const boundary_message = "错误 👍";
 
 fn installThrower(id: i32) void {
     const ctx = engine.getContext(id) orelse return;
@@ -41,7 +41,7 @@ fn installThrower(id: i32) void {
             "__throwUtf8",
             ActiveEngine.newCFunction(ctx, &cb, "__throwUtf8", 0),
         );
-    } else {
+    } else if (comptime backend.isJscApiBackend(backend.active_backend)) {
         const jsc_mod = @import("../backend/jsc.zig");
         const common = @import("../backend/jsc/common.zig");
         const cb = struct {
@@ -64,13 +64,16 @@ fn installThrower(id: i32) void {
         const func = common.makeFunction(@ptrCast(ctx), "__throwUtf8", &cb);
         if (func != null) jsc_mod.jsc.JSValueProtect(@ptrCast(ctx), func);
         ActiveEngine.setPropertyStr(ctx, global, "__throwUtf8", func);
+    } else {
+        // Escargot/Hermes: native callback trampoline not wired; leave global unset.
+        _ = .{ ctx, global };
     }
 }
 
 test "exception boundary: eval Error message keeps utf-8 and the next eval works" {
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
-            const res = engine.evalScript(id, "throw new Error('error 👍');", "<boundary>");
+            const res = engine.evalScript(id, "throw new Error('错误 👍');", "<boundary>");
             defer helpers.freeEvalResult(res);
             const err = res.err orelse return error.ExpectedException;
             try testing.expect(std.mem.indexOf(u8, err, boundary_message) != null);
@@ -80,6 +83,7 @@ test "exception boundary: eval Error message keeps utf-8 and the next eval works
 }
 
 test "exception boundary: native throwError is caught in JS with the same message" {
+    if (comptime backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
             installThrower(id);

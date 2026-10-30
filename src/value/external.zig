@@ -1,6 +1,6 @@
 //! External values — wrap a raw native pointer as an opaque JS value.
 //!
-//! Use this when JavaScript only needs to carry a native pointer through a one-shot FFI bridge.
+//! Analogous to napi-rs `env.create_external(value, finalize)` and V8's `v8::External::New`. Use this when JavaScript only needs to carry a native pointer through a one-shot FFI bridge.
 //!
 //! The resulting JS value is an object of a private class. It has no properties and is not callable from JS — it exists solely as a container the engine can GC-track. When the value is collected, the user-supplied finalizer (if any) runs with the native pointer so the owner can release the backing resource.
 //!
@@ -50,6 +50,16 @@ pub fn newExternal(
             _ = jsc_mod.jsc.JSValueProtect(@ptrCast(ctx), v);
             return v;
         },
+        .escargot => {
+            const c = @import("../backend/escargot/c_api.zig");
+            const fin_c: ?c.ExternalFinalizer = if (finalizer) |f| @ptrCast(f) else null;
+            return c.escargot_new_external(ctx, ptr, fin_c);
+        },
+        .hermes => {
+            const c = @import("../backend/hermes/c_api.zig");
+            const fin_c: ?c.ExternalFinalizer = if (finalizer) |f| @ptrCast(f) else null;
+            return c.hermes_new_external(ctx, ptr, fin_c);
+        },
     }
 }
 
@@ -60,10 +70,21 @@ pub fn getExternal(instance_id: i32, value: ActiveEngine.Value) ?*anyopaque {
         _ = engine.getContext(instance_id) orelse return null;
         const qjs_mod = @import("../backend.zig").ActiveEngineModule;
         return qjs_mod.qjsGetExternal(value);
-    } else {
+    } else if (comptime backend.isJscApiBackend(backend.active_backend)) {
         const ctx = engine.getContext(instance_id) orelse return null;
         const jsc_mod = @import("../backend/jsc.zig");
         return jsc_mod.jscGetExternal(@ptrCast(ctx), value);
+    } else if (comptime backend.active_backend == .escargot) {
+        const ctx = engine.getContext(instance_id) orelse return null;
+        const c = @import("../backend/escargot/c_api.zig");
+        return c.escargot_get_external(ctx, value);
+    } else if (comptime backend.active_backend == .hermes) {
+        const ctx = engine.getContext(instance_id) orelse return null;
+        const c = @import("../backend/hermes/c_api.zig");
+        return c.hermes_get_external(ctx, value);
+    } else {
+        _ = .{ instance_id, value };
+        return null;
     }
 }
 
@@ -73,9 +94,20 @@ pub fn isExternal(instance_id: i32, value: ActiveEngine.Value) bool {
         _ = engine.getContext(instance_id) orelse return false;
         const qjs_mod = @import("../backend.zig").ActiveEngineModule;
         return qjs_mod.qjsIsExternal(value);
-    } else {
+    } else if (comptime backend.isJscApiBackend(backend.active_backend)) {
         const ctx = engine.getContext(instance_id) orelse return false;
         const jsc_mod = @import("../backend/jsc.zig");
         return jsc_mod.jscIsExternal(@ptrCast(ctx), value);
+    } else if (comptime backend.active_backend == .escargot) {
+        const ctx = engine.getContext(instance_id) orelse return false;
+        const c = @import("../backend/escargot/c_api.zig");
+        return c.escargot_is_external(ctx, value);
+    } else if (comptime backend.active_backend == .hermes) {
+        const ctx = engine.getContext(instance_id) orelse return false;
+        const c = @import("../backend/hermes/c_api.zig");
+        return c.hermes_is_external(ctx, value);
+    } else {
+        _ = .{ instance_id, value };
+        return false;
     }
 }

@@ -1,6 +1,6 @@
 //! Host object with arbitrary get / set / enumerate traps.
 //!
-//! Host-object traps for arbitrary property names: unknown gets are `undefined`, a missing set trap throws a plain Error whose message starts with "TypeError: " (the error name is not "TypeError"), enumeration is only the names from `get_property_names` with canonical integer indices ascending first, and `in` / `hasOwnProperty` are true for every name. There is no decorator chain.
+//! Mirrors the JSI HostObject shape used by React Native and Hermes: unknown gets are `undefined`, a missing set trap throws a plain Error whose message starts with "TypeError: " (the error name is not "TypeError"), enumeration is only the names from `get_property_names` with canonical integer indices ascending first, and `in` / `hasOwnProperty` are true for every name. There is no decorator chain.
 //!
 //! Callback signatures are structural and must stay identical to the copies in `backend/quickjs/host_object.zig` and `backend/jsc/host_object.zig`.
 //!
@@ -70,6 +70,14 @@ pub fn create(instance_id: i32, user_data: ?*anyopaque, callbacks: Callbacks) ?A
             const v: ActiveEngine.Value = @ptrCast(obj);
             _ = jsc_mod.jsc.JSValueProtect(@ptrCast(ctx), v);
             return v;
+        },
+        .escargot => {
+            const esc = @import("../backend/escargot/host_object.zig");
+            return esc.create(ctx, instance_id, user_data, callbacks.get, callbacks.set, callbacks.get_property_names, callbacks.finalize);
+        },
+        .hermes => {
+            const her = @import("../backend/hermes/host_object.zig");
+            return her.create(ctx, instance_id, user_data, callbacks.get, callbacks.set, callbacks.get_property_names, callbacks.finalize);
         },
     }
 }

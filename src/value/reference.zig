@@ -1,6 +1,6 @@
 //! Reference lifecycle — Local / Global(T) / Weak(T) / Scope / StackFrameScope.
 //!
-//! Hold JS values across scope boundaries with `Global(T)`; temporary in-scope values are the backend-native `Local` (aka `ActiveEngine.Value`).
+//! This is the Zig/js-bay analog of ScriptX's Local/Global/Weak and JSI's `jsi::Value`/`jsi::Function::createFromHostFunction` machinery. Users who need to hold a JS `Value` across scope boundaries (e.g. store a callback in a Zig data structure) should reach for `Global(T)`; temporary in-scope values are the backend-native `Local` (aka `ActiveEngine.Value`).
 //!
 //! ## Lifetime summary
 //!
@@ -8,8 +8,8 @@
 //! - `Global(T)` — retained across scopes. `init` duplicates the value; the retained value is released on `reset` (or when the owning engine is destroyed, see `engine.destroy` → bookkeeping walk).
 //! - `Weak(T)` — **true weak** reference on JS objects. `get()` returns null once the target has been garbage collected. See "Weak semantics" below.
 //! - `Rooted` — refcounted GC root. `root` calls the backend protect only on the 0→1 edge; `unroot` releases only when the count returns to 0. `Global` is unchanged and still protects exactly once.
-//! - `Scope` — threadlocal stack that `currentInstanceId()` reads. Not yet required before every API call; exists so consumers can query the active engine id without passing it everywhere.
-//! - `StackFrameScope` — thin wrapper around `dupValue` for values that need to escape a frame.
+//! - `Scope` — threadlocal stack that `currentInstanceId()` reads. Not yet required before every API call; exists so consumers can query the active engine id without passing it everywhere (mirrors ScriptX).
+//! - `StackFrameScope` — thin wrapper around `dupValue` for values that need to escape a frame. Matches ScriptX semantics.
 //!
 //! ## Weak semantics
 //!
@@ -242,6 +242,7 @@ fn weakBackendIsObject(ctx: ActiveEngine.Context, v: Local) bool {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.Backend.jsIsObject(v),
         .jsc => @import("../backend/jsc.zig").JscBackend.isObjectVal(ctx, v),
+        .escargot, .hermes => ActiveEngine.isObjectVal(ctx, v),
     };
 }
 
@@ -250,6 +251,7 @@ fn weakBackendAttach(ctx: ActiveEngine.Context, cell: *WeakCell, v: Local) bool 
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.jsbay_qjsWeakAttach(ctx, cell, v),
         .jsc => @import("../backend/jsc.zig").jsbay_qjsWeakAttach(ctx, cell, v),
+        .escargot, .hermes => false,
     };
 }
 
@@ -258,6 +260,7 @@ fn weakBackendGetLive(ctx: ActiveEngine.Context, cell: *WeakCell) ?Local {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.jsbay_qjsWeakGetLive(ctx, cell),
         .jsc => @import("../backend/jsc.zig").jsbay_qjsWeakGetLive(ctx, cell),
+        .escargot, .hermes => null,
     };
 }
 
@@ -265,6 +268,7 @@ fn weakBackendRelease(ctx: ActiveEngine.Context, cell: *WeakCell) void {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.jsbay_qjsWeakRelease(ctx, cell),
         .jsc => @import("../backend/jsc.zig").jsbay_qjsWeakRelease(ctx, cell),
+        .escargot, .hermes => {},
     }
 }
 
@@ -273,6 +277,7 @@ fn rootBackendProtect(ctx: ActiveEngine.Context, v: Local) Local {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootProtect(ctx, v),
         .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootProtect(ctx, v),
+        .escargot, .hermes => ActiveEngine.dupValue(ctx, v),
     };
 }
 
@@ -281,6 +286,7 @@ fn rootBackendUnprotect(ctx: ActiveEngine.Context, v: Local) void {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootUnprotect(ctx, v),
         .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootUnprotect(ctx, v),
+        .escargot, .hermes => ActiveEngine.freeValue(ctx, v),
     }
 }
 
@@ -288,7 +294,7 @@ fn rootBackendUnprotect(ctx: ActiveEngine.Context, v: Local) void {
 // Global(T)
 // ----------------------------------------------------------------------
 
-/// Retained reference to a JS value, safe to hold across scope boundaries. `T` is a phantom marker (e.g. Value vs Function) for clarity at the type site; the Zig implementation does not currently distinguish on T at runtime.
+/// Retained reference to a JS value, safe to hold across scope boundaries. `T` is a phantom marker kept for API parity with ScriptX (Global<Value>, Global<Function>, ...). The Zig implementation does not currently distinguish on T at runtime; consumers may still use it for clarity at the type site.
 ///
 /// Ownership: a Global is a unique handle to the underlying heap cell. Copying the struct aliases the cell; deinit'ing one copy leaves any other copies with a dangling pointer. Pass Globals by pointer, or move them (do not use the source after assignment).
 pub fn Global(comptime T: type) type {
@@ -467,7 +473,6 @@ const RootCell = struct {
                 rootBackendUnprotect(ctx, cell.val);
             }
             cell.protected = false;
-            cell.val = ActiveEngine.nullValue();
         }
         cell.root_count = 0;
         cell.released = true;
@@ -528,9 +533,6 @@ pub const Rooted = struct {
                 rootBackendUnprotect(ctx, cell.val);
             }
             cell.protected = false;
-            // Keep cell.val so a later root() on a still-live object can re-protect it.
-            // (Clearing to nullValue here made isEmpty false after re-root while protecting
-            // only the sentinel — see "Rooted: re-root after count returns to zero".)
         }
     }
 

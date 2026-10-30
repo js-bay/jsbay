@@ -1,6 +1,6 @@
 //! Tests for src/backend/jsc/remote_inspector.zig — JSC WebKit Inspector enable/disable.
 //!
-//! These tests run only under `-Dbackend=jsc`; the aggregator (all_tests.zig) gates this file behind `backend.active_backend == .jsc`.
+//! These tests run only under `-Dbackend=jsc`; the aggregator (all_tests.zig) gates this file behind `backend.isJscApiBackend(backend.active_backend)`.
 //!
 //! We cannot drive Safari from a unit test, so coverage focuses on the Zig-side contract: null-instance handling, idempotency, enable/disable round-trips, and clean teardown when the engine is destroyed with inspection still enabled.
 

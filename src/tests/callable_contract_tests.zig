@@ -1,4 +1,4 @@
-//! isConstructor coverage and native receiver / hasReceiver behavior across backends.
+//! isConstructor (ChakraCore JsIsConstructorTest) and native receiver (ScriptX FunctionHasThiz).
 //!
 //! Bare-call receiver, observed by `thisValue()`: QuickJS: `undefined`. `hasReceiver()` is false (`JS_IsObject`). JSC: the global object. The C callback is sloppy, so `thisObject` is never null and `hasReceiver()` stays true. It is still not the method receiver.
 
@@ -56,12 +56,18 @@ test "isConstructor: Math, Reflect, object, generator, async, and arrows are not
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
             const ctx = engine.getContext(id) orelse return error.NoContext;
-            // Eight non-constructible values, in order.
-            try helpers.evalOk(id, "globalThis.__no = [Math, Reflect, {}, function*(){}, async function(){}, async function*(){}, _=>_, async _=>_];");
+            // ChakraCore JsIsConstructorTest order; Hermes build lacks async* and may lack generators.
+            const hermes = comptime backend.isHermesBackend(backend.active_backend);
+            const no_ctors = if (hermes)
+                "globalThis.__no = [Math, Reflect, {}, _=>_];"
+            else
+                "globalThis.__no = [Math, Reflect, {}, function*(){}, async function(){}, async function*(){}, _=>_, async _=>_];";
+            const no_count: u32 = if (hermes) 4 else 8;
+            try helpers.evalOk(id, no_ctors);
             const arr = try loadGlobal(id, "__no");
             defer ActiveEngine.freeValue(ctx, arr);
             var index: u32 = 0;
-            while (index < 8) : (index += 1) {
+            while (index < no_count) : (index += 1) {
                 const item = ActiveEngine.getIndex(ctx, arr, index) orelse return error.Missing;
                 defer ActiveEngine.freeValue(ctx, item);
                 try testing.expect(!value.isConstructor(id, item));
@@ -86,7 +92,7 @@ test "native method call receiver is the object" {
             value.registerFunction(id, null, "probe", &receiverTag);
             value.registerFunction(id, null, "probeHas", &receiverPresent);
             try helpers.evalOk(id, "globalThis.mark = 'global'; globalThis.x = { mark: 'obj', probe: probe, probeHas: probeHas };");
-            // A method call has the object as receiver.
+            // FunctionHasThiz: a method call has the object as receiver.
             try helpers.expectEvalEquals(id, "x.probe()", "obj");
             try helpers.expectEvalEquals(id, "x.probeHas()", "true");
         }
@@ -100,9 +106,9 @@ test "native bare call receiver is undefined on QuickJS and globalThis on JSC" {
             value.registerFunction(id, null, "probeHas", &receiverPresent);
             try helpers.evalOk(id, "globalThis.mark = 'global'; globalThis.x = { mark: 'obj', probe: probe, probeHas: probeHas };");
             // Not the method object on either backend.
-            if (comptime backend.active_backend == .jsc) {
+            if (comptime backend.isJscApiBackend(backend.active_backend)) {
                 try helpers.expectEvalEquals(id, "probe()", "global");
-                // On JSC, hasReceiver is `thisObject != null`, so a bare call still reports a receiver. Identity is globalThis.
+                // ScriptX JSC hasThiz is `thisObject != null`, so a bare call still reports a receiver. Identity is globalThis.
                 try helpers.expectEvalEquals(id, "probeHas()", "true");
             } else {
                 try helpers.expectEvalEquals(id, "probe()", "undefined");

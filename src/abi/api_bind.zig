@@ -41,8 +41,15 @@ fn statusException(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) ba
 }
 
 pub fn install(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
-    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         return jscInstall(id, ctx, name, callback, user_data, finalize);
+    }
+    if (comptime backend.isSpikeBackend(backend.active_backend)) {
+        return spikeInstall(id, ctx, name, callback, user_data, finalize);
+    }
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) {
+        _ = .{ id, ctx, name, callback, user_data, finalize };
+        return .out_of_memory;
     }
     const m = backend.ActiveEngineModule;
     const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
@@ -109,7 +116,7 @@ pub fn install(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, cal
 }
 
 fn releaseJscRoot(binding: *Binding) void {
-    if (comptime backend.active_backend != .jsc) return;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const ctx = binding.jsc_ctx orelse return;
     const root = binding.jsc_root orelse return;
     binding.jsc_root = null;
@@ -130,6 +137,102 @@ fn addBinding(binding: *Binding) ?usize {
     if (slot > std.math.maxInt(i32)) return null;
     bindings.append(std.heap.c_allocator, binding) catch return null;
     return slot;
+}
+
+
+fn spikeThrow(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) backend.ActiveEngine.Value {
+    if (comptime backend.active_backend == .escargot) {
+        @import("../backend/escargot/c_api.zig").escargot_throw(ctx, message);
+        return null;
+    }
+    if (comptime backend.active_backend == .hermes) {
+        @import("../backend/hermes/c_api.zig").hermes_throw(ctx, message);
+        return null;
+    }
+    return null;
+}
+
+fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
+    const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
+    const binding = std.heap.c_allocator.create(Binding) catch {
+        std.heap.c_allocator.free(name_z);
+        return .out_of_memory;
+    };
+    binding.* = .{ .instance_id = id, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
+    const slot = addBinding(binding) orelse {
+        std.heap.c_allocator.free(name_z);
+        std.heap.c_allocator.destroy(binding);
+        return .out_of_memory;
+    };
+    // Pack slot+1 so slot 0 is not a null user_data.
+    const slot_ud: ?*anyopaque = @ptrFromInt(slot + 1);
+    const function = backend.ActiveEngine.makeNativeFunction(ctx, name, &spikeTrampoline, slot_ud) orelse {
+        kill(slot);
+        return .out_of_memory;
+    };
+    binding.function_key = @intFromPtr(function);
+    const global = backend.ActiveEngine.getGlobalObject(ctx);
+    if (global == null) {
+        backend.ActiveEngine.freeValue(ctx, function);
+        kill(slot);
+        return .out_of_memory;
+    }
+    defer backend.ActiveEngine.freeValue(ctx, global);
+    backend.ActiveEngine.setPropertyStr(ctx, global, name_z.ptr, function);
+    // Return a distinct retain for the public handle (global keeps its own).
+    const returned = backend.ActiveEngine.dupValue(ctx, function);
+    if (returned == null) {
+        backend.ActiveEngine.freeValue(ctx, function);
+        kill(slot);
+        return .out_of_memory;
+    }
+    backend.ActiveEngine.freeValue(ctx, function);
+    return .{ .installed = .{ .function = returned, .binding = binding } };
+}
+
+fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEngine.Value, args: ?[*]const backend.ActiveEngine.Value, argc: usize, user_data: ?*anyopaque) callconv(.c) backend.ActiveEngine.Value {
+    // ActiveEngine.Context is already ?*c_api.Context (NativeFn first arg).
+    const slot_addr = @intFromPtr(user_data orelse {
+        return spikeThrow(ctx, "native binding is gone");
+    });
+    if (slot_addr == 0) return spikeThrow(ctx, "native binding is gone");
+    const slot = slot_addr - 1;
+    const binding = copy(slot) orelse return spikeThrow(ctx, "native binding is gone");
+    const borrowed_this = api_value.putBorrowed(binding.instance_id, this_val) orelse return spikeThrow(ctx, "out of memory");
+    defer api_value.revokeBorrowed(borrowed_this);
+    var handles = std.ArrayList(u64).empty;
+    defer handles.deinit(std.heap.c_allocator);
+    handles.ensureTotalCapacity(std.heap.c_allocator, argc) catch return spikeThrow(ctx, "out of memory");
+    defer for (handles.items) |handle| api_value.revokeBorrowed(handle);
+    var i: usize = 0;
+    while (i < argc) : (i += 1) {
+        const arg = if (args) |a| a[i] else null;
+        const handle = api_value.putBorrowed(binding.instance_id, arg) orelse return spikeThrow(ctx, "out of memory");
+        handles.appendAssumeCapacity(handle);
+    }
+    var result: u64 = 0;
+    var thrown: u64 = 0;
+    const rc = binding.callback(binding.instance_id, binding.user_data, borrowed_this, argc, if (argc == 0) null else handles.items.ptr, &result, &thrown);
+    if (rc == 0 and result != 0 and thrown == 0) {
+        const owned = api_value.takeOwned(result) orelse return spikeThrow(ctx, "invalid native callback result");
+        if (owned.instance_id != binding.instance_id) {
+            api_value.freeTaken(owned);
+            return spikeThrow(ctx, "native callback returned foreign value");
+        }
+        return owned.value;
+    }
+    if (rc == 1 and result == 0 and thrown != 0) {
+        const owned = api_value.takeOwned(thrown) orelse return spikeThrow(ctx, "invalid native callback exception");
+        if (owned.instance_id != binding.instance_id) {
+            api_value.freeTaken(owned);
+            return spikeThrow(ctx, "native callback returned foreign exception");
+        }
+        // Spike bridges only accept string pending_throw; drop the Error value and throw a generic message.
+        api_value.freeTaken(owned);
+        return spikeThrow(ctx, "native callback exception");
+    }
+    // destroy-during-trap returns INVALID_ARGUMENT with empty outs — surface as a throw; caller APIs see a dead instance.
+    return spikeThrow(ctx, "native callback returned invalid status");
 }
 
 fn jscInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {

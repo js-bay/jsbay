@@ -1,6 +1,6 @@
 //! Zero-copy buffer support — wrap a caller-owned byte slice as a JS ArrayBuffer (or Uint8Array view over it) without copying the payload.
 //!
-//! Both supported backends expose a no-copy ArrayBuffer pattern natively:
+//! Analogous to napi-rs `Buffer::new(unsafe { slice::from_raw_parts_mut(...) })` with a NoCopy hint, or to V8's `ArrayBuffer::New` with a backing-store deleter callback. Both supported backends expose this pattern natively:
 //!
 //!   * QuickJS: `JS_NewArrayBuffer(ctx, buf, len, 0, realloc_func, opaque, false)`
 //!   * JSC:     `JSObjectMakeArrayBufferWithBytesNoCopy`
@@ -44,7 +44,7 @@ pub fn newArrayBufferFromBytes(
     user_data: ?*anyopaque,
 ) ?ActiveEngine.Value {
     const ctx = engine.getContext(instance_id) orelse {
-        // Instance missing. The caller's memory is still owned by them; fire the finalizer so they can release it even when allocation fails.
+        // Instance missing. The caller's memory is still owned by them; fire the finalizer so they can release it. Matches napi-rs "on failure the finalizer runs" convention.
         if (finalizer) |fin| fin(user_data, bytes, len);
         return null;
     };
@@ -69,6 +69,62 @@ pub fn newArrayBufferFromBytes(
             // jscNewArrayBufferFromBytes already JSValueProtect'd the object so it balances with the caller's freeValue.
             const v: ActiveEngine.Value = @ptrCast(obj);
             return v;
+        },
+        .escargot => {
+            const esc = @import("../backend/escargot.zig").EscargotBackend;
+            const Pack = struct {
+                fin: BufferFinalizer,
+                bytes: [*]u8,
+                len: usize,
+                user_data: ?*anyopaque,
+            };
+            const deleter_cb = struct {
+                fn call(ud: ?*anyopaque) callconv(.c) void {
+                    const pack: *Pack = @ptrCast(@alignCast(ud orelse return));
+                    pack.fin(pack.user_data, pack.bytes, pack.len);
+                    std.heap.c_allocator.destroy(pack);
+                }
+            }.call;
+            if (finalizer) |fin| {
+                const pack = std.heap.c_allocator.create(Pack) catch {
+                    fin(user_data, bytes, len);
+                    return null;
+                };
+                pack.* = .{ .fin = fin, .bytes = bytes, .len = len, .user_data = user_data };
+                const val = esc.newArrayBufferNoCopyVal(ctx, bytes[0..len], deleter_cb, pack);
+                if (val == null) return null; // bridge already ran deleter on failure
+                return val;
+            } else {
+                return esc.newArrayBufferNoCopyVal(ctx, bytes[0..len], null, null);
+            }
+        },
+        .hermes => {
+            const herm = @import("../backend/hermes.zig").HermesBackend;
+            const Pack = struct {
+                fin: BufferFinalizer,
+                bytes: [*]u8,
+                len: usize,
+                user_data: ?*anyopaque,
+            };
+            const deleter_cb = struct {
+                fn call(ud: ?*anyopaque) callconv(.c) void {
+                    const pack: *Pack = @ptrCast(@alignCast(ud orelse return));
+                    pack.fin(pack.user_data, pack.bytes, pack.len);
+                    std.heap.c_allocator.destroy(pack);
+                }
+            }.call;
+            if (finalizer) |fin| {
+                const pack = std.heap.c_allocator.create(Pack) catch {
+                    fin(user_data, bytes, len);
+                    return null;
+                };
+                pack.* = .{ .fin = fin, .bytes = bytes, .len = len, .user_data = user_data };
+                const val = herm.newArrayBufferNoCopyVal(ctx, bytes[0..len], deleter_cb, pack);
+                if (val == null) return null;
+                return val;
+            } else {
+                return herm.newArrayBufferNoCopyVal(ctx, bytes[0..len], null, null);
+            }
         },
     }
 }
@@ -105,6 +161,70 @@ pub fn newUint8ArrayFromBytes(
             const v: ActiveEngine.Value = @ptrCast(obj);
             return v;
         },
+        .escargot => {
+            const esc = @import("../backend/escargot.zig").EscargotBackend;
+            // Build ArrayBuffer then Uint8Array view; finalizer owns the AB backing store.
+            const Pack = struct {
+                fin: BufferFinalizer,
+                bytes: [*]u8,
+                len: usize,
+                user_data: ?*anyopaque,
+            };
+            const deleter_cb = struct {
+                fn call(ud: ?*anyopaque) callconv(.c) void {
+                    const pack: *Pack = @ptrCast(@alignCast(ud orelse return));
+                    pack.fin(pack.user_data, pack.bytes, pack.len);
+                    std.heap.c_allocator.destroy(pack);
+                }
+            }.call;
+            const ab = blk: {
+                if (finalizer) |fin| {
+                    const pack = std.heap.c_allocator.create(Pack) catch {
+                        fin(user_data, bytes, len);
+                        return null;
+                    };
+                    pack.* = .{ .fin = fin, .bytes = bytes, .len = len, .user_data = user_data };
+                    break :blk esc.newArrayBufferNoCopyVal(ctx, bytes[0..len], deleter_cb, pack);
+                } else {
+                    break :blk esc.newArrayBufferNoCopyVal(ctx, bytes[0..len], null, null);
+                }
+            };
+            if (ab == null) return null;
+            defer esc.freeValue(ctx, ab);
+            // kind 1 = Uint8Array; length is element count
+            return esc.newTypedArrayFromBufferVal(ctx, ab, 1, 0, len);
+        },
+        .hermes => {
+            const herm = @import("../backend/hermes.zig").HermesBackend;
+            const Pack = struct {
+                fin: BufferFinalizer,
+                bytes: [*]u8,
+                len: usize,
+                user_data: ?*anyopaque,
+            };
+            const deleter_cb = struct {
+                fn call(ud: ?*anyopaque) callconv(.c) void {
+                    const pack: *Pack = @ptrCast(@alignCast(ud orelse return));
+                    pack.fin(pack.user_data, pack.bytes, pack.len);
+                    std.heap.c_allocator.destroy(pack);
+                }
+            }.call;
+            const ab = blk: {
+                if (finalizer) |fin| {
+                    const pack = std.heap.c_allocator.create(Pack) catch {
+                        fin(user_data, bytes, len);
+                        return null;
+                    };
+                    pack.* = .{ .fin = fin, .bytes = bytes, .len = len, .user_data = user_data };
+                    break :blk herm.newArrayBufferNoCopyVal(ctx, bytes[0..len], deleter_cb, pack);
+                } else {
+                    break :blk herm.newArrayBufferNoCopyVal(ctx, bytes[0..len], null, null);
+                }
+            };
+            if (ab == null) return null;
+            defer herm.freeValue(ctx, ab);
+            return herm.newTypedArrayFromBufferVal(ctx, ab, 1, 0, len);
+        },
     }
 }
 
@@ -121,6 +241,45 @@ pub fn getBufferView(instance_id: i32, value: ActiveEngine.Value) ?BufferView {
             const jsc_mod = @import("../backend/jsc.zig");
             const v = jsc_mod.jscGetBufferView(@ptrCast(ctx), value) orelse return null;
             return .{ .ptr = v.ptr, .len = v.len };
+        },
+        .escargot => {
+            const esc = @import("../backend/escargot.zig").EscargotBackend;
+            if (esc.isArrayBufferVal(ctx, value)) {
+                const slice = esc.getArrayBufferSliceVal(ctx, value) orelse return null;
+                return .{ .ptr = slice.ptr, .len = slice.len };
+            }
+            if (esc.isTypedArrayVal(ctx, value)) {
+                const info = esc.getTypedArrayBytesVal(ctx, value) orelse return null;
+                return .{ .ptr = info.bytes.ptr, .len = info.byte_length };
+            }
+            // DataView
+            const c_api = @import("../backend/escargot/c_api.zig");
+            if (c_api.escargot_is_data_view(value)) {
+                var off: usize = 0;
+                var len: usize = 0;
+                const ptr = c_api.escargot_data_view_data(ctx, value, &off, &len) orelse return null;
+                return .{ .ptr = ptr, .len = len };
+            }
+            return null;
+        },
+        .hermes => {
+            const herm = @import("../backend/hermes.zig").HermesBackend;
+            if (herm.isArrayBufferVal(ctx, value)) {
+                const slice = herm.getArrayBufferSliceVal(ctx, value) orelse return null;
+                return .{ .ptr = slice.ptr, .len = slice.len };
+            }
+            if (herm.isTypedArrayVal(ctx, value)) {
+                const info = herm.getTypedArrayBytesVal(ctx, value) orelse return null;
+                return .{ .ptr = info.bytes.ptr, .len = info.byte_length };
+            }
+            const c_api = @import("../backend/hermes/c_api.zig");
+            if (c_api.hermes_is_data_view(ctx, value)) {
+                var off: usize = 0;
+                var len: usize = 0;
+                const ptr = c_api.hermes_data_view_data(ctx, value, &off, &len) orelse return null;
+                return .{ .ptr = ptr, .len = len };
+            }
+            return null;
         },
     }
 }
@@ -140,6 +299,10 @@ fn bufferObjectKey(value: ActiveEngine.Value) ?usize {
             return @intFromPtr(value.u.ptr);
         },
         .jsc => {
+            const ptr = value orelse return null;
+            return @intFromPtr(ptr);
+        },
+        .escargot, .hermes => {
             const ptr = value orelse return null;
             return @intFromPtr(ptr);
         },

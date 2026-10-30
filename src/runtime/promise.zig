@@ -24,7 +24,7 @@
 //!
 //! `state` / `result` report pending, fulfilled, or rejected. On QuickJS that is `JS_PromiseState` / `JS_PromiseResult` (result fails while pending). On JSC the public C API cannot read promise state, so the record is the one written by `create` / `resolve` / `reject`.
 //!
-//! `setRejectionTracker` registers a per-instance host callback. QuickJS uses `JS_SetHostPromiseRejectionTracker` and reports an unhandled rejection only after the current microtask drain. A synchronous `.catch` therefore does not notify; a later `.catch` notifies with `handled=true`. JSC's public C API has no equivalent hook, so the call returns false.
+//! `setRejectionTracker` registers a per-instance host callback. QuickJS uses `JS_SetHostPromiseRejectionTracker`; Escargot uses `VMInstanceRef::registerPromiseRejectCallback`. Both report an unhandled rejection only after the current microtask drain. A synchronous `.catch` therefore does not notify; a later `.catch` notifies with `handled=true`. JSC has no equivalent public hook (returns false). Hermes uses HermesInternal.enablePromiseRejectionTracker plus a host flush after microtask drain (Escargot-style).
 
 const std = @import("std");
 const backend = @import("../backend.zig");
@@ -102,8 +102,15 @@ pub const Deferred = struct {
         ActiveEngine.processPendingJobs(ctx);
 
         self.settled = true;
-        if (backend.active_backend == .jsc and call_ok) {
+        if (backend.isJscApiBackend(backend.active_backend) and call_ok) {
             noteJscSettlement(ctx, self.instance_id, self.promise, slot == &self.resolve_fn, value);
+        }
+        if (comptime backend.active_backend == .hermes) {
+            if (call_ok) {
+                const c = @import("../backend/hermes/c_api.zig");
+                const st: c_int = if (slot == &self.resolve_fn) 1 else 2;
+                c.hermes_promise_note_settled(ctx, self.promise, st, value);
+            }
         }
         // Release the resolving callbacks but keep `promise_keep` alive — the caller may still be holding `self.promise` (e.g. it was already returned to JS, but the Deferred remains on their stack until deinit).
         self.resolve_fn.reset();
@@ -120,7 +127,7 @@ pub const Deferred = struct {
 
     /// Release the promise Local and any still-held resolving callbacks. Safe to call multiple times, and safe if the promise was already settled.
     pub fn deinit(self: *Deferred) void {
-        if (backend.active_backend == .jsc) {
+        if (backend.isJscApiBackend(backend.active_backend)) {
             if (ctxFor(self.instance_id)) |ctx| forgetJscPromise(ctx, self.promise);
         }
         self.promise_keep.reset();
@@ -163,6 +170,8 @@ pub fn state(instance_id: i32, value: Local) ?PromiseState {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => return quickjsPromiseState(ctx, value),
         .jsc => return jscPromiseState(value),
+        .escargot => return escargotPromiseState(ctx, value),
+        .hermes => return hermesPromiseState(ctx, value),
     }
 }
 
@@ -174,6 +183,8 @@ pub fn result(instance_id: i32, value: Local) ?Local {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => return quickjsPromiseResult(ctx, value),
         .jsc => return jscPromiseResult(ctx, value),
+        .escargot => return escargotPromiseResult(ctx, value),
+        .hermes => return hermesPromiseResult(ctx, value),
     }
 }
 
@@ -186,7 +197,7 @@ pub const RejectionTracker = *const fn (
     userdata: ?*anyopaque,
 ) callconv(.c) void;
 
-/// Register `tracker` for `instance_id`. Pass `null` to unregister. Returns false on JSC: the public C API has no rejection-tracker hook, and this function does not invent one.
+/// Register `tracker` for `instance_id`. Pass `null` to unregister. Returns false on JSC. Hermes installs HermesInternal.enablePromiseRejectionTracker (plus module-shim reports). Escargot uses `registerPromiseRejectCallback`.
 pub fn setRejectionTracker(instance_id: i32, tracker: ?RejectionTracker, userdata: ?*anyopaque) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
@@ -196,6 +207,18 @@ pub fn setRejectionTracker(instance_id: i32, tracker: ?RejectionTracker, userdat
             return true;
         },
         .jsc => return false,
+        .escargot => {
+            const ctx = ctxFor(instance_id) orelse return false;
+            const c = @import("../backend/escargot/c_api.zig");
+            // RejectionTracker and EscargotRejectionTrackerFn share the C callconv layout.
+            c.escargot_set_rejection_tracker(ctx, instance_id, tracker, userdata);
+            return true;
+        },
+        .hermes => {
+            const ctx = ctxFor(instance_id) orelse return false;
+            const c = @import("../backend/hermes/c_api.zig");
+            return c.hermes_set_rejection_tracker(ctx, instance_id, tracker, userdata);
+        },
     }
 }
 
@@ -212,6 +235,8 @@ fn backendCreate(instance_id: i32, ctx: ActiveEngine.Context) ?Deferred {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => return quickjsCreate(instance_id, ctx),
         .jsc => return jscCreate(instance_id, ctx),
+        .escargot => return escargotCreate(instance_id, ctx),
+        .hermes => return hermesCreate(instance_id, ctx),
     }
 }
 
@@ -219,6 +244,14 @@ fn backendIsPromise(ctx: ActiveEngine.Context, value: Local) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => return quickjsIsPromise(ctx, value),
         .jsc => return jscIsPromise(ctx, value),
+        .escargot => {
+            const c = @import("../backend/escargot/c_api.zig");
+            return c.escargot_is_promise(ctx, value);
+        },
+        .hermes => {
+            const c = @import("../backend/hermes/c_api.zig");
+            return c.hermes_is_promise(ctx, value);
+        },
     }
 }
 
@@ -378,17 +411,109 @@ fn jscPromiseResult(ctx: ActiveEngine.Context, value: Local) ?Local {
 }
 
 fn noteJscSettlement(ctx: ActiveEngine.Context, instance_id: i32, promise: Local, fulfilled: bool, value: Local) void {
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const eh = @import("../backend/jsc/error_handling.zig");
     eh.jscPromiseNote(
         @ptrCast(ctx),
         instance_id,
-        promise,
+        @ptrCast(promise),
         if (fulfilled) .fulfilled else .rejected,
-        value,
+        @ptrCast(value),
     );
 }
 
 fn forgetJscPromise(ctx: ActiveEngine.Context, promise: Local) void {
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const eh = @import("../backend/jsc/error_handling.zig");
-    eh.jscPromiseForget(@ptrCast(ctx), promise);
+    eh.jscPromiseForget(@ptrCast(ctx), @ptrCast(promise));
+}
+
+
+fn escargotCreate(instance_id: i32, ctx: ActiveEngine.Context) ?Deferred {
+    const c = @import("../backend/escargot/c_api.zig");
+    var promise: c.Value = null;
+    var resolve: c.Value = null;
+    var reject: c.Value = null;
+    if (!c.escargot_promise_create(ctx, &promise, &resolve, &reject)) return null;
+    var resolve_g = GlobalLocal.init(instance_id, resolve);
+    var reject_g = GlobalLocal.init(instance_id, reject);
+    var promise_keep = GlobalLocal.init(instance_id, promise);
+    // Global.init dups; free the bridge-retained locals.
+    ActiveEngine.freeValue(ctx, resolve);
+    ActiveEngine.freeValue(ctx, reject);
+    ActiveEngine.freeValue(ctx, promise);
+    if (resolve_g.isEmpty() or reject_g.isEmpty() or promise_keep.isEmpty()) {
+        resolve_g.reset();
+        reject_g.reset();
+        promise_keep.reset();
+        return null;
+    }
+    return Deferred{
+        .instance_id = instance_id,
+        .promise = promise,
+        .promise_keep = promise_keep,
+        .resolve_fn = resolve_g,
+        .reject_fn = reject_g,
+    };
+}
+
+fn escargotPromiseState(ctx: ActiveEngine.Context, value: Local) ?PromiseState {
+    const c = @import("../backend/escargot/c_api.zig");
+    return switch (c.escargot_promise_state(ctx, value)) {
+        0 => .pending,
+        1 => .fulfilled,
+        2 => .rejected,
+        else => null,
+    };
+}
+
+fn escargotPromiseResult(ctx: ActiveEngine.Context, value: Local) ?Local {
+    const c = @import("../backend/escargot/c_api.zig");
+    const st = c.escargot_promise_state(ctx, value);
+    if (st != 1 and st != 2) return null;
+    return c.escargot_promise_result(ctx, value);
+}
+
+fn hermesCreate(instance_id: i32, ctx: ActiveEngine.Context) ?Deferred {
+    const c = @import("../backend/hermes/c_api.zig");
+    var promise: c.Value = null;
+    var resolve: c.Value = null;
+    var reject: c.Value = null;
+    if (!c.hermes_promise_create(ctx, &promise, &resolve, &reject)) return null;
+    var resolve_g = GlobalLocal.init(instance_id, resolve);
+    var reject_g = GlobalLocal.init(instance_id, reject);
+    var promise_keep = GlobalLocal.init(instance_id, promise);
+    ActiveEngine.freeValue(ctx, resolve);
+    ActiveEngine.freeValue(ctx, reject);
+    ActiveEngine.freeValue(ctx, promise);
+    if (resolve_g.isEmpty() or reject_g.isEmpty() or promise_keep.isEmpty()) {
+        resolve_g.reset();
+        reject_g.reset();
+        promise_keep.reset();
+        return null;
+    }
+    return Deferred{
+        .instance_id = instance_id,
+        .promise = promise,
+        .promise_keep = promise_keep,
+        .resolve_fn = resolve_g,
+        .reject_fn = reject_g,
+    };
+}
+
+fn hermesPromiseState(ctx: ActiveEngine.Context, value: Local) ?PromiseState {
+    const c = @import("../backend/hermes/c_api.zig");
+    return switch (c.hermes_promise_state(ctx, value)) {
+        0 => .pending,
+        1 => .fulfilled,
+        2 => .rejected,
+        else => null,
+    };
+}
+
+fn hermesPromiseResult(ctx: ActiveEngine.Context, value: Local) ?Local {
+    const c = @import("../backend/hermes/c_api.zig");
+    const st = c.hermes_promise_state(ctx, value);
+    if (st != 1 and st != 2) return null;
+    return c.hermes_promise_result(ctx, value);
 }

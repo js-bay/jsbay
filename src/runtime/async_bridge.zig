@@ -162,12 +162,10 @@ fn abortReason(instance_id: i32, lease: engine_thread.EvalLease) ?AwaitError {
     if (instance_map.isTeardownPending(instance_id) or engine_thread.deferredDestroyRequested(lease)) {
         return error.InstanceGone;
     }
-    // Stop bit first. `isInterruptRequested` is user-bit only so a stop that races in between these checks cannot be misreported as Interrupted.
     if (runtime_control.isStopRequested(instance_id)) return error.InstanceGone;
     if (runtime_control.remainingExecutionLimitMillis(instance_id)) |remaining| {
         if (remaining == 0) return error.TimedOut;
     }
-    if (runtime_control.isStopRequested(instance_id)) return error.InstanceGone;
     if (runtime_control.isInterruptRequested(instance_id)) return error.Interrupted;
     return null;
 }
@@ -213,6 +211,7 @@ fn deleteGlobalProperty(ctx: ActiveEngine.Context, global: ActiveEngine.Value, k
             var exception: jsc_mod.jsc.JSValueRef = null;
             _ = jsc_mod.jsc.JSObjectDeleteProperty(@ptrCast(ctx), @ptrCast(@constCast(global)), property, &exception);
         },
+        .escargot, .hermes => {},
     }
 }
 

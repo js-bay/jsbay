@@ -135,6 +135,43 @@ pub fn newError(
             _ = jsc_mod.jsc.JSValueProtect(ctx_ref, v);
             return v;
         },
+        .escargot => {
+            const c_api = @import("../backend/escargot/c_api.zig");
+            // Must match escargot_new_error switch (not ErrorObjectRef::Code ordinal).
+            const kind_i: c_int = switch (kind) {
+                .type_error => 1,
+                .range_error => 2,
+                .reference_error => 3,
+                .syntax_error => 4,
+                .uri_error => 5,
+                .eval_error => 6,
+                .aggregate_error => 8,
+                .generic, .internal_error, .unknown => 0,
+            };
+            var buf: [1024]u8 = undefined;
+            if (message.len >= buf.len) return null;
+            @memcpy(buf[0..message.len], message);
+            buf[message.len] = 0;
+            return c_api.escargot_new_error(ctx, kind_i, @ptrCast(&buf));
+        },
+        .hermes => {
+            const c_api = @import("../backend/hermes/c_api.zig");
+            const kind_i: c_int = switch (kind) {
+                .type_error => 1,
+                .range_error => 2,
+                .reference_error => 3,
+                .syntax_error => 4,
+                .uri_error => 5,
+                .eval_error => 6,
+                .aggregate_error => 8,
+                .generic, .internal_error, .unknown => 0,
+            };
+            var buf: [1024]u8 = undefined;
+            if (message.len >= buf.len) return null;
+            @memcpy(buf[0..message.len], message);
+            buf[message.len] = 0;
+            return c_api.hermes_new_error(ctx, kind_i, @ptrCast(&buf));
+        },
     }
 }
 
@@ -155,6 +192,14 @@ pub fn inspectError(
         .jsc => blk: {
             const jsc_mod = @import("../backend/jsc.zig");
             break :blk jsc_mod.jscIsError(@ptrCast(ctx), value);
+        },
+        .escargot => blk: {
+            const c_api = @import("../backend/escargot/c_api.zig");
+            break :blk c_api.escargot_is_error(value);
+        },
+        .hermes => blk: {
+            const c_api = @import("../backend/hermes/c_api.zig");
+            break :blk c_api.hermes_is_error(ctx, value);
         },
     };
     if (!is_err) return null;
@@ -228,6 +273,20 @@ pub fn throwError(instance_id: i32, kind: JsErrorKind, message: []const u8) bool
             };
             const out: [*c]jsc_mod.jsc.JSValueRef = @ptrCast(@alignCast(slot));
             out[0] = obj;
+            return true;
+        },
+        .escargot, .hermes => {
+            // pending_throw is message-only (Escargot trampoline → TypeError;
+            // Hermes → `throw new Error(...)`). `kind` is honored on QJS/JSC arms only.
+            var buf: [1024]u8 = undefined;
+            if (message.len >= buf.len) return false;
+            @memcpy(buf[0..message.len], message);
+            buf[message.len] = 0;
+            switch (backend.active_backend) {
+                .escargot => @import("../backend/escargot/c_api.zig").escargot_throw(ctx, @ptrCast(&buf)),
+                .hermes => @import("../backend/hermes/c_api.zig").hermes_throw(ctx, @ptrCast(&buf)),
+                else => return false,
+            }
             return true;
         },
     }

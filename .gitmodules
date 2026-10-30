@@ -4,3 +4,9 @@
 [submodule "vendor/quickjs-ng"]
 	path = vendor/quickjs-ng
 	url = https://github.com/quickjs-ng/quickjs.git
+[submodule "vendor/escargot"]
+	path = vendor/escargot
+	url = https://github.com/Samsung/escargot.git
+[submodule "vendor/hermes"]
+	path = vendor/hermes
+	url = https://github.com/facebook/hermes.git

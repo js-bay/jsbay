@@ -12,6 +12,8 @@
 //! Backend notes:
 //! - QuickJS: full native support via `JS_SetInterruptHandler`. The JS VM throws an InternalError on the next interrupt check.
 //! - JSC: uses the private `JSContextGroupSetExecutionTimeLimit` API (symbol ships in JavaScriptCore.framework, even though the public header hides it). The system JSC build exercised here needs the callback to explicitly re-arm its next 50ms check after it returns false, despite the upstream header documenting automatic continuation. This keeps `requestInterrupt` and execution deadlines responsive there. `runGc` uses the public `JSGarbageCollect` and is reliable on all JSC builds. Memory usage is not queryable through JSC's public C API and is reported as zeros.
+//! - Escargot: `runGc` → `Memory::gc`. Soft `getMemoryUsage` via `Memory::heapSize`/`totalSize` (bdwgc; not QJS-shaped). No public heap cap (`setMemoryLimit` false). No mid-script interrupt in EscargotPublic.h (this pin) — permanent gap. `init` installs nothing.
+//! - Hermes: `runGc` via `instrumentation().collectGarbage`. Soft `getMemoryUsage` via `getHeapInfo` (`hermes_allocatedBytes`/`hermes_heapSize`). `setMemoryLimit` false (use EngineConfig.max_heap_size / -Dhermes-max-heap at create; GCConfig.MaxHeapSize create-time only). User `requestInterrupt` sets a bit only (does **not** call `asyncTriggerTimeout` — sticky Timeout AsyncBreak would poison later evals); mid-script abort is via stop/destroy → `requestStopInterrupt` + softRearm/drain. Escargot: bit only, **no** mid-script abort.
 
 const std = @import("std");
 const io = @import("../platform/io.zig");
@@ -94,44 +96,21 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     };
     registry_mutex.unlock();
 
-    switch (inst.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                // Safe: the two extern structs have identical layout.
-                const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
-                qjs_mod.qjsInstallInterruptHandler(m.runtime, qjs_state);
-            },
-            .jsc => {
-                const jsc_mod = @import("../backend/jsc.zig");
-                const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
-                // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
-                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
-                jsc_mod.jscInstallInterruptHandler(group, jsc_state);
-            },
+    switch (backend.active_backend) {
+        .quickjs, .quickjs_ng => {
+            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+            // Safe: the two extern structs have identical layout.
+            const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
+            qjs_mod.qjsInstallInterruptHandler(inst.runtime, qjs_state);
         },
-        .packed_alt => |a| {
-            // Dispatch by the instance backend so non-primary packs get interrupt/time-limit handlers too.
-            inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
-                if (a.tag == cand) {
-                    if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) return false;
-                    if (comptime backend.isQuickJsApiBackend(cand)) {
-                        const E = backend.Engine(cand);
-                        const Mod = backend.EngineModule(cand);
-                        const qjs_state: *Mod.QjsInterruptState = @ptrCast(state);
-                        const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
-                        Mod.qjsInstallInterruptHandler(rt, qjs_state);
-                    } else {
-                        const jsc_mod = @import("../backend/jsc.zig");
-                        const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
-                        const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
-                        const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
-                        jsc_mod.jscInstallInterruptHandler(group, jsc_state);
-                    }
-                    break;
-                }
-            } else return false;
+        .jsc => {
+            const jsc_mod = @import("../backend/jsc.zig");
+            const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
+            // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
+            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.ctx));
+            jsc_mod.jscInstallInterruptHandler(group, jsc_state);
         },
+        .escargot, .hermes => {},
     }
 
     return true;
@@ -145,37 +124,17 @@ pub fn deinit(instance_id: i32) bool {
 
     // Uninstall from the backend BEFORE freeing the state — otherwise the JS thread could read freed memory if it fires a check between takeState and here.
     if (inst_opt) |inst| {
-        switch (inst.engine_handles) {
-            .mono => |m| switch (backend.active_backend) {
-                .quickjs, .quickjs_ng => {
-                    const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                    qjs_mod.qjsUninstallInterruptHandler(m.runtime);
-                },
-                .jsc => {
-                    const jsc_mod = @import("../backend/jsc.zig");
-                    const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
-                    jsc_mod.jscUninstallInterruptHandler(group);
-                },
+        switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                qjs_mod.qjsUninstallInterruptHandler(inst.runtime);
             },
-            .packed_alt => |a| {
-                inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
-                    if (a.tag == cand) {
-                        if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) break;
-                        if (comptime backend.isQuickJsApiBackend(cand)) {
-                            const E = backend.Engine(cand);
-                            const Mod = backend.EngineModule(cand);
-                            const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
-                            Mod.qjsUninstallInterruptHandler(rt);
-                        } else {
-                            const jsc_mod = @import("../backend/jsc.zig");
-                            const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
-                            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
-                            jsc_mod.jscUninstallInterruptHandler(group);
-                        }
-                        break;
-                    }
-                }
+            .jsc => {
+                const jsc_mod = @import("../backend/jsc.zig");
+                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.ctx));
+                jsc_mod.jscUninstallInterruptHandler(group);
             },
+            .escargot, .hermes => {},
         }
     }
 
@@ -183,10 +142,76 @@ pub fn deinit(instance_id: i32) bool {
     return true;
 }
 
+
+fn hermesTriggerTimeout(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const inst = instance_map.getInstance(instance_id) orelse return;
+    const her = @import("../backend/hermes.zig");
+    her.c_api_mod.hermes_runtime_async_trigger_timeout(inst.runtime);
+}
+
+fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const inst = instance_map.getInstance(instance_id) orelse return;
+    const her = @import("../backend/hermes.zig");
+    if (millis == 0) {
+        her.c_api_mod.hermes_runtime_unwatch_time_limit(inst.runtime);
+        return;
+    }
+    const capped: u32 = if (millis > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(millis);
+    her.c_api_mod.hermes_runtime_watch_time_limit(inst.runtime, capped);
+}
+
+fn hermesDrainAsyncTimeout(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const inst = instance_map.getInstance(instance_id) orelse return;
+    const her = @import("../backend/hermes.zig");
+    her.c_api_mod.hermes_runtime_drain_async_timeout(inst.runtime);
+}
+
+/// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from
+/// requestStopInterrupt (destroy/stop) therefore kills finite work after a host
+/// callback (`hostDestroy(); 42`). Call from the host trampoline on the way back
+/// into JS: clear sticky bits on every eval-active instance on this thread
+/// (nested destroy can arm outer frames too), then arm a short watch so loops
+/// still abort soon.
+pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const et = @import("engine_thread.zig");
+    rearmOneHermesStop(instance_id);
+    et.forEachEvalActiveOnCurrentThread(rearmOneHermesStop);
+}
+
+fn rearmOneHermesStop(instance_id: i32) void {
+    if (!isStopRequested(instance_id)) return;
+    hermesDrainAsyncTimeout(instance_id);
+    hermesWatchTimeLimit(instance_id, 25);
+}
+
 /// Request that the JS runtime interrupt execution on the next interrupt check. Thread-safe. Returns false if the instance was never init()'d or has been deinit()'d.
 ///
 /// After the script throws, call `clearInterrupt` to reset the flag.
+/// True when `requestInterrupt` can abort mid-script JS (QuickJS/NG via interrupt handler; JSC via time-limit callback).
+/// Escargot/Hermes spikes: false — user interrupt must not be advertised as mid-script cancel.
+pub fn supportsMidScriptUserInterrupt() bool {
+    return switch (backend.active_backend) {
+        .quickjs, .quickjs_ng, .jsc => true,
+        .escargot, .hermes => false,
+    };
+}
+
+/// Request mid-script interrupt when the backend supports it.
+/// Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed).
+/// Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is
+/// stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
+    if (!supportsMidScriptUserInterrupt()) {
+        // Refuse to claim mid-script stop. Do not set the user bit (avoids false isInterruptRequested).
+        registry_mutex.lock();
+        defer registry_mutex.unlock();
+        _ = registry.get(instance_id) orelse return false;
+        return false;
+    }
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
@@ -198,29 +223,45 @@ pub fn requestInterrupt(instance_id: i32) bool {
 /// Clear a pending user interrupt. Lifecycle shutdown owns a separate bit, so this cannot resume a script that is being stopped.
 pub fn clearInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const state = registry.get(instance_id) orelse return false;
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchAnd(~@as(u8, 1), .monotonic);
+    registry_mutex.unlock();
+    // Unwatch only — do not evaluate here (may race a live mid-script eval).
+    // Sticky Timeout AsyncBreak from stop/destroy is drained in clearStopInterrupt after join.
+    hermesWatchTimeLimit(instance_id, 0);
     return true;
 }
 
 /// Request an interrupt owned by lifecycle shutdown without clearing a caller's explicit interrupt request or a configured deadline.
 pub fn requestStopInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const state = registry.get(instance_id) orelse return false;
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchOr(2, .monotonic);
+    registry_mutex.unlock();
+    hermesTriggerTimeout(instance_id);
     return true;
 }
 
 pub fn clearStopInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const state = registry.get(instance_id) orelse return false;
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchAnd(~@as(u8, 2), .monotonic);
+    registry_mutex.unlock();
+    // threadStop → requestStopInterrupt → asyncTriggerTimeout is sticky on Hermes.
+    hermesWatchTimeLimit(instance_id, 0);
+    hermesDrainAsyncTimeout(instance_id);
     return true;
 }
 
@@ -240,6 +281,9 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     // Saturate instead of wrapping: an absurdly large `millis` must mean "effectively no deadline", never wrap to an already-expired one.
     const deadline = std.math.add(u64, now, millis) catch std.math.maxInt(u64);
     p.store(deadline, .monotonic);
+    // Hermes: do not arm IHermes watchTimeLimit here — an expired watch stays sticky and
+    // poisons later evals. Deadlines are enforced at job/sync wait boundaries via deadline_ms;
+    // mid-script cancel uses requestInterrupt → asyncTriggerTimeout.
     return true;
 }
 
@@ -263,7 +307,6 @@ pub fn executionDeadlineMillis(instance_id: i32) ?u64 {
     return if (deadline == 0) null else deadline;
 }
 
-/// True when a caller-requested interrupt bit is set. Lifecycle stop uses a separate bit (`isStopRequested`); do not treat stop as a user interrupt — waiters must report teardown as instance-gone.
 pub fn isInterruptRequested(instance_id: i32) bool {
     registry_mutex.lock();
     const state = registry.get(instance_id) orelse {
@@ -271,7 +314,7 @@ pub fn isInterruptRequested(instance_id: i32) bool {
         return false;
     };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
-    const requested = (p.load(.monotonic) & 1) != 0;
+    const requested = p.load(.monotonic) != 0;
     registry_mutex.unlock();
     return requested;
 }
@@ -292,56 +335,48 @@ pub fn isStopRequested(instance_id: i32) bool {
 /// Force a GC pass on the runtime. Must be called on the engine's owning thread. Returns false if the instance was never created.
 pub fn runGc(instance_id: i32) bool {
     const inst = instance_map.getInstance(instance_id) orelse return false;
-    switch (inst.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsRunGc(m.runtime);
-            },
-            .jsc => {
-                const jsc_mod = @import("../backend/jsc.zig");
-                jsc_mod.jscRunGc(@ptrCast(m.ctx));
-            },
+    switch (backend.active_backend) {
+        .quickjs, .quickjs_ng => {
+            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+            qjs_mod.qjsRunGc(inst.runtime);
         },
-        .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
-            .runtime_addr = a.runtime_addr,
-            .ctx_addr = a.ctx_addr,
-        }),
+        .jsc => {
+            const jsc_mod = @import("../backend/jsc.zig");
+            jsc_mod.jscRunGc(inst.ctx);
+        },
+        .escargot => {
+            const esc = @import("../backend/escargot.zig");
+            esc.EscargotBackend.runGc(inst.runtime);
+        },
+        .hermes => {
+            const her = @import("../backend/hermes.zig");
+            // Bridge stub today; still invoke so the host path is wired.
+            her.HermesBackend.runGc(inst.runtime);
+        },
     }
     return true;
 }
 
-/// Cap the QuickJS-managed heap of this runtime at `bytes` (0 = unlimited). This does not cap allocations outside QuickJS, so it is not a process-RSS limit. Must be called on the engine's owning thread before the script it should bound runs. QuickJS: enforced via `JS_SetMemoryLimit` (GC is triggered on the next allocation past the cap). JSC: no public C API exists, so this operation is unsupported and returns false. Returns false when the instance was never created.
+/// Cap the QuickJS-managed heap of this runtime at `bytes` (0 = unlimited). This does not cap allocations outside QuickJS, so it is not a process-RSS limit. Must be called on the engine's owning thread before the script it should bound runs. QuickJS: enforced via `JS_SetMemoryLimit` (GC is triggered on the next allocation past the cap). JSC / Escargot / Hermes: no public per-runtime heap-cap API — returns false (do not claim an unenforced cap). Returns false when the instance was never created.
 pub fn setMemoryLimit(instance_id: i32, bytes: u64) bool {
     const inst = instance_map.getInstance(instance_id) orelse return false;
-    switch (inst.engine_handles) {
-        // Comptime switch: do not call ActiveEngineModule.qjs* when primary is JSC (Zig still typechecks the dead runtime `if`).
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsSetMemoryLimit(m.runtime, @intCast(bytes));
-                return true;
-            },
-            .jsc => return false,
+    switch (backend.active_backend) {
+        .quickjs, .quickjs_ng => {
+            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+            qjs_mod.qjsSetMemoryLimit(inst.runtime, @intCast(bytes));
         },
-        .packed_alt => |a| {
-            if (!backend.isQuickJsApiBackend(a.tag)) return false;
-            inline for (.{ .quickjs_ng, .quickjs }) |cand| {
-                if (a.tag == cand) {
-                    // Gate EngineModule imports on pack membership so mono-JSC builds do not pull qjs.
-                    if (comptime backend.isPacked(cand) or cand == backend.active_backend) {
-                        const E = backend.Engine(cand);
-                        const Mod = backend.EngineModule(cand);
-                        const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
-                        Mod.qjsSetMemoryLimit(rt, @intCast(bytes));
-                        return true;
-                    }
-                    return false;
-                }
-            }
+        .jsc => {
+            // No public JSC heap-cap API. Do not claim an unenforced cap.
+            return false;
+        },
+        .escargot, .hermes => {
+            // Escargot: Memory::* has GC/heapSize only — no setMemoryLimit.
+            // Hermes: GCConfig.MaxHeapSize is create-time only; no runtime setMemoryLimit.
+            // Do not claim an unenforced cap.
             return false;
         },
     }
+    return true;
 }
 
 /// Ask for one idle collection. Does not collect now and does not retain the JS runtime — `engine.destroy` can still free it while the request is queued. Extra requests before the next idle collection collapse into a single pending collection (one idle pass drains the whole queue). Returns false if the instance does not exist.
@@ -390,21 +425,23 @@ pub fn noteIdle(instance_id: i32) bool {
 
     // Resolve the runtime again after the lock. A destroy that won the race must not be followed by a GC on a freed runtime.
     const live = instance_map.getInstance(instance_id) orelse return false;
-    switch (live.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsRunGc(m.runtime);
-            },
-            .jsc => {
-                const jsc_mod = @import("../backend/jsc.zig");
-                jsc_mod.jscRunGc(@ptrCast(m.ctx));
-            },
+    switch (backend.active_backend) {
+        .quickjs, .quickjs_ng => {
+            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+            qjs_mod.qjsRunGc(live.runtime);
         },
-        .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
-            .runtime_addr = a.runtime_addr,
-            .ctx_addr = a.ctx_addr,
-        }),
+        .jsc => {
+            const jsc_mod = @import("../backend/jsc.zig");
+            jsc_mod.jscRunGc(live.ctx);
+        },
+        .escargot => {
+            const esc = @import("../backend/escargot.zig");
+            esc.EscargotBackend.runGc(live.runtime);
+        },
+        .hermes => {
+            const her = @import("../backend/hermes.zig");
+            her.HermesBackend.runGc(live.runtime);
+        },
     }
     return true;
 }
@@ -417,7 +454,7 @@ pub fn idleCollectionCount(instance_id: i32) u64 {
     return slot.collections;
 }
 
-/// Wall-clock gap after an idle collection during which `noteIdle` will not collect again. Long enough that back-to-back test calls stay inside it.
+/// Wall-clock gap after an idle collection during which `noteIdle` will not collect again. Long enough that back-to-back test calls stay inside it; not a Hermes entry-budget.
 const idle_cooldown_ms: u64 = 5_000;
 
 const IdleSlot = struct {
@@ -450,52 +487,47 @@ fn idleSlot(instance_id: i32) ?*IdleSlot {
 /// Snapshot memory usage. Returns null if the instance was never created. Backends that don't expose memory stats populate zeros.
 pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
     const inst = instance_map.getInstance(instance_id) orelse return null;
-    switch (inst.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                const snap = qjs_mod.qjsMemoryUsage(m.runtime);
-                return .{
-                    .malloc_count = snap.malloc_count,
-                    .malloc_size = snap.malloc_size,
-                    .malloc_limit = snap.malloc_limit,
-                    .memory_used_count = snap.memory_used_count,
-                    .memory_used_size = snap.memory_used_size,
-                    .atom_count = snap.atom_count,
-                    .atom_size = snap.atom_size,
-                    .obj_count = snap.obj_count,
-                    .obj_size = snap.obj_size,
-                    .shape_count = snap.shape_count,
-                };
-            },
-            .jsc => return .{},
+    switch (backend.active_backend) {
+        .quickjs, .quickjs_ng => {
+            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+            const snap = qjs_mod.qjsMemoryUsage(inst.runtime);
+            return .{
+                .malloc_count = snap.malloc_count,
+                .malloc_size = snap.malloc_size,
+                .malloc_limit = snap.malloc_limit,
+                .memory_used_count = snap.memory_used_count,
+                .memory_used_size = snap.memory_used_size,
+                .atom_count = snap.atom_count,
+                .atom_size = snap.atom_size,
+                .obj_count = snap.obj_count,
+                .obj_size = snap.obj_size,
+                .shape_count = snap.shape_count,
+            };
         },
-        .packed_alt => |a| {
-            if (!backend.isQuickJsApiBackend(a.tag)) return .{};
-            inline for (.{ .quickjs_ng, .quickjs }) |cand| {
-                if (a.tag == cand) {
-                    if (comptime backend.isPacked(cand) or cand == backend.active_backend) {
-                        const E = backend.Engine(cand);
-                        const Mod = backend.EngineModule(cand);
-                        const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
-                        const snap = Mod.qjsMemoryUsage(rt);
-                        return .{
-                            .malloc_count = snap.malloc_count,
-                            .malloc_size = snap.malloc_size,
-                            .malloc_limit = snap.malloc_limit,
-                            .memory_used_count = snap.memory_used_count,
-                            .memory_used_size = snap.memory_used_size,
-                            .atom_count = snap.atom_count,
-                            .atom_size = snap.atom_size,
-                            .obj_count = snap.obj_count,
-                            .obj_size = snap.obj_size,
-                            .shape_count = snap.shape_count,
-                        };
-                    }
-                    return .{};
-                }
-            }
+        .jsc => {
+            // JSC's public C API does not expose heap introspection. Returning all-zeros keeps the API shape consistent.
             return .{};
+        },
+        .escargot => {
+            // Soft approximation: bdwgc heapSize/totalSize (not QJS malloc_* shape).
+            const esc = @import("../backend/escargot.zig");
+            const heap = esc.c_api_mod.escargot_runtime_heap_size(inst.runtime);
+            const total = esc.c_api_mod.escargot_runtime_total_size(inst.runtime);
+            return .{
+                .malloc_size = heap,
+                .memory_used_size = total,
+            };
+        },
+        .hermes => {
+            // Soft approximation: JSI instrumentation getHeapInfo.
+            const her = @import("../backend/hermes.zig");
+            const allocated = her.c_api_mod.hermes_runtime_allocated_bytes(inst.runtime);
+            const heap = her.c_api_mod.hermes_runtime_heap_size(inst.runtime);
+            return .{
+                .malloc_size = allocated,
+                .memory_used_size = heap,
+            };
         },
     }
 }
+

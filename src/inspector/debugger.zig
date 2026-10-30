@@ -479,24 +479,10 @@ fn registerScript(instance_id: i32, url: []const u8, source: []const u8) u32 {
     };
     binding.active_script_id = id;
     binding.script_bytes += scriptStorageBytes(stored);
-    // Stable front eviction: free a prefix once, then compact remaining scripts in place.
-    var remove_count: usize = 0;
-    var retained_bytes = binding.script_bytes;
-    while (binding.scripts.items.len - remove_count > 1 and
-        (binding.scripts.items.len - remove_count > max_retained_scripts or retained_bytes > max_retained_source_bytes))
-    {
-        retained_bytes -= scriptStorageBytes(binding.scripts.items[remove_count]);
-        remove_count += 1;
-    }
-    if (remove_count != 0) {
-        for (binding.scripts.items[0..remove_count]) |evicted| freeScript(evicted);
-        const remain = binding.scripts.items[remove_count..];
-        var write: usize = 0;
-        while (write < remain.len) : (write += 1) {
-            binding.scripts.items[write] = remain[write];
-        }
-        binding.scripts.shrinkRetainingCapacity(remain.len);
-        binding.script_bytes = retained_bytes;
+    while (binding.scripts.items.len > 1 and (binding.scripts.items.len > max_retained_scripts or binding.script_bytes > max_retained_source_bytes)) {
+        const evicted = binding.scripts.orderedRemove(0);
+        binding.script_bytes -= scriptStorageBytes(evicted);
+        freeScript(evicted);
     }
     published = cloneScriptInfo(std.heap.c_allocator, binding.scripts.items[binding.scripts.items.len - 1]) catch null;
     binding.mutex.unlock();
@@ -695,7 +681,7 @@ fn locationInRange(line0: i32, column0: i32, start_line0: i32, start_column0: i3
 /// Innermost frame first. Line is 1-based and column is 0-based. Caller frees each name and url, then the slice. Engine thread only, while paused.
 pub fn copyDebugStack(instance_id: i32) []DebugFrame {
     if (comptime !@import("build_options").inspector) return &.{};
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         const parsed = @import("../backend/jsc/backtrace.zig").copyStack(instance_id);
         defer if (parsed.len != 0) std.heap.c_allocator.free(parsed);
         if (parsed.len == 0) return &.{};
@@ -748,7 +734,7 @@ pub const StackFrameBuf = struct {
 pub fn writeDebugStack(instance_id: i32, out: []StackFrameBuf) usize {
     if (comptime !@import("build_options").inspector) return 0;
     if (out.len == 0) return 0;
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         return @import("../backend/jsc/backtrace.zig").writeStack(instance_id, out);
     }
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return 0;

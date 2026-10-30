@@ -80,6 +80,11 @@ test "runtime_control: getMemoryUsage shape matches backend" {
                     try testing.expectEqual(@as(u64, 0), usage.malloc_size);
                     try testing.expectEqual(@as(u64, 0), usage.obj_count);
                 },
+                .escargot, .hermes => {
+                    // Soft GC stats (Escargot Memory::heapSize; Hermes getHeapInfo). Not QJS-shaped.
+                    try testing.expect(usage.malloc_size > 0 or usage.memory_used_size > 0);
+                    try testing.expectEqual(@as(u64, 0), usage.obj_count);
+                },
             }
         }
     }.run);
@@ -92,8 +97,9 @@ test "runtime_control: getMemoryUsage shape matches backend" {
 test "runtime_control: memory limit is enforced by QuickJS and rejected by JSC" {
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
-            if (backend.active_backend == .jsc) {
-                // JSC has no public C API for a per-runtime heap cap. Returning false prevents hosts from assuming an unenforced limit protects an untrusted script.
+            if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend)) {
+                // JSC/Escargot/Hermes: no runtime-enforced per-instance heap cap. Returning false
+                // prevents hosts from assuming an unenforced limit protects an untrusted script.
                 try testing.expect(!rc.setMemoryLimit(id, 1));
                 return;
             }
@@ -334,6 +340,7 @@ test "runtime_control: clearing lifecycle stop preserves user interrupt and dead
 // ---------------------------------------------------------------------------
 // 8. An interrupt unwinds through script-level try/catch/finally, promise executors, and microtask jobs.
 //
+// Reference cases: quickjs-ng api-test `sync_call` and `async_call` interrupt cases; rquickjs `promise_fails_on_interrupt_exception`.
 // ---------------------------------------------------------------------------
 
 const InterruptSource = enum { requested_from_thread, time_limit };
@@ -438,7 +445,7 @@ test "runtime_control: interrupt inside a microtask job is not swallowed and lat
 test "runtime_control: an allocation refused by the memory limit is catchable and recoverable" {
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
-            if (backend.active_backend == .jsc) return;
+            if (backend.isJscApiBackend(backend.active_backend)) return;
 
             const before = rc.getMemoryUsage(id) orelse return error.NoUsage;
             const cap = std.math.add(u64, before.malloc_size, 64 * 1024) catch return error.Overflow;
@@ -463,7 +470,7 @@ test "runtime_control: an allocation refused by the memory limit is catchable an
 test "runtime_control: dead WeakMap keys are reclaimed across repeated collections" {
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
-            if (backend.active_backend == .jsc) return;
+            if (backend.isJscApiBackend(backend.active_backend)) return;
             try testing.expect(rc.init(id));
             defer _ = rc.deinit(id);
 

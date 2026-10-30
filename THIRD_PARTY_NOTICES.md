@@ -65,74 +65,59 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## Chrome DevTools Protocol JSON
+## Samsung Escargot
 
-`libs/inspector/src/protocol-*.json` are derived from the [ChromeDevTools/devtools-protocol](https://github.com/ChromeDevTools/devtools-protocol) repository (see `libs/inspector/src/protocol-support.json` for the pinned commit and source file hashes). The upstream project is licensed under the BSD 3-Clause License:
+Source: <https://github.com/Samsung/escargot>
 
-```
-Copyright (c) 2014 The Chromium Authors. All rights reserved.
+Used only when building with `-Dbackend=escargot` (experimental spike). Escargot
+is primarily LGPL-2.1; some bundled components use other licenses (see
+`LICENSE.*` in the Escargot tree). JS Bay does not link Escargot in the default
+QuickJS-NG build. Before publishing an Escargot-linked artifact, ship the
+LICENSE / NOTICE files from the Escargot revision you vendor and meet LGPL
+obligations for that linkage.
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are
-met:
+## Meta Hermes
 
-   * Redistributions of source code must retain the above copyright
-notice, this list of conditions and the following disclaimer.
-   * Redistributions in binary form must reproduce the above
-copyright notice, this list of conditions and the following disclaimer
-in the documentation and/or other materials provided with the
-distribution.
-   * Neither the name of Google Inc. nor the names of its
-contributors may be used to endorse or promote products derived from
-this software without specific prior written permission.
+Source: <https://github.com/facebook/hermes>
 
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
+Used only when building with `-Dbackend=hermes` (experimental spike). Hermes is
+MIT-licensed; see `vendor/hermes` for NOTICE and third-party licenses.
 
-## Unicode data tables (via QuickJS-NG)
+```text
+MIT License
 
-`vendor/quickjs-ng/libunicode-table.h` (and the matching Unicode tables used when building the QuickJS-NG backend) carry the Unicode Inc. license notice. A representative excerpt:
+Copyright (c) Meta Platforms, Inc. and affiliates.
 
-```
-UNICODE LICENSE V3
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-COPYRIGHT AND PERMISSION NOTICE
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-Copyright © 1991-2026 Unicode, Inc.
-
-Permission is hereby granted, free of charge, to any person obtaining a
-copy of data files and any associated documentation (the "Data Files") or
-software and any associated documentation (the "Software") to deal in the
-Data Files or Software without restriction, including without limitation
-the rights to use, copy, modify, merge, publish, distribute, and/or sell
-copies of the Data Files or Software, and to permit persons to whom the
-Data Files or Software are furnished to do so, provided that either (a)
-this copyright and permission notice appear with all copies of the Data
-Files or Software, or (b) this copyright and permission notice appear in
-associated Documentation.
-
-THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
-KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
-THIRD PARTY RIGHTS.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```
 
-See the full notice in `vendor/quickjs-ng/libunicode-table.h`. Classic QuickJS builds use that engine's own Unicode tables under the QuickJS license above.
+## ICU (International Components for Unicode)
 
-## Brand icons in the repository banner
-
-SVG marks under `assets/brand-icons/` (inlined into `assets/banner.svg`) require the attributions in [assets/brand-icons/ATTRIBUTION.md](assets/brand-icons/ATTRIBUTION.md), including the CC BY 3.0 Android robot attribution. Trademarks remain with their owners; inclusion is for platform identification only.
+Hermes builds typically link ICU (`icuuc` / `icui18n` / `icudata`). ICU is
+Unicode License (Unicode-3.0) / ICU License. Ship the ICU license file from
+your ICU prefix when distributing a Hermes-linked artifact. See
+<https://unicode-org.github.io/icu/userguide/>.
 
 ## Distribution scope
 
-Shipped desktop libraries, Apple XCFrameworks, Android AARs, and Harmony HARs include JS Bay code plus the third-party material listed in this file (QuickJS / QuickJS-NG and their Unicode tables when that backend is selected, and Inspector CDP JSON when Inspector is built in). The Android JNI adapter and Apple / Harmony SDK adapters are JS Bay source: they use platform SDK headers and link platform libraries, and they do not add further third-party source beyond what this file already covers. If a future release adds another third-party dependency to a shipped artifact, add its notices here before publishing.
+The Android JNI adapter and Apple/Harmony SDK adapters are JS Bay source.
+They use platform SDK headers and link platform libraries, but do not copy
+third-party source into JS Bay distributions. If a future release adds a
+third-party dependency to a shipped artifact, its applicable notices must be
+added here before publishing.

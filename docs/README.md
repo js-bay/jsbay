@@ -1,8 +1,8 @@
 # Documentation
 
-Public declarations are in [the installed header](../include/jsbay.h). These guides cover behavior that signatures alone cannot describe.
+Public declarations are in [the installed header](../include/js_bay.h). These guides cover behavior that signatures alone cannot describe.
 
-- [Embedding](embedding.md): select a backend (or pack with `-Dbackends=`) and use Zig, C, or an SDK.
+- [Embedding](embedding.md): select a backend and use Zig, C, or an SDK.
 - [Public API contract](api-contract.md): ownership, status, callbacks, and lifecycle.
 - [Runtime limits](runtime-limits.md) and [synchronous native calls](native-sync.md).
 - [Inspector](inspector.md): CDP setup, compatibility, and Safari inspection.

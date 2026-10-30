@@ -32,7 +32,7 @@ pub fn Module(comptime Host: type) type {
                 if (job.snapshot) {
                     sendSnapshot(job, usage);
                 } else {
-                    if (comptime backend.active_backend == .jsc) {
+                    if (comptime backend.isJscApiBackend(backend.active_backend)) {
                         json_writer.sendError(job.state, job.session_id, job.request_id, -32601, "Heap usage statistics are unsupported by this backend");
                         return;
                     }
@@ -285,7 +285,7 @@ pub fn Module(comptime Host: type) type {
             var aw: std.Io.Writer.Allocating = .init(job.state.allocator);
             defer aw.deinit();
             const omitted_nodes = graph.omitted_nodes;
-            try aw.writer.print("{{\"id\":{d},\"result\":{{\"jsbaySnapshot\":{{\"complete\":false,\"truncated\":{},\"unsupported\":false,\"omittedNodes\":{d},\"omittedEdgeLabels\":{d},\"edgeCoverage\":[\"properties\",\"elements\",\"prototype\",\"cycles\"],\"propertyNamePrecision\":\"{s}\",\"rootCoverage\":\"synthetic-root-all-nodes\",\"retainedSizeSupported\":false}}}}}}", .{ job.request_id, graph.truncated(), omitted_nodes, graph.omitted_edge_labels, if (graph.omitted_edge_labels == 0) "complete" else "partial" });
+            try aw.writer.print("{{\"id\":{d},\"result\":{{\"jsBaySnapshot\":{{\"complete\":false,\"truncated\":{},\"unsupported\":false,\"omittedNodes\":{d},\"omittedEdgeLabels\":{d},\"edgeCoverage\":[\"properties\",\"elements\",\"prototype\",\"cycles\"],\"propertyNamePrecision\":\"{s}\",\"rootCoverage\":\"synthetic-root-all-nodes\",\"retainedSizeSupported\":false}}}}}}", .{ job.request_id, graph.truncated(), omitted_nodes, graph.omitted_edge_labels, if (graph.omitted_edge_labels == 0) "complete" else "partial" });
             json_writer.sendJson(job.state, job.session_id, aw.written());
         }
 
