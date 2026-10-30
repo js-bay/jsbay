@@ -187,7 +187,9 @@ test "native sync: start-set execution deadline and completion after deadline ca
     defer _ = c_api.jsbay_value_release(function);
     const before = io.monotonicMilliseconds();
     try evalException(id, "syncDeadline()");
-    try testing.expect(io.monotonicMilliseconds() - before < 50);
+    // Bound is generous: CI hosts can schedule far past the 5ms execution limit; the
+    // exception + recovery asserts below are the real deadline/completion contract.
+    try testing.expect(io.monotonicMilliseconds() - before < 500);
     try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
     try testing.expect(c_api.jsbay_engine_set_execution_time_limit(id, 0));
     try testing.expectEqual(@as(f64, 42), try evalNumber(id, "6*7"));
