@@ -42,6 +42,7 @@ pub extern fn hermes_is_null(v: Value) bool;
 pub extern fn hermes_is_bool(v: Value) bool;
 pub extern fn hermes_is_number(v: Value) bool;
 pub extern fn hermes_is_string(v: Value) bool;
+pub extern fn hermes_is_symbol(v: Value) bool;
 pub extern fn hermes_is_object(v: Value) bool;
 pub extern fn hermes_is_array(ctx: ?*Context, v: Value) bool;
 pub extern fn hermes_is_function(ctx: ?*Context, v: Value) bool;
@@ -140,6 +141,7 @@ pub extern fn hermes_call_result(ctx: ?*Context, fn_val: Value, this_val: Value,
 pub extern fn hermes_throw_value(ctx: ?*Context, exception: Value) void;
 pub extern fn hermes_get_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8) OpResult;
 pub extern fn hermes_json_parse_result(ctx: ?*Context, utf8: [*]const u8, len: usize) OpResult;
+pub extern fn hermes_json_stringify_result(ctx: ?*Context, v: Value) OpResult;
 pub extern fn hermes_set_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8, val: Value) OpResult;
 pub extern fn hermes_construct(ctx: ?*Context, ctor: Value, args: ?[*]const Value, argc: usize) OpResult;
 pub extern fn hermes_has_in(ctx: ?*Context, obj: Value, key: [*:0]const u8) BoolOpResult;

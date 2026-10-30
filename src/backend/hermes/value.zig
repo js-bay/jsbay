@@ -37,8 +37,8 @@ pub fn isNumber(_: Context, v: Value) bool {
 pub fn isString(_: Context, v: Value) bool {
     return c_api.hermes_is_string(v);
 }
-pub fn isSymbol(_: Context, _: Value) bool {
-    return false;
+pub fn isSymbol(_: Context, v: Value) bool {
+    return c_api.hermes_is_symbol(v);
 }
 pub fn isObjectVal(_: Context, v: Value) bool {
     return c_api.hermes_is_object(v);

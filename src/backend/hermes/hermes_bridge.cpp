@@ -552,6 +552,7 @@ extern "C" bool hermes_is_null(HermesValue v) { return v && asVal(v)->isNull(); 
 extern "C" bool hermes_is_bool(HermesValue v) { return v && asVal(v)->isBool(); }
 extern "C" bool hermes_is_number(HermesValue v) { return v && asVal(v)->isNumber(); }
 extern "C" bool hermes_is_string(HermesValue v) { return v && asVal(v)->isString(); }
+extern "C" bool hermes_is_symbol(HermesValue v) { return v && asVal(v)->isSymbol(); }
 extern "C" bool hermes_is_object(HermesValue v) { return v && asVal(v)->isObject(); }
 extern "C" bool hermes_is_array(JsbayHermesContext *c, HermesValue v) {
     if (!c || !c->rt || !v || !asVal(v)->isObject()) return false;
@@ -1531,6 +1532,20 @@ extern "C" HermesOpResult hermes_json_parse_result(JsbayHermesContext *c, const 
     }
 }
 
+extern "C" HermesOpResult hermes_json_stringify_result(JsbayHermesContext *c, HermesValue v) {
+    HermesOpResult out{nullptr, nullptr};
+    if (!c || !c->rt || !v) return out;
+    try {
+        auto JSON = c->rt->global().getPropertyAsObject(*c->rt, "JSON");
+        auto stringify = JSON.getPropertyAsFunction(*c->rt, "stringify");
+        return hopOk(c, stringify.call(*c->rt, *asVal(v)));
+    } catch (const jsi::JSError &e) {
+        return hopFail(c, jsi::Value(*c->rt, e.value()));
+    } catch (...) {
+        return out;
+    }
+}
+
 extern "C" uint64_t hermes_object_identity(JsbayHermesContext *c, HermesValue v) {
     if (!c || !c->rt || !v || !asVal(v)->isObject() || !c->identity_wm) return 0;
     try {
@@ -2018,9 +2033,11 @@ extern "C" bool hermes_weak_attach_finalizer(JsbayHermesContext *c, HermesValue 
                                              void *user_data, HermesWeakFinalizer cb) {
     if (!c || !c->rt || !target || !cb) return false;
     if (!asVal(target)->isObject()) return false;
+    HermesWeakBox *box = nullptr;
+    JsbayHermesContextOpaque::PendingFinal *pf = nullptr;
     try {
-        auto *box = new HermesWeakBox{user_data, cb};
-        auto *pf = new JsbayHermesContextOpaque::PendingFinal{&fireHermesWeakBox, box, false};
+        box = new HermesWeakBox{user_data, cb};
+        pf = new JsbayHermesContextOpaque::PendingFinal{&fireHermesWeakBox, box, false};
         {
             std::lock_guard<std::mutex> lock(c->finals_mu);
             c->pending_finals.push_back(pf);
@@ -2043,6 +2060,19 @@ extern "C" bool hermes_weak_attach_finalizer(JsbayHermesContext *c, HermesValue 
                      jsi::String::createFromUtf8(*c->rt, keybuf), desc);
         return true;
     } catch (...) {
+        // Attachment failed after pending_finals registration — drop without firing cb.
+        if (pf) {
+            std::lock_guard<std::mutex> lock(c->finals_mu);
+            auto &vec = c->pending_finals;
+            vec.erase(std::remove(vec.begin(), vec.end(), pf), vec.end());
+            delete pf;
+            pf = nullptr;
+        }
+        if (box) {
+            box->cb = nullptr;
+            delete box;
+            box = nullptr;
+        }
         return false;
     }
 }

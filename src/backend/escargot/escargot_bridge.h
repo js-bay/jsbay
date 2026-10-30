@@ -55,6 +55,7 @@ bool escargot_is_null(EscargotValue v);
 bool escargot_is_bool(EscargotValue v);
 bool escargot_is_number(EscargotValue v);
 bool escargot_is_string(EscargotValue v);
+bool escargot_is_symbol(EscargotValue v);
 bool escargot_is_object(EscargotValue v);
 bool escargot_is_array(EscargotContext *ctx, EscargotValue v);
 bool escargot_is_function(EscargotContext *ctx, EscargotValue v);
@@ -194,6 +195,7 @@ EscargotOpResult escargot_call_result(EscargotContext *ctx, EscargotValue fn, Es
 void escargot_throw_value(EscargotContext *ctx, EscargotValue exception);
 EscargotOpResult escargot_get_property_result(EscargotContext *ctx, EscargotValue obj, const char *key);
 EscargotOpResult escargot_json_parse_result(EscargotContext *ctx, const char *utf8, size_t len);
+EscargotOpResult escargot_json_stringify_result(EscargotContext *ctx, EscargotValue v);
 EscargotOpResult escargot_set_property_result(EscargotContext *ctx, EscargotValue obj, const char *key, EscargotValue val);
 EscargotOpResult escargot_construct(EscargotContext *ctx, EscargotValue ctor,
                                     const EscargotValue *args, size_t argc);

@@ -141,7 +141,7 @@ fn EscargotWrapper(comptime handler: NativeHandler) type {
                     return ActiveEngine.newSetFromJson(ctx, s) orelse c_api.escargot_null();
                 },
                 .data_view => |p| {
-                    const val = ActiveEngine.newDataViewFromBuffer(ctx, ActiveEngine.newArrayBufferCopyVal(ctx, p.buffer.bytes), p.byte_offset, p.byte_length);
+                    const val = dispatch.newDataView(ctx, p.buffer, p.byte_offset, p.byte_length);
                     if (p.buffer.free_after_copy) std.heap.c_allocator.free(@constCast(p.buffer.bytes));
                     return val;
                 },
@@ -237,7 +237,7 @@ fn HermesWrapper(comptime handler: NativeHandler) type {
                     return ActiveEngine.newSetFromJson(ctx, s) orelse c_api.hermes_null();
                 },
                 .data_view => |p| {
-                    const val = ActiveEngine.newDataViewFromBuffer(ctx, ActiveEngine.newArrayBufferCopyVal(ctx, p.buffer.bytes), p.byte_offset, p.byte_length);
+                    const val = dispatch.newDataView(ctx, p.buffer, p.byte_offset, p.byte_length);
                     if (p.buffer.free_after_copy) std.heap.c_allocator.free(@constCast(p.buffer.bytes));
                     return val;
                 },

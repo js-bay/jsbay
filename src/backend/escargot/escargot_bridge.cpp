@@ -446,6 +446,7 @@ extern "C" bool escargot_is_null(EscargotValue v) { return v && asVal(v)->isNull
 extern "C" bool escargot_is_bool(EscargotValue v) { return v && asVal(v)->isBoolean(); }
 extern "C" bool escargot_is_number(EscargotValue v) { return v && asVal(v)->isNumber(); }
 extern "C" bool escargot_is_string(EscargotValue v) { return v && asVal(v)->isString(); }
+extern "C" bool escargot_is_symbol(EscargotValue v) { return v && asVal(v)->isSymbol(); }
 extern "C" bool escargot_is_object(EscargotValue v) { return v && asVal(v)->isObject(); }
 extern "C" bool escargot_is_array(EscargotContext *, EscargotValue v) {
     return v && asVal(v)->isArrayObject();
@@ -1459,6 +1460,23 @@ extern "C" EscargotOpResult escargot_json_parse_result(EscargotContext *c, const
             return parse->call(state, JSON, 1, args);
         },
         utf8, len);
+    if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
+    return opOk(c, er.result);
+}
+
+extern "C" EscargotOpResult escargot_json_stringify_result(EscargotContext *c, EscargotValue v) {
+    EscargotOpResult out{nullptr, nullptr};
+    if (!c || !v) return out;
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, ValueRef *val) -> ValueRef * {
+            auto *JSON = state->context()->globalObject()->get(
+                state, StringRef::createFromASCII("JSON"));
+            auto *stringify = JSON->asObject()->get(
+                state, StringRef::createFromASCII("stringify"));
+            ValueRef *args[] = {val};
+            return stringify->call(state, JSON, 1, args);
+        },
+        asVal(v));
     if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
     return opOk(c, er.result);
 }

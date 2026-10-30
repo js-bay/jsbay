@@ -51,6 +51,7 @@ bool hermes_is_null(HermesValue v);
 bool hermes_is_bool(HermesValue v);
 bool hermes_is_number(HermesValue v);
 bool hermes_is_string(HermesValue v);
+bool hermes_is_symbol(HermesValue v);
 bool hermes_is_object(HermesValue v);
 bool hermes_is_array(JsbayHermesContext *ctx, HermesValue v);
 bool hermes_is_function(JsbayHermesContext *ctx, HermesValue v);
@@ -180,6 +181,7 @@ typedef struct {
 
 HermesOpResult hermes_get_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key);
 HermesOpResult hermes_json_parse_result(JsbayHermesContext *ctx, const char *utf8, size_t len);
+HermesOpResult hermes_json_stringify_result(JsbayHermesContext *ctx, HermesValue v);
 HermesOpResult hermes_set_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key, HermesValue val);
 HermesOpResult hermes_call_result(JsbayHermesContext *ctx, HermesValue fn, HermesValue this_val,
                                   const HermesValue *args, size_t argc);

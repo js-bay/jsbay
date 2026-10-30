@@ -197,7 +197,33 @@ fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, ca
         kill(slot);
         return .out_of_memory;
     }
-    backend.ActiveEngine.setPropertyStr(ctx, global, name_z.ptr, function);
+    const api_backend = @import("api_backend.zig");
+    const set_res = api_backend.set(ctx, global, name_z, function);
+    if (set_res.exception) |exception| {
+        backend.ActiveEngine.freeValue(ctx, returned);
+        kill(slot);
+        return .{ .exception = exception };
+    }
+    if (set_res.out_of_memory) {
+        backend.ActiveEngine.freeValue(ctx, returned);
+        kill(slot);
+        return .out_of_memory;
+    }
+    if (set_res.value) |ok_val| backend.ActiveEngine.freeValue(ctx, ok_val);
+    const published = backend.ActiveEngine.getPropertyVal(ctx, global, name_z.ptr) orelse {
+        backend.ActiveEngine.freeValue(ctx, returned);
+        kill(slot);
+        return .out_of_memory;
+    };
+    defer backend.ActiveEngine.freeValue(ctx, published);
+    if (!backend.ActiveEngine.sameValue(ctx, published, returned)) {
+        backend.ActiveEngine.freeValue(ctx, returned);
+        kill(slot);
+        const err = api_backend.newError(ctx, "native binding was not published");
+        if (err.exception) |exception| return .{ .exception = exception };
+        if (err.value) |ev| return .{ .exception = ev };
+        return .out_of_memory;
+    }
     return .{ .installed = .{ .function = returned, .binding = binding } };
 }
 
