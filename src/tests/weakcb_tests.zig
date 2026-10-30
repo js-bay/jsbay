@@ -102,7 +102,7 @@ test "weakcb: finalizer fires for NativeHandle instance on teardown" {
         return error.NoInstance;
     };
     switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => native_handle.init(instance.runtime),
+        .quickjs, .quickjs_ng => native_handle.init(instance.monoRuntime().?),
         .jsc => native_handle.init(),
     }
 

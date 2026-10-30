@@ -26,7 +26,7 @@ pub fn registerFunction(
         instance_id,
         struct {
             pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?ActiveEngine.Context {
-                return inst.ctx;
+                return inst.monoCtx();
             }
         }{},
     ) orelse return;
@@ -52,7 +52,7 @@ pub fn registerObjectWithFunctions(
         instance_id,
         struct {
             pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?ActiveEngine.Context {
-                return inst.ctx;
+                return inst.monoCtx();
             }
         }{},
     ) orelse return;

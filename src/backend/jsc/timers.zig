@@ -86,7 +86,8 @@ fn createTimer(ctx_ref: jsc.JSContextRef, argument_count: usize, arguments: [*c]
     const callback = arguments[0];
     jsc.JSValueProtect(ctx_ref, callback);
     const trace = async_stack.capture(id);
-    const timer_id = timers_mod.schedule(id, jsc_ctx, callback, delay_ms, is_interval, trace) orelse {
+    var callback_slot = callback;
+    const timer_id = timers_mod.scheduleOpaque(id, @intFromPtr(jsc_ctx), std.mem.asBytes(&callback_slot), delay_ms, is_interval, trace) orelse {
         jsc.JSValueUnprotect(ctx_ref, callback);
         if (trace) |captured| async_stack.freeTrace(captured);
         return common.throwError(ctx_ref, exception, "Timer allocation failed");

@@ -27,12 +27,15 @@ test "timer delay normalization handles zero, fractions, and the maximum delay" 
 
 pub const TimerData = struct {
     const ReadyState = enum { none, ready, firing };
+    const dispatch = @import("../backend_dispatch.zig");
     timer: event_loop.Timer = .{},
     allocator: std.mem.Allocator,
     resources: *@import("resource_limits.zig").Budget,
-    ctx: ActiveEngine.Context,
+    backend_tag: backend.BackendType,
+    ctx_addr: usize,
+    callback_storage: [dispatch.value_storage_size]u8 = undefined,
+    callback_len: u8,
     timer_id: i32,
-    callback: ActiveEngine.Value,
     delay_ms: u64,
     is_interval: bool,
     instance_id: i32,
@@ -45,6 +48,20 @@ pub const TimerData = struct {
     ready_next: ?*TimerData = null,
     ready_prev: ?*TimerData = null,
     ready_state: ReadyState = .none,
+
+    fn callbackBytes(self: *const TimerData) []const u8 {
+        return self.callback_storage[0..self.callback_len];
+    }
+
+    fn storeCallback(self: *TimerData, bytes: []const u8) void {
+        std.debug.assert(bytes.len <= self.callback_storage.len);
+        @memcpy(self.callback_storage[0..bytes.len], bytes);
+        self.callback_len = @intCast(bytes.len);
+    }
+
+    fn clearCallback(self: *TimerData) void {
+        self.callback_len = @intCast(dispatch.timerStoreUndefined(self.backend_tag, self.callback_storage[0..]));
+    }
 };
 pub const TimerRegistry = struct {
     allocator: std.mem.Allocator,
@@ -156,21 +173,56 @@ test "timer ID allocation skips live IDs across wraparound" {
     try std.testing.expectEqual(@as(?i32, 2), allocateId(&registry));
 }
 
-pub fn schedule(instance_id: i32, ctx: ActiveEngine.Context, callback: ActiveEngine.Value, delay_ms: u64, is_interval: bool, async_trace: ?async_stack.Trace) ?i32 {
+fn ctxToAddr(ctx: ActiveEngine.Context) usize {
+    switch (@typeInfo(ActiveEngine.Context)) {
+        .optional => {
+            const p = ctx orelse return 0;
+            return @intFromPtr(p);
+        },
+        .pointer => return @intFromPtr(ctx),
+        else => @compileError("ActiveEngine.Context must be a pointer or optional pointer"),
+    }
+}
+
+/// Type-erased schedule for primary and packed-alt timer bridges. `callback_bytes` must match `valueByteSize(instance.backendTag())`.
+pub fn scheduleOpaque(
+    instance_id: i32,
+    ctx_addr: usize,
+    callback_bytes: []const u8,
+    delay_ms: u64,
+    is_interval: bool,
+    async_trace: ?async_stack.Trace,
+) ?i32 {
+    const dispatch = @import("../backend_dispatch.zig");
     return instance_map.withInstanceReturn(instance_id, struct {
-        ctx: ActiveEngine.Context,
-        callback: ActiveEngine.Value,
+        ctx_addr: usize,
+        callback_bytes: []const u8,
         delay_ms: u64,
         is_interval: bool,
         async_trace: ?async_stack.Trace,
         pub fn call(self: @This(), inst: *instance_map.EngineInstance) ?i32 {
+            const tag = inst.backendTag();
+            const expected = dispatch.valueByteSize(tag);
+            if (expected == 0 or self.callback_bytes.len != expected or self.callback_bytes.len > dispatch.value_storage_size) return null;
             if (inst.teardown_pending or !inst.resources.reserve(.timer, 0)) return null;
             var committed = false;
             defer if (!committed) inst.resources.release(.timer, 0);
             if (inst.timers.clock_now != null) inst.timers.clock_now = @max(inst.timers.clock_now.?, inst.loop.now());
             const id = allocateId(&inst.timers) orelse return null;
             const data = inst.timers.allocator.create(TimerData) catch return null;
-            data.* = .{ .resources = inst.resources, .allocator = inst.timers.allocator, .ctx = self.ctx, .timer_id = id, .callback = self.callback, .delay_ms = self.delay_ms, .is_interval = self.is_interval, .instance_id = inst.instance_id, .async_trace = self.async_trace };
+            data.* = .{
+                .resources = inst.resources,
+                .allocator = inst.timers.allocator,
+                .backend_tag = tag,
+                .ctx_addr = self.ctx_addr,
+                .callback_len = 0,
+                .timer_id = id,
+                .delay_ms = self.delay_ms,
+                .is_interval = self.is_interval,
+                .instance_id = inst.instance_id,
+                .async_trace = self.async_trace,
+            };
+            data.storeCallback(self.callback_bytes);
             data.timer.init(inst.loop, data, nativeTimerReady);
             const has_pending = inst.timers.pending_head != null;
             if (inst.timers.clock_now != null and !has_pending) data.timer.reserve() catch {
@@ -199,7 +251,12 @@ pub fn schedule(instance_id: i32, ctx: ActiveEngine.Context, callback: ActiveEng
             committed = true;
             return id;
         }
-    }{ .ctx = ctx, .callback = callback, .delay_ms = delay_ms, .is_interval = is_interval, .async_trace = async_trace });
+    }{ .ctx_addr = ctx_addr, .callback_bytes = callback_bytes, .delay_ms = delay_ms, .is_interval = is_interval, .async_trace = async_trace });
+}
+
+pub fn schedule(instance_id: i32, ctx: ActiveEngine.Context, callback: ActiveEngine.Value, delay_ms: u64, is_interval: bool, async_trace: ?async_stack.Trace) ?i32 {
+    var callback_slot = callback;
+    return scheduleOpaque(instance_id, ctxToAddr(ctx), std.mem.asBytes(&callback_slot), delay_ms, is_interval, async_trace);
 }
 fn nativeTimerReady(ctx: ?*anyopaque, _: *event_loop.Timer) void {
     const data: *TimerData = @ptrCast(@alignCast(ctx.?));
@@ -253,8 +310,9 @@ pub fn cancel(instance_id: i32, timer_id: i32) void {
             return data;
         }
     }{ .timer_id = timer_id }) orelse return;
-    ActiveEngine.freeValue(data.ctx, data.callback);
-    data.callback = ActiveEngine.undefinedValue();
+    const dispatch = @import("../backend_dispatch.zig");
+    dispatch.timerFreeValue(data.backend_tag, data.ctx_addr, data.callbackBytes());
+    data.clearCallback();
     if (!data.in_callback) destroyTimerData(data);
 }
 /// Clear all timers. HashMap unlink runs under the instance-map registry mutex so any-thread
@@ -262,6 +320,7 @@ pub fn cancel(instance_id: i32, timer_id: i32) void {
 /// (no JS callbacks under the registry lock). Destroy still sequences this after teardown mark
 /// + control-plane drain; the mutex is hardening, not a substitute for that order.
 pub fn cancelAll(instance: *instance_map.EngineInstance) void {
+    const dispatch = @import("../backend_dispatch.zig");
     var free_head: ?*TimerData = null;
     instance_map.withInstance(instance.instance_id, struct {
         free_head: *?*TimerData,
@@ -290,8 +349,8 @@ pub fn cancelAll(instance: *instance_map.EngineInstance) void {
     while (cur) |data| {
         const next = data.pending_next;
         data.pending_next = null;
-        ActiveEngine.freeValue(data.ctx, data.callback);
-        data.callback = ActiveEngine.undefinedValue();
+        dispatch.timerFreeValue(data.backend_tag, data.ctx_addr, data.callbackBytes());
+        data.clearCallback();
         destroyTimerData(data);
         cur = next;
     }
@@ -304,8 +363,7 @@ pub fn fireDue(instance_id: i32, now_ms: u64) void {
     if (@import("js_scheduler.zig").isTurnActive(instance_id)) return;
     while (fireOneDue(instance_id, now_ms)) {
         if (engine_thread.deferredDestroyRequested(lease)) return;
-        const ctx = instance_map.getPtrs(instance_id) orelse return;
-        @import("js_scheduler.zig").checkpoint(instance_id, ctx.ctx);
+        @import("js_scheduler.zig").checkpointInstance(instance_id);
         if (instance_map.isTeardownPending(instance_id)) return;
     }
 }
@@ -357,15 +415,19 @@ fn fireOne(instance_id: i32, data: *TimerData, now_ms: u64, queued: *(@import("j
             if (inst.timers.current_callback == self.data) inst.timers.current_callback = null;
         }
     }{ .data = data });
-    if (!data.closing and ActiveEngine.isFunction(data.ctx, data.callback)) {
-        const callback = ActiveEngine.dupValue(data.ctx, data.callback);
-        defer ActiveEngine.freeValue(data.ctx, callback);
-        const label: []const u8 = if (data.is_interval) "setInterval" else "setTimeout";
-        const entered = if (data.async_trace) |parent| async_stack.enter(instance_id, label, parent) else false;
-        defer if (entered) async_stack.leave(instance_id);
-        if (ActiveEngine.callFunctionNoArgs(data.ctx, callback)) |message| {
-            defer std.heap.c_allocator.free(message);
-            @import("../inspector/root.zig").exceptions.reportUncaught(instance_id, message, "");
+    const dispatch = @import("../backend_dispatch.zig");
+    if (!data.closing and dispatch.timerIsFunction(data.backend_tag, data.ctx_addr, data.callbackBytes())) {
+        var dup_buf: [dispatch.value_storage_size]u8 = undefined;
+        const dup_len = dispatch.timerDupValue(data.backend_tag, data.ctx_addr, data.callbackBytes(), dup_buf[0..]) orelse 0;
+        defer if (dup_len != 0) dispatch.timerFreeValue(data.backend_tag, data.ctx_addr, dup_buf[0..dup_len]);
+        if (dup_len != 0) {
+            const label: []const u8 = if (data.is_interval) "setInterval" else "setTimeout";
+            const entered = if (data.async_trace) |parent| async_stack.enter(instance_id, label, parent) else false;
+            defer if (entered) async_stack.leave(instance_id);
+            if (dispatch.timerCallNoArgs(data.backend_tag, data.ctx_addr, dup_buf[0..dup_len])) |message| {
+                defer std.heap.c_allocator.free(message);
+                @import("../inspector/root.zig").exceptions.reportUncaught(instance_id, message, "");
+            }
         }
     }
     _ = queued.end();
@@ -373,8 +435,8 @@ fn fireOne(instance_id: i32, data: *TimerData, now_ms: u64, queued: *(@import("j
     if (data.closing or !data.is_interval) {
         if (!data.closing) {
             data.closing = true;
-            ActiveEngine.freeValue(data.ctx, data.callback);
-            data.callback = ActiveEngine.undefinedValue();
+            dispatch.timerFreeValue(data.backend_tag, data.ctx_addr, data.callbackBytes());
+            data.clearCallback();
         }
         destroyTimerData(data);
         return;
@@ -405,4 +467,9 @@ fn destroyTimerData(data: *TimerData) void {
     const resources = data.resources;
     data.allocator.destroy(data);
     resources.release(.timer, 0);
+}
+
+test "scheduleOpaque rejects wrong-sized callback" {
+    const junk: [3]u8 = .{ 0, 0, 0 };
+    try std.testing.expect(scheduleOpaque(1, 0, &junk, 0, false, null) == null);
 }

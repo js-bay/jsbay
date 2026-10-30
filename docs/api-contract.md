@@ -12,9 +12,11 @@ Language bindings must provide explicit close or dispose operations (prefer the 
 
 ## Build identity
 
-`jsbay_engine_version` is process-wide and thread-safe; it does not require an instance or the owner thread. Callers set `struct_size` to at least `sizeof(jsbay_engine_version_info_t)`. On success the `version`, `commit`, and `backend` pointers are library-owned NUL-terminated strings that outlive any instance and must not be freed. `commit` may be empty when the build did not record a revision. `backend` is one of `quickjs_ng`, `quickjs`, or `jsc`.
+`jsbay_engine_version` is process-wide and thread-safe; it does not require an instance or the owner thread. Callers set `struct_size` to at least `sizeof(jsbay_engine_version_info_t)`. On success the `version`, `commit`, and `backend` pointers are library-owned NUL-terminated strings that outlive any instance and must not be freed. `commit` may be empty when the build did not record a revision. `backend` is one of `quickjs_ng`, `quickjs`, or `jsc` (pack primary when built with `-Dbackends=`).
 
-For a pauseable Debugger embed template, host shutdown order, and version pinning when linking `libjsbay.a`, see [EMBEDDING.md](EMBEDDING.md).
+Library identity (no instance): `jsbay_library_backend` and `jsbay_library_capabilities` report the pack primary (`-Dbackends=` first entry, or `-Dbackend=`) and capability bits aligned with [embedding.md](embedding.md). `jsbay_available_backends` lists every packed engine in the artifact. Create-time select is `jsbay_engine_create_with_options` (not a live hot-switch of an existing instance).
+
+For a pauseable Debugger embed template, host shutdown order, and version pinning when linking `libjsbay.a`, see [embedding.md](embedding.md).
 
 ## Status, exceptions, and outputs
 

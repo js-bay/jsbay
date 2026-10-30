@@ -106,20 +106,39 @@ pub fn checkpoint(instance_id: i32, ctx: ActiveEngine.Context) void {
     if (!instance_map.isTeardownPending(instance_id)) ActiveEngine.processPendingJobs(ctx);
 }
 
+/// Drain microtasks for mono or packed-alt instances (packed-alt must not use ActiveEngine.Context).
+pub fn checkpointInstance(instance_id: i32) void {
+    const instance = instance_map.getInstance(instance_id) orelse return;
+    switch (instance.engine_handles) {
+        .mono => |m| checkpoint(instance_id, m.ctx),
+        .packed_alt => |a| {
+            if (engine_thread.ownerHasYielded(instance_id)) return;
+            var guard = instance.loop.scheduler.beginCheckpoint() orelse return;
+            defer guard.end();
+            if (!instance.loop.scheduler.beginBackendDrain()) return;
+            defer instance.loop.scheduler.endBackendDrain();
+            if (!instance_map.isTeardownPending(instance_id)) {
+                @import("../backend_dispatch.zig").processPendingJobsPacked(a.tag, .{
+                    .runtime_addr = a.runtime_addr,
+                    .ctx_addr = a.ctx_addr,
+                });
+            }
+        },
+    }
+}
+
 pub fn backendDrainAllowed(raw_ctx: ?*anyopaque) bool {
-    const ctx: ActiveEngine.Context = @ptrCast(raw_ctx);
-    const id = ActiveEngine.instanceIdFromCtx(ctx);
+    // Resolve by stored context address so packed-alt (non-primary) contexts are not passed through the primary ActiveEngine.instanceIdFromCtx.
+    const id = instance_map.findByContextAddr(@intFromPtr(raw_ctx orelse return true)) orelse return true;
     const instance = instance_map.getInstance(id) orelse return true;
-    if (instance.ctx != ctx) return true;
     if (engine_thread.ownerHasYielded(id)) return false;
     return instance.loop.scheduler.consumeBackendDrain();
 }
 
 pub fn backendDrainFinished(raw_ctx: ?*anyopaque) void {
-    const ctx: ActiveEngine.Context = @ptrCast(raw_ctx);
-    const id = ActiveEngine.instanceIdFromCtx(ctx);
+    const id = instance_map.findByContextAddr(@intFromPtr(raw_ctx orelse return)) orelse return;
     const instance = instance_map.getInstance(id) orelse return;
-    if (instance.ctx == ctx) instance.loop.scheduler.endBackendDrain();
+    instance.loop.scheduler.endBackendDrain();
 }
 
 pub fn runTurn(instance_id: i32, hooks: @import("js_event_loop").Scheduler.TurnHooks) bool {

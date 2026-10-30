@@ -502,7 +502,7 @@ test "cdp alignment: async depth without Debugger.enable keeps an explicitly att
     defer session.deinit();
 
     const instance = instance_map.getInstance(session.id) orelse return error.MissingEngine;
-    _ = debugger_mod.attach(session.id, @ptrCast(@constCast(instance.runtime)));
+    _ = debugger_mod.attach(session.id, @ptrCast(@constCast(instance.monoRuntime().?)));
     try testing.expect(debugger_mod.handlerInstallThreadId(session.id) != 0);
 
     const at = try send(&session, "Debugger.setAsyncCallStackDepth", "{\"maxDepth\":1}", 3011);

@@ -94,19 +94,43 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     };
     registry_mutex.unlock();
 
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            // Safe: the two extern structs have identical layout.
-            const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
-            qjs_mod.qjsInstallInterruptHandler(inst.runtime, qjs_state);
+    switch (inst.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                // Safe: the two extern structs have identical layout.
+                const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
+                qjs_mod.qjsInstallInterruptHandler(m.runtime, qjs_state);
+            },
+            .jsc => {
+                const jsc_mod = @import("../backend/jsc.zig");
+                const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
+                // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
+                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
+                jsc_mod.jscInstallInterruptHandler(group, jsc_state);
+            },
         },
-        .jsc => {
-            const jsc_mod = @import("../backend/jsc.zig");
-            const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
-            // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
-            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.ctx));
-            jsc_mod.jscInstallInterruptHandler(group, jsc_state);
+        .packed_alt => |a| {
+            // Dispatch by the instance backend so non-primary packs get interrupt/time-limit handlers too.
+            inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+                if (a.tag == cand) {
+                    if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) return false;
+                    if (comptime backend.isQuickJsApiBackend(cand)) {
+                        const E = backend.Engine(cand);
+                        const Mod = backend.EngineModule(cand);
+                        const qjs_state: *Mod.QjsInterruptState = @ptrCast(state);
+                        const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
+                        Mod.qjsInstallInterruptHandler(rt, qjs_state);
+                    } else {
+                        const jsc_mod = @import("../backend/jsc.zig");
+                        const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
+                        const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
+                        const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
+                        jsc_mod.jscInstallInterruptHandler(group, jsc_state);
+                    }
+                    break;
+                }
+            } else return false;
         },
     }
 
@@ -121,15 +145,36 @@ pub fn deinit(instance_id: i32) bool {
 
     // Uninstall from the backend BEFORE freeing the state — otherwise the JS thread could read freed memory if it fires a check between takeState and here.
     if (inst_opt) |inst| {
-        switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsUninstallInterruptHandler(inst.runtime);
+        switch (inst.engine_handles) {
+            .mono => |m| switch (backend.active_backend) {
+                .quickjs, .quickjs_ng => {
+                    const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                    qjs_mod.qjsUninstallInterruptHandler(m.runtime);
+                },
+                .jsc => {
+                    const jsc_mod = @import("../backend/jsc.zig");
+                    const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
+                    jsc_mod.jscUninstallInterruptHandler(group);
+                },
             },
-            .jsc => {
-                const jsc_mod = @import("../backend/jsc.zig");
-                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.ctx));
-                jsc_mod.jscUninstallInterruptHandler(group);
+            .packed_alt => |a| {
+                inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+                    if (a.tag == cand) {
+                        if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) break;
+                        if (comptime backend.isQuickJsApiBackend(cand)) {
+                            const E = backend.Engine(cand);
+                            const Mod = backend.EngineModule(cand);
+                            const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
+                            Mod.qjsUninstallInterruptHandler(rt);
+                        } else {
+                            const jsc_mod = @import("../backend/jsc.zig");
+                            const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
+                            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
+                            jsc_mod.jscUninstallInterruptHandler(group);
+                        }
+                        break;
+                    }
+                }
             },
         }
     }
@@ -247,15 +292,21 @@ pub fn isStopRequested(instance_id: i32) bool {
 /// Force a GC pass on the runtime. Must be called on the engine's owning thread. Returns false if the instance was never created.
 pub fn runGc(instance_id: i32) bool {
     const inst = instance_map.getInstance(instance_id) orelse return false;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsRunGc(inst.runtime);
+    switch (inst.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                qjs_mod.qjsRunGc(m.runtime);
+            },
+            .jsc => {
+                const jsc_mod = @import("../backend/jsc.zig");
+                jsc_mod.jscRunGc(@ptrCast(m.ctx));
+            },
         },
-        .jsc => {
-            const jsc_mod = @import("../backend/jsc.zig");
-            jsc_mod.jscRunGc(inst.ctx);
-        },
+        .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
+            .runtime_addr = a.runtime_addr,
+            .ctx_addr = a.ctx_addr,
+        }),
     }
     return true;
 }
@@ -263,17 +314,34 @@ pub fn runGc(instance_id: i32) bool {
 /// Cap the QuickJS-managed heap of this runtime at `bytes` (0 = unlimited). This does not cap allocations outside QuickJS, so it is not a process-RSS limit. Must be called on the engine's owning thread before the script it should bound runs. QuickJS: enforced via `JS_SetMemoryLimit` (GC is triggered on the next allocation past the cap). JSC: no public C API exists, so this operation is unsupported and returns false. Returns false when the instance was never created.
 pub fn setMemoryLimit(instance_id: i32, bytes: u64) bool {
     const inst = instance_map.getInstance(instance_id) orelse return false;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsSetMemoryLimit(inst.runtime, @intCast(bytes));
+    switch (inst.engine_handles) {
+        // Comptime switch: do not call ActiveEngineModule.qjs* when primary is JSC (Zig still typechecks the dead runtime `if`).
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                qjs_mod.qjsSetMemoryLimit(m.runtime, @intCast(bytes));
+                return true;
+            },
+            .jsc => return false,
         },
-        .jsc => {
-            // No public JSC heap-cap API. Do not claim an unenforced cap.
+        .packed_alt => |a| {
+            if (!backend.isQuickJsApiBackend(a.tag)) return false;
+            inline for (.{ .quickjs_ng, .quickjs }) |cand| {
+                if (a.tag == cand) {
+                    // Gate EngineModule imports on pack membership so mono-JSC builds do not pull qjs.
+                    if (comptime backend.isPacked(cand) or cand == backend.active_backend) {
+                        const E = backend.Engine(cand);
+                        const Mod = backend.EngineModule(cand);
+                        const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
+                        Mod.qjsSetMemoryLimit(rt, @intCast(bytes));
+                        return true;
+                    }
+                    return false;
+                }
+            }
             return false;
         },
     }
-    return true;
 }
 
 /// Ask for one idle collection. Does not collect now and does not retain the JS runtime — `engine.destroy` can still free it while the request is queued. Extra requests before the next idle collection collapse into a single pending collection (one idle pass drains the whole queue). Returns false if the instance does not exist.
@@ -322,15 +390,21 @@ pub fn noteIdle(instance_id: i32) bool {
 
     // Resolve the runtime again after the lock. A destroy that won the race must not be followed by a GC on a freed runtime.
     const live = instance_map.getInstance(instance_id) orelse return false;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsRunGc(live.runtime);
+    switch (live.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                qjs_mod.qjsRunGc(m.runtime);
+            },
+            .jsc => {
+                const jsc_mod = @import("../backend/jsc.zig");
+                jsc_mod.jscRunGc(@ptrCast(m.ctx));
+            },
         },
-        .jsc => {
-            const jsc_mod = @import("../backend/jsc.zig");
-            jsc_mod.jscRunGc(live.ctx);
-        },
+        .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
+            .runtime_addr = a.runtime_addr,
+            .ctx_addr = a.ctx_addr,
+        }),
     }
     return true;
 }
@@ -376,25 +450,51 @@ fn idleSlot(instance_id: i32) ?*IdleSlot {
 /// Snapshot memory usage. Returns null if the instance was never created. Backends that don't expose memory stats populate zeros.
 pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
     const inst = instance_map.getInstance(instance_id) orelse return null;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            const snap = qjs_mod.qjsMemoryUsage(inst.runtime);
-            return .{
-                .malloc_count = snap.malloc_count,
-                .malloc_size = snap.malloc_size,
-                .malloc_limit = snap.malloc_limit,
-                .memory_used_count = snap.memory_used_count,
-                .memory_used_size = snap.memory_used_size,
-                .atom_count = snap.atom_count,
-                .atom_size = snap.atom_size,
-                .obj_count = snap.obj_count,
-                .obj_size = snap.obj_size,
-                .shape_count = snap.shape_count,
-            };
+    switch (inst.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                const snap = qjs_mod.qjsMemoryUsage(m.runtime);
+                return .{
+                    .malloc_count = snap.malloc_count,
+                    .malloc_size = snap.malloc_size,
+                    .malloc_limit = snap.malloc_limit,
+                    .memory_used_count = snap.memory_used_count,
+                    .memory_used_size = snap.memory_used_size,
+                    .atom_count = snap.atom_count,
+                    .atom_size = snap.atom_size,
+                    .obj_count = snap.obj_count,
+                    .obj_size = snap.obj_size,
+                    .shape_count = snap.shape_count,
+                };
+            },
+            .jsc => return .{},
         },
-        .jsc => {
-            // JSC's public C API does not expose heap introspection. Returning all-zeros keeps the API shape consistent.
+        .packed_alt => |a| {
+            if (!backend.isQuickJsApiBackend(a.tag)) return .{};
+            inline for (.{ .quickjs_ng, .quickjs }) |cand| {
+                if (a.tag == cand) {
+                    if (comptime backend.isPacked(cand) or cand == backend.active_backend) {
+                        const E = backend.Engine(cand);
+                        const Mod = backend.EngineModule(cand);
+                        const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
+                        const snap = Mod.qjsMemoryUsage(rt);
+                        return .{
+                            .malloc_count = snap.malloc_count,
+                            .malloc_size = snap.malloc_size,
+                            .malloc_limit = snap.malloc_limit,
+                            .memory_used_count = snap.memory_used_count,
+                            .memory_used_size = snap.memory_used_size,
+                            .atom_count = snap.atom_count,
+                            .atom_size = snap.atom_size,
+                            .obj_count = snap.obj_count,
+                            .obj_size = snap.obj_size,
+                            .shape_count = snap.shape_count,
+                        };
+                    }
+                    return .{};
+                }
+            }
             return .{};
         },
     }

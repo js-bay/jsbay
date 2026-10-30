@@ -36,6 +36,49 @@ typedef struct {
     bool *out_cache_hit;
 } jsbay_engine_evaluate_options_t;
 
+/* Linked-build identity / create-time select.
+ * JSBAY_BACKEND_PRIMARY (0) means the pack primary (first -Dbackends= entry, or -Dbackend=).
+ * jsbay_library_backend returns that primary. Capability bits align with docs/embedding.md.
+ * Pack multiple engines with -Dbackends=quickjs_ng,jsc (Apple). Create-time select picks one
+ * packed engine per instance; this is not a live hot-switch of an existing instance. */
+typedef enum {
+    JSBAY_BACKEND_PRIMARY = 0,
+    JSBAY_BACKEND_QUICKJS_NG = 1,
+    JSBAY_BACKEND_QUICKJS = 2,
+    JSBAY_BACKEND_JSC = 3,
+} jsbay_backend_t;
+enum {
+    JSBAY_CAP_HEAP_STACK_LIMIT = 1u << 0,           /* set_memory_limit / stack budget (QJS family) */
+    JSBAY_CAP_HEAP_USAGE_SNAPSHOT = 1u << 1,        /* meaningful get_memory_usage fields */
+    JSBAY_CAP_INTERRUPT_DEADLINE = 1u << 2,         /* request_interrupt + execution time limit */
+    JSBAY_CAP_EXPLICIT_BYTECODE = 1u << 3,          /* compile_bytecode / run_bytecode (not UNSUPPORTED) */
+    JSBAY_CAP_PERSISTENT_BYTECODE_CACHE = 1u << 4, /* evaluate/CJS cache path (not source-only fallback) */
+    JSBAY_CAP_CDP_SOURCE_DEBUGGER = 1u << 5,       /* supportsDebugger (quickjs_ng) */
+    JSBAY_CAP_SAFARI_WEB_INSPECTOR = 1u << 6,      /* JSC remote inspector */
+};
+typedef struct {
+    uint32_t struct_size;
+    jsbay_backend_t backend;
+    uint32_t flags;
+} jsbay_engine_capabilities_t;
+jsbay_backend_t jsbay_library_backend(void);
+/* out must be non-NULL; set struct_size to sizeof(*out) before the call. Returns false if out is NULL or struct_size < 4. */
+bool jsbay_library_capabilities(jsbay_engine_capabilities_t *out);
+/* Writes up to cap packed engines into out[0..cap). Returns the packed count (required capacity), even when cap is smaller; clamp iteration to min(returned, cap). out may be NULL when cap is 0. */
+size_t jsbay_available_backends(jsbay_backend_t *out, size_t cap);
+/* Create with an explicit packed backend. options must be non-NULL; struct_size >= sizeof(*options).
+ * JSBAY_BACKEND_PRIMARY selects the pack primary. Any backend returned by
+ * jsbay_available_backends may be selected at create time (not a live hot-switch).
+ * Returns false when options are invalid, the backend is not packed, or create fails. */
+typedef struct {
+    uint32_t struct_size;
+    jsbay_backend_t backend;
+    jsbay_log_handler_t log_handler;
+    void *log_user_data;
+} jsbay_engine_create_options_t;
+bool jsbay_engine_create_with_options(int instance_id, const jsbay_engine_create_options_t *options);
+
+
 /* All out_* arguments in this header are required and must be non-NULL unless a declaration explicitly says otherwise. The only optional output is evaluate_options.out_cache_hit. */
 
 /* instance_id is supplied by the caller. Except request_interrupt, stop_loop, suspend, resume, is_suspended, list, snapshot, set/get_admission_class, resource_global_usage, and destroy, every API here runs on the owning thread, including release. Every output is cleared before work begins. On JSBAY_OK, out_value is non-zero and out_exception is zero; on JSBAY_EXCEPTION, out_value is zero and out_exception is a non-zero live thrown JS value (it need not be an Error); all other failures leave both outputs zero. */

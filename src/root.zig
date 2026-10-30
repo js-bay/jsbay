@@ -3,6 +3,7 @@
 //! Provides a unified API for embedding JavaScript engines (QuickJS / JSC) with an event loop, timers, and console support. Host apps build on top of this.
 
 const backend_mod = @import("backend.zig");
+pub const multi_pack = @import("multi_pack.zig");
 
 pub const types = @import("types.zig");
 pub const value = @import("value/root.zig");
@@ -88,6 +89,10 @@ pub const c_api = struct {
     pub const Bytes = c_api_impl.Bytes;
     pub const EvalOptions = c_api_impl.EvalOptions;
     pub const VersionInfo = c_api_impl.VersionInfo;
+    pub const BackendC = c_api_impl.BackendC;
+    pub const CapabilityFlags = c_api_impl.CapabilityFlags;
+    pub const EngineCapabilitiesC = c_api_impl.EngineCapabilitiesC;
+    pub const MemoryUsageC = c_api_impl.MemoryUsageC;
     pub const Callback = @import("abi/api_bind.zig").Callback;
     pub const Finalize = @import("abi/api_bind.zig").Finalize;
     pub const NativeSyncStart = c_api_impl.NativeSyncStart;
@@ -109,10 +114,14 @@ pub const c_api = struct {
     pub const jsbay_engine_set_resource_limits = c_api_impl.jsbay_engine_set_resource_limits;
     pub const jsbay_engine_get_resource_usage = c_api_impl.jsbay_engine_get_resource_usage;
     pub const jsbay_resource_global_usage = c_api_impl.jsbay_resource_global_usage;
-    pub const MemoryUsageC = c_api_impl.MemoryUsageC;
     pub const jsbay_engine_get_memory_usage = c_api_impl.jsbay_engine_get_memory_usage;
     pub const jsbay_engine_run_gc = c_api_impl.jsbay_engine_run_gc;
     pub const jsbay_engine_set_event_handler = c_api_impl.jsbay_engine_set_event_handler;
+    pub const jsbay_library_backend = c_api_impl.jsbay_library_backend;
+    pub const jsbay_library_capabilities = c_api_impl.jsbay_library_capabilities;
+    pub const jsbay_available_backends = c_api_impl.jsbay_available_backends;
+    pub const jsbay_engine_create_with_options = c_api_impl.jsbay_engine_create_with_options;
+    pub const EngineCreateOptionsC = c_api_impl.EngineCreateOptionsC;
     pub const jsbay_engine_request_interrupt = c_api_impl.jsbay_engine_request_interrupt;
     pub const jsbay_engine_clear_interrupt = c_api_impl.jsbay_engine_clear_interrupt;
     pub const jsbay_engine_set_execution_time_limit = c_api_impl.jsbay_engine_set_execution_time_limit;
@@ -177,5 +186,6 @@ comptime {
 comptime {
     if (@import("builtin").is_test) {
         _ = @import("tests/all_tests.zig");
+        _ = @import("multi_pack.zig");
     }
 }

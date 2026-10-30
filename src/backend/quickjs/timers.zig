@@ -37,7 +37,9 @@ fn createTimer(ctx: ?*qjs.JSContext, argc: c_int, argv: [*c]qjs.JSValue, is_inte
     const id = instanceIdFromCtx(ctx);
     const callback = c.jsbay_qjs_JS_DupValue(ctx, argv[0]);
     const trace = async_stack.capture(id);
-    const timer_id = timers_mod.schedule(id, ctx, callback, delay_ms, is_interval, trace) orelse {
+    var callback_slot = callback;
+    const ctx_addr: usize = if (ctx) |p| @intFromPtr(p) else 0;
+    const timer_id = timers_mod.scheduleOpaque(id, ctx_addr, std.mem.asBytes(&callback_slot), delay_ms, is_interval, trace) orelse {
         c.jsbay_qjs_JS_FreeValue(ctx, callback);
         if (trace) |captured| async_stack.freeTrace(captured);
         return qjs.JS_ThrowInternalError(ctx, "Timer allocation failed");

@@ -13,6 +13,7 @@ const runtime_control = @import("runtime/runtime_control.zig");
 const engine_thread = @import("runtime/engine_thread.zig");
 const inspector_mod = @import("inspector/root.zig");
 const api_value = @import("abi/api_value.zig");
+const packed_api_value = @import("abi/packed_api_value.zig");
 const typed_eval = @import("script/typed_eval.zig");
 const api_backend = @import("abi/api_backend.zig");
 const api_bind = @import("abi/api_bind.zig");
@@ -21,6 +22,981 @@ const native_sync = @import("js_event_loop").native_sync;
 const host_wake = @import("js_event_loop").host_wake;
 
 const ActiveEngine = backend.ActiveEngine;
+
+// ---- Library identity (compile-time -Dbackend; no instance) ----
+
+pub const BackendC = backend.BackendC;
+pub const CapabilityFlags = backend.CapabilityFlags;
+
+pub const EngineCapabilitiesC = extern struct {
+    struct_size: u32,
+    backend: BackendC = .quickjs_ng,
+    flags: u32 = 0,
+};
+
+/// Which `-Dbackend` was compiled into this linked library.
+pub export fn jsbay_library_backend() c_int {
+    return @backingInt(backend.libraryBackendC());
+}
+
+/// Fill capability bits for this linked build. No instance required.
+pub export fn jsbay_library_capabilities(out_caps: ?*EngineCapabilitiesC) bool {
+    const out = out_caps orelse return false;
+    const caller_size = out.struct_size;
+    if (caller_size < 4) return false;
+    var filled = EngineCapabilitiesC{
+        .struct_size = caller_size,
+        .backend = backend.libraryBackendC(),
+        .flags = backend.libraryCapabilityFlags(),
+    };
+    const copy_len = @min(caller_size, @sizeOf(EngineCapabilitiesC));
+    const src: [*]const u8 = @ptrCast(&filled);
+    const dst: [*]u8 = @ptrCast(out);
+    @memset(dst[0..caller_size], 0);
+    @memcpy(dst[0..copy_len], src[0..copy_len]);
+    out.struct_size = caller_size;
+    return true;
+}
+
+test "c_api: library_backend and capabilities match compile-time backend" {
+    const tag = jsbay_library_backend();
+    switch (backend.active_backend) {
+        .quickjs_ng => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.quickjs_ng)), tag),
+        .quickjs => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.quickjs)), tag),
+        .jsc => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.jsc)), tag),
+    }
+
+    try std.testing.expect(!jsbay_library_capabilities(null));
+    var too_small = EngineCapabilitiesC{ .struct_size = 0 };
+    try std.testing.expect(!jsbay_library_capabilities(&too_small));
+
+    var caps = EngineCapabilitiesC{ .struct_size = @sizeOf(EngineCapabilitiesC) };
+    try std.testing.expect(jsbay_library_capabilities(&caps));
+    try std.testing.expectEqual(backend.libraryBackendC(), caps.backend);
+    try std.testing.expectEqual(backend.libraryCapabilityFlags(), caps.flags);
+
+    const F = CapabilityFlags;
+    // Interrupt/deadline exist for every current backend.
+    try std.testing.expect((caps.flags & F.interrupt_deadline) != 0);
+    if (backend.isQuickJsApiBackend(backend.active_backend)) {
+        try std.testing.expect((caps.flags & F.heap_stack_limit) != 0);
+        try std.testing.expect((caps.flags & F.heap_usage_snapshot) != 0);
+        try std.testing.expect((caps.flags & F.explicit_bytecode) != 0);
+        if (@import("build_options").bytecode_cache) {
+            try std.testing.expect((caps.flags & F.persistent_bytecode_cache) != 0);
+        } else {
+            try std.testing.expect((caps.flags & F.persistent_bytecode_cache) == 0);
+        }
+        try std.testing.expect((caps.flags & F.safari_web_inspector) == 0);
+    } else {
+        try std.testing.expect((caps.flags & F.heap_stack_limit) == 0);
+        try std.testing.expect((caps.flags & F.heap_usage_snapshot) == 0);
+        try std.testing.expect((caps.flags & F.explicit_bytecode) == 0);
+        try std.testing.expect((caps.flags & F.persistent_bytecode_cache) == 0);
+        try std.testing.expect((caps.flags & F.safari_web_inspector) != 0);
+    }
+    if (backend.supportsDebugger(backend.active_backend) and @import("build_options").inspector) {
+        try std.testing.expect((caps.flags & F.cdp_source_debugger) != 0);
+    } else {
+        try std.testing.expect((caps.flags & F.cdp_source_debugger) == 0);
+    }
+}
+
+const multi_pack = @import("multi_pack.zig");
+
+pub const EngineCreateOptionsC = extern struct {
+    struct_size: u32,
+    backend: BackendC = .primary,
+    log_handler: ?types.LogHandler = null,
+    log_user_data: ?*anyopaque = null,
+};
+
+/// Packed backends in this artifact (create-time select candidates). Writes up to `cap` tags into `out` when non-NULL; always returns the packed count (required capacity). Callers must clamp iteration to `min(returned, cap)`.
+pub export fn jsbay_available_backends(out_backends: ?[*]BackendC, cap: usize) usize {
+    var buf: [4]multi_pack.Backend = undefined;
+    const n = multi_pack.availableBackends(&buf);
+    if (out_backends) |out| {
+        const write_n = @min(n, cap);
+        var i: usize = 0;
+        while (i < write_n) : (i += 1) {
+            out[i] = backend.backendToC(buf[i]);
+        }
+    }
+    return n;
+}
+
+/// Create-time engine select. `backend == .primary` (0) selects the pack primary. Any packed backend (including non-primary) creates an instance; non-packed tags fail. Non-primary packed instances support create/eval/destroy plus the typed Value surface wired through packed_api_value; bytecode cache and bind/inspector remain primary-only.
+pub export fn jsbay_engine_create_with_options(
+    instance_id: c_int,
+    options_arg: ?*const EngineCreateOptionsC,
+) bool {
+    const options = options_arg orelse return false;
+    if (options.struct_size < @sizeOf(u32)) return false;
+    if (options.struct_size < 8) return false;
+
+    const raw_backend: c_int = @backingInt(options.backend);
+    const requested = backend.backendFromC(raw_backend) orelse return false;
+    if (!backend.isPacked(requested)) return false;
+
+    const log_handler: ?types.LogHandler = if (options.struct_size >= @offsetOf(EngineCreateOptionsC, "log_handler") + @sizeOf(?types.LogHandler))
+        options.log_handler
+    else
+        null;
+    const log_user_data: ?*anyopaque = if (options.struct_size >= @sizeOf(EngineCreateOptionsC))
+        options.log_user_data
+    else
+        null;
+
+    if (host_wake.isNotifying()) return false;
+    const id: i32 = @intCast(instance_id);
+    const config = cApiEngineConfig(log_handler, log_user_data, resource_limits.Limits{});
+    if (!engine.createWithBackend(id, config, requested)) return false;
+    // runtime_control is mono-only; packed-alt skips it inside createWithBackend.
+    if (requested == backend.active_backend) {
+        if (!runtime_control.init(id)) {
+            engine.destroy(id);
+            return false;
+        }
+    }
+    if (!api_value.noteCreated(id)) {
+        engine.destroy(id);
+        return false;
+    }
+    if (log_handler) |lh| lh(id, .info, "jsbay create ok", log_user_data);
+    return true;
+}
+
+test "c_api: available_backends matches packed bits" {
+    const n = jsbay_available_backends(null, 0);
+    try std.testing.expectEqual(multi_pack.packedCount(), n);
+    try std.testing.expect(n >= 1);
+
+    var buf: [4]BackendC = undefined;
+    const written = jsbay_available_backends(&buf, buf.len);
+    try std.testing.expectEqual(n, written);
+    var i: usize = 0;
+    while (i < written) : (i += 1) {
+        const tag = backend.backendFromC(@backingInt(buf[i])) orelse return error.BadBackendTag;
+        try std.testing.expect(backend.isPacked(tag));
+        try std.testing.expect(buf[i] != .primary);
+    }
+
+    // Cap smaller than packed count still returns full count.
+    if (n >= 1) {
+        var one: [1]BackendC = undefined;
+        const reported = jsbay_available_backends(&one, 1);
+        try std.testing.expectEqual(n, reported);
+        try std.testing.expect(one[0] != .primary);
+    }
+}
+
+test "c_api: create_with_options primary packed succeeds; non-packed fails" {
+    const helpers = @import("tests/test_helpers.zig");
+
+    // Default / primary tag → full create.
+    {
+        const id = helpers.nextInstanceId();
+        var opts = EngineCreateOptionsC{
+            .struct_size = @sizeOf(EngineCreateOptionsC),
+            .backend = .primary,
+        };
+        try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
+        defer jsbay_engine_destroy(id);
+    }
+    {
+        const id = helpers.nextInstanceId();
+        var opts = EngineCreateOptionsC{
+            .struct_size = @sizeOf(EngineCreateOptionsC),
+            .backend = backend.libraryBackendC(),
+        };
+        try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
+        defer jsbay_engine_destroy(id);
+    }
+
+    try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), null));
+    var too_small = EngineCreateOptionsC{ .struct_size = 0, .backend = .primary };
+    try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), &too_small));
+
+    // Pick a backend that is not packed in this artifact.
+    const candidates = [_]BackendC{ .quickjs_ng, .quickjs, .jsc };
+    var found_unpacked = false;
+    for (candidates) |cand| {
+        const tag = backend.backendFromC(@backingInt(cand)).?;
+        if (backend.isPacked(tag)) continue;
+        found_unpacked = true;
+        var opts = EngineCreateOptionsC{
+            .struct_size = @sizeOf(EngineCreateOptionsC),
+            .backend = cand,
+        };
+        try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), &opts));
+        break;
+    }
+    // With a single packed engine, at least one of the three tags is unpacked.
+    try std.testing.expect(found_unpacked);
+
+    // Unknown backend enum value.
+    var bogus = EngineCreateOptionsC{
+        .struct_size = @sizeOf(EngineCreateOptionsC),
+        .backend = @fromBackingInt(@intCast(99)),
+    };
+    try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), &bogus));
+}
+
+test "c_api: create_with_options non-primary packed create eval destroy" {
+    // When multi-pack includes a non-primary engine, create/eval/destroy must work (Apple NG+JSC).
+    var buf: [4]BackendC = undefined;
+    const n = jsbay_available_backends(&buf, buf.len);
+    const primary = backend.libraryBackendC();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (buf[i] == primary) continue;
+        const id = @import("tests/test_helpers.zig").nextInstanceId();
+        var opts = EngineCreateOptionsC{
+            .struct_size = @sizeOf(EngineCreateOptionsC),
+            .backend = buf[i],
+        };
+        try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
+        defer jsbay_engine_destroy(id);
+        const tag = backend.backendFromC(@backingInt(buf[i])).?;
+        const ev = engine.evalScript(id, "1+1", "<c-api-alt>");
+        defer {
+            if (ev.result) |s| std.heap.c_allocator.free(@constCast(s));
+            if (ev.err_is_heap) {
+                if (ev.err) |e| std.heap.c_allocator.free(@constCast(e));
+            }
+        }
+        try std.testing.expect(ev.err == null);
+        try std.testing.expectEqualStrings("2", ev.result.?);
+        _ = tag;
+    }
+    // Single-pack Linux: loop body skipped; dual pack (Apple NG+JSC) exercises create/eval/destroy here.
+}
+
+test "c_api: packed-alt typed evaluate number + retain/release (real non-primary when packed)" {
+    var buf: [4]BackendC = undefined;
+    const n = jsbay_available_backends(&buf, buf.len);
+    const primary = backend.libraryBackendC();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (buf[i] == primary) continue;
+        const id = @import("tests/test_helpers.zig").nextInstanceId();
+        var opts = EngineCreateOptionsC{
+            .struct_size = @sizeOf(EngineCreateOptionsC),
+            .backend = buf[i],
+        };
+        try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
+        defer jsbay_engine_destroy(id);
+        var value: u64 = 0;
+        var exception: u64 = 0;
+        const source = "40+2";
+        const filename = "<alt-eval>";
+        try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
+        defer _ = jsbay_value_release(value);
+        try std.testing.expectEqual(@as(u64, 0), exception);
+        try std.testing.expect(packed_api_value.isPackedHandle(value));
+        var kind: c_int = -1;
+        try std.testing.expectEqual(API_OK, jsbay_value_type(value, &kind));
+        try std.testing.expectEqual(@as(c_int, 3), kind); // number
+        var number: f64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_to_number(value, &number));
+        try std.testing.expectEqual(@as(f64, 42), number);
+        var retained: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_retain(value, &retained));
+        defer _ = jsbay_value_release(retained);
+        try std.testing.expectEqual(API_OK, jsbay_value_to_number(retained, &number));
+        try std.testing.expectEqual(@as(f64, 42), number);
+    }
+}
+
+test "c_api: forced packed_alt typed value (Linux primary-tag)" {
+    // Build EngineInstance.packed_alt for the pack primary without a second real engine.
+    const helpers = @import("tests/test_helpers.zig");
+    const instance_map = @import("runtime/instance_map.zig");
+    const event_loop = @import("js_event_loop");
+    const timers = @import("runtime/timers.zig");
+    const backend_dispatch = @import("backend_dispatch.zig");
+    const id = helpers.nextInstanceId();
+    const tag = backend.active_backend;
+    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
+    const handles = backend_dispatch.createPacked(tag) orelse {
+        loop.destroy();
+        return error.CreatePackedFailed;
+    };
+    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
+    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        return error.Oom;
+    };
+    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        std.heap.c_allocator.destroy(instance);
+        return error.BudgetFailed;
+    };
+    instance.* = .{
+        .resources = resources,
+        .instance_id = id,
+        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
+        .loop = loop,
+        .timers = timers.TimerRegistry.init(),
+    };
+    if (!instance_map.insert(instance)) {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        resources.deinit();
+        instance.deinitSynchronization();
+        std.heap.c_allocator.destroy(instance);
+        return error.InsertFailed;
+    }
+    try std.testing.expect(api_value.noteCreated(id));
+    defer jsbay_engine_destroy(id);
+
+    var value: u64 = 0;
+    var exception: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "40+2", .len = 4 }, .{ .data = "<forced-alt>", .len = 12 }, null, &value, &exception));
+    defer _ = jsbay_value_release(value);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expect(packed_api_value.isPackedHandle(value));
+    var kind: c_int = -1;
+    try std.testing.expectEqual(API_OK, jsbay_value_type(value, &kind));
+    try std.testing.expectEqual(@as(c_int, 3), kind);
+    var number: f64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(value, &number));
+    try std.testing.expectEqual(@as(f64, 42), number);
+
+    var obj: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "({n:7,s:'hi'})", .len = 14 }, .{ .data = "<forced-obj>", .len = 12 }, null, &obj, &exception));
+    defer _ = jsbay_value_release(obj);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var prop: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(obj, .{ .data = "n", .len = 1 }, &prop, &exception));
+    defer _ = jsbay_value_release(prop);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(prop, &number));
+    try std.testing.expectEqual(@as(f64, 7), number);
+
+    var sprop: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(obj, .{ .data = "s", .len = 1 }, &sprop, &exception));
+    defer _ = jsbay_value_release(sprop);
+    var bytes: Bytes = .{ .data = null, .len = 0 };
+    var to_exc: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(sprop, &bytes, &to_exc));
+    defer jsbay_free_bytes(bytes);
+    try std.testing.expectEqualStrings("hi", bytes.data.?[0..bytes.len]);
+}
+
+test "c_api: forced packed_alt set/call/construct/new_* (Linux primary-tag proof)" {
+    const helpers = @import("tests/test_helpers.zig");
+    const instance_map = @import("runtime/instance_map.zig");
+    const event_loop = @import("js_event_loop");
+    const timers = @import("runtime/timers.zig");
+    const backend_dispatch = @import("backend_dispatch.zig");
+    const id = helpers.nextInstanceId();
+    const tag = backend.active_backend;
+    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
+    const handles = backend_dispatch.createPacked(tag) orelse {
+        loop.destroy();
+        return error.CreatePackedFailed;
+    };
+    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
+    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        return error.Oom;
+    };
+    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        std.heap.c_allocator.destroy(instance);
+        return error.BudgetFailed;
+    };
+    instance.* = .{
+        .resources = resources,
+        .instance_id = id,
+        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
+        .loop = loop,
+        .timers = timers.TimerRegistry.init(),
+    };
+    if (!instance_map.insert(instance)) {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        resources.deinit();
+        instance.deinitSynchronization();
+        std.heap.c_allocator.destroy(instance);
+        return error.InsertFailed;
+    }
+    try std.testing.expect(api_value.noteCreated(id));
+    defer jsbay_engine_destroy(id);
+
+    var exception: u64 = 0;
+
+    // new_object + new_number + set + get
+    var obj: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_object(id, &obj));
+    defer _ = jsbay_value_release(obj);
+    try std.testing.expect(packed_api_value.isPackedHandle(obj));
+    var num: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 99, &num));
+    defer _ = jsbay_value_release(num);
+    try std.testing.expectEqual(API_OK, jsbay_value_set(obj, .{ .data = "x", .len = 1 }, num, &exception));
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var got: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(obj, .{ .data = "x", .len = 1 }, &got, &exception));
+    defer _ = jsbay_value_release(got);
+    var number: f64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(got, &number));
+    try std.testing.expectEqual(@as(f64, 99), number);
+
+    // new_string / bool / null / undefined / array / global
+    var s: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_string(id, .{ .data = "hi", .len = 2 }, &s));
+    defer _ = jsbay_value_release(s);
+    var flag: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_bool(id, true, &flag));
+    defer _ = jsbay_value_release(flag);
+    var kind: c_int = -1;
+    try std.testing.expectEqual(API_OK, jsbay_value_type(flag, &kind));
+    try std.testing.expectEqual(@as(c_int, 2), kind);
+    var und: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_undefined(id, &und));
+    defer _ = jsbay_value_release(und);
+    var nul: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_null(id, &nul));
+    defer _ = jsbay_value_release(nul);
+    var arr: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_array(id, &arr));
+    defer _ = jsbay_value_release(arr);
+    try std.testing.expectEqual(API_OK, jsbay_value_type(arr, &kind));
+    try std.testing.expectEqual(@as(c_int, 6), kind);
+    var global: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_global(id, &global));
+    defer _ = jsbay_value_release(global);
+
+    // call: eval function, call with number arg
+    var fn_val: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(a){ return a + 3; })", .len = 30 }, .{ .data = "<fn>", .len = 4 }, null, &fn_val, &exception));
+    defer _ = jsbay_value_release(fn_val);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var arg: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 7, &arg));
+    defer _ = jsbay_value_release(arg);
+    var call_result: u64 = 0;
+    const args = [_]u64{arg};
+    try std.testing.expectEqual(API_OK, jsbay_value_call(fn_val, und, &args, 1, &call_result, &exception));
+    defer _ = jsbay_value_release(call_result);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(call_result, &number));
+    try std.testing.expectEqual(@as(f64, 10), number);
+
+    // construct: new Number(5) style via evaluated constructor
+    var ctor: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function Point(x){ this.x = x; })", .len = 34 }, .{ .data = "<ctor>", .len = 6 }, null, &ctor, &exception));
+    defer _ = jsbay_value_release(ctor);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var cx: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 5, &cx));
+    defer _ = jsbay_value_release(cx);
+    var constructed: u64 = 0;
+    const cargs = [_]u64{cx};
+    try std.testing.expectEqual(API_OK, jsbay_value_construct(ctor, &cargs, 1, &constructed, &exception));
+    defer _ = jsbay_value_release(constructed);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var px: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(constructed, .{ .data = "x", .len = 1 }, &px, &exception));
+    defer _ = jsbay_value_release(px);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(px, &number));
+    try std.testing.expectEqual(@as(f64, 5), number);
+
+    // ArrayBuffer
+    const payload = [_]u8{ 1, 2, 3, 4 };
+    var buf: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_array_buffer(id, &payload, payload.len, &buf));
+    defer _ = jsbay_value_release(buf);
+}
+
+test "c_api: packed-alt set/call/new when real non-primary packed" {
+    var buf: [4]BackendC = undefined;
+    const n = jsbay_available_backends(&buf, buf.len);
+    const primary = backend.libraryBackendC();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (buf[i] == primary) continue;
+        const id = @import("tests/test_helpers.zig").nextInstanceId();
+        var opts = EngineCreateOptionsC{
+            .struct_size = @sizeOf(EngineCreateOptionsC),
+            .backend = buf[i],
+        };
+        try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
+        defer jsbay_engine_destroy(id);
+        var exception: u64 = 0;
+        var obj: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_object(id, &obj));
+        defer _ = jsbay_value_release(obj);
+        try std.testing.expect(packed_api_value.isPackedHandle(obj));
+        var num: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 3, &num));
+        defer _ = jsbay_value_release(num);
+        try std.testing.expectEqual(API_OK, jsbay_value_set(obj, .{ .data = "n", .len = 1 }, num, &exception));
+        try std.testing.expectEqual(@as(u64, 0), exception);
+        var fn_val: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(a,b){ return a*b; })", .len = 30 }, .{ .data = "<alt-fn>", .len = 8 }, null, &fn_val, &exception));
+        defer _ = jsbay_value_release(fn_val);
+        var a: u64 = 0;
+        var b: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 6, &a));
+        defer _ = jsbay_value_release(a);
+        try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 7, &b));
+        defer _ = jsbay_value_release(b);
+        var und: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_undefined(id, &und));
+        defer _ = jsbay_value_release(und);
+        var result: u64 = 0;
+        const args = [_]u64{ a, b };
+        try std.testing.expectEqual(API_OK, jsbay_value_call(fn_val, und, &args, 2, &result, &exception));
+        defer _ = jsbay_value_release(result);
+        var number: f64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_to_number(result, &number));
+        try std.testing.expectEqual(@as(f64, 42), number);
+    }
+}
+
+test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/new_error" {
+    const helpers = @import("tests/test_helpers.zig");
+    const instance_map = @import("runtime/instance_map.zig");
+    const event_loop = @import("js_event_loop");
+    const timers = @import("runtime/timers.zig");
+    const backend_dispatch = @import("backend_dispatch.zig");
+    const id = helpers.nextInstanceId();
+    const tag = backend.active_backend;
+    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
+    const handles = backend_dispatch.createPacked(tag) orelse {
+        loop.destroy();
+        return error.CreatePackedFailed;
+    };
+    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
+    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        return error.Oom;
+    };
+    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        std.heap.c_allocator.destroy(instance);
+        return error.BudgetFailed;
+    };
+    instance.* = .{
+        .resources = resources,
+        .instance_id = id,
+        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
+        .loop = loop,
+        .timers = timers.TimerRegistry.init(),
+    };
+    if (!instance_map.insert(instance)) {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        resources.deinit();
+        instance.deinitSynchronization();
+        std.heap.c_allocator.destroy(instance);
+        return error.InsertFailed;
+    }
+    try std.testing.expect(api_value.noteCreated(id));
+    defer jsbay_engine_destroy(id);
+
+    var exception: u64 = 0;
+
+    // to_bool
+    var flag_v: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_bool(id, true, &flag_v));
+    defer _ = jsbay_value_release(flag_v);
+    var flag: bool = false;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_bool(flag_v, &flag));
+    try std.testing.expect(flag);
+
+    // has / set / delete / keys
+    var obj: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_object(id, &obj));
+    defer _ = jsbay_value_release(obj);
+    var num: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 1, &num));
+    defer _ = jsbay_value_release(num);
+    try std.testing.expectEqual(API_OK, jsbay_value_set(obj, .{ .data = "k", .len = 1 }, num, &exception));
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var has: bool = false;
+    try std.testing.expectEqual(API_OK, jsbay_value_has(obj, .{ .data = "k", .len = 1 }, &has, &exception));
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expect(has);
+    var keys_arr: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_keys(obj, &keys_arr, &exception));
+    defer _ = jsbay_value_release(keys_arr);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var kind: c_int = -1;
+    try std.testing.expectEqual(API_OK, jsbay_value_type(keys_arr, &kind));
+    try std.testing.expectEqual(@as(c_int, 6), kind); // array
+    var deleted: bool = false;
+    try std.testing.expectEqual(API_OK, jsbay_value_delete(obj, .{ .data = "k", .len = 1 }, &deleted, &exception));
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expect(deleted);
+    try std.testing.expectEqual(API_OK, jsbay_value_has(obj, .{ .data = "k", .len = 1 }, &has, &exception));
+    try std.testing.expect(!has);
+
+    // instanceof
+    var err: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_error(id, .{ .data = "boom", .len = 4 }, &err));
+    defer _ = jsbay_value_release(err);
+    try std.testing.expect(packed_api_value.isPackedHandle(err));
+    var ctor: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "Error", .len = 5 }, .{ .data = "<Error>", .len = 7 }, null, &ctor, &exception));
+    defer _ = jsbay_value_release(ctor);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var is_err: bool = false;
+    try std.testing.expectEqual(API_OK, jsbay_value_instance_of(err, ctor, &is_err, &exception));
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expect(is_err);
+
+    // JSON round-trip
+    const json_in = "{\"a\":2}";
+    var parsed: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_json(id, .{ .data = json_in.ptr, .len = json_in.len }, &parsed, &exception));
+    defer _ = jsbay_value_release(parsed);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var json_bytes: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_to_json(parsed, &json_bytes, &exception));
+    defer jsbay_free_bytes(json_bytes);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expectEqualStrings(json_in, json_bytes.data.?[0..json_bytes.len]);
+
+    // copy_buffer from ArrayBuffer
+    const payload = [_]u8{ 9, 8, 7 };
+    var buf_v: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_array_buffer(id, &payload, payload.len, &buf_v));
+    defer _ = jsbay_value_release(buf_v);
+    var copied: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_copy_buffer(buf_v, &copied, &exception));
+    defer jsbay_free_bytes(copied);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expectEqualSlices(u8, &payload, copied.data.?[0..copied.len]);
+}
+
+test "c_api: packed-alt to_bool/has/json/buffer when real non-primary packed" {
+    var buf: [4]BackendC = undefined;
+    const n = jsbay_available_backends(&buf, buf.len);
+    const primary = backend.libraryBackendC();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (buf[i] == primary) continue;
+        const id = @import("tests/test_helpers.zig").nextInstanceId();
+        var opts = EngineCreateOptionsC{
+            .struct_size = @sizeOf(EngineCreateOptionsC),
+            .backend = buf[i],
+        };
+        try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
+        defer jsbay_engine_destroy(id);
+        var exception: u64 = 0;
+
+        var flag_v: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_bool(id, false, &flag_v));
+        defer _ = jsbay_value_release(flag_v);
+        var flag: bool = true;
+        try std.testing.expectEqual(API_OK, jsbay_value_to_bool(flag_v, &flag));
+        try std.testing.expect(!flag);
+
+        var obj: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_object(id, &obj));
+        defer _ = jsbay_value_release(obj);
+        var num: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 4, &num));
+        defer _ = jsbay_value_release(num);
+        try std.testing.expectEqual(API_OK, jsbay_value_set(obj, .{ .data = "z", .len = 1 }, num, &exception));
+        var has: bool = false;
+        try std.testing.expectEqual(API_OK, jsbay_value_has(obj, .{ .data = "z", .len = 1 }, &has, &exception));
+        try std.testing.expect(has);
+
+        const json_in = "[1,2]";
+        var parsed: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_json(id, .{ .data = json_in.ptr, .len = json_in.len }, &parsed, &exception));
+        defer _ = jsbay_value_release(parsed);
+        var json_bytes: Bytes = .{ .data = null, .len = 0 };
+        try std.testing.expectEqual(API_OK, jsbay_value_to_json(parsed, &json_bytes, &exception));
+        defer jsbay_free_bytes(json_bytes);
+        try std.testing.expectEqualStrings(json_in, json_bytes.data.?[0..json_bytes.len]);
+
+        const payload = [_]u8{ 5, 6 };
+        var buf_v: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_array_buffer(id, &payload, payload.len, &buf_v));
+        defer _ = jsbay_value_release(buf_v);
+        var copied: Bytes = .{ .data = null, .len = 0 };
+        try std.testing.expectEqual(API_OK, jsbay_value_copy_buffer(buf_v, &copied, &exception));
+        defer jsbay_free_bytes(copied);
+        try std.testing.expectEqualSlices(u8, &payload, copied.data.?[0..copied.len]);
+
+        var err: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_error(id, .{ .data = "x", .len = 1 }, &err));
+        defer _ = jsbay_value_release(err);
+        try std.testing.expect(packed_api_value.isPackedHandle(err));
+    }
+}
+
+test "c_api: packed-alt adversarial get exception / bind / empty options / destroy stale" {
+    const helpers = @import("tests/test_helpers.zig");
+    const instance_map = @import("runtime/instance_map.zig");
+    const event_loop = @import("js_event_loop");
+    const timers = @import("runtime/timers.zig");
+    const backend_dispatch = @import("backend_dispatch.zig");
+    const id = helpers.nextInstanceId();
+    const tag = backend.active_backend;
+    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
+    const handles = backend_dispatch.createPacked(tag) orelse {
+        loop.destroy();
+        return error.CreatePackedFailed;
+    };
+    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
+    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        return error.Oom;
+    };
+    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        std.heap.c_allocator.destroy(instance);
+        return error.BudgetFailed;
+    };
+    instance.* = .{
+        .resources = resources,
+        .instance_id = id,
+        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
+        .loop = loop,
+        .timers = timers.TimerRegistry.init(),
+    };
+    if (!instance_map.insert(instance)) {
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        resources.deinit();
+        instance.deinitSynchronization();
+        std.heap.c_allocator.destroy(instance);
+        return error.InsertFailed;
+    }
+    try std.testing.expect(api_value.noteCreated(id));
+    defer {
+        if (instance_map.getInstance(id) != null) jsbay_engine_destroy(id);
+    }
+
+    var exception: u64 = 0;
+
+    // Empty evaluate options must not be rejected as UNSUPPORTED on packed-alt.
+    var empty_opts = EvalOptions{
+        .struct_size = @sizeOf(EvalOptions),
+        .cache_dir = .{ .data = null, .len = 0 },
+        .cache_version = .{ .data = null, .len = 0 },
+        .out_cache_hit = null,
+    };
+    var value: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "1", .len = 1 }, .{ .data = "<adv>", .len = 5 }, &empty_opts, &value, &exception));
+    defer _ = jsbay_value_release(value);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+
+    // Getter throw must surface as status 1 + exception handle (not silent undefined).
+    var toxic: u64 = 0;
+    const toxic_src = "({ get boom() { throw new Error('nope'); } })";
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = toxic_src.ptr, .len = toxic_src.len }, .{ .data = "<toxic>", .len = 7 }, null, &toxic, &exception));
+    defer _ = jsbay_value_release(toxic);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var got: u64 = 0;
+    try std.testing.expectEqual(@as(c_int, 1), jsbay_value_get(toxic, .{ .data = "boom", .len = 4 }, &got, &exception));
+    try std.testing.expectEqual(@as(u64, 0), got);
+    try std.testing.expect(packed_api_value.isPackedHandle(exception));
+    _ = jsbay_value_release(exception);
+    exception = 0;
+
+    // null/undefined receiver must TypeError (ToObject), not crash.
+    var nul: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_null(id, &nul));
+    defer _ = jsbay_value_release(nul);
+    try std.testing.expectEqual(@as(c_int, 1), jsbay_value_get(nul, .{ .data = "x", .len = 1 }, &got, &exception));
+    try std.testing.expectEqual(@as(u64, 0), got);
+    try std.testing.expect(exception != 0);
+    _ = jsbay_value_release(exception);
+    exception = 0;
+
+    // Number primitive boxes via ToObject; missing prop is undefined (not a throw, not a crash).
+    var num: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 3, &num));
+    defer _ = jsbay_value_release(num);
+    try std.testing.expectEqual(API_OK, jsbay_value_get(num, .{ .data = "x", .len = 1 }, &got, &exception));
+    defer _ = jsbay_value_release(got);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var prim_kind: c_int = -1;
+    try std.testing.expectEqual(API_OK, jsbay_value_type(got, &prim_kind));
+    try std.testing.expectEqual(@as(c_int, 0), prim_kind);
+
+    // Throwing toString must surface via to_utf8 exception path.
+    var bad_str: u64 = 0;
+    const bad_src = "({ toString() { throw new Error('bad'); } })";
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = bad_src.ptr, .len = bad_src.len }, .{ .data = "<bad>", .len = 5 }, null, &bad_str, &exception));
+    defer _ = jsbay_value_release(bad_str);
+    var utf8: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(@as(c_int, 1), jsbay_value_to_utf8(bad_str, &utf8, &exception));
+    try std.testing.expect(utf8.data == null);
+    try std.testing.expect(exception != 0);
+    _ = jsbay_value_release(exception);
+    exception = 0;
+
+    // bind / platform-loop attach on packed-alt must be honest UNSUPPORTED (not INSTANCE_NOT_FOUND).
+    var fn_out: u64 = 0;
+    try std.testing.expectEqual(API_UNSUPPORTED, jsbay_engine_bind(id, .{ .data = "host", .len = 4 }, &bindOomCallback, null, null, &fn_out, &exception));
+    try std.testing.expectEqual(@as(u64, 0), fn_out);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expectEqual(API_UNSUPPORTED, jsbay_engine_attach_loop(id, &noopLoopSchedule, &noopLoopCancel, null));
+    try std.testing.expectEqual(API_UNSUPPORTED, jsbay_engine_detach_loop(id));
+    try std.testing.expectEqual(API_UNSUPPORTED, jsbay_engine_run_loop(id));
+
+    // keys content: length === 1 after one own enumerable string key.
+    var obj: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_object(id, &obj));
+    defer _ = jsbay_value_release(obj);
+    var one: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 1, &one));
+    defer _ = jsbay_value_release(one);
+    try std.testing.expectEqual(API_OK, jsbay_value_set(obj, .{ .data = "k", .len = 1 }, one, &exception));
+    var keys_arr: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_keys(obj, &keys_arr, &exception));
+    defer _ = jsbay_value_release(keys_arr);
+    var len_v: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(keys_arr, .{ .data = "length", .len = 6 }, &len_v, &exception));
+    defer _ = jsbay_value_release(len_v);
+    var len_n: f64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(len_v, &len_n));
+    try std.testing.expectEqual(@as(f64, 1), len_n);
+
+    // Empty keys array length === 0
+    var empty_obj: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_object(id, &empty_obj));
+    defer _ = jsbay_value_release(empty_obj);
+    var empty_keys: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_keys(empty_obj, &empty_keys, &exception));
+    defer _ = jsbay_value_release(empty_keys);
+    var empty_len_v: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(empty_keys, .{ .data = "length", .len = 6 }, &empty_len_v, &exception));
+    defer _ = jsbay_value_release(empty_len_v);
+    var empty_len_n: f64 = -1;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(empty_len_v, &empty_len_n));
+    try std.testing.expectEqual(@as(f64, 0), empty_len_n);
+
+    // Invalid JSON → status 1 + owned exception
+    var bad_json: u64 = 0;
+    try std.testing.expectEqual(@as(c_int, 1), jsbay_value_new_json(id, .{ .data = "{", .len = 1 }, &bad_json, &exception));
+    try std.testing.expectEqual(@as(u64, 0), bad_json);
+    try std.testing.expect(exception != 0);
+    _ = jsbay_value_release(exception);
+    exception = 0;
+
+    // Zero-length ArrayBuffer copy_buffer
+    var zbuf: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_array_buffer(id, &[_]u8{}, 0, &zbuf));
+    defer _ = jsbay_value_release(zbuf);
+    var zcopied: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_copy_buffer(zbuf, &zcopied, &exception));
+    defer jsbay_free_bytes(zcopied);
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    try std.testing.expectEqual(@as(usize, 0), zcopied.len);
+
+    // Cross-instance set must reject (STALE), not mix backends/ctx.
+    const id2 = helpers.nextInstanceId();
+    const loop2 = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
+    const handles2 = backend_dispatch.createPacked(tag) orelse {
+        loop2.destroy();
+        return error.CreatePackedFailed;
+    };
+    backend_dispatch.finishCreate(tag, handles2, id2, 256 * 1024);
+    const instance2 = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
+        backend_dispatch.destroyPacked(tag, handles2);
+        loop2.destroy();
+        return error.Oom;
+    };
+    const resources2 = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+        backend_dispatch.destroyPacked(tag, handles2);
+        loop2.destroy();
+        std.heap.c_allocator.destroy(instance2);
+        return error.BudgetFailed;
+    };
+    instance2.* = .{
+        .resources = resources2,
+        .instance_id = id2,
+        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles2.runtime_addr, .ctx_addr = handles2.ctx_addr } },
+        .loop = loop2,
+        .timers = timers.TimerRegistry.init(),
+    };
+    if (!instance_map.insert(instance2)) {
+        backend_dispatch.destroyPacked(tag, handles2);
+        loop2.destroy();
+        resources2.deinit();
+        instance2.deinitSynchronization();
+        std.heap.c_allocator.destroy(instance2);
+        return error.InsertFailed;
+    }
+    try std.testing.expect(api_value.noteCreated(id2));
+    defer jsbay_engine_destroy(id2);
+    var obj2: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_object(id2, &obj2));
+    defer _ = jsbay_value_release(obj2);
+    var foreign: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 9, &foreign));
+    defer _ = jsbay_value_release(foreign);
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_set(obj2, .{ .data = "k", .len = 1 }, foreign, &exception));
+    try std.testing.expectEqual(@as(u64, 0), exception);
+
+    // Double-release after single release
+    var once: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 2, &once));
+    try std.testing.expectEqual(API_OK, jsbay_value_release(once));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(once));
+
+    // Retain a handle, destroy engine, then ops must be STALE (registry dropInstance).
+    var live: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_bool(id, true, &live));
+    try std.testing.expect(packed_api_value.isPackedHandle(live));
+    jsbay_engine_destroy(id);
+    var kind: c_int = -1;
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(live, &kind));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(live));
+}
+
+test "c_api: packed-alt adversarial when real non-primary packed" {
+    var backends_buf: [4]BackendC = undefined;
+    const n = jsbay_available_backends(&backends_buf, backends_buf.len);
+    const primary = backend.libraryBackendC();
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (backends_buf[i] == primary) continue;
+        const alt_id = @import("tests/test_helpers.zig").nextInstanceId();
+        var create_opts = EngineCreateOptionsC{
+            .struct_size = @sizeOf(EngineCreateOptionsC),
+            .backend = backends_buf[i],
+        };
+        try std.testing.expect(jsbay_engine_create_with_options(alt_id, &create_opts));
+        defer jsbay_engine_destroy(alt_id);
+        var exception: u64 = 0;
+        var toxic: u64 = 0;
+        const toxic_src = "({ get boom() { throw new Error('alt-nope'); } })";
+        try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(alt_id, .{ .data = toxic_src.ptr, .len = toxic_src.len }, .{ .data = "<alt-toxic>", .len = 11 }, null, &toxic, &exception));
+        defer _ = jsbay_value_release(toxic);
+        var got: u64 = 0;
+        try std.testing.expectEqual(@as(c_int, 1), jsbay_value_get(toxic, .{ .data = "boom", .len = 4 }, &got, &exception));
+        try std.testing.expect(exception != 0);
+        defer _ = jsbay_value_release(exception);
+        try std.testing.expectEqual(@as(u64, 0), got);
+
+        var released: u64 = 0;
+        try std.testing.expectEqual(API_OK, jsbay_value_new_bool(alt_id, true, &released));
+        try std.testing.expectEqual(API_OK, jsbay_value_release(released));
+        var flag: bool = false;
+        try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_to_bool(released, &flag));
+
+        try std.testing.expectEqual(API_UNSUPPORTED, jsbay_engine_bind(alt_id, .{ .data = "host", .len = 4 }, &bindOomCallback, null, null, &got, &exception));
+    }
+}
 
 /// One-shot fault for the next property-key copy shared by set/has/delete.
 const key_fault = if (builtin.is_test) struct {
@@ -326,6 +1302,7 @@ pub const LoopCancel = *const fn (?*anyopaque) callconv(.c) void;
 pub export fn jsbay_engine_attach_loop(instance_id: c_int, schedule: ?LoopSchedule, cancel: ?LoopCancel, user_data: ?*anyopaque) c_int {
     const id: i32 = @intCast(instance_id);
     if (schedule == null or cancel == null) return API_INVALID_ARGUMENT;
+    if (packedTagOf(id) != null) return API_UNSUPPORTED;
     if (engine.getContext(id) == null or @import("runtime/instance_map.zig").isTeardownPending(id)) return API_INSTANCE_NOT_FOUND;
     if (!api_value.isOwner(id)) return API_WRONG_THREAD;
     engine.attachLoop(id, .{ .context = user_data, .schedule = schedule.?, .cancel = cancel.? }) catch |err| {
@@ -340,6 +1317,7 @@ pub export fn jsbay_engine_attach_loop(instance_id: c_int, schedule: ?LoopSchedu
 
 pub export fn jsbay_engine_detach_loop(instance_id: c_int) c_int {
     const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) return API_UNSUPPORTED;
     if (engine.getContext(id) == null) return API_INSTANCE_NOT_FOUND;
     if (!api_value.isOwner(id)) return API_WRONG_THREAD;
     engine.detachLoop(id);
@@ -356,6 +1334,7 @@ pub export fn jsbay_engine_loop_status(instance_id: c_int) c_int {
 
 pub export fn jsbay_engine_run_loop(instance_id: c_int) c_int {
     const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) return API_UNSUPPORTED;
     if (engine.getContext(id) == null or @import("runtime/instance_map.zig").isTeardownPending(id)) return API_INSTANCE_NOT_FOUND;
     if (!api_value.isOwner(id)) return API_WRONG_THREAD;
     const inst = @import("runtime/instance_map.zig").getInstance(id) orelse return API_INSTANCE_NOT_FOUND;
@@ -978,6 +1957,18 @@ fn discardTypedBytecodeResult(ctx: ActiveEngine.Context, result: typed_bytecode.
 
 pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
     out_value.* = 0;
+    if (packed_api_value.isPackedHandle(value)) {
+        const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
+        if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
+        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        out_value.* = packed_api_value.retain(value) orelse return API_OUT_OF_MEMORY;
+        return API_OK;
+    }
     const instance_id = api_value.instanceFor(value) orelse return API_STALE_VALUE;
     var op = switch (beginApiOp(instance_id)) {
         .status => |status| return status,
@@ -989,6 +1980,21 @@ pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
 }
 
 pub export fn jsbay_value_release(value: u64) c_int {
+    if (host_string_values.take(value)) |entry| {
+        std.heap.c_allocator.free(entry.bytes);
+        return API_OK;
+    }
+    if (packed_api_value.isPackedHandle(value)) {
+        const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
+        if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
+        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
+        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        return if (packed_api_value.release(value)) API_OK else API_STALE_VALUE;
+    }
     const instance_id = api_value.instanceFor(value) orelse return API_STALE_VALUE;
     // Release keeps a beginApiOp lease so freeValue cannot race destroyRuntime's freeContext.
     // When teardown is already pending, beginApiOp fails and destroy's dropInstance frees the
@@ -1004,6 +2010,23 @@ pub export fn jsbay_value_release(value: u64) c_int {
 pub export fn jsbay_engine_global(instance_id_raw: c_int, out_value: *u64) c_int {
     out_value.* = 0;
     const instance_id: i32 = @intCast(instance_id_raw);
+    if (packedTagOf(instance_id) != null) {
+        const ready = switch (packedInstanceReady(instance_id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(instance_id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueGetGlobal(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(instance_id, ready.tag, ready.ctx_addr, result, out_value, null);
+    }
     var op = switch (beginApiOp(instance_id)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1023,7 +2046,30 @@ fn apiNewSimple(instance_id_raw: c_int, out_value: *u64, comptime make: anytype)
     return apiStore(instance_id, make(op.ctx), out_value);
 }
 
+fn packedNewFromResult(instance_id: i32, result: @import("backend_dispatch.zig").EvalValueResult, tag: backend.BackendType, ctx_addr: usize, out_value: *u64) c_int {
+    return packedPublish(instance_id, tag, ctx_addr, result, out_value, null);
+}
+
 pub export fn jsbay_value_undefined(instance_id: c_int, out_value: *u64) c_int {
+    out_value.* = 0;
+    const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewUndefined(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
+    }
     return apiNewSimple(instance_id, out_value, struct {
         fn make(_: ActiveEngine.Context) ActiveEngine.Value {
             return ActiveEngine.undefinedValue();
@@ -1032,6 +2078,25 @@ pub export fn jsbay_value_undefined(instance_id: c_int, out_value: *u64) c_int {
 }
 
 pub export fn jsbay_value_null(instance_id: c_int, out_value: *u64) c_int {
+    out_value.* = 0;
+    const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewNull(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
+    }
     return apiNewSimple(instance_id, out_value, struct {
         fn make(_: ActiveEngine.Context) ActiveEngine.Value {
             return ActiveEngine.nullValue();
@@ -1042,6 +2107,23 @@ pub export fn jsbay_value_null(instance_id: c_int, out_value: *u64) c_int {
 pub export fn jsbay_value_new_bool(instance_id: c_int, input: bool, out_value: *u64) c_int {
     out_value.* = 0;
     const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewBool(ready.tag, ready.ctx_addr, input);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1053,6 +2135,23 @@ pub export fn jsbay_value_new_bool(instance_id: c_int, input: bool, out_value: *
 pub export fn jsbay_value_new_number(instance_id: c_int, input: f64, out_value: *u64) c_int {
     out_value.* = 0;
     const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewNumber(ready.tag, ready.ctx_addr, input);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1066,6 +2165,23 @@ pub export fn jsbay_value_new_string(instance_id: c_int, input: Utf8, out_value:
     const bytes = checkedUtf8(input) orelse return API_INVALID_ARGUMENT;
     if (!std.unicode.utf8ValidateSlice(bytes)) return API_INVALID_ARGUMENT;
     const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewString(ready.tag, ready.ctx_addr, bytes);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1084,6 +2200,30 @@ pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u
     out_value.* = 0;
     const bytes: []const u8 = if (data) |ptr| ptr[0..len] else if (len == 0) "" else return API_INVALID_ARGUMENT;
     const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewArrayBuffer(ready.tag, ready.ctx_addr, bytes);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        var exc: u64 = 0;
+        const status = packedPublish(id, ready.tag, ready.ctx_addr, result, out_value, &exc);
+        if (status == 1) {
+            // ArrayBuffer ctor failure as exception → treat as OOM for this API (no out_exception).
+            _ = jsbay_value_release(exc);
+            return API_OUT_OF_MEMORY;
+        }
+        return status;
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1100,6 +2240,19 @@ pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u
 
 pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
     out_kind.* = 0;
+    if (host_string_values.get(value) != null) {
+        out_kind.* = 4; // JSBAY_VALUE_STRING
+        return API_OK;
+    }
+    if (packed_api_value.isPackedHandle(value)) {
+        var data = switch (beginPackedValueOp(value)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        out_kind.* = @import("backend_dispatch.zig").valueTypeKind(data.js.tag, data.js.ctx_addr, data.bytes());
+        return API_OK;
+    }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1111,6 +2264,16 @@ pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
 
 pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
     out_value.* = false;
+    if (packed_api_value.isPackedHandle(value)) {
+        var data = switch (beginPackedValueOp(value)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        if (!@import("backend_dispatch.zig").valueIsBool(data.js.tag, data.js.ctx_addr, data.bytes())) return API_INVALID_ARGUMENT;
+        out_value.* = @import("backend_dispatch.zig").valueToBool(data.js.tag, data.js.ctx_addr, data.bytes()) orelse return API_INVALID_ARGUMENT;
+        return API_OK;
+    }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1123,6 +2286,16 @@ pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
 
 pub export fn jsbay_value_to_number(value: u64, out_value: *f64) c_int {
     out_value.* = 0;
+    if (packed_api_value.isPackedHandle(value)) {
+        var data = switch (beginPackedValueOp(value)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        if (!@import("backend_dispatch.zig").valueIsNumber(data.js.tag, data.js.ctx_addr, data.bytes())) return API_INVALID_ARGUMENT;
+        out_value.* = @import("backend_dispatch.zig").valueToFloat64(data.js.tag, data.js.ctx_addr, data.bytes()) orelse return API_INVALID_ARGUMENT;
+        return API_OK;
+    }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1136,6 +2309,23 @@ pub export fn jsbay_value_to_number(value: u64, out_value: *f64) c_int {
 pub export fn jsbay_value_new_object(instance_id: c_int, out_value: *u64) c_int {
     out_value.* = 0;
     const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewObject(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1153,6 +2343,23 @@ pub export fn jsbay_value_new_object(instance_id: c_int, out_value: *u64) c_int 
 pub export fn jsbay_value_new_array(instance_id: c_int, out_value: *u64) c_int {
     out_value.* = 0;
     const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewArray(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1177,6 +2384,335 @@ fn duplicateKey(key: []const u8) ?[:0]u8 {
     return std.heap.c_allocator.dupeSentinel(u8, key, 0) catch null;
 }
 
+/// Host-owned UTF-8 results (legacy); packed-alt evaluate now publishes typed packed_api_value handles.
+const host_string_values = struct {
+    var mutex: @import("zev").Mutex = .{};
+    var map = std.AutoHashMap(u64, Entry).init(std.heap.c_allocator);
+    var next: u64 = 1;
+
+    const Entry = struct {
+        instance_id: i32,
+        bytes: []u8,
+    };
+
+    fn put(instance_id: i32, text_bytes: []const u8) ?u64 {
+        const owned = std.heap.c_allocator.dupe(u8, text_bytes) catch return null;
+        mutex.lock();
+        defer mutex.unlock();
+        if (next == 0 or next > std.math.maxInt(i64)) {
+            std.heap.c_allocator.free(owned);
+            return null;
+        }
+        const handle = next;
+        next += 1;
+        map.put(handle, .{ .instance_id = instance_id, .bytes = owned }) catch {
+            std.heap.c_allocator.free(owned);
+            return null;
+        };
+        return handle;
+    }
+
+    fn take(handle: u64) ?Entry {
+        mutex.lock();
+        defer mutex.unlock();
+        const kv = map.fetchRemove(handle) orelse return null;
+        return kv.value;
+    }
+
+    fn get(handle: u64) ?Entry {
+        mutex.lock();
+        defer mutex.unlock();
+        return map.get(handle);
+    }
+
+    fn dropInstance(instance_id: i32) void {
+        mutex.lock();
+        defer mutex.unlock();
+        var to_free = std.ArrayList(u64).empty;
+        defer to_free.deinit(std.heap.c_allocator);
+        var it = map.iterator();
+        while (it.next()) |item| {
+            if (item.value_ptr.instance_id == instance_id) {
+                to_free.append(std.heap.c_allocator, item.key_ptr.*) catch {};
+            }
+        }
+        for (to_free.items) |h| {
+            if (map.fetchRemove(h)) |kv| {
+                std.heap.c_allocator.free(kv.value.bytes);
+            }
+        }
+    }
+};
+
+fn packedHandlesOf(instance_id: i32) ?@import("backend_dispatch.zig").Handles {
+    const inst = @import("runtime/instance_map.zig").getInstance(instance_id) orelse return null;
+    return switch (inst.engine_handles) {
+        .packed_alt => |a| .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr },
+        .mono => null,
+    };
+}
+
+const PackedJsOp = struct {
+    id: i32,
+    tag: backend.BackendType,
+    ctx_addr: usize,
+    lease: engine_thread.EvalLease,
+    entered_js: bool,
+    execution: ?@import("js_event_loop").Scheduler.Execution = null,
+
+    fn endExecution(self: *PackedJsOp) void {
+        if (self.execution) |*guard| guard.end();
+        self.execution = null;
+    }
+
+    fn deinit(self: *PackedJsOp) void {
+        if (self.execution != null) {
+            self.endExecution();
+            @import("runtime/js_scheduler.zig").checkpointInstance(self.id);
+        }
+        if (self.entered_js) @import("backend_dispatch.zig").leaveJsPacked(self.tag, self.ctx_addr);
+        engine.finishEvalEntry(self.id, self.lease);
+    }
+};
+
+/// Admission lease for packed-alt value ops that may execute JavaScript (mirrors beginApiOp / beginValueOp).
+fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) union(enum) { ok: PackedJsOp, status: c_int } {
+    if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
+    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
+    if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
+        if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
+    }
+    const lease = engine_thread.beginEval(instance_id);
+    if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    if (!@import("backend_dispatch.zig").enterJsPacked(tag, ctx_addr)) {
+        engine.finishEvalEntry(instance_id, lease);
+        return .{ .status = API_WRONG_THREAD };
+    }
+    return .{ .ok = .{
+        .id = instance_id,
+        .tag = tag,
+        .ctx_addr = ctx_addr,
+        .lease = lease,
+        .entered_js = true,
+        .execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id),
+    } };
+}
+
+const PackedValueOp = struct {
+    js: PackedJsOp,
+    value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined,
+    value_len: usize = 0,
+
+    fn bytes(self: *const PackedValueOp) []const u8 {
+        return self.value_buf[0..self.value_len];
+    }
+
+    fn deinit(self: *PackedValueOp) void {
+        if (self.value_len != 0) {
+            @import("backend_dispatch.zig").timerFreeValue(self.js.tag, self.js.ctx_addr, self.bytes());
+            self.value_len = 0;
+        }
+        self.js.deinit();
+    }
+};
+
+/// Pin a packed handle's backend value for the op lifetime (mirrors beginValueOp for primary).
+fn beginPackedValueOp(handle: u64) union(enum) { ok: PackedValueOp, status: c_int } {
+    const entry = packed_api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
+    if (!api_value.isOwner(entry.instance_id)) {
+        return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(entry.instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    }
+    var js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        .status => |status| return .{ .status = status },
+        .ok => |ok| ok,
+    };
+    // Re-read while admitted, then pin. A toPrimitive / getter can re-enter and release the public handle.
+    const live = packed_api_value.get(handle) orelse {
+        js.deinit();
+        return .{ .status = API_STALE_VALUE };
+    };
+    if (live.instance_id != js.id or live.tag != js.tag) {
+        js.deinit();
+        return .{ .status = API_STALE_VALUE };
+    }
+    var op: PackedValueOp = .{ .js = js, .value_len = 0 };
+    op.value_len = @import("backend_dispatch.zig").timerDupValue(live.tag, live.ctx_addr, live.bytes(), op.value_buf[0..]) orelse {
+        op.js.deinit();
+        return .{ .status = API_STALE_VALUE };
+    };
+    return .{ .ok = op };
+}
+
+fn drainPackedJobs(js: *PackedJsOp) bool {
+    js.endExecution();
+    const map = @import("runtime/instance_map.zig");
+    if (!map.isTeardownPending(js.id)) @import("runtime/js_scheduler.zig").checkpointInstance(js.id);
+    return !map.isTeardownPending(js.id);
+}
+
+fn discardPackedEvalResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").EvalValueResult) void {
+    if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, v.slice());
+    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+}
+
+fn discardPackedBytesResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BytesValueResult) void {
+    if (result.bytes) |b| std.heap.c_allocator.free(b);
+    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+}
+
+fn discardPackedBoolResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BoolValueResult) void {
+    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+}
+
+fn packedTagOf(instance_id: i32) ?backend.BackendType {
+    const inst = @import("runtime/instance_map.zig").getInstance(instance_id) orelse return null;
+    return switch (inst.engine_handles) {
+        .packed_alt => |a| a.tag,
+        .mono => null,
+    };
+}
+
+fn packedStore(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, erased: @import("backend_dispatch.zig").ErasedValue, out: *u64) c_int {
+    out.* = 0;
+    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
+        @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, erased.slice());
+        return API_INSTANCE_NOT_FOUND;
+    }
+    out.* = packed_api_value.putOwned(instance_id, tag, ctx_addr, erased.slice()) orelse {
+        @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, erased.slice());
+        return API_OUT_OF_MEMORY;
+    };
+    return API_OK;
+}
+
+fn packedPublish(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").EvalValueResult, out_value: *u64, out_exception: ?*u64) c_int {
+    if (out_exception) |exc| exc.* = 0;
+    if (result.out_of_memory) {
+        if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, v.slice());
+        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+        return API_OUT_OF_MEMORY;
+    }
+    if (result.exception) |exc| {
+        if (out_exception) |slot| {
+            const stored = packedStore(instance_id, tag, ctx_addr, exc, slot);
+            return if (stored == API_OK) 1 else stored;
+        }
+        @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, exc.slice());
+        return API_OUT_OF_MEMORY;
+    }
+    if (result.value) |value| return packedStore(instance_id, tag, ctx_addr, value, out_value);
+    // set-style ops succeed with empty result
+    out_value.* = 0;
+    return API_OK;
+}
+
+fn packedPublishBool(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BoolValueResult, out_flag: *bool, out_exception: *u64) c_int {
+    out_exception.* = 0;
+    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
+        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+        return API_INSTANCE_NOT_FOUND;
+    }
+    if (result.out_of_memory) {
+        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+        return API_OUT_OF_MEMORY;
+    }
+    if (result.exception) |exc| {
+        const stored = packedStore(instance_id, tag, ctx_addr, exc, out_exception);
+        return if (stored == API_OK) 1 else stored;
+    }
+    out_flag.* = result.value;
+    return API_OK;
+}
+
+fn packedPublishBytes(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BytesValueResult, out_bytes: *Bytes, out_exception: *u64) c_int {
+    out_exception.* = 0;
+    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
+        if (result.bytes) |b| std.heap.c_allocator.free(b);
+        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+        return API_INSTANCE_NOT_FOUND;
+    }
+    if (result.out_of_memory) {
+        if (result.bytes) |b| std.heap.c_allocator.free(b);
+        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+        return API_OUT_OF_MEMORY;
+    }
+    if (result.invalid_argument) {
+        if (result.bytes) |b| std.heap.c_allocator.free(b);
+        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+        return API_INVALID_ARGUMENT;
+    }
+    if (result.exception) |exc| {
+        if (result.bytes) |b| std.heap.c_allocator.free(b);
+        const stored = packedStore(instance_id, tag, ctx_addr, exc, out_exception);
+        return if (stored == API_OK) 1 else stored;
+    }
+    const bytes = result.bytes orelse return API_OUT_OF_MEMORY;
+    out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
+    return API_OK;
+}
+
+fn packedDupBytes(handle: u64, expect_instance: i32, expect_tag: backend.BackendType, out: []u8) ?usize {
+    const entry = packed_api_value.get(handle) orelse return null;
+    if (entry.instance_id != expect_instance or entry.tag != expect_tag) return null;
+    return @import("backend_dispatch.zig").timerDupValue(entry.tag, entry.ctx_addr, entry.bytes(), out);
+}
+
+fn packedInstanceReady(instance_id: i32) union(enum) {
+    ok: struct { tag: backend.BackendType, ctx_addr: usize },
+    status: c_int,
+} {
+    if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
+    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
+    if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    const tag = packedTagOf(instance_id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
+    const handles = packedHandlesOf(instance_id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
+    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
+        if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
+    }
+    return .{ .ok = .{ .tag = tag, .ctx_addr = handles.ctx_addr } };
+}
+
+fn evaluatePackedAlt(instance_id: i32, source: []const u8, filename: []const u8, out_value: *u64, out_exception: *u64) c_int {
+    out_value.* = 0;
+    out_exception.* = 0;
+    if (!api_value.isOwner(instance_id)) {
+        return if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
+    }
+    const tag = packedTagOf(instance_id) orelse return API_INSTANCE_NOT_FOUND;
+    const handles = packedHandlesOf(instance_id) orelse return API_INSTANCE_NOT_FOUND;
+    const lease = engine_thread.beginEval(instance_id);
+    defer engine.finishEvalEntry(instance_id, lease);
+    if (!lease.allowed) {
+        return if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
+    }
+    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
+        if (inst.loop.lastError() != null) return API_LOOP_FAILED;
+    }
+    var execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse return API_INSTANCE_NOT_FOUND;
+    @import("inspector/debugger.zig").noteScript(instance_id, filename, source);
+    @import("inspector/debugger.zig").clearExceptionHold(instance_id);
+    const result = @import("backend_dispatch.zig").evalValuePacked(tag, handles, source, filename);
+    execution.end();
+    @import("runtime/js_scheduler.zig").checkpointInstance(instance_id);
+    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
+        if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, handles.ctx_addr, v.slice());
+        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, handles.ctx_addr, e.slice());
+        return API_INSTANCE_NOT_FOUND;
+    }
+    if (result.out_of_memory) {
+        if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, handles.ctx_addr, v.slice());
+        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, handles.ctx_addr, e.slice());
+        return API_OUT_OF_MEMORY;
+    }
+    if (result.exception) |exc| {
+        const stored = packedStore(instance_id, tag, handles.ctx_addr, exc, out_exception);
+        return if (stored == API_OK) 1 else stored;
+    }
+    if (result.value) |value| return packedStore(instance_id, tag, handles.ctx_addr, value, out_value);
+    return API_OUT_OF_MEMORY;
+}
+
 pub export fn jsbay_engine_evaluate(instance_id_raw: c_int, source_arg: Utf8, filename_arg: Utf8, options: ?*const EvalOptions, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
     out_exception.* = 0;
@@ -1194,6 +2730,13 @@ pub export fn jsbay_engine_evaluate(instance_id_raw: c_int, source_arg: Utf8, fi
         if ((cache_dir.len == 0) != (cache_version.len == 0)) return API_INVALID_ARGUMENT;
     }
     const id: i32 = @intCast(instance_id_raw);
+    if (@import("runtime/instance_map.zig").getInstance(id)) |inst| {
+        if (!inst.isPrimaryBackend()) {
+            // Empty options (or all-empty cache fields) are accepted; bytecode cache itself is primary-only.
+            if (cache_dir.len != 0 or cache_version.len != 0) return API_UNSUPPORTED;
+            return evaluatePackedAlt(id, source, filename, out_value, out_exception);
+        }
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |value| value,
@@ -1237,9 +2780,9 @@ test "c_api: evaluation and cache preserve inspector source contract" {
     const inspector_enabled = @import("build_options").inspector;
     if (comptime inspector_enabled) {
         if (comptime !backend.supportsDebugger(backend.active_backend)) return error.SkipZigTest;
-        try testing.expect(debugger.attach(id, @ptrCast(@constCast(instance.runtime))));
+        try testing.expect(debugger.attach(id, @ptrCast(@constCast(instance.monoRuntime().?))));
     } else {
-        try testing.expect(!debugger.attach(id, @ptrCast(@constCast(instance.runtime))));
+        try testing.expect(!debugger.attach(id, @ptrCast(@constCast(instance.monoRuntime().?))));
     }
     var temp = testing.tmpDir(.{});
     defer temp.cleanup();
@@ -1285,6 +2828,23 @@ pub export fn jsbay_value_new_json(instance_id_raw: c_int, input_arg: Utf8, out_
     const input = checkedUtf8(input_arg) orelse return API_INVALID_ARGUMENT;
     if (!std.unicode.utf8ValidateSlice(input)) return API_INVALID_ARGUMENT;
     const id: i32 = @intCast(instance_id_raw);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewJson(ready.tag, ready.ctx_addr, input);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(id, ready.tag, ready.ctx_addr, result, out_value, out_exception);
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |value| value,
@@ -1307,6 +2867,23 @@ pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, o
     const message = checkedUtf8(message_arg) orelse return API_INVALID_ARGUMENT;
     if (!std.unicode.utf8ValidateSlice(message)) return API_INVALID_ARGUMENT;
     const id: i32 = @intCast(instance_id_raw);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        var packed_js = switch (beginPackedJsOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewError(ready.tag, ready.ctx_addr, message);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
+    }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |value| value,
@@ -1324,6 +2901,37 @@ pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, o
 pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
     out_exception.* = 0;
+    if (host_string_values.get(value)) |entry| {
+        const duped = std.heap.c_allocator.dupe(u8, entry.bytes) catch return API_OUT_OF_MEMORY;
+        out_bytes.* = .{ .data = duped.ptr, .len = duped.len };
+        return API_OK;
+    }
+    if (packed_api_value.isPackedHandle(value)) {
+        var data = switch (beginPackedValueOp(value)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        const result = @import("backend_dispatch.zig").valueToUtf8(data.js.tag, data.js.ctx_addr, data.bytes());
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedBytesResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        const status = packedPublishBytes(data.js.id, data.js.tag, data.js.ctx_addr, result, out_bytes, out_exception);
+        if (status != API_OK) return status;
+        // QuickJS may surface WTF-8; public ABI promises UTF-8.
+        if (out_bytes.data) |ptr| {
+            const bytes = ptr[0..out_bytes.len];
+            if (!std.unicode.utf8ValidateSlice(bytes)) {
+                std.unicode.wtf8ToUtf8Lossy(bytes, bytes) catch {
+                    std.heap.c_allocator.free(bytes);
+                    out_bytes.* = .{ .data = null, .len = 0 };
+                    return API_INVALID_ARGUMENT;
+                };
+            }
+        }
+        return API_OK;
+    }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1354,6 +2962,19 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
 pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
     out_exception.* = 0;
+    if (packed_api_value.isPackedHandle(value)) {
+        var data = switch (beginPackedValueOp(value)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        const result = @import("backend_dispatch.zig").valueToJson(data.js.tag, data.js.ctx_addr, data.bytes());
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedBytesResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublishBytes(data.js.id, data.js.tag, data.js.ctx_addr, result, out_bytes, out_exception);
+    }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1377,6 +2998,19 @@ pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: 
 pub export fn jsbay_value_copy_buffer(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
     out_exception.* = 0;
+    if (packed_api_value.isPackedHandle(value)) {
+        var data = switch (beginPackedValueOp(value)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        const result = @import("backend_dispatch.zig").valueCopyBuffer(data.js.tag, data.js.ctx_addr, data.bytes());
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedBytesResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublishBytes(data.js.id, data.js.tag, data.js.ctx_addr, result, out_bytes, out_exception);
+    }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1405,6 +3039,21 @@ pub export fn jsbay_value_get(object: u64, key_arg: Utf8, out_value: *u64, out_e
     out_exception.* = 0;
     const key = checkedUtf8(key_arg) orelse return API_INVALID_ARGUMENT;
     if (!std.unicode.utf8ValidateSlice(key) or !noEmbeddedNul(key)) return API_INVALID_ARGUMENT;
+    if (packed_api_value.isPackedHandle(object)) {
+        var data = switch (beginPackedValueOp(object)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        const key_z = std.heap.c_allocator.dupeSentinel(u8, key, 0) catch return API_OUT_OF_MEMORY;
+        defer std.heap.c_allocator.free(key_z);
+        const result = @import("backend_dispatch.zig").valueGetProperty(data.js.tag, data.js.ctx_addr, data.bytes(), key_z);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, out_value, out_exception);
+    }
     var data = switch (beginValueOp(object)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1428,6 +3077,28 @@ pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_except
     out_exception.* = 0;
     const key = checkedUtf8(key_arg) orelse return API_INVALID_ARGUMENT;
     if (!std.unicode.utf8ValidateSlice(key) or !noEmbeddedNul(key)) return API_INVALID_ARGUMENT;
+    if (packed_api_value.isPackedHandle(object)) {
+        // Acquire the eval lease before duplicating the value so Zig LIFO runs lease release after freeValue cleanup.
+        var data = switch (beginPackedValueOp(object)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        if (!packed_api_value.isPackedHandle(value)) return API_STALE_VALUE;
+        // Allocate before duplicating `value`: a key-allocation failure must not leave a duplicate without an owner.
+        const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
+        defer std.heap.c_allocator.free(key_z);
+        var value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+        const value_len = packedDupBytes(value, data.js.id, data.js.tag, value_buf[0..]) orelse return API_STALE_VALUE;
+        // valueSetProperty consumes the duplicated value.
+        const result = @import("backend_dispatch.zig").valueSetProperty(data.js.tag, data.js.ctx_addr, data.bytes(), key_z, value_buf[0..value_len]);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        var dummy: u64 = 0;
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, &dummy, out_exception);
+    }
     var object_data = switch (beginValueOp(object)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1456,6 +3127,56 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
     out_value.* = 0;
     out_exception.* = 0;
     if (args == null and argc != 0) return API_INVALID_ARGUMENT;
+    if (packed_api_value.isPackedHandle(function)) {
+        if (!packed_api_value.isPackedHandle(this_value)) return API_STALE_VALUE;
+        // Acquire the eval lease before duplicating this/args so Zig LIFO runs lease release after freeValue cleanup.
+        var data = switch (beginPackedValueOp(function)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        var this_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+        const this_len = packedDupBytes(this_value, data.js.id, data.js.tag, this_buf[0..]) orelse return API_STALE_VALUE;
+        defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, this_buf[0..this_len]);
+
+        var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
+        defer arg_storage.deinit(std.heap.c_allocator);
+        var arg_lens = std.ArrayList(usize).empty;
+        defer arg_lens.deinit(std.heap.c_allocator);
+        defer {
+            var i: usize = 0;
+            while (i < arg_storage.items.len) : (i += 1) {
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, arg_storage.items[i][0..arg_lens.items[i]]);
+            }
+        }
+        if (args) |raw_args| for (raw_args[0..argc]) |handle| {
+            if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
+            var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+            const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
+            arg_storage.append(std.heap.c_allocator, buf) catch {
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
+                return API_OUT_OF_MEMORY;
+            };
+            arg_lens.append(std.heap.c_allocator, len) catch {
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
+                _ = arg_storage.pop();
+                return API_OUT_OF_MEMORY;
+            };
+        };
+        var arg_slices = std.ArrayList([]const u8).empty;
+        defer arg_slices.deinit(std.heap.c_allocator);
+        arg_slices.ensureTotalCapacityPrecise(std.heap.c_allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
+        var ai: usize = 0;
+        while (ai < arg_storage.items.len) : (ai += 1) {
+            arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
+        }
+        const result = @import("backend_dispatch.zig").valueCall(data.js.tag, data.js.ctx_addr, data.bytes(), this_buf[0..this_len], arg_slices.items);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, out_value, out_exception);
+    }
     var function_data = switch (beginValueOp(function)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1495,6 +3216,51 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
     out_value.* = 0;
     out_exception.* = 0;
     if (args == null and argc != 0) return API_INVALID_ARGUMENT;
+    if (packed_api_value.isPackedHandle(function)) {
+        // Acquire the eval lease before duplicating args so Zig LIFO runs lease release after freeValue cleanup.
+        var data = switch (beginPackedValueOp(function)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
+        defer arg_storage.deinit(std.heap.c_allocator);
+        var arg_lens = std.ArrayList(usize).empty;
+        defer arg_lens.deinit(std.heap.c_allocator);
+        defer {
+            var i: usize = 0;
+            while (i < arg_storage.items.len) : (i += 1) {
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, arg_storage.items[i][0..arg_lens.items[i]]);
+            }
+        }
+        if (args) |raw_args| for (raw_args[0..argc]) |handle| {
+            if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
+            var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+            const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
+            arg_storage.append(std.heap.c_allocator, buf) catch {
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
+                return API_OUT_OF_MEMORY;
+            };
+            arg_lens.append(std.heap.c_allocator, len) catch {
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
+                _ = arg_storage.pop();
+                return API_OUT_OF_MEMORY;
+            };
+        };
+        var arg_slices = std.ArrayList([]const u8).empty;
+        defer arg_slices.deinit(std.heap.c_allocator);
+        arg_slices.ensureTotalCapacityPrecise(std.heap.c_allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
+        var ai: usize = 0;
+        while (ai < arg_storage.items.len) : (ai += 1) {
+            arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
+        }
+        const result = @import("backend_dispatch.zig").valueConstruct(data.js.tag, data.js.ctx_addr, data.bytes(), arg_slices.items);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, out_value, out_exception);
+    }
     var function_data = switch (beginValueOp(function)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1562,17 +3328,60 @@ fn keyedBoolOp(
     return finishBoolOp(&data.op, backendOp(data.op.ctx, data.value, key_z), out_flag, out_exception);
 }
 
+fn packedKeyedBoolOp(
+    comptime which: enum { has, delete },
+    object: u64,
+    key_arg: Utf8,
+    out_flag: *bool,
+    out_exception: *u64,
+) c_int {
+    out_flag.* = false;
+    out_exception.* = 0;
+    const key = checkedUtf8(key_arg) orelse return API_INVALID_ARGUMENT;
+    if (!std.unicode.utf8ValidateSlice(key) or !noEmbeddedNul(key)) return API_INVALID_ARGUMENT;
+    var data = switch (beginPackedValueOp(object)) {
+        .status => |status| return status,
+        .ok => |ok| ok,
+    };
+    defer data.deinit();
+    const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
+    defer std.heap.c_allocator.free(key_z);
+    const result = switch (which) {
+        .has => @import("backend_dispatch.zig").valueHas(data.js.tag, data.js.ctx_addr, data.bytes(), key_z),
+        .delete => @import("backend_dispatch.zig").valueDelete(data.js.tag, data.js.ctx_addr, data.bytes(), key_z),
+    };
+    if (!drainPackedJobs(&data.js)) {
+        discardPackedBoolResult(data.js.tag, data.js.ctx_addr, result);
+        return API_INSTANCE_NOT_FOUND;
+    }
+    return packedPublishBool(data.js.id, data.js.tag, data.js.ctx_addr, result, out_flag, out_exception);
+}
 pub export fn jsbay_value_has(object: u64, key: Utf8, out_has: *bool, out_exception: *u64) c_int {
+    if (packed_api_value.isPackedHandle(object)) return packedKeyedBoolOp(.has, object, key, out_has, out_exception);
     return keyedBoolOp(api_backend.has, object, key, out_has, out_exception);
 }
 
 pub export fn jsbay_value_delete(object: u64, key: Utf8, out_deleted: *bool, out_exception: *u64) c_int {
+    if (packed_api_value.isPackedHandle(object)) return packedKeyedBoolOp(.delete, object, key, out_deleted, out_exception);
     return keyedBoolOp(api_backend.delete, object, key, out_deleted, out_exception);
 }
 
 pub export fn jsbay_value_keys(object: u64, out_array: *u64, out_exception: *u64) c_int {
     out_array.* = 0;
     out_exception.* = 0;
+    if (packed_api_value.isPackedHandle(object)) {
+        var data = switch (beginPackedValueOp(object)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        const result = @import("backend_dispatch.zig").valueKeys(data.js.tag, data.js.ctx_addr, data.bytes());
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, out_array, out_exception);
+    }
     var data = switch (beginValueOp(object)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1594,6 +3403,24 @@ pub export fn jsbay_value_keys(object: u64, out_array: *u64, out_exception: *u64
 pub export fn jsbay_value_instance_of(value: u64, constructor: u64, out_result: *bool, out_exception: *u64) c_int {
     out_result.* = false;
     out_exception.* = 0;
+    if (packed_api_value.isPackedHandle(value)) {
+        if (!packed_api_value.isPackedHandle(constructor)) return API_STALE_VALUE;
+        // Acquire the eval lease before duplicating the constructor so Zig LIFO runs lease release after freeValue cleanup.
+        var data = switch (beginPackedValueOp(value)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
+        var ctor_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+        const ctor_len = packedDupBytes(constructor, data.js.id, data.js.tag, ctor_buf[0..]) orelse return API_STALE_VALUE;
+        defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, ctor_buf[0..ctor_len]);
+        const result = @import("backend_dispatch.zig").valueInstanceOf(data.js.tag, data.js.ctx_addr, data.bytes(), ctor_buf[0..ctor_len]);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedBoolResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublishBool(data.js.id, data.js.tag, data.js.ctx_addr, result, out_result, out_exception);
+    }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
         .ok => |ok| ok,
@@ -1621,6 +3448,12 @@ test "c_api: set key allocation failure does not retain its value duplicate" {
     try std.testing.expectEqual(API_OK, jsbay_value_release(value));
     try std.testing.expectEqual(API_OK, jsbay_value_release(object));
 }
+
+fn noopLoopSchedule(_: ?*anyopaque, _: u64, _: LoopTask, _: ?*anyopaque) callconv(.c) bool {
+    return false;
+}
+
+fn noopLoopCancel(_: ?*anyopaque) callconv(.c) void {}
 
 fn bindOomCallback(_: i32, _: ?*anyopaque, _: u64, _: usize, _: ?[*]const u64, out_value: *u64, out_exception: *u64) callconv(.c) c_int {
     out_value.* = 0;
@@ -1686,6 +3519,7 @@ pub export fn jsbay_engine_bind(instance_id_raw: c_int, name_arg: Utf8, callback
     if (name.len == 0 or !std.unicode.utf8ValidateSlice(name) or !noEmbeddedNul(name)) return API_INVALID_ARGUMENT;
     const cb = callback orelse return API_INVALID_ARGUMENT;
     const id: i32 = @intCast(instance_id_raw);
+    if (packedTagOf(id) != null) return API_UNSUPPORTED;
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
         .ok => |ok| ok,

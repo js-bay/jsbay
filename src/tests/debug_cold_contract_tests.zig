@@ -94,13 +94,13 @@ fn flipAsyncDepthDuringPromiseJob(id: i32, _: value.NativeArgs) value.NativeResu
     switch (backend.active_backend) {
         .quickjs => {
             const jobs = @import("../backend/quickjs/jobs.zig");
-            jobs.setAsyncStackDepth(instance.runtime, id, 0);
-            jobs.setAsyncStackDepth(instance.runtime, id, 1);
+            jobs.setAsyncStackDepth(instance.monoRuntime().?, id, 0);
+            jobs.setAsyncStackDepth(instance.monoRuntime().?, id, 1);
         },
         .quickjs_ng => {
             const jobs = @import("../backend/quickjs_ng/jobs.zig");
-            jobs.setAsyncStackDepth(instance.runtime, id, 0);
-            jobs.setAsyncStackDepth(instance.runtime, id, 1);
+            jobs.setAsyncStackDepth(instance.monoRuntime().?, id, 0);
+            jobs.setAsyncStackDepth(instance.monoRuntime().?, id, 1);
         },
         .jsc => unreachable,
     }
@@ -113,16 +113,16 @@ var cold_window_enqueue_failed = false;
 fn queueDuringZeroDepthWindow(id: i32, _: value.NativeArgs) value.NativeResult {
     const instance = instance_map.getInstance(id) orelse return .undefined_val;
     switch (backend.active_backend) {
-        .quickjs => @import("../backend/quickjs/jobs.zig").setAsyncStackDepth(instance.runtime, id, 0),
-        .quickjs_ng => @import("../backend/quickjs_ng/jobs.zig").setAsyncStackDepth(instance.runtime, id, 0),
+        .quickjs => @import("../backend/quickjs/jobs.zig").setAsyncStackDepth(instance.monoRuntime().?, id, 0),
+        .quickjs_ng => @import("../backend/quickjs_ng/jobs.zig").setAsyncStackDepth(instance.monoRuntime().?, id, 0),
         .jsc => unreachable,
     }
     queueQuickJsJobWithoutDrain(id, "Promise.resolve().then(function p2ColdB(){ console.log('p2-cold-b-token'); });") catch {
         cold_window_enqueue_failed = true;
     };
     switch (backend.active_backend) {
-        .quickjs => @import("../backend/quickjs/jobs.zig").setAsyncStackDepth(instance.runtime, id, 1),
-        .quickjs_ng => @import("../backend/quickjs_ng/jobs.zig").setAsyncStackDepth(instance.runtime, id, 1),
+        .quickjs => @import("../backend/quickjs/jobs.zig").setAsyncStackDepth(instance.monoRuntime().?, id, 1),
+        .quickjs_ng => @import("../backend/quickjs_ng/jobs.zig").setAsyncStackDepth(instance.monoRuntime().?, id, 1),
         .jsc => unreachable,
     }
     return .undefined_val;
@@ -460,7 +460,7 @@ const InspectorEnabledTests3 = if (@import("build_options").inspector) struct {
         try testing.expect(before.err == null);
 
         const runtime = instance_map.getInstance(id) orelse return error.MissingInstance;
-        _ = debugger_mod.attach(id, @ptrCast(runtime.runtime));
+        _ = debugger_mod.attach(id, @ptrCast(runtime.monoRuntime().?));
         try testing.expect(debugger_mod.handlerInstallThreadId(id) != 0);
 
         // Executing a closure compiled while cold must not assign its URL a debugger source identity after debugging is enabled.
