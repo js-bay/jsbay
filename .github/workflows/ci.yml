@@ -56,6 +56,11 @@ jobs:
         with:
           global-json-file: global.json
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
       - name: Install pawl
         uses: tiangong-dev/pawl@v0.8.2
         with:
@@ -119,6 +124,9 @@ jobs:
           bash scripts/quality/dotnet-style.sh self-test
           bash scripts/quality/dotnet-lint.sh self-test
 
+      - name: Test262 runner contract (quickjs_ng)
+        run: JSBAY_TEST262_CONTRACT_SCOPE=quickjs_ng bash tests/test262_runner_contract.sh
+
       - name: Shut down .NET build servers
         if: ${{ !cancelled() }}
         run: |
@@ -165,7 +173,8 @@ jobs:
         run: zig build test-engine -Dbackend=${{ matrix.backend }} -Dinspector-transport=false -Dtest-filter="host transport" --summary all
 
       - name: Inspector-disabled tests
-        run: zig build test-engine -Dbackend=${{ matrix.backend }} -Dinspector=false --summary all
+        if: matrix.backend == 'quickjs_ng'
+        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector=false --summary all
 
       - name: QuickJS-NG location dispatch contract
         if: matrix.backend == 'quickjs_ng'
@@ -195,10 +204,6 @@ jobs:
 
       - name: .NET SDK consumer
         run: tests/dotnet-sdk/run.sh ${{ matrix.backend }}
-
-      - name: Classic QuickJS ReleaseSafe public consumer
-        if: matrix.backend == 'quickjs'
-        run: sh scripts/check-quickjs-release-safe-consumer.sh artifacts/quickjs-release-safe
 
       - name: QuickJS GC stress
         if: matrix.backend == 'quickjs_ng'
@@ -322,8 +327,8 @@ jobs:
             (cd "libs/$package" && zig build test --summary all)
           done
 
-      - name: Test262 runner contract
-        run: bash tests/test262_runner_contract.sh
+      - name: Test262 runner contract (JSC host)
+        run: JSBAY_TEST262_CONTRACT_SCOPE=jsc bash tests/test262_runner_contract.sh
 
       - name: SDK quality — Apple style and lint
         run: make check CHECKS=apple-style,apple-lint
@@ -457,10 +462,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # An image-provisioned iPhone avoids simctl create, which spent ~90s in first-boot data migration on a brand-new device.
+          # Boot an image-provisioned iPhone before the slice build so first-boot migration overlaps the compile. simctl boot returns before the device is ready; build-apple.sh waits with bootstatus.
           if udid="$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | .value[] | select(.isAvailable == true) | select(.name | startswith("iPhone"))] | .[0].udid // empty')" && [ -n "$udid" ]; then
             export JSBAY_IOS_SIM_UDID="$udid"
             echo "Reusing simulator $udid"
+            xcrun simctl boot "$udid" || true
           fi
           JSBAY_APPLE_SMOKE=simulator ./build-apple.sh quickjs_ng
           grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status

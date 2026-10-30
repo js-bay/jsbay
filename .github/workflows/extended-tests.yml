@@ -53,6 +53,8 @@ jobs:
           set -euo pipefail
           zig build test-engine -Dbackend=quickjs -Doptimize=ReleaseSafe --summary all
           bash tests/ci/run-desktop-consumers.sh quickjs
+          sh scripts/check-quickjs-release-safe-consumer.sh "$RUNNER_TEMP/quickjs-release-safe"
+          zig build test-engine -Dbackend=quickjs -Dinspector=false --summary all
 
       - name: Upstream engine regression (quickjs_ng)
         run: |
