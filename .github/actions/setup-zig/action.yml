@@ -1,0 +1,127 @@
+name: Setup Zig
+description: Install Zig via composite steps (no Node.js action runtime)
+inputs:
+  version:
+    description: Zig version, e.g. 0.17.0
+    required: true
+    default: "0.17.0"
+runs:
+  using: composite
+  steps:
+    - name: Resolve Zig download
+      id: zig
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64) target=x86_64-linux ;;
+          Linux-ARM64) target=aarch64-linux ;;
+          macOS-X64) target=x86_64-macos ;;
+          macOS-ARM64) target=aarch64-macos ;;
+          Windows-X64) target=x86_64-windows ;;
+          Windows-ARM64) target=aarch64-windows ;;
+          *)
+            echo "Unsupported runner: ${RUNNER_OS}-${RUNNER_ARCH}"
+            exit 1
+            ;;
+        esac
+        dest="${RUNNER_TEMP}/zig-${ZIG_VERSION}-${target}"
+        {
+          echo "target=${target}"
+          echo "dest=${dest}"
+          echo "version=${ZIG_VERSION}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Cache Zig toolchain
+      id: cache
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.zig.outputs.dest }}
+        key: zig-toolchain-${{ steps.zig.outputs.version }}-${{ steps.zig.outputs.target }}
+
+    - name: Download and install Zig
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ steps.zig.outputs.version }}
+        TARGET: ${{ steps.zig.outputs.target }}
+        DEST: ${{ steps.zig.outputs.dest }}
+      run: |
+        set -euo pipefail
+        archive="${RUNNER_TEMP}/zig-download-${ZIG_VERSION}-${TARGET}"
+        python3 - <<'PY'
+        import hashlib, json, os, sys, urllib.request
+
+        version = os.environ["ZIG_VERSION"]
+        target = os.environ["TARGET"]
+        archive = os.path.join(
+            os.environ["RUNNER_TEMP"], f"zig-download-{version}-{target}"
+        )
+        index = json.load(urllib.request.urlopen("https://ziglang.org/download/index.json"))
+        if version not in index:
+            sys.exit(f"Zig {version} not in download index")
+        if target not in index[version]:
+            sys.exit(f"Zig {version} has no build for {target}")
+        info = index[version][target]
+        url = info["tarball"]
+        expect = info["shasum"]
+        print(f"Downloading {url}")
+        urllib.request.urlretrieve(url, archive)
+        digest = hashlib.sha256()
+        with open(archive, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                digest.update(chunk)
+        got = digest.hexdigest()
+        if got != expect:
+            sys.exit(f"sha256 mismatch for {url}: {got} != {expect}")
+        print(f"sha256 ok {got}")
+        PY
+
+        mkdir -p "$DEST"
+        extract="${RUNNER_TEMP}/zig-extract-${ZIG_VERSION}-${TARGET}"
+        rm -rf "$extract"
+        mkdir -p "$extract"
+        case "$TARGET" in
+          *-windows)
+            if tar -tf "$archive" >/dev/null 2>&1; then
+              tar -xf "$archive" -C "$extract"
+            else
+              unzip -q "$archive" -d "$extract"
+            fi
+            ;;
+          *)
+            tar -xJf "$archive" -C "$extract"
+            ;;
+        esac
+        top="$(find "$extract" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+        if [[ -z "${top}" ]]; then
+          echo "Zig archive did not contain a top-level directory"
+          exit 1
+        fi
+        # shellcheck disable=SC2086
+        shopt -s dotglob nullglob
+        mv "$top"/* "$DEST"/
+        if [[ -f "$DEST/zig" ]]; then
+          chmod +x "$DEST/zig"
+        fi
+        if [[ -f "$DEST/zig.exe" ]]; then
+          "$DEST/zig.exe" version
+        else
+          "$DEST/zig" version
+        fi
+
+    - name: Add Zig to PATH
+      shell: bash
+      run: |
+        echo "${{ steps.zig.outputs.dest }}" >> "$GITHUB_PATH"
+        if [[ -x "${{ steps.zig.outputs.dest }}/zig" ]]; then
+          "${{ steps.zig.outputs.dest }}/zig" version
+        elif [[ -f "${{ steps.zig.outputs.dest }}/zig.exe" ]]; then
+          "${{ steps.zig.outputs.dest }}/zig.exe" version
+        else
+          echo "Zig binary missing after install"
+          ls -la "${{ steps.zig.outputs.dest }}"
+          exit 1
+        fi

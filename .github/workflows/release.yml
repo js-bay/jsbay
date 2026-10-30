@@ -41,12 +41,12 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
 
@@ -116,7 +116,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjsng.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs_ng"
 
       - name: Upload build artifact (quickjs_ng / linux-x86_64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjsng.outputs.name }}
           path: ${{ steps.pack_qjsng.outputs.archive }}
@@ -178,7 +178,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjs.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs"
 
       - name: Upload build artifact (quickjs / linux-x86_64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjs.outputs.name }}
           path: ${{ steps.pack_qjs.outputs.archive }}
@@ -190,12 +190,12 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
 
@@ -265,7 +265,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjsng.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs_ng"
 
       - name: Upload build artifact (quickjs_ng / linux-aarch64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjsng.outputs.name }}
           path: ${{ steps.pack_qjsng.outputs.archive }}
@@ -327,7 +327,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjs.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs"
 
       - name: Upload build artifact (quickjs / linux-aarch64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjs.outputs.name }}
           path: ${{ steps.pack_qjs.outputs.archive }}
@@ -339,12 +339,12 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
 
@@ -414,7 +414,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjsng.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs_ng"
 
       - name: Upload build artifact (quickjs_ng / macos-aarch64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjsng.outputs.name }}
           path: ${{ steps.pack_qjsng.outputs.archive }}
@@ -476,7 +476,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjs.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs"
 
       - name: Upload build artifact (quickjs / macos-aarch64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjs.outputs.name }}
           path: ${{ steps.pack_qjs.outputs.archive }}
@@ -538,7 +538,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_jsc.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "jsc"
 
       - name: Upload build artifact (jsc / macos-aarch64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_jsc.outputs.name }}
           path: ${{ steps.pack_jsc.outputs.archive }}
@@ -550,12 +550,12 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
 
@@ -625,7 +625,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjsng.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs_ng"
 
       - name: Upload build artifact (quickjs_ng / macos-x86_64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjsng.outputs.name }}
           path: ${{ steps.pack_qjsng.outputs.archive }}
@@ -687,7 +687,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_qjs.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "quickjs"
 
       - name: Upload build artifact (quickjs / macos-x86_64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjs.outputs.name }}
           path: ${{ steps.pack_qjs.outputs.archive }}
@@ -749,7 +749,7 @@ jobs:
         run: bash tests/ci/release-desktop-consumer.sh "${{ steps.pack_jsc.outputs.archive }}" "${{ steps.ver.outputs.label }}" "${{ github.sha }}" "jsc"
 
       - name: Upload build artifact (jsc / macos-x86_64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_jsc.outputs.name }}
           path: ${{ steps.pack_jsc.outputs.archive }}
@@ -765,12 +765,12 @@ jobs:
     timeout-minutes: 150
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
 
@@ -825,7 +825,7 @@ jobs:
         run: bash tests/apple-sdk/git-package-consumer.sh "$GITHUB_WORKSPACE/${{ steps.pack_qjsng.outputs.archive }}" "$RUNNER_TEMP/apple-git-consumer-qjsng"
 
       - name: Upload Apple artifact (quickjs_ng)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjsng.outputs.name }}
           path: ${{ steps.pack_qjsng.outputs.archive }}
@@ -864,7 +864,7 @@ jobs:
         run: bash tests/apple-sdk/git-package-consumer.sh "$GITHUB_WORKSPACE/${{ steps.pack_qjs.outputs.archive }}" "$RUNNER_TEMP/apple-git-consumer-qjs"
 
       - name: Upload Apple artifact (quickjs)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_qjs.outputs.name }}
           path: ${{ steps.pack_qjs.outputs.archive }}
@@ -903,7 +903,7 @@ jobs:
         run: bash tests/apple-sdk/git-package-consumer.sh "$GITHUB_WORKSPACE/${{ steps.pack_jsc.outputs.archive }}" "$RUNNER_TEMP/apple-git-consumer-jsc"
 
       - name: Upload Apple artifact (jsc)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack_jsc.outputs.name }}
           path: ${{ steps.pack_jsc.outputs.archive }}
@@ -923,12 +923,12 @@ jobs:
         backend: [quickjs_ng, quickjs]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+        uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
 
@@ -940,7 +940,7 @@ jobs:
           add-to-path: false
 
       - name: Setup JDK for Android Gradle Plugin 8.7.3
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -1062,14 +1062,14 @@ jobs:
           script: bash tests/ci/release-android-consumer.sh "${{ steps.maven.outputs.archive }}" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle"
 
       - name: Upload Android Maven repository
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: jsbay-${{ steps.ver.outputs.label }}-android-maven-${{ matrix.backend }}
           path: ${{ steps.maven.outputs.archive }}
           if-no-files-found: error
 
       - name: Upload Android AAR
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: jsbay-${{ steps.ver.outputs.label }}-android-aar-${{ matrix.backend }}
           path: build-android/aar/jsbay-${{ steps.ver.outputs.label }}-android-${{ matrix.backend }}.aar
@@ -1125,7 +1125,7 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - name: Upload Android artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.pack.outputs.name }}
           path: ${{ steps.pack.outputs.archive }}
@@ -1151,11 +1151,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout reviewed source snapshot
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - uses: mlugg/setup-zig@v2
+      - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
 
@@ -1210,7 +1210,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Upload checked archives
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: jsbay-release-assets
           path: release-assets/
