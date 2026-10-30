@@ -24,6 +24,16 @@ zig version
 
 JS Bay's event loop and wake primitive are implemented in Zig; the reusable loop primitives are in the separate `libs/zev` package. `libs/js_event_loop` coordinates JS task execution, microtask checkpoints and synchronous native waits above `zev`; engine values and runtime admission stay in the root adapters. Persistent bytecode artifact naming and storage are in `libs/bytecode_cache`; engine compilation, execution and exception ownership stay in the root package. Both QuickJS backends are supported on Linux; JSC requires Apple frameworks.
 
+### Git pre-commit hook (Zig formatting)
+
+CI runs `zig build test-fmt`. To block local commits the same way, enable the repo-owned hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook runs `zig build test-fmt` (full project paths, matching CI). Skip with `git commit --no-verify` only when you intentionally defer formatting.
+
 ### Quality checks (`make check` / pawl)
 
 `make check` invokes **pawl** (see `pawl.yaml`): a task runner for hard quality gates such as SDK formatters and linters. Install `pawl` on your `PATH`, then run `make check` (optionally `CHECKS=…` to select dimensions) before pushing platform or style-sensitive changes.

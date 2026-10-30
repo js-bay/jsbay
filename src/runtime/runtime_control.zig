@@ -94,19 +94,43 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     };
     registry_mutex.unlock();
 
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            // Safe: the two extern structs have identical layout.
-            const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
-            qjs_mod.qjsInstallInterruptHandler(inst.monoRuntime().?, qjs_state);
+    switch (inst.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                // Safe: the two extern structs have identical layout.
+                const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
+                qjs_mod.qjsInstallInterruptHandler(m.runtime, qjs_state);
+            },
+            .jsc => {
+                const jsc_mod = @import("../backend/jsc.zig");
+                const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
+                // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
+                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
+                jsc_mod.jscInstallInterruptHandler(group, jsc_state);
+            },
         },
-        .jsc => {
-            const jsc_mod = @import("../backend/jsc.zig");
-            const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
-            // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
-            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.monoCtx().?));
-            jsc_mod.jscInstallInterruptHandler(group, jsc_state);
+        .packed_alt => |a| {
+            // Dispatch by the instance backend so non-primary packs get interrupt/time-limit handlers too.
+            inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+                if (a.tag == cand) {
+                    if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) return false;
+                    if (comptime backend.isQuickJsApiBackend(cand)) {
+                        const E = backend.Engine(cand);
+                        const Mod = backend.EngineModule(cand);
+                        const qjs_state: *Mod.QjsInterruptState = @ptrCast(state);
+                        const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
+                        Mod.qjsInstallInterruptHandler(rt, qjs_state);
+                    } else {
+                        const jsc_mod = @import("../backend/jsc.zig");
+                        const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
+                        const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
+                        const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
+                        jsc_mod.jscInstallInterruptHandler(group, jsc_state);
+                    }
+                    break;
+                }
+            } else return false;
         },
     }
 
@@ -121,15 +145,36 @@ pub fn deinit(instance_id: i32) bool {
 
     // Uninstall from the backend BEFORE freeing the state — otherwise the JS thread could read freed memory if it fires a check between takeState and here.
     if (inst_opt) |inst| {
-        switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsUninstallInterruptHandler(inst.monoRuntime().?);
+        switch (inst.engine_handles) {
+            .mono => |m| switch (backend.active_backend) {
+                .quickjs, .quickjs_ng => {
+                    const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                    qjs_mod.qjsUninstallInterruptHandler(m.runtime);
+                },
+                .jsc => {
+                    const jsc_mod = @import("../backend/jsc.zig");
+                    const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
+                    jsc_mod.jscUninstallInterruptHandler(group);
+                },
             },
-            .jsc => {
-                const jsc_mod = @import("../backend/jsc.zig");
-                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.monoCtx().?));
-                jsc_mod.jscUninstallInterruptHandler(group);
+            .packed_alt => |a| {
+                inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+                    if (a.tag == cand) {
+                        if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) break;
+                        if (comptime backend.isQuickJsApiBackend(cand)) {
+                            const E = backend.Engine(cand);
+                            const Mod = backend.EngineModule(cand);
+                            const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
+                            Mod.qjsUninstallInterruptHandler(rt);
+                        } else {
+                            const jsc_mod = @import("../backend/jsc.zig");
+                            const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
+                            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
+                            jsc_mod.jscUninstallInterruptHandler(group);
+                        }
+                        break;
+                    }
+                }
             },
         }
     }

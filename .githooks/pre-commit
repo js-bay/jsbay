@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Repo-owned pre-commit: block commits when Zig sources fail `zig build test-fmt`
+# (same check as CI). Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+if ! command -v zig >/dev/null 2>&1; then
+  echo "pre-commit: zig not found on PATH; cannot run test-fmt" >&2
+  exit 1
+fi
+echo "pre-commit: zig build test-fmt"
+zig build test-fmt --summary none

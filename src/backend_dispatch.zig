@@ -752,11 +752,16 @@ fn valueConstructReal(comptime tag: Backend, ctx_addr: usize, func_bytes: []cons
         const ctx_ref: jsc.JSContextRef = @ptrCast(ctx);
         const lifted_function = common.liftValue(ctx_ref, function);
         if (!jsc.JSValueIsObject(ctx_ref, lifted_function) or !jsc.JSObjectIsConstructor(ctx_ref, @ptrCast(@constCast(lifted_function)))) {
+            // Match primary jscConstruct/jscTypeError: non-constructible values throw TypeError, not a plain Error.
             const msg_val = common.makeStringValue(ctx_ref, "value is not a constructor") orelse return .{ .out_of_memory = true };
             var args_err = [_]jsc.JSValueRef{msg_val};
             var inner: jsc.JSValueRef = null;
             const err = jsc.JSObjectMakeError(ctx_ref, 1, &args_err, &inner);
             if (err == null) return .{ .out_of_memory = true };
+            const value_mod = @import("backend/jsc/value.zig");
+            if (value_mod.typeErrorPrototype(@ptrCast(ctx))) |prototype| {
+                jsc.JSObjectSetPrototype(ctx_ref, @ptrCast(@constCast(err)), prototype);
+            }
             jsc.JSValueProtect(ctx_ref, err);
             return .{ .exception = storeErased(E, err) };
         }
@@ -1171,6 +1176,27 @@ fn valueToJsonReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []const 
     }
 }
 
+fn packedJscNormalizeBufferException(comptime tag: Backend, ctx: backend.Engine(tag).Context, exception: ?backend.Engine(tag).Value) BytesValueResult {
+    comptime if (backend.isQuickJsApiBackend(tag)) unreachable;
+    const E = backend.Engine(tag);
+    const Mod = backend.EngineModule(tag);
+    const jsc = Mod.jsc;
+    const intrinsics = @import("backend/jsc/value.zig");
+    const ctx_ref: jsc.JSContextRef = @ptrCast(ctx);
+    const thrown = exception orelse return .{ .out_of_memory = true };
+    jsc.JSValueProtect(ctx_ref, thrown);
+    // Match primary jscBufferException: buffer-validation TypeErrors → invalid_argument with empty exception.
+    if (jsc.JSValueIsObject(ctx_ref, thrown)) {
+        if (intrinsics.typeErrorPrototype(@ptrCast(ctx))) |prototype| {
+            if (jsc.JSValueIsStrictEqual(ctx_ref, jsc.JSObjectGetPrototype(ctx_ref, @constCast(thrown)), prototype)) {
+                E.freeValue(ctx, thrown);
+                return .{ .invalid_argument = true };
+            }
+        }
+    }
+    return .{ .exception = storeErased(E, thrown) };
+}
+
 fn valueCopyBufferReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []const u8) BytesValueResult {
     const E = backend.Engine(tag);
     if (value_bytes.len != @sizeOf(E.Value)) return .{ .out_of_memory = true };
@@ -1197,17 +1223,7 @@ fn valueCopyBufferReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []co
 
         var exception: jsc.JSValueRef = null;
         const kind = jsc.JSValueGetTypedArrayType(ctx_ref, effective, &exception);
-        if (exception != null) {
-            jsc.JSValueProtect(ctx_ref, exception);
-            // TypeError from buffer APIs maps to invalid_argument on primary.
-            if (intrinsics.typeErrorPrototype(@ptrCast(ctx))) |prototype| {
-                if (jsc.JSValueIsObject(ctx_ref, exception) and jsc.JSValueIsStrictEqual(ctx_ref, jsc.JSObjectGetPrototype(ctx_ref, @constCast(exception)), prototype)) {
-                    E.freeValue(ctx, exception);
-                    return .{ .invalid_argument = true };
-                }
-            }
-            return .{ .exception = storeErased(E, exception) };
-        }
+        if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
 
         var buffer: jsc.JSObjectRef = undefined;
         var byte_offset: usize = 0;
@@ -1215,16 +1231,10 @@ fn valueCopyBufferReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []co
         if (kind == jsc.kJSTypedArrayTypeArrayBuffer) {
             buffer = @constCast(effective);
             byte_length = jsc.JSObjectGetArrayBufferByteLength(ctx_ref, buffer, &exception);
-            if (exception != null) {
-                jsc.JSValueProtect(ctx_ref, exception);
-                return .{ .exception = storeErased(E, exception) };
-            }
+            if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
         } else {
             buffer = jsc.JSObjectGetTypedArrayBuffer(ctx_ref, @constCast(effective), &exception);
-            if (exception != null) {
-                jsc.JSValueProtect(ctx_ref, exception);
-                return .{ .exception = storeErased(E, exception) };
-            }
+            if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
             if (buffer == null) return .{ .invalid_argument = true };
             const validator = if (kind == jsc.kJSTypedArrayTypeNone)
                 intrinsics.dataViewByteLengthGetter(@ptrCast(ctx))
@@ -1232,21 +1242,12 @@ fn valueCopyBufferReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []co
                 intrinsics.typedArrayValues(@ptrCast(ctx));
             const validate = validator orelse return .{ .out_of_memory = true };
             const validation_result = jsc.JSObjectCallAsFunction(ctx_ref, validate, @constCast(effective), 0, null, &exception);
-            if (exception != null) {
-                jsc.JSValueProtect(ctx_ref, exception);
-                return .{ .exception = storeErased(E, exception) };
-            }
+            if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
             if (validation_result == null) return .{ .out_of_memory = true };
             byte_offset = jsc.JSObjectGetTypedArrayByteOffset(ctx_ref, @constCast(effective), &exception);
-            if (exception != null) {
-                jsc.JSValueProtect(ctx_ref, exception);
-                return .{ .exception = storeErased(E, exception) };
-            }
+            if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
             byte_length = jsc.JSObjectGetTypedArrayByteLength(ctx_ref, @constCast(effective), &exception);
-            if (exception != null) {
-                jsc.JSValueProtect(ctx_ref, exception);
-                return .{ .exception = storeErased(E, exception) };
-            }
+            if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
         }
         jsc.JSValueProtect(ctx_ref, buffer);
         defer jsc.JSValueUnprotect(ctx_ref, buffer);
@@ -1254,10 +1255,7 @@ fn valueCopyBufferReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []co
         exception = null;
         const source = jsc.JSObjectMakeTypedArrayWithArrayBufferAndOffset(ctx_ref, @intCast(jsc.kJSTypedArrayTypeUint8Array), buffer, byte_offset, byte_length, &exception);
         if (source == null or exception != null) {
-            if (exception != null) {
-                jsc.JSValueProtect(ctx_ref, exception);
-                return .{ .exception = storeErased(E, exception) };
-            }
+            if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
             return .{ .out_of_memory = true };
         }
         jsc.JSValueProtect(ctx_ref, source);
@@ -1266,10 +1264,7 @@ fn valueCopyBufferReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []co
         exception = null;
         const destination = jsc.JSObjectMakeTypedArray(ctx_ref, @intCast(jsc.kJSTypedArrayTypeUint8Array), byte_length, &exception);
         if (destination == null or exception != null) {
-            if (exception != null) {
-                jsc.JSValueProtect(ctx_ref, exception);
-                return .{ .exception = storeErased(E, exception) };
-            }
+            if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
             return .{ .out_of_memory = true };
         }
         jsc.JSValueProtect(ctx_ref, destination);
@@ -1279,26 +1274,20 @@ fn valueCopyBufferReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []co
         const args = [_]jsc.JSValueRef{source};
         exception = null;
         const set_result = jsc.JSObjectCallAsFunction(ctx_ref, set_fn, destination, args.len, &args, &exception);
-        if (exception != null) {
-            jsc.JSValueProtect(ctx_ref, exception);
-            return .{ .exception = storeErased(E, exception) };
-        }
+        if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
         if (set_result == null) return .{ .out_of_memory = true };
 
         exception = null;
         const copied_len = jsc.JSObjectGetTypedArrayByteLength(ctx_ref, destination, &exception);
-        if (exception != null) {
-            jsc.JSValueProtect(ctx_ref, exception);
-            return .{ .exception = storeErased(E, exception) };
-        }
+        if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
         if (copied_len != byte_length) return .{ .out_of_memory = true };
         const ptr = jsc.JSObjectGetTypedArrayBytesPtr(ctx_ref, destination, &exception);
-        if (exception != null) {
-            jsc.JSValueProtect(ctx_ref, exception);
-            return .{ .exception = storeErased(E, exception) };
-        }
+        if (exception != null) return packedJscNormalizeBufferException(tag, ctx, exception);
         if (ptr == null and copied_len != 0) return .{ .out_of_memory = true };
-        const source_bytes: []const u8 = if (copied_len == 0) &.{} else @as([*]const u8, @ptrCast(ptr.?))[0..copied_len];
+        const source_bytes: []const u8 = if (copied_len == 0)
+            &.{}
+        else
+            @as([*]const u8, @ptrCast(ptr.?))[0..copied_len];
         return .{ .bytes = std.heap.c_allocator.dupe(u8, source_bytes) catch return .{ .out_of_memory = true } };
     }
 }

@@ -167,9 +167,10 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
     };
     if (!@import("builtin").is_test) instance.timers.clock_now = loop.now();
 
-    // Skip runtime_control / debugger hooks for packed-alt — those layers are still monomorphic.
+    // Install interrupt/time-limit control for packed-alt by instance backend (same as primary). Debugger attach remains primary-only.
     if (!instance_map.insertWith(instance, struct {
         pub fn call(_: @This(), registered: *instance_map.EngineInstance) bool {
+            if (!@import("runtime/runtime_control.zig").initForInstance(registered.instance_id, registered)) return false;
             if (create_after_insert_hook_for_testing) |hook| hook(registered.instance_id, create_after_insert_context_for_testing);
             return true;
         }

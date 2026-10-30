@@ -2499,7 +2499,6 @@ fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) 
     } };
 }
 
-
 const PackedValueOp = struct {
     js: PackedJsOp,
     value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined,
