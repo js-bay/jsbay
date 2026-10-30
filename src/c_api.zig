@@ -1796,7 +1796,7 @@ fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: us
     native_sync.tightenDeadline(started.request, deadline);
 
     // The host start callback receives borrowed JS handles only while it is running. It may complete inline, but must otherwise hand only the ID to its system completion path.
-    if (runtime_control.isInterruptRequested(instance_id)) {
+    if (runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) {
         native_sync.cancel(started.id);
     } else {
         binding.start(instance_id, binding.user_data, started.id, this_value, argc, args);

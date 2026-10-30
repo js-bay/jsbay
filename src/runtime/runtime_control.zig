@@ -218,6 +218,7 @@ pub fn executionDeadlineMillis(instance_id: i32) ?u64 {
     return if (deadline == 0) null else deadline;
 }
 
+/// True when a caller-requested interrupt bit is set. Lifecycle stop uses a separate bit (`isStopRequested`); do not treat stop as a user interrupt — waiters must report teardown as instance-gone.
 pub fn isInterruptRequested(instance_id: i32) bool {
     registry_mutex.lock();
     const state = registry.get(instance_id) orelse {
@@ -225,7 +226,7 @@ pub fn isInterruptRequested(instance_id: i32) bool {
         return false;
     };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
-    const requested = p.load(.monotonic) != 0;
+    const requested = (p.load(.monotonic) & 1) != 0;
     registry_mutex.unlock();
     return requested;
 }

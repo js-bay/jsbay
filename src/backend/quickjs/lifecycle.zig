@@ -242,7 +242,7 @@ threadlocal var job_drain_depth: u32 = 0;
 
 fn shouldStopPendingJobDrain(instance_id: i32) bool {
     const runtime_control = @import("../../runtime/runtime_control.zig");
-    if (runtime_control.isInterruptRequested(instance_id)) return true;
+    if (runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) return true;
     return if (runtime_control.remainingExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
 }
 

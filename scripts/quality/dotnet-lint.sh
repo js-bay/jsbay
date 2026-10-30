@@ -24,18 +24,18 @@ internal static class AnalyzerProbe
     internal static bool HasText(string text) => text.IndexOf('x') >= 0;
 }
 CS
-    if "$WORK/scripts/quality/dotnet-lint.sh" check > "$WORK/expected-diagnostics.log" 2>&1; then
+    if env -u GITHUB_ACTIONS -u CI -u TF_BUILD "$WORK/scripts/quality/dotnet-lint.sh" check > "$WORK/expected-diagnostics.log" 2>&1; then
         echo 'C# analyzer violation unexpectedly passed.' >&2
         exit 1
     else
         echo "Expected rejection exit: $?"
     fi
     if ! grep -q 'CA2249' "$WORK/expected-diagnostics.log"; then
-        sed 's/##\[/## [/g' "$WORK/expected-diagnostics.log" >&2
+        sed -E 's/^##\[[^]]*\]/# /g; s/##\[[^]]*\]/# /g' "$WORK/expected-diagnostics.log" >&2
         echo 'Analyzer check failed without the expected CA2249 diagnostic.' >&2
         exit 1
     fi
-    sed 's/##\[/## [/g' "$WORK/expected-diagnostics.log"
+    sed -E 's/^##\[[^]]*\]/# /g; s/##\[[^]]*\]/# /g' "$WORK/expected-diagnostics.log"
     "$WORK/scripts/quality/dotnet-lint.sh" fix
     find "$WORK/sdk" "$WORK/tests" -type f -name '*.cs' -exec cksum {} \; | sort > "$WORK/once.checksums"
     "$WORK/scripts/quality/dotnet-lint.sh" fix
