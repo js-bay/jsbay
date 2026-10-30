@@ -19,7 +19,7 @@ fn globalValue(id: i32, name: [*:0]const u8) !ActiveEngine.Value {
 }
 
 fn qjsHasNoPendingException(ctx: ActiveEngine.Context) bool {
-    if (comptime backend.active_backend == .jsc) return true;
+    if (comptime backend.isJscApiBackend(backend.active_backend)) return true;
     const qjs_mod = backend.ActiveEngineModule;
     if (comptime backend.active_backend == .quickjs) {
         return qjs_mod.qjs.JS_HasException(ctx) == 0;
@@ -259,7 +259,7 @@ test "dataview: zero-length view stays attached" {
 }
 
 test "dataview: detached and ordinary values leave the context usable" {
-    if (comptime backend.active_backend == .jsc) return;
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
 
     reset();
     const id = helpers.nextInstanceId();
@@ -296,7 +296,10 @@ test "dataview: detached and ordinary values leave the context usable" {
 }
 
 test "dataview: length-tracking resizable buffer follows shrink and grow" {
-    if (comptime backend.active_backend == .jsc) return;
+    if (comptime backend.isJscApiBackend(backend.active_backend)) return;
+    // Spikes: Hermes has no ArrayBuffer.resize; Escargot resizes but Public ArrayBufferView
+    // zeros OOB length-tracking views (cannot match QuickJS dataViewInfo→null).
+    if (comptime backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
 
     reset();
     const id = helpers.nextInstanceId();

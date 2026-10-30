@@ -73,6 +73,200 @@ fn BackendWrapper(comptime handler: NativeHandler) type {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => QuickJsWrapper(handler),
         .jsc => JscWrapper(handler),
+        .escargot => EscargotWrapper(handler),
+        .hermes => HermesWrapper(handler),
+    };
+}
+
+fn EscargotWrapper(comptime handler: NativeHandler) type {
+    const c_api = backend.ActiveEngineModule.c_api_mod;
+    return struct {
+        fn callback(ctx: ?*c_api.Context, this_val: c_api.Value, args_ptr: ?[*]const c_api.Value, argc: usize, _: ?*anyopaque) callconv(.c) c_api.Value {
+            const id = ActiveEngine.instanceIdFromCtx(ctx);
+            const args = NativeArgs{
+                .instance_id = id,
+                ._count = argc,
+                ._ctx = ctx,
+                ._argv_raw = if (args_ptr) |p| @ptrCast(p) else @ptrCast(&[_]c_api.Value{}),
+                ._this = this_val,
+            };
+            const result = handler(id, args);
+            return nativeResultToEscargot(ctx, result);
+        }
+
+        fn nativeResultToEscargot(ctx: ?*c_api.Context, result: NativeResult) c_api.Value {
+            switch (result) {
+                .null_val => return c_api.escargot_null(),
+                .undefined_val => return c_api.escargot_undefined(),
+                .boolean => |v| return c_api.escargot_new_bool(v),
+                .number => |v| return c_api.escargot_new_float64(v),
+                .string => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    return c_api.escargot_new_string(ctx, s.ptr, s.len);
+                },
+                .json => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    return c_api.escargot_json_parse(ctx, s.ptr, s.len) orelse c_api.escargot_null();
+                },
+                .err => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    var buf: [512]u8 = undefined;
+                    const n = @min(s.len, buf.len - 1);
+                    @memcpy(buf[0..n], s[0..n]);
+                    buf[n] = 0;
+                    c_api.escargot_throw(ctx, @ptrCast(&buf));
+                    return null;
+                },
+                .value => |v| return v,
+                .promise => |v| return v,
+                .array_buffer => |p| {
+                    const val = ActiveEngine.newArrayBufferCopyVal(ctx, p.bytes);
+                    if (p.free_after_copy) std.heap.c_allocator.free(@constCast(p.bytes));
+                    return val;
+                },
+                .typed_array => |p| {
+                    const val = dispatch.newTypedArrayFromBytes(ctx, p.kind, p.bytes);
+                    if (p.free_after_copy) std.heap.c_allocator.free(@constCast(p.bytes));
+                    return val;
+                },
+                .date_ms => |ms| return ActiveEngine.newDate(ctx, ms),
+                .big_int_i64 => |v| return ActiveEngine.newBigIntI64(ctx, v),
+                .big_int_u64 => |v| return ActiveEngine.newBigIntU64(ctx, v),
+                .map_json => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    return ActiveEngine.newMapFromJson(ctx, s) orelse c_api.escargot_null();
+                },
+                .set_json => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    return ActiveEngine.newSetFromJson(ctx, s) orelse c_api.escargot_null();
+                },
+                .data_view => |p| {
+                    const val = dispatch.newDataView(ctx, p.buffer, p.byte_offset, p.byte_length);
+                    if (p.buffer.free_after_copy) std.heap.c_allocator.free(@constCast(p.buffer.bytes));
+                    return val;
+                },
+            }
+        }
+
+        pub fn register(ctx: ActiveEngine.Context, parent_name: ?[*:0]const u8, fn_name: [*:0]const u8) void {
+            const name = std.mem.span(fn_name);
+            const func = ActiveEngine.makeNativeFunction(ctx, name, &callback, null) orelse return;
+            const global = ActiveEngine.getGlobalObject(ctx);
+            defer ActiveEngine.freeValue(ctx, global);
+            if (parent_name) |pn| {
+                const parent = ActiveEngine.getPropertyVal(ctx, global, pn) orelse blk: {
+                    const obj = ActiveEngine.newObject(ctx);
+                    ActiveEngine.setPropertyStr(ctx, global, pn, ActiveEngine.dupValue(ctx, obj));
+                    break :blk obj;
+                };
+                defer ActiveEngine.freeValue(ctx, parent);
+                ActiveEngine.setPropertyStr(ctx, parent, fn_name, func);
+            } else {
+                ActiveEngine.setPropertyStr(ctx, global, fn_name, func);
+            }
+        }
+
+        pub fn setOnObject(ctx: ActiveEngine.Context, obj: ActiveEngine.Value, fn_name: [*:0]const u8) void {
+            const name = std.mem.span(fn_name);
+            const func = ActiveEngine.makeNativeFunction(ctx, name, &callback, null) orelse return;
+            ActiveEngine.setPropertyStr(ctx, obj, fn_name, func);
+        }
+    };
+}
+
+fn HermesWrapper(comptime handler: NativeHandler) type {
+    const c_api = backend.ActiveEngineModule.c_api_mod;
+    return struct {
+        fn callback(ctx: ?*c_api.Context, this_val: c_api.Value, args_ptr: ?[*]const c_api.Value, argc: usize, _: ?*anyopaque) callconv(.c) c_api.Value {
+            const id = ActiveEngine.instanceIdFromCtx(ctx);
+            const args = NativeArgs{
+                .instance_id = id,
+                ._count = argc,
+                ._ctx = ctx,
+                ._argv_raw = if (args_ptr) |p| @ptrCast(p) else @ptrCast(&[_]c_api.Value{}),
+                ._this = this_val,
+            };
+            const result = handler(id, args);
+            return nativeResultToHermes(ctx, result);
+        }
+
+        fn nativeResultToHermes(ctx: ?*c_api.Context, result: NativeResult) c_api.Value {
+            switch (result) {
+                .null_val => return c_api.hermes_null(),
+                .undefined_val => return c_api.hermes_undefined(),
+                .boolean => |v| return c_api.hermes_new_bool(ctx, v),
+                .number => |v| return c_api.hermes_new_float64(ctx, v),
+                .string => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    return c_api.hermes_new_string(ctx, s.ptr, s.len);
+                },
+                .json => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    return c_api.hermes_json_parse(ctx, s.ptr, s.len) orelse c_api.hermes_null();
+                },
+                .err => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    var buf: [512]u8 = undefined;
+                    const n = @min(s.len, buf.len - 1);
+                    @memcpy(buf[0..n], s[0..n]);
+                    buf[n] = 0;
+                    c_api.hermes_throw(ctx, @ptrCast(&buf));
+                    return null;
+                },
+                .value => |v| return v,
+                .promise => |v| return v,
+                .array_buffer => |p| {
+                    const val = ActiveEngine.newArrayBufferCopyVal(ctx, p.bytes);
+                    if (p.free_after_copy) std.heap.c_allocator.free(@constCast(p.bytes));
+                    return val;
+                },
+                .typed_array => |p| {
+                    const val = dispatch.newTypedArrayFromBytes(ctx, p.kind, p.bytes);
+                    if (p.free_after_copy) std.heap.c_allocator.free(@constCast(p.bytes));
+                    return val;
+                },
+                .date_ms => |ms| return ActiveEngine.newDate(ctx, ms),
+                .big_int_i64 => |v| return ActiveEngine.newBigIntI64(ctx, v),
+                .big_int_u64 => |v| return ActiveEngine.newBigIntU64(ctx, v),
+                .map_json => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    return ActiveEngine.newMapFromJson(ctx, s) orelse c_api.hermes_null();
+                },
+                .set_json => |s| {
+                    defer std.heap.c_allocator.free(@constCast(s));
+                    return ActiveEngine.newSetFromJson(ctx, s) orelse c_api.hermes_null();
+                },
+                .data_view => |p| {
+                    const val = dispatch.newDataView(ctx, p.buffer, p.byte_offset, p.byte_length);
+                    if (p.buffer.free_after_copy) std.heap.c_allocator.free(@constCast(p.buffer.bytes));
+                    return val;
+                },
+            }
+        }
+
+        pub fn register(ctx: ActiveEngine.Context, parent_name: ?[*:0]const u8, fn_name: [*:0]const u8) void {
+            const name = std.mem.span(fn_name);
+            const func = ActiveEngine.makeNativeFunction(ctx, name, &callback, null) orelse return;
+            const global = ActiveEngine.getGlobalObject(ctx);
+            defer ActiveEngine.freeValue(ctx, global);
+            if (parent_name) |pn| {
+                const parent = ActiveEngine.getPropertyVal(ctx, global, pn) orelse blk: {
+                    const obj = ActiveEngine.newObject(ctx);
+                    ActiveEngine.setPropertyStr(ctx, global, pn, ActiveEngine.dupValue(ctx, obj));
+                    break :blk obj;
+                };
+                defer ActiveEngine.freeValue(ctx, parent);
+                ActiveEngine.setPropertyStr(ctx, parent, fn_name, func);
+            } else {
+                ActiveEngine.setPropertyStr(ctx, global, fn_name, func);
+            }
+        }
+
+        pub fn setOnObject(ctx: ActiveEngine.Context, obj: ActiveEngine.Value, fn_name: [*:0]const u8) void {
+            const name = std.mem.span(fn_name);
+            const func = ActiveEngine.makeNativeFunction(ctx, name, &callback, null) orelse return;
+            ActiveEngine.setPropertyStr(ctx, obj, fn_name, func);
+        }
     };
 }
 

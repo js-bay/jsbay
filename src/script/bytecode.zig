@@ -1,6 +1,6 @@
 //! Bytecode cache — compile a JS script once, serialize bytes for the same trusted build, and re-execute without re-parsing on subsequent starts.
 //!
-//! This is a significant perf win for large scripts loaded at startup. The pattern is:
+//! This is a significant perf win for large scripts loaded at startup (napi-rs and rquickjs expose equivalent APIs). The pattern is:
 //!
 //! const bytes = bytecode.compile(id, source, "app.js") orelse unreachable; defer bytecode.freeBytecode(bytes); // ... persist `bytes` to disk ...
 //!
@@ -8,7 +8,8 @@
 //!
 //! Backend support:
 //! - QuickJS: fully implemented via JS_WriteObject / JS_ReadObject + JS_EvalFunction.
-//! - JavaScriptCore: no stable public bytecode API. `compile` returns a CompileResult with `err = "bytecode cache is not supported on JSC backend (use QuickJS)"`; `runBytecode` returns the same error as an EvalResult.
+//! - JavaScriptCore / Escargot: no stable public bytecode blob API. `compile` returns a not-supported sentinel; `runBytecode` returns the same.
+//! - Hermes: compile via hermesc to `.hbc`, run via JSI `evaluateJavaScript` Buffer.
 //!
 //! Safety contract: like every other engine API, operations on a given `instance_id` MUST happen on the owning thread.
 
@@ -81,6 +82,16 @@ pub fn compile(
             // JSC always returns the static "not supported" literal — not heap.
             return .{ .bytes = out.bytes, .err = out.err, .err_is_heap = false };
         },
+        .escargot => return .{ .err = "bytecode cache is not supported on Escargot backend", .err_is_heap = false },
+        .hermes => {
+            // Hermes .hbc via hermesc + JSI Buffer (only analyzed when -Dbackend=hermes).
+            if (comptime !backend.isHermesBackend(backend.active_backend)) {
+                return .{ .err = "bytecode cache is not supported on this backend", .err_is_heap = false };
+            }
+            const out = @import("../backend/hermes.zig").hermesCompileBytecode(source, filename);
+            if (out.bytes) |b| return .{ .bytes = b, .err = null, .err_is_heap = false };
+            return .{ .bytes = null, .err = out.err, .err_is_heap = out.err != null };
+        },
     }
 }
 
@@ -136,6 +147,13 @@ pub fn runBytecode(instance_id: i32, bytes: []const u8) types.EvalResult {
         .jsc => {
             const jsc_mod = @import("../backend/jsc.zig");
             return jsc_mod.jscRunBytecode(@ptrCast(ctx), bytes);
+        },
+        .escargot => return .{ .err = "bytecode cache is not supported on Escargot backend", .err_is_heap = false },
+        .hermes => {
+            if (comptime !backend.isHermesBackend(backend.active_backend)) {
+                return .{ .err = "bytecode cache is not supported on this backend", .err_is_heap = false };
+            }
+            return @import("../backend/hermes.zig").hermesRunBytecode(ctx, bytes);
         },
     }
 }

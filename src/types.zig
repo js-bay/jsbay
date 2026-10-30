@@ -43,13 +43,17 @@ pub const EngineEventHandler = *const fn (*const EngineEvent, ?*anyopaque) callc
 
 /// Configuration for creating an engine instance.
 pub const EngineConfig = struct {
-    /// Native timer and asynchronous callback budgets; zero rejects every reservation of that resource.
+    /// Native timer and asynchronous callback budgets; zero disables that resource.
     resource_limits: @import("runtime/resource_limits.zig").Limits = .{},
     log_handler: ?LogHandler = null,
     /// User data passed to log_handler callbacks.
     log_user_data: ?*anyopaque = null,
     /// Maximum stack size for the JS runtime in bytes. QuickJS: applied to runtime and capped to the executing native thread's available stack. JSC: ignored (not configurable via public API). Default: 1 MiB.
     max_stack_size: usize = 1024 * 1024,
+    /// Create-time max JS heap hint in bytes. `0` = backend default.
+    /// Hermes: applied as `GCConfig.MaxHeapSize` when the Runtime is created (also lowers `InitHeapSize` so Hermes does not clamp Max up). Overridable build default: `-Dhermes-max-heap=N`. Escargot / JSC / QuickJS: ignored here (QuickJS uses runtime `setMemoryLimit`).
+    /// This is **not** `setMemoryLimit` — on Hermes/Escargot `setMemoryLimit` still returns false.
+    max_heap_size: usize = 0,
     /// Optional ES module loader vtable. When non-null, top-level `import` statements in sources evaluated through `engine.evalModule` / `engine.importModule` are dispatched here. The pointed-to `ModuleLoader` must outlive the engine instance — the engine does not take ownership.
     ///
     /// QuickJS / QuickJS-NG: `resolve`, `load`, and `free_resolved` are wired through the runtime module callbacks.

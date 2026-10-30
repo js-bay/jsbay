@@ -2,9 +2,9 @@
 //!
 //! Content fidelity is checked through `JSON.stringify(Array.from(val))`.
 //!
+//! Reference cases: napi-rs `map-set.spec.ts`; ScriptX `Basic_test.cc` Map/Set tests.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const testing = std.testing;
 const helpers = @import("test_helpers.zig");
 const value = @import("../value/root.zig");
@@ -342,6 +342,7 @@ fn hEarlyExitMap(_: i32, args: value.NativeArgs) value.NativeResult {
 }
 
 test "iteration: callback returning false stops Map iteration after 2 entries" {
+    // Hermes early-stop via throw jsi::JSError — stable with libhermes_bridge.so.
     g_map_sum_state.data = .{};
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
@@ -465,9 +466,6 @@ fn currentCtx() ?backend.ActiveEngine.Context {
 }
 
 test "builder: newMap + mapSet with object values survives round-trip to JS" {
-    // Windows CI currently crashes inside QuickJS while materializing Map object values
-    // (null JSShape). Keep coverage on POSIX hosts until the builder path is hardened.
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {

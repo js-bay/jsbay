@@ -21,6 +21,7 @@ pub fn compile(ctx: ActiveEngine.Context, source: []const u8, filename: []const 
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => compileQuickJs(ctx, source, filename),
         .jsc => .{ .unsupported = true },
+        .escargot, .hermes => .{ .unsupported = true },
     };
 }
 
@@ -29,6 +30,7 @@ pub fn run(ctx: ActiveEngine.Context, bytes: []const u8) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => runQuickJs(ctx, bytes),
         .jsc => .{ .unsupported = true },
+        .escargot, .hermes => .{ .unsupported = true },
     };
 }
 
@@ -77,6 +79,8 @@ fn runQuickJs(ctx: ActiveEngine.Context, bytes: []const u8) Result {
 }
 
 test "typed bytecode: compile and run preserve live values and throw values" {
+    // True limitation: EscargotPublic and Hermes JSI expose no compile-only bytecode blob API comparable to QuickJS JS_WriteObject / JS_EvalFunction. Keep skipped until an engine-native blob API exists; do not shim via eval.
+    if (comptime backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
     const testing = std.testing;
     const engine = @import("../engine.zig");
     const id = @import("../tests/test_helpers.zig").nextInstanceId();
@@ -95,7 +99,7 @@ test "typed bytecode: compile and run preserve live values and throw values" {
     };
     try testing.expect(entered_js);
 
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         const unsupported = compile(ctx, "1", "unsupported.js");
         try testing.expect(unsupported.unsupported);
         return;

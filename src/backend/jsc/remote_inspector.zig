@@ -26,13 +26,13 @@ const instance_map = @import("../../runtime/instance_map.zig");
 //
 // JSStringRef is an opaque pointer from the JSC bindings, referenced only in the JSC branch.
 
-const jsc_mod = if (backend.active_backend == .jsc)
+const jsc_mod = if (backend.isJscApiBackend(backend.active_backend))
     @import("../jsc.zig")
 else
     struct {};
 
 // These externs are only link-resolved when built against JavaScriptCore. Under QJS they're never called, but declaring them is harmless — Zig emits no references unless a call site is actually reachable.
-const externs = if (backend.active_backend == .jsc) struct {
+const externs = if (backend.isJscApiBackend(backend.active_backend)) struct {
     pub extern "c" fn JSRemoteInspectorStart() void;
     pub extern "c" fn JSRemoteInspectorSetInspectionEnabledByDefault(enabled: bool) void;
     pub extern "c" fn JSGlobalContextSetRemoteInspectionEnabled(
@@ -68,7 +68,7 @@ var g_default_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(fals
 ///
 /// Under QJS backend: no-op, returns false.
 pub fn startListener() bool {
-    if (backend.active_backend != .jsc) return false;
+    if (!backend.isJscApiBackend(backend.active_backend)) return false;
     if (g_listener_started.swap(true, .seq_cst)) {
         // Already started — idempotent success.
         return true;
@@ -84,7 +84,7 @@ pub fn startListener() bool {
 ///
 /// Returns false if called on the QJS backend, if the instance is gone, or if `JSRemoteInspectorStart` hasn't been called yet (call `startListener` first or the convenience `startAndEnable`).
 pub fn enable(instance_id: i32, name: ?[]const u8) bool {
-    if (backend.active_backend != .jsc) return false;
+    if (!backend.isJscApiBackend(backend.active_backend)) return false;
 
     if (!g_listener_started.load(.seq_cst)) {
         std.log.warn(
@@ -121,7 +121,7 @@ pub fn enable(instance_id: i32, name: ?[]const u8) bool {
 
 /// Disable remote inspection on this engine instance. Safe to call even if `enable` was never called. Does NOT stop the process-wide listener (it has no off switch in the public-but-private JSC API anyway).
 pub fn disable(instance_id: i32) bool {
-    if (backend.active_backend != .jsc) return false;
+    if (!backend.isJscApiBackend(backend.active_backend)) return false;
 
     const ptrs = instance_map.getPtrs(instance_id) orelse return false;
     const ctx: jsc_mod.jsc.JSGlobalContextRef = ptrs.ctx;
@@ -134,7 +134,7 @@ pub fn disable(instance_id: i32) bool {
 
 /// Convenience: `startListener()` + `enable(instance_id, name)` in one call. Returns true only if both steps succeed.
 pub fn startAndEnable(instance_id: i32, name: ?[]const u8) bool {
-    if (backend.active_backend != .jsc) return false;
+    if (!backend.isJscApiBackend(backend.active_backend)) return false;
     if (!startListener()) return false;
     return enable(instance_id, name);
 }
@@ -144,7 +144,7 @@ pub fn startAndEnable(instance_id: i32, name: ?[]const u8) bool {
 // ---------------------------------------------------------------------------
 
 fn setName(ctx: anytype, name: []const u8) void {
-    if (backend.active_backend != .jsc) return;
+    if (!backend.isJscApiBackend(backend.active_backend)) return;
 
     // JSStringCreateWithUTF8CString requires a NUL-terminated input. The `name` we get from callers is a Zig slice that may not be sentinel-terminated, so duplicate into a c_allocator-owned buffer first.
     const z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch {

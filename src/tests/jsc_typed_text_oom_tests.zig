@@ -10,7 +10,7 @@ const api_ok: c_int = 0;
 const api_out_of_memory: c_int = 6;
 
 test "JSC typed text conversion OOM does not read or write the empty key" {
-    if (comptime backend.active_backend != .jsc) return error.SkipZigTest;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
     const common = @import("../backend/jsc/common.zig");
     const id = @import("test_helpers.zig").nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));

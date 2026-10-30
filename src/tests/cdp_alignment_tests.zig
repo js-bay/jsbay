@@ -342,7 +342,7 @@ test "cdp alignment: Runtime awaitPromise awaits settled, pending, rejected, eva
 }
 
 test "cdp alignment: JSC Runtime.awaitPromise explicitly reports unsupported" {
-    if (comptime backend.active_backend != .jsc) return;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-jsc-await-unsupported");
     defer session.deinit();

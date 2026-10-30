@@ -204,7 +204,7 @@ pub fn Module(comptime Host: type) type {
                 else
                     \\[{"name":"Runtime","version":"1.3"},{"name":"Profiler","version":"1.3"},{"name":"Performance","version":"1.3"},{"name":"Schema","version":"1.3"}]
                 ,
-                .jsc =>
+                .jsc, .escargot, .hermes =>
                 \\[{"name":"Runtime","version":"1.3"},{"name":"Performance","version":"1.3"},{"name":"Schema","version":"1.3"}]
                 ,
             };

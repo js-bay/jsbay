@@ -1,13 +1,14 @@
 //! Zero-copy buffer support — wrap a caller-owned byte slice as a JS ArrayBuffer (or Uint8Array view over it) without copying the payload.
 //!
-//! Both supported backends expose a no-copy ArrayBuffer pattern natively:
+//! Backends expose this pattern natively:
 //!
 //!   * QuickJS: `JS_NewArrayBuffer(ctx, buf, len, 0, realloc_func, opaque, false)`
 //!   * JSC:     `JSObjectMakeArrayBufferWithBytesNoCopy`
+//!   * Escargot / Hermes: bridge helpers that attach a host finalizer to a buffer object
 //!
 //! The `finalizer` fires when the JS GC reclaims the ArrayBuffer wrapper; the caller is responsible for freeing the backing memory inside the finalizer (both backends will pass back the same pointer/length they received). Pass a `null` finalizer for memory that outlives the engine (static data) — nothing happens at collection time then.
 //!
-//! Contract (mirrors the rest of the engine API): operations on a given `instance_id` MUST happen on the owning thread. The finalizer itself is called from the GC and MUST NOT re-enter JS.
+//! Contract: operations on a given `instance_id` MUST happen on the owning thread. The finalizer itself is called from the GC and MUST NOT re-enter JS.
 
 const std = @import("std");
 const backend = @import("../backend.zig");
@@ -44,7 +45,7 @@ pub fn newArrayBufferFromBytes(
     user_data: ?*anyopaque,
 ) ?ActiveEngine.Value {
     const ctx = engine.getContext(instance_id) orelse {
-        // Instance missing. The caller's memory is still owned by them; fire the finalizer so they can release it even when allocation fails.
+        // Instance missing. The caller's memory is still owned by them; fire the finalizer so they can release it. Matches napi-rs "on failure the finalizer runs" convention.
         if (finalizer) |fin| fin(user_data, bytes, len);
         return null;
     };
@@ -69,6 +70,62 @@ pub fn newArrayBufferFromBytes(
             // jscNewArrayBufferFromBytes already JSValueProtect'd the object so it balances with the caller's freeValue.
             const v: ActiveEngine.Value = @ptrCast(obj);
             return v;
+        },
+        .escargot => {
+            const esc = @import("../backend/escargot.zig").EscargotBackend;
+            const Pack = struct {
+                fin: BufferFinalizer,
+                bytes: [*]u8,
+                len: usize,
+                user_data: ?*anyopaque,
+            };
+            const deleter_cb = struct {
+                fn call(ud: ?*anyopaque) callconv(.c) void {
+                    const pack: *Pack = @ptrCast(@alignCast(ud orelse return));
+                    pack.fin(pack.user_data, pack.bytes, pack.len);
+                    std.heap.c_allocator.destroy(pack);
+                }
+            }.call;
+            if (finalizer) |fin| {
+                const pack = std.heap.c_allocator.create(Pack) catch {
+                    fin(user_data, bytes, len);
+                    return null;
+                };
+                pack.* = .{ .fin = fin, .bytes = bytes, .len = len, .user_data = user_data };
+                const val = esc.newArrayBufferNoCopyVal(ctx, bytes[0..len], deleter_cb, pack);
+                if (val == null) return null; // bridge already ran deleter on failure
+                return val;
+            } else {
+                return esc.newArrayBufferNoCopyVal(ctx, bytes[0..len], null, null);
+            }
+        },
+        .hermes => {
+            const herm = @import("../backend/hermes.zig").HermesBackend;
+            const Pack = struct {
+                fin: BufferFinalizer,
+                bytes: [*]u8,
+                len: usize,
+                user_data: ?*anyopaque,
+            };
+            const deleter_cb = struct {
+                fn call(ud: ?*anyopaque) callconv(.c) void {
+                    const pack: *Pack = @ptrCast(@alignCast(ud orelse return));
+                    pack.fin(pack.user_data, pack.bytes, pack.len);
+                    std.heap.c_allocator.destroy(pack);
+                }
+            }.call;
+            if (finalizer) |fin| {
+                const pack = std.heap.c_allocator.create(Pack) catch {
+                    fin(user_data, bytes, len);
+                    return null;
+                };
+                pack.* = .{ .fin = fin, .bytes = bytes, .len = len, .user_data = user_data };
+                const val = herm.newArrayBufferNoCopyVal(ctx, bytes[0..len], deleter_cb, pack);
+                if (val == null) return null;
+                return val;
+            } else {
+                return herm.newArrayBufferNoCopyVal(ctx, bytes[0..len], null, null);
+            }
         },
     }
 }
@@ -105,6 +162,70 @@ pub fn newUint8ArrayFromBytes(
             const v: ActiveEngine.Value = @ptrCast(obj);
             return v;
         },
+        .escargot => {
+            const esc = @import("../backend/escargot.zig").EscargotBackend;
+            // Build ArrayBuffer then Uint8Array view; finalizer owns the AB backing store.
+            const Pack = struct {
+                fin: BufferFinalizer,
+                bytes: [*]u8,
+                len: usize,
+                user_data: ?*anyopaque,
+            };
+            const deleter_cb = struct {
+                fn call(ud: ?*anyopaque) callconv(.c) void {
+                    const pack: *Pack = @ptrCast(@alignCast(ud orelse return));
+                    pack.fin(pack.user_data, pack.bytes, pack.len);
+                    std.heap.c_allocator.destroy(pack);
+                }
+            }.call;
+            const ab = blk: {
+                if (finalizer) |fin| {
+                    const pack = std.heap.c_allocator.create(Pack) catch {
+                        fin(user_data, bytes, len);
+                        return null;
+                    };
+                    pack.* = .{ .fin = fin, .bytes = bytes, .len = len, .user_data = user_data };
+                    break :blk esc.newArrayBufferNoCopyVal(ctx, bytes[0..len], deleter_cb, pack);
+                } else {
+                    break :blk esc.newArrayBufferNoCopyVal(ctx, bytes[0..len], null, null);
+                }
+            };
+            if (ab == null) return null;
+            defer esc.freeValue(ctx, ab);
+            // kind 1 = Uint8Array; length is element count
+            return esc.newTypedArrayFromBufferVal(ctx, ab, 1, 0, len);
+        },
+        .hermes => {
+            const herm = @import("../backend/hermes.zig").HermesBackend;
+            const Pack = struct {
+                fin: BufferFinalizer,
+                bytes: [*]u8,
+                len: usize,
+                user_data: ?*anyopaque,
+            };
+            const deleter_cb = struct {
+                fn call(ud: ?*anyopaque) callconv(.c) void {
+                    const pack: *Pack = @ptrCast(@alignCast(ud orelse return));
+                    pack.fin(pack.user_data, pack.bytes, pack.len);
+                    std.heap.c_allocator.destroy(pack);
+                }
+            }.call;
+            const ab = blk: {
+                if (finalizer) |fin| {
+                    const pack = std.heap.c_allocator.create(Pack) catch {
+                        fin(user_data, bytes, len);
+                        return null;
+                    };
+                    pack.* = .{ .fin = fin, .bytes = bytes, .len = len, .user_data = user_data };
+                    break :blk herm.newArrayBufferNoCopyVal(ctx, bytes[0..len], deleter_cb, pack);
+                } else {
+                    break :blk herm.newArrayBufferNoCopyVal(ctx, bytes[0..len], null, null);
+                }
+            };
+            if (ab == null) return null;
+            defer herm.freeValue(ctx, ab);
+            return herm.newTypedArrayFromBufferVal(ctx, ab, 1, 0, len);
+        },
     }
 }
 
@@ -122,6 +243,45 @@ pub fn getBufferView(instance_id: i32, value: ActiveEngine.Value) ?BufferView {
             const v = jsc_mod.jscGetBufferView(@ptrCast(ctx), value) orelse return null;
             return .{ .ptr = v.ptr, .len = v.len };
         },
+        .escargot => {
+            const esc = @import("../backend/escargot.zig").EscargotBackend;
+            if (esc.isArrayBufferVal(ctx, value)) {
+                const slice = esc.getArrayBufferSliceVal(ctx, value) orelse return null;
+                return .{ .ptr = slice.ptr, .len = slice.len };
+            }
+            if (esc.isTypedArrayVal(ctx, value)) {
+                const info = esc.getTypedArrayBytesVal(ctx, value) orelse return null;
+                return .{ .ptr = info.bytes.ptr, .len = info.byte_length };
+            }
+            // DataView
+            const c_api = @import("../backend/escargot/c_api.zig");
+            if (c_api.escargot_is_data_view(value)) {
+                var off: usize = 0;
+                var len: usize = 0;
+                const ptr = c_api.escargot_data_view_data(ctx, value, &off, &len) orelse return null;
+                return .{ .ptr = ptr, .len = len };
+            }
+            return null;
+        },
+        .hermes => {
+            const herm = @import("../backend/hermes.zig").HermesBackend;
+            if (herm.isArrayBufferVal(ctx, value)) {
+                const slice = herm.getArrayBufferSliceVal(ctx, value) orelse return null;
+                return .{ .ptr = slice.ptr, .len = slice.len };
+            }
+            if (herm.isTypedArrayVal(ctx, value)) {
+                const info = herm.getTypedArrayBytesVal(ctx, value) orelse return null;
+                return .{ .ptr = info.bytes.ptr, .len = info.byte_length };
+            }
+            const c_api = @import("../backend/hermes/c_api.zig");
+            if (c_api.hermes_is_data_view(ctx, value)) {
+                var off: usize = 0;
+                var len: usize = 0;
+                const ptr = c_api.hermes_data_view_data(ctx, value, &off, &len) orelse return null;
+                return .{ .ptr = ptr, .len = len };
+            }
+            return null;
+        },
     }
 }
 
@@ -132,7 +292,7 @@ pub fn getBufferView(instance_id: i32, value: ActiveEngine.Value) ?BufferView {
 var pin_counts: std.AutoHashMap(usize, u32) = std.AutoHashMap(usize, u32).init(std.heap.c_allocator);
 var pin_mutex: @import("zev").Mutex = .{};
 
-fn bufferObjectKey(value: ActiveEngine.Value) ?usize {
+fn bufferObjectKey(ctx: ActiveEngine.Context, value: ActiveEngine.Value) ?usize {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
@@ -143,6 +303,18 @@ fn bufferObjectKey(value: ActiveEngine.Value) ?usize {
             const ptr = value orelse return null;
             return @intFromPtr(ptr);
         },
+        .escargot => {
+            // Escargot retained handles are ValueRef* identity for the live object.
+            const ptr = value orelse return null;
+            return @intFromPtr(ptr);
+        },
+        .hermes => {
+            // Distinct retained jsi::Value wrappers must share one key for the same JS object.
+            const c = @import("../backend/hermes/c_api.zig");
+            const id = c.hermes_object_identity(ctx, value);
+            if (id == 0) return null;
+            return @intCast(id);
+        },
     }
 }
 
@@ -150,7 +322,7 @@ fn bufferObjectKey(value: ActiveEngine.Value) ?usize {
 pub fn pin(instance_id: i32, value: ActiveEngine.Value) bool {
     const ctx = engine.getContext(instance_id) orelse return false;
     if (!ActiveEngine.isArrayBufferVal(ctx, value)) return false;
-    const key = bufferObjectKey(value) orelse return false;
+    const key = bufferObjectKey(ctx, value) orelse return false;
     pin_mutex.lock();
     defer pin_mutex.unlock();
     const entry = pin_counts.getPtr(key);
@@ -164,8 +336,8 @@ pub fn pin(instance_id: i32, value: ActiveEngine.Value) bool {
 
 /// Drop one pin taken by `pin`. Returns false if it was not pinned.
 pub fn unpin(instance_id: i32, value: ActiveEngine.Value) bool {
-    _ = instance_id;
-    const key = bufferObjectKey(value) orelse return false;
+    const ctx = engine.getContext(instance_id) orelse return false;
+    const key = bufferObjectKey(ctx, value) orelse return false;
     pin_mutex.lock();
     defer pin_mutex.unlock();
     const count = pin_counts.getPtr(key) orelse return false;
@@ -179,8 +351,8 @@ pub fn unpin(instance_id: i32, value: ActiveEngine.Value) bool {
 
 /// True while at least one `pin` is outstanding for this ArrayBuffer.
 pub fn isPinned(instance_id: i32, value: ActiveEngine.Value) bool {
-    _ = instance_id;
-    const key = bufferObjectKey(value) orelse return false;
+    const ctx = engine.getContext(instance_id) orelse return false;
+    const key = bufferObjectKey(ctx, value) orelse return false;
     pin_mutex.lock();
     defer pin_mutex.unlock();
     const count = pin_counts.get(key) orelse return false;

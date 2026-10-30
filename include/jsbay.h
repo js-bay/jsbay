@@ -46,6 +46,8 @@ typedef enum {
     JSBAY_BACKEND_QUICKJS_NG = 1,
     JSBAY_BACKEND_QUICKJS = 2,
     JSBAY_BACKEND_JSC = 3,
+    JSBAY_BACKEND_ESCARGOT = 4,
+    JSBAY_BACKEND_HERMES = 5,
 } jsbay_backend_t;
 enum {
     JSBAY_CAP_HEAP_STACK_LIMIT = 1u << 0,           /* set_memory_limit / stack budget (QJS family) */
@@ -75,6 +77,9 @@ typedef struct {
     jsbay_backend_t backend;
     jsbay_log_handler_t log_handler;
     void *log_user_data;
+    /* Optional create-time heap cap in bytes (Hermes MaxHeapSize). Zero keeps the backend default.
+     * Older callers with a smaller struct_size leave this unset; the implementation treats missing as 0. */
+    uint64_t max_heap_size;
 } jsbay_engine_create_options_t;
 bool jsbay_engine_create_with_options(int instance_id, const jsbay_engine_create_options_t *options);
 
@@ -83,7 +88,7 @@ bool jsbay_engine_create_with_options(int instance_id, const jsbay_engine_create
 
 /* instance_id is supplied by the caller. Except request_interrupt, stop_loop, suspend, resume, is_suspended, list, snapshot, set/get_admission_class, resource_global_usage, and destroy, every API here runs on the owning thread, including release. Every output is cleared before work begins. On JSBAY_OK, out_value is non-zero and out_exception is zero; on JSBAY_EXCEPTION, out_value is zero and out_exception is a non-zero live thrown JS value (it need not be an Error); all other failures leave both outputs zero. */
 
-/* Process-wide build identity. No instance required; thread-safe. out must be non-NULL and struct_size must be at least sizeof(*out). On success the string pointers are library-owned NUL-terminated C strings that remain valid for the lifetime of the loaded library (do not free them). commit is "" when the build did not record a git revision. backend is the compile-time -Dbackend tag: "quickjs_ng", "quickjs", or "jsc". Returns false when out is NULL or struct_size is too small. */
+/* Process-wide build identity. No instance required; thread-safe. out must be non-NULL and struct_size must be at least sizeof(*out). On success the string pointers are library-owned NUL-terminated C strings that remain valid for the lifetime of the loaded library (do not free them). commit is "" when the build did not record a git revision. backend is the compile-time -Dbackend tag: "quickjs_ng", "quickjs", "jsc", "escargot", or "hermes". Returns false when out is NULL or struct_size is too small. */
 typedef struct {
     uint32_t struct_size;
     const char *version;

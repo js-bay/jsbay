@@ -114,8 +114,10 @@ const privacy_patterns =
     // device ids, and private network markers go in git `info/privacy-denylist`
     // (or PRIVACY_EXTRA_FILE) so they are not embedded in this source file.
     "(^|[^0-9.])100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]+\\.[0-9]+\n/Use[r]s/[A-Za-z0-9._-]+\n/Volum[e]s/[A-Za-z0-9._-]+\n" ++
-    // Comparison / inspiration engine product names — block attributions in-tree.
-    "h[e]rmes\nr[e]act[-_ ]?native\n\\bj[s]i\\b\n";
+    // Comparison / inspiration host-product names that are not first-party backends.
+    // First-party engine backends (including the Hermes -Dbackend= and its JSI bridge paths)
+    // are allowed; keep the mobile host-framework product name banned for casual attribution.
+    "r[e]act[-_ ]?native\n";
 
 fn privacy(c: Context, args: []const []const u8) !void {
     if (args.len != 0 and (args.len != 2 or !std.mem.eql(u8, args[0], "--commits"))) return error.Usage;

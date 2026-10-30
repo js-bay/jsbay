@@ -1,5 +1,6 @@
 //! Memory-limit headroom sweep.
 //!
+//! Reference cases: quickjs-ng api-test.c `backtrace_oom_callsite_array`, `backtrace_oom_current_exception`, and `large_allocation_accounting`.
 //!
 //! The runtime cap is tightened to `usage + k` for growing k. At every step each host API under test must return a status allowed by the C ABI matrix (OK, EXCEPTION or OUT_OF_MEMORY), leave failed outputs zeroed, leak no objects, and the same engine must still evaluate correctly once the cap is lifted. Whether a given step succeeds is deliberately not asserted: the cut-over point differs per backend.
 
@@ -88,7 +89,7 @@ const Fixture = struct {
             \\({ name: 'sweep', blob: 'x'.repeat(40000),
             \\   rows: Array.from({ length: 1500 }, (_, i) => ({ i, label: 'row-' + i, nested: { even: i % 2 === 0 } })) })
         );
-        self.big_string = try self.evaluateOk("'h\\u00e9llo-\\u03ba\\u03cc\\u03c3\\u03bc\\u03bf\\u03c2-'.repeat(8000)");
+        self.big_string = try self.evaluateOk("'h\\u00e9llo-\\u4e16\\u754c-'.repeat(8000)");
         self.expected_json = try self.textOf(c_api.jsbay_value_to_json, self.big_object);
         self.expected_utf8 = try self.textOf(c_api.jsbay_value_to_utf8, self.big_string);
         try testing.expect(self.expected_json.len > 40000);
@@ -250,7 +251,7 @@ test "oom sweep: host APIs stay valid and the engine recovers at every memory he
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer c_api.jsbay_engine_destroy(id);
 
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         // JSC has no heap cap; the rejection itself is the contract (see runtime_control_tests).
         try testing.expect(!rc.setMemoryLimit(id, 1));
         try testing.expect(!c_api.jsbay_engine_set_memory_limit(id, 1));

@@ -43,6 +43,16 @@ pub fn newAtom(instance_id: i32, name: []const u8) ?Atom {
             if (str_ref == null) return null;
             return Atom{ .repr = @as(u64, @intFromPtr(str_ref)) };
         },
+        .escargot => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const handle = c_api.escargot_atom_new(ctx, name.ptr, name.len) orelse return null;
+            return Atom{ .repr = @intFromPtr(handle) };
+        },
+        .hermes => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const handle = c_api.hermes_atom_new(ctx, name.ptr, name.len) orelse return null;
+            return Atom{ .repr = @intFromPtr(handle) };
+        },
     }
 }
 
@@ -68,6 +78,30 @@ pub fn atomToString(allocator: std.mem.Allocator, instance_id: i32, atom: Atom) 
             const common = @import("../backend/jsc/common.zig");
             return common.jsStringToOwnedAlloc(allocator, str_ref);
         },
+        .escargot => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const handle: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            const p = c_api.escargot_atom_to_utf8(ctx, handle) orelse return null;
+            const s = std.mem.span(p);
+            const out = allocator.dupe(u8, s) catch {
+                _ = std.c.free(p);
+                return null;
+            };
+            _ = std.c.free(p);
+            return out;
+        },
+        .hermes => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const handle: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            const p = c_api.hermes_atom_to_utf8(ctx, handle) orelse return null;
+            const s = std.mem.span(p);
+            const out = allocator.dupe(u8, s) catch {
+                _ = std.c.free(p);
+                return null;
+            };
+            _ = std.c.free(p);
+            return out;
+        },
     }
 }
 
@@ -84,6 +118,16 @@ pub fn freeAtom(instance_id: i32, atom: Atom) void {
             const jsc_mod = @import("../backend/jsc.zig");
             const str_ref: jsc_mod.jsc.JSStringRef = @ptrFromInt(@as(usize, @intCast(atom.repr)));
             if (str_ref != null) jsc_mod.jsc.JSStringRelease(str_ref);
+        },
+        .escargot => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const a: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            c_api.escargot_atom_free(a);
+        },
+        .hermes => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const a: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            c_api.hermes_atom_free(a);
         },
     }
 }
@@ -124,6 +168,26 @@ pub fn getProperty(instance_id: i32, object: ActiveEngine.Value, atom: Atom) ?Ac
             jsc_mod.jsc.JSValueProtect(ctx_ref, val);
             return val;
         },
+        .escargot => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const a: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            const val = c_api.escargot_get_property_atom(ctx, object, a);
+            if (val == null or c_api.escargot_is_undefined(val)) {
+                if (val != null) c_api.escargot_free_value(ctx, val);
+                return null;
+            }
+            return val;
+        },
+        .hermes => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const a: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            const val = c_api.hermes_get_property_atom(ctx, object, a);
+            if (val == null or c_api.hermes_is_undefined(val)) {
+                if (val != null) c_api.hermes_free_value(ctx, val);
+                return null;
+            }
+            return val;
+        },
     }
 }
 
@@ -157,6 +221,18 @@ pub fn setProperty(
             jsc_mod.jsc.JSObjectSetProperty(ctx_ref, @constCast(object), str_ref, value, 0, &exc);
             return exc == null;
         },
+        .escargot => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            defer c_api.escargot_free_value(ctx, value);
+            const a: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            return c_api.escargot_set_property_atom(ctx, object, a, value);
+        },
+        .hermes => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            defer c_api.hermes_free_value(ctx, value);
+            const a: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            return c_api.hermes_set_property_atom(ctx, object, a, value);
+        },
     }
 }
 
@@ -185,6 +261,16 @@ pub fn hasProperty(instance_id: i32, object: ActiveEngine.Value, atom: Atom) boo
             const str_ref: jsc_mod.jsc.JSStringRef = @ptrFromInt(@as(usize, @intCast(atom.repr)));
             if (str_ref == null) return false;
             return jsc_mod.jsc.JSObjectHasProperty(ctx_ref, @constCast(object), str_ref);
+        },
+        .escargot => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const a: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            return c_api.escargot_has_property_atom(ctx, object, a);
+        },
+        .hermes => {
+            const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
+            const a: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
+            return c_api.hermes_has_property_atom(ctx, object, a);
         },
     }
 }

@@ -99,11 +99,17 @@ pub const value_storage_size: usize = blk: {
     if (multi_pack.isPacked(.jsc) or backend.active_backend == .jsc) {
         m = @max(m, @sizeOf(backend.Engine(.jsc).Value));
     }
+    if (backend.active_backend == .escargot) {
+        m = @max(m, @sizeOf(backend.Engine(.escargot).Value));
+    }
+    if (backend.active_backend == .hermes) {
+        m = @max(m, @sizeOf(backend.Engine(.hermes).Value));
+    }
     break :blk m;
 };
 
 pub fn valueByteSize(tag: Backend) usize {
-    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc, .escargot, .hermes }) |cand| {
         if (cand == tag) {
             if (comptime multi_pack.isPacked(cand) or cand == backend.active_backend) {
                 return @sizeOf(backend.Engine(cand).Value);
@@ -127,7 +133,7 @@ fn storeValue(comptime E: type, value: E.Value, out: []u8) usize {
 }
 
 pub fn timerIsFunction(tag: Backend, ctx_addr: usize, callback_bytes: []const u8) bool {
-    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc, .escargot, .hermes }) |cand| {
         if (cand == tag) {
             if (comptime multi_pack.isPacked(cand) or cand == backend.active_backend) {
                 const E = backend.Engine(cand);
@@ -142,7 +148,7 @@ pub fn timerIsFunction(tag: Backend, ctx_addr: usize, callback_bytes: []const u8
 }
 
 pub fn timerDupValue(tag: Backend, ctx_addr: usize, callback_bytes: []const u8, out: []u8) ?usize {
-    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc, .escargot, .hermes }) |cand| {
         if (cand == tag) {
             if (comptime multi_pack.isPacked(cand) or cand == backend.active_backend) {
                 const E = backend.Engine(cand);
@@ -158,7 +164,7 @@ pub fn timerDupValue(tag: Backend, ctx_addr: usize, callback_bytes: []const u8, 
 }
 
 pub fn timerFreeValue(tag: Backend, ctx_addr: usize, callback_bytes: []const u8) void {
-    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc, .escargot, .hermes }) |cand| {
         if (cand == tag) {
             if (comptime multi_pack.isPacked(cand) or cand == backend.active_backend) {
                 const E = backend.Engine(cand);
@@ -172,7 +178,7 @@ pub fn timerFreeValue(tag: Backend, ctx_addr: usize, callback_bytes: []const u8)
 }
 
 pub fn timerStoreUndefined(tag: Backend, out: []u8) usize {
-    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc, .escargot, .hermes }) |cand| {
         if (cand == tag) {
             if (comptime multi_pack.isPacked(cand) or cand == backend.active_backend) {
                 const E = backend.Engine(cand);
@@ -186,7 +192,7 @@ pub fn timerStoreUndefined(tag: Backend, out: []u8) usize {
 }
 
 pub fn timerCallNoArgs(tag: Backend, ctx_addr: usize, callback_bytes: []const u8) ?[]const u8 {
-    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc, .escargot, .hermes }) |cand| {
         if (cand == tag) {
             if (comptime multi_pack.isPacked(cand) or cand == backend.active_backend) {
                 const E = backend.Engine(cand);

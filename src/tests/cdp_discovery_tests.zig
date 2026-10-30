@@ -53,54 +53,13 @@ fn writeAll(stream: wire.TestStream, bytes: []const u8) !void {
 }
 
 fn readHttp(alloc: std.mem.Allocator, stream: wire.TestStream) ![]u8 {
-    // Loopback sockets use a short SO_RCVTIMEO for WS polling. Treat WouldBlock as
-    // "keep waiting" until Content-Length is satisfied, not as EOF (which truncated
-    // the ~90KB /json/protocol body into UnexpectedEndOfInput).
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var buf: [4096]u8 = undefined;
-    var header_end: ?usize = null;
-    var content_length: ?usize = null;
-    var idle: usize = 0;
-    while (idle < 200) {
-        const count = stream.read(&buf) catch |err| switch (err) {
-            error.WouldBlock => {
-                idle += 1;
-                for (0..64) |_| std.Thread.yield() catch {};
-                continue;
-            },
-            else => 0,
-        };
-        if (count == 0) {
-            if (header_end != null and content_length != null and out.items.len >= header_end.? + 4 + content_length.?) break;
-            idle += 1;
-            for (0..64) |_| std.Thread.yield() catch {};
-            continue;
-        }
-        idle = 0;
+    while (true) {
+        const count = stream.read(&buf) catch 0;
+        if (count == 0) break;
         try out.appendSlice(alloc, buf[0..count]);
-        if (header_end == null) {
-            if (std.mem.indexOf(u8, out.items, "\r\n\r\n")) |he| {
-                header_end = he;
-                const headers = out.items[0..he];
-                var lines = std.mem.splitSequence(u8, headers, "\r\n");
-                while (lines.next()) |line| {
-                    if (std.ascii.startsWithIgnoreCase(line, "Content-Length:")) {
-                        const raw = std.mem.trim(u8, line["Content-Length:".len..], " \t");
-                        content_length = try std.fmt.parseInt(usize, raw, 10);
-                        break;
-                    }
-                }
-            }
-        }
-        if (header_end) |he| {
-            if (content_length) |cl| {
-                if (out.items.len >= he + 4 + cl) {
-                    out.shrinkRetainingCapacity(he + 4 + cl);
-                    break;
-                }
-            }
-        }
     }
     return out.toOwnedSlice(alloc);
 }
@@ -156,6 +115,7 @@ fn expectedDomains() []const []const u8 {
         else
             &.{ "Runtime", "Profiler", "Performance", "Schema" },
         .jsc => &.{ "Runtime", "Performance", "Schema" },
+        .escargot, .hermes => &.{ "Runtime", "Performance", "Schema" },
     };
 }
 

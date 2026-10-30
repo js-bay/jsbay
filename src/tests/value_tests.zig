@@ -615,6 +615,7 @@ test "value: returning .json parses into JS object" {
 }
 
 test "value: returning .err throws JS exception containing message" {
+    // Hermes host-throw fixed via libhermes_bridge.so (shared libstdc++/libgcc_s with hermesvm).
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {

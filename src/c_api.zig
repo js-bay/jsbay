@@ -64,6 +64,8 @@ test "c_api: library_backend and capabilities match compile-time backend" {
         .quickjs_ng => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.quickjs_ng)), tag),
         .quickjs => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.quickjs)), tag),
         .jsc => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.jsc)), tag),
+        .escargot => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.escargot)), tag),
+        .hermes => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.hermes)), tag),
     }
 
     try std.testing.expect(!jsbay_library_capabilities(null));
@@ -76,8 +78,10 @@ test "c_api: library_backend and capabilities match compile-time backend" {
     try std.testing.expectEqual(backend.libraryCapabilityFlags(), caps.flags);
 
     const F = CapabilityFlags;
-    // Interrupt/deadline exist for every current backend.
-    try std.testing.expect((caps.flags & F.interrupt_deadline) != 0);
+    // Interrupt/deadline exist for QJS/JSC; spike backends report bit-only / create-time limits.
+    if (!backend.isSpikeBackend(backend.active_backend)) {
+        try std.testing.expect((caps.flags & F.interrupt_deadline) != 0);
+    }
     if (backend.isQuickJsApiBackend(backend.active_backend)) {
         try std.testing.expect((caps.flags & F.heap_stack_limit) != 0);
         try std.testing.expect((caps.flags & F.heap_usage_snapshot) != 0);
@@ -109,11 +113,13 @@ pub const EngineCreateOptionsC = extern struct {
     backend: BackendC = .primary,
     log_handler: ?types.LogHandler = null,
     log_user_data: ?*anyopaque = null,
+    /// Create-time heap cap in bytes (Hermes MaxHeapSize). Ignored by other backends when zero.
+    max_heap_size: u64 = 0,
 };
 
 /// Packed backends in this artifact (create-time select candidates). Writes up to `cap` tags into `out` when non-NULL; always returns the packed count (required capacity). Callers must clamp iteration to `min(returned, cap)`.
 pub export fn jsbay_available_backends(out_backends: ?[*]BackendC, cap: usize) usize {
-    var buf: [4]multi_pack.Backend = undefined;
+    var buf: [8]multi_pack.Backend = undefined;
     const n = multi_pack.availableBackends(&buf);
     if (out_backends) |out| {
         const write_n = @min(n, cap);
@@ -149,7 +155,10 @@ pub export fn jsbay_engine_create_with_options(
 
     if (host_wake.isNotifying()) return false;
     const id: i32 = @intCast(instance_id);
-    const config = cApiEngineConfig(log_handler, log_user_data, resource_limits.Limits{});
+    var config = cApiEngineConfig(log_handler, log_user_data, resource_limits.Limits{});
+    if (options.struct_size >= @offsetOf(EngineCreateOptionsC, "max_heap_size") + @sizeOf(u64)) {
+        config.max_heap_size = @intCast(options.max_heap_size);
+    }
     if (!engine.createWithBackend(id, config, requested)) return false;
     // runtime_control is mono-only; packed-alt skips it inside createWithBackend.
     if (requested == backend.active_backend) {
@@ -171,7 +180,7 @@ test "c_api: available_backends matches packed bits" {
     try std.testing.expectEqual(multi_pack.packedCount(), n);
     try std.testing.expect(n >= 1);
 
-    var buf: [4]BackendC = undefined;
+    var buf: [8]BackendC = undefined;
     const written = jsbay_available_backends(&buf, buf.len);
     try std.testing.expectEqual(n, written);
     var i: usize = 0;
@@ -244,7 +253,7 @@ test "c_api: create_with_options primary packed succeeds; non-packed fails" {
 
 test "c_api: create_with_options non-primary packed create eval destroy" {
     // When multi-pack includes a non-primary engine, create/eval/destroy must work (Apple NG+JSC).
-    var buf: [4]BackendC = undefined;
+    var buf: [8]BackendC = undefined;
     const n = jsbay_available_backends(&buf, buf.len);
     const primary = backend.libraryBackendC();
     var i: usize = 0;
@@ -273,7 +282,7 @@ test "c_api: create_with_options non-primary packed create eval destroy" {
 }
 
 test "c_api: packed-alt typed evaluate number + retain/release (real non-primary when packed)" {
-    var buf: [4]BackendC = undefined;
+    var buf: [8]BackendC = undefined;
     const n = jsbay_available_backends(&buf, buf.len);
     const primary = backend.libraryBackendC();
     var i: usize = 0;
@@ -516,7 +525,7 @@ test "c_api: forced packed_alt set/call/construct/new_* (Linux primary-tag proof
 }
 
 test "c_api: packed-alt set/call/new when real non-primary packed" {
-    var buf: [4]BackendC = undefined;
+    var buf: [8]BackendC = undefined;
     const n = jsbay_available_backends(&buf, buf.len);
     const primary = backend.libraryBackendC();
     var i: usize = 0;
@@ -680,7 +689,7 @@ test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/ne
 }
 
 test "c_api: packed-alt to_bool/has/json/buffer when real non-primary packed" {
-    var buf: [4]BackendC = undefined;
+    var buf: [8]BackendC = undefined;
     const n = jsbay_available_backends(&buf, buf.len);
     const primary = backend.libraryBackendC();
     var i: usize = 0;
@@ -964,7 +973,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
 }
 
 test "c_api: packed-alt adversarial when real non-primary packed" {
-    var backends_buf: [4]BackendC = undefined;
+    var backends_buf: [8]BackendC = undefined;
     const n = jsbay_available_backends(&backends_buf, backends_buf.len);
     const primary = backend.libraryBackendC();
     var i: usize = 0;
@@ -3592,7 +3601,7 @@ fn syncAdoptOrCopyArrayBuffer(instance_id: i32, payload: []u8, out_value: *u64) 
         const buffers = switch (comptime backend.active_backend) {
             .quickjs => @import("backend/quickjs/buffers.zig"),
             .quickjs_ng => @import("backend/quickjs_ng/buffers.zig"),
-            .jsc => unreachable,
+            .jsc, .escargot, .hermes => unreachable,
         };
         const freer = struct {
             fn f(_: ?*anyopaque, bytes: [*]u8, len: usize) callconv(.c) void {

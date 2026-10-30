@@ -63,7 +63,16 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
     const backend_dispatch = @import("backend_dispatch.zig");
 
     if (tag == backend.active_backend) {
-        const runtime = ActiveEngine.newRuntime() orelse {
+        const runtime = blk: {
+            if (comptime backend.isHermesBackend(backend.active_backend)) {
+                const build_opts = @import("build_options");
+                const from_config: u64 = config.max_heap_size;
+                const from_build: u64 = build_opts.hermes_max_heap;
+                const max_heap: u64 = if (from_config != 0) from_config else from_build;
+                break :blk @import("backend/hermes/lifecycle.zig").newRuntimeWithMaxHeap(max_heap);
+            }
+            break :blk ActiveEngine.newRuntime();
+        } orelse {
             loop.destroy();
             return false;
         };
@@ -86,6 +95,16 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
                 .jsc => {
                     const jsc_mod = @import("backend/jsc.zig");
                     jsc_mod.installModuleLoader(ctx, ml);
+                },
+                .escargot => {
+                    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+                        @import("backend/escargot.zig").installModuleLoader(ctx, ml);
+                    }
+                },
+                .hermes => {
+                    if (comptime backend.isHermesBackend(backend.active_backend)) {
+                        @import("backend/hermes.zig").installModuleLoader(ctx, ml);
+                    }
                 },
             }
         }
@@ -256,6 +275,18 @@ pub fn evalModule(instance_id: i32, source: []const u8, filename: []const u8) Ev
     const result = switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("backend.zig").ActiveEngineModule.evalAsModule(ptrs.ctx, source, filename),
         .jsc => @import("backend/jsc.zig").jscEvalModule(ptrs.ctx, source, filename),
+        .escargot => blk: {
+            if (comptime !backend.isEscargotBackend(backend.active_backend)) {
+                break :blk @as(EvalResult, .{ .result = null, .err = "ES modules not supported on this backend", .err_is_heap = false });
+            }
+            break :blk @import("backend/escargot.zig").escargotEvalModule(ptrs.ctx, source, filename);
+        },
+        .hermes => blk: {
+            if (comptime !backend.isHermesBackend(backend.active_backend)) {
+                break :blk @as(EvalResult, .{ .result = null, .err = "ES modules not supported on this backend", .err_is_heap = false });
+            }
+            break :blk @import("backend/hermes.zig").hermesEvalModule(ptrs.ctx, source, filename);
+        },
     };
     execution.end();
     @import("runtime/js_scheduler.zig").checkpoint(instance_id, ptrs.ctx);
@@ -287,6 +318,18 @@ pub fn importModule(instance_id: i32, entry_specifier: []const u8) EvalResult {
         .jsc => {
             const jsc_mod = @import("backend/jsc.zig");
             return jsc_mod.jscImportModule(ptrs.ctx, entry_specifier);
+        },
+        .escargot => {
+            if (comptime !backend.isEscargotBackend(backend.active_backend)) {
+                return .{ .result = null, .err = "ES modules not supported on this backend", .err_is_heap = false };
+            }
+            return @import("backend/escargot.zig").escargotImportModule(ptrs.ctx, entry_specifier);
+        },
+        .hermes => {
+            if (comptime !backend.isHermesBackend(backend.active_backend)) {
+                return .{ .result = null, .err = "ES modules not supported on this backend", .err_is_heap = false };
+            }
+            return @import("backend/hermes.zig").hermesImportModule(ptrs.ctx, entry_specifier);
         },
     }
 }
@@ -553,6 +596,7 @@ pub fn runGc(instance_id: i32) void {
                 jsc_mod.JSSynchronousEdenCollectForDebugging(@ptrCast(m.ctx));
                 jsc_mod.JSSynchronousGarbageCollectForDebugging(@ptrCast(m.ctx));
             },
+            .escargot, .hermes => ActiveEngine.runGc(m.runtime),
         },
         .packed_alt => |a| @import("backend_dispatch.zig").runGcPacked(a.tag, .{
             .runtime_addr = a.runtime_addr,

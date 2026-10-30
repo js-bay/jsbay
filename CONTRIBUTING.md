@@ -2,8 +2,6 @@
 
 Thanks for considering a patch. This document covers what you need to know to land code in `JS Bay`. If something is unclear, open an issue before doing significant work.
 
-Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report security issues through [SECURITY.md](SECURITY.md), not public issues.
-
 Before you push, read [AGENTS.md](AGENTS.md) and run `zig build tool -- privacy`: the repository must not contain private product names, private network addresses or personal paths.
 
 Comments explain current behavior, constraints, ownership, and reasons. Leave dates, machine details, implementation history, and review notes out of comments. Write one prose paragraph per physical line in comments, documentation, commit messages, PRs, issues, and work logs; let the reader's editor or platform wrap it. Preserve meaningful line breaks in lists, tables, code examples, stack traces, license notices, and tool directives. See [comment and prose rules](AGENTS.md#comments-and-prose).
@@ -23,20 +21,6 @@ zig version
 ### Event loop dependencies
 
 JS Bay's event loop and wake primitive are implemented in Zig; the reusable loop primitives are in the separate `libs/zev` package. `libs/js_event_loop` coordinates JS task execution, microtask checkpoints and synchronous native waits above `zev`; engine values and runtime admission stay in the root adapters. Persistent bytecode artifact naming and storage are in `libs/bytecode_cache`; engine compilation, execution and exception ownership stay in the root package. Both QuickJS backends are supported on Linux; JSC requires Apple frameworks.
-
-### Git pre-commit hook (Zig formatting)
-
-CI runs `zig build test-fmt`. To block local commits the same way, enable the repo-owned hook once per clone:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-The hook runs `zig build test-fmt` (full project paths, matching CI). Skip with `git commit --no-verify` only when you intentionally defer formatting.
-
-### Quality checks (`make check` / pawl)
-
-`make check` invokes **pawl** (see `pawl.yaml`): a task runner for hard quality gates such as SDK formatters and linters. Install `pawl` on your `PATH`, then run `make check` (optionally `CHECKS=…` to select dimensions) before pushing platform or style-sensitive changes.
 
 ### Build + test the backend you care about
 
@@ -58,6 +42,10 @@ If your change touches code under `src/backend/jsc/`, `src/backend/jsc/remote_in
 Use the responsibility and package boundaries in [architecture](docs/architecture.md). Keep engine-specific code in its backend directory and preserve the existing public export names.
 
 Tests for root engine modules go in `src/tests/<area>_tests.zig` and must be registered in `src/tests/all_tests.zig`. Package unit tests belong to that package and must be registered by its `src/tests.zig`; pure Inspector protocol, HTTP/WebSocket, and bytecode artifact-storage tests do not belong in the engine suite. Contracts that require a real Inspector host run through `src/tests/inspector_host_contract_tests.zig`; cache compile/run behavior and the disabled build switch remain root integration tests. Tests inside a generic factory are not collected automatically: expose test-only checks and call them from ordinary test declarations. Confirm a nonzero test count. The root test command runs the package suites too and forwards `-Dtest-filter` to them. Gate engine-specific integration tests by an explicit capability or backend tag.
+
+### Documentation filenames
+
+Under `docs/`, all Markdown files must use lowercase kebab-case names (for example `api-contract.md`, `host-isolation.md`, `readme.md`). Do not add `docs/README.md`, `docs/*.MD`, or TitleCase basenames; `zig build tool -- check-docs` enforces this.
 
 ## 3. TDD policy (required)
 

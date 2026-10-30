@@ -316,9 +316,9 @@ pub const NativeArgs = struct {
         return self._this;
     }
 
-    /// Whether a receiver is present. QuickJS: `this` is an object (bare call is `undefined`, so false). JSC: `thisObject != null`. A bare call is the global object, so this is still true; compare `thisValue()` with that object to tell a method call from a bare call.
+    /// ScriptX `Arguments::hasThiz`. QuickJS: `this` is an object (bare call is `undefined`, so false). JSC: `thisObject != null`. A bare call is the global object, so this is still true; compare `thisValue()` with that object to tell a method call from a bare call.
     pub fn hasReceiver(self: NativeArgs) bool {
-        if (comptime backend.active_backend == .jsc) {
+        if (comptime backend.isJscApiBackend(backend.active_backend)) {
             return self._this != null;
         }
         return ActiveEngine.isObjectVal(self._ctx, self._this);

@@ -1,6 +1,12 @@
 # Brand icon sources
 
-Icons used in `assets/banner.svg` (and stored here for reuse). Trademarks remain with their owners; inclusion is for platform identification only and does not imply endorsement.
+Icons used in `assets/banner.svg` (and stored here for reuse). Trademarks remain with their owners; inclusion is for platform / engine identification only and does not imply endorsement.
+
+Hermes mark: official vector from `vendor/hermes/doc/img/logo.svg` (MIT-licensed repo asset; Hermes/Meta trademark). Used in the banner.
+JavaScriptCore: WebKit compass identity. Full mark in `webkit-logo.svg` (Wikimedia); banner embeds the simplified flat `webkit-mark.svg`. Apple trademark; identification only.
+QuickJS / QuickJS-NG / Escargot: no official upstream logos — the banner uses solid dots for those pills, not custom substitute marks.
+
+## Host platforms
 
 | File | Source | License / notes |
 |------|--------|-----------------|
@@ -17,4 +23,14 @@ Icons used in `assets/banner.svg` (and stored here for reuse). Trademarks remain
 | `openharmony-logo.svg` / `openharmony-emblem.svg` | [Wikimedia: OpenHarmony Logo by OpenAtom.svg](https://commons.wikimedia.org/wiki/File:OpenHarmony_Logo_by_OpenAtom.svg) | OpenAtom Foundation mark; archived for reference. |
 | `huawei-flower.svg` | Simple Icons `huawei` source for `harmony-mark.svg` | CC0 path data; Huawei trademark. |
 
-Downloaded 2026-10-22 from Wikimedia Commons (`Special:FilePath`) and jsDelivr Simple Icons.
+## JS engines
+
+| File | Source | License / notes |
+|------|--------|-----------------|
+| `hermes-logo.svg` | [facebook/hermes `doc/img/logo.svg`](https://github.com/facebook/hermes/blob/main/doc/img/logo.svg) (Meta Hermes JS engine; title *Hermes Full Color Logo*) | MIT-licensed repo asset; **Hermes / Meta trademark**. Identification only, no endorsement. Official green `#2bb673`. |
+| `hermes-mark.svg` | Flattened (inline fills, no CSS classes) derivative of `hermes-logo.svg` for reliable banner embedding | Same Meta trademark / source. **Used in banner.** |
+| `webkit-logo.svg` | [Wikimedia: WebKit logo.svg](https://commons.wikimedia.org/wiki/File:WebKit_logo.svg) (full compass; Brands of the World → Commons) | Tagged LGPL / BSD on Commons; **Apple WebKit trademark**. Apple’s WebKit terms do not grant a logo license for branding — identification only. Full archive; not inlined in banner. |
+| `webkit-mark.svg` | Simplified flat compass face for ~26px pills, derived from the WebKit logo identity (blue dial + N/S needle) | Same WebKit / Apple trademark caveat. Stands in for **JavaScriptCore** (JSC is the WebKit JS engine). **Used in banner.** |
+| `webkit-compass-box.svg` | [Wikimedia: Compass in a box.svg](https://commons.wikimedia.org/wiki/File:Compass_in_a_box.svg) | Related WebKit-compass artwork; archived, not used in banner. |
+
+QuickJS, QuickJS-NG, and Escargot have **no official marks** upstream; the banner uses animated solid dots for those pills (not separate SVG files).

@@ -12,6 +12,8 @@
 //! Backend notes:
 //! - QuickJS: full native support via `JS_SetInterruptHandler`. The JS VM throws an InternalError on the next interrupt check.
 //! - JSC: uses the private `JSContextGroupSetExecutionTimeLimit` API (symbol ships in JavaScriptCore.framework, even though the public header hides it). The system JSC build exercised here needs the callback to explicitly re-arm its next 50ms check after it returns false, despite the upstream header documenting automatic continuation. This keeps `requestInterrupt` and execution deadlines responsive there. `runGc` uses the public `JSGarbageCollect` and is reliable on all JSC builds. Memory usage is not queryable through JSC's public C API and is reported as zeros.
+//! - Escargot: `runGc` → `Memory::gc`. Soft `getMemoryUsage` via `Memory::heapSize`/`totalSize`. No public heap cap (`setMemoryLimit` false). No mid-script interrupt in this pin.
+//! - Hermes: `runGc` via instrumentation collectGarbage. Soft `getMemoryUsage` via getHeapInfo. `setMemoryLimit` false (use EngineConfig.max_heap_size / -Dhermes-max-heap at create). User `requestInterrupt` is bit-only (no sticky Timeout AsyncBreak); mid-script abort via stop/destroy + softRearm/drain.
 
 const std = @import("std");
 const io = @import("../platform/io.zig");
@@ -109,6 +111,7 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
                 const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
                 jsc_mod.jscInstallInterruptHandler(group, jsc_state);
             },
+            .escargot, .hermes => {},
         },
         .packed_alt => |a| {
             // Dispatch by the instance backend so non-primary packs get interrupt/time-limit handlers too.
@@ -156,6 +159,7 @@ pub fn deinit(instance_id: i32) bool {
                     const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
                     jsc_mod.jscUninstallInterruptHandler(group);
                 },
+                .escargot, .hermes => {},
             },
             .packed_alt => |a| {
                 inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
@@ -186,7 +190,23 @@ pub fn deinit(instance_id: i32) bool {
 /// Request that the JS runtime interrupt execution on the next interrupt check. Thread-safe. Returns false if the instance was never init()'d or has been deinit()'d.
 ///
 /// After the script throws, call `clearInterrupt` to reset the flag.
+/// True when `requestInterrupt` can abort mid-script JS (QuickJS/NG via interrupt handler; JSC via time-limit callback).
+/// Escargot/Hermes: false — user interrupt is not advertised as mid-script cancel.
+pub fn supportsMidScriptUserInterrupt() bool {
+    return switch (backend.active_backend) {
+        .quickjs, .quickjs_ng, .jsc => true,
+        .escargot, .hermes => false,
+    };
+}
+
 pub fn requestInterrupt(instance_id: i32) bool {
+    if (!supportsMidScriptUserInterrupt()) {
+        // Refuse mid-script claim for Escargot/Hermes; do not arm the user bit.
+        registry_mutex.lock();
+        defer registry_mutex.unlock();
+        _ = registry.get(instance_id) orelse return false;
+        return false;
+    }
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
@@ -302,6 +322,16 @@ pub fn runGc(instance_id: i32) bool {
                 const jsc_mod = @import("../backend/jsc.zig");
                 jsc_mod.jscRunGc(@ptrCast(m.ctx));
             },
+            .escargot => {
+                if (comptime backend.isEscargotBackend(backend.active_backend)) {
+                    @import("../backend/escargot.zig").EscargotBackend.runGc(m.runtime);
+                }
+            },
+            .hermes => {
+                if (comptime backend.isHermesBackend(backend.active_backend)) {
+                    @import("../backend/hermes.zig").HermesBackend.runGc(m.runtime);
+                }
+            },
         },
         .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
             .runtime_addr = a.runtime_addr,
@@ -322,7 +352,7 @@ pub fn setMemoryLimit(instance_id: i32, bytes: u64) bool {
                 qjs_mod.qjsSetMemoryLimit(m.runtime, @intCast(bytes));
                 return true;
             },
-            .jsc => return false,
+            .jsc, .escargot, .hermes => return false,
         },
         .packed_alt => |a| {
             if (!backend.isQuickJsApiBackend(a.tag)) return false;
@@ -400,6 +430,16 @@ pub fn noteIdle(instance_id: i32) bool {
                 const jsc_mod = @import("../backend/jsc.zig");
                 jsc_mod.jscRunGc(@ptrCast(m.ctx));
             },
+            .escargot => {
+                if (comptime backend.isEscargotBackend(backend.active_backend)) {
+                    @import("../backend/escargot.zig").EscargotBackend.runGc(m.runtime);
+                }
+            },
+            .hermes => {
+                if (comptime backend.isHermesBackend(backend.active_backend)) {
+                    @import("../backend/hermes.zig").HermesBackend.runGc(m.runtime);
+                }
+            },
         },
         .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
             .runtime_addr = a.runtime_addr,
@@ -468,7 +508,7 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
                     .shape_count = snap.shape_count,
                 };
             },
-            .jsc => return .{},
+            .jsc, .escargot, .hermes => return .{},
         },
         .packed_alt => |a| {
             if (!backend.isQuickJsApiBackend(a.tag)) return .{};

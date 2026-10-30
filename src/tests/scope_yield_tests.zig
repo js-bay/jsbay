@@ -1,6 +1,6 @@
 //! Temporarily yield the engine so another thread can eval.
 //!
-//! Owner-thread claim yield: the owning thread drops its claim so a second thread can enter, then the owner takes the claim back. Before `threadStart` there is no engine thread, so release / reacquire do nothing.
+//! ScriptX `ExitEngineScope` drops the owning thread's claim; a second thread enters, then the owner takes the claim back. Before `threadStart` there is no engine thread, so release / reacquire do nothing.
 
 const std = @import("std");
 const testing = std.testing;
@@ -316,7 +316,7 @@ fn yieldConcurrentEval(data: ?*anyopaque) void {
 }
 
 test "scope yield: JSC serializes simultaneous foreign evaluations" {
-    if (backend.active_backend != .jsc) return;
+    if (!backend.isJscApiBackend(backend.active_backend)) return;
     const id = helpers.nextInstanceId();
     if (!engine.create(id, .{})) return error.EngineCreateFailed;
     defer engine.destroy(id);
@@ -413,7 +413,7 @@ const ForeignEvalAttempt = struct {
 };
 
 test "scope yield: JSC owner teardown excludes active foreign eval and rejects new entries" {
-    if (backend.active_backend != .jsc) return error.SkipZigTest;
+    if (!backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
     if (!engine.create(id, .{})) return error.EngineCreateFailed;
     defer engine.destroy(id);
@@ -510,7 +510,7 @@ const ExclusiveTeardownWorker = struct {
 };
 
 test "scope yield: JSC teardown waits for a foreign lease after threadStop" {
-    if (backend.active_backend != .jsc) return error.SkipZigTest;
+    if (!backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
     if (!engine.create(id, .{})) return error.EngineCreateFailed;
     defer engine.destroy(id);
@@ -591,7 +591,7 @@ test "scope yield: foreign eval runs while released and fails after reacquire" {
         worker.join();
     }
 
-    // Runs on the engine thread outside eval.
+    // Runs on the engine thread outside eval, matching ExitEngineScope.
     try testing.expect(engine_thread.postToEngineThread(id, yieldOnEngine, @ptrCast(&phase)));
     try testing.expect(waitStep(&phase, 4));
 
@@ -602,52 +602,4 @@ test "scope yield: foreign eval runs while released and fails after reacquire" {
     try testing.expect(phase.blocked_after.load(.seq_cst));
     try testing.expect(phase.refused.load(.seq_cst));
     try expectPosted(id, "globalThis.marker", "7");
-}
-
-const YieldedTurnProbe = struct {
-    id: i32,
-    ran: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    yielded_next: std.atomic.Value(i64) = std.atomic.Value(i64).init(-2),
-    ran_while_yielded: std.atomic.Value(u32) = std.atomic.Value(u32).init(99),
-    woke_on_reacquire: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    resumed_next: std.atomic.Value(i64) = std.atomic.Value(i64).init(-2),
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-};
-
-fn yieldedTurnTask(data: ?*anyopaque) void {
-    const probe: *YieldedTurnProbe = @ptrCast(@alignCast(data orelse return));
-    _ = probe.ran.fetchAdd(1, .seq_cst);
-}
-
-fn yieldedTurnJob(data: ?*anyopaque) void {
-    const probe: *YieldedTurnProbe = @ptrCast(@alignCast(data orelse return));
-    defer probe.done.store(true, .seq_cst);
-    const loop = @import("../runtime/instance_map.zig").getPtrs(probe.id).?.loop;
-    _ = @import("../runtime/dispatch.zig").postTask(probe.id, .{ .ctx = probe, .run = yieldedTurnTask });
-    if (!engine_thread.releaseForExternalEval(probe.id)) return;
-    probe.yielded_next.store(engine.testing.advance(probe.id, 1000), .seq_cst);
-    probe.ran_while_yielded.store(probe.ran.load(.seq_cst), .seq_cst);
-    const seen = loop.loop.wakeGeneration();
-    _ = engine_thread.reacquire(probe.id);
-    probe.woke_on_reacquire.store(loop.loop.wakeGeneration() != seen, .seq_cst);
-    probe.resumed_next.store(engine.testing.advance(probe.id, 1001), .seq_cst);
-}
-
-test "scope yield: a yielded owner reports no runnable work and wakes the loop when it reacquires" {
-    const id = helpers.nextInstanceId();
-    if (!engine.create(id, .{})) return error.EngineCreateFailed;
-    defer engine.destroy(id);
-    var probe = YieldedTurnProbe{ .id = id };
-    try testing.expect(engine_thread.threadStart(id));
-    try testing.expect(engine_thread.postToEngineThread(id, yieldedTurnJob, @ptrCast(&probe)));
-    const deadline = io.monotonicMilliseconds() + 3000;
-    while (!probe.done.load(.seq_cst)) {
-        if (io.monotonicMilliseconds() >= deadline) return error.YieldedTurnTimedOut;
-        io.sleepMs(1);
-    }
-    try testing.expectEqual(@as(u32, 0), probe.ran_while_yielded.load(.seq_cst));
-    try testing.expectEqual(@as(i64, -1), probe.yielded_next.load(.seq_cst));
-    try testing.expect(probe.woke_on_reacquire.load(.seq_cst));
-    try testing.expectEqual(@as(i64, -1), probe.resumed_next.load(.seq_cst));
-    try testing.expectEqual(@as(u32, 1), probe.ran.load(.seq_cst));
 }

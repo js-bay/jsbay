@@ -227,7 +227,7 @@ test "cdp: async depth zero does not invent a parent stack" {
 }
 
 test "cdp: setInterval console event names the interval parent" {
-    if (!backend.isQuickJsApiBackend(backend.active_backend) and backend.active_backend != .jsc) return;
+    if (!backend.isQuickJsApiBackend(backend.active_backend) and !backend.isJscApiBackend(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-async-interval");
     defer session.deinit();
@@ -245,7 +245,7 @@ test "cdp: setInterval console event names the interval parent" {
 }
 
 test "cdp: promise reaction keeps the scheduling stack" {
-    if (!backend.isQuickJsApiBackend(backend.active_backend) and backend.active_backend != .jsc) return;
+    if (!backend.isQuickJsApiBackend(backend.active_backend) and !backend.isJscApiBackend(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-async-promise");
     defer session.deinit();
@@ -263,7 +263,7 @@ test "cdp: promise reaction keeps the scheduling stack" {
 }
 
 test "cdp: queueMicrotask keeps the scheduling stack" {
-    if (!backend.isQuickJsApiBackend(backend.active_backend) and backend.active_backend != .jsc) return;
+    if (!backend.isQuickJsApiBackend(backend.active_backend) and !backend.isJscApiBackend(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-async-micro");
     defer session.deinit();

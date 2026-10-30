@@ -223,7 +223,7 @@ test "c_api: log handler receives engine info output" {
 }
 
 test "c_api: interrupt request aborts an infinite evaluation from another thread" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer c_api.jsbay_engine_destroy(id);
@@ -291,7 +291,7 @@ test "c_api: destroy releases explicitly installed CJS state before same-id recr
 }
 
 test "engine: destroy keeps interrupt state alive until an active evaluation unwinds" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
@@ -474,7 +474,7 @@ test "c_api: typed bytecode compile and run preserve value ownership" {
         &bytes,
         &exception,
     );
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         try testing.expectEqual(@as(c_int, 7), compile_status);
         try testing.expect(bytes.data == null and bytes.len == 0 and exception == 0);
         return;
@@ -509,7 +509,7 @@ test "c_api: typed bytecode returns raw compile and run exceptions" {
         &bytes,
         &syntax_exception,
     );
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         try testing.expectEqual(@as(c_int, 7), syntax_status);
         try testing.expect(bytes.data == null and bytes.len == 0 and syntax_exception == 0);
         return;
@@ -544,7 +544,7 @@ test "c_api: typed bytecode clears outputs for invalid bytecode" {
     var value: u64 = 1;
     var exception: u64 = 1;
     const status = c_api.jsbay_engine_run_bytecode(id, null, 0, &value, &exception);
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         try testing.expectEqual(@as(c_int, 7), status);
     } else {
         try testing.expect(status != 0);
@@ -967,6 +967,7 @@ test "typed constructors clear outputs and leave the engine usable after allocat
 // ---------------------------------------------------------------------------
 // Exception identity across the C ABI.
 //
+// Reference cases: ScriptX `ExceptionTest.Cross`.
 // ---------------------------------------------------------------------------
 
 fn expectEvalTrue(id: i32, source: []const u8) !void {
@@ -1271,7 +1272,7 @@ test "c_api: to_json of a symbol is an invalid argument with no output" {
     defer _ = c_api.jsbay_value_release(sym);
     var bytes: c_api.Bytes = .{ .data = @ptrFromInt(1), .len = 7 };
     var exception: u64 = 99;
-    // JSBAY_INVALID_ARGUMENT
+    // JS_BAY_INVALID_ARGUMENT
     const status = c_api.jsbay_value_to_json(sym, &bytes, &exception);
     try testing.expect(status != 0);
     try testing.expect(bytes.data == null);
@@ -1300,6 +1301,7 @@ test "c_api: get_memory_usage and run_gc are owner-thread observability hooks" {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => try testing.expect(usage.obj_count > 0 or usage.malloc_size > 0),
         .jsc => {},
+        .escargot, .hermes => {},
     }
 }
 

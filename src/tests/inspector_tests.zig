@@ -419,7 +419,7 @@ test "dispatchTask rejects scripts after instance task admission closes" {
     try testing.expect(!engine.dispatchTask(id, "globalThis.__closed_dispatch_task__ = true"));
     const instance = instance_map.getInstance(id) orelse return error.InstanceMissing;
     instance.task_mutex.lock();
-    const queued_scripts = instance.task_queue.pendingLen();
+    const queued_scripts = instance.task_queue.items.items.len;
     instance.task_mutex.unlock();
     try testing.expectEqual(@as(usize, 0), queued_scripts);
     const result = engine.evalScript(id, "typeof globalThis.__closed_dispatch_task__", "<closed-dispatch>");
@@ -790,7 +790,7 @@ const InspectorEnabledTests3 = if (@import("build_options").inspector) struct {
     }
 
     test "JSC inspector stop on yielded owner waits for foreign eval before freeing JS values" {
-        if (backend.active_backend != .jsc) return error.SkipZigTest;
+        if (!backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
         const id = helpers.nextInstanceId();
         try testing.expect(engine.create(id, .{}));
         defer engine.destroy(id);

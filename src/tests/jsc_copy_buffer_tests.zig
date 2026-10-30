@@ -30,7 +30,7 @@ fn expectBytes(value: u64, expected: []const u8) !void {
 }
 
 test "JSC copy buffer rejects genuinely detached buffers without mutable hooks" {
-    if (comptime backend.active_backend != .jsc) return;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer c_api.jsbay_engine_destroy(id);
@@ -67,7 +67,7 @@ test "JSC copy buffer rejects genuinely detached buffers without mutable hooks" 
 }
 
 test "JSC C-created empty ArrayBuffer is attached and copyable" {
-    if (comptime backend.active_backend != .jsc) return;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer c_api.jsbay_engine_destroy(id);
@@ -100,7 +100,7 @@ test "JSC C-created empty ArrayBuffer is attached and copyable" {
 }
 
 test "JSC copy buffer uses native DataView state without property access" {
-    if (comptime backend.active_backend != .jsc) return;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer c_api.jsbay_engine_destroy(id);

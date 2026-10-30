@@ -295,6 +295,15 @@ fn compileWrapper(
             // Protect so the caller can freeValue (JSValueUnprotect) symmetrically.
             return ActiveEngine.dupValue(ctx, raw);
         },
+        .escargot, .hermes => {
+            const r = ActiveEngine.evalValue(ctx, source, filename);
+            if (r.err_text) |e| {
+                std.heap.c_allocator.free(e);
+                if (r.exception) |ex| ActiveEngine.freeValue(ctx, ex);
+                return error.Compile;
+            }
+            return r.value orelse return error.Compile;
+        },
     }
 }
 
@@ -437,6 +446,11 @@ pub fn runCommonJS(instance_id: i32, bytes: []const u8, filename: []const u8) Cj
         .jsc => {
             return .{ .err = "runCommonJS not supported on JSC", .err_is_heap = false };
         },
+        .escargot, .hermes => {
+            // No stable bytecode blob on Escargot; Hermes .hbc path is separate (hermesCompileBytecode).
+            // Text CJS goes through require()/evalAsCjs + evalValue.
+            return .{ .err = "runCommonJS bytecode path not supported on Escargot/Hermes", .err_is_heap = false };
+        },
     }
 }
 
@@ -457,8 +471,11 @@ pub fn evalCachedCjs(
     version: []const u8,
 ) CjsCacheResult {
     if (!@import("build_options").bytecode_cache) return plainCjs(instance_id, source, filename);
-    // JSC has no portable bytecode decode/execute path. Bypass persistent cache lookup entirely so an old cache entry cannot block plain CJS.
-    if (backend.active_backend == .jsc) return plainCjs(instance_id, source, filename);
+    // JSC/Escargot have no QJS-shaped CJS bytecode replay; Hermes .hbc is a different format
+    // (hermesCompileBytecode / hermesRunBytecode). Bypass so stale or engine-native blobs cannot
+    // block plain require()/evalAsCjs.
+    if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend))
+        return plainCjs(instance_id, source, filename);
     // Small modules are cheaper to parse than to read/deserialize back.
     if (source.len < 4 * 1024) return plainCjs(instance_id, source, filename);
     if (!cache.isSafeVersion(version) or cache_dir.len == 0) return plainCjs(instance_id, source, filename);
@@ -547,6 +564,13 @@ fn registerGlobalRequire(ctx: ActiveEngine.Context) bool {
             jsc_mod.JscBackend.setProperty(jsc_ctx, global, "require", @ptrCast(fn_obj));
             return true;
         },
+        .escargot, .hermes => {
+            const fn_obj = ActiveEngine.makeNativeFunction(ctx, "require", &spikeRequireCb, null) orelse return false;
+            const global = ActiveEngine.getGlobalObject(ctx);
+            defer ActiveEngine.freeValue(ctx, global);
+            ActiveEngine.setPropertyStr(ctx, global, "require", fn_obj);
+            return true;
+        },
     }
 }
 
@@ -568,6 +592,12 @@ fn getGlobalRequire(ctx: ActiveEngine.Context) ActiveEngine.Value {
             const val = jsc_mod.jsc.JSObjectGetProperty(jsc_ctx, global, js_name, &exc);
             if (val != null) jsc_mod.jsc.JSValueProtect(jsc_ctx, val);
             return val;
+        },
+        .escargot, .hermes => {
+            const global = ActiveEngine.getGlobalObject(ctx);
+            defer ActiveEngine.freeValue(ctx, global);
+            // getPropertyVal returns ?Value; Value is already optional-pointer.
+            return ActiveEngine.getPropertyVal(ctx, global, "require") orelse null;
         },
     }
 }
@@ -674,6 +704,62 @@ fn jscThrowRequireError(
             return jsc_mod.JscBackend.throwError(ctx_ref, exception, "require: module threw during evaluation");
         },
         error.OutOfMemory => return jsc_mod.JscBackend.throwError(ctx_ref, exception, "require: out of memory"),
+    }
+}
+
+fn spikeRequireCb(
+    ctx: ActiveEngine.Context,
+    _this: ActiveEngine.Value,
+    args_ptr: ?[*]const ActiveEngine.Value,
+    argc: usize,
+    _: ?*anyopaque,
+) callconv(.c) ActiveEngine.Value {
+    _ = _this;
+    if (argc < 1) {
+        _ = ActiveEngine.throwError(ctx, "require: specifier required");
+        return null;
+    }
+    const state = stateFromCtx(ctx) orelse {
+        _ = ActiveEngine.throwError(ctx, "require: not installed");
+        return null;
+    };
+    const argv = args_ptr orelse {
+        _ = ActiveEngine.throwError(ctx, "require: specifier required");
+        return null;
+    };
+    const spec_owned = ActiveEngine.valueToString(ctx, argv[0]) orelse {
+        _ = ActiveEngine.throwError(ctx, "require: specifier must be a string");
+        return null;
+    };
+    defer std.heap.c_allocator.free(@constCast(spec_owned));
+
+    const loaded = doRequire(state, spec_owned, "<cjs>") catch |e| {
+        return spikeThrowRequireError(ctx, spec_owned, e);
+    };
+    return loaded;
+}
+
+fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: DoRequireError) ActiveEngine.Value {
+    switch (e) {
+        error.NotFound => {
+            var msg_buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "Cannot find module '{s}'", .{specifier}) catch
+                "Cannot find module";
+            _ = ActiveEngine.throwError(ctx, msg);
+            return null;
+        },
+        error.CompileFailed => {
+            _ = ActiveEngine.throwError(ctx, "require: failed to compile module");
+            return null;
+        },
+        error.CallFailed => {
+            _ = ActiveEngine.throwError(ctx, "require: module threw during evaluation");
+            return null;
+        },
+        error.OutOfMemory => {
+            _ = ActiveEngine.throwError(ctx, "require: out of memory");
+            return null;
+        },
     }
 }
 
@@ -852,6 +938,7 @@ fn registerGlobalCjsCache(ctx: ActiveEngine.Context) bool {
             return true;
         },
         .jsc => return false,
+        .escargot, .hermes => return false,
     }
 }
 

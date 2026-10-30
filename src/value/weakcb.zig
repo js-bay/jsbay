@@ -1,4 +1,4 @@
-//! Weak-callback / finalize registration — N-API `napi_wrap` + finalize equivalent, or the V8 weak-persistent-with-finalizer pattern.
+//! Weak-callback / finalize registration for host-owned resources tied to a JS object lifetime.
 //!
 //! Use this when native code needs to release a resource at the same moment a JavaScript object becomes unreachable. Common cases:
 //!   - clean up native state tied to a host object
@@ -66,6 +66,14 @@ pub fn attachFinalizer(
             const jsc_mod = @import("../backend/jsc.zig");
             return jsc_mod.jscWeakAttachFinalizer(@ptrCast(ctx), target, user_data, on_finalize);
         },
+        .escargot => {
+            const c = @import("../backend/escargot/c_api.zig");
+            return c.escargot_weak_attach_finalizer(ctx, target, user_data, @ptrCast(on_finalize));
+        },
+        .hermes => {
+            const c = @import("../backend/hermes/c_api.zig");
+            return c.hermes_weak_attach_finalizer(ctx, target, user_data, @ptrCast(on_finalize));
+        },
     }
 }
 
@@ -121,6 +129,14 @@ fn attachDispatch(instance_id: i32, target: ActiveEngine.Value, dispatch: Dispat
         .jsc => blk: {
             const jsc_mod = @import("../backend/jsc.zig");
             break :blk jsc_mod.jscWeakAttachFinalizer(@ptrCast(ctx), target, @ptrCast(box), dispatchFinalizer);
+        },
+        .escargot => blk: {
+            const c = @import("../backend/escargot/c_api.zig");
+            break :blk c.escargot_weak_attach_finalizer(ctx, target, @ptrCast(box), dispatchFinalizer);
+        },
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            break :blk c.hermes_weak_attach_finalizer(ctx, target, @ptrCast(box), dispatchFinalizer);
         },
     };
     if (!installed) std.heap.c_allocator.destroy(box);

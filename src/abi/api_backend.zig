@@ -30,6 +30,7 @@ pub fn toUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult 
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsToUtf8(ctx, value),
         .jsc => jscToUtf8(ctx, value),
+        .escargot, .hermes => .{ .bytes = ActiveEngine.valueToStringAlloc(std.heap.c_allocator, ctx, value) },
     };
 }
 
@@ -39,6 +40,8 @@ pub fn toJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult 
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsToJson(ctx, value),
         .jsc => jscToJson(ctx, value),
+        .escargot => spikeToJson(ctx, value, .escargot),
+        .hermes => spikeToJson(ctx, value, .hermes),
     };
 }
 
@@ -46,6 +49,9 @@ pub fn get(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsGet(ctx, object, key),
         .jsc => jscGet(ctx, object, key[0..key.len]),
+        // Exception-preserving property reads (getter throws must not collapse to OOM).
+        .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_get_property_result(ctx, object, key.ptr)),
+        .hermes => hermesOp(@import("../backend/hermes/c_api.zig").hermes_get_property_result(ctx, object, key.ptr)),
     };
 }
 
@@ -53,6 +59,8 @@ pub fn call(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value:
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsCall(ctx, function, this_value, args),
         .jsc => jscCall(ctx, function, this_value, args),
+        .escargot => escargotCall(ctx, function, this_value, args),
+        .hermes => hermesCall(ctx, function, this_value, args),
     };
 }
 
@@ -61,6 +69,19 @@ pub fn set(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsSet(ctx, object, key, value),
         .jsc => jscSet(ctx, object, key[0..key.len], value),
+        .escargot => blk: {
+            const c = @import("../backend/escargot/c_api.zig");
+            const r = c.escargot_set_property_result(ctx, object, key.ptr, value);
+            // Consume value like setPropertyStr (bridge copies into the engine).
+            ActiveEngine.freeValue(ctx, value);
+            break :blk escargotOp(r);
+        },
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            const r = c.hermes_set_property_result(ctx, object, key.ptr, value);
+            ActiveEngine.freeValue(ctx, value);
+            break :blk hermesOp(r);
+        },
     };
 }
 
@@ -69,6 +90,8 @@ pub fn construct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: 
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsConstruct(ctx, function, args),
         .jsc => jscConstruct(ctx, function, args),
+        .escargot => escargotConstruct(ctx, function, args),
+        .hermes => hermesConstruct(ctx, function, args),
     };
 }
 
@@ -77,6 +100,8 @@ pub fn has(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsHas(ctx, object, key),
         .jsc => jscHas(ctx, object, key[0..key.len]),
+        .escargot => escargotHas(ctx, object, key),
+        .hermes => hermesHas(ctx, object, key),
     };
 }
 
@@ -85,6 +110,8 @@ pub fn delete(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]co
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsDelete(ctx, object, key),
         .jsc => jscDelete(ctx, object, key[0..key.len]),
+        .escargot => escargotDelete(ctx, object, key),
+        .hermes => hermesDelete(ctx, object, key),
     };
 }
 
@@ -93,6 +120,8 @@ pub fn keys(ctx: ActiveEngine.Context, object: ActiveEngine.Value) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsKeys(ctx, object),
         .jsc => jscKeys(ctx, object),
+        .escargot => escargotKeys(ctx, object),
+        .hermes => hermesKeys(ctx, object),
     };
 }
 
@@ -101,6 +130,8 @@ pub fn instanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, construc
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsInstanceOf(ctx, value, constructor),
         .jsc => jscInstanceOf(ctx, value, constructor),
+        .escargot => escargotInstanceOf(ctx, value, constructor),
+        .hermes => hermesInstanceOf(ctx, value, constructor),
     };
 }
 
@@ -108,6 +139,14 @@ pub fn parseJson(ctx: ActiveEngine.Context, input: []const u8) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsParseJson(ctx, input),
         .jsc => jscParseJson(ctx, input),
+        .escargot => escargotOp(blk: {
+            const c = @import("../backend/escargot/c_api.zig");
+            break :blk c.escargot_json_parse_result(ctx, input.ptr, input.len);
+        }),
+        .hermes => hermesOp(blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            break :blk c.hermes_json_parse_result(ctx, input.ptr, input.len);
+        }),
     };
 }
 
@@ -115,6 +154,8 @@ pub fn newError(ctx: ActiveEngine.Context, message: []const u8) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsNewError(ctx, message),
         .jsc => jscNewError(ctx, message),
+        .escargot => escargotNewError(ctx, message),
+        .hermes => hermesNewError(ctx, message),
     };
 }
 
@@ -150,6 +191,10 @@ pub fn newString(ctx: ActiveEngine.Context, input: []const u8) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsConstructorResult(ctx, ActiveEngine.newStringVal(ctx, input)),
         .jsc => jscNewString(ctx, input),
+        .escargot, .hermes => blk: {
+            const v = ActiveEngine.newStringVal(ctx, input);
+            break :blk if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+        },
     };
 }
 
@@ -159,6 +204,7 @@ pub fn newObject(ctx: ActiveEngine.Context) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsConstructorResult(ctx, ActiveEngine.newObject(ctx)),
         .jsc => if (ActiveEngine.newObject(ctx)) |value| .{ .value = value } else .{ .out_of_memory = true },
+        .escargot, .hermes => .{ .value = ActiveEngine.newObject(ctx) },
     };
 }
 
@@ -168,6 +214,7 @@ pub fn newArray(ctx: ActiveEngine.Context, len: u32) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsConstructorResult(ctx, ActiveEngine.newArray(ctx, len) orelse return .{ .out_of_memory = true }),
         .jsc => if (ActiveEngine.newArray(ctx, len)) |value| .{ .value = value } else .{ .out_of_memory = true },
+        .escargot, .hermes => if (ActiveEngine.newArray(ctx, len)) |value| .{ .value = value } else .{ .out_of_memory = true },
     };
 }
 
@@ -180,11 +227,12 @@ pub fn newArrayBuffer(ctx: ActiveEngine.Context, bytes: []const u8) Result {
             break :blk .{ .value = value };
         },
         .jsc => if (value == null) .{ .out_of_memory = true } else .{ .value = value },
+        .escargot, .hermes => if (value == null) .{ .out_of_memory = true } else .{ .value = value },
     };
 }
 
 pub fn copyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
-    if (comptime backend.active_backend == .jsc) return jscCopyBuffer(ctx, value);
+    if (comptime backend.isJscApiBackend(backend.active_backend)) return jscCopyBuffer(ctx, value);
 
     const source: []const u8 = if (ActiveEngine.getArrayBufferSliceVal(ctx, value)) |bytes|
         bytes
@@ -706,4 +754,111 @@ fn jscToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     const text = result orelse return .{ .invalid_argument = true };
     defer m.jsc.JSStringRelease(text);
     return .{ .bytes = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(std.heap.c_allocator, text) orelse return .{ .out_of_memory = true } };
+}
+
+fn escargotOp(result: @import("../backend/escargot/c_api.zig").OpResult) Result {
+    if (result.exception != null) return .{ .exception = result.exception };
+    if (result.value != null) return .{ .value = result.value };
+    return .{ .out_of_memory = true };
+}
+
+fn escargotBoolOp(result: @import("../backend/escargot/c_api.zig").BoolOpResult) BoolResult {
+    if (result.exception != null) return .{ .exception = result.exception };
+    return .{ .value = result.value };
+}
+
+fn escargotConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+    const c = @import("../backend/escargot/c_api.zig");
+    const r = c.escargot_construct(ctx, function, if (args.len == 0) null else args.ptr, args.len);
+    return escargotOp(r);
+}
+
+fn escargotHas(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const u8) BoolResult {
+    const c = @import("../backend/escargot/c_api.zig");
+    return escargotBoolOp(c.escargot_has_in(ctx, object, key.ptr));
+}
+
+fn escargotDelete(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const u8) BoolResult {
+    const c = @import("../backend/escargot/c_api.zig");
+    return escargotBoolOp(c.escargot_delete_property(ctx, object, key.ptr));
+}
+
+fn escargotKeys(ctx: ActiveEngine.Context, object: ActiveEngine.Value) Result {
+    const c = @import("../backend/escargot/c_api.zig");
+    return escargotOp(c.escargot_own_keys(ctx, object));
+}
+
+fn escargotInstanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, constructor: ActiveEngine.Value) BoolResult {
+    const c = @import("../backend/escargot/c_api.zig");
+    return escargotBoolOp(c.escargot_instance_of(ctx, value, constructor));
+}
+
+fn hermesCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+    const c = @import("../backend/hermes/c_api.zig");
+    return hermesOp(c.hermes_call_result(ctx, function, this_value, if (args.len > 0) args.ptr else null, args.len));
+}
+
+fn escargotCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+    const c = @import("../backend/escargot/c_api.zig");
+    return escargotOp(c.escargot_call_result(ctx, function, this_value, if (args.len > 0) args.ptr else null, args.len));
+}
+
+fn hermesNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
+    const c = @import("../backend/hermes/c_api.zig");
+    const msg_z = std.heap.c_allocator.dupeSentinel(u8, message, 0) catch return .{ .out_of_memory = true };
+    defer std.heap.c_allocator.free(msg_z);
+    const v = c.hermes_new_error(ctx, 0, msg_z.ptr);
+    return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+}
+
+fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
+    const c = @import("../backend/escargot/c_api.zig");
+    const msg_z = std.heap.c_allocator.dupeSentinel(u8, message, 0) catch return .{ .out_of_memory = true };
+    defer std.heap.c_allocator.free(msg_z);
+    const v = c.escargot_new_error(ctx, 0, msg_z.ptr);
+    return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+}
+
+fn spikeToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value, comptime which: enum { escargot, hermes }) BytesResult {
+    const op = switch (which) {
+        .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_json_stringify_result(ctx, value)),
+        .hermes => hermesOp(@import("../backend/hermes/c_api.zig").hermes_json_stringify_result(ctx, value)),
+    };
+    if (op.exception) |exception| return .{ .exception = exception };
+    if (op.out_of_memory) return .{ .out_of_memory = true };
+    const json_val = op.value orelse return .{ .out_of_memory = true };
+    defer ActiveEngine.freeValue(ctx, json_val);
+    if (ActiveEngine.isUndefined(ctx, json_val)) return .{ .invalid_argument = true };
+    // Convert the JSON string Value to owned UTF-8 bytes.
+    return toUtf8(ctx, json_val);
+}
+
+fn hermesOp(result: @import("../backend/hermes/c_api.zig").OpResult) Result {
+    if (result.exception != null) return .{ .exception = result.exception };
+    if (result.value != null) return .{ .value = result.value };
+    return .{ .out_of_memory = true };
+}
+fn hermesBoolOp(result: @import("../backend/hermes/c_api.zig").BoolOpResult) BoolResult {
+    if (result.exception != null) return .{ .exception = result.exception };
+    return .{ .value = result.value };
+}
+fn hermesConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+    const c = @import("../backend/hermes/c_api.zig");
+    return hermesOp(c.hermes_construct(ctx, function, if (args.len == 0) null else args.ptr, args.len));
+}
+fn hermesHas(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const u8) BoolResult {
+    const c = @import("../backend/hermes/c_api.zig");
+    return hermesBoolOp(c.hermes_has_in(ctx, object, key.ptr));
+}
+fn hermesDelete(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const u8) BoolResult {
+    const c = @import("../backend/hermes/c_api.zig");
+    return hermesBoolOp(c.hermes_delete_property(ctx, object, key.ptr));
+}
+fn hermesKeys(ctx: ActiveEngine.Context, object: ActiveEngine.Value) Result {
+    const c = @import("../backend/hermes/c_api.zig");
+    return hermesOp(c.hermes_own_keys(ctx, object));
+}
+fn hermesInstanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, constructor: ActiveEngine.Value) BoolResult {
+    const c = @import("../backend/hermes/c_api.zig");
+    return hermesBoolOp(c.hermes_instance_of(ctx, value, constructor));
 }

@@ -32,7 +32,7 @@ pub fn Module(comptime Host: type) type {
                 if (job.snapshot) {
                     sendSnapshot(job, usage);
                 } else {
-                    if (comptime backend.active_backend == .jsc) {
+                    if (comptime backend.isJscApiBackend(backend.active_backend)) {
                         json_writer.sendError(job.state, job.session_id, job.request_id, -32601, "Heap usage statistics are unsupported by this backend");
                         return;
                     }

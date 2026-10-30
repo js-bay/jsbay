@@ -15,6 +15,8 @@ pub fn isPacked(tag: BackendType) bool {
         .quickjs_ng => 1 << 0,
         .quickjs => 1 << 1,
         .jsc => 1 << 2,
+        .escargot => 1 << 3,
+        .hermes => 1 << 4,
     };
     return (packed_backend_bits & bit) != 0;
 }
@@ -24,9 +26,32 @@ pub fn isQuickJsApiBackend(tag: BackendType) bool {
     return tag == .quickjs or tag == .quickjs_ng;
 }
 
+/// Apple JavaScriptCore C API backend only (not Escargot/Hermes).
+pub fn isJscApiBackend(tag: BackendType) bool {
+    return tag == .jsc;
+}
+
+pub fn isEscargotBackend(tag: BackendType) bool {
+    return tag == .escargot;
+}
+
+pub fn isHermesBackend(tag: BackendType) bool {
+    return tag == .hermes;
+}
+
+/// Pointer-handle value backends that are not QuickJS (JSC, Escargot, Hermes).
+pub fn isPointerValueBackend(tag: BackendType) bool {
+    return tag == .jsc or tag == .escargot or tag == .hermes;
+}
+
 /// Whether this engine exposes the bytecode debugger hooks used by debugger.zig.
 pub fn supportsDebugger(tag: BackendType) bool {
     return tag == .quickjs_ng;
+}
+
+/// Spike engines: gate advanced features until the native facade is complete.
+pub fn isSpikeBackend(tag: BackendType) bool {
+    return tag == .escargot or tag == .hermes;
 }
 
 pub const ActiveEngine = Engine(active_backend);
@@ -37,6 +62,8 @@ pub fn Engine(comptime tag: BackendType) type {
         .quickjs => @import("backend/quickjs.zig").QuickJsBackend,
         .quickjs_ng => @import("backend/quickjs_ng.zig").QuickJsNgBackend,
         .jsc => @import("backend/jsc.zig").JscBackend,
+        .escargot => @import("backend/escargot.zig").EscargotBackend,
+        .hermes => @import("backend/hermes.zig").HermesBackend,
     };
 }
 
@@ -46,6 +73,8 @@ pub fn EngineModule(comptime tag: BackendType) type {
         .quickjs => @import("backend/quickjs.zig"),
         .quickjs_ng => @import("backend/quickjs_ng.zig"),
         .jsc => @import("backend/jsc.zig"),
+        .escargot => @import("backend/escargot.zig"),
+        .hermes => @import("backend/hermes.zig"),
     };
 }
 
@@ -55,6 +84,8 @@ pub const BackendC = enum(c_int) {
     quickjs_ng = 1,
     quickjs = 2,
     jsc = 3,
+    escargot = 4,
+    hermes = 5,
     _,
 };
 
@@ -63,6 +94,8 @@ pub fn libraryBackendC() BackendC {
         .quickjs_ng => .quickjs_ng,
         .quickjs => .quickjs,
         .jsc => .jsc,
+        .escargot => .escargot,
+        .hermes => .hermes,
     };
 }
 
@@ -71,6 +104,8 @@ pub fn backendToC(tag: BackendType) BackendC {
         .quickjs_ng => .quickjs_ng,
         .quickjs => .quickjs,
         .jsc => .jsc,
+        .escargot => .escargot,
+        .hermes => .hermes,
     };
 }
 
@@ -81,6 +116,8 @@ pub fn backendFromC(raw: c_int) ?BackendType {
         @backingInt(BackendC.quickjs_ng) => .quickjs_ng,
         @backingInt(BackendC.quickjs) => .quickjs,
         @backingInt(BackendC.jsc) => .jsc,
+        @backingInt(BackendC.escargot) => .escargot,
+        @backingInt(BackendC.hermes) => .hermes,
         else => null,
     };
 }
@@ -100,6 +137,7 @@ pub const CapabilityFlags = struct {
 pub fn libraryCapabilityFlags() u32 {
     var flags: u32 = 0;
     // Interrupt + execution deadline: QJS JS_SetInterruptHandler; JSC private time-limit path.
+    // Spike backends expose requestInterrupt with documented reliability limits.
     flags |= CapabilityFlags.interrupt_deadline;
     if (isQuickJsApiBackend(active_backend)) {
         // setMemoryLimit returns false on JSC; QJS fills MemoryUsage, JSC zeros.

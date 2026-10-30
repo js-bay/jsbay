@@ -41,5 +41,9 @@ fn make(instance_id: i32, text: []const u8, is_global: bool) ?ActiveEngine.Value
             _ = jsc_mod.jsc.JSValueProtect(@ptrCast(ctx), sym);
             return sym;
         },
+        .escargot, .hermes => {
+            if (is_global) return ActiveEngine.symbolFor(ctx, text);
+            return ActiveEngine.newSymbol(ctx, text);
+        },
     }
 }

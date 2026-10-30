@@ -10,7 +10,6 @@ const async_stack = @import("../inspector/async_stack.zig");
 const cold_probe = @import("debug_cold_probe.zig");
 const debugger_mod = @import("../inspector/debugger.zig");
 const dispatch = @import("../runtime/dispatch.zig");
-const io = @import("../platform/io.zig");
 const engine = @import("../engine.zig");
 const helpers = @import("test_helpers.zig");
 const inspector = @import("../inspector/root.zig");
@@ -33,13 +32,12 @@ fn sendCdpAndPump(id: i32, stream: wire.TestStream, reader: *wire.FrameReader, r
 }
 /// A socket close is observed by the transport reader thread.  Keep pumping the engine owner until its queued session-cleanup task applies the new aggregate async-depth request.
 fn pumpUntilAsyncDepth(id: i32, expected: u32) !void {
-    // Transport reader observes the socket close on another thread; give it wall time on loaded CI hosts.
     var attempts: usize = 0;
-    while (attempts < 500) : (attempts += 1) {
+    while (attempts < 100) : (attempts += 1) {
         _ = dispatch.tickInstance(id);
         engine.runEventLoopOnce(id);
         if (async_stack.depth(id) == expected) return;
-        io.sleepMs(1);
+        std.Thread.yield() catch {};
     }
     return error.TestUnexpectedResult;
 }
@@ -80,6 +78,7 @@ fn queueQuickJsJobWithoutDrain(id: i32, source: [:0]const u8) !void {
             try testing.expect(!c.jsIsException(result));
         },
         .jsc => unreachable,
+        .escargot, .hermes => unreachable,
     }
 }
 
@@ -103,6 +102,7 @@ fn flipAsyncDepthDuringPromiseJob(id: i32, _: value.NativeArgs) value.NativeResu
             jobs.setAsyncStackDepth(instance.monoRuntime().?, id, 1);
         },
         .jsc => unreachable,
+        .escargot, .hermes => unreachable,
     }
     return .undefined_val;
 }
@@ -116,6 +116,7 @@ fn queueDuringZeroDepthWindow(id: i32, _: value.NativeArgs) value.NativeResult {
         .quickjs => @import("../backend/quickjs/jobs.zig").setAsyncStackDepth(instance.monoRuntime().?, id, 0),
         .quickjs_ng => @import("../backend/quickjs_ng/jobs.zig").setAsyncStackDepth(instance.monoRuntime().?, id, 0),
         .jsc => unreachable,
+        .escargot, .hermes => unreachable,
     }
     queueQuickJsJobWithoutDrain(id, "Promise.resolve().then(function p2ColdB(){ console.log('p2-cold-b-token'); });") catch {
         cold_window_enqueue_failed = true;
@@ -124,6 +125,7 @@ fn queueDuringZeroDepthWindow(id: i32, _: value.NativeArgs) value.NativeResult {
         .quickjs => @import("../backend/quickjs/jobs.zig").setAsyncStackDepth(instance.monoRuntime().?, id, 1),
         .quickjs_ng => @import("../backend/quickjs_ng/jobs.zig").setAsyncStackDepth(instance.monoRuntime().?, id, 1),
         .jsc => unreachable,
+        .escargot, .hermes => unreachable,
     }
     return .undefined_val;
 }
@@ -201,7 +203,7 @@ comptime {
 }
 
 test "debug cold: JSC leaves Promise and debug helper globals untouched before a debugging session" {
-    if (comptime backend.active_backend != .jsc) return;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
 
     const id = helpers.nextInstanceId();
     try testing.expect(engine.create(id, .{}));
@@ -215,7 +217,7 @@ test "debug cold: JSC leaves Promise and debug helper globals untouched before a
 
 const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
     test "debug cold: JSC async wrappers follow CDP depth and preserve application replacements" {
-        if (comptime backend.active_backend != .jsc) return;
+        if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
         if (comptime !@import("build_options").inspector) return;
 
         const id = helpers.nextInstanceId();
@@ -251,7 +253,7 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
     }
 
     test "debug cold: JSC async wrapper restores a missing queueMicrotask property" {
-        if (comptime backend.active_backend != .jsc) return;
+        if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
         if (comptime !@import("build_options").inspector) return;
 
         const id = helpers.nextInstanceId();
@@ -283,7 +285,7 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
     }
 
     test "debug cold: JSC async wrapper restores a non-function queueMicrotask value" {
-        if (comptime backend.active_backend != .jsc) return;
+        if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
         if (comptime !@import("build_options").inspector) return;
 
         const id = helpers.nextInstanceId();
@@ -314,7 +316,7 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
     }
 
     test "debug cold: JSC async teardown survives a deleted Promise global" {
-        if (comptime backend.active_backend != .jsc) return;
+        if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
         if (comptime !@import("build_options").inspector) return;
 
         const id = helpers.nextInstanceId();
@@ -539,7 +541,7 @@ const InspectorEnabledTests3 = if (@import("build_options").inspector) struct {
         var second_received: std.ArrayList(u8) = .empty;
         defer second_received.deinit(testing.allocator);
 
-        if (comptime backend.active_backend == .jsc) {
+        if (comptime backend.isJscApiBackend(backend.active_backend)) {
             try helpers.evalOk(id, "globalThis.__thenBeforeSessionClose = Promise.prototype.then;");
         }
 
@@ -570,7 +572,7 @@ const InspectorEnabledTests3 = if (@import("build_options").inspector) struct {
             try testing.expect(inactive.err == null);
             try testing.expectEqual(@as(usize, 0), cold_probe.jobHookCallbacks());
         }
-        if (comptime backend.active_backend == .jsc) {
+        if (comptime backend.isJscApiBackend(backend.active_backend)) {
             try helpers.expectEvalEquals(id, "String(Promise.prototype.then === globalThis.__thenBeforeSessionClose)", "true");
         }
     }
@@ -592,7 +594,7 @@ const InspectorEnabledTests3 = if (@import("build_options").inspector) struct {
         var received: std.ArrayList(u8) = .empty;
         defer received.deinit(testing.allocator);
 
-        if (comptime backend.active_backend == .jsc) {
+        if (comptime backend.isJscApiBackend(backend.active_backend)) {
             try helpers.evalOk(id, "globalThis.__closeOwnerThen = Promise.prototype.then;");
         }
         try sendCdpAndPump(id, stream, &reader, &received, "{\"id\":1,\"method\":\"Debugger.setAsyncCallStackDepth\",\"params\":{\"maxDepth\":1}}", 1);
@@ -618,7 +620,7 @@ const InspectorEnabledTests3 = if (@import("build_options").inspector) struct {
             try testing.expectEqual(@as(usize, 0), cold_probe.jobHookCallbacks());
         }
         try testing.expectEqual(@as(u32, 0), async_stack.depth(id));
-        if (comptime backend.active_backend == .jsc) {
+        if (comptime backend.isJscApiBackend(backend.active_backend)) {
             try helpers.expectEvalEquals(id, "String(Promise.prototype.then === globalThis.__closeOwnerThen)", "true");
         }
     }

@@ -24,42 +24,11 @@ JS Bay implements a subset of CDP for an embedded JavaScript engine. It has no D
 - Runtime evaluation, function calls, console events, and object inspection support limited parameters. CDP object handles retain engine values until released or the session closes; property behavior differs by backend.
 - QuickJS and QuickJS-NG can wait for Promises while the host keeps driving its event loop. Closing Inspector cancels its waits, not application Promises. JSC does not advertise this capability.
 - Exception events cover observable evaluation and asynchronous boundaries, not a complete engine-wide trace. Locations and stacks can be incomplete.
-- Only QuickJS-NG advertises a partial CDP `Debugger` domain. Plain QuickJS does not. JSC uses Safari Web Inspector, not CDP Debugger. See [Backend domain matrix](#backend-domain-matrix). Raw bytecode without source identity cannot provide reliable attribution.
-- QuickJS-family CPU profiles are interrupt samples from a bounded window. Heap snapshots are a custom bounded graph—see [HeapProfiler](#heapprofiler-not-chrome-memory) below; do not treat them as Chrome Memory.
+- Only QuickJS-NG advertises partial source debugging. Raw bytecode without source identity cannot provide reliable attribution.
+- QuickJS-family CPU profiles are interrupt samples from a bounded window. Heap snapshots are bounded partial reference graphs, not complete heap or retained-size measurements.
 - `Performance.getMetrics` is pull-only. `Timestamp` is monotonic seconds, QuickJS-family heap accounting is not process RSS, and JSC reports only the timestamp.
 
 Queues and retained diagnostic state are bounded. Slow or disconnected clients can lose queued events. A successful transport send only means the transport accepted a message. These limits protect the owner thread; they do not bound arbitrary host callbacks.
-
-## HeapProfiler (not Chrome Memory)
-
-**Hosts must not treat HeapProfiler output as a complete Chrome DevTools Memory / `.heapsnapshot`.**
-
-The advertised surface is only:
-
-- command `HeapProfiler.takeHeapSnapshot`
-- event `HeapProfiler.addHeapSnapshotChunk`
-
-The command result is a custom `jsbaySnapshot` object. Before assuming completeness, read at least `complete`, `truncated`, `retainedSizeSupported`, and `omittedNodes` (related fields such as `omittedEdgeLabels`, `edgeCoverage`, and `propertyNamePrecision` further describe what was dropped). Retained-size measurement is not supported. Chunks carry a bounded partial reference graph, not a full heap dump.
-
-Not implemented (expect method-not-found / not advertised):
-
-- `HeapProfiler.getObjectByHeapObjectId`
-- heap sampling (`startSampling`, `stopSampling`, `getSamplingProfile`, and related commands)
-
-Building with `-Dheap-snapshot=false` keeps the public symbols but `takeHeapSnapshot` returns an unsupported error on QuickJS-family builds. JSC does not advertise HeapProfiler over CDP.
-
-## Backend domain matrix
-
-Authority for what a running build advertises is `Schema.getDomains` and the support manifest [`libs/inspector/src/protocol-support.json`](../libs/inspector/src/protocol-support.json). Advertised commands can still support only a subset of optional parameters.
-
-| Area | `quickjs` | `quickjs_ng` | `jsc` |
-| --- | --- | --- | --- |
-| CDP `Debugger` | Not advertised | Partial (enable/pause/breakpoints/step family in the manifest) | Not CDP Debugger; use [Safari Web Inspector](#safari-web-inspector) |
-| CDP `Runtime` / `Profiler` / `Performance` | Partial | Partial | Partial Runtime + Performance; no Profiler/HeapProfiler in the manifest |
-| CDP `HeapProfiler` | `takeHeapSnapshot` + `addHeapSnapshotChunk` only | Same | Not advertised |
-| Safari Web Inspector | No | No | Supported JSC builds only |
-
-Production hosts that fix `-Dbackend=quickjs` get no CDP Debugger domain: source breakpoints and `debugger;` pause over CDP are an engine gap on that backend, not a missing host/N-API wire. Prefer `quickjs_ng` when CDP debugging is required, or use the Safari path on JSC.
 
 ## Build options
 
