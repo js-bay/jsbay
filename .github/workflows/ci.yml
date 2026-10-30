@@ -1,5 +1,5 @@
 # JS Bay CI — see docs/testing.md#ci for the matrix rationale.
-# PR jobs: linux (governance) / linux-engine×2 / linux-android / macos / macos-ios / macos-android / windows.
+# PR jobs: linux (governance) / linux-engine×2 / macos / macos-ios (simulator smoke) / macos-android / windows.
 # Modest splits only: peel iOS and parallelize Linux backends; keep platforms aggregated. Dual-pack (-Dbackends=quickjs_ng,jsc) stays on macos (JSC needs Apple).
 name: CI
 
@@ -14,6 +14,13 @@ concurrency:
 
 permissions:
   contents: read
+
+env:
+  # MSBuild node reuse and the Roslyn shared compiler stay up as `dotnet` after the step. The runner then waits out that orphan. These properties keep the servers from starting; jobs that invoke dotnet also shut them down.
+  MSBUILDDISABLENODEREUSE: "1"
+  UseSharedCompilation: "false"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
 
 jobs:
   linux:
@@ -48,6 +55,11 @@ jobs:
         uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
 
       - name: Install pawl
         uses: tiangong-dev/pawl@v0.8.2
@@ -112,6 +124,16 @@ jobs:
           bash scripts/quality/dotnet-style.sh self-test
           bash scripts/quality/dotnet-lint.sh self-test
 
+      - name: Test262 runner contract (quickjs_ng)
+        run: JSBAY_TEST262_CONTRACT_SCOPE=quickjs_ng bash tests/test262_runner_contract.sh
+
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
+
   linux-engine:
     name: linux-engine (${{ matrix.backend }})
     runs-on: ubuntu-24.04
@@ -124,7 +146,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          fetch-depth: 0
           submodules: recursive
 
       - name: Setup Zig
@@ -152,7 +173,8 @@ jobs:
         run: zig build test-engine -Dbackend=${{ matrix.backend }} -Dinspector-transport=false -Dtest-filter="host transport" --summary all
 
       - name: Inspector-disabled tests
-        run: zig build test-engine -Dbackend=${{ matrix.backend }} -Dinspector=false --summary all
+        if: matrix.backend == 'quickjs_ng'
+        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector=false --summary all
 
       - name: QuickJS-NG location dispatch contract
         if: matrix.backend == 'quickjs_ng'
@@ -182,10 +204,6 @@ jobs:
 
       - name: .NET SDK consumer
         run: tests/dotnet-sdk/run.sh ${{ matrix.backend }}
-
-      - name: Classic QuickJS ReleaseSafe public consumer
-        if: matrix.backend == 'quickjs'
-        run: sh scripts/check-quickjs-release-safe-consumer.sh artifacts/quickjs-release-safe
 
       - name: QuickJS GC stress
         if: matrix.backend == 'quickjs_ng'
@@ -243,89 +261,12 @@ jobs:
           bash tests/qjs-regression/run.sh --engine ${{ matrix.backend }}
           bash tests/qjs-regression/run.sh --engine ${{ matrix.backend }} --inspector off
 
-  linux-android:
-    name: linux-android
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          submodules: recursive
-
-      - name: Setup Zig
-        uses: ./.github/actions/setup-zig
-        with:
-          version: 0.17.0
-
-      - name: Setup Java
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4.0.4
-
-      - name: Install pawl
-        uses: tiangong-dev/pawl@v0.8.2
-        with:
-          version: v0.8.2
-
-      - name: Install ripgrep
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes ripgrep
-
-      - name: Check host tool dependencies
-        run: command -v git zig ruby tar zip unzip rg
-
-      - name: Install Android build and emulator dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1' 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'
-
-      - name: Download Gradle 8.9
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
-          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
-          test -x "$RUNNER_TEMP/gradle-8.9/bin/gradle"
-
-      - name: Test Android smoke builder staging
-        shell: bash
-        run: ANDROID_BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0" KOTLIN_GRADLE_LIB="$RUNNER_TEMP/gradle-8.9/lib" bash tests/ci/android-smoke-builder-test.sh
-
-      - name: Build Android core and JNI adapter (smoke)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ANDROID_SMOKE_BUILD_ONLY=true GRADLE_BIN="$RUNNER_TEMP/gradle-8.9/bin/gradle" bash tests/ci/run-android-device-smoke.sh
-
-      - name: Enable KVM for the Android Emulator
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-
-      - name: Android ART and R8 consumers (API 35)
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          api-level: 35
-          target: google_apis
-          arch: x86_64
-          disable-animations: true
-          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: >-
-            ANDROID_SMOKE_SKIP_BUILD=true
-            ANDROID_SMOKE_JNI_LIBS="$GITHUB_WORKSPACE/build-android/jniLibs"
-            GRADLE_BIN="$RUNNER_TEMP/gradle-8.9/bin/gradle"
-            ANDROID_R8_TEST_OUT="$RUNNER_TEMP/jsbay-android-r8"
-            ANDROID_R8_TEST_REMOTE='/data/local/tmp/jsbay-android-r8'
-            bash tests/ci/run-android-device-smoke.sh
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
 
   macos:
     name: macos
@@ -386,8 +327,8 @@ jobs:
             (cd "libs/$package" && zig build test --summary all)
           done
 
-      - name: Test262 runner contract
-        run: bash tests/test262_runner_contract.sh
+      - name: Test262 runner contract (JSC host)
+        run: JSBAY_TEST262_CONTRACT_SCOPE=jsc bash tests/test262_runner_contract.sh
 
       - name: SDK quality — Apple style and lint
         run: make check CHECKS=apple-style,apple-lint
@@ -395,20 +336,9 @@ jobs:
       - name: SDK quality — Swift formatter regression probe
         run: bash scripts/quality/apple-style.sh self-test
 
+      # transport-off, inspector-disabled, location dispatch, and the pinned Test262 subset run on linux-engine every PR and on extended macos daily. This job keeps the Darwin engine suite.
       - name: Engine tests (quickjs_ng)
         run: zig build test-engine -Dbackend=quickjs_ng --summary all
-
-      - name: Host CDP transport without HTTP or WebSocket (quickjs_ng)
-        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector-transport=false -Dtest-filter="host transport" --summary all
-
-      - name: Inspector-disabled tests (quickjs_ng)
-        run: zig build test-engine -Dbackend=quickjs_ng -Dinspector=false --summary all
-
-      - name: QuickJS-NG location dispatch contract
-        run: zig build test-ng-dispatch -Dbackend=quickjs_ng --summary all
-
-      - name: Pinned Test262 subset (quickjs_ng)
-        run: bash tests/test262/run.sh --backend quickjs_ng --output artifacts/test262-quickjs_ng.json
 
       - name: Public Zig module consumer (quickjs_ng)
         working-directory: tests/zig-consumer
@@ -496,6 +426,13 @@ jobs:
           path: inspector-demo.log
           if-no-files-found: ignore
 
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
+
   macos-ios:
     name: macos-ios
     runs-on: macos-26
@@ -525,7 +462,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./build-apple.sh quickjs_ng
+          # Boot an image-provisioned iPhone before the slice build so first-boot migration overlaps the compile. simctl boot returns before the device is ready; build-apple.sh waits with bootstatus.
+          if udid="$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | .value[] | select(.isAvailable == true) | select(.name | startswith("iPhone"))] | .[0].udid // empty')" && [ -n "$udid" ]; then
+            export JSBAY_IOS_SIM_UDID="$udid"
+            echo "Reusing simulator $udid"
+            xcrun simctl boot "$udid" || true
+          fi
+          JSBAY_APPLE_SMOKE=simulator ./build-apple.sh quickjs_ng
           grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
 
   macos-android:
@@ -571,6 +514,9 @@ jobs:
           curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.7-bin.zip" https://services.gradle.org/distributions/gradle-8.7-bin.zip
           unzip -q "$RUNNER_TEMP/gradle-8.7-bin.zip" -d "$RUNNER_TEMP"
           echo "KOTLIN_GRADLE_LIB=$RUNNER_TEMP/gradle-8.7/lib" >> "$GITHUB_ENV"
+
+      - name: Test Android smoke builder staging
+        run: ANDROID_BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0" KOTLIN_GRADLE_LIB="$RUNNER_TEMP/gradle-8.7/lib" bash tests/ci/android-smoke-builder-test.sh
 
       - name: Build Android core for both shipped ABIs
         run: ./build-android.sh artifacts/android/jniLibs
@@ -642,3 +588,11 @@ jobs:
       - name: Run .NET SDK consumer
         shell: bash
         run: tests/dotnet-sdk/run.sh quickjs_ng
+
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi

@@ -8,14 +8,28 @@ BACKEND="${3:-quickjs_ng}"
 PLATFORM="${4:-macosx}"
 SDK="$(xcrun --sdk "$PLATFORM" --show-sdk-path)"
 mkdir -p "$OUTPUT"
+machine="$(uname -m)"
+case "$machine" in
+    arm64|aarch64) host_arch=arm64 ;;
+    x86_64) host_arch=x86_64 ;;
+    *)
+        echo "Unsupported host machine for Apple consumers: $machine" >&2
+        exit 2
+        ;;
+esac
 if [ "$PLATFORM" = iphonesimulator ]; then
-    TARGET=arm64-apple-ios13.0-simulator
-    ZIG_TARGET=aarch64-ios.13.0-simulator
+    if [ "$host_arch" = arm64 ]; then
+        TARGET=arm64-apple-ios13.0-simulator
+        ZIG_TARGET=aarch64-ios.13.0-simulator
+    else
+        TARGET=x86_64-apple-ios13.0-simulator
+        ZIG_TARGET=x86_64-ios.13.0-simulator
+    fi
 elif [ "$PLATFORM" = iphoneos ]; then
     TARGET=arm64-apple-ios13.0
     ZIG_TARGET=aarch64-ios.13.0
 elif [ "$PLATFORM" = macosx ]; then
-    TARGET=arm64-apple-macos11.0
+    TARGET="${host_arch}-apple-macos11.0"
 else
     echo "Unsupported consumer platform: $PLATFORM" >&2
     exit 2

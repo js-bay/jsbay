@@ -92,6 +92,8 @@ bash scripts/quality/apple-lint.sh
 
 From the repository root, `./build-apple.sh` produces the XCFramework. The default device and packaging backend is **jsc**. Override with a positional argument (`quickjs`, `quickjs_ng`, or `jsc`) or set `JSBAY_APPLE_BACKEND` (the env var wins when both are set). Example: `JSBAY_APPLE_BACKEND=quickjs ./build-apple.sh` or `./build-apple.sh quickjs_ng`.
 
+`JSBAY_APPLE_SMOKE=simulator` builds and runs only the simulator slice for the machine's architecture. It skips the macOS slice, the device slice, the other simulator architecture, XCFramework assembly, and Swift package packaging. Release and the daily macOS job keep the full script. Set `JSBAY_IOS_SIM_UDID` to boot an existing simulator instead of creating one.
+
 `JSBAY_SOURCE_ROOT`, when used by host or packaging scripts, must point at this repository root. Leave it unset when you run the in-tree scripts from that root; do not hard-code a machine-local path.
 
 ### arm64e-only iPhoneOS SDKs (Zig vs clang consumers)

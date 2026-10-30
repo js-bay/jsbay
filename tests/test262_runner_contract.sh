@@ -71,6 +71,14 @@ run_case() {
 }
 
 [ -x "$runner" ] || { echo "missing runner: $runner" >&2; exit 127; }
+# all runs every case. quickjs_ng skips the JSC host probe. jsc runs only that probe, which needs an Apple host.
+scope=${JSBAY_TEST262_CONTRACT_SCOPE:-all}
+case "$scope" in
+    all|quickjs_ng|jsc) ;;
+    *) echo "JSBAY_TEST262_CONTRACT_SCOPE must be all, quickjs_ng, or jsc (got: $scope)" >&2; exit 2 ;;
+esac
+if [ "$scope" != jsc ]; then
+export JSBAY_TEST262_HOST_DIR="$tmp/host-quickjs_ng"
 run_case pass test/pass/ok.js normal pass
 run_case negative test/pass/negative-runtime.js negative pass
 run_case parse-negative test/pass/negative-parse.js normal pass parse SyntaxError
@@ -95,7 +103,10 @@ if "$runner" --backend quickjs_ng --source-root "$src" --manifest "$tmp/bad-dige
     echo "digest mismatch unexpectedly passed" >&2
     exit 1
 fi
+fi
 
+if [ "$scope" != quickjs_ng ]; then
+export JSBAY_TEST262_HOST_DIR="$tmp/host-jsc"
 # JSC's host cannot independently observe every unhandled Promise rejection. Its report must disclose that limit instead of a bare pass count implying parity with the QuickJS host watcher.
 manifest test/async/done.js async >"$tmp/jsc-capabilities.json"
 if ! "$runner" --backend jsc --source-root "$src" --manifest "$tmp/jsc-capabilities.json" --output "$tmp/jsc-capabilities.out.json" >"$tmp/jsc-capabilities.stdout" 2>"$tmp/jsc-capabilities.stderr"; then
@@ -109,3 +120,4 @@ jq -e '
   (.capabilities.unhandledPromiseRejection == false) and
   (.capabilities.asyncLimitation | type == "string" and length > 0)
 ' "$tmp/jsc-capabilities.out.json" >/dev/null
+fi

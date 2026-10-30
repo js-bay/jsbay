@@ -61,4 +61,4 @@ bash tests/harmony-sdk/style-consumer.sh
 
 These self-tests inject real violations into temporary sources, require the check to reject, then pass after fix, and require a second fix to leave files unchanged. They do not modify SDK sources.
 
-`.github/workflows/sdk-quality.yml` runs native, Android format, C#, and Apple checks on push/PR; Android Lint runs in the existing AAR build job. Harmony official checks run via the `workflow_dispatch` `harmony` option and need a self-hosted runner labeled `jsbay-harmony-sdk12` with the Code Linter/ETS environment above. Repo config does not prove that runner is deployed; without it the job waits and does not count as passed.
+`.github/workflows/ci.yml` runs portable SDK quality on the Linux job and Apple style and lint on the macOS job. Android Lint runs in the macOS AAR job. `.github/workflows/sdk-quality.yml` is manual dispatch for official Harmony lint and needs a self-hosted runner labeled `jsbay-harmony-sdk12` with the Code Linter/ETS environment above. Repo config does not prove that runner is deployed; without it the job waits and does not count as passed.

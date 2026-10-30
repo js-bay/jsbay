@@ -152,13 +152,23 @@ runs:
           exit 1
         fi
 
+    - name: Select Zig global cache
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The first `zig build` in a job compiles the build runner into the global cache, which .zig-cache does not cover.
+        cache_dir="${GITHUB_WORKSPACE}/.zig-global-cache"
+        mkdir -p "$cache_dir"
+        echo "ZIG_GLOBAL_CACHE_DIR=${cache_dir}" >> "$GITHUB_ENV"
+
     - name: Cache Zig build artifacts
       if: inputs.cache-build == 'true'
       uses: actions/cache@v5
       with:
-        # Root + package local caches (Zig 0.17). Missing paths are skipped on save.
+        # Root + package local caches and the global cache that holds the build runner (Zig 0.17). Missing paths are skipped on save.
         path: |
           .zig-cache
+          .zig-global-cache
           libs/zev/.zig-cache
           libs/js_event_loop/.zig-cache
           libs/inspector/.zig-cache
