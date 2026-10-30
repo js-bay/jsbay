@@ -5,9 +5,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCHIVE="${1:?core archive required}"
 OUTPUT="${2:?output directory required}"
 mkdir -p "$OUTPUT"
-LIBS=(-lm -pthread)
+# Zig Debug archives emit UBSan references; ReleaseFast typically does not, but
+# linking -fsanitize=undefined is harmless and keeps Debug consumers green (see CI idle wake).
+LIBS=(-lm -pthread -fsanitize=undefined)
 if [ "$(uname -s)" = Darwin ]; then
-    # JSC's module loader is Objective-C and ReleaseSafe archives carry the UBSan runtime references emitted by Zig. Link the same dependencies as a real macOS C consumer so every registered consumer executes.
+    # JSC's module loader is Objective-C; match a real macOS C consumer.
     LIBS=(-lm -framework Foundation -framework JavaScriptCore -lobjc -fsanitize=undefined)
 fi
 (cd "$ROOT" && zig build tool -- check-c-abi "$ARCHIVE")
