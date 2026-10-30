@@ -7,11 +7,13 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     const tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{.{ .name = "bytecode_cache", .module = bytecode_cache }},
     }) });
     const run_tests = b.addRunArtifact(tests);

@@ -9,7 +9,13 @@ data class ResourceLimits(
     val maxPendingTasks: Long = 4096,
 ) {
     init {
-        require(maxTimers >= 0 && maxTsfnHandles >= 0 && maxPendingCalls >= 0 && maxPendingBytes >= 0 && maxPendingTasks >= 0) {
+        require(
+            maxTimers >= 0 &&
+                maxTsfnHandles >= 0 &&
+                maxPendingCalls >= 0 &&
+                maxPendingBytes >= 0 &&
+                maxPendingTasks >= 0,
+        ) {
             "resource limits must be non-negative"
         }
     }

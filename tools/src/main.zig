@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const repository = @import("repository.zig");
 const ios_stdlib = @import("ios_stdlib.zig");
 const apple_archive = @import("apple_archive.zig");
@@ -39,13 +40,14 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn usage() !void {
-    std.debug.print("usage: jsbay-tool <apple-archive|check-c-abi|check-r8|prepare-ios-stdlib> ...\n", .{});
+    std.debug.print("usage: jsbay-tool <apple-archive|check-c-abi|write-android-exports-map|check-r8|prepare-ios-stdlib> ...\n", .{});
     return error.Usage;
 }
 
 fn dispatch(command: []const u8, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, command, "check-r8")) return checkR8(args);
     if (std.mem.eql(u8, command, "check-c-abi")) return checkCAbi(args);
+    if (std.mem.eql(u8, command, "write-android-exports-map")) return writeAndroidExportsMap(args);
     _ = usage() catch {};
     return error.Usage;
 }
@@ -148,10 +150,14 @@ fn checkCAbi(args: []const []const u8) !u8 {
     }
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
+    // Prefer the system compilers. Android NDK setup often puts a target-clang
+    // named `cc` ahead on PATH, which breaks these host syntax-only probes.
+    const cc: []const u8 = if (builtin.os.tag == .windows) "cc" else "/usr/bin/cc";
+    const cxx: []const u8 = if (builtin.os.tag == .windows) "c++" else "/usr/bin/c++";
     const consumers = [_][]const u8{ "tests/c_consumer.c", "tests/bytecode_consumer.c", "tests/native_sync_consumer.c", "tests/host_wake_consumer.c" };
     for (consumers) |consumer| {
-        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
-        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ "c++", "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
+        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
+        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
     }
     const lib = library orelse return 0;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -172,7 +178,8 @@ fn checkCAbi(args: []const []const u8) !u8 {
         const symbol_raw = it.next() orelse continue;
         if (!isHex(address) or kind.len != 1 or (kind[0] >= 'a' and kind[0] <= 'z' and kind[0] == 'u') or kind[0] == 'U') continue;
         const symbol = if (std.mem.startsWith(u8, symbol_raw, "_")) symbol_raw[1..] else symbol_raw;
-        if (std.mem.startsWith(u8, symbol, "jsbay_")) try actual.put(symbol, {});
+        // QuickJS/JSC C shims (jsbay_qjs_*, jsbay_jsc_*) are engine-private wrappers for Zig; not public ABI.
+        if (std.mem.startsWith(u8, symbol, "jsbay_") and !std.mem.startsWith(u8, symbol, "jsbay_qjs_") and !std.mem.startsWith(u8, symbol, "jsbay_jsc_")) try actual.put(symbol, {});
         if (std.mem.startsWith(u8, symbol, "no" ++ "ok_engine_") or std.mem.startsWith(u8, symbol, "z" ++ "je_") or std.mem.startsWith(u8, symbol, "z" ++ "jse_") or std.mem.startsWith(u8, symbol, "Java_") or std.mem.eql(u8, symbol, "JNI_OnLoad")) try forbidden.append(allocator, symbol);
     }
     var failed = false;
@@ -197,6 +204,41 @@ fn isHex(value: []const u8) bool {
     if (value.len == 0) return false;
     for (value) |c| if (!std.ascii.isHex(c)) return false;
     return true;
+}
+
+fn writeAndroidExportsMap(args: []const []const u8) !u8 {
+    if (args.len != 1) {
+        std.debug.print("usage: jsbay-tool write-android-exports-map <exports.map>\n", .{});
+        return error.Usage;
+    }
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var symbols = try headerSymbols(allocator);
+    defer symbols.deinit();
+    if (symbols.count() == 0) return error.NoPublicSymbols;
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(allocator);
+    var it = symbols.keyIterator();
+    while (it.next()) |sym| try list.append(allocator, sym.*);
+    std.mem.sort([]const u8, list.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, "{\n  global:\n");
+    for (list.items) |sym| {
+        try out.appendSlice(allocator, "  ");
+        try out.appendSlice(allocator, sym);
+        try out.appendSlice(allocator, ";\n");
+    }
+    try out.appendSlice(allocator, "  local: *;\n};\n");
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    try std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = args[0], .data = out.items });
+    return 0;
 }
 
 pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
@@ -267,11 +309,18 @@ fn runOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8)
 }
 
 fn requireExternal(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    const output = runOutput(allocator, io, argv) catch |err| {
+    const result = std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(16 * 1024 * 1024) }) catch |err| {
         std.debug.print("external command failed: {s}\n", .{argv[0]});
         return err;
     };
-    allocator.free(output);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| if (code == 0) return,
+        else => {},
+    }
+    std.debug.print("external command failed: {s}\n{s}{s}\n", .{ argv[0], result.stdout, result.stderr });
+    return error.ExternalFailure;
 }
 
 fn checkDiagnosticExports(init: std.process.Init, args: []const []const u8) !void {

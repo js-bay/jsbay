@@ -15,19 +15,23 @@ if [ "$MODE" = self-test ]; then
     cp "$ROOT/global.json" "$WORK/"
     cp "$ROOT/scripts/quality/"dotnet-*.sh "$WORK/scripts/quality/"
     export JSBAY_DOTNET_ARTIFACTS="$WORK/artifacts"
+    # Intentional failures must not emit Actions workflow commands as PR annotations.
+    unset GITHUB_ACTIONS CI TF_BUILD
     printf '\ninternal sealed class FormattingProbe{internal static int Check(bool input){if(input)return 1;return 0;}}\n' >> "$WORK/tests/dotnet-sdk/Program.cs"
-    if "$WORK/scripts/quality/dotnet-style.sh" check > "$WORK/expected-diagnostics.log" 2>&1; then
+    if env -u GITHUB_ACTIONS -u CI -u TF_BUILD "$WORK/scripts/quality/dotnet-style.sh" check > "$WORK/expected-diagnostics.log" 2>&1; then
         echo 'Malformed C# formatting unexpectedly passed.' >&2
         exit 1
     else
         echo "Expected rejection exit: $?"
     fi
     if ! grep -Eq 'WHITESPACE|IDE0011' "$WORK/expected-diagnostics.log"; then
-        cat "$WORK/expected-diagnostics.log" >&2
+        echo "self-test diagnostics (sanitized summary):" >&2
+        grep -Eo 'WHITESPACE|IDE0011' "$WORK/expected-diagnostics.log" | sort -u | sed 's/^/  observed /' >&2 || true
         echo 'Style check failed without the expected source diagnostic.' >&2
         exit 1
     fi
-    cat "$WORK/expected-diagnostics.log"
+    # Do not replay MSBuild lines — Actions problem matchers turn `file(line): error CODE:` into annotations.
+    grep -Eo 'WHITESPACE|IDE0011' "$WORK/expected-diagnostics.log" | sort -u | sed 's/^/self-test observed /'
     "$WORK/scripts/quality/dotnet-style.sh" fix
     find "$WORK/sdk" "$WORK/tests" -type f -name '*.cs' -exec cksum {} \; | sort > "$WORK/once.checksums"
     "$WORK/scripts/quality/dotnet-style.sh" fix

@@ -1,0 +1,170 @@
+name: Setup Zig
+description: Install Zig via composite steps (no Node.js action runtime)
+inputs:
+  version:
+    description: Zig version, e.g. 0.17.0
+    required: true
+    default: "0.17.0"
+  cache-build:
+    description: Restore/save Zig .zig-cache build artifacts (content-addressed; safe across backends)
+    required: false
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Resolve Zig download
+      id: zig
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64) target=x86_64-linux ;;
+          Linux-ARM64) target=aarch64-linux ;;
+          macOS-X64) target=x86_64-macos ;;
+          macOS-ARM64) target=aarch64-macos ;;
+          Windows-X64) target=x86_64-windows ;;
+          Windows-ARM64) target=aarch64-windows ;;
+          *)
+            echo "Unsupported runner: ${RUNNER_OS}-${RUNNER_ARCH}"
+            exit 1
+            ;;
+        esac
+        dest="${RUNNER_TEMP}/zig-${ZIG_VERSION}-${target}"
+        {
+          echo "target=${target}"
+          echo "dest=${dest}"
+          echo "version=${ZIG_VERSION}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Cache Zig toolchain
+      id: cache
+      uses: actions/cache@v5
+      with:
+        path: ${{ steps.zig.outputs.dest }}
+        key: zig-toolchain-${{ steps.zig.outputs.version }}-${{ steps.zig.outputs.target }}
+
+    - name: Download and install Zig
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ steps.zig.outputs.version }}
+        TARGET: ${{ steps.zig.outputs.target }}
+        DEST: ${{ steps.zig.outputs.dest }}
+      run: |
+        set -euo pipefail
+        # Official 0.17.0 builds (sha256 from ziglang.org/download/index.json).
+        # Keep this table in sync when bumping the default Zig pin.
+        case "${ZIG_VERSION}:${TARGET}" in
+          0.17.0:x86_64-linux)
+            url='https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz'
+            expect='1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026'
+            ;;
+          0.17.0:aarch64-linux)
+            url='https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz'
+            expect='9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8'
+            ;;
+          0.17.0:x86_64-macos)
+            url='https://ziglang.org/download/0.17.0/zig-x86_64-macos-0.17.0.tar.xz'
+            expect='4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6'
+            ;;
+          0.17.0:aarch64-macos)
+            url='https://ziglang.org/download/0.17.0/zig-aarch64-macos-0.17.0.tar.xz'
+            expect='b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a'
+            ;;
+          0.17.0:x86_64-windows)
+            url='https://ziglang.org/download/0.17.0/zig-x86_64-windows-0.17.0.zip'
+            expect='b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428'
+            ;;
+          0.17.0:aarch64-windows)
+            url='https://ziglang.org/download/0.17.0/zig-aarch64-windows-0.17.0.zip'
+            expect='0a59d91fa1cb40cf068e9b0954434ce973500c7a2ea749f1e01af62cdab52d26'
+            ;;
+          *)
+            echo "No hardcoded Zig download for ${ZIG_VERSION} on ${TARGET}"
+            exit 1
+            ;;
+        esac
+
+        archive="${RUNNER_TEMP}/zig-download-${ZIG_VERSION}-${TARGET}"
+        echo "Downloading ${url}"
+        curl -fsSL "$url" -o "$archive"
+
+        if command -v sha256sum >/dev/null 2>&1; then
+          got="$(sha256sum "$archive" | awk '{print $1}')"
+        elif command -v shasum >/dev/null 2>&1; then
+          got="$(shasum -a 256 "$archive" | awk '{print $1}')"
+        else
+          echo "Neither sha256sum nor shasum is available"
+          exit 1
+        fi
+        if [[ "$got" != "$expect" ]]; then
+          echo "sha256 mismatch for ${url}: ${got} != ${expect}"
+          exit 1
+        fi
+        echo "sha256 ok ${got}"
+
+        mkdir -p "$DEST"
+        extract="${RUNNER_TEMP}/zig-extract-${ZIG_VERSION}-${TARGET}"
+        rm -rf "$extract"
+        mkdir -p "$extract"
+        case "$TARGET" in
+          *-windows)
+            if tar -tf "$archive" >/dev/null 2>&1; then
+              tar -xf "$archive" -C "$extract"
+            else
+              unzip -q "$archive" -d "$extract"
+            fi
+            ;;
+          *)
+            tar -xJf "$archive" -C "$extract"
+            ;;
+        esac
+        top="$(find "$extract" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+        if [[ -z "${top}" ]]; then
+          echo "Zig archive did not contain a top-level directory"
+          exit 1
+        fi
+        shopt -s dotglob nullglob
+        mv "$top"/* "$DEST"/
+        if [[ -f "$DEST/zig" ]]; then
+          chmod +x "$DEST/zig"
+        fi
+        if [[ -f "$DEST/zig.exe" ]]; then
+          "$DEST/zig.exe" version
+        else
+          "$DEST/zig" version
+        fi
+
+    - name: Add Zig to PATH
+      shell: bash
+      run: |
+        echo "${{ steps.zig.outputs.dest }}" >> "$GITHUB_PATH"
+        if [[ -x "${{ steps.zig.outputs.dest }}/zig" ]]; then
+          "${{ steps.zig.outputs.dest }}/zig" version
+        elif [[ -f "${{ steps.zig.outputs.dest }}/zig.exe" ]]; then
+          "${{ steps.zig.outputs.dest }}/zig.exe" version
+        else
+          echo "Zig binary missing after install"
+          ls -la "${{ steps.zig.outputs.dest }}"
+          exit 1
+        fi
+
+    - name: Cache Zig build artifacts
+      if: inputs.cache-build == 'true'
+      uses: actions/cache@v5
+      with:
+        # Root + package local caches (Zig 0.17). Missing paths are skipped on save.
+        path: |
+          .zig-cache
+          libs/zev/.zig-cache
+          libs/js_event_loop/.zig-cache
+          libs/inspector/.zig-cache
+          libs/inspector_transport/.zig-cache
+          libs/bytecode_cache/.zig-cache
+          tools/.zig-cache
+        key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ hashFiles('build.zig', 'build.zig.zon', 'libs/*/build.zig', 'libs/*/build.zig.zon', 'vendor/*.patch', '.gitmodules') }}
+        restore-keys: |
+          zig-build-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-
+

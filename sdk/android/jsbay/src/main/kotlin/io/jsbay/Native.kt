@@ -80,7 +80,10 @@ internal object Native {
 
     external fun isSuspended(id: Int): Boolean
 
-    external fun setAdmissionClass(id: Int, cls: Int): Boolean
+    external fun setAdmissionClass(
+        id: Int,
+        cls: Int,
+    ): Boolean
 
     external fun getAdmissionClass(id: Int): Int
 

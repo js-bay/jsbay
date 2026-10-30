@@ -105,7 +105,7 @@ test "shutdown race: ordered stop → run returns → inspector_stop → release
     try testing.expect(held != 0);
     try testing.expectEqual(@as(u64, 0), exception);
 
-    const inspector_enabled = @import("build_options").inspector;
+    const inspector_enabled = @import("build_options").inspector and @import("build_options").inspector_transport;
     if (comptime inspector_enabled) {
         var port: u16 = 0;
         try testing.expect(c_api.jsbay_engine_inspector_start(id, 0, &port));

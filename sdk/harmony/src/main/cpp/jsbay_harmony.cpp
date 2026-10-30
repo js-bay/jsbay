@@ -284,8 +284,8 @@ static void finalizeBinding(void *opaque) {
 }
 
 static jsbay_status_t bridge(int id, void *opaque, jsbay_value_t this_value, size_t argc,
-                              const jsbay_value_t *args, jsbay_value_t *out,
-                              jsbay_value_t *out_exception) {
+                             const jsbay_value_t *args, jsbay_value_t *out,
+                             jsbay_value_t *out_exception) {
     auto *b = static_cast<Binding *>(opaque);
     Engine *e = b ? b->engine : nullptr;
     if (!owner(e))
@@ -300,7 +300,7 @@ static jsbay_status_t bridge(int id, void *opaque, jsbay_value_t this_value, siz
         callback_scope = owned_scope.parent;
         napi_close_handle_scope(e->env, scope);
         return jsbay_value_new_error(id, bytes("Harmony host callback is unavailable"),
-                                      out_exception) == JSBAY_OK
+                                     out_exception) == JSBAY_OK
                    ? JSBAY_EXCEPTION
                    : JSBAY_UNSUPPORTED;
     }
@@ -389,7 +389,7 @@ static void syncBridge(int id, void *opaque, uint64_t request_id, jsbay_value_t 
     napi_handle_scope scope;
     if (napi_open_handle_scope(e->env, &scope) != napi_ok) {
         (void)jsbay_sync_complete(request_id, JSBAY_EXCEPTION, JSBAY_SYNC_PAYLOAD_UTF8_STRING,
-                                   bytes("Harmony sync starter is unavailable"));
+                                  bytes("Harmony sync starter is unavailable"));
         return;
     }
     CallbackScope owned_scope{e, callback_scope, {}};
@@ -405,7 +405,7 @@ static void syncBridge(int id, void *opaque, uint64_t request_id, jsbay_value_t 
     napi_value fn = nullptr;
     if (napi_get_reference_value(e->env, binding->callback, &fn) != napi_ok || !fn) {
         (void)jsbay_sync_complete(request_id, JSBAY_EXCEPTION, JSBAY_SYNC_PAYLOAD_UTF8_STRING,
-                                   bytes("Harmony sync starter is unavailable"));
+                                  bytes("Harmony sync starter is unavailable"));
         finish();
         return;
     }
@@ -414,7 +414,7 @@ static void syncBridge(int id, void *opaque, uint64_t request_id, jsbay_value_t 
         !(this_box = wrapValue(e->env, e, this_value, true)) ||
         napi_create_array_with_length(e->env, argc, &array) != napi_ok) {
         (void)jsbay_sync_complete(request_id, JSBAY_EXCEPTION, JSBAY_SYNC_PAYLOAD_UTF8_STRING,
-                                   bytes("Harmony sync starter allocation failed"));
+                                  bytes("Harmony sync starter allocation failed"));
         finish();
         return;
     }
@@ -423,8 +423,8 @@ static void syncBridge(int id, void *opaque, uint64_t request_id, jsbay_value_t 
         napi_value item = wrapValue(e->env, e, args[index], true);
         if (!item ||
             napi_set_element(e->env, array, static_cast<uint32_t>(index), item) != napi_ok) {
-        (void)jsbay_sync_complete(request_id, JSBAY_EXCEPTION, JSBAY_SYNC_PAYLOAD_UTF8_STRING,
-                                       bytes("Harmony sync starter allocation failed"));
+            (void)jsbay_sync_complete(request_id, JSBAY_EXCEPTION, JSBAY_SYNC_PAYLOAD_UTF8_STRING,
+                                      bytes("Harmony sync starter allocation failed"));
             finish();
             return;
         }
@@ -438,10 +438,10 @@ static void syncBridge(int id, void *opaque, uint64_t request_id, jsbay_value_t 
         napi_value pending = nullptr;
         napi_get_and_clear_last_exception(e->env, &pending);
         (void)jsbay_sync_complete(request_id, JSBAY_EXCEPTION, JSBAY_SYNC_PAYLOAD_UTF8_STRING,
-                                   bytes("Harmony sync starter threw"));
+                                  bytes("Harmony sync starter threw"));
     } else if (call_status != napi_ok) {
         (void)jsbay_sync_complete(request_id, JSBAY_EXCEPTION, JSBAY_SYNC_PAYLOAD_UTF8_STRING,
-                                   bytes("Harmony sync starter failed"));
+                                  bytes("Harmony sync starter failed"));
     }
     finish();
 }
@@ -504,13 +504,14 @@ static napi_value completeSync(napi_env env, napi_callback_info info) {
             if (readBufferWindow(env, a[3], &raw, &len)) {
                 jsbay_utf8_t payload = {raw, len};
                 status = jsbay_sync_complete(request_id, static_cast<jsbay_status_t>(outcome),
-                                              static_cast<jsbay_sync_payload_kind_t>(kind), payload);
+                                             static_cast<jsbay_sync_payload_kind_t>(kind), payload);
             }
         } else {
             std::string data;
             if (readUtf8(env, a[3], &data))
-                status = jsbay_sync_complete(request_id, static_cast<jsbay_status_t>(outcome),
-                                              static_cast<jsbay_sync_payload_kind_t>(kind), bytes(data));
+                status =
+                    jsbay_sync_complete(request_id, static_cast<jsbay_status_t>(outcome),
+                                        static_cast<jsbay_sync_payload_kind_t>(kind), bytes(data));
         }
     }
     napi_value result = nullptr;
@@ -825,10 +826,13 @@ static bool readU64AsSize(napi_env env, napi_value v, size_t *out) {
     }
     return false;
 }
-static bool readLimitsArgs(napi_env env, napi_value *a, size_t start, jsbay_resource_limits_t *out) {
+static bool readLimitsArgs(napi_env env, napi_value *a, size_t start,
+                           jsbay_resource_limits_t *out) {
     size_t max_timers, max_tsfn, max_calls, max_bytes, max_tasks;
-    if (!readU64AsSize(env, a[start], &max_timers) || !readU64AsSize(env, a[start + 1], &max_tsfn) ||
-        !readU64AsSize(env, a[start + 2], &max_calls) || !readU64AsSize(env, a[start + 3], &max_bytes) ||
+    if (!readU64AsSize(env, a[start], &max_timers) ||
+        !readU64AsSize(env, a[start + 1], &max_tsfn) ||
+        !readU64AsSize(env, a[start + 2], &max_calls) ||
+        !readU64AsSize(env, a[start + 3], &max_bytes) ||
         !readU64AsSize(env, a[start + 4], &max_tasks))
         return false;
     *out = (jsbay_resource_limits_t){
@@ -874,7 +878,8 @@ static napi_value createWithLimits(napi_env env, napi_callback_info info) {
     napi_get_cb_info(env, info, &n, a, nullptr, nullptr);
     int32_t id;
     jsbay_resource_limits_t limits;
-    if (n != 6 || napi_get_value_int32(env, a[0], &id) != napi_ok || !readLimitsArgs(env, a, 1, &limits) ||
+    if (n != 6 || napi_get_value_int32(env, a[0], &id) != napi_ok ||
+        !readLimitsArgs(env, a, 1, &limits) ||
         !jsbay_engine_create_with_limits(id, nullptr, nullptr, &limits))
         return makeError(env, "cannot create JsBay Engine with limits");
     return wrapCreatedEngine(env, id);
@@ -904,7 +909,8 @@ static napi_value resourceUsage(napi_env env, napi_callback_info info) {
     napi_value out;
     if (napi_create_object(env, &out) != napi_ok)
         return makeError(env, "cannot allocate resource usage");
-    if (!setU64Prop(env, out, "timers", usage.timers) || !setU64Prop(env, out, "tsfnHandles", usage.tsfn_handles) ||
+    if (!setU64Prop(env, out, "timers", usage.timers) ||
+        !setU64Prop(env, out, "tsfnHandles", usage.tsfn_handles) ||
         !setU64Prop(env, out, "pendingCalls", usage.pending_calls) ||
         !setU64Prop(env, out, "nativeTasks", usage.native_tasks) ||
         !setU64Prop(env, out, "scriptTasks", usage.script_tasks) ||
@@ -983,7 +989,8 @@ static napi_value globalResourceUsage(napi_env env, napi_callback_info info) {
     napi_value out;
     if (napi_create_object(env, &out) != napi_ok)
         return makeError(env, "cannot allocate global resource usage");
-    if (!setU64Prop(env, out, "timers", usage.timers) || !setU64Prop(env, out, "tsfnHandles", usage.tsfn_handles) ||
+    if (!setU64Prop(env, out, "timers", usage.timers) ||
+        !setU64Prop(env, out, "tsfnHandles", usage.tsfn_handles) ||
         !setU64Prop(env, out, "pendingCalls", usage.pending_calls) ||
         !setU64Prop(env, out, "nativeTasks", usage.native_tasks) ||
         !setU64Prop(env, out, "scriptTasks", usage.script_tasks) ||
@@ -1292,9 +1299,9 @@ static napi_value newSimple(napi_env env, napi_callback_info info, int kind) {
         return makeError(env, "constructor requires owner Engine");
     jsbay_value_t h = 0;
     jsbay_status_t s = kind == 0   ? jsbay_value_undefined(e->id, &h)
-                        : kind == 1 ? jsbay_value_null(e->id, &h)
-                        : kind == 2 ? jsbay_value_new_object(e->id, &h)
-                                    : jsbay_value_new_array(e->id, &h);
+                       : kind == 1 ? jsbay_value_null(e->id, &h)
+                       : kind == 2 ? jsbay_value_new_object(e->id, &h)
+                                   : jsbay_value_new_array(e->id, &h);
     return s == JSBAY_OK ? wrapValue(env, e, h, false) : statusError(env, s);
 }
 static napi_value newUndefined(napi_env e, napi_callback_info i) {
@@ -1319,8 +1326,8 @@ static napi_value newTextValue(napi_env env, napi_callback_info info, bool json,
         return makeError(env, "constructor requires owner Engine and string");
     jsbay_value_t h = 0, x = 0;
     jsbay_status_t s = error  ? jsbay_value_new_error(e->id, bytes(text), &h)
-                        : json ? jsbay_value_new_json(e->id, bytes(text), &h, &x)
-                               : JSBAY_INVALID_ARGUMENT;
+                       : json ? jsbay_value_new_json(e->id, bytes(text), &h, &x)
+                              : JSBAY_INVALID_ARGUMENT;
     return error ? (s == JSBAY_OK ? wrapValue(env, e, h, false) : statusError(env, s))
                  : takeResult(env, e, s, h, x);
 }
@@ -1475,8 +1482,7 @@ static napi_value textValue(napi_env env, napi_callback_info info, bool json) {
         return nullptr;
     jsbay_bytes_t b = {nullptr, 0};
     jsbay_value_t x = 0;
-    auto s =
-        json ? jsbay_value_to_json(v->handle, &b, &x) : jsbay_value_to_utf8(v->handle, &b, &x);
+    auto s = json ? jsbay_value_to_json(v->handle, &b, &x) : jsbay_value_to_utf8(v->handle, &b, &x);
     if (s == JSBAY_EXCEPTION)
         return takeResult(env, v->engine, s, 0, x);
     if (s != JSBAY_OK)

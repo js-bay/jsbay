@@ -15,6 +15,8 @@ if [ "$MODE" = self-test ]; then
     cp "$ROOT/global.json" "$WORK/"
     cp "$ROOT/scripts/quality/"dotnet-*.sh "$WORK/scripts/quality/"
     export JSBAY_DOTNET_ARTIFACTS="$WORK/artifacts"
+    # Intentional failures must not emit Actions workflow commands as PR annotations.
+    unset GITHUB_ACTIONS CI TF_BUILD
     cat >> "$WORK/sdk/dotnet/JsBay/Status.cs" <<'CS'
 
 internal static class AnalyzerProbe
@@ -22,18 +24,20 @@ internal static class AnalyzerProbe
     internal static bool HasText(string text) => text.IndexOf('x') >= 0;
 }
 CS
-    if "$WORK/scripts/quality/dotnet-lint.sh" check > "$WORK/expected-diagnostics.log" 2>&1; then
+    if env -u GITHUB_ACTIONS -u CI -u TF_BUILD "$WORK/scripts/quality/dotnet-lint.sh" check > "$WORK/expected-diagnostics.log" 2>&1; then
         echo 'C# analyzer violation unexpectedly passed.' >&2
         exit 1
     else
         echo "Expected rejection exit: $?"
     fi
     if ! grep -q 'CA2249' "$WORK/expected-diagnostics.log"; then
-        cat "$WORK/expected-diagnostics.log" >&2
+        echo "self-test diagnostics (sanitized summary):" >&2
+        grep -Eo 'CA2249' "$WORK/expected-diagnostics.log" | sort -u | sed 's/^/  observed /' >&2 || true
         echo 'Analyzer check failed without the expected CA2249 diagnostic.' >&2
         exit 1
     fi
-    cat "$WORK/expected-diagnostics.log"
+    # Do not replay MSBuild lines — Actions problem matchers turn `file(line): error CODE:` into annotations.
+    grep -Eo 'CA2249' "$WORK/expected-diagnostics.log" | sort -u | sed 's/^/self-test observed /'
     "$WORK/scripts/quality/dotnet-lint.sh" fix
     find "$WORK/sdk" "$WORK/tests" -type f -name '*.cs' -exec cksum {} \; | sort > "$WORK/once.checksums"
     "$WORK/scripts/quality/dotnet-lint.sh" fix

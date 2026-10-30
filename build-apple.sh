@@ -179,8 +179,12 @@ link_consumer_probes() {
     if [ -z "$udid" ]; then
         local runtimes_json="$probe_dir/sim-runtimes.json"
         local device_types_json="$probe_dir/sim-device-types.json"
-        xcrun simctl list runtimes -j > "$runtimes_json"
-        xcrun simctl list devicetypes -j > "$device_types_json"
+        if ! xcrun simctl list runtimes -j > "$runtimes_json" 2>/dev/null \
+            || ! xcrun simctl list devicetypes -j > "$device_types_json" 2>/dev/null; then
+            printf '%s\n' 'FAIL: iOS Simulator runtime unavailable' > "$probe_dir/ios-simulator-consumer.status"
+            echo "ERROR: iOS Simulator runtime unavailable; simulator runtime smoke is required" >&2
+            return 1
+        fi
         local runtime device_type created
         while IFS= read -r runtime; do
             [ -n "$runtime" ] || continue
@@ -191,8 +195,8 @@ link_consumer_probes() {
                     owned_sim=1
                     break 2
                 fi
-            done < <(zig build tool -- simulator-list devices "$device_types_json")
-        done < <(zig build tool -- simulator-list runtimes "$runtimes_json")
+            done < <(zig build tool -- simulator-list devices "$device_types_json" 2>/dev/null || true)
+        done < <(zig build tool -- simulator-list runtimes "$runtimes_json" 2>/dev/null || true)
     fi
     if [ -z "$udid" ]; then
         printf '%s\n' 'FAIL: iOS Simulator runtime unavailable' > "$probe_dir/ios-simulator-consumer.status"

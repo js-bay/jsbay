@@ -21,7 +21,9 @@ static void Check(BOOL condition, NSString *message) {
 int main(void) {
     @autoreleasepool {
         NSError *error = nil;
-        JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:81003 allowMainRunLoopAttach:YES error:&error];
+        JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:81003
+                                               allowMainRunLoopAttach:YES
+                                                                error:&error];
         Check(engine != nil, error.localizedDescription);
         JSBayValue *function = [engine evaluate:@"(function(value) { return value + 1; })"
                                        filename:@"allocation-failure.js"

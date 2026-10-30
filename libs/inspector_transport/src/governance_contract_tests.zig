@@ -472,6 +472,8 @@ test "transport: a broadcast snapshot allocation failure releases every retained
     failing.fail_index = failing.alloc_index + 1;
     t.broadcastText("oom-broadcast-token");
     try testing.expect(failing.has_induced_failure);
+    // FailingAllocator keeps failing every alloc at fail_index; re-arm so deinit/close can free.
+    failing.fail_index = std.math.maxInt(usize);
     std.debug.print("GOVERNANCE_BROADCAST_RESIZE_FAILED peers={d}\n", .{peers.len});
     t.deinit();
     deinitialized = true;

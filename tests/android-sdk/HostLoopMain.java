@@ -169,7 +169,8 @@ public final class HostLoopMain {
   }
 
   private static void runDedicatedEngineThread() {
-    try (DedicatedEngineThread dedicated = DedicatedEngineThread.start(7141, "jsbay-dedicated-7141")) {
+    try (DedicatedEngineThread dedicated =
+        DedicatedEngineThread.start(7141, "jsbay-dedicated-7141")) {
       String answer =
           dedicated.runOnOwner(
               engine -> {
@@ -183,7 +184,10 @@ public final class HostLoopMain {
     }
   }
 
-  /** P0-1 regression: suspend soft-cancels a pending Host schedule; resume must not latch LOOP_FAILED. */
+  /**
+   * P0-1 regression: suspend soft-cancels a pending Host schedule; resume must not latch
+   * LOOP_FAILED.
+   */
   private static void runSuspendResumeKeepsLoopAlive(Looper looper) {
     try (Engine engine = new Engine(7142)) {
       boolean[] fired = {false};
@@ -221,5 +225,4 @@ public final class HostLoopMain {
       }
     }
   }
-
 }

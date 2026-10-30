@@ -15,11 +15,11 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Adversarial Android extreme matrix: burst create/destroy, close races,
- * wrong-thread storms, memory/time hammer + recover.
+ * Adversarial Android extreme matrix: burst create/destroy, close races, wrong-thread storms,
+ * memory/time hammer + recover.
  *
- * Greppable PASS:/FAIL:/SKIP: lines. Does NOT enable Zig fault-injection in-process
- * (that lives in tests/process-isolation harness under a child process).
+ * <p>Greppable PASS:/FAIL:/SKIP: lines. Does NOT enable Zig fault-injection in-process (that lives
+ * in tests/process-isolation harness under a child process).
  */
 public final class ExtremeMatrixMain {
   private static int failures = 0;

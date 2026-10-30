@@ -559,6 +559,7 @@ export class Engine {
   }
   resourceUsage(): ResourceUsage {
     return invoke(() => native.resourceUsage(this.live()) as ResourceUsage);
+  }
   getMemoryUsage(): MemoryUsage {
     return invoke(() => native.getMemoryUsage(this.live()) as MemoryUsage);
   }

@@ -184,7 +184,7 @@ const commit_z: [:0]const u8 = @import("build_options").git_commit ++ "\x00";
 const backend_z: [:0]const u8 = @import("build_options").backend_name ++ "\x00";
 
 /// Fill `out` with process-wide build identity. See `include/jsbay.h`.
-pub fn jsbay_engine_version(out: ?*VersionInfo) callconv(.c) bool {
+pub export fn jsbay_engine_version(out: ?*VersionInfo) bool {
     const info = out orelse return false;
     // Do not touch fields when struct_size is too small: a C caller may have allocated only the prefix.
     if (info.struct_size < @sizeOf(VersionInfo)) return false;
@@ -220,11 +220,11 @@ test "c_api: engine version reports package backend and stable pointers" {
     try std.testing.expect(!jsbay_engine_version(null));
 }
 
-pub fn jsbay_engine_create(
+pub export fn jsbay_engine_create(
     instance_id: c_int,
     log_handler: ?types.LogHandler,
     log_user_data: ?*anyopaque,
-) callconv(.c) bool {
+) bool {
     return jsbay_engine_create_with_limits(instance_id, log_handler, log_user_data, null);
 }
 
@@ -278,7 +278,7 @@ test "c_api: engine creation keeps recursion below native stack limits" {
     try std.testing.expectEqualStrings("42", std.mem.span(result));
 }
 
-pub fn jsbay_engine_destroy(instance_id: c_int) callconv(.c) void {
+pub export fn jsbay_engine_destroy(instance_id: c_int) void {
     if (host_wake.isNotifying()) return;
     const id: i32 = @intCast(instance_id);
     // Owner-thread destroy is the common path (release values first, then destroy). A non-owner
@@ -415,7 +415,7 @@ fn testSetWakeHandler(instance_id: c_int, handler: ?host_wake.Handler, user_data
 }
 
 /// Thread-safe control-plane request. The engine owner observes the flag from its backend interrupt handler and turns the running evaluation into an exception; this function never waits for the JavaScript thread.
-pub fn jsbay_engine_request_interrupt(instance_id: c_int) callconv(.c) bool {
+pub export fn jsbay_engine_request_interrupt(instance_id: c_int) bool {
     const id: i32 = @intCast(instance_id);
     const accepted = runtime_control.requestInterrupt(id);
     if (accepted) {
@@ -426,13 +426,13 @@ pub fn jsbay_engine_request_interrupt(instance_id: c_int) callconv(.c) bool {
 }
 
 /// Clear a previously requested interrupt before evaluating more JavaScript.
-pub fn jsbay_engine_clear_interrupt(instance_id: c_int) callconv(.c) bool {
+pub export fn jsbay_engine_clear_interrupt(instance_id: c_int) bool {
     if (!api_value.isOwner(@intCast(instance_id))) return false;
     return runtime_control.clearInterrupt(@intCast(instance_id));
 }
 
 /// Arm a relative execution limit without blocking the caller. Zero disables the limit. The backend interrupt handler owns enforcement.
-pub fn jsbay_engine_set_execution_time_limit(instance_id: c_int, millis: u64) callconv(.c) bool {
+pub export fn jsbay_engine_set_execution_time_limit(instance_id: c_int, millis: u64) bool {
     const id: i32 = @intCast(instance_id);
     if (!api_value.isOwner(id)) return false;
     const accepted = runtime_control.setExecutionTimeLimit(id, millis);
@@ -443,7 +443,7 @@ pub fn jsbay_engine_set_execution_time_limit(instance_id: c_int, millis: u64) ca
 }
 
 /// Cap the runtime's heap at `bytes` (0 = unlimited). QuickJS enforces it via JS_SetMemoryLimit. JSC has no public heap-cap API and returns false (same contract as `runtime_control.setMemoryLimit` / the C header).
-pub fn jsbay_engine_set_memory_limit(instance_id: c_int, bytes: u64) callconv(.c) bool {
+pub export fn jsbay_engine_set_memory_limit(instance_id: c_int, bytes: u64) bool {
     if (!api_value.isOwner(@intCast(instance_id))) return false;
     return runtime_control.setMemoryLimit(@intCast(instance_id), bytes);
 }
@@ -619,7 +619,7 @@ pub const MemoryUsageC = extern struct {
     shape_count: u64 = 0,
 };
 
-pub fn jsbay_engine_get_memory_usage(instance_id: c_int, out_usage: ?*MemoryUsageC) callconv(.c) bool {
+pub export fn jsbay_engine_get_memory_usage(instance_id: c_int, out_usage: ?*MemoryUsageC) bool {
     const out = out_usage orelse return false;
     const id: i32 = @intCast(instance_id);
     if (!api_value.isOwner(id)) return false;
@@ -649,7 +649,7 @@ pub fn jsbay_engine_get_memory_usage(instance_id: c_int, out_usage: ?*MemoryUsag
 }
 
 /// Owner-thread forced GC. Returns false when missing or wrong thread.
-pub fn jsbay_engine_run_gc(instance_id: c_int) callconv(.c) bool {
+pub export fn jsbay_engine_run_gc(instance_id: c_int) bool {
     const id: i32 = @intCast(instance_id);
     if (!api_value.isOwner(id)) return false;
     return runtime_control.runGc(id);
@@ -658,11 +658,11 @@ pub fn jsbay_engine_run_gc(instance_id: c_int) callconv(.c) bool {
 const engine_events = @import("runtime/engine_events.zig");
 
 /// Owner-thread telemetry handler registration. Pass null handler to clear.
-pub fn jsbay_engine_set_event_handler(
+pub export fn jsbay_engine_set_event_handler(
     instance_id: c_int,
     handler: ?types.EngineEventHandler,
     user_data: ?*anyopaque,
-) callconv(.c) bool {
+) bool {
     const id: i32 = @intCast(instance_id);
     if (!api_value.isOwner(id)) return false;
     if (@import("runtime/instance_map.zig").getInstance(id) == null) return false;
@@ -1796,7 +1796,7 @@ fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: us
     native_sync.tightenDeadline(started.request, deadline);
 
     // The host start callback receives borrowed JS handles only while it is running. It may complete inline, but must otherwise hand only the ID to its system completion path.
-    if (runtime_control.isInterruptRequested(instance_id)) {
+    if (runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) {
         native_sync.cancel(started.id);
     } else {
         binding.start(instance_id, binding.user_data, started.id, this_value, argc, args);
@@ -2195,19 +2195,6 @@ test "c_api: admission class defaults to FOREGROUND and mid-flight set keeps usa
     legacy.struct_size = @intCast(resource_global_usage_legacy_size);
     try std.testing.expect(jsbay_resource_global_usage(&legacy));
     try std.testing.expectEqual(@as(u32, @intCast(resource_global_usage_legacy_size)), legacy.struct_size);
-}
-
-comptime {
-    @export(&jsbay_engine_version, .{ .name = "jsbay_engine_version" });
-    @export(&jsbay_engine_create, .{ .name = "jsbay_engine_create" });
-    @export(&jsbay_engine_destroy, .{ .name = "jsbay_engine_destroy" });
-    @export(&jsbay_engine_request_interrupt, .{ .name = "jsbay_engine_request_interrupt" });
-    @export(&jsbay_engine_clear_interrupt, .{ .name = "jsbay_engine_clear_interrupt" });
-    @export(&jsbay_engine_set_execution_time_limit, .{ .name = "jsbay_engine_set_execution_time_limit" });
-    @export(&jsbay_engine_set_memory_limit, .{ .name = "jsbay_engine_set_memory_limit" });
-    @export(&jsbay_engine_get_memory_usage, .{ .name = "jsbay_engine_get_memory_usage" });
-    @export(&jsbay_engine_run_gc, .{ .name = "jsbay_engine_run_gc" });
-    @export(&jsbay_engine_set_event_handler, .{ .name = "jsbay_engine_set_event_handler" });
 }
 
 // Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`.

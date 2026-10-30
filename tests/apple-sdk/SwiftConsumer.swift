@@ -476,13 +476,16 @@ struct SwiftConsumer {
       fatalError("P0 snapshot missing")
     }
 
-    let syncBytes = try engine.bindSync("p0SyncBytes", timeoutMilliseconds: 2_000) { _, _, completion in
+    let syncBytes = try engine.bindSync("p0SyncBytes", timeoutMilliseconds: 2_000) {
+      _, _, completion in
       DispatchQueue.global().async { try? completion.resolveBytes([9, 8, 7]) }
     }
     defer { try? syncBytes.close() }
     guard
       try engine.evaluate(
-        "(function(){ var u = new Uint8Array(p0SyncBytes()); return u.length===3 && u[0]===9 && u[1]===8 && u[2]===7 })()",
+        """
+        (function(){ var u = new Uint8Array(p0SyncBytes()); return u.length===3 && u[0]===9 && u[1]===8 && u[2]===7 })()
+        """,
         filename: "p0-sync-bytes.js"
       ).bool()
     else {

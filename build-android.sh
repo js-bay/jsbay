@@ -27,50 +27,8 @@ trap 'rm -rf "$TEMP_BUILD" "$STAGING_ROOT"' EXIT
 # A jsbay_* wildcard would also export internal QuickJS wrappers named jsbay_qjs_*.
 write_exports_map() {
     local out="$1"
-    python3 - "$SCRIPT_DIR" "$out" <<'PY'
-import pathlib, sys
-repo, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-names = ("jsbay.h", "jsbay_bytecode.h", "jsbay_sync.h")
-symbols = []
-seen = set()
-for name in names:
-    text = (repo / "include" / name).read_text(encoding="utf-8")
-    i = 0
-    n = len(text)
-    while i < n:
-        if text.startswith("/*", i):
-            j = text.find("*/", i + 2)
-            if j < 0:
-                raise SystemExit(f"unterminated comment in {name}")
-            i = j + 2
-            continue
-        if text.startswith("//", i):
-            j = text.find("\n", i)
-            i = n if j < 0 else j + 1
-            continue
-        if text.startswith("jsbay_", i):
-            if i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_"):
-                i += 1
-                continue
-            start = i
-            i += len("jsbay_")
-            while i < n and (text[i].isalnum() or text[i] == "_"):
-                i += 1
-            sym = text[start:i]
-            if sym.endswith("_t"):
-                continue
-            while i < n and text[i].isspace():
-                i += 1
-            if i < n and text[i] == "(" and sym not in seen:
-                seen.add(sym)
-                symbols.append(sym)
-            continue
-        i += 1
-if not symbols:
-    raise SystemExit("no public jsbay_* function symbols found in headers")
-body = "\n".join(f"  {s};" for s in symbols)
-out.write_text("{\n  global:\n" + body + "\n  local: *;\n};\n", encoding="utf-8")
-PY
+    # Same public ABI set as check-c-abi (zig tool; no host interpreters).
+    (cd "$SCRIPT_DIR" && zig build tool -- write-android-exports-map "$out")
 }
 write_exports_map "$TEMP_BUILD/exports.map"
 

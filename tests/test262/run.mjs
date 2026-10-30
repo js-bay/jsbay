@@ -28,7 +28,9 @@ try {
   const manifest = JSON.parse(await readFile(options.manifest, 'utf8'));
   if (manifest.schema_version !== 1 || !manifest.tests?.length || !manifest.files?.length) throw Error('Empty or invalid manifest');
   summary.revision = manifest.revision;
-  const sourceRoot = options['source-root'] ? await realpath(options['source-root']) : resolve(process.env.JSBAY_TEST262_CACHE || resolve(tmpdir(), 'jsbay-test262-source'), manifest.revision);
+  const provisionalRoot = options['source-root'] ? options['source-root'] : resolve(process.env.JSBAY_TEST262_CACHE || resolve(tmpdir(), 'jsbay-test262-source'), manifest.revision);
+  if (!options['source-root']) await mkdir(provisionalRoot, { recursive: true });
+  const sourceRoot = await realpath(provisionalRoot);
   if (!options['source-root'] && !/^[a-f0-9]{40}$/.test(manifest.revision)) throw Error('A pinned revision is required for downloads');
   const sources = new Map();
   for (const entry of manifest.files) {

@@ -10,3 +10,12 @@
 -keep class io.jsbay.SyncStarter { *; }
 -keep class io.jsbay.SyncCall { *; }
 -keep class io.jsbay.SyncCompletion { *; }
+
+# JNI RegisterNatives resolves native methods by exact JVM name/descriptor.
+# Descriptor types must keep their JVM names or RegisterNatives fails at loadLibrary.
+-keep class io.jsbay.LogHandler { *; }
+-keep class io.jsbay.EventHandler { *; }
+-keep class io.jsbay.Native { *; }
+-keepclasseswithmembernames,includedescriptorclasses class io.jsbay.Native {
+    native <methods>;
+}

@@ -31,7 +31,8 @@ public enum JsBayError: Error, Equatable, CustomStringConvertible {
     }
   }
 
-  /// Stable `jsbay_status_t` equivalent for both C failures and SDK precondition failures. Callers must not infer a status from enum order.
+  /// Stable `jsbay_status_t` equivalent for both C failures and SDK precondition failures. Callers must not infer a
+  /// status from enum order.
   public var statusCode: Int32 {
     switch self {
     case .status(let raw): return raw
@@ -46,7 +47,8 @@ public final class JsException: Error {
   public let value: Value
   fileprivate init(_ value: Value) { self.value = value }
 
-  /// Returns the thrown value's text and closes it. A second JavaScript throw closes both values and returns a fixed fallback.
+  /// Returns the thrown value's text and closes it. A second JavaScript throw closes both values and returns a fixed
+  /// fallback.
   public func describeAndClose() throws -> String {
     try value.requireOwnedForConsume()
     do {
@@ -61,7 +63,8 @@ public final class JsException: Error {
   }
 }
 
-/// A thread-safe, data-only completion for `Engine.bindSync`. It may run on a background queue and never calls Engine or Value APIs. Prefer calling `jsbay_sync_complete` from native code on the hot path.
+/// A thread-safe, data-only completion for `Engine.bindSync`. It may run on a background queue and never calls Engine
+/// or Value APIs. Prefer calling `jsbay_sync_complete` from native code on the hot path.
 public final class SyncCompletion: @unchecked Sendable {
   private let requestID: UInt64
   private let lock = NSLock()
@@ -88,12 +91,15 @@ public final class SyncCompletion: @unchecked Sendable {
     let status = tryReject(message)
     if status != JsBayStatus.ok { throw JsBayError.status(status) }
   }
-  private func complete(_ outcome: jsbay_status_t, _ kind: jsbay_sync_payload_kind_t, _ bytes: [UInt8]) -> Int32 {
+  private func complete(
+    _ outcome: jsbay_status_t, _ kind: jsbay_sync_payload_kind_t, _ bytes: [UInt8]
+  ) -> Int32 {
     lock.lock()
     defer { lock.unlock() }
     if terminal { return JsBayStatus.staleValue }
     let status: jsbay_status_t = bytes.withUnsafeBufferPointer {
-      jsbay_sync_complete(requestID, outcome, kind, jsbay_utf8_t(data: $0.baseAddress, len: $0.count))
+      jsbay_sync_complete(
+        requestID, outcome, kind, jsbay_utf8_t(data: $0.baseAddress, len: $0.count))
     }
     let raw = Int32(status.rawValue)
     if raw == JsBayStatus.ok || raw == JsBayStatus.staleValue { terminal = true }
@@ -126,7 +132,8 @@ public final class Value {
     case .closed:
       return
     case .borrowed:
-      // Borrowed callback parameters do not own a C reference. Keep the wrapper valid until scope exit, where it becomes stale.
+      // Borrowed callback parameters do not own a C reference. Keep the wrapper valid until scope exit, where it
+      // becomes stale.
       throw JsBayError.status(JsBayStatus.invalidArgument)
     case .expiredBorrowed:
       throw JsBayError.status(JsBayStatus.staleValue)
@@ -311,7 +318,8 @@ public final class Value {
       handle = 0
       return
     }
-    // Callback scopes run on the engine owner thread. A close request made in the callback marks the engine closed; then C must not be touched.
+    // Callback scopes run on the engine owner thread. A close request made in the callback marks the engine closed;
+    // then C must not be touched.
     _ = jsbay_value_release(handle)
     ownership = .closed
     handle = 0
@@ -387,8 +395,12 @@ public struct ResourceLimits: Equatable, Sendable {
     self.maxPendingTasks = maxPendingTasks
   }
 
-  fileprivate func withCLimits<R>(_ body: (UnsafePointer<jsbay_resource_limits_t>) throws -> R) throws -> R {
-    guard maxTimers >= 0, maxTsfnHandles >= 0, maxPendingCalls >= 0, maxPendingBytes >= 0, maxPendingTasks >= 0 else {
+  fileprivate func withCLimits<R>(_ body: (UnsafePointer<jsbay_resource_limits_t>) throws -> R)
+    throws -> R
+  {
+    guard maxTimers >= 0, maxTsfnHandles >= 0, maxPendingCalls >= 0, maxPendingBytes >= 0,
+      maxPendingTasks >= 0
+    else {
       throw JsBayError.status(JsBayStatus.invalidArgument)
     }
     var limits = jsbay_resource_limits_t(
@@ -574,7 +586,9 @@ public final class Engine {
 
   /// Creates an engine on the calling thread and attaches the automatic CFRunLoop driver.
   ///
-  /// Attaching to the process main run loop schedules JavaScript on the UI/main thread. Multi-instance hosts should create one engine per dedicated owner thread instead. Pass `allowMainRunLoopAttach: true` only when intentionally attaching there.
+  /// Attaching to the process main run loop schedules JavaScript on the UI/main thread. Multi-instance hosts should
+  /// create one engine per dedicated owner thread instead. Pass `allowMainRunLoopAttach: true` only when intentionally
+  /// attaching there.
   public convenience init(id: Int32, allowMainRunLoopAttach: Bool) throws {
     try self.init(id: id, limits: nil, allowMainRunLoopAttach: allowMainRunLoopAttach)
   }
@@ -759,7 +773,8 @@ public final class Engine {
     return JsException(value)
   }
 
-  /// Blocks the owner thread on the core loop. Refuses the process main thread unless this engine was created with `allowMainRunLoopAttach: true`.
+  /// Blocks the owner thread on the core loop. Refuses the process main thread unless this engine was created with
+  /// `allowMainRunLoopAttach: true`.
   public func runLoop() throws {
     try requireOpen()
     if Engine.isMainThread() && !allowMainRunLoopAttach {
@@ -808,7 +823,8 @@ public final class Engine {
     guard isOpen, Engine.live[id]?.value === self else { return false }
     return jsbay_engine_stop_loop(id)
   }
-  /// Keep-alive pause for multi-runtime Hide. Cancels pending platform schedules without detaching or clearing timers/VM state.
+  /// Keep-alive pause for multi-runtime Hide. Cancels pending platform schedules without detaching or clearing
+  /// timers/VM state.
   public func suspendLoop() -> Bool {
     Engine.liveLock.lock()
     defer { Engine.liveLock.unlock() }
@@ -921,8 +937,10 @@ public final class Engine {
     try requireOpen()
     var usage = jsbay_resource_usage_t(
       struct_size: UInt32(MemoryLayout<jsbay_resource_usage_t>.size),
-      timers: 0, tsfn_handles: 0, pending_calls: 0, native_tasks: 0, script_tasks: 0, pending_bytes: 0,
-      max_timers: 0, max_tsfn_handles: 0, max_pending_calls: 0, max_pending_bytes: 0, max_pending_tasks: 0)
+      timers: 0, tsfn_handles: 0, pending_calls: 0, native_tasks: 0, script_tasks: 0,
+      pending_bytes: 0,
+      max_timers: 0, max_tsfn_handles: 0, max_pending_calls: 0, max_pending_bytes: 0,
+      max_pending_tasks: 0)
     guard jsbay_engine_get_resource_usage(id, &usage) else {
       throw JsBayError.status(JsBayStatus.invalidArgument)
     }
@@ -944,13 +962,17 @@ public final class Engine {
   public static func globalResourceUsage() throws -> ResourceGlobalUsage {
     var usage = jsbay_resource_global_usage_t(
       struct_size: UInt32(MemoryLayout<jsbay_resource_global_usage_t>.size),
-      timers: 0, tsfn_handles: 0, pending_calls: 0, native_tasks: 0, script_tasks: 0, pending_bytes: 0,
-      max_timers: 0, max_tsfn_handles: 0, max_pending_calls: 0, max_native_tasks: 0, max_script_tasks: 0,
+      timers: 0, tsfn_handles: 0, pending_calls: 0, native_tasks: 0, script_tasks: 0,
+      pending_bytes: 0,
+      max_timers: 0, max_tsfn_handles: 0, max_pending_calls: 0, max_native_tasks: 0,
+      max_script_tasks: 0,
       max_pending_bytes: 0,
       fg_headroom_timers: 0, fg_headroom_tsfn_handles: 0, fg_headroom_pending_calls: 0,
       fg_headroom_native_tasks: 0, fg_headroom_script_tasks: 0, fg_headroom_pending_bytes: 0,
-      bg_effective_max_timers: 0, bg_effective_max_tsfn_handles: 0, bg_effective_max_pending_calls: 0,
-      bg_effective_max_native_tasks: 0, bg_effective_max_script_tasks: 0, bg_effective_max_pending_bytes: 0)
+      bg_effective_max_timers: 0, bg_effective_max_tsfn_handles: 0,
+      bg_effective_max_pending_calls: 0,
+      bg_effective_max_native_tasks: 0, bg_effective_max_script_tasks: 0,
+      bg_effective_max_pending_bytes: 0)
     guard jsbay_resource_global_usage(&usage) else {
       throw JsBayError.status(JsBayStatus.invalidArgument)
     }
@@ -979,6 +1001,8 @@ public final class Engine {
       bgEffectiveMaxNativeTasks: usage.bg_effective_max_native_tasks,
       bgEffectiveMaxScriptTasks: usage.bg_effective_max_script_tasks,
       bgEffectiveMaxPendingBytes: usage.bg_effective_max_pending_bytes)
+  }
+
   public struct MemoryUsage: Equatable {
     public var mallocCount: UInt64 = 0
     public var mallocSize: UInt64 = 0
@@ -1011,7 +1035,10 @@ public final class Engine {
     return jsbay_engine_run_gc(id)
   }
 
-  public typealias EventHandler = @convention(c) (UnsafePointer<jsbay_engine_event_t>?, UnsafeMutableRawPointer?) -> Void
+  public typealias EventHandler =
+    @convention(c) (
+      UnsafePointer<jsbay_engine_event_t>?, UnsafeMutableRawPointer?
+    ) -> Void
 
   @discardableResult public func setEventHandler(
     _ handler: EventHandler?, userData: UnsafeMutableRawPointer? = nil
@@ -1094,8 +1121,7 @@ public final class Engine {
     }
     throw JsBayError.status(Int32(status.rawValue))
   }
-  fileprivate func withUTF8<T>(_ string: String, _ body: (jsbay_utf8_t) throws -> T) rethrows -> T
-  {
+  fileprivate func withUTF8<T>(_ string: String, _ body: (jsbay_utf8_t) throws -> T) rethrows -> T {
     try Array(string.utf8).withUnsafeBufferPointer { bytes in
       try body(jsbay_utf8_t(data: bytes.baseAddress, len: bytes.count))
     }
@@ -1135,7 +1161,8 @@ private func jsbaySwiftCallback(
   defer { retained.release() }
   outValue.pointee = 0
   outException.pointee = 0
-  // The core guarantees this callback only while the engine exists. The temporary retain above also keeps the closure alive if close() is reentered.
+  // The core guarantees this callback only while the engine exists. The temporary retain above also keeps the closure
+  // alive if close() is reentered.
   guard let engine = Engine.lookup(instance), engine.isOpen else {
     return JSBAY_INSTANCE_NOT_FOUND
   }

@@ -266,6 +266,9 @@ test "prepare-ios-stdlib relinks a cached overlay when the compiler moves" {
     var old = try runPrepare(allocator, io, tool, root, old_source, overlay);
     defer old.deinit();
     try testing.expect(old.succeeded());
+    // CI restores zig-cache while setup-zig extracts Zig under a new _temp path; the
+    // previous install directory is gone. Reproduce that before rebuilding the overlay.
+    try Dir.cwd().deleteTree(io, try join(allocator, &.{ root, "old-install" }));
     const new_source = try prepareSource(allocator, io, root, "new-install", process_original, threaded_original);
     var new = try runPrepare(allocator, io, tool, root, new_source, overlay);
     defer new.deinit();
