@@ -353,7 +353,12 @@ simulator_only_smoke() {
     echo "==> Building for ${sim_label} [$BACKEND] (simulator smoke)"
     cd "$SCRIPT_DIR"
     zig build $COMMON_FLAGS -Dtarget="$sim_target" "-Dapple-sysroot=$IOS_SIM_SDK" --prefix "$BUILD_DIR/zig-prefix"
-    archive="$BUILD_DIR/libjsbay-ios-sim-smoke.a"
+    # Keep arch in the filename so distribution fixture otool minos rules (*ios-sim-arm64* → 14.0, else 13.0) stay honest.
+    if [ "$machine" = x86_64 ]; then
+        archive="$BUILD_DIR/libjsbay-ios-sim-x86_64-smoke.a"
+    else
+        archive="$BUILD_DIR/libjsbay-ios-sim-arm64-smoke.a"
+    fi
     normalize_archive "$BUILD_DIR/zig-prefix/lib/libjsbay.a" "$archive"
     verify_archive_minos "$archive" "$sim_minos"
     verify_jsc_baseline_imports "$archive"
