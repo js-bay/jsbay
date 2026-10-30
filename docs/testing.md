@@ -4,16 +4,16 @@
 
 CI has four layers. The workflow files define the commands; a configured job is not evidence that a device test has run.
 
-PR CI uses **aggressive aggregation: one large job per platform** (`linux`, `macos`, `windows`) so a pull request shows three checks instead of a large matrix.
+PR CI keeps **aggressive aggregation** (few coherent jobs, not a micro-matrix). Modest splits exist only where they cut wall-clock: Linux governance vs engine backends in parallel, and iOS Simulator peeled from macOS desktop. Zig `.zig-cache` is restored via [`setup-zig`](../.github/actions/setup-zig/action.yml) on every job.
 
 | Layer | Entry | Coverage |
 | --- | --- | --- |
-| Pull requests and main | [`ci.yml`](../.github/workflows/ci.yml) | One job per platform. Linux: privacy, actionlint, tools/packages, portable SDK quality, quickjs_ng + quickjs engine/consumers, GC stress, Inspector e2e, upstream regression, Android ART smoke. macOS: tools/packages, Apple SDK quality, quickjs_ng + jsc engine/consumers, Android AAR, Inspector e2e, iOS Simulator smoke. Windows: quickjs_ng engine and consumers. |
+| Pull requests and main | [`ci.yml`](../.github/workflows/ci.yml) | `linux` governance (privacy, actionlint, tools/packages, portable SDK quality). `linux-engine` matrix (`quickjs_ng`, `quickjs`): engine/consumers, Test262, Inspector/GC on ng. `linux-android` ART smoke. `macos` desktop (tools/packages, Apple SDK quality, quickjs_ng + jsc, Inspector). `macos-ios` Simulator smoke. `macos-android` AAR. `windows` quickjs_ng. Upstream QuickJS regression runs on **main pushes** (and daily extended), not every PR. |
 | Daily and manual extension | [`extended-tests.yml`](../.github/workflows/extended-tests.yml) | One job per runner image (`linux`, `linux-arm`, `macos`, `macos-intel`, `windows`, `windows-arm`): native backends/optimize variants, stress/GC/OOM, zev contention/TSan, Android ART API 24+35 (linux), diagnostic/benchmark contracts (macos) |
 | Release acceptance | [`release.yml`](../.github/workflows/release.yml) | L1 desktop libs one job per runner image; L2 Apple backends sequential on macos; L2 Android kept as its own skippable job; assemble + tag publish stay separate. Consumers, licenses, ABI, version, commit, backend and checksums checked |
 | Provisioned devices | [`device-tests.yml`](../.github/workflows/device-tests.yml) | Explicitly dispatched Android / iOS / Harmony on distinct self-hosted runners (already one job per platform choice; not further merged) |
 
-The reusable [`mobile-tests.yml`](../.github/workflows/mobile-tests.yml) still owns Android Emulator / iOS Simulator definitions for manual `workflow_dispatch`. PR CI and extended `linux` inline the Android ART steps; PR `macos` inlines iOS Simulator. An Emulator result does not replace ARM64 Android hardware, and a Simulator result does not replace an iPhone result. Harmony host N-API tests do not establish that a device Worker can load the HAR.
+The reusable [`mobile-tests.yml`](../.github/workflows/mobile-tests.yml) still owns Android Emulator / iOS Simulator definitions for manual `workflow_dispatch`. PR CI and extended `linux` inline the Android ART steps; PR `macos-ios` owns iOS Simulator smoke. An Emulator result does not replace ARM64 Android hardware, and a Simulator result does not replace an iPhone result. Harmony host N-API tests do not establish that a device Worker can load the HAR.
 
 [`sdk-quality.yml`](../.github/workflows/sdk-quality.yml) is dispatch-only for official Harmony lint on a provisioned runner; portable and Apple SDK quality checks run inside CI's platform jobs.
 

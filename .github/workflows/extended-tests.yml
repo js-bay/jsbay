@@ -54,6 +54,18 @@ jobs:
           zig build test-engine -Dbackend=quickjs -Doptimize=ReleaseSafe --summary all
           bash tests/ci/run-desktop-consumers.sh quickjs
 
+      - name: Upstream engine regression (quickjs_ng)
+        run: |
+          set -euo pipefail
+          bash tests/qjs-regression/run.sh --engine quickjs_ng
+          bash tests/qjs-regression/run.sh --engine quickjs_ng --inspector off
+
+      - name: Upstream engine regression (quickjs)
+        run: |
+          set -euo pipefail
+          bash tests/qjs-regression/run.sh --engine quickjs
+          bash tests/qjs-regression/run.sh --engine quickjs --inspector off
+
       - name: Stress — concurrency and lifecycle (quickjs_ng)
         run: zig build test-engine -Dbackend=quickjs_ng -Dstress-tests=true --summary all
 

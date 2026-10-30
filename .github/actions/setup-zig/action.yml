@@ -5,6 +5,10 @@ inputs:
     description: Zig version, e.g. 0.17.0
     required: true
     default: "0.17.0"
+  cache-build:
+    description: Restore/save Zig .zig-cache build artifacts (content-addressed; safe across backends)
+    required: false
+    default: "true"
 runs:
   using: composite
   steps:
@@ -146,3 +150,21 @@ runs:
           ls -la "${{ steps.zig.outputs.dest }}"
           exit 1
         fi
+
+    - name: Cache Zig build artifacts
+      if: inputs.cache-build == 'true'
+      uses: actions/cache@v5
+      with:
+        # Root + package local caches (Zig 0.17). Missing paths are skipped on save.
+        path: |
+          .zig-cache
+          libs/zev/.zig-cache
+          libs/js_event_loop/.zig-cache
+          libs/inspector/.zig-cache
+          libs/inspector_transport/.zig-cache
+          libs/bytecode_cache/.zig-cache
+          tools/.zig-cache
+        key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-${{ hashFiles('build.zig', 'build.zig.zon', 'libs/*/build.zig', 'libs/*/build.zig.zon', 'vendor/*.patch', '.gitmodules') }}
+        restore-keys: |
+          zig-build-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}-
+
