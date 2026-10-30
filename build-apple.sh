@@ -324,8 +324,6 @@ link_simulator_smoke() {
     if [ "$owned_sim" -eq 1 ]; then
         xcrun simctl shutdown "$udid" 2>/dev/null || true
         xcrun simctl delete "$udid" 2>/dev/null || true
-    else
-        xcrun simctl shutdown "$udid" 2>/dev/null || true
     fi
     if [ "$sim_rc" -ne 0 ]; then
         return "$sim_rc"

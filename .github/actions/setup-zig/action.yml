@@ -156,7 +156,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # The first `zig build` in a job compiles the build runner into the global cache. That cost showed up as ~80s inside whichever step ran first (privacy on Linux, test-tools on macOS) and is not covered by .zig-cache.
+        # The first `zig build` in a job compiles the build runner into the global cache, which .zig-cache does not cover.
         cache_dir="${GITHUB_WORKSPACE}/.zig-global-cache"
         mkdir -p "$cache_dir"
         echo "ZIG_GLOBAL_CACHE_DIR=${cache_dir}" >> "$GITHUB_ENV"

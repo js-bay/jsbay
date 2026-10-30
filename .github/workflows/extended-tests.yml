@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+env:
+  # Same .NET orphan prevention as ci.yml: keep MSBuild/Roslyn from lingering after jobs that invoke dotnet.
+  MSBUILDDISABLENODEREUSE: "1"
+  UseSharedCompilation: "false"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
 concurrency:
   group: extended-${{ github.ref }}
   cancel-in-progress: true
@@ -160,6 +167,13 @@ jobs:
             ANDROID_R8_TEST_REMOTE='/data/local/tmp/jsbay-android-r8'
             bash tests/ci/run-android-device-smoke.sh
 
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
+
   linux-arm:
     name: linux-arm
     runs-on: ubuntu-24.04-arm
@@ -204,6 +218,13 @@ jobs:
       - name: zev wait/notification contention
         working-directory: libs/zev
         run: zig build stress --summary all
+
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
 
   macos:
     name: macos
@@ -319,6 +340,13 @@ jobs:
           ./build-apple.sh quickjs_ng
           grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
 
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
+
   macos-intel:
     name: macos-intel
     runs-on: macos-26-intel
@@ -357,6 +385,13 @@ jobs:
         working-directory: libs/zev
         run: zig build stress --summary all
 
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
+
   windows:
     name: windows
     runs-on: windows-2025
@@ -387,6 +422,13 @@ jobs:
         working-directory: libs/zev
         run: zig build stress --summary all
 
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
+
   windows-arm:
     name: windows-arm
     runs-on: windows-11-arm
@@ -412,3 +454,10 @@ jobs:
           set -euo pipefail
           zig build test-engine -Dbackend=quickjs_ng -Doptimize=Debug -Dinspector-transport=false --summary all
           bash tests/ci/run-desktop-consumers.sh quickjs_ng
+
+      - name: Shut down .NET build servers
+        if: ${{ !cancelled() }}
+        run: |
+          if command -v dotnet >/dev/null 2>&1; then
+            dotnet build-server shutdown
+          fi
