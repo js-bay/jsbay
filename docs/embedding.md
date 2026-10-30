@@ -2,7 +2,49 @@
 
 ## Backend selection
 
-Build with `-Dbackend=quickjs`, `-Dbackend=jsc`, or `-Dbackend=quickjs_ng`. Product defaults are `jsc` for Apple packaging and classic `quickjs` everywhere else; `quickjs_ng` is optional. All backends support engine lifecycle, ordinary evaluation, values, host objects, timers, references, finalizers, explicit GC, and the common C ABI.
+Single engine: `-Dbackend=quickjs`, `-Dbackend=jsc`, or `-Dbackend=quickjs_ng`. Product defaults are `jsc` for Apple packaging and classic `quickjs` everywhere else; `quickjs_ng` is optional.
+
+Multi-engine pack: `-Dbackends=` with a comma-separated list (first entry is the pack primary). Do not pass `-Dbackend` and `-Dbackends` together. `quickjs` and `quickjs_ng` cannot share a pack (C symbol collision at link). Packing `jsc` needs an Apple target.
+
+Lifecycle, eval, values, host objects, timers, references, finalizers, GC, and the C ABI are the same across backends. After link:
+
+- `jsbay_library_backend` / `jsbay_library_capabilities` — primary backend and its capability bits
+- `jsbay_available_backends` — every engine in the artifact
+- `jsbay_engine_create_with_options` — pick a packed backend at create time (`JSBAY_BACKEND_PRIMARY` / 0 = primary). This is not a hot-switch of a live instance.
+
+### Non-primary (packed-alt) Value surface
+
+Non-primary instances use erased handles plus dispatch. Typed Value coverage that matches primary:
+
+`evaluate` (owned handle), `retain` / `release`, `type`, `to_bool` / `to_number` / `to_utf8` / `to_json`, `get` / `set` / `has` / `delete` / `keys` / `instanceof`, `call` / `construct`, `new_*` (ArrayBuffer / JSON / Error), `global`, `copy_buffer`.
+
+Packed handles set the high bit (`packed_api_value`) so they do not collide with primary `api_value` ids.
+
+Still primary-only (non-primary returns `JSBAY_API_UNSUPPORTED` or refuses the option):
+
+- `evaluate` with non-empty bytecode cache fields (empty / null `EvalOptions` is fine)
+- bind
+- inspector Value paths
+- loop `attach` / `detach` / `run` on packed-alt
+
+### Verify on Mac (NG+JSC)
+
+```bash
+zig build test -Dbackends=quickjs_ng,jsc -Dtest-filter="create_with_options"
+zig build test -Dbackends=quickjs_ng,jsc -Dtest-filter="packed_alt"
+zig build test -Dbackends=quickjs_ng,jsc -Dtest-filter="packed-alt"
+zig build test -Dbackends=quickjs_ng,jsc -Dtest-filter="timer"
+```
+
+### Verify on Linux (single pack)
+
+Linux cannot pack JSC (or both QuickJS variants). Use `-Dbackends=quickjs_ng` (or `quickjs`). Forced primary-tag `packed_alt` tests exercise the dispatch path without a second engine:
+
+```bash
+zig build test -Dbackends=quickjs_ng -Dtest-filter="packed"
+zig build test -Dbackends=quickjs_ng -Dtest-filter="create_with_options"
+zig build test -Dbackends=quickjs_ng -Dtest-filter="adversarial"
+```
 
 | Capability | JSC | QuickJS | QuickJS-NG |
 | --- | --- | --- | --- |

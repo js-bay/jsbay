@@ -99,13 +99,13 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
             // Safe: the two extern structs have identical layout.
             const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
-            qjs_mod.qjsInstallInterruptHandler(inst.runtime, qjs_state);
+            qjs_mod.qjsInstallInterruptHandler(inst.monoRuntime().?, qjs_state);
         },
         .jsc => {
             const jsc_mod = @import("../backend/jsc.zig");
             const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
             // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
-            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.ctx));
+            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.monoCtx().?));
             jsc_mod.jscInstallInterruptHandler(group, jsc_state);
         },
     }
@@ -124,11 +124,11 @@ pub fn deinit(instance_id: i32) bool {
         switch (backend.active_backend) {
             .quickjs, .quickjs_ng => {
                 const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsUninstallInterruptHandler(inst.runtime);
+                qjs_mod.qjsUninstallInterruptHandler(inst.monoRuntime().?);
             },
             .jsc => {
                 const jsc_mod = @import("../backend/jsc.zig");
-                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.ctx));
+                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(inst.monoCtx().?));
                 jsc_mod.jscUninstallInterruptHandler(group);
             },
         }
@@ -250,11 +250,11 @@ pub fn runGc(instance_id: i32) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsRunGc(inst.runtime);
+            qjs_mod.qjsRunGc(inst.monoRuntime().?);
         },
         .jsc => {
             const jsc_mod = @import("../backend/jsc.zig");
-            jsc_mod.jscRunGc(inst.ctx);
+            jsc_mod.jscRunGc(inst.monoCtx().?);
         },
     }
     return true;
@@ -266,7 +266,7 @@ pub fn setMemoryLimit(instance_id: i32, bytes: u64) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsSetMemoryLimit(inst.runtime, @intCast(bytes));
+            qjs_mod.qjsSetMemoryLimit(inst.monoRuntime().?, @intCast(bytes));
         },
         .jsc => {
             // No public JSC heap-cap API. Do not claim an unenforced cap.
@@ -325,11 +325,11 @@ pub fn noteIdle(instance_id: i32) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsRunGc(live.runtime);
+            qjs_mod.qjsRunGc(live.monoRuntime().?);
         },
         .jsc => {
             const jsc_mod = @import("../backend/jsc.zig");
-            jsc_mod.jscRunGc(live.ctx);
+            jsc_mod.jscRunGc(live.monoCtx().?);
         },
     }
     return true;
@@ -379,7 +379,7 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            const snap = qjs_mod.qjsMemoryUsage(inst.runtime);
+            const snap = qjs_mod.qjsMemoryUsage(inst.monoRuntime().?);
             return .{
                 .malloc_count = snap.malloc_count,
                 .malloc_size = snap.malloc_size,

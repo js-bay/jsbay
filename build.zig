@@ -10,6 +10,100 @@ pub const Backend = enum {
     jsc,
 };
 
+/// Bitmask for build_options.packed_backend_bits (stable for Zig comptime).
+pub const PackedBit = struct {
+    pub const quickjs_ng: u32 = 1 << 0;
+    pub const quickjs: u32 = 1 << 1;
+    pub const jsc: u32 = 1 << 2;
+};
+
+fn backendBit(tag: Backend) u32 {
+    return switch (tag) {
+        .quickjs_ng => PackedBit.quickjs_ng,
+        .quickjs => PackedBit.quickjs,
+        .jsc => PackedBit.jsc,
+    };
+}
+
+fn parseBackendName(name: []const u8) ?Backend {
+    if (std.mem.eql(u8, name, "quickjs_ng")) return .quickjs_ng;
+    if (std.mem.eql(u8, name, "quickjs")) return .quickjs;
+    if (std.mem.eql(u8, name, "jsc")) return .jsc;
+    return null;
+}
+
+const ResolvedBackends = struct {
+    /// Engines linked into this artifact (explicit -Dbackends=… or single -Dbackend=…).
+    list: []const Backend,
+    /// Temporary monomorphic default for the shared layer (first packed / -Dbackend=).
+    primary: Backend,
+    bits: u32,
+};
+
+/// Resolve pack set. `-Dbackends=` is the multi-pack selector (no implicit quickjs_ng).
+/// `-Dbackend=` remains the single-engine shorthand (default quickjs to match product builds).
+fn resolveBackends(b: *std.Build, os: std.Target.Os.Tag) ResolvedBackends {
+    const backends_str = b.option([]const u8, "backends", "Comma-separated engines to pack into one artifact (e.g. quickjs_ng,jsc). Do not pass with -Dbackend.");
+    const backend_opt = b.option(Backend, "backend", "Single JS engine backend shorthand (quickjs_ng, quickjs, or jsc). Do not pass with -Dbackends.");
+
+    if (backends_str) |raw| {
+        if (backend_opt != null) {
+            std.process.fatal("Pass either -Dbackends=… or -Dbackend=…, not both", .{});
+        }
+        var buf: [8]Backend = undefined;
+        var n: usize = 0;
+        var seen_qjs = false;
+        var seen_ng = false;
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |part_raw| {
+            const part = std.mem.trim(u8, part_raw, " \t");
+            if (part.len == 0) continue;
+            const tag = parseBackendName(part) orelse {
+                std.process.fatal("Unknown backend in -Dbackends=: '{s}' (expected quickjs_ng, quickjs, or jsc)", .{part});
+            };
+            // Dedup
+            var dup = false;
+            for (buf[0..n]) |existing| {
+                if (existing == tag) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            if (n >= buf.len) std.process.fatal("-Dbackends=: too many backends", .{});
+            buf[n] = tag;
+            n += 1;
+            if (tag == .quickjs) seen_qjs = true;
+            if (tag == .quickjs_ng) seen_ng = true;
+        }
+        if (n == 0) {
+            std.process.fatal("-Dbackends= is empty; list at least one of: quickjs_ng, quickjs, jsc", .{});
+        }
+        if (seen_qjs and seen_ng) {
+            std.process.fatal(
+                \\Cannot pack both 'quickjs' and 'quickjs_ng' in one artifact: they export the same JS_* C symbols (JS_NewRuntime, JS_Eval, …) and would collide at link time.
+                \\Pick one QuickJS-family engine, e.g. -Dbackends=quickjs_ng,jsc or -Dbackends=quickjs,jsc.
+            , .{});
+        }
+        var bits: u32 = 0;
+        for (buf[0..n]) |tag| {
+            if (tag == .jsc and os != .macos and os != .ios) {
+                std.process.fatal(
+                    \\-Dbackends=… includes 'jsc', which requires an Apple target (macOS/iOS) to link JavaScriptCore.framework.
+                    \\This host OS cannot pack jsc. Use -Dbackends=quickjs_ng (or quickjs) here, or build on/for Apple with jsc included.
+                , .{});
+            }
+            bits |= backendBit(tag);
+        }
+        const list = b.allocator.dupe(Backend, buf[0..n]) catch @panic("OOM resolving -Dbackends=");
+        return .{ .list = list, .primary = list[0], .bits = bits };
+    }
+
+    const primary = backend_opt orelse .quickjs;
+    const list = b.allocator.dupe(Backend, &[_]Backend{primary}) catch @panic("OOM resolving -Dbackend=");
+    return .{ .list = list, .primary = primary, .bits = backendBit(primary) };
+}
+
 /// Link the public module and core with the compiler configuration they require.
 pub fn linkConsumer(consumer: *std.Build.Step.Compile, dependency: *std.Build.Dependency) void {
     const core = dependency.artifact("jsbay");
@@ -58,7 +152,11 @@ pub fn build(b: *std.Build) void {
     run_tool_tests.step.dependOn(&install_tool.step);
     b.step("test-tools", "Run repository-tool tests").dependOn(&run_tool_tests.step);
 
-    const backend = b.option(Backend, "backend", "JS engine backend (quickjs, quickjs_ng, or jsc)") orelse .quickjs;
+    const resolved = resolveBackends(b, target.result.os.tag);
+    const backend = resolved.primary;
+    const packed_backends = resolved.list;
+    const packed_backend_bits = resolved.bits;
+    const multi_pack = packed_backends.len > 1;
     const quickjs_gc_stress = b.option(bool, "quickjs-gc-stress", "Force a QuickJS GC before every allocation (QuickJS-NG or QuickJS only)") orelse false;
     const shared = b.option(bool, "shared", "Build shared library instead of static") orelse false;
     const apple_sysroot = b.option([]const u8, "apple-sysroot", "Apple SDK sysroot path for cross-compilation");
@@ -105,15 +203,25 @@ pub fn build(b: *std.Build) void {
     const bytecode_cache = bytecode_cache_dep.module("bytecode_cache");
 
     // The checked-in gitlinks are copied into the build cache before patching, leaving both the submodule checkout and an imported source snapshot intact.
-    const qjs_root: ?std.Build.LazyPath = switch (backend) {
+    // Prepare QuickJS tree if any packed engine needs it (first QJS-family wins for translate-c).
+    var qjs_family: ?Backend = null;
+    for (packed_backends) |tag| {
+        if (tag == .quickjs_ng or tag == .quickjs) {
+            qjs_family = tag;
+            break;
+        }
+    }
+    const qjs_root: ?std.Build.LazyPath = if (qjs_family) |fam| switch (fam) {
         .quickjs_ng => preparePatchedQuickJsNg(b, tool),
         .quickjs => preparePatchedQuickJs(b, tool),
         .jsc => null,
-    };
+    } else null;
 
     // Build options module passed to source code
     const build_options = b.addOptions();
     build_options.addOption(Backend, "backend", backend);
+    build_options.addOption(u32, "packed_backend_bits", packed_backend_bits);
+    build_options.addOption(bool, "multi_pack", multi_pack);
     build_options.addOption(bool, "stress_tests", stress_tests);
     build_options.addOption(bool, "inspector", inspector_enabled);
     build_options.addOption(bool, "inspector_transport", inspector_transport_enabled);
@@ -129,7 +237,7 @@ pub fn build(b: *std.Build) void {
     // Translate quickjs.h once and import it as "qjs".
     const qjs_mod = if (qjs_root) |root| blk: {
         const android = target.result.abi.isAndroid();
-        const header = if (backend == .quickjs_ng)
+        const header = if (qjs_family == .quickjs_ng)
             root.path(b, "quickjs.h")
         else
             b.path("src/backend/quickjs/quickjs_shim.h");
@@ -229,7 +337,7 @@ pub fn build(b: *std.Build) void {
     lib_module.addImport("inspector_transport", inspector_transport);
     lib_module.addImport("bytecode_cache", bytecode_cache);
     addPlatformCompatSources(b, lib_module);
-    addBackendSources(b, lib_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, lib_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
 
     lib_module.linkSystemLibrary("m", .{});
     const lib = b.addLibrary(.{
@@ -295,7 +403,7 @@ pub fn build(b: *std.Build) void {
     if (qjs_mod) |qjs| test_module.addImport("qjs", qjs);
 
     addPlatformCompatSources(b, test_module);
-    addBackendSources(b, test_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, test_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
 
     const unit_tests = b.addTest(.{
         .root_module = test_module,
@@ -307,6 +415,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
     b.step("test-engine", "Run engine tests without independent package suites").dependOn(&run_unit_tests.step);
     b.step("test-compile", "Compile engine tests without running them").dependOn(&unit_tests.step);
+
     if (!stress_tests) {
         const zev_tests = b.addTest(.{
             .root_module = b.createModule(.{
@@ -391,7 +500,7 @@ pub fn build(b: *std.Build) void {
     conformance_module.addImport("bytecode_cache", bytecode_cache);
     if (qjs_mod) |qjs| conformance_module.addImport("qjs", qjs);
     addPlatformCompatSources(b, conformance_module);
-    addBackendSources(b, conformance_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, conformance_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
     const conformance_library = b.addLibrary(.{
         .name = "jsbay_test262",
         .root_module = conformance_module,
@@ -454,7 +563,7 @@ pub fn build(b: *std.Build) void {
     if (qjs_mod) |qjs| bench_module.addImport("qjs", qjs);
 
     addPlatformCompatSources(b, bench_module);
-    addBackendSources(b, bench_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, bench_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
 
     const bench_exe = b.addExecutable(.{
         .name = b.fmt("bench-{s}", .{@tagName(backend)}),
@@ -486,7 +595,7 @@ pub fn build(b: *std.Build) void {
     if (qjs_mod) |qjs| demo_module.addImport("qjs", qjs);
 
     addPlatformCompatSources(b, demo_module);
-    addBackendSources(b, demo_module, backend, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
+    addBackendSources(b, demo_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan);
 
     const demo_exe = b.addExecutable(.{
         .name = b.fmt("inspector-demo-{s}", .{@tagName(backend)}),
@@ -634,20 +743,16 @@ fn preparePatchedQuickJs(b: *std.Build, tool: *std.Build.Step.Compile) std.Build
     return out;
 }
 
-/// Adds the selected engine's C sources / system libraries to `m`.
-fn addBackendSources(
+/// Adds one engine's C sources / system libraries to `m`.
+fn addOneBackendSources(
     b: *std.Build,
     m: *std.Build.Module,
     backend: Backend,
     quickjs_gc_stress: bool,
     os: std.Target.Os.Tag,
     qjs_root: ?std.Build.LazyPath,
-    inspector_enabled: bool,
-    heap_snapshot: bool,
     asan: bool,
 ) void {
-    m.addCMacro("JSBAY_INSPECTOR", if (inspector_enabled) "1" else "0");
-    m.addCMacro("JSBAY_HEAP_SNAPSHOT", if (heap_snapshot) "1" else "0");
     switch (backend) {
         .quickjs_ng => addQuickJsNgSources(b, m, quickjs_gc_stress, qjs_root.?, asan),
         .quickjs => addQuickJsSources(b, m, quickjs_gc_stress, qjs_root.?, asan),
@@ -666,6 +771,25 @@ fn addBackendSources(
                 m.linkSystemLibrary("JavaScriptCore", .{});
             }
         },
+    }
+}
+
+/// Adds every packed engine's sources (multi-pack) or the single selected backend.
+fn addBackendSources(
+    b: *std.Build,
+    m: *std.Build.Module,
+    engines: []const Backend,
+    quickjs_gc_stress: bool,
+    os: std.Target.Os.Tag,
+    qjs_root: ?std.Build.LazyPath,
+    inspector_enabled: bool,
+    heap_snapshot: bool,
+    asan: bool,
+) void {
+    m.addCMacro("JSBAY_INSPECTOR", if (inspector_enabled) "1" else "0");
+    m.addCMacro("JSBAY_HEAP_SNAPSHOT", if (heap_snapshot) "1" else "0");
+    for (engines) |tag| {
+        addOneBackendSources(b, m, tag, quickjs_gc_stress, os, qjs_root, asan);
     }
 }
 

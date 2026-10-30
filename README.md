@@ -42,7 +42,7 @@ zig build -Dbackend=quickjs
 zig build test
 ```
 
-Supported backend tags are `quickjs`, `quickjs_ng`, and `jsc`. Defaults: Apple packaging uses `jsc`; other product builds use `quickjs`. Pass `-Dbackend=quickjs_ng` or `-Dbackend=jsc` when you want those variants. Apple packaging also accepts `JSBAY_APPLE_BACKEND` (see [Apple SDK](sdk/apple/README.md)); set `QUICKJS_BACKEND` for Android / Harmony packaging scripts.
+Supported backend tags are `quickjs`, `quickjs_ng`, and `jsc`. Defaults: Apple packaging uses `jsc`; other product builds use `quickjs`. Pass `-Dbackend=quickjs_ng` or `-Dbackend=jsc` when you want those variants. Pack several engines with `-Dbackends=` (comma-separated; first is primary; create-time select, not hot-switch) — see [backend selection](docs/embedding.md#backend-selection). Apple packaging also accepts `JSBAY_APPLE_BACKEND` (see [Apple SDK](sdk/apple/README.md)); set `QUICKJS_BACKEND` for Android / Harmony packaging scripts.
 
 The public C header is [`include/jsbay.h`](include/jsbay.h). Create and use each engine on one owner thread, release every owned `jsbay_value_t`, and destroy the engine on that same thread. `jsbay_engine_request_interrupt` and `jsbay_engine_stop_loop` are the ordinary cross-thread controls.
 

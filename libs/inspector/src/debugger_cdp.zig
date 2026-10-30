@@ -132,7 +132,7 @@ pub fn Module(comptime Host: type) type {
             // Re-read sessions on the owner. A late static task for an old state can only cool its own instance, and never detaches an active debugger.
             if (pending.debugger_cooldown and !state_mod.hasEnabledDebuggerSession(state)) debugger_mod.coolDown(state.instance_id);
             const instance = instance_map.getInstance(state.instance_id) orelse return;
-            setAsyncStackDepthOnOwner(state.instance_id, instance.runtime, pending.depth);
+            setAsyncStackDepthOnOwner(state.instance_id, instance.monoRuntime().?, pending.depth);
         }
 
         // Called by the per-instance owner tick as the allocation-free fallback for a session-close reconciliation that could not be posted from the transport thread. It is harmless when no inspector or no change is pending.
@@ -530,7 +530,7 @@ pub fn Module(comptime Host: type) type {
                     json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Engine is not available");
                     return;
                 };
-                switch (enableDebuggerSessionOnOwner(task.state, task.session_id, @ptrCast(@constCast(instance.runtime)))) {
+                switch (enableDebuggerSessionOnOwner(task.state, task.session_id, @ptrCast(@constCast(instance.monoRuntime().?)))) {
                     .enabled => {},
                     .session_unavailable => {
                         json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Debugger session is not available");
@@ -905,7 +905,7 @@ pub fn Module(comptime Host: type) type {
                 try testing.expect(engine.create(instance_id, .{}));
                 defer engine.destroy(instance_id);
                 const instance = instance_map.getInstance(instance_id) orelse return error.MissingEngine;
-                _ = debugger_mod.attach(instance_id, @ptrCast(@constCast(instance.runtime)));
+                _ = debugger_mod.attach(instance_id, @ptrCast(@constCast(instance.monoRuntime().?)));
 
                 var state = InspectorState{
                     .instance_id = instance_id,

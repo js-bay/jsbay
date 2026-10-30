@@ -65,7 +65,7 @@ test "Global survives unrelated eval and still yields its content" {
             // Run other JS that allocates memory and triggers GC heuristics.
             try helpers.evalOk(id, "var arr = []; for (var i=0;i<1000;i++) arr.push({n:i});");
             // Trigger GC explicitly on QuickJS; no-op on JSC.
-            const inst_runtime = (instance_map.getInstance(id) orelse return error.NoInstance).runtime;
+            const inst_runtime = (instance_map.getInstance(id) orelse return error.NoInstance).monoRuntime() orelse return error.NoRuntime;
             ActiveEngine.runGc(inst_runtime);
 
             const got = g.get() orelse return error.GetReturnedNull;

@@ -28,6 +28,20 @@ pub const RefBookkeeping = struct {
     mutex: sync.Mutex = .{},
 };
 
+pub const EngineHandles = union(enum) {
+    /// Pack primary — typed ActiveEngine handles used by the monomorphic shared layers.
+    mono: struct {
+        runtime: ActiveEngine.Runtime,
+        ctx: ActiveEngine.Context,
+    },
+    /// Non-primary packed backend — erased pointers; lifecycle via `backend_dispatch`.
+    packed_alt: struct {
+        tag: backend.BackendType,
+        runtime_addr: usize,
+        ctx_addr: usize,
+    },
+};
+
 pub const EngineInstance = struct {
     /// Called after registry removal and all admitted users have drained.
     pub fn deinitSynchronization(self: *EngineInstance) void {
@@ -38,12 +52,36 @@ pub const EngineInstance = struct {
         self.ref_bookkeeping.mutex.deinit();
     }
 
+    pub fn backendTag(self: *const EngineInstance) backend.BackendType {
+        return switch (self.engine_handles) {
+            .mono => backend.active_backend,
+            .packed_alt => |a| a.tag,
+        };
+    }
+
+    pub fn isPrimaryBackend(self: *const EngineInstance) bool {
+        return self.engine_handles == .mono;
+    }
+
+    pub fn monoCtx(self: *const EngineInstance) ?ActiveEngine.Context {
+        return switch (self.engine_handles) {
+            .mono => |m| m.ctx,
+            .packed_alt => null,
+        };
+    }
+
+    pub fn monoRuntime(self: *const EngineInstance) ?ActiveEngine.Runtime {
+        return switch (self.engine_handles) {
+            .mono => |m| m.runtime,
+            .packed_alt => null,
+        };
+    }
+
     instance_id: i32,
     /// Changes on every successful publication, including when an id is reused. Asynchronous producers must capture this with `dispatch.captureInstanceToken` before starting work and use it when posting the result.
     generation: u64 = 0,
     resources: *@import("resource_limits.zig").Budget,
-    runtime: ActiveEngine.Runtime,
-    ctx: ActiveEngine.Context,
+    engine_handles: EngineHandles,
     loop: *event_loop.Driver,
     timers: timers.TimerRegistry,
     task_queue: TaskQueue = .{},
@@ -156,17 +194,24 @@ pub fn remove(instance_id: i32) ?*EngineInstance {
 }
 
 pub const InstancePtrs = struct {
+    /// Valid ActiveEngine context only when `backend_tag == active_backend` (mono handle).
     ctx: ActiveEngine.Context,
     loop: *event_loop.Driver,
+    backend_tag: backend.BackendType = backend.active_backend,
 };
 
 pub fn getPtrs(instance_id: i32) ?InstancePtrs {
     mutex.lock();
     defer mutex.unlock();
     const inst = instances.get(instance_id) orelse return null;
-    return .{
-        .ctx = inst.ctx,
-        .loop = inst.loop,
+    return switch (inst.engine_handles) {
+        .mono => |m| .{ .ctx = m.ctx, .loop = inst.loop, .backend_tag = backend.active_backend },
+        // Existence must succeed for packed-alt; ctx is a typed placeholder and must not be used with ActiveEngine.* — use backend_dispatch instead.
+        .packed_alt => |a| .{
+            .ctx = @ptrFromInt(0),
+            .loop = inst.loop,
+            .backend_tag = a.tag,
+        },
     };
 }
 
@@ -192,7 +237,14 @@ pub fn beginControlPlane(instance_id: i32) ?ControlLease {
     inst.dispatch_mutex.unlock();
     return .{
         .inst = inst,
-        .ptrs = .{ .ctx = inst.ctx, .loop = inst.loop },
+        .ptrs = switch (inst.engine_handles) {
+            .mono => |m| .{ .ctx = m.ctx, .loop = inst.loop, .backend_tag = backend.active_backend },
+            .packed_alt => |a| .{
+                .ctx = @ptrFromInt(0),
+                .loop = inst.loop,
+                .backend_tag = a.tag,
+            },
+        },
     };
 }
 

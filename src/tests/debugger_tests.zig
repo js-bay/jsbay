@@ -155,7 +155,7 @@ fn waitPaused(id: i32) bool {
 /// Direct debugger API tests deliberately opt into the otherwise cold debugger binding. Production instances are armed by `Debugger.enable`.
 fn attachDebuggerForTest(id: i32) !void {
     const instance = instance_map.getInstance(id) orelse return error.MissingEngine;
-    _ = debugger_mod.attach(id, @ptrCast(@constCast(instance.runtime)));
+    _ = debugger_mod.attach(id, @ptrCast(@constCast(instance.monoRuntime().?)));
 }
 
 const NativeFrameDebuggerToggle = struct {
@@ -167,7 +167,7 @@ const NativeFrameDebuggerToggle = struct {
         const self = active_native_frame_debugger_toggle orelse return .undefined_val;
         if (instance_id != self.id) return .undefined_val;
         const instance = instance_map.getInstance(instance_id) orelse return .undefined_val;
-        self.attach_ok.store(debugger_mod.attach(instance_id, @ptrCast(@constCast(instance.runtime))), .seq_cst);
+        self.attach_ok.store(debugger_mod.attach(instance_id, @ptrCast(@constCast(instance.monoRuntime().?))), .seq_cst);
         self.breakpoint_id.store(debugger_mod.setBreakpoint(instance_id, "native-frame-attach.js", 3), .seq_cst);
         return .undefined_val;
     }
