@@ -94,7 +94,15 @@ From the repository root, `./build-apple.sh` produces the XCFramework. The defau
 
 `JSBAY_SOURCE_ROOT`, when used by host or packaging scripts, must point at this repository root. Leave it unset when you run the in-tree scripts from that root; do not hard-code a machine-local path.
 
-On newer iPhoneOS SDKs whose `libobjc.A.tbd` lists only `arm64e-ios`, `build-apple.sh` skips the Zig iOS consumer probe by default and prints a WARN; clang `link_consumer_probes` still run. Force the Zig probe with `JSBAY_FORCE_IOS_ZIG_CONSUMER=1`, or skip it explicitly with `JSBAY_SKIP_IOS_ZIG_CONSUMER=1` (legacy `JS_BAY_*` names are accepted).
+### arm64e-only iPhoneOS SDKs (Zig vs clang consumers)
+
+On newer iPhoneOS SDKs whose `libobjc.A.tbd` lists only `arm64e-ios`, Zig 0.17 cannot link an `aarch64-ios` consumer against that TBD. `build-apple.sh` therefore **skips the Zig iOS consumer by default** and prints a `WARN`. That skip is expected success, not a build failure.
+
+- **Clang consumers still count:** `link_consumer_probes` (clang) still run and must pass. Local and CI Apple builds are green when clang probes pass, even if the Zig iOS consumer was skipped.
+- **Zig consumer optional on arm64e-only SDKs:** force it with `JSBAY_FORCE_IOS_ZIG_CONSUMER=1` (expect link failure until Zig supports the TBD), or skip explicitly with `JSBAY_SKIP_IOS_ZIG_CONSUMER=1`. Legacy `JS_BAY_*` names are accepted.
+- **When Zig is required:** on SDKs that are not arm64e-only (or after FORCE succeeds), the Zig iOS consumer must pass like the clang probes.
+
+Integrators should treat a Zig SKIP/`WARN` on arm64e-only SDKs as documented behavior, not as a broken checkout.
 
 ## Isolation and observability
 
