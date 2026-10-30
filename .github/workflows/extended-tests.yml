@@ -206,7 +206,7 @@ jobs:
   macos:
     name: macos
     runs-on: macos-26
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.5.app/Contents/Developer
     defaults:
@@ -309,6 +309,13 @@ jobs:
           bash tests/benchmark_operation_metadata_contract.sh
           bash tests/objc_benchmark_failure_contract.sh
           bash tests/benchmark_interop_contract.sh --host-only
+
+      # Pull-request macos-ios builds only the host simulator slice. The three-slice XCFramework for quickjs_ng stays on this daily job; quickjs and jsc packaging stay on release.
+      - name: Full Apple XCFramework and iOS Simulator smoke (quickjs_ng)
+        run: |
+          set -euo pipefail
+          ./build-apple.sh quickjs_ng
+          grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
 
   macos-intel:
     name: macos-intel

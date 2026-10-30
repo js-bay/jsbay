@@ -1,5 +1,5 @@
 # JS Bay CI — see docs/testing.md#ci for the matrix rationale.
-# PR jobs: linux (governance) / linux-engine×2 / linux-android (build, no emulator) / macos / macos-ios / macos-android / windows.
+# PR jobs: linux (governance) / linux-engine×2 / macos / macos-ios (simulator smoke) / macos-android / windows.
 # Modest splits only: peel iOS and parallelize Linux backends; keep platforms aggregated. Dual-pack (-Dbackends=quickjs_ng,jsc) stays on macos (JSC needs Apple).
 name: CI
 
@@ -263,77 +263,6 @@ jobs:
             dotnet build-server shutdown
           fi
 
-  linux-android:
-    name: linux-android
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Setup Zig
-        uses: ./.github/actions/setup-zig
-        with:
-          version: 0.17.0
-
-      - name: Setup Java
-        uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v4.0.4
-
-      - name: Cache Android SDK packages
-        uses: actions/cache@v5
-        with:
-          path: |
-            ${{ env.ANDROID_SDK_ROOT }}/ndk/28.2.13676358
-            ${{ env.ANDROID_SDK_ROOT }}/platforms/android-35
-            ${{ env.ANDROID_SDK_ROOT }}/build-tools/35.0.0
-            ${{ env.ANDROID_SDK_ROOT }}/cmake/3.22.1
-          key: android-sdk-ndk-28.2.13676358-platform-35-build-tools-35.0.0-cmake-3.22.1-${{ runner.os }}-${{ runner.arch }}
-
-      - name: Install pawl
-        uses: tiangong-dev/pawl@v0.8.2
-        with:
-          version: v0.8.2
-
-      - name: Install ripgrep
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes ripgrep
-
-      - name: Check host tool dependencies
-        run: command -v git zig ruby tar zip unzip rg
-
-      - name: Install Android build dependencies
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358' 'cmake;3.22.1'
-
-      - name: Download Gradle 8.9
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
-          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
-          test -x "$RUNNER_TEMP/gradle-8.9/bin/gradle"
-
-      - name: Test Android smoke builder staging
-        shell: bash
-        run: ANDROID_BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0" KOTLIN_GRADLE_LIB="$RUNNER_TEMP/gradle-8.9/lib" bash tests/ci/android-smoke-builder-test.sh
-
-      - name: Build Android core and JNI adapter (smoke)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ANDROID_SMOKE_BUILD_ONLY=true GRADLE_BIN="$RUNNER_TEMP/gradle-8.9/bin/gradle" bash tests/ci/run-android-device-smoke.sh
-
   macos:
     name: macos
     runs-on: macos-26
@@ -528,7 +457,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./build-apple.sh quickjs_ng
+          # An image-provisioned iPhone avoids simctl create, which spent ~90s in first-boot data migration on a brand-new device.
+          if udid="$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | .value[] | select(.isAvailable == true) | select(.name | startswith("iPhone"))] | .[0].udid // empty')" && [ -n "$udid" ]; then
+            export JSBAY_IOS_SIM_UDID="$udid"
+            echo "Reusing simulator $udid"
+          fi
+          JSBAY_APPLE_SMOKE=simulator ./build-apple.sh quickjs_ng
           grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
 
   macos-android:
@@ -574,6 +508,9 @@ jobs:
           curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.7-bin.zip" https://services.gradle.org/distributions/gradle-8.7-bin.zip
           unzip -q "$RUNNER_TEMP/gradle-8.7-bin.zip" -d "$RUNNER_TEMP"
           echo "KOTLIN_GRADLE_LIB=$RUNNER_TEMP/gradle-8.7/lib" >> "$GITHUB_ENV"
+
+      - name: Test Android smoke builder staging
+        run: ANDROID_BUILD_TOOLS="$ANDROID_SDK_ROOT/build-tools/35.0.0" KOTLIN_GRADLE_LIB="$RUNNER_TEMP/gradle-8.7/lib" bash tests/ci/android-smoke-builder-test.sh
 
       - name: Build Android core for both shipped ABIs
         run: ./build-android.sh artifacts/android/jniLibs

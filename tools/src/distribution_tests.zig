@@ -232,6 +232,29 @@ test "test_apple_missing_simulator_runtime_fails_the_script" {
     try notContains(weak.result.stderr, "strongly imports preadv");
 }
 
+test "test_apple_simulator_smoke_skips_device_and_macos_slices" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const fixture = try temp(a, io, "jsbay-apple-smoke");
+    defer Dir.cwd().deleteTree(io, fixture) catch {};
+    const repo = try appleFixture(a, io, cwd, fixture);
+    const tools = try join(a, fixture, &.{"tools"});
+    const env_path = try pathEnv(a, tools);
+    const build_dir = try join(a, repo, &.{"build"});
+    const script = try join(a, repo, &.{"build-apple.sh"});
+    var smoke = try sdk.run(a, io, &.{ "env", env_path, try std.fmt.allocPrint(a, "BUILD_DIR={s}", .{build_dir}), "JSBAY_APPLE_SMOKE=simulator", script, "quickjs_ng" }, repo);
+    defer smoke.deinit();
+    try testing.expect(!smoke.succeeded());
+    const output = try std.fmt.allocPrint(a, "{s}{s}", .{ smoke.result.stdout, smoke.result.stderr });
+    try contains(output, "simulator smoke");
+    try notContains(output, "Building for macOS");
+    try notContains(output, "Building for iOS (arm64)");
+    try contains(output, "Simulator runtime unavailable");
+}
+
 test "test_release_builds_and_uploads_verified_android_aar" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

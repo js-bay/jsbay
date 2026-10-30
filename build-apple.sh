@@ -16,6 +16,8 @@
 #   JSBAY_FORCE_IOS_ZIG_CONSUMER=1
 #       Always run the Zig iOS consumer even when the SDK looks arm64e-only.
 #       Legacy alias: JS_BAY_FORCE_IOS_ZIG_CONSUMER.
+#   JSBAY_APPLE_SMOKE=simulator
+#       Build and run only the host-architecture iOS Simulator slice. Skip the macOS slice, the device slice, the other simulator architecture, the three-slice XCFramework, and Swift package packaging. The full script remains the release and daily path.
 set -euo pipefail
 
 BACKEND="${JSBAY_APPLE_BACKEND:-${1:-jsc}}"
@@ -23,6 +25,13 @@ case "$BACKEND" in
     quickjs|quickjs_ng|jsc) ;;
     *)
         echo "ERROR: backend must be quickjs, quickjs_ng, or jsc (got: $BACKEND)" >&2
+        exit 2
+        ;;
+esac
+case "${JSBAY_APPLE_SMOKE:-}" in
+    ""|simulator) ;;
+    *)
+        echo "ERROR: JSBAY_APPLE_SMOKE must be empty or simulator (got: ${JSBAY_APPLE_SMOKE})" >&2
         exit 2
         ;;
 esac
@@ -256,6 +265,110 @@ check_ios_zig_consumer() {
         zig build check -Dbackend="$BACKEND" -Dtarget=aarch64-ios.13.0 -Doptimize="$OPTIMIZE" "-Dapple-sysroot=$IOS_SDK"
     )
 }
+
+# Pull-request smoke: one simulator slice for this machine, then install and launch. The three-slice XCFramework stays on the default path.
+link_simulator_smoke() {
+    local archive="$1"
+    local probe_dir="$BUILD_DIR/consumer-probes"
+    mkdir -p "$probe_dir"
+
+    local udid owned_sim=0
+    udid="${JSBAY_IOS_SIM_UDID:-}"
+    if [ -z "$udid" ]; then
+        local runtimes_json="$probe_dir/sim-runtimes.json"
+        local device_types_json="$probe_dir/sim-device-types.json"
+        if ! xcrun simctl list runtimes -j > "$runtimes_json" 2>/dev/null \
+            || ! xcrun simctl list devicetypes -j > "$device_types_json" 2>/dev/null; then
+            printf '%s\n' 'FAIL: iOS Simulator runtime unavailable' > "$probe_dir/ios-simulator-consumer.status"
+            echo "ERROR: iOS Simulator runtime unavailable; simulator runtime smoke is required" >&2
+            return 1
+        fi
+        local runtime device_type created
+        while IFS= read -r runtime; do
+            [ -n "$runtime" ] || continue
+            while IFS= read -r device_type; do
+                [ -n "$device_type" ] || continue
+                if created="$(xcrun simctl create "JsBayAppleConsumer-$$" "$device_type" "$runtime" 2>/dev/null)"; then
+                    udid="$created"
+                    owned_sim=1
+                    break 2
+                fi
+            done < <(zig build tool -- simulator-list devices "$device_types_json" 2>/dev/null || true)
+        done < <(zig build tool -- simulator-list runtimes "$runtimes_json" 2>/dev/null || true)
+    fi
+    if [ -z "$udid" ]; then
+        printf '%s\n' 'FAIL: iOS Simulator runtime unavailable' > "$probe_dir/ios-simulator-consumer.status"
+        echo "ERROR: iOS Simulator runtime unavailable; simulator runtime smoke is required" >&2
+        return 1
+    fi
+    if ! bash "$SCRIPT_DIR/tests/apple-sdk/run.sh" "$archive" "$probe_dir" "$BACKEND" iphonesimulator; then
+        if [ "$owned_sim" -eq 1 ]; then xcrun simctl delete "$udid" 2>/dev/null || true; fi
+        return 1
+    fi
+    local sim_log="$probe_dir/ios-simulator-consumer.log"
+    local app="$probe_dir/JsBayAppleConsumer.app"
+    local sim_rc=0
+    xcrun simctl boot "$udid" 2>/dev/null || true
+    xcrun simctl bootstatus "$udid" -b || sim_rc=$?
+    if [ "$sim_rc" -eq 0 ]; then
+        xcrun simctl install "$udid" "$app" || sim_rc=$?
+    fi
+    if [ "$sim_rc" -eq 0 ]; then
+        xcrun simctl launch --console-pty "$udid" org.js-bay.appleconsumer >"$sim_log" 2>&1 || \
+            xcrun simctl launch --console "$udid" org.js-bay.appleconsumer >"$sim_log" 2>&1 || sim_rc=$?
+    fi
+    if [ "$sim_rc" -eq 0 ] && ! grep -q 'JSBAY_APPLE_CONSUMER_PASS' "$sim_log"; then
+        sim_rc=1
+        echo "ERROR: iOS Simulator consumer probe did not report success; log: $sim_log" >&2
+    fi
+    if [ "$owned_sim" -eq 1 ]; then
+        xcrun simctl shutdown "$udid" 2>/dev/null || true
+        xcrun simctl delete "$udid" 2>/dev/null || true
+    else
+        xcrun simctl shutdown "$udid" 2>/dev/null || true
+    fi
+    if [ "$sim_rc" -ne 0 ]; then
+        return "$sim_rc"
+    fi
+    printf '%s\n' 'PASS: iOS Simulator consumer smoke' > "$probe_dir/ios-simulator-consumer.status"
+}
+
+simulator_only_smoke() {
+    local machine sim_target sim_minos sim_label archive
+    machine="$(uname -m)"
+    case "$machine" in
+        arm64|aarch64)
+            sim_target="aarch64-ios.14.0-simulator"
+            sim_minos="14.0"
+            sim_label="iOS Simulator (arm64)"
+            ;;
+        x86_64)
+            sim_target="x86_64-ios.13.0-simulator"
+            sim_minos="13.0"
+            sim_label="iOS Simulator (x86_64)"
+            ;;
+        *)
+            echo "ERROR: simulator smoke does not support machine $machine" >&2
+            return 2
+            ;;
+    esac
+    echo "==> Building for ${sim_label} [$BACKEND] (simulator smoke)"
+    cd "$SCRIPT_DIR"
+    zig build $COMMON_FLAGS -Dtarget="$sim_target" "-Dapple-sysroot=$IOS_SIM_SDK" --prefix "$BUILD_DIR/zig-prefix"
+    archive="$BUILD_DIR/libjsbay-ios-sim-smoke.a"
+    normalize_archive "$BUILD_DIR/zig-prefix/lib/libjsbay.a" "$archive"
+    verify_archive_minos "$archive" "$sim_minos"
+    verify_jsc_baseline_imports "$archive"
+    if [ "$sim_minos" = "13.0" ]; then
+        verify_ios13_vectored_io_imports "$archive"
+    fi
+    link_simulator_smoke "$archive"
+}
+
+if [ "${JSBAY_APPLE_SMOKE:-}" = simulator ]; then
+    simulator_only_smoke
+    exit 0
+fi
 
 echo "==> Building for macOS (arm64) [$BACKEND]"
 cd "$SCRIPT_DIR"
