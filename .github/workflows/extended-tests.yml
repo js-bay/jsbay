@@ -246,6 +246,15 @@ jobs:
           zig build test-engine -Dbackend=jsc -Doptimize=ReleaseSafe --summary all
           bash tests/ci/run-desktop-consumers.sh jsc
 
+      # These quickjs_ng checks run on linux-engine for every pull request. Daily Darwin coverage stays here so PR macos does not repeat them.
+      - name: quickjs_ng transport, inspector-disabled, dispatch, and Test262
+        run: |
+          set -euo pipefail
+          zig build test-engine -Dbackend=quickjs_ng -Dinspector-transport=false -Dtest-filter="host transport" --summary all
+          zig build test-engine -Dbackend=quickjs_ng -Dinspector=false --summary all
+          zig build test-ng-dispatch -Dbackend=quickjs_ng --summary all
+          bash tests/test262/run.sh --backend quickjs_ng --output artifacts/test262-quickjs_ng.json
+
       - name: Stress — concurrency and lifecycle (quickjs_ng)
         run: zig build test-engine -Dbackend=quickjs_ng -Dstress-tests=true --summary all
 
