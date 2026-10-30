@@ -532,7 +532,7 @@ test "native: NativeResult.json valid" {
 }
 
 test "native: NativeResult.json invalid → null" {
-        resetState();
+    resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
@@ -543,7 +543,7 @@ test "native: NativeResult.json invalid → null" {
 }
 
 test "native: NativeResult.err thrown and caught" {
-        resetState();
+    resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
@@ -571,7 +571,7 @@ test "native: large string result (100KB)" {
 }
 
 test "native: throw from native, subsequent evals still work" {
-        resetState();
+    resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
@@ -588,7 +588,7 @@ test "native: throw from native, subsequent evals still work" {
 }
 
 test "native: throw from nested call chain caught at outer's caller" {
-        resetState();
+    resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {

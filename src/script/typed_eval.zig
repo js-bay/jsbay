@@ -95,7 +95,6 @@ fn cacheFile(source: []const u8, filename: []const u8, cache_dir: []const u8, ve
     return cache.cachePath(gpa, cache_dir, version, source_hash, name_hash);
 }
 
-
 fn evaluateSpike(ctx: ActiveEngine.Context, source: []const u8, filename: []const u8) Result {
     defer {
         if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);

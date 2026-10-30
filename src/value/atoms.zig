@@ -52,7 +52,7 @@ pub fn newAtom(instance_id: i32, name: []const u8) ?Atom {
             const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
             const handle = c_api.hermes_atom_new(ctx, name.ptr, name.len) orelse return null;
             return Atom{ .repr = @intFromPtr(handle) };
-        }, 
+        },
     }
 }
 

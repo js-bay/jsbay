@@ -60,7 +60,6 @@ pub extern fn hermes_has_property(ctx: ?*Context, obj: Value, key: [*:0]const u8
 pub extern fn hermes_call(ctx: ?*Context, fn_val: Value, this_val: Value, args: ?[*]const Value, argc: usize, out_err: *?[*:0]u8) Value;
 pub extern fn hermes_process_pending_jobs(ctx: ?*Context) void;
 
-
 pub const ValueResultC = extern struct {
     value: Value,
     err: ?[*:0]u8,
@@ -124,7 +123,6 @@ pub extern fn hermes_atom_to_utf8(ctx: ?*Context, atom: ?*anyopaque) ?[*:0]u8;
 pub extern fn hermes_get_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque) Value;
 pub extern fn hermes_set_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque, val: Value) bool;
 pub extern fn hermes_has_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque) bool;
-
 
 pub const OpResult = extern struct {
     value: Value,

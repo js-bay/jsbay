@@ -139,7 +139,6 @@ fn addBinding(binding: *Binding) ?usize {
     return slot;
 }
 
-
 fn spikeThrow(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) backend.ActiveEngine.Value {
     if (comptime backend.active_backend == .escargot) {
         @import("../backend/escargot/c_api.zig").escargot_throw(ctx, message);
@@ -164,7 +163,6 @@ fn spikeThrowValue(ctx: backend.ActiveEngine.Context, exception: backend.ActiveE
     backend.ActiveEngine.freeValue(ctx, exception);
     return null;
 }
-
 
 fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;

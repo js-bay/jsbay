@@ -907,7 +907,7 @@ test "c_api: inspector start and stop preserve the build-mode contract" {
     defer c_api.jsbay_engine_destroy(id);
 
     var port: u16 = 99;
-    if (comptime !build_options.inspector) {
+    if (comptime !build_options.inspector or !build_options.inspector_transport) {
         const original_port = port;
         try testing.expect(!c_api.jsbay_engine_inspector_start(id, 0, &port));
         try testing.expectEqual(original_port, port);
@@ -1312,7 +1312,7 @@ const EventCapture = struct {
     fn handler(event: *const types.EngineEvent, user_data: ?*anyopaque) callconv(.c) void {
         const self: *EventCapture = @ptrCast(@alignCast(user_data.?));
         _ = self.count.fetchAdd(1, .seq_cst);
-        self.last_kind.store(@intFromEnum(event.kind), .seq_cst);
+        self.last_kind.store(@backingInt(event.kind), .seq_cst);
     }
 };
 
@@ -1325,7 +1325,7 @@ test "c_api: set_event_handler receives interrupt telemetry" {
     try testing.expect(c_api.jsbay_engine_set_event_handler(id, EventCapture.handler, &capture));
     try testing.expect(c_api.jsbay_engine_request_interrupt(id));
     try testing.expect(capture.count.load(.seq_cst) >= 1);
-    try testing.expectEqual(@as(i32, @intFromEnum(types.EngineEventKind.execution_interrupted)), capture.last_kind.load(.seq_cst));
+    try testing.expectEqual(@as(i32, @backingInt(types.EngineEventKind.execution_interrupted)), capture.last_kind.load(.seq_cst));
     try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
     try testing.expect(c_api.jsbay_engine_set_event_handler(id, null, null));
 }

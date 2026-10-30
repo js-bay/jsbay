@@ -245,7 +245,6 @@ test "modules: circular imports do not deadlock" {
     try testing.expectEqual(@as(i64, 3), try helpers.evalInt(id, "globalThis.__bPlusA()"));
 }
 
-
 test "modules: missing module throws an error" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);

@@ -225,7 +225,6 @@ test "spike smoke: engine_thread post/wait eval" {
     try testing.expectEqualStrings("42", std.mem.span(result.?));
 }
 
-
 test "spike smoke: getMemoryUsage soft stats; setMemoryLimit rejected" {
     if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {
@@ -278,5 +277,3 @@ test "spike smoke: C ABI create_with_options MaxHeapSize; set_memory_limit false
     try testing.expect(!c_api.jsbay_engine_request_interrupt(id));
     try testing.expect(!runtime_control.supportsMidScriptUserInterrupt());
 }
-
-

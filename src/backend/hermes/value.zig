@@ -257,5 +257,3 @@ pub fn makeFunction(ctx: Context, name: []const u8, fn_ptr: c_api.NativeFn, user
     buf[name.len] = 0;
     return c_api.hermes_make_function(ctx, @ptrCast(&buf), fn_ptr, user_data);
 }
-
-

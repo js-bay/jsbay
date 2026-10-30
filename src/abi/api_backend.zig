@@ -756,7 +756,6 @@ fn jscToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     return .{ .bytes = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(std.heap.c_allocator, text) orelse return .{ .out_of_memory = true } };
 }
 
-
 fn escargotOp(result: @import("../backend/escargot/c_api.zig").OpResult) Result {
     if (result.exception != null) return .{ .exception = result.exception };
     if (result.value != null) return .{ .value = result.value };
@@ -793,7 +792,6 @@ fn escargotInstanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, cons
     const c = @import("../backend/escargot/c_api.zig");
     return escargotBoolOp(c.escargot_instance_of(ctx, value, constructor));
 }
-
 
 fn hermesCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
     const c = @import("../backend/hermes/c_api.zig");

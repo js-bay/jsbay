@@ -61,7 +61,6 @@ pub extern fn escargot_process_pending_jobs(ctx: ?*Context) void;
 pub const RejectionTrackerFn = *const fn (instance_id: i32, handled: bool, reason: [*]const u8, reason_len: usize, userdata: ?*anyopaque) callconv(.c) void;
 pub extern fn escargot_set_rejection_tracker(ctx: ?*Context, instance_id: i32, fn_ptr: ?RejectionTrackerFn, userdata: ?*anyopaque) void;
 
-
 pub const ValueResultC = extern struct {
     value: Value,
     err: ?[*:0]u8,
@@ -125,7 +124,6 @@ pub extern fn escargot_set_property_atom(ctx: ?*Context, obj: Value, atom: ?*any
 pub extern fn escargot_has_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque) bool;
 pub extern fn escargot_is_error(v: Value) bool;
 pub extern fn escargot_new_error(ctx: ?*Context, kind: c_int, message: [*:0]const u8) Value;
-
 
 pub const OpResult = extern struct {
     value: Value,
@@ -199,4 +197,3 @@ pub extern fn escargot_host_object_create(
     names_fn: ?HostNamesFn,
     finalize_fn: ?HostFinalizeFn,
 ) Value;
-

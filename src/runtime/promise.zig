@@ -428,7 +428,6 @@ fn forgetJscPromise(ctx: ActiveEngine.Context, promise: Local) void {
     eh.jscPromiseForget(@ptrCast(ctx), @ptrCast(promise));
 }
 
-
 fn escargotCreate(instance_id: i32, ctx: ActiveEngine.Context) ?Deferred {
     const c = @import("../backend/escargot/c_api.zig");
     var promise: c.Value = null;

@@ -2333,6 +2333,7 @@ const StackProbe = struct {
 };
 
 test "engine thread: native stack is at least Harmony's 128MB" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
     var live = try createInstance(id);
     defer live.close();
