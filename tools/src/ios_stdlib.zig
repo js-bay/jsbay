@@ -133,7 +133,17 @@ fn refreshLink(init: std.process.Init, allocator: std.mem.Allocator, target: []c
         else => return err,
     };
     if (stat.kind != .sym_link) return error.UnexpectedOverlayEntry;
-    const existing_target = try std.Io.Dir.cwd().realPathFileAlloc(init.io, link, allocator);
+    // Cached overlays keep absolute symlinks into the Zig install. When CI restores
+    // zig-cache after setup-zig extracts a new install path, those links dangle and
+    // realPath fails — replace them instead of aborting the iOS build.
+    const existing_target = std.Io.Dir.cwd().realPathFileAlloc(init.io, link, allocator) catch |err| switch (err) {
+        error.FileNotFound => {
+            try std.Io.Dir.cwd().deleteFile(init.io, link);
+            try std.Io.Dir.cwd().symLink(init.io, target, link, .{ .is_directory = is_directory });
+            return;
+        },
+        else => return err,
+    };
     defer allocator.free(existing_target);
     const expected_target = try std.Io.Dir.cwd().realPathFileAlloc(init.io, target, allocator);
     defer allocator.free(expected_target);
