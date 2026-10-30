@@ -1,25 +1,58 @@
 # js_event_loop
 
-JavaScript scheduling built on `zev`. The package depends on `zev` and the Zig standard library; it contains no JavaScript engine or host API bindings.
+JavaScript scheduling on `zev`. Depends on `zev` and the Zig stdlib; no JS engine or host API bindings here.
 
-`Driver` owns the native `zev` loop, its monotonic clock, waiting, timers, notifications, and browser-style turns. `run` and `runFor` drive an environment on a dedicated thread without a host clock or deadline. `attach` drives an environment on a platform-owned thread. Callers do not pump turns, sample clocks, or calculate deadlines.
+## Driver ↔ zev
 
-`attach` connects a Driver to a platform-owned thread. The platform supplies a coalescing asynchronous `Host.schedule` callback and a matching owner-thread `Host.cancel`; it invokes the supplied drive callback, which calls `runAttached` while the engine lease is held. A Driver schedules its own next callback after each turn, wakes early when a timer or notification changes, and does not poll while idle. `detach` runs on the owner thread before the runtime is released. Blocking `run` and attached driving are mutually exclusive. `requestStop` ends the active blocking run; when none is active it applies to the next run, and the run that ends consumes it; `attach` discards a request made before it. While attached it stops platform driving until `detach` and a later `attach`, and `detach` discards the request.
+`Driver` owns the native `zev.Loop` (clock, wait, timers, notifiers, turns).
 
-`Timer` and `Notifier` are Driver-owned wrappers around native handles. Callers initialize them with a Driver, schedule absolute monotonic times or relative delays, notify from another thread, and never access `zev.Loop` directly.
+- dispatch: `dispatchEventsLimited`; optional `dispatch_budget` / `dispatch_time_budget_ms` (`null` = unlimited)
+- `Driver.now` → `Loop.nowMs`
+- tests: `Driver.testing.advance` / `setNow` install `Loop.setClock` (no parallel `test_now`)
+- notify / timer start use zev coalesce; attached hosts get a schedule nudge. `cancel` and public `wake` still signal the waiter
+- blocking `run` / `runFor` wrap `beginRun` / `endRun` so owner wake-skip matches `Loop.run`
+- virtual clock: park for an external wake; do not sleep a virtual delay as wall time
 
-`Scheduler` owns task admission, synchronous execution and native-wait scopes, non-reentrant microtask checkpoints, and the order of a driver-owned turn. Each host task, native dispatch callback, TSFN callback and JS timer callback finishes before its microtask checkpoint. Microtasks added by microtasks drain before another queued task starts.
+`run` / `runFor` drive on a dedicated thread. `attach` drives on a platform-owned thread. Callers do not pump turns, sample clocks, or compute deadlines.
 
-A synchronous native call holds `SyncWait` from its host start callback until its result or exception is returned. Other threads may enqueue work and complete the request, but this environment cannot run queued JavaScript or microtasks during that wait. `native_sync` delivers bytes directly to the waiting thread through `zev.Condition`; it never needs a JavaScript task to deliver a result.
+## Attach / suspend
 
-One owner thread calls `start`, uses its returned request pointer, then calls `wait` and `finish` in order. It may read returned bytes until `finish`, which must run once after that read. A reduced deadline can turn an already completed result into a timeout before `wait` delivers it; after `wait` returns, later deadline changes leave that result and its borrowed bytes unchanged. Completion, cancellation, and instance-wide cancellation or deadline changes may run concurrently.
+Platform supplies coalescing async `Host.schedule` and owner-thread `Host.cancel`, then invokes the drive callback (`runAttached` under the engine lease). Driver schedules its next callback after each turn, wakes early on timer/notify, idle otherwise. `detach` on the owner thread before releasing the runtime; it waits for in-flight Host schedule/cancel so the Host may free `context` only after that cancel returns. Blocking `run` and attached driving are mutually exclusive.
 
-`host_wake` is an internal bridge for components that need to wake a Driver. Applications use `Driver.run`, `Driver.runFor`, or `Driver.attach`; they do not register wake callbacks or pump turns themselves. `set` and `drop` may run concurrently, including for one instance ID. After active callbacks finish, their effects for that ID follow the order in which they reacquire the slot mutex. Neither may run from a host-wake callback.
+`suspendScheduling` / `resumeScheduling` pause turns and Host schedules without detaching or clearing timers/tasks (Hide/Show). Soft `Host.cancel` must stay reusable; hard teardown belongs to detach/destroy.
 
-The host supplies the actual JavaScript calls, exception handling and job-drain operation. Every scope must finish while its runtime remains alive. Scheduler state is owner-thread only; native completion and notification registries have their own synchronization. The root engine owns runtime admission and destruction and keeps JS values in its timer/dispatch adapters. `zev` remains the sole owner of the native timer heap.
+`requestStop` ends the active blocking run; when none is active it applies to the next run and is consumed by the run that ends. `attach` discards a prior idle stop. While attached it freezes platform driving until `detach` + later `attach`.
 
-Each turn first collects native readiness, then starts at most one ready JavaScript task and performs a complete microtask checkpoint. The scheduler rotates fairly among host scripts, native dispatch callbacks, TSFN payloads and due timers. Tasks from one source keep FIFO order. Ordering between sources is intentionally unspecified. A future host `nextTick` binding belongs to the embedder and must enqueue a later task, rather than a Promise microtask or Node.js `process.nextTick`. This package does not claim complete HTML or Node.js event-loop compatibility.
+## Handles
 
-JavaScriptCore runs Promise reactions inside its VM; QuickJS-family backends expose an explicit job drain. The engine adapter enforces its controllable task and checkpoint boundaries and tests the observable contract on all three backends.
+`Timer` / `Notifier` are Driver wrappers. Init with a Driver; schedule absolute or relative times; notify from another thread. Do not touch `zev.Loop` directly.
 
-Run `zig build test` in this directory. Pure scheduling, native wait and notification contracts live here; real-engine ordering and lifecycle tests live in the root suite. Root `zig build test` also runs this suite and forwards `-Dtest-filter`.
+## Scheduler
+
+Owns admission, sync/native-wait scopes, non-reentrant microtask checkpoints, and turn order. Each host / native-dispatch / TSFN / JS-timer callback finishes before its microtask checkpoint. Microtasks spawned by microtasks drain before the next queued task.
+
+## SyncWait / native_sync
+
+A sync native call holds `SyncWait` from the host start callback until result or exception. Other threads may enqueue and complete; this environment does not run JS or microtasks during the wait. `native_sync` delivers bytes on the waiting thread via `zev.Condition` — no JS task needed for the result.
+
+One owner thread: `start` → use request pointer → `wait` → `finish`. Bytes readable until `finish` (once, after the read). A reduced deadline can turn a completed result into a timeout before `wait` delivers it; after `wait` returns, later deadline changes leave that result alone. Completion, cancel, and instance-wide cancel/deadline changes may run concurrently.
+
+## host_wake
+
+Internal bridge for components that need to wake a Driver. Apps use `Driver.run` / `runFor` / `attach` — no wake callbacks, no pumping. `set` / `drop` may run concurrently (including same instance ID); after active callbacks finish, effects for that ID follow slot-mutex reacquire order. Neither from a host-wake callback.
+
+## Ownership / turns
+
+Host supplies JS calls, exception handling, job drain. Every scope finishes while its runtime is alive. Scheduler state is owner-thread only; native completion/notification registries have their own sync. Root engine owns runtime admission/destruction and JS values in timer/dispatch adapters. `zev` alone owns the native timer heap.
+
+Each turn: collect native readiness → at most one ready JS task → full microtask checkpoint. Fair rotate among host scripts, native dispatch, TSFN, due timers. FIFO within a source; order across sources unspecified. A future host `nextTick` belongs to the embedder and must enqueue a later task (not a Promise microtask / Node `process.nextTick`). This package does not claim full HTML or Node event-loop compatibility.
+
+JSC runs Promise reactions inside the VM; QuickJS-family exposes an explicit job drain. The engine adapter enforces controllable task/checkpoint boundaries and tests the contract on all three backends.
+
+## Test
+
+```sh
+zig build test
+```
+
+Pure scheduling / native-wait / notification contracts live here; real-engine ordering and lifecycle tests are in the root suite. Root `zig build test` also runs this suite and forwards `-Dtest-filter`.

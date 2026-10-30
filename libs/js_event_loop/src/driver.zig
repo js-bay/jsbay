@@ -22,7 +22,12 @@ pub const Driver = struct {
     host_ops_in_flight: usize = 0,
     host_ops_cv: zev.Condition = .init,
     last_error: ?Error = null,
-    test_now: ?u64 = null,
+    /// Max Notifier+Timer callbacks per turn passed to `zev.Loop.dispatchEventsLimited`. `null` = unlimited.
+    dispatch_budget: ?usize = null,
+    /// Optional time cap for one native dispatch turn (`Loop.nowMs` from turn start). `null` = no limit.
+    dispatch_time_budget_ms: ?u64 = null,
+    /// Absolute ms for an installed Loop virtual clock. Tests set this through `testing.advance` / `testing.setNow`; production leaves it null so `Loop` uses the system monotonic clock.
+    loop_clock_ms: ?u64 = null,
 
     const Mode = enum { idle, running, attached };
 
@@ -66,6 +71,8 @@ pub const Driver = struct {
     /// The caller must first detach an attached driver and stop all threads using this driver.
     pub fn destroy(self: *Driver) void {
         self.detach();
+        self.loop.setClock(null, null);
+        self.loop_clock_ms = null;
         self.loop.destroy();
         self.host_ops_cv.deinit();
         self.state_mutex.deinit();
@@ -73,8 +80,26 @@ pub const Driver = struct {
     }
 
     pub fn now(self: *const Driver) u64 {
-        if (builtin.is_test) if (self.test_now) |current| return current;
-        return zev.monotonicMilliseconds();
+        return self.loop.nowMs();
+    }
+
+    /// Install or refresh the Loop virtual clock from `loop_clock_ms`. No-op while unset (system clock).
+    fn syncLoopClock(self: *Driver) void {
+        if (self.loop_clock_ms != null) {
+            self.loop.setClock(self, readLoopClock);
+        } else {
+            self.loop.setClock(null, null);
+        }
+    }
+
+    fn readLoopClock(context: ?*anyopaque) u64 {
+        const self: *Driver = @ptrCast(@alignCast(context.?));
+        return self.loop_clock_ms.?;
+    }
+
+    fn advanceLoopClock(self: *Driver, now_ms: u64) void {
+        self.loop_clock_ms = if (self.loop_clock_ms) |current| @max(current, now_ms) else now_ms;
+        self.syncLoopClock();
     }
 
     pub fn isAttached(self: *Driver) bool {
@@ -108,7 +133,10 @@ pub const Driver = struct {
                 const self_adapter: *@This() = @ptrCast(@alignCast(context.?));
                 self_adapter.prepared = if (self_adapter.hooks.prepare) |hook| hook(self_adapter.hooks.context, self_adapter.now) else true;
                 if (!self_adapter.prepared) return;
-                self_adapter.driver.loop.dispatchEvents(self_adapter.now);
+                self_adapter.driver.loop.dispatchEventsLimited(
+                    self_adapter.driver.dispatch_budget,
+                    self_adapter.driver.dispatch_time_budget_ms,
+                );
             }
             fn task(context: ?*anyopaque, source: Scheduler.TaskSource) bool {
                 const self_adapter: *@This() = @ptrCast(@alignCast(context.?));
@@ -152,6 +180,11 @@ pub const Driver = struct {
             if (self.isSuspended()) continue;
             const current = self.now();
             const timeout = if (next) |deadline| if (deadline == 0 or deadline <= current) 0 else deadline - current else null;
+            // Match Loop.run: a virtual clock must not translate virtual delays into real sleeps.
+            if (self.loop_clock_ms != null and (timeout == null or timeout.? > 0)) {
+                _ = self.loop.waitForWake(seen, null);
+                continue;
+            }
             _ = self.loop.waitForWake(seen, timeout);
         }
     }
@@ -168,7 +201,11 @@ pub const Driver = struct {
                 const current = self.now();
                 if (current >= deadline) break;
                 const seen = self.loop.wakeGeneration();
-                _ = self.loop.waitForWake(seen, deadline - current);
+                if (self.loop_clock_ms != null) {
+                    _ = self.loop.waitForWake(seen, null);
+                } else {
+                    _ = self.loop.waitForWake(seen, deadline - current);
+                }
                 continue;
             }
             const seen = self.loop.wakeGeneration();
@@ -179,6 +216,10 @@ pub const Driver = struct {
             const own = if (next) |candidate| if (candidate == 0 or candidate <= current) 0 else candidate - current else null;
             const remaining = deadline - current;
             const timeout = if (own) |delay| @min(delay, remaining) else remaining;
+            if (self.loop_clock_ms != null and timeout > 0) {
+                _ = self.loop.waitForWake(seen, null);
+                continue;
+            }
             _ = self.loop.waitForWake(seen, timeout);
         }
     }
@@ -253,6 +294,11 @@ pub const Driver = struct {
     /// While suspended, only the wait primitive is woken; the Host is not scheduled until `resumeScheduling`.
     pub fn wake(self: *Driver) void {
         self.loop.wake();
+        self.scheduleAttached(0);
+    }
+
+    /// After zev already coalesced/woke (or skipped an in-run owner wake), only nudge an attached host. Avoids a second `Waiter.signal` that would undo pending coalesce.
+    fn nudgeHost(self: *Driver) void {
         self.scheduleAttached(0);
     }
 
@@ -332,9 +378,13 @@ pub const Driver = struct {
         if (self.mode == .attached) return error.Attached;
         if (self.mode == .running) return error.AlreadyRunning;
         if (self.scheduler.isTurnActive() or !self.scheduler.allowsQueuedWork()) return error.AlreadyRunning;
+        // Keep Loop.run_state aligned so owner wake-skip covers the whole blocking run,
+        // including gaps between turns while waitForWake is active on this thread.
+        if (!self.loop.beginRun()) return error.AlreadyRunning;
         self.mode = .running;
     }
     fn endRun(self: *Driver) void {
+        self.loop.endRun();
         self.state_mutex.lock();
         self.mode = .idle;
         self.stop_requested = false;
@@ -356,8 +406,10 @@ pub const Driver = struct {
         return self.last_error != null;
     }
     fn nextDeadline(self: *Driver, hooks: Hooks) ?u64 {
-        const native = self.loop.nextDeadline();
+        // Sample host first: hooks may notify/start timers. Then re-read native so a
+        // same-turn pending Notifier reports deadline 0 (Loop.runOnce does the same).
         const host = hooks.next_task_deadline(hooks.context);
+        const native = self.loop.nextDeadline();
         if (native) |deadline| if (deadline == 0) return 0;
         if (host) |deadline| if (deadline == 0) return 0;
         if (native) |left| if (host) |right| return @min(left, right) else return left;
@@ -454,15 +506,15 @@ pub const Timer = struct {
     }
     pub fn startAt(self: *Timer, deadline_ms: u64) !void {
         try self.raw.startAt(deadline_ms);
-        if (self.driver) |driver| driver.wake();
+        if (self.driver) |driver| driver.nudgeHost();
     }
     pub fn startAfter(self: *Timer, delay_ms: u64) !void {
-        if (self.raw.loop == null) return error.Closed;
-        const driver = self.driver orelse return error.Closed;
-        return self.startAt(std.math.add(u64, driver.now(), delay_ms) catch std.math.maxInt(u64));
+        try self.raw.startAfter(delay_ms);
+        if (self.driver) |driver| driver.nudgeHost();
     }
     pub fn cancel(self: *Timer) bool {
         const cancelled = self.raw.cancel();
+        // zev cancel does not wake; recompute deadlines for blockers and attached hosts.
         if (cancelled) if (self.driver) |driver| driver.wake();
         return cancelled;
     }
@@ -498,7 +550,8 @@ pub const Notifier = struct {
     }
     pub fn notify(self: *Notifier) bool {
         const notified = self.raw.notify();
-        if (notified) if (self.driver) |driver| driver.wake();
+        // zev already coalesced and woke (or skipped an in-run owner wake).
+        if (notified) if (self.driver) |driver| driver.nudgeHost();
         return notified;
     }
     pub fn close(self: *Notifier) void {
@@ -517,16 +570,21 @@ const DriverTesting = if (builtin.is_test) struct {
         return driver.runOnce(hooks);
     }
 
-    /// Advances a driver's test-only monotonic clock and executes one complete turn.
+    /// Sets/advances the Loop virtual clock without running a turn.
+    pub fn setNow(driver: *Driver, now: u64) void {
+        driver.advanceLoopClock(now);
+    }
+
+    /// Advances the Loop virtual clock (`Loop.setClock` / `Loop.nowMs`) and executes one complete turn.
     pub fn advance(driver: *Driver, hooks: Driver.Hooks, now: u64) ?u64 {
-        driver.test_now = if (driver.test_now) |current| @max(current, now) else now;
+        driver.advanceLoopClock(now);
         return driver.runOnce(hooks);
     }
 
-    /// Dispatches native readiness without selecting a JavaScript task.
+    /// Advances the Loop virtual clock and dispatches native readiness without selecting a JavaScript task.
     pub fn dispatchEvents(driver: *Driver, now: u64) void {
-        driver.test_now = if (driver.test_now) |current| @max(current, now) else now;
-        driver.loop.dispatchEvents(driver.test_now.?);
+        driver.advanceLoopClock(now);
+        driver.loop.dispatchEventsLimited(driver.dispatch_budget, driver.dispatch_time_budget_ms);
     }
 } else struct {};
 

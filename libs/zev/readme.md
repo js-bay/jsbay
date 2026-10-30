@@ -1,15 +1,15 @@
 # zev
 
-A small event loop and notification library for Zig 0.17. zev provides cross-thread notifications, one-shot timers, waiting, clocks, and synchronization primitives. Callbacks run on the thread driving the loop; host applications own their task queues and scheduling policy.
+A small event loop and notification library for Zig 0.17. Cross-thread notifications, one-shot timers, waiting, clocks, sync primitives. Callbacks run on the thread driving the loop; the host owns its task queues and scheduling policy.
 
 | API | Purpose |
 | --- | --- |
-| `Loop` | Dispatch notifications, wait until the next deadline, wake, and stop |
-| `Notifier` | Notify the loop from other threads without allocating; repeated notifications may coalesce |
-| `Timer` | Schedule a one-shot callback using a shared deadline heap |
+| `Loop` | Dispatch, wait, wake, stop; optional dispatch budgets; replaceable clock via `setClock` / `nowMs` |
+| `Notifier` | Cross-thread notify without allocating; coalesces; returns to idle after dispatch unless re-armed |
+| `Timer` | One-shot callback on a shared deadline heap |
 | `Waiter` | Wait for a generation counter to change |
-| `Mutex`, `Condition` | Synchronize shared state and wait for changes |
-| Clock and sleep functions | Read monotonic or realtime milliseconds, or sleep |
+| `Mutex`, `Condition` | Shared-state sync |
+| Clock / sleep | Monotonic or realtime ms, sleep; loop timers use `Loop.nowMs` |
 
 ## Build integration
 
@@ -21,7 +21,7 @@ Add a local path dependency to your `build.zig.zon`:
 },
 ```
 
-Add the module to your executable in `build.zig`:
+Wire it in `build.zig`:
 
 ```zig
 const dependency = b.dependency("zev", .{
@@ -32,25 +32,25 @@ exe.root_module.addImport("zev", dependency.module("zev"));
 exe.root_module.link_libc = true;
 ```
 
-Create a loop with `Loop.create(allocator)`. The caller supplies the allocator and receives allocation errors explicitly. Platform-specific native dependencies are listed below.
+`Loop.create(allocator)` — caller supplies the allocator and handles allocation errors. Platform deps are in Native backends below.
 
 ## API compatibility
 
-This release changes the public API: `Async.send()` is now `Notifier.notify()`, loop construction is `Loop.create(allocator)` with `destroy()`, and `Condition.waitTimeout()` returns `.notified` or `.timed_out`. Update callers rather than relying on compatibility aliases.
+Public API changes: `Async.send()` → `Notifier.notify()`, loop construction is `Loop.create` / `destroy`, `Condition.waitTimeout()` returns `.notified` or `.timed_out`. No compatibility aliases.
 
-`Mutex` now uses native blocking synchronization and has a different layout. Rebuild Zig consumers and add `deinit()` to the owners of instance-local mutexes.
+`Mutex` is a native blocking mutex with a different layout. Rebuild consumers; owners of instance-local mutexes need `deinit()`.
 
 ## Mutex lifetime
 
-`Mutex` uses a blocking operating-system mutex. Construct it with `.{}` at its final address, then call `lock()`, `unlock()`, or `tryLock()`. Do not copy a mutex after construction or lock it recursively. An instance-owned mutex must be unlocked and have no remaining users or waiters before its owner calls `deinit()`. Process-wide mutexes may remain alive until process exit.
+Construct with `.{}` at its final address, then `lock` / `unlock` / `tryLock`. Do not copy after construction or lock recursively. Unlock and drop waiters before `deinit()`. Process-wide mutexes may live until exit.
 
-A condition wait releases the associated mutex while sleeping and reacquires it before returning. Always recheck the protected predicate in a loop, including after a timeout or notification.
+Condition wait releases the mutex while sleeping and reacquires before return. Always recheck the predicate in a loop.
 
-OpenHarmony imports the mutex layout and `PTHREAD_MUTEX_INITIALIZER` from its SDK `pthread.h` during the build. The mutex stays inline, like the other POSIX targets; it does not allocate a handle or use a C mutex wrapper.
+OpenHarmony pulls mutex layout and `PTHREAD_MUTEX_INITIALIZER` from its SDK `pthread.h` at build time. Inline like other POSIX targets — no heap handle, no C wrapper.
 
 ## Quick start
 
-This program waits for a timer, invokes its callback on the calling thread, and stops the loop:
+Waits for a timer, runs its callback on the calling thread, stops:
 
 ```zig
 const std = @import("std");
@@ -74,39 +74,53 @@ fn onTimer(ctx: ?*anyopaque, _: *zev.Timer) void {
 }
 ```
 
-`run` keeps running until stopped, until `should_stop` returns true, or until an optional `deadline_ms` is reached. It does not exit merely because no timers remain.
+`run` stops on `requestStop`, `should_stop`, or optional `deadline_ms` — not merely because no timers remain.
 
 ## Driving the loop
 
-All timers attached to a `Loop` share one indexed min-heap. By default, `runOnce` snapshots pending `Notifier` notifications and due timers, dispatches their callbacks, then calls an optional host `tick`. It never waits.
+All timers on a `Loop` share one indexed min-heap. Default `runOnce`: snapshot pending Notifiers and due Timers → dispatch → optional host `tick`. Never waits.
 
-A host tick has this signature:
+Host tick:
 
 ```zig
 fn tick(ctx: ?*anyopaque, now_ms: u64) ?u64
 ```
 
-Return the host's next absolute monotonic deadline, or `null` if it has none. Return `now_ms` while ready host work remains so that the loop does not sleep with work still queued.
+Return the host's next absolute monotonic deadline, or `null`. Return `now_ms` while ready host work remains so the loop does not sleep with work queued.
 
-`run` records the wake generation before doing work, then waits for the earliest deadline from its timers, the host tick, and `RunOptions.deadline_ms`. `wake()` interrupts the wait. `requestStop()` stops only a `run` that is currently active; a request made before `run()` has started does not stop the next run. The loop can be run again afterward. Both methods may be called from another thread.
+`run` records the wake generation, does work, then waits for the earliest of timer / host / `RunOptions.deadline_ms`. `wake()` interrupts. `requestStop()` only affects an active `run`; a request before `run()` starts does not stop the next one. Both are thread-safe.
 
-Manual drivers can use `wakeGeneration()` and `waitForWake(seen, timeout_ms)` to observe wake notifications. These methods report only a wake change; they do not report that a callback has completed.
+Manual drivers: `wakeGeneration()` + `waitForWake(seen, timeout_ms)`. These report wake changes only, not callback completion.
 
 ### Host-controlled dispatch
 
-Set `RunOptions.event_dispatch = .host` when the host needs to choose where notifications run within its tick. In this mode, the host tick calls `loop.dispatchEvents(now_ms)` explicitly; zev does not dispatch automatically. Only one event batch is dispatched per `runOnce`, even if the host calls `dispatchEvents` again.
+`RunOptions.event_dispatch = .host`: host tick calls `dispatchEvents()` / `dispatchEventsLimited`; zev does not auto-dispatch. One batch per `runOnce` even if the host calls dispatch again. Automatic mode uses the same `dispatch_budget` / `dispatch_time_budget_ms`.
 
-An external event loop can also call `dispatchEvents(now_ms)` directly and use `nextDeadline()` to arrange its next wake:
+External loops can call `dispatchEvents()` and use `nextDeadline()`:
 
-- An absolute timestamp means a timer is scheduled for that time.
-- `0` means a notification is ready and another turn should run immediately.
-- `null` means there is no scheduled or ready notification.
+- absolute timestamp — timer scheduled
+- `0` — ready work; run another turn now
+- `null` — nothing ready or scheduled
 
-Keep timestamps in one monotonic clock domain. `startAfter` reads zev's system monotonic clock; use `startAt` when supplying timestamps from an external clock. Direct calls to `dispatchEvents` do not wait. In manual mode, the host decides whether and when to drive another turn; `requestStop()` does not add a separate manual-mode stop state.
+Due checks and time budgets use `Loop.nowMs()` (system monotonic, or `setClock`). No separate host `now` on dispatch. Use `setClock` for a virtual clock, or `startAt` in the same domain as `nowMs`. Direct dispatch does not wait. In manual mode the host decides the next turn; `requestStop()` does not add a separate stop state.
+
+### Dispatch budget
+
+- `RunOptions.dispatch_budget` / `dispatch_time_budget_ms`, or `dispatchEventsLimited`
+- default `null` = drain the full ready snapshot (no clock read unless a time budget is set)
+- Notifiers before Timers within a turn
+- budget exhausted → remaining work stays ready; `nextDeadline()` is `0`
+
+### Clock
+
+- `Loop.setClock(ctx, now_fn)` — source for `nowMs`, due checks, time budgets, `startAfter`, `runOnce`, `run`
+- null function restores system clock
+- call from the owner/test thread only (unsynchronized)
+- custom clock: `run` waits for an external wake instead of sleeping a virtual delay as wall time
 
 ## Notifications
 
-Initialize a `Notifier` on the loop's owning thread with a callback of type `fn (?*anyopaque, *zev.Notifier) void`. Other threads may then call `notify()`:
+Init on the owning thread; callback type `fn (?*anyopaque, *zev.Notifier) void`. Other threads call `notify()`:
 
 ```zig
 var notification: zev.Notifier = .{};
@@ -115,83 +129,90 @@ notification.init(loop, &state, State.onNotify);
 const accepted = notification.notify();
 ```
 
-`notify` returns `false` after the handle has been closed. It does not allocate and carries no payload. Multiple notifications may produce a single callback, so callback counts are not message counts. Store payloads in a queue or other shared state owned by your application.
+`notify` returns `false` after close. No alloc, no payload. Multiple notifies may yield one callback — store payloads in app-owned shared state.
 
-The callback runs on the thread driving the loop, outside the loop's lock. Calling `notify()` again from a callback schedules a later turn rather than recursively invoking the callback.
+State (owner dispatches; `notify` is the cross-thread entry):
+
+- `idle` → `pending` on first notify
+- further `pending` notifies coalesce (no extra wake)
+- snapshot: `pending` → `ready`
+- dispatch: `executing` (or back to `pending` if `again` was set while `ready`)
+- after callback → `idle`, unless a nested `notify` already re-armed to `pending`
+
+Wake skip: while the owner is driving (`run` / `beginRun` / `runOnce` / `dispatchEvents`), same-thread `notify` / timer starts skip `Waiter.signal`. External blocking drivers wrap their wait loop with `beginRun` / `endRun`. Remote threads still wake. Idle owner always wakes so a create-thread `notify` cannot starve a waiter on another thread. Explicit `Loop.wake()` always signals. Mutex stays on every notify (queues are shared).
+
+Callback runs on the driving thread, outside the loop lock. `notify()` from a callback schedules a later turn, not a recursive call.
 
 ## Timers
 
-Initialize a `Timer` with a callback of type `fn (?*anyopaque, *zev.Timer) void`, then schedule it with:
+Callback type `fn (?*anyopaque, *zev.Timer) void`. Schedule with:
 
-- `startAfter(delay_ms)`: wait at least this many milliseconds from the current system monotonic time.
-- `startAt(deadline_ms)`: use an absolute monotonic timestamp.
-- `cancel()`: remove a pending callback; returns whether a scheduled or ready timer was cancelled.
-- `isActive()`: report whether the timer is scheduled or ready to be dispatched.
-- `close()`: cancel the timer and detach it from the loop.
+- `startAfter(delay_ms)` — relative to `Loop.nowMs()`
+- `startAt(deadline_ms)` — absolute monotonic
+- `cancel()` — remove pending/ready; returns whether one was cancelled
+- `isActive()` — scheduled or ready
+- `close()` — cancel and detach
 
-Timers are one-shot and become inactive before their callbacks run. Restarting an active timer replaces its deadline. To repeat a timer, call `startAt` or `startAfter` again and choose the interval policy in your application.
+One-shot; inactive before the callback runs. Restart replaces the deadline. Equal deadlines dispatch in schedule order. A start/restart inside a callback waits for a later turn (including delay 0). A callback may cancel/close another ready-but-not-yet-run timer.
 
-Timers with equal deadlines are dispatched in the order they were scheduled for that deadline. A timer scheduled or restarted inside a callback waits for a later dispatch turn, including when its delay is zero. A callback may cancel or close another timer that is ready but has not yet been invoked.
-
-Starting an unreserved timer may allocate to grow the shared heap. `reserve()` reserves capacity for a handle without scheduling it. The reservation lasts until `close`, allowing subsequent starts on that handle without heap growth. If reservation or heap growth fails, an existing timer schedule is preserved. Dispatching already queued timers does not allocate.
+Unreserved start may grow the heap. `reserve()` holds capacity until `close`. Failed growth keeps an existing schedule. Dispatch of already-queued timers does not allocate.
 
 ## Ownership and shutdown
 
-- Initialize, schedule, cancel, close, and drive handles on the loop's owning thread. Among handle operations, only `Notifier.notify` is cross-thread; `Loop.wake` and `Loop.requestStop` are also thread-safe.
-- Initialize handles with `.{}`. Once initialized, keep their addresses stable: do not copy or move them.
-- Stop and join all notifying threads before closing or freeing a `Notifier`. Keep the loop alive until those threads have finished.
-- Callbacks run outside the loop's lock and may close and free their own handles. Reentrant drive attempts do not execute another turn.
-- End all driving, waiting, and waking operations before calling `Loop.destroy`. Do not destroy the loop from a callback.
-- `Loop.destroy` detaches remaining handles without invoking callbacks. It does not free application-owned handles or callback contexts.
+- Init / schedule / cancel / close / drive on the owning thread. Cross-thread among handles: only `Notifier.notify`. Also thread-safe: `Loop.wake`, `Loop.requestStop`.
+- Init with `.{}`; keep addresses stable.
+- Stop and join notifying threads before closing or freeing a `Notifier`; keep the loop alive until they finish.
+- Callbacks run outside the loop lock and may close/free their own handles. Reentrant drive does not run another turn.
+- Finish all drive / wait / wake before `Loop.destroy`. Do not destroy from a callback.
+- `destroy` detaches remaining handles without invoking callbacks; does not free app-owned handles or contexts.
 
 ## Waiter and synchronization
 
-`Waiter` uses a generation counter to avoid losing a wake between checking shared state and waiting. Read the generation before checking the state, using the application's synchronization to protect that state:
+Generation counter avoids losing a wake between checking state and waiting:
 
 ```zig
 const seen = waiter.generation();
 if (!hasWork()) _ = waiter.waitUntilChange(seen, null);
 ```
 
-`waitUntilChange(expected, timeout_ms)` returns `true` when the generation changes and `false` on timeout. A `null` timeout waits indefinitely. `signal()` wakes at least one waiter; `broadcast()` wakes all waiters. Recheck application state after waking.
+`waitUntilChange(expected, timeout_ms)` → `true` on generation change, `false` on timeout. `null` timeout waits forever. `signal()` wakes ≥1; `broadcast()` wakes all. Recheck state after waking.
 
-Generations can wrap: compare them for equality rather than treating them as event counts. The Linux-family backend uses a 32-bit counter; other backends use a 64-bit counter. Construct a `Waiter` at its final storage address and do not copy or move it. All operations must finish before its `deinit`.
+Compare generations for equality (they wrap). Linux-family: 32-bit; others: 64-bit. Construct at final address; no copy/move. Finish all ops before `deinit`.
 
-`Condition.waitTimeout` reacquires the supplied `Mutex` before returning and yields `.notified` or `.timed_out`. `.notified` only means a notification was observed; while still holding the mutex, recheck the shared condition before proceeding.
+`Condition.waitTimeout` reacquires the mutex before return (`.notified` / `.timed_out`). Recheck the condition while holding the mutex.
 
 ## Native backends
 
-Waiting, clocks, and sleep call operating-system APIs directly. They do not require a `std.Io` instance or initialize `std.Io.Threaded`. zev still uses the Zig standard library for allocators, atomics, and system declarations.
+OS APIs directly — no `std.Io` / `std.Io.Threaded`. Still uses Zig std for allocators, atomics, system decls.
 
 | Platform | Mutex | Waiting and waking | Clocks and sleep | Native dependency |
 | --- | --- | --- | --- | --- |
-| macOS, iOS | pthread mutex | pthread condition variables; relative timed waits | `clock_gettime(CLOCK_MONOTONIC)`, `nanosleep` | libc |
-| Linux, Android | pthread mutex | `FUTEX_WAIT`, `FUTEX_WAKE` | Linux clock and sleep system calls | libc and kernel interfaces |
-| OpenHarmony | SDK pthread mutex through a translated SDK header | `FUTEX_WAIT`, `FUTEX_WAKE` | Linux clock and sleep system calls | SDK headers, libc, and kernel interfaces |
+| macOS, iOS | pthread mutex | pthread cond; relative timed waits | `clock_gettime(CLOCK_MONOTONIC)`, `nanosleep` | libc |
+| Linux, Android | pthread mutex | `FUTEX_WAIT` / `FUTEX_WAKE` | Linux clock / sleep syscalls | libc + kernel |
+| OpenHarmony | SDK pthread via translated header | `FUTEX_WAIT` / `FUTEX_WAKE` | Linux clock / sleep syscalls | SDK headers, libc, kernel |
 | Windows | exclusive `SRWLOCK` | `SRWLOCK`, `CONDITION_VARIABLE` | `GetTickCount64`, `GetSystemTimeAsFileTime`, `Sleep` | `kernel32` |
 
-Standalone OpenHarmony builds require `-Dohos-sysroot=<sdk-native-sysroot>`. For the stress executable, also pass `-Dohos-clang=<sdk-clang>`. An embedding build configures the shared `zev` module using `@import("zev").build_support_api.configureOhosMutex(b, module, target, sysroot)`; this adds the SDK include paths and the translated pthread binding without passing SDK options through every intermediate dependency.
+Standalone OpenHarmony: `-Dohos-sysroot=<sdk-native-sysroot>`; stress also needs `-Dohos-clang=<sdk-clang>`. Embeddings configure via `@import("zev").build_support_api.configureOhosMutex(b, module, target, sysroot)`.
 
-`monotonicMilliseconds()` is suitable for deadlines. `realtimeMilliseconds()` reads wall-clock time and can change when the system clock is adjusted. `sleepMilliseconds()` suspends the calling thread.
+`monotonicMilliseconds()` for deadlines. `realtimeMilliseconds()` is wall clock (can jump). `sleepMilliseconds()` sleeps the calling thread.
 
 ## Testing
 
-Run from the package directory:
-
 ```sh
 zig build test
+zig build bench -Doptimize=ReleaseFast
 zig build stress -Doptimize=ReleaseFast
 ```
 
-Add `-Dtsan=true` to enable ThreadSanitizer. Behavioral tests cover waiting and waking, synchronization, timer ordering and cancellation, cross-thread notifications, host-driven dispatch, reentrancy, and handle lifetimes. The stress executable checks native mutex lifecycle, `tryLock`, protected updates, and condition broadcasts, measures waiting-thread CPU time, then exercises one million signals from four producers, 100,000 zero-timeout waits, and 20,000 create/signal/wait lifecycles.
+`-Dtsan=true` for ThreadSanitizer. Behavioral tests cover wait/wake, sync, timer order/cancel, cross-thread notify, host dispatch, reentrancy, lifetimes. Stress: native mutex lifecycle, `tryLock`, protected updates, cond broadcasts, waiting-thread CPU, 1M signals / 4 producers, 100k zero-timeout waits, 20k create/signal/wait cycles.
 
-The platform test kit lives in [platform-test](platform-test/readme.md):
+Platform kit: [platform-test](platform-test/readme.md)
 
 ```sh
 zig build platform-test -- run --case zev_stress --platform macos
 zig build platform-test -- run --case zev_stress --all
 ```
 
-The runner reports `PASS`, `FAIL`, or `SKIP` for each requested platform. Configuration uses the `ZEV_` prefix; see [config.env.example](platform-test/config.env.example) for toolchain and device settings.
+`PASS` / `FAIL` / `SKIP` per platform. Config prefix `ZEV_`; see [config.env.example](platform-test/config.env.example).
 
-When zev is used in the containing repository, its package-boundary checks run with the normal repository test suite.
+In the containing repo, package-boundary checks run with the normal test suite.

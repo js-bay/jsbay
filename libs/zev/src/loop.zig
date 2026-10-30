@@ -12,6 +12,10 @@ pub const RunOptions = struct {
     should_stop: ?*const fn (?*anyopaque) bool = null,
     deadline_ms: ?u64 = null,
     event_dispatch: EventDispatch = .automatic,
+    /// Max Notifier+Timer callbacks to invoke in one dispatch turn. `null` means unlimited (default), so existing callers keep draining a full ready snapshot. Notifiers are drained before timers; exhaustion leaves remaining ready work queued and makes `runOnce` report an immediate deadline.
+    dispatch_budget: ?usize = null,
+    /// Optional wall/virtual-time cap for one dispatch turn, measured with `Loop.nowMs` from the turn start. `null` means no time limit (default). A limit of `0` prevents any callback in that turn (same idea as `dispatch_budget = 0`).
+    dispatch_time_budget_ms: ?u64 = null,
 };
 
 pub const Notifier = struct {
@@ -37,12 +41,23 @@ pub const Notifier = struct {
         defer loop.events_mutex.unlock();
         switch (self.state) {
             .closed => return false,
-            .idle => loop.appendNotifierPendingLocked(self),
+            .idle => {
+                loop.appendNotifierPendingLocked(self);
+                loop.wakeForEvent();
+            },
             .pending => {},
-            .ready => self.again = true,
-            .executing => loop.appendNotifierPendingLocked(self),
+            .ready => {
+                // Coalesce while already marked for another turn; first again still wakes.
+                if (!self.again) {
+                    self.again = true;
+                    loop.wakeForEvent();
+                }
+            },
+            .executing => {
+                loop.appendNotifierPendingLocked(self);
+                loop.wakeForEvent();
+            },
         }
-        loop.wake();
         return true;
     }
 
@@ -98,7 +113,7 @@ pub const Timer = struct {
         self.heap_index = loop.timer_heap.items.len;
         loop.timer_heap.appendAssumeCapacity(self);
         loop.siftTimerUpLocked(self.heap_index);
-        loop.wake();
+        loop.wakeForEvent();
     }
 
     /// Reserve heap capacity for this handle without scheduling it. The reservation remains until close, so later startAt calls cannot fail because the shared heap needs to grow.
@@ -114,7 +129,8 @@ pub const Timer = struct {
     }
 
     pub fn startAfter(self: *Timer, delay_ms: u64) !void {
-        const now = root.monotonicMilliseconds();
+        const loop = self.loop orelse return error.Closed;
+        const now = loop.nowMs();
         return self.startAt(std.math.add(u64, now, delay_ms) catch std.math.maxInt(u64));
     }
 
@@ -157,6 +173,8 @@ pub const Loop = struct {
     allocator: std.mem.Allocator,
     waiter: Waiter = .init,
     run_state: std.atomic.Value(RunState) = .init(.idle),
+    /// Thread that creates or last drives the loop. Used to skip redundant wakes: the owner cannot be blocked in `waitForWake` on this loop while calling in.
+    owner_thread: std.atomic.Value(u64) = .init(0),
     events_mutex: Mutex = .{},
     notifier_registered: ?*Notifier = null,
     notifier_pending_head: ?*Notifier = null,
@@ -173,11 +191,14 @@ pub const Loop = struct {
     running_once: bool = false,
     turn_active: bool = false,
     events_dispatched: bool = false,
+    clock_ctx: ?*anyopaque = null,
+    clock_fn: ?*const fn (?*anyopaque) u64 = null,
 
     pub fn create(allocator: std.mem.Allocator) !*Loop {
         const loop = try allocator.create(Loop);
         errdefer allocator.destroy(loop);
         loop.* = .{ .allocator = allocator };
+        loop.bindOwnerThread();
         return loop;
     }
 
@@ -218,15 +239,57 @@ pub const Loop = struct {
         self.allocator.destroy(self);
     }
 
-    fn beginRun(self: *Loop) void {
-        self.run_state.store(.running, .seq_cst);
+    /// Install a monotonic clock used by `nowMs`, timer due checks, time budgets, `Timer.startAfter`, `runOnce`, and `run`. Pass a null function to restore the system monotonic clock.
+    /// Not synchronized: call from the owner/test thread with no concurrent `nowMs` / dispatch / `startAfter`. A frozen virtual clock means `dispatch_time_budget_ms` will not elapse unless the harness advances the clock (count budgets still apply).
+    /// Prefer `runOnce` / `dispatchEvents` over blocking `run` when advancing time from the same thread; under a custom clock, `run` waits only for an external wake.
+    pub fn setClock(self: *Loop, ctx: ?*anyopaque, now: ?*const fn (?*anyopaque) u64) void {
+        self.clock_ctx = ctx;
+        self.clock_fn = now;
     }
-    fn endRun(self: *Loop) void {
+
+    pub fn nowMs(self: *const Loop) u64 {
+        if (self.clock_fn) |clock| return clock(self.clock_ctx);
+        return root.monotonicMilliseconds();
+    }
+
+    fn bindOwnerThread(self: *Loop) void {
+        self.owner_thread.store(@intCast(std.Thread.getCurrentId()), .release);
+    }
+
+    pub fn isOwnerThread(self: *const Loop) bool {
+        const owner = self.owner_thread.load(.acquire);
+        if (owner == 0) return false;
+        return owner == @as(u64, @intCast(std.Thread.getCurrentId()));
+    }
+
+    /// Skip the waiter signal when the owner thread is already driving this loop (`run` / `beginRun` / `runOnce` / `dispatchEvents`): it cannot be blocked in `waitForWake` for this loop while calling in. If the owner is idle, always signal so a create-thread `notify` cannot starve another thread blocked in `waitForWake`. Full mutex elision on the owner is unsafe because cross-thread `Notifier.notify` mutates the same queues.
+    fn wakeForEvent(self: *Loop) void {
+        if (self.isOwnerThread()) {
+            // `.running` and `.stopped` both mean a beginRun session is still open (endRun not yet called).
+            if (self.run_state.load(.seq_cst) != .idle) return;
+            if (self.running_once or self.dispatching_events or self.turn_active) return;
+        }
+        self.wake();
+    }
+
+    /// Mark this thread as driving the loop for the duration of a blocking run (including waits).
+    /// Returns false if another driver already called `beginRun` (state was not idle).
+    /// External drivers such as `js_event_loop.Driver.run` / `runFor` must pair a successful call with `endRun`.
+    pub fn beginRun(self: *Loop) bool {
+        self.bindOwnerThread();
+        return self.run_state.cmpxchgStrong(.idle, .running, .seq_cst, .seq_cst) == null;
+    }
+    /// Clears the driving session started by `beginRun` (from `.running` or `.stopped`).
+    pub fn endRun(self: *Loop) void {
         self.run_state.store(.idle, .seq_cst);
+    }
+    /// True while a `beginRun` session is open (`.running` or `.stopped` after `requestStop`, until `endRun`).
+    pub fn isRunning(self: *const Loop) bool {
+        return self.run_state.load(.seq_cst) != .idle;
     }
     pub fn requestStop(self: *Loop) void {
         _ = self.run_state.cmpxchgStrong(.running, .stopped, .seq_cst, .seq_cst);
-        self.wake();
+        self.wakeForEvent();
     }
     fn isStopRequested(self: *const Loop) bool {
         return self.run_state.load(.seq_cst) == .stopped;
@@ -242,22 +305,46 @@ pub const Loop = struct {
         return self.waiter.waitUntilChange(seen, finite);
     }
 
-    /// Runs pending Notifier and due Timer callbacks. Recursion only observes the outer dispatch; callbacks registered during this turn wait for another.
-    pub fn dispatchEvents(self: *Loop, now_ms: u64) void {
-        if (self.dispatching_events or (self.turn_active and self.events_dispatched)) return;
-        if (self.turn_active) self.events_dispatched = true;
-        self.dispatchEventsForTurn(now_ms);
+    /// Runs pending Notifier and due Timer callbacks using `nowMs()` for timer due checks.
+    /// Time budgets also sample `nowMs()`; do not pass a separate host clock sample.
+    /// Recursion only observes the outer dispatch; callbacks registered during this turn wait for another.
+    pub fn dispatchEvents(self: *Loop) void {
+        self.dispatchEventsLimited(null, null);
     }
 
-    fn dispatchEventsForTurn(self: *Loop, now_ms: u64) void {
+    /// Like `dispatchEvents`, with optional count and time budgets. Timer due checks and time budgets both use `nowMs()`.
+    pub fn dispatchEventsLimited(self: *Loop, budget: ?usize, time_budget_ms: ?u64) void {
+        if (self.dispatching_events or (self.turn_active and self.events_dispatched)) return;
+        if (self.turn_active) self.events_dispatched = true;
+        self.bindOwnerThread();
+        self.dispatchEventsForTurn(self.nowMs(), budget, time_budget_ms);
+    }
+
+    fn dispatchEventsForTurn(self: *Loop, now_ms: u64, budget: ?usize, time_budget_ms: ?u64) void {
         std.debug.assert(!self.dispatching_events);
         self.dispatching_events = true;
         defer self.dispatching_events = false;
         self.events_mutex.lock();
         self.snapshotEventsLocked(now_ms);
         self.events_mutex.unlock();
-        self.runReadyNotifier();
-        if (!self.isStopRequested()) self.runReadyTimers();
+        var remaining = budget;
+        // Sample the clock only when a time budget is active. Count-only and unlimited
+        // drains must not pay clock_gettime (or virtual-clock) per callback.
+        const turn_started: u64 = if (time_budget_ms != null) self.nowMs() else 0;
+        self.runReadyNotifier(&remaining, time_budget_ms, turn_started);
+        if (!self.isStopRequested()) self.runReadyTimers(&remaining, time_budget_ms, turn_started);
+    }
+
+    fn consumeBudget(remaining: *?usize) void {
+        if (remaining.*) |*left| left.* -|= 1;
+    }
+
+    /// Returns false when the turn has exhausted its count and/or time budget.
+    /// Does not read the clock unless `time_budget_ms` is set.
+    fn budgetAllows(self: *Loop, remaining: *?usize, time_budget_ms: ?u64, turn_started: u64) bool {
+        if (remaining.*) |left| if (left == 0) return false;
+        if (time_budget_ms) |limit| if (self.nowMs() -% turn_started >= limit) return false;
+        return true;
     }
 
     pub fn nextDeadline(self: *Loop) ?u64 {
@@ -271,15 +358,16 @@ pub const Loop = struct {
     pub fn runOnce(self: *Loop, options: RunOptions) ?u64 {
         if (self.running_once or self.dispatching_events or self.turn_active) return self.nextDeadline();
         if (options.should_stop) |stop| if (stop(options.ctx)) return null;
+        self.bindOwnerThread();
         self.running_once = true;
         defer self.running_once = false;
         self.turn_active = true;
         defer self.turn_active = false;
         self.events_dispatched = false;
-        const now = root.monotonicMilliseconds();
+        const now = self.nowMs();
         if (options.event_dispatch == .automatic) {
             self.events_dispatched = true;
-            self.dispatchEventsForTurn(now);
+            self.dispatchEventsForTurn(now, options.dispatch_budget, options.dispatch_time_budget_ms);
         }
         if (self.isStopRequested()) return self.nextDeadline();
         if (options.should_stop) |stop| if (stop(options.ctx)) return null;
@@ -291,8 +379,8 @@ pub const Loop = struct {
     }
 
     pub fn run(self: *Loop, options: RunOptions) void {
-        if (self.run_state.load(.seq_cst) == .running or self.running_once or self.dispatching_events or self.turn_active) return;
-        self.beginRun();
+        if (self.running_once or self.dispatching_events or self.turn_active) return;
+        if (!self.beginRun()) return;
         defer self.endRun();
         while (!self.isStopRequested()) {
             if (options.should_stop) |stop| if (stop(options.ctx)) break;
@@ -300,12 +388,21 @@ pub const Loop = struct {
             const next = self.runOnce(options);
             if (self.isStopRequested()) break;
             if (options.should_stop) |stop| if (stop(options.ctx)) break;
-            const now = root.monotonicMilliseconds();
+            const now = self.nowMs();
             if (options.deadline_ms) |limit| if (now >= limit) break;
             var timeout: ?u64 = if (next) |deadline| if (deadline <= now) 0 else deadline - now else null;
             if (options.deadline_ms) |limit| {
                 const remaining = if (limit <= now) 0 else limit - now;
                 timeout = if (timeout) |current| @min(current, remaining) else remaining;
+            }
+            // A virtual clock must not translate virtual delays into real sleeps. When the next
+            // deadline is still in the future under a custom clock, park only for an external wake
+            // (notify / requestStop / wake) so the harness can advance time on another thread.
+            if (self.clock_fn != null) {
+                if (timeout == null or timeout.? > 0) {
+                    _ = self.waitForWake(seen, null);
+                    continue;
+                }
             }
             _ = self.waitForWake(seen, timeout);
         }
@@ -463,9 +560,18 @@ pub const Loop = struct {
             self.timer_ready_tail = timer;
         }
     }
-    fn runReadyNotifier(self: *Loop) void {
+    fn runReadyNotifier(self: *Loop, remaining: *?usize, time_budget_ms: ?u64, turn_started: u64) void {
+        // Fold idle restore into the next dequeue lock so a multi-callback drain pays one
+        // mutex round-trip per callback instead of two. The final callback still needs a
+        // trailing lock to leave `.idle` (P0 state-machine invariant).
+        var previous: ?*Notifier = null;
         while (!self.isStopRequested()) {
+            if (!self.budgetAllows(remaining, time_budget_ms, turn_started)) break;
             self.events_mutex.lock();
+            if (previous) |prior| {
+                if (prior.state == .executing) prior.state = .idle;
+                previous = null;
+            }
             const handle = self.notifier_ready_head orelse {
                 self.events_mutex.unlock();
                 return;
@@ -480,11 +586,19 @@ pub const Loop = struct {
             const callback = handle.callback.?;
             const ctx = handle.ctx;
             self.events_mutex.unlock();
+            consumeBudget(remaining);
             callback(ctx, handle);
+            previous = handle;
+        }
+        if (previous) |prior| {
+            self.events_mutex.lock();
+            if (prior.state == .executing) prior.state = .idle;
+            self.events_mutex.unlock();
         }
     }
-    fn runReadyTimers(self: *Loop) void {
+    fn runReadyTimers(self: *Loop, remaining: *?usize, time_budget_ms: ?u64, turn_started: u64) void {
         while (!self.isStopRequested()) {
+            if (!self.budgetAllows(remaining, time_budget_ms, turn_started)) return;
             self.events_mutex.lock();
             const handle = self.timer_ready_head orelse {
                 self.events_mutex.unlock();
@@ -497,6 +611,7 @@ pub const Loop = struct {
             const callback = handle.callback.?;
             const ctx = handle.ctx;
             self.events_mutex.unlock();
+            consumeBudget(remaining);
             callback(ctx, handle);
         }
     }

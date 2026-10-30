@@ -460,7 +460,7 @@ test "attached suspend cancels Host schedule; wake stays dirty until resume" {
 
     const driver = try js_event_loop.Driver.create(std.testing.allocator);
     defer driver.destroy();
-    driver.test_now = 1_000;
+    js_event_loop.Driver.testing.setNow(driver, 1_000);
     var fixture = Fixture{ .driver = driver };
     try driver.attach(.{ .context = &fixture, .schedule = Fixture.schedule, .cancel = Fixture.cancel }, Fixture.drive, &fixture);
     try std.testing.expectEqual(@as(usize, 1), fixture.schedules);
@@ -482,7 +482,7 @@ test "attached suspend cancels Host schedule; wake stays dirty until resume" {
     try std.testing.expect(timer.isActive());
 
     // Time passes and foreign wakes arrive while suspended: no Host schedule, no fire.
-    driver.test_now = 5_000;
+    js_event_loop.Driver.testing.setNow(driver, 5_000);
     driver.wake();
     driver.wake();
     try std.testing.expectEqual(schedules_before_suspend, fixture.schedules);
@@ -608,7 +608,7 @@ test "attached soft Host cancel survives suspend resume (SDK hard-cancel regress
     {
         const driver = try js_event_loop.Driver.create(std.testing.allocator);
         defer driver.destroy();
-        driver.test_now = 1_000;
+        js_event_loop.Driver.testing.setNow(driver, 1_000);
         var fixture = Fixture{ .driver = driver, .hard_cancel = false };
         try driver.attach(.{ .context = &fixture, .schedule = Fixture.schedule, .cancel = Fixture.cancel }, Fixture.drive, &fixture);
         fixture.runScheduled();
@@ -624,7 +624,7 @@ test "attached soft Host cancel survives suspend resume (SDK hard-cancel regress
         try std.testing.expect(fixture.alive);
         try std.testing.expect(fixture.task == null);
 
-        driver.test_now = 5_000;
+        js_event_loop.Driver.testing.setNow(driver, 5_000);
         driver.resumeScheduling();
         try std.testing.expect(driver.lastError() == null);
         try std.testing.expect(fixture.alive);
@@ -638,7 +638,7 @@ test "attached soft Host cancel survives suspend resume (SDK hard-cancel regress
     {
         const driver = try js_event_loop.Driver.create(std.testing.allocator);
         defer driver.destroy();
-        driver.test_now = 1_000;
+        js_event_loop.Driver.testing.setNow(driver, 1_000);
         var fixture = Fixture{ .driver = driver, .hard_cancel = true };
         try driver.attach(.{ .context = &fixture, .schedule = Fixture.schedule, .cancel = Fixture.cancel }, Fixture.drive, &fixture);
         fixture.runScheduled();
@@ -650,7 +650,7 @@ test "attached soft Host cancel survives suspend resume (SDK hard-cancel regress
 
         driver.suspendScheduling();
         try std.testing.expect(!fixture.alive);
-        driver.test_now = 5_000;
+        js_event_loop.Driver.testing.setNow(driver, 5_000);
         driver.resumeScheduling();
         try std.testing.expect(driver.lastError() != null);
         try std.testing.expectEqual(js_event_loop.Driver.Error.ScheduleFailed, driver.lastError().?);
@@ -1209,4 +1209,265 @@ test "attach discards a stop requested while idle so the new attachment drives" 
     task(fixture.task_context);
     try std.testing.expectEqual(@as(usize, 1), fixture.probe.turns);
     driver.detach();
+}
+
+test "testing.advance installs Loop virtual clock for now and timers" {
+    const Probe = struct {
+        fired: usize = 0,
+        fn timer(context: ?*anyopaque, _: *js_event_loop.Timer) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.fired += 1;
+        }
+        fn runTask(_: ?*anyopaque, _: js_event_loop.Scheduler.TaskSource, _: u64) bool {
+            return false;
+        }
+        fn checkpoint(_: ?*anyopaque) void {}
+        fn nextDeadline(_: ?*anyopaque) ?u64 {
+            return null;
+        }
+    };
+
+    var probe = Probe{};
+    const driver = try js_event_loop.Driver.create(std.testing.allocator);
+    defer driver.destroy();
+
+    _ = js_event_loop.Driver.testing.advance(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    }, 1_000);
+    try std.testing.expectEqual(@as(u64, 1_000), driver.now());
+    try std.testing.expectEqual(@as(u64, 1_000), driver.loop.nowMs());
+
+    var timer: js_event_loop.Timer = undefined;
+    timer.init(driver, &probe, Probe.timer);
+    defer timer.close();
+    try timer.startAt(1_500);
+
+    _ = js_event_loop.Driver.testing.advance(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    }, 1_400);
+    try std.testing.expectEqual(@as(usize, 0), probe.fired);
+    try std.testing.expectEqual(@as(u64, 1_400), driver.now());
+
+    _ = js_event_loop.Driver.testing.advance(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    }, 1_500);
+    try std.testing.expectEqual(@as(usize, 1), probe.fired);
+}
+
+test "dispatch_budget limits native callbacks per driver turn" {
+    const Probe = struct {
+        fired: usize = 0,
+        fn notifier(context: ?*anyopaque, _: *js_event_loop.Notifier) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.fired += 1;
+        }
+        fn runTask(_: ?*anyopaque, _: js_event_loop.Scheduler.TaskSource, _: u64) bool {
+            return false;
+        }
+        fn checkpoint(_: ?*anyopaque) void {}
+        fn nextDeadline(_: ?*anyopaque) ?u64 {
+            return null;
+        }
+    };
+
+    var probe = Probe{};
+    const driver = try js_event_loop.Driver.create(std.testing.allocator);
+    defer driver.destroy();
+    driver.dispatch_budget = 1;
+
+    var first: js_event_loop.Notifier = undefined;
+    var second: js_event_loop.Notifier = undefined;
+    first.init(driver, &probe, Probe.notifier);
+    defer first.close();
+    second.init(driver, &probe, Probe.notifier);
+    defer second.close();
+    try std.testing.expect(first.notify());
+    try std.testing.expect(second.notify());
+
+    _ = js_event_loop.Driver.testing.runOnce(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    });
+    try std.testing.expectEqual(@as(usize, 1), probe.fired);
+
+    _ = js_event_loop.Driver.testing.runOnce(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    });
+    try std.testing.expectEqual(@as(usize, 2), probe.fired);
+}
+
+test "Timer.startAfter uses Loop virtual clock after advance" {
+    const Probe = struct {
+        fired: usize = 0,
+        fn timer(context: ?*anyopaque, _: *js_event_loop.Timer) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.fired += 1;
+        }
+        fn runTask(_: ?*anyopaque, _: js_event_loop.Scheduler.TaskSource, _: u64) bool {
+            return false;
+        }
+        fn checkpoint(_: ?*anyopaque) void {}
+        fn nextDeadline(_: ?*anyopaque) ?u64 {
+            return null;
+        }
+    };
+
+    var probe = Probe{};
+    const driver = try js_event_loop.Driver.create(std.testing.allocator);
+    defer driver.destroy();
+    _ = js_event_loop.Driver.testing.advance(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    }, 50);
+
+    var timer: js_event_loop.Timer = undefined;
+    timer.init(driver, &probe, Probe.timer);
+    defer timer.close();
+    try timer.startAfter(25);
+    try std.testing.expectEqual(@as(u64, 75), timer.deadline());
+
+    _ = js_event_loop.Driver.testing.advance(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    }, 74);
+    try std.testing.expectEqual(@as(usize, 0), probe.fired);
+    _ = js_event_loop.Driver.testing.advance(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    }, 75);
+    try std.testing.expectEqual(@as(usize, 1), probe.fired);
+}
+
+test "driver notifier pending coalesce does not double-wake the loop waiter" {
+    const Probe = struct {
+        fired: usize = 0,
+        fn notifier(context: ?*anyopaque, _: *js_event_loop.Notifier) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.fired += 1;
+        }
+        fn runTask(_: ?*anyopaque, _: js_event_loop.Scheduler.TaskSource, _: u64) bool {
+            return false;
+        }
+        fn checkpoint(_: ?*anyopaque) void {}
+        fn nextDeadline(_: ?*anyopaque) ?u64 {
+            return null;
+        }
+    };
+
+    var probe = Probe{};
+    const driver = try js_event_loop.Driver.create(std.testing.allocator);
+    defer driver.destroy();
+
+    var handle: js_event_loop.Notifier = undefined;
+    handle.init(driver, &probe, Probe.notifier);
+    defer handle.close();
+
+    // Leave the create thread so the first notify is remote and must wake; the second
+    // stays pending and must not bump generation again (Driver must not force a wake).
+    const Ctx = struct {
+        handle: *js_event_loop.Notifier,
+        before: u64,
+        after_first: std.atomic.Value(u64) = .init(0),
+        fn send(self: *@This()) void {
+            std.debug.assert(self.handle.notify());
+            self.after_first.store(self.handle.driver.?.loop.wakeGeneration(), .release);
+            std.debug.assert(self.handle.notify());
+        }
+    };
+    var ctx = Ctx{ .handle = &handle, .before = driver.loop.wakeGeneration() };
+    const thread = try std.Thread.spawn(.{}, Ctx.send, .{&ctx});
+    thread.join();
+    const after_first = ctx.after_first.load(.acquire);
+    try std.testing.expect(after_first == ctx.before + 1);
+    try std.testing.expectEqual(after_first, driver.loop.wakeGeneration());
+
+    _ = js_event_loop.Driver.testing.runOnce(driver, .{
+        .context = &probe,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+    });
+    try std.testing.expectEqual(@as(usize, 1), probe.fired);
+}
+
+test "Driver.run sets Loop.isRunning for the blocking wait loop" {
+    const Probe = struct {
+        driver: *js_event_loop.Driver,
+        saw_running: std.atomic.Value(bool) = .init(false),
+        fn runTask(_: ?*anyopaque, _: js_event_loop.Scheduler.TaskSource, _: u64) bool {
+            return false;
+        }
+        fn checkpoint(_: ?*anyopaque) void {}
+        fn nextDeadline(_: ?*anyopaque) ?u64 {
+            return null;
+        }
+        fn shouldStop(context: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.driver.loop.isRunning()) self.saw_running.store(true, .release);
+            return self.saw_running.load(.acquire);
+        }
+        fn run(self: *@This()) void {
+            self.driver.run(.{
+                .context = self,
+                .run_one_task = runTask,
+                .checkpoint = checkpoint,
+                .next_task_deadline = nextDeadline,
+                .should_stop = shouldStop,
+            }) catch unreachable;
+        }
+    };
+
+    const driver = try js_event_loop.Driver.create(std.testing.allocator);
+    defer driver.destroy();
+    var probe = Probe{ .driver = driver };
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    thread.join();
+    try std.testing.expect(probe.saw_running.load(.acquire));
+    try std.testing.expect(!driver.loop.isRunning());
+}
+
+test "Driver.runFor clears Loop.isRunning after return" {
+    const Probe = struct {
+        fn runTask(_: ?*anyopaque, _: js_event_loop.Scheduler.TaskSource, _: u64) bool {
+            return false;
+        }
+        fn checkpoint(_: ?*anyopaque) void {}
+        fn nextDeadline(_: ?*anyopaque) ?u64 {
+            return null;
+        }
+        fn shouldStop(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+
+    const driver = try js_event_loop.Driver.create(std.testing.allocator);
+    defer driver.destroy();
+    try driver.runFor(.{
+        .context = null,
+        .run_one_task = Probe.runTask,
+        .checkpoint = Probe.checkpoint,
+        .next_task_deadline = Probe.nextDeadline,
+        .should_stop = Probe.shouldStop,
+    }, 1);
+    try std.testing.expect(!driver.loop.isRunning());
 }
