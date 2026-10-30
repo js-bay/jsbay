@@ -2021,6 +2021,10 @@ pub export fn jsbay_engine_global(instance_id_raw: c_int, out_value: *u64) c_int
         };
         defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueGetGlobal(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
         return packedPublish(instance_id, ready.tag, ready.ctx_addr, result, out_value, null);
     }
     var op = switch (beginApiOp(instance_id)) {
@@ -2059,7 +2063,12 @@ pub export fn jsbay_value_undefined(instance_id: c_int, out_value: *u64) c_int {
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewUndefined(ready.tag, ready.ctx_addr), ready.tag, ready.ctx_addr, out_value);
+        const result = @import("backend_dispatch.zig").valueNewUndefined(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
     }
     return apiNewSimple(instance_id, out_value, struct {
         fn make(_: ActiveEngine.Context) ActiveEngine.Value {
@@ -2081,7 +2090,12 @@ pub export fn jsbay_value_null(instance_id: c_int, out_value: *u64) c_int {
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewNull(ready.tag, ready.ctx_addr), ready.tag, ready.ctx_addr, out_value);
+        const result = @import("backend_dispatch.zig").valueNewNull(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
     }
     return apiNewSimple(instance_id, out_value, struct {
         fn make(_: ActiveEngine.Context) ActiveEngine.Value {
@@ -2103,7 +2117,12 @@ pub export fn jsbay_value_new_bool(instance_id: c_int, input: bool, out_value: *
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewBool(ready.tag, ready.ctx_addr, input), ready.tag, ready.ctx_addr, out_value);
+        const result = @import("backend_dispatch.zig").valueNewBool(ready.tag, ready.ctx_addr, input);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
@@ -2126,7 +2145,12 @@ pub export fn jsbay_value_new_number(instance_id: c_int, input: f64, out_value: 
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewNumber(ready.tag, ready.ctx_addr, input), ready.tag, ready.ctx_addr, out_value);
+        const result = @import("backend_dispatch.zig").valueNewNumber(ready.tag, ready.ctx_addr, input);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
@@ -2151,7 +2175,12 @@ pub export fn jsbay_value_new_string(instance_id: c_int, input: Utf8, out_value:
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewString(ready.tag, ready.ctx_addr, bytes), ready.tag, ready.ctx_addr, out_value);
+        const result = @import("backend_dispatch.zig").valueNewString(ready.tag, ready.ctx_addr, bytes);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
@@ -2181,8 +2210,13 @@ pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
+        const result = @import("backend_dispatch.zig").valueNewArrayBuffer(ready.tag, ready.ctx_addr, bytes);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
         var exc: u64 = 0;
-        const status = packedPublish(id, ready.tag, ready.ctx_addr, @import("backend_dispatch.zig").valueNewArrayBuffer(ready.tag, ready.ctx_addr, bytes), out_value, &exc);
+        const status = packedPublish(id, ready.tag, ready.ctx_addr, result, out_value, &exc);
         if (status == 1) {
             // ArrayBuffer ctor failure as exception → treat as OOM for this API (no out_exception).
             _ = jsbay_value_release(exc);
@@ -2211,14 +2245,12 @@ pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
         return API_OK;
     }
     if (packed_api_value.isPackedHandle(value)) {
-        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        out_kind.* = @import("backend_dispatch.zig").valueTypeKind(entry.tag, entry.ctx_addr, entry.bytes());
+        defer data.deinit();
+        out_kind.* = @import("backend_dispatch.zig").valueTypeKind(data.js.tag, data.js.ctx_addr, data.bytes());
         return API_OK;
     }
     var data = switch (beginValueOp(value)) {
@@ -2233,15 +2265,13 @@ pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
 pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
     out_value.* = false;
     if (packed_api_value.isPackedHandle(value)) {
-        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        if (!@import("backend_dispatch.zig").valueIsBool(entry.tag, entry.ctx_addr, entry.bytes())) return API_INVALID_ARGUMENT;
-        out_value.* = @import("backend_dispatch.zig").valueToBool(entry.tag, entry.ctx_addr, entry.bytes()) orelse return API_INVALID_ARGUMENT;
+        defer data.deinit();
+        if (!@import("backend_dispatch.zig").valueIsBool(data.js.tag, data.js.ctx_addr, data.bytes())) return API_INVALID_ARGUMENT;
+        out_value.* = @import("backend_dispatch.zig").valueToBool(data.js.tag, data.js.ctx_addr, data.bytes()) orelse return API_INVALID_ARGUMENT;
         return API_OK;
     }
     var data = switch (beginValueOp(value)) {
@@ -2257,15 +2287,13 @@ pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
 pub export fn jsbay_value_to_number(value: u64, out_value: *f64) c_int {
     out_value.* = 0;
     if (packed_api_value.isPackedHandle(value)) {
-        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        if (!@import("backend_dispatch.zig").valueIsNumber(entry.tag, entry.ctx_addr, entry.bytes())) return API_INVALID_ARGUMENT;
-        out_value.* = @import("backend_dispatch.zig").valueToFloat64(entry.tag, entry.ctx_addr, entry.bytes()) orelse return API_INVALID_ARGUMENT;
+        defer data.deinit();
+        if (!@import("backend_dispatch.zig").valueIsNumber(data.js.tag, data.js.ctx_addr, data.bytes())) return API_INVALID_ARGUMENT;
+        out_value.* = @import("backend_dispatch.zig").valueToFloat64(data.js.tag, data.js.ctx_addr, data.bytes()) orelse return API_INVALID_ARGUMENT;
         return API_OK;
     }
     var data = switch (beginValueOp(value)) {
@@ -2291,7 +2319,12 @@ pub export fn jsbay_value_new_object(instance_id: c_int, out_value: *u64) c_int 
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewObject(ready.tag, ready.ctx_addr), ready.tag, ready.ctx_addr, out_value);
+        const result = @import("backend_dispatch.zig").valueNewObject(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
@@ -2320,7 +2353,12 @@ pub export fn jsbay_value_new_array(instance_id: c_int, out_value: *u64) c_int {
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewArray(ready.tag, ready.ctx_addr), ready.tag, ready.ctx_addr, out_value);
+        const result = @import("backend_dispatch.zig").valueNewArray(ready.tag, ready.ctx_addr);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
@@ -2459,6 +2497,73 @@ fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) 
         .entered_js = true,
         .execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id),
     } };
+}
+
+
+const PackedValueOp = struct {
+    js: PackedJsOp,
+    value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined,
+    value_len: usize = 0,
+
+    fn bytes(self: *const PackedValueOp) []const u8 {
+        return self.value_buf[0..self.value_len];
+    }
+
+    fn deinit(self: *PackedValueOp) void {
+        if (self.value_len != 0) {
+            @import("backend_dispatch.zig").timerFreeValue(self.js.tag, self.js.ctx_addr, self.bytes());
+            self.value_len = 0;
+        }
+        self.js.deinit();
+    }
+};
+
+/// Pin a packed handle's backend value for the op lifetime (mirrors beginValueOp for primary).
+fn beginPackedValueOp(handle: u64) union(enum) { ok: PackedValueOp, status: c_int } {
+    const entry = packed_api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
+    if (!api_value.isOwner(entry.instance_id)) {
+        return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(entry.instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    }
+    var js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        .status => |status| return .{ .status = status },
+        .ok => |ok| ok,
+    };
+    // Re-read while admitted, then pin. A toPrimitive / getter can re-enter and release the public handle.
+    const live = packed_api_value.get(handle) orelse {
+        js.deinit();
+        return .{ .status = API_STALE_VALUE };
+    };
+    if (live.instance_id != js.id or live.tag != js.tag) {
+        js.deinit();
+        return .{ .status = API_STALE_VALUE };
+    }
+    var op: PackedValueOp = .{ .js = js, .value_len = 0 };
+    op.value_len = @import("backend_dispatch.zig").timerDupValue(live.tag, live.ctx_addr, live.bytes(), op.value_buf[0..]) orelse {
+        op.js.deinit();
+        return .{ .status = API_STALE_VALUE };
+    };
+    return .{ .ok = op };
+}
+
+fn drainPackedJobs(js: *PackedJsOp) bool {
+    js.endExecution();
+    const map = @import("runtime/instance_map.zig");
+    if (!map.isTeardownPending(js.id)) @import("runtime/js_scheduler.zig").checkpointInstance(js.id);
+    return !map.isTeardownPending(js.id);
+}
+
+fn discardPackedEvalResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").EvalValueResult) void {
+    if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, v.slice());
+    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+}
+
+fn discardPackedBytesResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BytesValueResult) void {
+    if (result.bytes) |b| std.heap.c_allocator.free(b);
+    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
+}
+
+fn discardPackedBoolResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BoolValueResult) void {
+    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
 }
 
 fn packedTagOf(instance_id: i32) ?backend.BackendType {
@@ -2735,6 +2840,10 @@ pub export fn jsbay_value_new_json(instance_id_raw: c_int, input_arg: Utf8, out_
         };
         defer packed_js.deinit();
         const result = @import("backend_dispatch.zig").valueNewJson(ready.tag, ready.ctx_addr, input);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
         return packedPublish(id, ready.tag, ready.ctx_addr, result, out_value, out_exception);
     }
     var op = switch (beginApiOp(id)) {
@@ -2769,7 +2878,12 @@ pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, o
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        return packedNewFromResult(id, @import("backend_dispatch.zig").valueNewError(ready.tag, ready.ctx_addr, message), ready.tag, ready.ctx_addr, out_value);
+        const result = @import("backend_dispatch.zig").valueNewError(ready.tag, ready.ctx_addr, message);
+        if (!drainPackedJobs(&packed_js)) {
+            discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedNewFromResult(id, result, ready.tag, ready.ctx_addr, out_value);
     }
     var op = switch (beginApiOp(id)) {
         .status => |status| return status,
@@ -2794,15 +2908,17 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
         return API_OK;
     }
     if (packed_api_value.isPackedHandle(value)) {
-        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueToUtf8(entry.tag, entry.ctx_addr, entry.bytes());
-        const status = packedPublishBytes(entry.instance_id, entry.tag, entry.ctx_addr, result, out_bytes, out_exception);
+        defer data.deinit();
+        const result = @import("backend_dispatch.zig").valueToUtf8(data.js.tag, data.js.ctx_addr, data.bytes());
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedBytesResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        const status = packedPublishBytes(data.js.id, data.js.tag, data.js.ctx_addr, result, out_bytes, out_exception);
         if (status != API_OK) return status;
         // QuickJS may surface WTF-8; public ABI promises UTF-8.
         if (out_bytes.data) |ptr| {
@@ -2848,15 +2964,17 @@ pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: 
     out_bytes.* = .{ .data = null, .len = 0 };
     out_exception.* = 0;
     if (packed_api_value.isPackedHandle(value)) {
-        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueToJson(entry.tag, entry.ctx_addr, entry.bytes());
-        return packedPublishBytes(entry.instance_id, entry.tag, entry.ctx_addr, result, out_bytes, out_exception);
+        defer data.deinit();
+        const result = @import("backend_dispatch.zig").valueToJson(data.js.tag, data.js.ctx_addr, data.bytes());
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedBytesResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublishBytes(data.js.id, data.js.tag, data.js.ctx_addr, result, out_bytes, out_exception);
     }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
@@ -2882,15 +3000,17 @@ pub export fn jsbay_value_copy_buffer(value: u64, out_bytes: *Bytes, out_excepti
     out_bytes.* = .{ .data = null, .len = 0 };
     out_exception.* = 0;
     if (packed_api_value.isPackedHandle(value)) {
-        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueCopyBuffer(entry.tag, entry.ctx_addr, entry.bytes());
-        return packedPublishBytes(entry.instance_id, entry.tag, entry.ctx_addr, result, out_bytes, out_exception);
+        defer data.deinit();
+        const result = @import("backend_dispatch.zig").valueCopyBuffer(data.js.tag, data.js.ctx_addr, data.bytes());
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedBytesResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublishBytes(data.js.id, data.js.tag, data.js.ctx_addr, result, out_bytes, out_exception);
     }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,
@@ -2921,27 +3041,19 @@ pub export fn jsbay_value_get(object: u64, key_arg: Utf8, out_value: *u64, out_e
     const key = checkedUtf8(key_arg) orelse return API_INVALID_ARGUMENT;
     if (!std.unicode.utf8ValidateSlice(key) or !noEmbeddedNul(key)) return API_INVALID_ARGUMENT;
     if (packed_api_value.isPackedHandle(object)) {
-        const entry = packed_api_value.get(object) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        const key_z = std.heap.c_allocator.dupeSentinel(u8, key, 0) catch return API_OUT_OF_MEMORY;
-        defer std.heap.c_allocator.free(key_z);
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var data = switch (beginPackedValueOp(object)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueGetProperty(entry.tag, entry.ctx_addr, entry.bytes(), key_z);
-        if (result.out_of_memory) {
-            if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, v.slice());
-            if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, e.slice());
-            return API_OUT_OF_MEMORY;
+        defer data.deinit();
+        const key_z = std.heap.c_allocator.dupeSentinel(u8, key, 0) catch return API_OUT_OF_MEMORY;
+        defer std.heap.c_allocator.free(key_z);
+        const result = @import("backend_dispatch.zig").valueGetProperty(data.js.tag, data.js.ctx_addr, data.bytes(), key_z);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
         }
-        if (result.exception) |exc| {
-            const stored = packedStore(entry.instance_id, entry.tag, entry.ctx_addr, exc, out_exception);
-            return if (stored == API_OK) 1 else stored;
-        }
-        if (result.value) |value| return packedStore(entry.instance_id, entry.tag, entry.ctx_addr, value, out_value);
-        return API_OUT_OF_MEMORY;
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, out_value, out_exception);
     }
     var data = switch (beginValueOp(object)) {
         .status => |status| return status,
@@ -2967,24 +3079,26 @@ pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_except
     const key = checkedUtf8(key_arg) orelse return API_INVALID_ARGUMENT;
     if (!std.unicode.utf8ValidateSlice(key) or !noEmbeddedNul(key)) return API_INVALID_ARGUMENT;
     if (packed_api_value.isPackedHandle(object)) {
-        const entry = packed_api_value.get(object) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
+        // Acquire the eval lease before duplicating the value so Zig LIFO runs lease release after freeValue cleanup.
+        var data = switch (beginPackedValueOp(object)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
         if (!packed_api_value.isPackedHandle(value)) return API_STALE_VALUE;
+        // Allocate before duplicating `value`: a key-allocation failure must not leave a duplicate without an owner.
         const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
         defer std.heap.c_allocator.free(key_z);
         var value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const value_len = packedDupBytes(value, entry.instance_id, entry.tag, value_buf[0..]) orelse return API_STALE_VALUE;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
-            .status => |status| {
-                @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, value_buf[0..value_len]);
-                return status;
-            },
-            .ok => |ok| ok,
-        };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueSetProperty(entry.tag, entry.ctx_addr, entry.bytes(), key_z, value_buf[0..value_len]);
+        const value_len = packedDupBytes(value, data.js.id, data.js.tag, value_buf[0..]) orelse return API_STALE_VALUE;
+        // valueSetProperty consumes the duplicated value.
+        const result = @import("backend_dispatch.zig").valueSetProperty(data.js.tag, data.js.ctx_addr, data.bytes(), key_z, value_buf[0..value_len]);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
         var dummy: u64 = 0;
-        return packedPublish(entry.instance_id, entry.tag, entry.ctx_addr, result, &dummy, out_exception);
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, &dummy, out_exception);
     }
     var object_data = switch (beginValueOp(object)) {
         .status => |status| return status,
@@ -3015,13 +3129,16 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
     out_exception.* = 0;
     if (args == null and argc != 0) return API_INVALID_ARGUMENT;
     if (packed_api_value.isPackedHandle(function)) {
-        const entry = packed_api_value.get(function) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
         if (!packed_api_value.isPackedHandle(this_value)) return API_STALE_VALUE;
+        // Acquire the eval lease before duplicating this/args so Zig LIFO runs lease release after freeValue cleanup.
+        var data = switch (beginPackedValueOp(function)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
         var this_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const this_len = packedDupBytes(this_value, entry.instance_id, entry.tag, this_buf[0..]) orelse return API_STALE_VALUE;
-        // Keep this owned for the call duration then free (call does not consume this/args).
-        defer @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, this_buf[0..this_len]);
+        const this_len = packedDupBytes(this_value, data.js.id, data.js.tag, this_buf[0..]) orelse return API_STALE_VALUE;
+        defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, this_buf[0..this_len]);
 
         var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
         defer arg_storage.deinit(std.heap.c_allocator);
@@ -3030,19 +3147,19 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         defer {
             var i: usize = 0;
             while (i < arg_storage.items.len) : (i += 1) {
-                @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, arg_storage.items[i][0..arg_lens.items[i]]);
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, arg_storage.items[i][0..arg_lens.items[i]]);
             }
         }
         if (args) |raw_args| for (raw_args[0..argc]) |handle| {
             if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
             var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-            const len = packedDupBytes(handle, entry.instance_id, entry.tag, buf[0..]) orelse return API_STALE_VALUE;
+            const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
             arg_storage.append(std.heap.c_allocator, buf) catch {
-                @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, buf[0..len]);
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 return API_OUT_OF_MEMORY;
             };
             arg_lens.append(std.heap.c_allocator, len) catch {
-                @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, buf[0..len]);
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 _ = arg_storage.pop();
                 return API_OUT_OF_MEMORY;
             };
@@ -3054,13 +3171,12 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         while (ai < arg_storage.items.len) : (ai += 1) {
             arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
         }
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
-            .status => |status| return status,
-            .ok => |ok| ok,
-        };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueCall(entry.tag, entry.ctx_addr, entry.bytes(), this_buf[0..this_len], arg_slices.items);
-        return packedPublish(entry.instance_id, entry.tag, entry.ctx_addr, result, out_value, out_exception);
+        const result = @import("backend_dispatch.zig").valueCall(data.js.tag, data.js.ctx_addr, data.bytes(), this_buf[0..this_len], arg_slices.items);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, out_value, out_exception);
     }
     var function_data = switch (beginValueOp(function)) {
         .status => |status| return status,
@@ -3102,8 +3218,12 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
     out_exception.* = 0;
     if (args == null and argc != 0) return API_INVALID_ARGUMENT;
     if (packed_api_value.isPackedHandle(function)) {
-        const entry = packed_api_value.get(function) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
+        // Acquire the eval lease before duplicating args so Zig LIFO runs lease release after freeValue cleanup.
+        var data = switch (beginPackedValueOp(function)) {
+            .status => |status| return status,
+            .ok => |ok| ok,
+        };
+        defer data.deinit();
         var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
         defer arg_storage.deinit(std.heap.c_allocator);
         var arg_lens = std.ArrayList(usize).empty;
@@ -3111,19 +3231,19 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
         defer {
             var i: usize = 0;
             while (i < arg_storage.items.len) : (i += 1) {
-                @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, arg_storage.items[i][0..arg_lens.items[i]]);
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, arg_storage.items[i][0..arg_lens.items[i]]);
             }
         }
         if (args) |raw_args| for (raw_args[0..argc]) |handle| {
             if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
             var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-            const len = packedDupBytes(handle, entry.instance_id, entry.tag, buf[0..]) orelse return API_STALE_VALUE;
+            const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
             arg_storage.append(std.heap.c_allocator, buf) catch {
-                @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, buf[0..len]);
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 return API_OUT_OF_MEMORY;
             };
             arg_lens.append(std.heap.c_allocator, len) catch {
-                @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, buf[0..len]);
+                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 _ = arg_storage.pop();
                 return API_OUT_OF_MEMORY;
             };
@@ -3135,13 +3255,12 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
         while (ai < arg_storage.items.len) : (ai += 1) {
             arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
         }
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
-            .status => |status| return status,
-            .ok => |ok| ok,
-        };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueConstruct(entry.tag, entry.ctx_addr, entry.bytes(), arg_slices.items);
-        return packedPublish(entry.instance_id, entry.tag, entry.ctx_addr, result, out_value, out_exception);
+        const result = @import("backend_dispatch.zig").valueConstruct(data.js.tag, data.js.ctx_addr, data.bytes(), arg_slices.items);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, out_value, out_exception);
     }
     var function_data = switch (beginValueOp(function)) {
         .status => |status| return status,
@@ -3221,22 +3340,23 @@ fn packedKeyedBoolOp(
     out_exception.* = 0;
     const key = checkedUtf8(key_arg) orelse return API_INVALID_ARGUMENT;
     if (!std.unicode.utf8ValidateSlice(key) or !noEmbeddedNul(key)) return API_INVALID_ARGUMENT;
-    const entry = packed_api_value.get(object) orelse return API_STALE_VALUE;
-    if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-    const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
-    defer std.heap.c_allocator.free(key_z);
-    var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+    var data = switch (beginPackedValueOp(object)) {
         .status => |status| return status,
         .ok => |ok| ok,
     };
-    defer packed_js.deinit();
+    defer data.deinit();
+    const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
+    defer std.heap.c_allocator.free(key_z);
     const result = switch (which) {
-        .has => @import("backend_dispatch.zig").valueHas(entry.tag, entry.ctx_addr, entry.bytes(), key_z),
-        .delete => @import("backend_dispatch.zig").valueDelete(entry.tag, entry.ctx_addr, entry.bytes(), key_z),
+        .has => @import("backend_dispatch.zig").valueHas(data.js.tag, data.js.ctx_addr, data.bytes(), key_z),
+        .delete => @import("backend_dispatch.zig").valueDelete(data.js.tag, data.js.ctx_addr, data.bytes(), key_z),
     };
-    return packedPublishBool(entry.instance_id, entry.tag, entry.ctx_addr, result, out_flag, out_exception);
+    if (!drainPackedJobs(&data.js)) {
+        discardPackedBoolResult(data.js.tag, data.js.ctx_addr, result);
+        return API_INSTANCE_NOT_FOUND;
+    }
+    return packedPublishBool(data.js.id, data.js.tag, data.js.ctx_addr, result, out_flag, out_exception);
 }
-
 pub export fn jsbay_value_has(object: u64, key: Utf8, out_has: *bool, out_exception: *u64) c_int {
     if (packed_api_value.isPackedHandle(object)) return packedKeyedBoolOp(.has, object, key, out_has, out_exception);
     return keyedBoolOp(api_backend.has, object, key, out_has, out_exception);
@@ -3251,15 +3371,17 @@ pub export fn jsbay_value_keys(object: u64, out_array: *u64, out_exception: *u64
     out_array.* = 0;
     out_exception.* = 0;
     if (packed_api_value.isPackedHandle(object)) {
-        const entry = packed_api_value.get(object) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var data = switch (beginPackedValueOp(object)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueKeys(entry.tag, entry.ctx_addr, entry.bytes());
-        return packedPublish(entry.instance_id, entry.tag, entry.ctx_addr, result, out_array, out_exception);
+        defer data.deinit();
+        const result = @import("backend_dispatch.zig").valueKeys(data.js.tag, data.js.ctx_addr, data.bytes());
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublish(data.js.id, data.js.tag, data.js.ctx_addr, result, out_array, out_exception);
     }
     var data = switch (beginValueOp(object)) {
         .status => |status| return status,
@@ -3283,19 +3405,22 @@ pub export fn jsbay_value_instance_of(value: u64, constructor: u64, out_result: 
     out_result.* = false;
     out_exception.* = 0;
     if (packed_api_value.isPackedHandle(value)) {
-        const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        if (!api_value.isOwner(entry.instance_id)) return API_WRONG_THREAD;
         if (!packed_api_value.isPackedHandle(constructor)) return API_STALE_VALUE;
-        var ctor_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const ctor_len = packedDupBytes(constructor, entry.instance_id, entry.tag, ctor_buf[0..]) orelse return API_STALE_VALUE;
-        defer @import("backend_dispatch.zig").timerFreeValue(entry.tag, entry.ctx_addr, ctor_buf[0..ctor_len]);
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        // Acquire the eval lease before duplicating the constructor so Zig LIFO runs lease release after freeValue cleanup.
+        var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueInstanceOf(entry.tag, entry.ctx_addr, entry.bytes(), ctor_buf[0..ctor_len]);
-        return packedPublishBool(entry.instance_id, entry.tag, entry.ctx_addr, result, out_result, out_exception);
+        defer data.deinit();
+        var ctor_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+        const ctor_len = packedDupBytes(constructor, data.js.id, data.js.tag, ctor_buf[0..]) orelse return API_STALE_VALUE;
+        defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, ctor_buf[0..ctor_len]);
+        const result = @import("backend_dispatch.zig").valueInstanceOf(data.js.tag, data.js.ctx_addr, data.bytes(), ctor_buf[0..ctor_len]);
+        if (!drainPackedJobs(&data.js)) {
+            discardPackedBoolResult(data.js.tag, data.js.ctx_addr, result);
+            return API_INSTANCE_NOT_FOUND;
+        }
+        return packedPublishBool(data.js.id, data.js.tag, data.js.ctx_addr, result, out_result, out_exception);
     }
     var data = switch (beginValueOp(value)) {
         .status => |status| return status,

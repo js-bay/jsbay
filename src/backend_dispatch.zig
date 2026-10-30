@@ -87,10 +87,18 @@ pub fn finishCreate(tag: Backend, handles: Handles, instance_id: i32, max_stack_
 }
 
 /// Largest packed-engine Value footprint (QJS JSValue is 16B; JSC JSValueRef is a pointer).
+/// Only measure engines that are actually linked — otherwise mono-JSC pulls `qjs` via Engine(.quickjs_ng).
 pub const value_storage_size: usize = blk: {
     var m: usize = @sizeOf(usize);
-    m = @max(m, @sizeOf(backend.Engine(.quickjs_ng).Value));
-    m = @max(m, @sizeOf(backend.Engine(.quickjs).Value));
+    if (multi_pack.isPacked(.quickjs_ng) or backend.active_backend == .quickjs_ng) {
+        m = @max(m, @sizeOf(backend.Engine(.quickjs_ng).Value));
+    }
+    if (multi_pack.isPacked(.quickjs) or backend.active_backend == .quickjs) {
+        m = @max(m, @sizeOf(backend.Engine(.quickjs).Value));
+    }
+    if (multi_pack.isPacked(.jsc) or backend.active_backend == .jsc) {
+        m = @max(m, @sizeOf(backend.Engine(.jsc).Value));
+    }
     break :blk m;
 };
 

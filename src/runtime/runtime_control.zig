@@ -270,21 +270,28 @@ pub fn runGc(instance_id: i32) bool {
 pub fn setMemoryLimit(instance_id: i32, bytes: u64) bool {
     const inst = instance_map.getInstance(instance_id) orelse return false;
     switch (inst.engine_handles) {
-        .mono => |m| {
-            if (!backend.isQuickJsApiBackend(backend.active_backend)) return false;
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsSetMemoryLimit(m.runtime, @intCast(bytes));
-            return true;
+        // Comptime switch: do not call ActiveEngineModule.qjs* when primary is JSC (Zig still typechecks the dead runtime `if`).
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                qjs_mod.qjsSetMemoryLimit(m.runtime, @intCast(bytes));
+                return true;
+            },
+            .jsc => return false,
         },
         .packed_alt => |a| {
             if (!backend.isQuickJsApiBackend(a.tag)) return false;
             inline for (.{ .quickjs_ng, .quickjs }) |cand| {
                 if (a.tag == cand) {
-                    const E = backend.Engine(cand);
-                    const Mod = backend.EngineModule(cand);
-                    const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
-                    Mod.qjsSetMemoryLimit(rt, @intCast(bytes));
-                    return true;
+                    // Gate EngineModule imports on pack membership so mono-JSC builds do not pull qjs.
+                    if (comptime backend.isPacked(cand) or cand == backend.active_backend) {
+                        const E = backend.Engine(cand);
+                        const Mod = backend.EngineModule(cand);
+                        const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
+                        Mod.qjsSetMemoryLimit(rt, @intCast(bytes));
+                        return true;
+                    }
+                    return false;
                 }
             }
             return false;
@@ -338,15 +345,21 @@ pub fn noteIdle(instance_id: i32) bool {
 
     // Resolve the runtime again after the lock. A destroy that won the race must not be followed by a GC on a freed runtime.
     const live = instance_map.getInstance(instance_id) orelse return false;
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => {
-            const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-            qjs_mod.qjsRunGc(live.monoRuntime().?);
+    switch (live.engine_handles) {
+        .mono => |m| switch (backend.active_backend) {
+            .quickjs, .quickjs_ng => {
+                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                qjs_mod.qjsRunGc(m.runtime);
+            },
+            .jsc => {
+                const jsc_mod = @import("../backend/jsc.zig");
+                jsc_mod.jscRunGc(@ptrCast(m.ctx));
+            },
         },
-        .jsc => {
-            const jsc_mod = @import("../backend/jsc.zig");
-            jsc_mod.jscRunGc(live.monoCtx().?);
-        },
+        .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
+            .runtime_addr = a.runtime_addr,
+            .ctx_addr = a.ctx_addr,
+        }),
     }
     return true;
 }
@@ -416,22 +429,25 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
             if (!backend.isQuickJsApiBackend(a.tag)) return .{};
             inline for (.{ .quickjs_ng, .quickjs }) |cand| {
                 if (a.tag == cand) {
-                    const E = backend.Engine(cand);
-                    const Mod = backend.EngineModule(cand);
-                    const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
-                    const snap = Mod.qjsMemoryUsage(rt);
-                    return .{
-                        .malloc_count = snap.malloc_count,
-                        .malloc_size = snap.malloc_size,
-                        .malloc_limit = snap.malloc_limit,
-                        .memory_used_count = snap.memory_used_count,
-                        .memory_used_size = snap.memory_used_size,
-                        .atom_count = snap.atom_count,
-                        .atom_size = snap.atom_size,
-                        .obj_count = snap.obj_count,
-                        .obj_size = snap.obj_size,
-                        .shape_count = snap.shape_count,
-                    };
+                    if (comptime backend.isPacked(cand) or cand == backend.active_backend) {
+                        const E = backend.Engine(cand);
+                        const Mod = backend.EngineModule(cand);
+                        const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
+                        const snap = Mod.qjsMemoryUsage(rt);
+                        return .{
+                            .malloc_count = snap.malloc_count,
+                            .malloc_size = snap.malloc_size,
+                            .malloc_limit = snap.malloc_limit,
+                            .memory_used_count = snap.memory_used_count,
+                            .memory_used_size = snap.memory_used_size,
+                            .atom_count = snap.atom_count,
+                            .atom_size = snap.atom_size,
+                            .obj_count = snap.obj_count,
+                            .obj_size = snap.obj_size,
+                            .shape_count = snap.shape_count,
+                        };
+                    }
+                    return .{};
                 }
             }
             return .{};
