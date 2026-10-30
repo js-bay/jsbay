@@ -208,7 +208,7 @@ jobs:
       - name: Build idle wake consumer
         run: |
           set -euo pipefail
-          link_flags=(-lm -pthread)
+          link_flags=(-lm -pthread -fsanitize=undefined)
           cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/host_wake_consumer.c zig-out/lib/libjsbay.a "${link_flags[@]}" -o zig-out/bin/host-wake-consumer
 
       - name: Inspector e2e, idle wake and signal shutdown
