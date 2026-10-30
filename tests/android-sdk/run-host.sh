@@ -16,13 +16,24 @@ package external;
 import io.jsbay.Engine;
 final class JavaHookNegative { void use(Engine engine) { engine.beginCallbackScopeForNative(); Engine.currentForNative(); } }
 EOF
-if "$JDK_HOME/bin/javac" -cp "$OUT/classes:$GRADLE_LIB/kotlin-stdlib-1.9.22.jar" -d "$OUT/negative-java" "$OUT/JavaHookNegative.java"; then echo "JNI hooks leaked to Java" >&2; exit 1; fi
+# Capture compiler output: expected failure must not become Actions problem-matcher annotations.
+if "$JDK_HOME/bin/javac" -cp "$OUT/classes:$GRADLE_LIB/kotlin-stdlib-1.9.22.jar" -d "$OUT/negative-java" "$OUT/JavaHookNegative.java" >"$OUT/JavaHookNegative.log" 2>&1; then
+  echo "JNI hooks leaked to Java" >&2
+  cat "$OUT/JavaHookNegative.log" >&2
+  exit 1
+fi
+echo "PASS: JavaHookNegative compile rejected (JNI hooks stay package-private/internal)"
 cat > "$OUT/KotlinHookNegative.kt" <<'EOF'
 package external
 import io.jsbay.Engine
 fun use(engine: Engine) { engine.beginCallbackScopeForNative(); Engine.currentForNative() }
 EOF
-if "$JDK_HOME/bin/java" -cp "$GRADLE_LIB/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -classpath "$OUT/classes:$GRADLE_LIB/kotlin-stdlib-1.9.22.jar:$GRADLE_LIB/annotations-24.0.1.jar" -d "$OUT/negative-kotlin" "$OUT/KotlinHookNegative.kt"; then echo "JNI hooks leaked to Kotlin" >&2; exit 1; fi
+if "$JDK_HOME/bin/java" -cp "$GRADLE_LIB/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -classpath "$OUT/classes:$GRADLE_LIB/kotlin-stdlib-1.9.22.jar:$GRADLE_LIB/annotations-24.0.1.jar" -d "$OUT/negative-kotlin" "$OUT/KotlinHookNegative.kt" >"$OUT/KotlinHookNegative.log" 2>&1; then
+  echo "JNI hooks leaked to Kotlin" >&2
+  cat "$OUT/KotlinHookNegative.log" >&2
+  exit 1
+fi
+echo "PASS: KotlinHookNegative compile rejected (JNI hooks stay internal)"
 "$JDK_HOME/bin/jar" --create --file "$OUT/consumer.jar" -C "$OUT/classes" .
 if [ -n "${JSBAY_ANDROID_TEST_FAIL_STAGE:-}" ]; then
     cc -std=c11 -Wall -Wextra -Werror -fPIC -shared "-DJSBAY_ANDROID_TEST_FAIL_STAGE=${JSBAY_ANDROID_TEST_FAIL_STAGE}" -I"$JDK_HOME/include" -I"$JDK_HOME/include/darwin" -I"$ROOT/include" "$ROOT/sdk/android/jsbay/src/main/cpp/jsbay_android.c" "$CORE" -lm -fsanitize=undefined -o "$OUT/libjsbay_android.dylib"
