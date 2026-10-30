@@ -20,6 +20,10 @@
  * quickjs advertises no Debugger domain. --port 0 binds an ephemeral port.
  */
 
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "jsbay.h"
 
 #include <pthread.h>
