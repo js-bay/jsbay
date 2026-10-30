@@ -28,7 +28,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
 elif [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || "$(uname -s)" == CYGWIN* ]]; then
   # Place native jsbay.dll beside the apphost. LoadLibrary searches the app dir before PATH;
   # managed assembly is JsBay.Net.dll so it no longer shadows the native DLL name.
-  "$dotnet_bin" build -p:JsBayTestHooks=true --project tests/dotnet-sdk/JsBayConsumer.csproj -v:q
+  "$dotnet_bin" build -p:JsBayTestHooks=true -v:q tests/dotnet-sdk/JsBayConsumer.csproj
   out_dir="$("$dotnet_bin" msbuild tests/dotnet-sdk/JsBayConsumer.csproj -nologo -getProperty:TargetDir -p:JsBayTestHooks=true | tr -d '\r')"
   cp -f zig-out/bin/jsbay.dll "$out_dir/jsbay.dll"
   PATH="$PWD/zig-out/bin:$PWD/zig-out/lib:$PATH" "$dotnet_bin" run --no-build -p:JsBayTestHooks=true --project tests/dotnet-sdk/JsBayConsumer.csproj

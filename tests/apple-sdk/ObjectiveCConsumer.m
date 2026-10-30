@@ -18,10 +18,14 @@ int jsbay_objc_sdk_probe(void) {
             Check(mainDenied == nil && refused.code == JSBayErrorInvalidArgument,
                   @"main run loop attach must be refused without opt-in");
         }
-        JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:81002 allowMainRunLoopAttach:YES error:&error];
+        JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:81002
+                                               allowMainRunLoopAttach:YES
+                                                                error:&error];
         Check(engine != nil, error.localizedDescription);
         error = nil;
-        JSBayEngine *duplicate = [[JSBayEngine alloc] initWithIdentifier:81002 allowMainRunLoopAttach:YES error:&error];
+        JSBayEngine *duplicate = [[JSBayEngine alloc] initWithIdentifier:81002
+                                                  allowMainRunLoopAttach:YES
+                                                                   error:&error];
         Check(duplicate == nil && error.code == JSBayErrorInvalidArgument,
               @"duplicate engine ID must be invalid argument");
         error = nil;
@@ -549,7 +553,9 @@ int jsbay_objc_sdk_probe(void) {
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
         Check(automaticTimerCount == 2, @"CFRunLoop driver did not run both timers");
 
-        JSBayEngine *pending = [[JSBayEngine alloc] initWithIdentifier:81006 allowMainRunLoopAttach:YES error:&error];
+        JSBayEngine *pending = [[JSBayEngine alloc] initWithIdentifier:81006
+                                                allowMainRunLoopAttach:YES
+                                                                 error:&error];
         __block BOOL closedTimerFired = NO;
         Check([pending bind:@"objcClosedTimer"
                    callback:^JSBayValue *(JSBayValue *thisValue, NSArray<JSBayValue *> *arguments,
@@ -622,7 +628,9 @@ int jsbay_objc_sdk_probe(void) {
         Check(rejectedNestedRunLoop && recoveredTimerCount == 1,
               @"rejected runLoop did not restore the automatic driver");
 
-        JSBayEngine *other = [[JSBayEngine alloc] initWithIdentifier:81004 allowMainRunLoopAttach:YES error:&error];
+        JSBayEngine *other = [[JSBayEngine alloc] initWithIdentifier:81004
+                                              allowMainRunLoopAttach:YES
+                                                               error:&error];
         dispatch_semaphore_t wrongThreadDone = dispatch_semaphore_create(0);
         __block BOOL rejectedWrongThread = NO;
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
@@ -666,7 +674,9 @@ int jsbay_objc_sdk_probe(void) {
                          error:&error] == nil,
               @"foreign callback value accepted");
         error = nil;
-        JSBayEngine *closing = [[JSBayEngine alloc] initWithIdentifier:81005 allowMainRunLoopAttach:YES error:&error];
+        JSBayEngine *closing = [[JSBayEngine alloc] initWithIdentifier:81005
+                                                allowMainRunLoopAttach:YES
+                                                                 error:&error];
         JSBayValue *closingValue = [closing numberValue:1 error:&error];
         Check([closing bind:@"closeDuringCallback"
                    callback:^JSBayValue *(JSBayValue *thisValue, NSArray<JSBayValue *> *arguments,

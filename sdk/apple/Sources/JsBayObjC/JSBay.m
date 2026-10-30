@@ -1,8 +1,8 @@
-#import "JSBayObjC.h"
-#include <stdlib.h>
 #import "jsbay.h"
+#import "JSBayObjC.h"
 #import "jsbay_sync.h"
 #import <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 
 NSErrorDomain const JSBayErrorDomain = @"com.jsbay.error";
@@ -515,7 +515,7 @@ static NSLock *JSBayEngineStateLock(void) {
     jsbay_bytes_t bytes = {0};
     uint64_t exception = 0;
     jsbay_status_t s = json ? jsbay_value_to_json(_handle, &bytes, &exception)
-                             : jsbay_value_to_utf8(_handle, &bytes, &exception);
+                            : jsbay_value_to_utf8(_handle, &bytes, &exception);
     if (![_engine voidResult:s exception:exception error:error])
         return nil;
     NSString *result = [[NSString alloc] initWithBytes:bytes.data
@@ -603,7 +603,7 @@ static NSLock *JSBayEngineStateLock(void) {
         uint64_t value = 0, exception = 0;
         JSBayValue *result =
             [_engine valueResult:jsbay_value_call(_handle, receiver.handle, handles, count, &value,
-                                                   &exception)
+                                                  &exception)
                            value:value
                        exception:exception
                            error:error];
@@ -697,7 +697,7 @@ static NSLock *JSBayEngineStateLock(void) {
 @end
 
 static jsbay_status_t JSBayThrownCallbackException(int instance, NSException *exception,
-                                                    uint64_t *outException) {
+                                                   uint64_t *outException) {
     static const uint8_t fallback[] = "Objective-C callback threw";
     *outException = 0;
     @try {
@@ -718,8 +718,8 @@ static jsbay_status_t JSBayThrownCallbackException(int instance, NSException *ex
 }
 
 static jsbay_status_t JSBayHostCallback(int instance, void *userData, uint64_t thisHandle,
-                                         size_t argc, const uint64_t *args, uint64_t *outValue,
-                                         uint64_t *outException) {
+                                        size_t argc, const uint64_t *args, uint64_t *outValue,
+                                        uint64_t *outException) {
     JSBayBinding *binding = (__bridge JSBayBinding *)userData;
     CFRetain((__bridge CFTypeRef)binding);
     *outValue = 0;
@@ -903,7 +903,6 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
 @implementation JSBayInstanceSnapshot
 @end
 
-
 @implementation JSBayEngine
 @synthesize identifier = _identifier, owner = _owner, open = _open, scopes = _scopes,
             allowMainRunLoopAttach = _allowMainRunLoopAttach, loopUserData = _loopUserData,
@@ -943,14 +942,17 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
     return [self initWithIdentifier:identifier limits:limits allowMainRunLoopAttach:NO error:error];
 }
 - (instancetype)initWithIdentifier:(int32_t)identifier
-           allowMainRunLoopAttach:(BOOL)allowMainRunLoopAttach
-                            error:(NSError **)error {
-    return [self initWithIdentifier:identifier limits:nil allowMainRunLoopAttach:allowMainRunLoopAttach error:error];
+            allowMainRunLoopAttach:(BOOL)allowMainRunLoopAttach
+                             error:(NSError **)error {
+    return [self initWithIdentifier:identifier
+                             limits:nil
+             allowMainRunLoopAttach:allowMainRunLoopAttach
+                              error:error];
 }
 - (instancetype)initWithIdentifier:(int32_t)identifier
                             limits:(JSBayResourceLimits *)limits
-           allowMainRunLoopAttach:(BOOL)allowMainRunLoopAttach
-                            error:(NSError **)error {
+            allowMainRunLoopAttach:(BOOL)allowMainRunLoopAttach
+                             error:(NSError **)error {
     if (!(self = [super init]))
         return nil;
     _identifier = identifier;
@@ -1122,8 +1124,8 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
             (jsbay_engine_evaluate_options_t){sizeof(options), directoryUTF8, versionUTF8, &hit};
         optionPtr = &options;
     }
-    jsbay_status_t status = jsbay_engine_evaluate(_identifier, sourceUTF8, filenameUTF8,
-                                                    optionPtr, &value, &exception);
+    jsbay_status_t status =
+        jsbay_engine_evaluate(_identifier, sourceUTF8, filenameUTF8, optionPtr, &value, &exception);
     if (cache)
         cache.didHit = hit;
     return [self valueResult:status value:value exception:exception error:error];
@@ -1256,7 +1258,7 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
     void *user = (void *)CFBridgingRetain(b);
     uint64_t f = 0, ex = 0;
     jsbay_status_t s = jsbay_engine_bind_sync(_identifier, text, JSBaySyncStart, user,
-                                                JSBayHostFinalize, timeoutMilliseconds, &f, &ex);
+                                              JSBayHostFinalize, timeoutMilliseconds, &f, &ex);
     if (s != JSBAY_OK) {
         CFBridgingRelease(user);
         return [self valueResult:s value:f exception:ex error:error];
@@ -1348,7 +1350,8 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
         [lock unlock];
         return NO;
     }
-    BOOL result = jsbay_engine_set_admission_class(_identifier, (jsbay_admission_class_t)admissionClass);
+    BOOL result =
+        jsbay_engine_set_admission_class(_identifier, (jsbay_admission_class_t)admissionClass);
     [lock unlock];
     return result;
 }

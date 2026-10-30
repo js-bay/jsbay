@@ -3,8 +3,8 @@
 NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(NSInteger, JSBayAdmissionClass) {
-  JSBayAdmissionClassForeground = 0,
-  JSBayAdmissionClassBackground = 1,
+    JSBayAdmissionClassForeground = 0,
+    JSBayAdmissionClassBackground = 1,
 };
 
 FOUNDATION_EXPORT NSErrorDomain const JSBayErrorDomain;
@@ -167,11 +167,11 @@ typedef void (^JSBaySyncStarter)(JSBayValue *thisValue, NSArray<JSBayValue *> *a
                                       error:(NSError *_Nullable *_Nullable)error;
 /// Same as initWithIdentifier:error:, and allows attaching the automatic driver to the process main run loop when allowMainRunLoopAttach is YES. Default init refuses that attach.
 - (nullable instancetype)initWithIdentifier:(int32_t)identifier
-                    allowMainRunLoopAttach:(BOOL)allowMainRunLoopAttach
+                     allowMainRunLoopAttach:(BOOL)allowMainRunLoopAttach
                                       error:(NSError *_Nullable *_Nullable)error;
 - (nullable instancetype)initWithIdentifier:(int32_t)identifier
                                      limits:(nullable JSBayResourceLimits *)limits
-                    allowMainRunLoopAttach:(BOOL)allowMainRunLoopAttach
+                     allowMainRunLoopAttach:(BOOL)allowMainRunLoopAttach
                                       error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)close:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)evaluate:(NSString *)source

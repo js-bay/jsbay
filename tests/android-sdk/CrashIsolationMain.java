@@ -126,8 +126,7 @@ public final class CrashIsolationMain {
         skip(name, "backend rejected setMemoryLimit (e.g. JSC)");
         return;
       }
-      try (Value ignored =
-          engine.evaluate("new ArrayBuffer(8 * 1024 * 1024)", "oom.js")) {
+      try (Value ignored = engine.evaluate("new ArrayBuffer(8 * 1024 * 1024)", "oom.js")) {
         // Some backends may GC-succeed; treat success as SKIP if limit unsupported in practice.
         skip(name, "allocation succeeded under soft cap; backend may not hard-fail");
       } catch (JsBayException expected) {
@@ -256,8 +255,9 @@ public final class CrashIsolationMain {
     }
     skip(
         name,
-        "same-process native abort still kills the host; use a separate android:process / "
-            + "app_process child for isolation. Parent runner pattern: invoke this main with "
-            + "--crash-child and expect exit 99 while parent stays alive (see run-crash-isolation-device.sh)");
+        "same-process native abort still kills the host; use a separate android:process /"
+            + " app_process child for isolation. Parent runner pattern: invoke this main with"
+            + " --crash-child and expect exit 99 while parent stays alive (see"
+            + " run-crash-isolation-device.sh)");
   }
 }

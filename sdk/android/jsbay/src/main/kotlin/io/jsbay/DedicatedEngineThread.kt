@@ -122,8 +122,9 @@ class DedicatedEngineThread private constructor(
                         }
                         val created = Engine(id, options)
                         val looperClass = Class.forName("android.os.Looper")
-                        val looper = looperClass.getMethod("myLooper").invoke(null)
-                            ?: throw JsBayException(Status.INVALID_ARGUMENT)
+                        val looper =
+                            looperClass.getMethod("myLooper").invoke(null)
+                                ?: throw JsBayException(Status.INVALID_ARGUMENT)
                         val handlerClass = Class.forName("android.os.Handler")
                         val handler = handlerClass.getConstructor(looperClass).newInstance(looper)
                         val post = handlerClass.getMethod("post", Runnable::class.java)

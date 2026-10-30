@@ -3,11 +3,11 @@ package io.jsbay.consumer
 import io.jsbay.AdmissionClass
 import io.jsbay.DedicatedEngineThread
 import io.jsbay.Engine
+import io.jsbay.Value
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
-import io.jsbay.Value
 
 /** Real-device P0 keep-alive harness (ART + Looper). */
 object DeviceP0Main {
@@ -90,27 +90,30 @@ object DeviceP0Main {
     private fun runBindSyncTyped() {
         DedicatedEngineThread.start(7203, "jsbay-device-p0-sync").use { dedicated ->
             dedicated.runOnOwner { engine ->
-                engine.bindSync("p0SyncStr", 2000) { call ->
-                    Thread({
-                        call.completion.resolveString("typed-ok")
-                    }, "p0-sync-str").start()
-                }.use {
-                    engine.evaluate("p0SyncStr()", "device-p0-sync-str.js").use { result ->
-                        check(result.string() == "typed-ok") { "ResolveString mismatch: ${result.string()}" }
+                engine
+                    .bindSync("p0SyncStr", 2000) { call ->
+                        Thread({
+                            call.completion.resolveString("typed-ok")
+                        }, "p0-sync-str").start()
+                    }.use {
+                        engine.evaluate("p0SyncStr()", "device-p0-sync-str.js").use { result ->
+                            check(result.string() == "typed-ok") { "ResolveString mismatch: ${result.string()}" }
+                        }
                     }
-                }
-                engine.bindSync("p0SyncBytes", 2000) { call ->
-                    Thread({
-                        call.completion.resolveBytes(byteArrayOf(9, 8, 7))
-                    }, "p0-sync-bytes").start()
-                }.use {
-                    engine.evaluate(
-                        "(function(){ var u = new Uint8Array(p0SyncBytes()); return u.length===3 && u[0]===9 && u[1]===8 && u[2]===7; })()",
-                        "device-p0-sync-bytes.js",
-                    ).use { ok ->
-                        check(ok.bool()) { "ResolveBytes mismatch" }
+                engine
+                    .bindSync("p0SyncBytes", 2000) { call ->
+                        Thread({
+                            call.completion.resolveBytes(byteArrayOf(9, 8, 7))
+                        }, "p0-sync-bytes").start()
+                    }.use {
+                        engine
+                            .evaluate(
+                                "(function(){ var u = new Uint8Array(p0SyncBytes()); return u.length===3 && u[0]===9 && u[1]===8 && u[2]===7; })()",
+                                "device-p0-sync-bytes.js",
+                            ).use { ok ->
+                                check(ok.bool()) { "ResolveBytes mismatch" }
+                            }
                     }
-                }
             }
         }
         println("PASS: device bindSync ResolveString/ResolveBytes")

@@ -4,7 +4,9 @@
 int main(void) {
     @autoreleasepool {
         NSError *error = nil;
-        JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:99102 allowMainRunLoopAttach:YES error:&error];
+        JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:99102
+                                               allowMainRunLoopAttach:YES
+                                                                error:&error];
         if (engine == nil)
             return 1;
         JSBayValue *value = [engine evaluate:@"6 * 7"
