@@ -10,6 +10,7 @@ const async_stack = @import("../inspector/async_stack.zig");
 const cold_probe = @import("debug_cold_probe.zig");
 const debugger_mod = @import("../inspector/debugger.zig");
 const dispatch = @import("../runtime/dispatch.zig");
+const io = @import("../platform/io.zig");
 const engine = @import("../engine.zig");
 const helpers = @import("test_helpers.zig");
 const inspector = @import("../inspector/root.zig");
@@ -32,12 +33,13 @@ fn sendCdpAndPump(id: i32, stream: wire.TestStream, reader: *wire.FrameReader, r
 }
 /// A socket close is observed by the transport reader thread.  Keep pumping the engine owner until its queued session-cleanup task applies the new aggregate async-depth request.
 fn pumpUntilAsyncDepth(id: i32, expected: u32) !void {
+    // Transport reader observes the socket close on another thread; give it wall time on loaded CI hosts.
     var attempts: usize = 0;
-    while (attempts < 100) : (attempts += 1) {
+    while (attempts < 500) : (attempts += 1) {
         _ = dispatch.tickInstance(id);
         engine.runEventLoopOnce(id);
         if (async_stack.depth(id) == expected) return;
-        std.Thread.yield() catch {};
+        io.sleepMs(1);
     }
     return error.TestUnexpectedResult;
 }

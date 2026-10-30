@@ -31,11 +31,13 @@ CS
         echo "Expected rejection exit: $?"
     fi
     if ! grep -q 'CA2249' "$WORK/expected-diagnostics.log"; then
-        sed -E 's/^##\[[^]]*\]/# /g; s/##\[[^]]*\]/# /g' "$WORK/expected-diagnostics.log" >&2
+        echo "self-test diagnostics (sanitized summary):" >&2
+        grep -Eo 'CA2249' "$WORK/expected-diagnostics.log" | sort -u | sed 's/^/  observed /' >&2 || true
         echo 'Analyzer check failed without the expected CA2249 diagnostic.' >&2
         exit 1
     fi
-    sed -E 's/^##\[[^]]*\]/# /g; s/##\[[^]]*\]/# /g' "$WORK/expected-diagnostics.log"
+    # Do not replay MSBuild lines — Actions problem matchers turn `file(line): error CODE:` into annotations.
+    grep -Eo 'CA2249' "$WORK/expected-diagnostics.log" | sort -u | sed 's/^/self-test observed /'
     "$WORK/scripts/quality/dotnet-lint.sh" fix
     find "$WORK/sdk" "$WORK/tests" -type f -name '*.cs' -exec cksum {} \; | sort > "$WORK/once.checksums"
     "$WORK/scripts/quality/dotnet-lint.sh" fix
