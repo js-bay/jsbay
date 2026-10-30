@@ -54,7 +54,7 @@ Read [the API contract](docs/api-contract.md) before implementing a binding or c
 
 ## Documentation
 
-Start with the [documentation index](docs/README.md). The most commonly needed guides are [embedding](docs/embedding.md), [runtime limits](docs/runtime-limits.md), [backend selection](docs/embedding.md#backend-selection), and [Inspector setup](docs/inspector.md).
+Start with the [documentation index](docs/readme.md). The most commonly needed guides are [embedding](docs/embedding.md), [runtime limits](docs/runtime-limits.md), [backend selection](docs/embedding.md#backend-selection), and [Inspector setup](docs/inspector.md).
 
 
 ## Experimental backends

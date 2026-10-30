@@ -45,7 +45,7 @@ Tests for root engine modules go in `src/tests/<area>_tests.zig` and must be reg
 
 ### Documentation filenames
 
-Under `docs/`, all Markdown files must use lowercase kebab-case names (for example `api-contract.md`, `host-isolation.md`). The only exception is `docs/README.md`. Do not add new `docs/*.MD` or TitleCase basenames.
+Under `docs/`, all Markdown files must use lowercase kebab-case names (for example `api-contract.md`, `host-isolation.md`, `readme.md`). Do not add `docs/README.md`, `docs/*.MD`, or TitleCase basenames; `zig build tool -- check-docs` enforces this.
 
 ## 3. TDD policy (required)
 
