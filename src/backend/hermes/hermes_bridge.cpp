@@ -1226,48 +1226,65 @@ extern "C" bool hermes_map_foreach(JsbayHermesContext *c, HermesValue map, void 
     if (!c || !c->rt || !map || !cb) return false;
     if (!hermes_is_map(c, map)) return false;
     try {
-        auto o = asVal(map)->getObject(*c->rt);
-        auto forEach = o.getPropertyAsFunction(*c->rt, "forEach");
-        // forEach callback(value, key, map) — note Map order is value first
-        auto host = jsi::Function::createFromHostFunction(
-            *c->rt, jsi::PropNameID::forAscii(*c->rt, "cb"), 3,
-            [c, cb_ctx, cb](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                HermesValue val = (count > 0) ? retainMove(c, jsi::Value(rt, args[0])) : nullptr;
-                HermesValue key = (count > 1) ? retainMove(c, jsi::Value(rt, args[1])) : nullptr;
-                bool cont = cb(c, cb_ctx, key, val);
-                hermes_free_value(c, key);
-                hermes_free_value(c, val);
-                if (!cont) throw jsi::JSError(rt, "__jsbay_foreach_stop");
-                return jsi::Value::undefined();
-            });
-        forEach.callWithThis(*c->rt, o, host);
+        // Snapshot entries without installing a HostFunction (overridden forEach can retain the callback past this frame).
+        c->rt->global().setProperty(*c->rt, "__jsbay_tmp_map", *asVal(map));
+        jsi::Value arr_v = c->rt->evaluateJavaScript(
+            std::make_shared<jsi::StringBuffer>("Array.from(__jsbay_tmp_map.entries())"), "<bridge>");
+        c->rt->global().setProperty(*c->rt, "__jsbay_tmp_map", jsi::Value::undefined());
+        if (!arr_v.isObject() || !arr_v.getObject(*c->rt).isArray(*c->rt)) return false;
+        HermesValue arr = retainMove(c, std::move(arr_v));
+        uint32_t n = hermes_get_length(c, arr);
+        for (uint32_t i = 0; i < n; i++) {
+            auto pair = hermes_get_index(c, arr, i);
+            if (!pair) {
+                hermes_free_value(c, arr);
+                return false;
+            }
+            auto key = hermes_get_index(c, pair, 0);
+            auto val = hermes_get_index(c, pair, 1);
+            hermes_free_value(c, pair);
+            bool cont = cb(c, cb_ctx, key, val);
+            if (key) hermes_free_value(c, key);
+            if (val) hermes_free_value(c, val);
+            if (!cont) {
+                hermes_free_value(c, arr);
+                return true; // early stop
+            }
+        }
+        hermes_free_value(c, arr);
         return true;
-    } catch (const jsi::JSError &e) {
-        if (e.getMessage().find("__jsbay_foreach_stop") != std::string::npos) return true;
+    } catch (...) {
+        try { c->rt->global().setProperty(*c->rt, "__jsbay_tmp_map", jsi::Value::undefined()); } catch (...) {}
         return false;
-    } catch (...) { return false; }
+    }
 }
 extern "C" bool hermes_set_foreach(JsbayHermesContext *c, HermesValue set, void *cb_ctx, HermesSetForEachFn cb) {
     if (!c || !c->rt || !set || !cb) return false;
     if (!hermes_is_set(c, set)) return false;
     try {
-        auto o = asVal(set)->getObject(*c->rt);
-        auto forEach = o.getPropertyAsFunction(*c->rt, "forEach");
-        auto host = jsi::Function::createFromHostFunction(
-            *c->rt, jsi::PropNameID::forAscii(*c->rt, "cb"), 1,
-            [c, cb_ctx, cb](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                HermesValue val = (count > 0) ? retainMove(c, jsi::Value(rt, args[0])) : nullptr;
-                bool cont = cb(c, cb_ctx, val);
-                hermes_free_value(c, val);
-                if (!cont) throw jsi::JSError(rt, "__jsbay_foreach_stop");
-                return jsi::Value::undefined();
-            });
-        forEach.callWithThis(*c->rt, o, host);
+        // Same as map: iterate a snapshot so no HostFunction is exposed to user-overridable forEach.
+        c->rt->global().setProperty(*c->rt, "__jsbay_tmp_set", *asVal(set));
+        jsi::Value arr_v = c->rt->evaluateJavaScript(
+            std::make_shared<jsi::StringBuffer>("Array.from(__jsbay_tmp_set.values())"), "<bridge>");
+        c->rt->global().setProperty(*c->rt, "__jsbay_tmp_set", jsi::Value::undefined());
+        if (!arr_v.isObject() || !arr_v.getObject(*c->rt).isArray(*c->rt)) return false;
+        HermesValue arr = retainMove(c, std::move(arr_v));
+        uint32_t n = hermes_get_length(c, arr);
+        for (uint32_t i = 0; i < n; i++) {
+            auto val = hermes_get_index(c, arr, i);
+            bool cont = cb(c, cb_ctx, val);
+            if (val) hermes_free_value(c, val);
+            if (!cont) {
+                hermes_free_value(c, arr);
+                return true; // early stop
+            }
+        }
+        hermes_free_value(c, arr);
         return true;
-    } catch (const jsi::JSError &e) {
-        if (e.getMessage().find("__jsbay_foreach_stop") != std::string::npos) return true;
+    } catch (...) {
+        try { c->rt->global().setProperty(*c->rt, "__jsbay_tmp_set", jsi::Value::undefined()); } catch (...) {}
         return false;
-    } catch (...) { return false; }
+    }
 }
 
 extern "C" bool hermes_is_array_buffer(JsbayHermesContext *c, HermesValue v) {
@@ -2440,11 +2457,14 @@ extern "C" HermesValue hermes_host_object_create(JsbayHermesContext *c, int32_t 
         std::lock_guard<std::mutex> lock(c->finals_mu);
         c->pending_finals.push_back(pf);
     }
+    // Keep a shared_ptr so catch can null box before delete (escaped holders via inherited setters).
+    std::shared_ptr<HermesHostNativeState> host_ns;
     try {
         jsi::Runtime &rt = *c->rt;
         // Holder carries NativeState → box for traps.
         jsi::Object holder(rt);
-        holder.setNativeState(rt, std::make_shared<HermesHostNativeState>(box));
+        host_ns = std::make_shared<HermesHostNativeState>(box);
+        holder.setNativeState(rt, host_ns);
 
         auto getFn = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "__ho_get"), 2,
@@ -2584,6 +2604,8 @@ extern "C" HermesValue hermes_host_object_create(JsbayHermesContext *c, int32_t 
         return retainMove(c, std::move(proxy));
     } catch (const std::exception &e) {
         (void)e;
+        try { c->rt->global().setProperty(*c->rt, "__jsbay_ho_holder", jsi::Value::undefined()); } catch (...) {}
+        if (host_ns) host_ns->box = nullptr;
         std::lock_guard<std::mutex> lock(c->finals_mu);
         auto &vec = c->pending_finals;
         vec.erase(std::remove(vec.begin(), vec.end(), pf), vec.end());
@@ -2591,6 +2613,8 @@ extern "C" HermesValue hermes_host_object_create(JsbayHermesContext *c, int32_t 
         delete box;
         return nullptr;
     } catch (...) {
+        try { c->rt->global().setProperty(*c->rt, "__jsbay_ho_holder", jsi::Value::undefined()); } catch (...) {}
+        if (host_ns) host_ns->box = nullptr;
         std::lock_guard<std::mutex> lock(c->finals_mu);
         auto &vec = c->pending_finals;
         vec.erase(std::remove(vec.begin(), vec.end(), pf), vec.end());

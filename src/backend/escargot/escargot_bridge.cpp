@@ -1360,10 +1360,13 @@ static ValueRef *nativeTrampoline(ExecutionStateRef *state, ValueRef *thisValue,
     }
     EscargotValue result = data->fn(data->ctx, thisValue, args.data(), argc, data->user_data);
     if (data->ctx->pending_throw_value) {
-        ValueRef *exc = asVal(data->ctx->pending_throw_value);
+        // Release bridge protect-map ownership while transferring the ValueRef* into the VM throw.
+        EscargotValue pending = data->ctx->pending_throw_value;
+        ValueRef *exc = asVal(pending);
         data->ctx->pending_throw_value = nullptr;
         data->ctx->pending_throw.clear();
         if (result) escargot_free_value(data->ctx, result);
+        escargot_free_value(data->ctx, pending);
         state->throwException(exc);
         return ValueRef::createUndefined();
     }
@@ -2439,6 +2442,16 @@ static ValueRef *nativeHandleTrampoline(ExecutionStateRef *state, ValueRef *this
     for (size_t i = 0; i < argc; ++i) args[i] = argv[i];
     c->pending_throw.clear();
     EscargotValue out = bx->call_fn(c, thisValue, args.data(), argc, bx->handle_data);
+    if (c->pending_throw_value) {
+        EscargotValue pending = c->pending_throw_value;
+        ValueRef *exc = asVal(pending);
+        c->pending_throw_value = nullptr;
+        c->pending_throw.clear();
+        if (out) escargot_free_value(c, out);
+        escargot_free_value(c, pending);
+        state->throwException(exc);
+        return ValueRef::createUndefined();
+    }
     if (!c->pending_throw.empty()) {
         std::string msg = c->pending_throw;
         c->pending_throw.clear();

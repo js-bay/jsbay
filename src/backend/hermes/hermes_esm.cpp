@@ -1236,12 +1236,36 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 if (std::regex_search(blanked, m, any_import)) {
                     size_t start = m.position() + (m[1].matched ? m[1].length() : 0);
                     if (start > 0) {
-                        // Move that import to front by rotating — extract line from live body.
-                        size_t line_end = body.find('\n', start);
-                        std::string line = body.substr(start, line_end == std::string::npos ? std::string::npos : line_end - start + (line_end == std::string::npos ? 0 : 1));
-                        if (line.find("import") != std::string::npos) {
-                            body.erase(start, line.size());
-                            body = line + body;
+                        // Move the complete import declaration (not just the first line) to the front.
+                        std::string tail = body.substr(start);
+                        std::smatch im;
+                        size_t decl_len = 0;
+                        if (std::regex_search(tail, im, import_def_named) && im.position() == 0)
+                            decl_len = im.length();
+                        else if (std::regex_search(tail, im, import_named) && im.position() == 0)
+                            decl_len = im.length();
+                        else if (std::regex_search(tail, im, import_ns) && im.position() == 0)
+                            decl_len = im.length();
+                        else if (std::regex_search(tail, im, import_default) && im.position() == 0)
+                            decl_len = im.length();
+                        else if (std::regex_search(tail, im, import_side) && im.position() == 0)
+                            decl_len = im.length();
+                        else {
+                            // Fallback: through terminating `;` on blankNonCode (strings/comments ignored).
+                            size_t semi = blanked.find(';', start);
+                            if (semi != std::string::npos) {
+                                decl_len = semi - start + 1;
+                                if (start + decl_len < body.size() && body[start + decl_len] == '\r') ++decl_len;
+                                if (start + decl_len < body.size() && body[start + decl_len] == '\n') ++decl_len;
+                            } else {
+                                size_t line_end = body.find('\n', start);
+                                decl_len = line_end == std::string::npos ? body.size() - start : line_end - start + 1;
+                            }
+                        }
+                        if (decl_len > 0 && tail.find("import") != std::string::npos) {
+                            std::string decl = body.substr(start, decl_len);
+                            body.erase(start, decl_len);
+                            body = decl + body;
                             changed = true;
                             continue;
                         }

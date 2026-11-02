@@ -2,17 +2,13 @@
 
 Backends selected with `-Dbackend=escargot` or `-Dbackend=hermes`.
 ABI is not frozen yet (full engine_thread suite / inspector / QJS native_handle class_id still missing; Escargot has rejection tracker; spike native_handle opaque+call+finalize+method this-binding; Hermes host ESM shim landed).
-Suite lists below are what `src/tests/all_tests.zig` imports for each backend;
-out-of-scope suites stay out of the aggregator. Production gap ranking:
-`docs/production-gaps.md`.
+Suite lists below are what `src/tests/all_tests.zig` imports for each backend; out-of-scope suites stay out of the aggregator. Production gap ranking: `docs/production-gaps.md`.
 
-Shared tree: both engines live under `src/backend/{escargot,hermes}/`. Build one
-at a time via `-Dbackend=…` (not a multi-engine pack).
+Shared tree: both engines live under `src/backend/{escargot,hermes}/`. Build one at a time via `-Dbackend=…` (not a multi-engine pack).
 
 ## Escargot (`-Dbackend=escargot`)
 
-Scope: eval, value/object, Promise (+ host rejection tracker), buffers, timers,
-host_object, ESM (ModuleLoader), text CJS/`require` (no QJS-shaped bytecode CJS cache).
+Scope: eval, value/object, Promise (+ host rejection tracker), buffers, timers, host_object, ESM (ModuleLoader), text CJS/`require` (no QJS-shaped bytecode CJS cache).
 
 | Area | Status | Notes |
 |------|--------|-------|
@@ -42,13 +38,9 @@ host_object, ESM (ModuleLoader), text CJS/`require` (no QJS-shaped bytecode CJS 
 | rejection tracker | **yes** | `registerPromiseRejectCallback`; report after microtask drain |
 | buffer copy / transferable | **partial** | native transfer green; C `copyBuffer` imported; DataView OOB-after-resize → INVALID (aligned with QJS) |
 
-`zig build test-engine -Dbackend=escargot`: **491 pass / 61 skip / 0 fail** (soft getMemoryUsage; ET host + interrupt + DestroyDefer permanent).
-
 ## Hermes (`-Dbackend=hermes`)
 
-Scope: eval, value/object, Promise, buffers, timers, host_object, `.hbc`
-bytecode (hermesc + JSI), text CJS/`require`, host-side ESM ModuleLoader shim
-(`hermes_esm.cpp` — pin has no native CJS/ESM codegen).
+Scope: eval, value/object, Promise, buffers, timers, host_object, `.hbc` bytecode (hermesc + JSI), text CJS/`require`, host-side ESM ModuleLoader shim (`hermes_esm.cpp` — pin has no native CJS/ESM codegen).
 
 | Area | Status | Notes |
 |------|--------|-------|
@@ -61,7 +53,7 @@ bytecode (hermesc + JSI), text CJS/`require`, host-side ESM ModuleLoader shim
 | Symbol / Symbol.for | **yes** | |
 | isConstructor | **yes** | Reflect.construct newTarget probe |
 | Promise / Deferred | **yes** | |
-| Map / Set / Date / BigInt | **yes** | Map foreach early-stop OK via `throw jsi::JSError` |
+| Map / Set / Date / BigInt | **yes** | Map/Set foreach via entries/values snapshot (no HostFunction callback) |
 | ArrayBuffer / TypedArray / DataView | **yes** | zero-length + shadowed. No `.resize`. Transfer: **polyfill** (`HermesInternal.detachArrayBuffer` + WeakSet `detached`; source `byteLength` may stay non-zero) |
 | timers / queueMicrotask | **yes** | |
 | host_object | **yes** | JSI HostObject + Proxy |
@@ -79,10 +71,6 @@ bytecode (hermesc + JSI), text CJS/`require`, host-side ESM ModuleLoader shim
 | buffer copy / transferable | **partial** | transfer polyfill green; C `copyBuffer` imported; exotic-getter green (pristine `%TypedArray%` brand+getters); Hermes `.resize` windows still Skip |
 | native_function host-throw | **yes** | NativeResult.err / nested throw / CJS missing-module / value `.err` OK; getPropertyString loop green (`var` across Hermes evals) |
 | async / async generators in fixtures | **no** | this Hermes build strips them |
-
-`zig build test-engine -Dbackend=hermes`: **531 pass / 30 skip / 0 fail** (create-time MaxHeapSize + soft getMemoryUsage; resize permanent; setMemoryLimit false).
-
-`zig build test-engine` (QuickJS-NG default): **1059 pass / 13 skip / 0 fail**.
 
 `JSBAY_HERMESC` overrides hermesc if it is not on `PATH` / `vendor/hermes-install/bin/hermesc`.
 
@@ -104,8 +92,7 @@ bytecode (hermesc + JSI), text CJS/`require`, host-side ESM ModuleLoader shim
 | `vendor/hermes` | https://github.com/facebook/hermes.git | `9a51f48dcbccf0eddd0b67c687d17b3ab4cede58` |
 
 These match the revisions the C bridges / install prefixes were built against.
-Install / build trees stay **local** (gitignored): `vendor/escargot-install`,
-`vendor/hermes-install`, `vendor/hermes-build`, `vendor/icu-prefix`.
+Install / build trees stay **local** (gitignored): `vendor/escargot-install`, `vendor/hermes-install`, `vendor/hermes-build`, `vendor/icu-prefix`.
 
 ```bash
 # sources (QuickJS + Escargot + Hermes)
@@ -117,8 +104,7 @@ git submodule update --init --recursive vendor/quickjs vendor/quickjs-ng \
 
 **Scripts (fresh clone):** `scripts/rebuild-icu-prefix.sh` → `scripts/rebuild-hermes-install.sh`; `scripts/rebuild-escargot-install.sh` (THREADING + GNU2 TLS + bridge). Then compile bridges as below / via scripts.
 
-Rebuild each engine into a prefix, then compile the bridge `.o` into that
-prefix. Point Zig at the prefix with `-D` / env:
+Rebuild each engine into a prefix, then compile the bridge `.o` into that prefix. Point Zig at the prefix with `-D` / env:
 
 ```bash
 # shared toolchain bits (g++ local-exec TLS; Zig must not link libc++)
@@ -182,13 +168,6 @@ Supported threading configuration: `ENABLE_THREADING`, `ENABLE_TLS_ACCESS_BY_PTH
 - Escargot DestroyDefer (2): bdwgc ABRT — not cheap
 - Hermes `ArrayBuffer.resize` — **permanent Skip**
 - inspector / CDP; CJS bytecode cache (QJS-only); Hermes ESM beyond TLA; native_handle class_id
-
-### Gated counts
-
-| Backend | pass | skip | fail |
-|---------|------|------|------|
-| Escargot | 491 | 61 | 0 |
-| Hermes | 531 | 30 | 0 |
 
 ## Capability snapshot (vs QuickJS-NG; **not a production tag** / diminishing returns)
 
