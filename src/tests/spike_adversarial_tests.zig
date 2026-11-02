@@ -371,9 +371,9 @@ test "adversarial: ops on wrong instance id after destroy" {
     _ = engine.runGc(id);
 }
 
-// ---- Round 2: deeper hostility ----
+// ---- deeper hostility ----
 
-test "adversarial r2: throw null/undefined/number does not poison" {
+test "adversarial: throw null/undefined/number does not poison" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -386,7 +386,7 @@ test "adversarial r2: throw null/undefined/number does not poison" {
     }.run);
 }
 
-test "adversarial r2: Deferred resolve with undefined" {
+test "adversarial: Deferred resolve with undefined" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -405,7 +405,7 @@ test "adversarial r2: Deferred resolve with undefined" {
     }.run);
 }
 
-test "adversarial r2: setInterval cleared from inside callback" {
+test "adversarial: setInterval cleared from inside callback" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -424,7 +424,7 @@ test "adversarial r2: setInterval cleared from inside callback" {
     }.run);
 }
 
-test "adversarial r2: very long identifier and string literal" {
+test "adversarial: very long identifier and string literal" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -438,7 +438,7 @@ test "adversarial r2: very long identifier and string literal" {
     }.run);
 }
 
-test "adversarial r2: ArrayBuffer slice views share memory" {
+test "adversarial: ArrayBuffer slice views share memory" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -454,7 +454,7 @@ test "adversarial r2: ArrayBuffer slice views share memory" {
     }.run);
 }
 
-test "adversarial r2: Escargot ESM re-eval same entry after failure" {
+test "adversarial: Escargot ESM re-eval same entry after failure" {
     try spikeOnly();
     if (comptime !backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {
@@ -475,7 +475,7 @@ test "adversarial r2: Escargot ESM re-eval same entry after failure" {
     }.run);
 }
 
-test "adversarial r2: Hermes bytecode from engine A run on engine B" {
+test "adversarial: Hermes bytecode from engine A run on engine B" {
     try spikeOnly();
     if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
     const a = helpers.nextInstanceId();
@@ -493,7 +493,7 @@ test "adversarial r2: Hermes bytecode from engine A run on engine B" {
     try helpers.expectEvalEquals(b, "String(globalThis.__from)", "11");
 }
 
-test "adversarial r2: host_object set trap returns error" {
+test "adversarial: host_object set trap returns error" {
     try spikeOnly();
     const setFn = struct {
         fn f(_: i32, _: ?*anyopaque, _: []const u8, _: host_value.HostValue) ?[*:0]const u8 {
@@ -518,7 +518,7 @@ test "adversarial r2: host_object set trap returns error" {
     try helpers.expectEvalEquals(id, "2+2", "4");
 }
 
-test "adversarial r2: recursive JSON-like deep object" {
+test "adversarial: recursive JSON-like deep object" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -534,7 +534,7 @@ test "adversarial r2: recursive JSON-like deep object" {
     }.run);
 }
 
-test "adversarial r2: Promise thenable storm then drain" {
+test "adversarial: Promise thenable storm then drain" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -554,9 +554,9 @@ test "adversarial r2: Promise thenable storm then drain" {
     }.run);
 }
 
-// ---- Round 3: bridge sharp edges + hardening checks ----
+// ---- bridge sharp edges + hardening checks ----
 
-test "adversarial r3: double destroy is safe" {
+test "adversarial: double destroy is safe" {
     try spikeOnly();
     const id = helpers.nextInstanceId();
     if (!engine.create(id, .{})) return error.EngineCreateFailed;
@@ -567,7 +567,7 @@ test "adversarial r3: double destroy is safe" {
     try testing.expect(res.err != null);
 }
 
-test "adversarial r3: setProperty rejects key with embedded NUL" {
+test "adversarial: setProperty rejects key with embedded NUL" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -585,7 +585,7 @@ test "adversarial r3: setProperty rejects key with embedded NUL" {
     }.run);
 }
 
-test "adversarial r3: Hermes compile filename with spaces and metacharacters" {
+test "adversarial: Hermes compile filename with spaces and metacharacters" {
     try spikeOnly();
     if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {
@@ -602,7 +602,7 @@ test "adversarial r3: Hermes compile filename with spaces and metacharacters" {
     }.run);
 }
 
-test "adversarial r3: Hermes compile empty filename uses fallback" {
+test "adversarial: Hermes compile empty filename uses fallback" {
     try spikeOnly();
     if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {
@@ -619,7 +619,7 @@ test "adversarial r3: Hermes compile empty filename uses fallback" {
     }.run);
 }
 
-test "adversarial r3: Escargot evalModule with only export default" {
+test "adversarial: Escargot evalModule with only export default" {
     try spikeOnly();
     if (comptime !backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {
@@ -633,7 +633,7 @@ test "adversarial r3: Escargot evalModule with only export default" {
     }.run);
 }
 
-test "adversarial r3: create many Deferreds and abandon without settle" {
+test "adversarial: create many Deferreds and abandon without settle" {
     try spikeOnly();
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -647,7 +647,7 @@ test "adversarial r3: create many Deferreds and abandon without settle" {
     }.run);
 }
 
-// ---- Round-4 capability expansion ----
+// ---- capability expansion ----
 
 test "adversarial: Escargot ESM re-export chain" {
     try spikeOnly();
@@ -726,9 +726,9 @@ test "adversarial: host Uint8Array view shares memory both ways" {
     }.run);
 }
 
-// ---- Round 4: ESM deepen (Escargot) + .hbc deepen (Hermes) + host-ops smoke ----
+// ---- ESM deepen (Escargot) + .hbc deepen (Hermes) + host-ops smoke ----
 
-test "adversarial r4: Escargot circular link + resolve rewrite together" {
+test "adversarial: Escargot circular link + resolve rewrite together" {
     try spikeOnly();
     if (comptime !backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
     // Without a loader, relative import must fail cleanly (not hang).
@@ -741,7 +741,7 @@ test "adversarial r4: Escargot circular link + resolve rewrite together" {
     try testing.expect(res.err != null);
 }
 
-test "adversarial r4: Escargot evalModule top-level await if supported else readable fail" {
+test "adversarial: Escargot evalModule top-level await if supported else readable fail" {
     try spikeOnly();
     if (comptime !backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
@@ -757,7 +757,7 @@ test "adversarial r4: Escargot evalModule top-level await if supported else read
     try testing.expect(ping.err == null);
 }
 
-test "adversarial r4: Hermes large source compile+run .hbc" {
+test "adversarial: Hermes large source compile+run .hbc" {
     try spikeOnly();
     if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {
@@ -774,7 +774,7 @@ test "adversarial r4: Hermes large source compile+run .hbc" {
     }.run);
 }
 
-test "adversarial r4: Hermes malformed .hbc with random bytes" {
+test "adversarial: Hermes malformed .hbc with random bytes" {
     try spikeOnly();
     if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {
@@ -788,7 +788,7 @@ test "adversarial r4: Hermes malformed .hbc with random bytes" {
     }.run);
 }
 
-test "adversarial r4: Escargot arraySet then arrayClear via host ops" {
+test "adversarial: Escargot arraySet then arrayClear via host ops" {
     try spikeOnly();
     if (comptime !backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
     const value = @import("../value/root.zig");
@@ -805,7 +805,7 @@ test "adversarial r4: Escargot arraySet then arrayClear via host ops" {
     try testing.expectEqual(@as(u32, 0), value.arrayLength(id, arr) orelse 99);
 }
 
-test "adversarial r4: Escargot Symbol.for registry identity" {
+test "adversarial: Escargot Symbol.for registry identity" {
     try spikeOnly();
     if (comptime !backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
     const symbol = @import("../value/symbol.zig");
@@ -814,9 +814,9 @@ test "adversarial r4: Escargot Symbol.for registry identity" {
     try testing.expect(engine.create(id, .{}));
     defer engine.destroy(id);
     const ctx = engine.getContext(id).?;
-    const a = symbol.forKey(id, "r4") orelse return error.Sym;
+    const a = symbol.forKey(id, "adv-registry") orelse return error.Sym;
     defer ActiveEngine.freeValue(ctx, a);
-    const b = symbol.forKey(id, "r4") orelse return error.Sym;
+    const b = symbol.forKey(id, "adv-registry") orelse return error.Sym;
     defer ActiveEngine.freeValue(ctx, b);
     try testing.expect(value.strictEquals(id, a, b));
 }

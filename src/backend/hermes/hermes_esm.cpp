@@ -705,9 +705,23 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                     } else {
                         local = exported = part;
                     }
-                    repl += "Object.defineProperty(exports,\"" + exported +
-                            "\",{enumerable:true,configurable:true,get:function(){return " + local +
-                            ";},set:function(v){" + local + "=v;}});";
+                    // Imported bindings are rewritten to non-assignable expressions (e.g. `(0, ns.x)`); emit getter-only forwarding for those.
+                    bool is_imported = false;
+                    for (const auto &ib : imports) {
+                        if (!ib.local.empty() && ib.local == local) {
+                            is_imported = true;
+                            break;
+                        }
+                    }
+                    if (is_imported) {
+                        repl += "Object.defineProperty(exports,\"" + exported +
+                                "\",{enumerable:true,configurable:true,get:function(){return " + local +
+                                ";}});";
+                    } else {
+                        repl += "Object.defineProperty(exports,\"" + exported +
+                                "\",{enumerable:true,configurable:true,get:function(){return " + local +
+                                ";},set:function(v){" + local + "=v;}});";
+                    }
                 }
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
