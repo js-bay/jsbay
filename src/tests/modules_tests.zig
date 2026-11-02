@@ -269,6 +269,79 @@ test "modules: re-export chain" {
     try testing.expectEqual(@as(i64, 4242), got);
 }
 
+test "modules: parenthesized arrow param shadows imported binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Parenthesized arrow params must bind before import rewriting (else `(0, ns.value)` in param position is a SyntaxError).
+    const src = "import { value } from 'dep';\nexport const result = ((value) => value)(2);\nglobalThis.__result__ = result;";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 2), got);
+}
+
+test "modules: re-export dependency evaluates before module body" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "globalThis.order.push('dep'); export const value = 1;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    try helpers.evalOk(id, "globalThis.order = []");
+    // Native ESM loads static re-export deps before the entry body runs.
+    const src = "globalThis.order.push('entry'); export { value } from 'dep';";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    try helpers.expectEvalEquals(id, "globalThis.order.join(',')", "dep,entry");
+}
+
+test "modules: ambiguous star re-export is omitted from namespace" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("a", "export const shared = 1; export const onlyA = 10;");
+    try ctx.modules.put("b", "export const shared = 2; export const onlyB = 20;");
+    try ctx.modules.put("barrel", "export * from 'a'; export * from 'b';");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import * as ns from 'barrel';
+        \\globalThis.__onlyA__ = ns.onlyA;
+        \\globalThis.__onlyB__ = ns.onlyB;
+        \\globalThis.__hasShared__ = Object.prototype.hasOwnProperty.call(ns, 'shared');
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    try testing.expectEqual(@as(i64, 10), try helpers.evalInt(id, "globalThis.__onlyA__"));
+    try testing.expectEqual(@as(i64, 20), try helpers.evalInt(id, "globalThis.__onlyB__"));
+    try helpers.expectEvalEquals(id, "globalThis.__hasShared__", "false");
+}
+
 test "modules: circular imports do not deadlock" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
