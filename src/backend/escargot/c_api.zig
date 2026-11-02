@@ -115,7 +115,9 @@ pub extern fn escargot_new_typed_array(ctx: ?*Context, ab: Value, kind: c_int, b
 pub extern fn escargot_typed_array_data(ctx: ?*Context, ta: Value, byte_offset: *usize, byte_length: *usize, kind: *c_int) ?[*]u8;
 pub extern fn escargot_new_data_view(ctx: ?*Context, ab: Value, byte_offset: usize, byte_length: usize) Value;
 pub extern fn escargot_data_view_data(ctx: ?*Context, dv: Value, byte_offset: *usize, byte_length: *usize) ?[*]u8;
+pub const NativeDataFree = *const fn (ctx: ?*Context, user_data: ?*anyopaque) callconv(.c) void;
 pub extern fn escargot_make_function(ctx: ?*Context, name: [*:0]const u8, fn_ptr: NativeFn, user_data: ?*anyopaque) Value;
+pub extern fn escargot_make_function_ex(ctx: ?*Context, name: [*:0]const u8, fn_ptr: NativeFn, user_data: ?*anyopaque, free_ud: ?NativeDataFree) Value;
 pub extern fn escargot_throw(ctx: ?*Context, message: [*:0]const u8) void;
 pub extern fn escargot_atom_new(ctx: ?*Context, utf8: [*]const u8, len: usize) ?*anyopaque;
 pub extern fn escargot_atom_free(atom: ?*anyopaque) void;
@@ -143,6 +145,7 @@ pub extern fn escargot_throw_value(ctx: ?*Context, exception: Value) void;
 pub extern fn escargot_get_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8) OpResult;
 pub extern fn escargot_json_parse_result(ctx: ?*Context, utf8: [*]const u8, len: usize) OpResult;
 pub extern fn escargot_json_stringify_result(ctx: ?*Context, v: Value) OpResult;
+pub extern fn escargot_value_to_string_result(ctx: ?*Context, v: Value) OpResult;
 pub extern fn escargot_set_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8, val: Value) OpResult;
 pub extern fn escargot_construct(ctx: ?*Context, ctor: Value, args: ?[*]const Value, argc: usize) OpResult;
 pub extern fn escargot_has_in(ctx: ?*Context, obj: Value, key: [*:0]const u8) BoolOpResult;

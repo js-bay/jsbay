@@ -169,7 +169,8 @@ pub fn callFunctionNoArgs(ctx: Context, fn_val: Value) ?[]const u8 {
     var err: ?[*:0]u8 = null;
     const this_val = c_api.escargot_get_global(ctx);
     defer c_api.escargot_free_value(ctx, this_val);
-    _ = c_api.escargot_call(ctx, fn_val, this_val, null, 0, &err);
+    const result = c_api.escargot_call(ctx, fn_val, this_val, null, 0, &err);
+    defer if (result != null) c_api.escargot_free_value(ctx, result);
     if (err) |e| {
         const s = std.mem.span(e);
         const owned = std.heap.c_allocator.dupe(u8, s) catch {

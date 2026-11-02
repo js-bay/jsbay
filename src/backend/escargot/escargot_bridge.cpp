@@ -987,13 +987,20 @@ extern "C" EscargotValue escargot_new_set_from_json(EscargotContext *c, const ch
 
 extern "C" bool escargot_map_foreach(EscargotContext *c, EscargotValue map, void *cb_ctx, EscargotMapForEachFn cb) {
     if (!c || !map || !cb || !asVal(map)->isMapObject()) return false;
-    // Use JS forEach to drive iteration; install a native callback via make_function would recurse.
-    // Instead: dump entries array and iterate in C++.
-    char *json = escargot_map_to_json(c, map);
-    if (!json) return false;
-    auto arr = escargot_json_parse(c, json, std::strlen(json));
-    std::free(json);
-    if (!arr) return false;
+    // Full-fidelity iteration: Array.from(map.entries()) keeps live values (no JSON clone).
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, ValueRef *m) -> ValueRef * {
+            ValueRef *g = state->context()->globalObject();
+            ValueRef *Array = g->asObject()->get(state, StringRef::createFromASCII("Array"));
+            ValueRef *from = Array->asObject()->get(state, StringRef::createFromASCII("from"));
+            ValueRef *entriesFn = m->asObject()->get(state, StringRef::createFromASCII("entries"));
+            ValueRef *iter = entriesFn->call(state, m, 0, nullptr);
+            ValueRef *args[] = {iter};
+            return from->call(state, Array, 1, args);
+        },
+        asVal(map));
+    if (!er.isSuccessful() || !er.result) return false;
+    EscargotValue arr = retain(c, er.result);
     uint32_t n = escargot_get_length(c, arr);
     bool ok = true;
     for (uint32_t i = 0; i < n; i++) {
@@ -1016,11 +1023,17 @@ extern "C" bool escargot_map_foreach(EscargotContext *c, EscargotValue map, void
 }
 extern "C" bool escargot_set_foreach(EscargotContext *c, EscargotValue set, void *cb_ctx, EscargotSetForEachFn cb) {
     if (!c || !set || !cb || !asVal(set)->isSetObject()) return false;
-    char *json = escargot_set_to_json(c, set);
-    if (!json) return false;
-    auto arr = escargot_json_parse(c, json, std::strlen(json));
-    std::free(json);
-    if (!arr) return false;
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, ValueRef *s) -> ValueRef * {
+            ValueRef *g = state->context()->globalObject();
+            ValueRef *Array = g->asObject()->get(state, StringRef::createFromASCII("Array"));
+            ValueRef *from = Array->asObject()->get(state, StringRef::createFromASCII("from"));
+            ValueRef *args[] = {s};
+            return from->call(state, Array, 1, args);
+        },
+        asVal(set));
+    if (!er.isSuccessful() || !er.result) return false;
+    EscargotValue arr = retain(c, er.result);
     uint32_t n = escargot_get_length(c, arr);
     bool ok = true;
     for (uint32_t i = 0; i < n; i++) {
@@ -1238,7 +1251,23 @@ struct NativeFnData {
     EscargotNativeFn fn;
     void *user_data;
     EscargotContextOpaque *ctx;
+    EscargotNativeDataFree free_ud = nullptr;
+    bool ud_freed = false;
+    void releaseUserData() {
+        if (ud_freed) return;
+        ud_freed = true;
+        if (free_ud && user_data) {
+            free_ud(ctx, user_data);
+            user_data = nullptr;
+        }
+    }
 };
+static void fireNativeFnData(void *p) {
+    auto *d = static_cast<NativeFnData *>(p);
+    if (!d) return;
+    d->releaseUserData();
+    delete d;
+}
 
 static ValueRef *nativeTrampoline(ExecutionStateRef *state, ValueRef *thisValue,
                                   size_t argc, ValueRef **argv, bool isConstructorCall) {
@@ -1275,9 +1304,15 @@ static ValueRef *nativeTrampoline(ExecutionStateRef *state, ValueRef *thisValue,
     return result ? asVal(result) : ValueRef::createUndefined();
 }
 
-extern "C" EscargotValue escargot_make_function(EscargotContext *c, const char *name, EscargotNativeFn fn, void *user_data) {
+static EscargotValue escargotMakeFunctionOwned(EscargotContext *c, const char *name, EscargotNativeFn fn,
+                                                 void *user_data, EscargotNativeDataFree free_ud) {
     if (!c || !fn) return nullptr;
-    auto *ndata = new NativeFnData{fn, user_data, c};
+    auto *ndata = new NativeFnData{fn, user_data, c, free_ud, false};
+    auto *pf = new EscargotContextOpaque::PendingFinal{&fireNativeFnData, ndata, false};
+    {
+        std::lock_guard<std::mutex> lock(c->finals_mu);
+        c->pending_finals.push_back(pf);
+    }
     auto er = Evaluator::execute(c->ctx.get(),
         [](ExecutionStateRef *state, const char *n, NativeFnData *d) -> ValueRef * {
             AtomicStringRef *an = AtomicStringRef::create(state->context(), n ? n : "", n ? std::strlen(n) : 0);
@@ -1288,10 +1323,24 @@ extern "C" EscargotValue escargot_make_function(EscargotContext *c, const char *
         },
         name, ndata);
     if (!er.isSuccessful()) {
+        std::lock_guard<std::mutex> lock(c->finals_mu);
+        auto &vec = c->pending_finals;
+        vec.erase(std::remove(vec.begin(), vec.end(), pf), vec.end());
+        delete pf;
+        ndata->releaseUserData();
         delete ndata;
         return nullptr;
     }
     return retain(c, er.result);
+}
+
+extern "C" EscargotValue escargot_make_function(EscargotContext *c, const char *name, EscargotNativeFn fn, void *user_data) {
+    return escargotMakeFunctionOwned(c, name, fn, user_data, nullptr);
+}
+
+extern "C" EscargotValue escargot_make_function_ex(EscargotContext *c, const char *name, EscargotNativeFn fn,
+                                                   void *user_data, EscargotNativeDataFree free_ud) {
+    return escargotMakeFunctionOwned(c, name, fn, user_data, free_ud);
 }
 
 extern "C" void escargot_throw_value(EscargotContext *c, EscargotValue exception) {
@@ -1414,6 +1463,18 @@ static EscargotBoolOpResult boolOk(bool v) {
 static ValueRef *retainedErrorOrNull(EscargotContextOpaque *c, const Evaluator::EvaluatorResult &er) {
     if (er.error) return const_cast<ValueRef *>(er.error.value());
     return nullptr;
+}
+
+extern "C" EscargotOpResult escargot_value_to_string_result(EscargotContext *c, EscargotValue v) {
+    EscargotOpResult out{nullptr, nullptr};
+    if (!c || !v) return out;
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, ValueRef *val) -> ValueRef * {
+            return val->toString(state);
+        },
+        asVal(v));
+    if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
+    return opOk(c, er.result);
 }
 
 extern "C" EscargotOpResult escargot_call_result(EscargotContext *c, EscargotValue fn, EscargotValue this_val,

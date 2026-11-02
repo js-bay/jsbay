@@ -160,7 +160,10 @@ uint8_t *escargot_data_view_data(EscargotContext *ctx, EscargotValue dv, size_t 
 /* ---- Native function ---- */
 typedef EscargotValue (*EscargotNativeFn)(EscargotContext *ctx, EscargotValue this_val,
                                           const EscargotValue *args, size_t argc, void *user_data);
+typedef void (*EscargotNativeDataFree)(EscargotContext *ctx, void *user_data);
 EscargotValue escargot_make_function(EscargotContext *ctx, const char *name, EscargotNativeFn fn, void *user_data);
+EscargotValue escargot_make_function_ex(EscargotContext *ctx, const char *name, EscargotNativeFn fn, void *user_data,
+                                        EscargotNativeDataFree free_ud);
 
 /* ---- Atoms (AtomicStringRef* as opaque handle) ---- */
 typedef void *EscargotAtom;
@@ -196,6 +199,7 @@ void escargot_throw_value(EscargotContext *ctx, EscargotValue exception);
 EscargotOpResult escargot_get_property_result(EscargotContext *ctx, EscargotValue obj, const char *key);
 EscargotOpResult escargot_json_parse_result(EscargotContext *ctx, const char *utf8, size_t len);
 EscargotOpResult escargot_json_stringify_result(EscargotContext *ctx, EscargotValue v);
+EscargotOpResult escargot_value_to_string_result(EscargotContext *ctx, EscargotValue v);
 EscargotOpResult escargot_set_property_result(EscargotContext *ctx, EscargotValue obj, const char *key, EscargotValue val);
 EscargotOpResult escargot_construct(EscargotContext *ctx, EscargotValue ctor,
                                     const EscargotValue *args, size_t argc);
