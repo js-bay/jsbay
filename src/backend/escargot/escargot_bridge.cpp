@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -495,13 +496,54 @@ static int32_t escargotToInt32Number(double d) {
     return static_cast<int32_t>(mod);
 }
 
-extern "C" int32_t escargot_to_int32(EscargotValue v) {
-    if (!v || !asVal(v)->isNumber()) return 0;
-    return escargotToInt32Number(asVal(v)->asNumber());
+// ECMAScript ToNumber into *out. On failure sets pending throw and returns false.
+static bool escargotToNumber(EscargotContext *c, EscargotValue v, double *out) {
+    if (!out) return false;
+    if (!v) {
+        *out = std::numeric_limits<double>::quiet_NaN(); // Number(undefined)
+        return true;
+    }
+    ValueRef *val = asVal(v);
+    if (val->isNumber()) {
+        *out = val->asNumber();
+        return true;
+    }
+    if (!c) return false;
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, ValueRef *arg) -> ValueRef * {
+            auto *Number = state->context()->globalObject()->get(
+                state, StringRef::createFromASCII("Number"));
+            ValueRef *args[] = {arg};
+            return Number->call(state, ValueRef::createUndefined(), 1, args);
+        },
+        val);
+    if (!er.isSuccessful()) {
+        c->pending_throw.clear();
+        if (c->pending_throw_value) {
+            escargot_free_value(c, c->pending_throw_value);
+            c->pending_throw_value = nullptr;
+        }
+        if (er.error) {
+            c->pending_throw_value = retain(c, er.error.value());
+        } else {
+            c->pending_throw = "TypeError";
+        }
+        return false;
+    }
+    if (!er.result || !er.result->isNumber()) return false;
+    *out = er.result->asNumber();
+    return true;
 }
-extern "C" double escargot_to_float64(EscargotValue v) {
-    if (!v || !asVal(v)->isNumber()) return 0;
-    return asVal(v)->asNumber();
+
+extern "C" bool escargot_to_int32(EscargotContext *c, EscargotValue v, int32_t *out) {
+    if (!out) return false;
+    double d = 0;
+    if (!escargotToNumber(c, v, &d)) return false;
+    *out = escargotToInt32Number(d);
+    return true;
+}
+extern "C" bool escargot_to_float64(EscargotContext *c, EscargotValue v, double *out) {
+    return escargotToNumber(c, v, out);
 }
 
 extern "C" char *escargot_value_to_utf8(EscargotContext *c, EscargotValue v) {

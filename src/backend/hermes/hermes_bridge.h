@@ -64,8 +64,9 @@ bool hermes_is_function(JsbayHermesContext *ctx, HermesValue v);
 bool hermes_is_constructor(JsbayHermesContext *ctx, HermesValue v);
 
 bool hermes_to_bool(HermesValue v);
-int32_t hermes_to_int32(HermesValue v);
-double hermes_to_float64(HermesValue v);
+/* ToNumber then ToInt32 / identity. On conversion failure sets pending throw and returns false. */
+bool hermes_to_int32(JsbayHermesContext *ctx, HermesValue v, int32_t *out);
+bool hermes_to_float64(JsbayHermesContext *ctx, HermesValue v, double *out);
 
 char *hermes_value_to_utf8(JsbayHermesContext *ctx, HermesValue v);
 char *hermes_value_to_utf8_n(JsbayHermesContext *ctx, HermesValue v, size_t *out_len);

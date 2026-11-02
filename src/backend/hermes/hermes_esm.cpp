@@ -965,6 +965,12 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
         if (i + 6 > src.size() || src.compare(i, 6, "import") != 0) return false;
         if (i > 0 && isIdent(src[i - 1])) return false;
         if (i + 6 < src.size() && isIdent(src[i + 6])) return false;
+        // Member access / method call: obj.import(...) is not dynamic import().
+        if (i > 0) {
+            size_t j = i;
+            while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1]))) --j;
+            if (j > 0 && src[j - 1] == '.') return false;
+        }
 
         size_t k = i + 6;
         while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
@@ -1428,7 +1434,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         if (ib.imported == ".") {
             ident_repl[ib.local] = ns;
         } else if (ib.imported == "default") {
-            ident_repl[ib.local] = "(" + ns + ".default!==undefined?" + ns + ".default:" + ns + ")";
+            // Read .default directly so `export default undefined` stays undefined.
+            ident_repl[ib.local] = ns + ".default";
         } else {
             // Unbound call form: `import { f }` must keep `f()` as an unbound call
             // (this === undefined), not `__jsbay_ns.f()` which binds this to the ns.

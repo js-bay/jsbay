@@ -62,13 +62,17 @@ pub fn toBool(_: Context, v: Value) ?bool {
     if (v == null) return null;
     return c_api.hermes_to_bool(v);
 }
-pub fn toInt32(_: Context, v: Value) ?i32 {
+pub fn toInt32(ctx: Context, v: Value) ?i32 {
     if (v == null) return null;
-    return c_api.hermes_to_int32(v);
+    var out: i32 = 0;
+    if (!c_api.hermes_to_int32(ctx, v, &out)) return null;
+    return out;
 }
-pub fn toFloat64(_: Context, v: Value) ?f64 {
+pub fn toFloat64(ctx: Context, v: Value) ?f64 {
     if (v == null) return null;
-    return c_api.hermes_to_float64(v);
+    var out: f64 = 0;
+    if (!c_api.hermes_to_float64(ctx, v, &out)) return null;
+    return out;
 }
 pub fn newBoolVal(ctx: Context, v: bool) Value {
     return c_api.hermes_new_bool(ctx, v);

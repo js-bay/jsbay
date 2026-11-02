@@ -65,7 +65,8 @@ fn createTimer(ctx: Context, args: ?[*]const Value, argc: usize, is_interval: bo
     }
     var delay_ms: u64 = 0;
     if (argc >= 2) {
-        const d = value_mod.toFloat64(ctx, args.?[1]) orelse 0;
+        // ToNumber (via value.toFloat64); conversion exceptions propagate via pending throw.
+        const d = value_mod.toFloat64(ctx, args.?[1]) orelse return null;
         delay_ms = timers_mod.normalizeDelay(d);
     }
     const id = instanceIdFromCtx(ctx);
@@ -89,7 +90,8 @@ fn jsSetInterval(ctx: ?*c_api.Context, _: Value, args: ?[*]const Value, argc: us
 fn jsClearTimer(ctx: ?*c_api.Context, _: Value, args: ?[*]const Value, argc: usize, _: ?*anyopaque) callconv(.c) Value {
     const c = ctx orelse return null;
     if (argc < 1 or args == null) return value_mod.undefinedValue();
-    const number = value_mod.toFloat64(c, args.?[0]) orelse return value_mod.undefinedValue();
+    // ToNumber; conversion exceptions propagate via pending throw.
+    const number = value_mod.toFloat64(c, args.?[0]) orelse return null;
     if (!std.math.isFinite(number) or number < @as(f64, @floatFromInt(std.math.minInt(i32))) or number > @as(f64, @floatFromInt(std.math.maxInt(i32)))) {
         return value_mod.undefinedValue();
     }

@@ -666,13 +666,54 @@ static int32_t hermesToInt32Number(double d) {
     return static_cast<int32_t>(mod);
 }
 
-extern "C" int32_t hermes_to_int32(HermesValue v) {
-    if (!v || !asVal(v)->isNumber()) return 0;
-    return hermesToInt32Number(asVal(v)->getNumber());
+// ECMAScript ToNumber into *out. On failure sets pending throw and returns false.
+static bool hermesToNumber(JsbayHermesContext *c, HermesValue v, double *out) {
+    if (!out) return false;
+    if (!v) {
+        *out = std::numeric_limits<double>::quiet_NaN(); // Number(undefined)
+        return true;
+    }
+    jsi::Value &val = *asVal(v);
+    if (val.isNumber()) {
+        *out = val.getNumber();
+        return true;
+    }
+    if (!c || !c->rt) return false;
+    try {
+        auto Number = c->rt->global().getPropertyAsFunction(*c->rt, "Number");
+        jsi::Value n = Number.call(*c->rt, val);
+        if (!n.isNumber()) return false;
+        *out = n.getNumber();
+        return true;
+    } catch (const jsi::JSError &e) {
+        c->pending_throw.clear();
+        try {
+            c->pending_throw_value = std::make_unique<jsi::Value>(*c->rt, e.value());
+        } catch (...) {
+            c->pending_throw_value.reset();
+            c->pending_throw = e.getMessage();
+        }
+        return false;
+    } catch (const std::exception &e) {
+        c->pending_throw_value.reset();
+        c->pending_throw = e.what();
+        return false;
+    } catch (...) {
+        c->pending_throw_value.reset();
+        c->pending_throw = "TypeError";
+        return false;
+    }
 }
-extern "C" double hermes_to_float64(HermesValue v) {
-    if (!v || !asVal(v)->isNumber()) return 0;
-    return asVal(v)->getNumber();
+
+extern "C" bool hermes_to_int32(JsbayHermesContext *c, HermesValue v, int32_t *out) {
+    if (!out) return false;
+    double d = 0;
+    if (!hermesToNumber(c, v, &d)) return false;
+    *out = hermesToInt32Number(d);
+    return true;
+}
+extern "C" bool hermes_to_float64(JsbayHermesContext *c, HermesValue v, double *out) {
+    return hermesToNumber(c, v, out);
 }
 
 extern "C" char *hermes_value_to_utf8(JsbayHermesContext *c, HermesValue v) {
@@ -2060,8 +2101,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
 
     if (state != 1) return;
 
-    // Resolve may adopt a thenable/promise. Leave the side table pending and update from
-    // the Deferred promise's own fulfillment/rejection handlers after microtask drain.
+    // Resolve may adopt a thenable/promise. Leave the side table pending and update from the Deferred promise's own fulfillment/rejection handlers after microtask drain.
     try {
         auto &rt = *c->rt;
         jsi::Object po = pvalue->asObject(rt);

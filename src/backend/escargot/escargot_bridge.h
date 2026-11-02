@@ -62,8 +62,9 @@ bool escargot_is_function(EscargotContext *ctx, EscargotValue v);
 bool escargot_is_constructor(EscargotContext *ctx, EscargotValue v);
 
 bool escargot_to_bool(EscargotValue v);
-int32_t escargot_to_int32(EscargotValue v);
-double escargot_to_float64(EscargotValue v);
+/* ToNumber then ToInt32 / identity. On conversion failure sets pending throw and returns false. */
+bool escargot_to_int32(EscargotContext *ctx, EscargotValue v, int32_t *out);
+bool escargot_to_float64(EscargotContext *ctx, EscargotValue v, double *out);
 
 /* Heap UTF-8; caller frees with free(). NULL on failure. */
 char *escargot_value_to_utf8(EscargotContext *ctx, EscargotValue v);
