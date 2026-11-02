@@ -44,7 +44,6 @@ fn dupeAndFreeLen(src_opt: ?[*]u8, len: usize) ?[]const u8 {
     return owned;
 }
 
-
 pub const CompileOut = struct {
     bytes: ?[]u8 = null,
     err: ?[]const u8 = null,
