@@ -57,6 +57,43 @@ static bool isIdent(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
 
+// Same length as src, with string/template/comment interiors blanked to spaces so
+// export/import regexes cannot match text that is not executable source.
+static std::string blankNonCode(const std::string &src) {
+    std::string out = src;
+    size_t i = 0;
+    while (i < out.size()) {
+        char c = out[i];
+        if (c == '/' && i + 1 < out.size() && out[i + 1] == '/') {
+            i += 2;
+            while (i < out.size() && out[i] != '\n') { out[i] = ' '; ++i; }
+            continue;
+        }
+        if (c == '/' && i + 1 < out.size() && out[i + 1] == '*') {
+            out[i] = out[i + 1] = ' ';
+            i += 2;
+            while (i + 1 < out.size() && !(out[i] == '*' && out[i + 1] == '/')) { out[i] = ' '; ++i; }
+            if (i < out.size()) out[i++] = ' ';
+            if (i < out.size()) out[i++] = ' ';
+            continue;
+        }
+        if (c == '\'' || c == '"' || c == '`') {
+            char q = c;
+            ++i;
+            while (i < out.size()) {
+                if (out[i] == '\\' && i + 1 < out.size()) { out[i] = out[i + 1] = ' '; i += 2; continue; }
+                if (out[i] == q) { ++i; break; }
+                out[i] = ' ';
+                ++i;
+            }
+            continue;
+        }
+        ++i;
+    }
+    return out;
+}
+
+
 // Skip strings/comments roughly; return rewritten source with identifier replacements.
 static std::string rewriteIdents(const std::string &src,
                                  const std::unordered_map<std::string, std::string> &repl) {
@@ -271,10 +308,15 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     {
         static const std::regex re(R"(export\s*\{([^}]*)\}\s*from\s*(['\"])([^'\"]+)\2\s*;?)");
         std::smatch m;
-        while (std::regex_search(body, m, re)) {
-            std::string specs = m[1].str();
-            std::string mod = m[3].str();
-            std::string repl;
+        for (;;) {
+            std::string blanked = blankNonCode(body);
+            if (!std::regex_search(blanked, m, re)) break;
+            // Specs / module from the blanked match spans on the live body (same offsets).
+            std::string specs = body.substr(m.position(1), m.length(1));
+            std::string mod = body.substr(m.position(3), m.length(3));
+            static int reexport_ns = 0;
+            std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
+            std::string repl = "var " + ns + " = require(\"" + mod + "\");";
             size_t pos = 0;
             while (pos < specs.size()) {
                 size_t comma = specs.find(',', pos);
@@ -289,8 +331,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                         imported = exported = part;
                     }
                     repl += "Object.defineProperty(exports,\"" + exported +
-                            "\",{enumerable:true,configurable:true,get:function(){return require(\"" + mod +
-                            "\")." + imported + ";}});";
+                            "\",{enumerable:true,configurable:true,get:function(){return " + ns + "." +
+                            imported + ";}});";
                 }
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
@@ -302,17 +344,23 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     // export * from 'mod';
     {
         static const std::regex re(R"(export\s*\*\s*from\s*(['\"])([^'\"]+)\1\s*;?)");
-        body = std::regex_replace(
-            body, re,
-            "Object.assign(exports, require(\"$2\"));");
+        for (;;) {
+            std::string blanked = blankNonCode(body);
+            std::smatch m;
+            if (!std::regex_search(blanked, m, re)) break;
+            std::string mod = body.substr(m.position(2), m.length(2));
+            std::string repl = "Object.assign(exports, require(\"" + mod + "\"));";
+            body.replace(m.position(), m.length(), repl);
+        }
     }
 
     // export default ...
     {
         static const std::regex re_fn(R"(export\s+default\s+function\s*([A-Za-z_$][\w$]*)?)");
         std::smatch m;
-        if (std::regex_search(body, m, re_fn)) {
-            std::string name = m[1].matched ? m[1].str() : "__default_export";
+        std::string blanked = blankNonCode(body);
+        if (std::regex_search(blanked, m, re_fn)) {
+            std::string name = m[1].matched ? body.substr(m.position(1), m.length(1)) : "__default_export";
             if (!m[1].matched) {
                 body.replace(m.position(), m.length(), "function " + name);
             } else {
@@ -321,7 +369,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             epilogue.push_back("exports.default = " + name + ";");
         } else {
             static const std::regex re_def(R"(export\s+default\s+)");
-            if (std::regex_search(body, m, re_def)) {
+            blanked = blankNonCode(body);
+            if (std::regex_search(blanked, m, re_def)) {
                 body.replace(m.position(), m.length(), "exports.default = ");
             }
         }
@@ -332,9 +381,10 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         static const std::regex re(R"(export\s+function\s+([A-Za-z_$][\w$]*))");
         std::smatch m;
         std::string tmp = body;
+        std::string blanked = blankNonCode(tmp);
         body.clear();
         size_t last = 0;
-        while (std::regex_search(tmp.cbegin() + last, tmp.cend(), m, re)) {
+        while (std::regex_search(blanked.cbegin() + last, blanked.cend(), m, re)) {
             size_t pos = last + m.position();
             body.append(tmp, last, pos - last);
             std::string name = m[1].str();
@@ -351,13 +401,15 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     {
         static const std::regex re(R"(export\s+(const|let|var)\s+)");
         std::smatch m;
-        while (std::regex_search(body, m, re)) {
-            // Find binding names until '=' or ',' chain — simplified: single name
+        for (;;) {
+            std::string blanked = blankNonCode(body);
+            if (!std::regex_search(blanked, m, re)) break;
             size_t start = m.position() + m.length();
             size_t i = start;
             while (i < body.size() && isIdent(body[i])) ++i;
             std::string name = body.substr(start, i - start);
-            body.replace(m.position(), m.length(), std::string(m[1]) + " ");
+            std::string kind = m[1].str();
+            body.replace(m.position(), m.length(), kind + " ");
             if (!name.empty()) {
                 epilogue.push_back("Object.defineProperty(exports,\"" + name +
                                    "\",{enumerable:true,configurable:true,get:function(){return " + name +
@@ -370,8 +422,10 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     {
         static const std::regex re(R"(export\s*\{([^}]*)\}\s*;?)");
         std::smatch m;
-        while (std::regex_search(body, m, re)) {
-            std::string specs = m[1].str();
+        for (;;) {
+            std::string blanked = blankNonCode(body);
+            if (!std::regex_search(blanked, m, re)) break;
+            std::string specs = body.substr(m.position(1), m.length(1));
             std::string repl;
             size_t pos = 0;
             while (pos < specs.size()) {
