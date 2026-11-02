@@ -204,6 +204,27 @@ test "modules: imported binding rewritten in ternary consequent" {
     try testing.expectEqual(@as(i64, 9), got);
 }
 
+test "modules: named function import calls stay unbound" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    // Calling an imported function must not bind `this` to the module namespace.
+    try ctx.modules.put("dep", "export function getThis() { return this; }");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src = "import { getThis } from 'dep';\nglobalThis.__this__ = getThis();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    try helpers.expectEvalEquals(id, "globalThis.__this__ === undefined", "true");
+}
+
 test "modules: default export + import" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);

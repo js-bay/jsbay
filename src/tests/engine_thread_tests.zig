@@ -553,6 +553,33 @@ fn skipEscargotEtHost() !void {
     if (comptime backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
 }
 
+test "engine thread: failed hostInstall does not block threadStart" {
+    // Spike only: Escargot/Hermes property install failures must kill the pending binding.
+    if (comptime !(backend.isEscargotBackend(backend.active_backend) or backend.isHermesBackend(backend.active_backend)))
+        return error.SkipZigTest;
+
+    const id = helpers.nextInstanceId();
+    var live = try createInstance(id);
+    defer live.close();
+
+    const noop: JsBayHostFn = struct {
+        fn cb(
+            _: c_int,
+            _: ?*anyopaque,
+            _: u32,
+            _: ?[*]const JsBayHostValue,
+            out: *JsBayHostValue,
+        ) callconv(.c) c_int {
+            out.* = .{ .tag = host_undefined, .reserved = 0, .number = 0, .ptr = null, .len = 0 };
+            return 0;
+        }
+    }.cb;
+
+    // Infinity is a non-configurable global; install must fail and leave no live binding.
+    try testing.expect(!engine_thread_mod.hostInstall(id, "Infinity", noop, null));
+    try startThread(&live);
+}
+
 test "engine thread: a script posted from another thread runs there, and wait sees its result" {
     try skipEscargotEtHost();
     const id = helpers.nextInstanceId();

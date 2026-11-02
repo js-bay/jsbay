@@ -82,9 +82,10 @@ fn dupeAndFree(src_opt: ?[*:0]u8) ?[]const u8 {
 pub fn hermesEvalModule(ctx: Context, source: []const u8, filename: []const u8) types.EvalResult {
     const r = hermes_eval_module(ctx, source.ptr, source.len, filename.ptr, filename.len);
     if (r.err != null) {
-        const err = dupeAndFree(r.err) orelse "module evaluation failed";
+        const duped = dupeAndFree(r.err);
+        const err = duped orelse "module evaluation failed";
         if (r.result) |p| free(@ptrCast(p));
-        return .{ .result = null, .err = err, .err_is_heap = true };
+        return .{ .result = null, .err = err, .err_is_heap = duped != null };
     }
     return .{ .result = dupeAndFree(r.result), .err = null };
 }
@@ -96,9 +97,10 @@ pub fn hermesImportModule(ctx: Context, specifier: []const u8) types.EvalResult 
     defer std.heap.c_allocator.free(spec_z);
     const r = hermes_import_module(ctx, spec_z.ptr);
     if (r.err != null) {
-        const err = dupeAndFree(r.err) orelse "module import failed";
+        const duped = dupeAndFree(r.err);
+        const err = duped orelse "module import failed";
         if (r.result) |p| free(@ptrCast(p));
-        return .{ .result = null, .err = err, .err_is_heap = true };
+        return .{ .result = null, .err = err, .err_is_heap = duped != null };
     }
     return .{ .result = dupeAndFree(r.result), .err = null };
 }

@@ -734,7 +734,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         } else if (ib.imported == "default") {
             ident_repl[ib.local] = "(" + ns + ".default!==undefined?" + ns + ".default:" + ns + ")";
         } else {
-            ident_repl[ib.local] = ns + "." + ib.imported;
+            // Unbound call form: `import { f }` must keep `f()` as an unbound call
+            // (this === undefined), not `__jsbay_ns.f()` which binds this to the ns.
+            ident_repl[ib.local] = "(0, " + ns + "." + ib.imported + ")";
         }
     }
 
