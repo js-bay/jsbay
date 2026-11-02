@@ -274,9 +274,123 @@ static std::string rewriteIdents(const std::string &src,
             if (!n.empty()) scopes.back().insert(n);
         }
     };
+    // Indices of scopes that act as function (or module) environments for `var` hoisting.
+    std::vector<size_t> fn_scope_stack;
+    fn_scope_stack.push_back(0); // module / script scope
+    auto addVarBindings = [&](const std::vector<std::string> &names) {
+        size_t idx = fn_scope_stack.empty() ? 0 : fn_scope_stack.back();
+        if (idx >= scopes.size()) idx = scopes.empty() ? 0 : scopes.size() - 1;
+        if (scopes.empty()) return;
+        for (const auto &n : names) {
+            if (!n.empty()) scopes[idx].insert(n);
+        }
+    };
     auto pushScope = [&]() { scopes.emplace_back(); };
     auto popScope = [&]() {
         if (scopes.size() > 1) scopes.pop_back();
+        while (!fn_scope_stack.empty() && fn_scope_stack.back() >= scopes.size()) fn_scope_stack.pop_back();
+        if (fn_scope_stack.empty()) fn_scope_stack.push_back(0);
+    };
+    auto pushFunctionScope = [&]() {
+        pushScope();
+        fn_scope_stack.push_back(scopes.size() - 1);
+    };
+    // Scan a matched `{...}` body (or top-level range) for `var` bindings, skipping nested function/class bodies so their vars stay local to those scopes.
+    auto collectVarBindingsInRange = [&](size_t from, size_t to, std::unordered_set<std::string> &into) {
+        size_t i = from;
+        auto skipLineComment = [&]() {
+            i += 2;
+            while (i < src.size() && src[i] != '\n') ++i;
+        };
+        auto skipBlockComment = [&]() {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            if (i + 1 < src.size()) i += 2;
+        };
+        auto skipQuoted = [&](char q) {
+            ++i;
+            while (i < src.size()) {
+                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                if (src[i] == q) { ++i; break; }
+                ++i;
+            }
+        };
+        auto skipTemplate = [&]() {
+            ++i;
+            while (i < src.size()) {
+                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                if (src[i] == '`') { ++i; break; }
+                if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                    i += 2;
+                    int d = 1;
+                    while (i < src.size() && d > 0) {
+                        if (src[i] == '{') ++d;
+                        else if (src[i] == '}') --d;
+                        ++i;
+                    }
+                    continue;
+                }
+                ++i;
+            }
+        };
+        auto skipBalanced = [&](char open_ch, char close_ch) {
+            int d = 0;
+            while (i < src.size()) {
+                char ch = src[i];
+                if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') { skipLineComment(); continue; }
+                if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
+                if (ch == '\'' || ch == '"') { char q = ch; skipQuoted(q); continue; }
+                if (ch == '`') { skipTemplate(); continue; }
+                if (ch == open_ch) { ++d; ++i; continue; }
+                if (ch == close_ch) {
+                    --d;
+                    ++i;
+                    if (d == 0) return;
+                    continue;
+                }
+                ++i;
+            }
+        };
+        auto skipNestedFunctionOrClass = [&](const std::string &kw) {
+            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            if (kw == "function" && i < src.size() && src[i] == '*') {
+                ++i;
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            }
+            if (i < src.size() && isIdentStart(src[i])) {
+                while (i < src.size() && isIdent(src[i])) ++i;
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            }
+            if (i < src.size() && src[i] == '(') skipBalanced('(', ')');
+            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            if (i < src.size() && src[i] == '{') skipBalanced('{', '}');
+        };
+        while (i < to && i < src.size()) {
+            char c = src[i];
+            if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') { skipLineComment(); continue; }
+            if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
+            if (c == '\'' || c == '"') { skipQuoted(c); continue; }
+            if (c == '`') { skipTemplate(); continue; }
+            if (isIdentStart(c) && (i == from || !isIdent(src[i - 1]))) {
+                size_t j = i + 1;
+                while (j < src.size() && isIdent(src[j])) ++j;
+                std::string id = src.substr(i, j - i);
+                if (id == "function" || id == "class") {
+                    i = j;
+                    skipNestedFunctionOrClass(id);
+                    continue;
+                }
+                if (id == "var") {
+                    auto names = collectDeclaratorBoundNames(src, j);
+                    for (const auto &n : names) if (!n.empty()) into.insert(n);
+                    i = j;
+                    continue;
+                }
+                i = j;
+                continue;
+            }
+            ++i;
+        }
     };
 
     // Container stack: ObjectLit vs Block vs Bracket vs Paren/ParamList.
@@ -451,6 +565,54 @@ static std::string rewriteIdents(const std::string &src,
                 kind = Cont::FnBody;
                 next_brace_is_fn_body = false;
                 // Param scope already pushed; body shares it (no extra scope).
+                // Collect function-scoped `var` bindings now so they shadow imports for the whole body, including references that appear before the declarator.
+                if (!scopes.empty()) {
+                    size_t body_start = i + 1;
+                    int depth = 1;
+                    size_t p = body_start;
+                    while (p < src.size() && depth > 0) {
+                        char ch = src[p];
+                        if (ch == '/' && p + 1 < src.size() && src[p + 1] == '/') {
+                            p += 2; while (p < src.size() && src[p] != '\n') ++p; continue;
+                        }
+                        if (ch == '/' && p + 1 < src.size() && src[p + 1] == '*') {
+                            p += 2; while (p + 1 < src.size() && !(src[p] == '*' && src[p + 1] == '/')) ++p;
+                            if (p + 1 < src.size()) p += 2; continue;
+                        }
+                        if (ch == '\'' || ch == '"') {
+                            char q = ch; ++p;
+                            while (p < src.size()) {
+                                if (src[p] == '\\' && p + 1 < src.size()) { p += 2; continue; }
+                                if (src[p] == q) { ++p; break; }
+                                ++p;
+                            }
+                            continue;
+                        }
+                        if (ch == '`') {
+                            ++p;
+                            while (p < src.size()) {
+                                if (src[p] == '\\' && p + 1 < src.size()) { p += 2; continue; }
+                                if (src[p] == '`') { ++p; break; }
+                                if (src[p] == '$' && p + 1 < src.size() && src[p + 1] == '{') {
+                                    p += 2; int d = 1;
+                                    while (p < src.size() && d > 0) {
+                                        if (src[p] == '{') ++d;
+                                        else if (src[p] == '}') --d;
+                                        ++p;
+                                    }
+                                    continue;
+                                }
+                                ++p;
+                            }
+                            continue;
+                        }
+                        if (ch == '{') { ++depth; ++p; continue; }
+                        if (ch == '}') { --depth; ++p; continue; }
+                        ++p;
+                    }
+                    size_t body_end = (depth == 0) ? (p - 1) : src.size();
+                    collectVarBindingsInRange(body_start, body_end, scopes.back());
+                }
             } else if (prevIsObjectLitIntro()) {
                 kind = Cont::ObjectLit;
             } else {
@@ -497,7 +659,7 @@ static std::string rewriteIdents(const std::string &src,
             if (outEndsWithWord(pk2, "function") || outEndsWithWord(pk2, "catch") ||
                 outEndsWithWord(pk, "function") || outEndsWithWord(pk, "catch")) {
                 kind = Cont::ParamList;
-                pushScope();
+                pushFunctionScope();
             }
             cont.push_back(kind);
             out.push_back(src[i++]);
@@ -563,11 +725,13 @@ static std::string rewriteIdents(const std::string &src,
             }
 
             // const / let / var — register declarator bindings; rewrite only initializer expressions.
+            // `var` is function-scoped (or module-scoped): keep it active for the enclosing function, not the current block.
             if ((id == "const" || id == "let" || id == "var") && (i == 0 || !isIdent(src[i - 1]))) {
                 out += id;
                 i = j;
                 auto names = collectDeclaratorBoundNames(src, i);
-                addBindings(names);
+                if (id == "var") addVarBindings(names);
+                else addBindings(names);
                 int depth = 0;
                 while (i < src.size()) {
                     char ch = src[i];
@@ -655,7 +819,7 @@ static std::string rewriteIdents(const std::string &src,
                     char p = prevSignificant();
                     // Only treat as param if not a call/member and looks like expression start.
                     if (p != '.' && p != '?' && !isIdent(p) && p != ')' && p != ']') {
-                        pushScope();
+                        pushFunctionScope();
                         addBindings({id});
                         out += id;
                         i = j;
@@ -693,11 +857,13 @@ static std::string rewriteIdents(const std::string &src,
             }
             size_t k = j;
             while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
-            bool object_key = !after_question && (k < src.size() && src[k] == ':' &&
+            // Property keys are only excluded inside object literals; a following colon alone is also the consequent/alternate separator in `?:`.
+            bool in_object_lit_for_key = !cont.empty() && cont.back() == Cont::ObjectLit;
+            bool object_key = in_object_lit_for_key && !after_question && (k < src.size() && src[k] == ':' &&
                                                  !(k + 1 < src.size() && src[k + 1] == ':'));
             // Method / accessor keys (`value()`, `get value()`, `set value()`, `async value()`, `*value()`) are names, not references.
             bool method_key = false;
-            if (!after_dot && !after_question && !cont.empty() && cont.back() == Cont::ObjectLit &&
+            if (!after_dot && !after_question && in_object_lit_for_key &&
                 k < src.size() && src[k] == '(') {
                 size_t pk = out.size();
                 while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
@@ -1746,8 +1912,7 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
     };
     try {
         auto &rt = *hermes_context_rt(c);
-        // Ensure a loader exists for require during entry. makeRequire closures capture the
-        // loader pointer, so it must outlive this stack frame (heap / context map).
+        // Ensure a loader exists for require during entry. makeRequire closures capture the loader pointer, so it must outlive this stack frame (heap / context map).
         if (!use) {
             auto owned = std::make_unique<HermesModLoader>();
             use = owned.get();

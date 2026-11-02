@@ -1411,9 +1411,21 @@ extern "C" HermesValue hermes_new_array_buffer_copy(JsbayHermesContext *c, const
 }
 extern "C" HermesValue hermes_new_array_buffer_no_copy(JsbayHermesContext *c, uint8_t *bytes, size_t len,
                                                       HermesBufferDeleter deleter, void *user_data) {
+    // Own the deleter until ExternalBuffer construction succeeds. If make_shared/ArrayBuffer throws before ownership transfers, fire once here so Zig's finalizer pack cannot leak.
+    struct DeleterGuard {
+        HermesBufferDeleter d;
+        void *u;
+        bool armed;
+        DeleterGuard(HermesBufferDeleter d_, void *u_) : d(d_), u(u_), armed(true) {}
+        ~DeleterGuard() {
+            if (armed && d) d(u);
+        }
+        void release() { armed = false; }
+    } guard(deleter, user_data);
     if (!c || !c->rt) return nullptr;
     try {
         auto buf = std::make_shared<ExternalBuffer>(bytes, len, deleter, user_data);
+        guard.release(); // ExternalBuffer destructor owns the exactly-once call from here.
         return retainMove(c, jsi::Value(jsi::ArrayBuffer(*c->rt, std::move(buf))));
     } catch (...) { return nullptr; }
 }

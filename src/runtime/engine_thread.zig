@@ -248,8 +248,7 @@ fn detach(instance_id: i32) ?*State {
 
 pub fn threadStart(instance_id: i32) bool {
     if (instance_map.isTeardownPending(instance_id)) return false;
-    // Escargot Context is thread-affine: hosts installed on the create thread must not
-    // be evaluated on the engine thread (AtomicString/GC SEGV). Refuse ET start instead.
+    // Escargot Context is thread-affine: hosts installed on the create thread must not be evaluated on the engine thread (AtomicString/GC SEGV). Refuse ET start instead.
     if (comptime backend.active_backend == .escargot) {
         if (@import("../abi/spike_host_abi.zig").hasBindings(instance_id)) return false;
     }
