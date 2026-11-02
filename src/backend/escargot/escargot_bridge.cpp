@@ -547,10 +547,11 @@ static int32_t escargotToInt32Number(double d) {
 }
 
 // ECMAScript ToNumber into *out. On failure sets pending throw and returns false.
+// Prefer ToNumber semantics (unary +) over Number(...): BigInt must TypeError like QuickJS/JSC.
 static bool escargotToNumber(EscargotContext *c, EscargotValue v, double *out) {
     if (!out) return false;
     if (!v) {
-        *out = std::numeric_limits<double>::quiet_NaN(); // Number(undefined)
+        *out = std::numeric_limits<double>::quiet_NaN(); // ToNumber(undefined)
         return true;
     }
     ValueRef *val = asVal(v);
@@ -558,13 +559,23 @@ static bool escargotToNumber(EscargotContext *c, EscargotValue v, double *out) {
         *out = val->asNumber();
         return true;
     }
+    if (val->isBoolean()) {
+        *out = val->asBoolean() ? 1.0 : 0.0;
+        return true;
+    }
+    if (val->isNull()) {
+        *out = 0.0;
+        return true;
+    }
+    if (val->isUndefined()) {
+        *out = std::numeric_limits<double>::quiet_NaN();
+        return true;
+    }
     if (!c) return false;
     auto er = Evaluator::execute(c->ctx.get(),
         [](ExecutionStateRef *state, ValueRef *arg) -> ValueRef * {
-            auto *Number = state->context()->globalObject()->get(
-                state, StringRef::createFromASCII("Number"));
-            ValueRef *args[] = {arg};
-            return Number->call(state, ValueRef::createUndefined(), 1, args);
+            // ToNumber (throws TypeError for BigInt / ToPrimitive→BigInt); not Number(...).
+            return ValueRef::create(arg->toNumber(state));
         },
         val);
     if (!er.isSuccessful()) {

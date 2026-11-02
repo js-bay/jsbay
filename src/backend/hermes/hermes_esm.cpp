@@ -127,7 +127,42 @@ static bool canStartRegexLiteral(const std::string &preceding) {
     }
 
     char prev = preceding[pk - 1];
-    if (prev == ')' || prev == ']' || prev == '"' || prev == '\'' || prev == '`') return false;
+    if (prev == ']' || prev == '"' || prev == '\'' || prev == '`') return false;
+    if (prev == ')') {
+        // Closing a call/group is division, but `if (…)` / `while (…)` / `for (…)` / `with (…)` / `switch (…)`
+        // leave the grammar where `/…/` can start a RegExp literal.
+        int depth = 0;
+        size_t j = pk;
+        while (j > 0) {
+            char ch = preceding[j - 1];
+            if (ch == ')') {
+                ++depth;
+                --j;
+                continue;
+            }
+            if (ch == '(') {
+                --depth;
+                --j;
+                if (depth == 0) {
+                    while (j > 0 && std::isspace(static_cast<unsigned char>(preceding[j - 1]))) --j;
+                    size_t end = j;
+                    while (j > 0) {
+                        char w = preceding[j - 1];
+                        if (!(std::isalnum(static_cast<unsigned char>(w)) || w == '_' || w == '$')) break;
+                        --j;
+                    }
+                    std::string word = preceding.substr(j, end - j);
+                    if (word == "if" || word == "while" || word == "for" || word == "with" ||
+                        word == "switch")
+                        return true;
+                    return false;
+                }
+                continue;
+            }
+            --j;
+        }
+        return false;
+    }
 
     // Identifier / keyword / number token.
     if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_' || prev == '$') {
@@ -400,6 +435,22 @@ static std::string rewriteIdents(const std::string &src,
     bool next_brace_is_fn_body = false;
     // True while scanning a parameter default initializer (`=` … until `,`/`)` at ParamList depth).
     bool in_param_default = false;
+    // Expression-bodied arrows (`=> expr` without `{`): cont.size() when the body began.
+    // Pop the param scope when the expression ends at that container depth (`,` / `;`) or when
+    // an outer container closes (cont shrinks below the marker).
+    std::vector<size_t> expr_arrow_cont_depth;
+    auto closeExprArrowsDeeperThan = [&](size_t depth) {
+        while (!expr_arrow_cont_depth.empty() && expr_arrow_cont_depth.back() > depth) {
+            expr_arrow_cont_depth.pop_back();
+            popScope();
+        }
+    };
+    auto closeExprArrowsAt = [&](size_t depth) {
+        while (!expr_arrow_cont_depth.empty() && expr_arrow_cont_depth.back() == depth) {
+            expr_arrow_cont_depth.pop_back();
+            popScope();
+        }
+    };
 
     auto prevSignificant = [&]() -> char {
         size_t pk = out.size();
@@ -636,6 +687,7 @@ static std::string rewriteIdents(const std::string &src,
                     popScope();
                 }
             }
+            closeExprArrowsDeeperThan(cont.size());
             out.push_back(src[i++]);
             continue;
         }
@@ -646,6 +698,7 @@ static std::string rewriteIdents(const std::string &src,
         }
         if (c == ']') {
             if (!cont.empty() && cont.back() == Cont::Bracket) cont.pop_back();
+            closeExprArrowsDeeperThan(cont.size());
             out.push_back(src[i++]);
             continue;
         }
@@ -760,14 +813,19 @@ static std::string rewriteIdents(const std::string &src,
                 if (k < src.size() && src[k] == '{') {
                     next_brace_is_fn_body = true;
                 } else if (k + 1 < src.size() && src[k] == '=' && src[k + 1] == '>') {
-                    // Arrow expression body: keep param scope until approximate end.
+                    // Arrow: keep param scope; `=>` handler records expr-body end or sets FnBody.
                     next_brace_is_fn_body = false;
-                    // If `=> {` then brace handler; if `=> expr` pop at `;` loosely below.
                 } else {
                     popScope();
                 }
             }
+            closeExprArrowsDeeperThan(cont.size());
             continue;
+        }
+
+        // End expression-arrow bodies at this container depth (array elements, args, sequence).
+        if (c == ',' || c == ';') {
+            closeExprArrowsAt(cont.size());
         }
 
         // Parameter / destructuring-default separators end a default initializer (not commas inside nested `(…)` of the default expr).
@@ -793,15 +851,17 @@ static std::string rewriteIdents(const std::string &src,
             continue;
         }
 
-        // Arrow `=>` with block body after a non-paren single-param: `value => ...`
+        // Arrow `=>`: block body → FnBody; expression body → track end so param scope does not leak.
         if (c == '=' && i + 1 < src.size() && src[i + 1] == '>') {
             out.push_back(src[i++]);
             out.push_back(src[i++]);
             size_t k = i;
             skipSpacesSrc(k);
             if (k < src.size() && src[k] == '{') {
-                // Single-param arrow: binding was already added when we saw the ident before `=>`.
                 next_brace_is_fn_body = true;
+            } else {
+                // Expression body: param scope stays until `,`/`;` at this cont depth or an outer close.
+                expr_arrow_cont_depth.push_back(cont.size());
             }
             continue;
         }
@@ -870,7 +930,14 @@ static std::string rewriteIdents(const std::string &src,
                         out.push_back(src[i++]);
                         continue;
                     }
-                    if (ch == '=' && depth == 0) {
+// Declarator initializer (depth 0) or binding-pattern default (depth > 0): rewrite imports in the expression.
+                    if (ch == '=' &&
+                        !(i + 1 < src.size() && (src[i + 1] == '>' || src[i + 1] == '=')) &&
+                        !(i > 0 && (src[i - 1] == '=' || src[i - 1] == '!' || src[i - 1] == '<' ||
+                                    src[i - 1] == '>' || src[i - 1] == '+' || src[i - 1] == '-' ||
+                                    src[i - 1] == '*' || src[i - 1] == '/' || src[i - 1] == '%' ||
+                                    src[i - 1] == '&' || src[i - 1] == '|' || src[i - 1] == '^'))) {
+                        const bool pattern_default = depth > 0;
                         out.push_back(src[i++]);
                         size_t is = i;
                         int d = 0;
@@ -895,7 +962,17 @@ static std::string rewriteIdents(const std::string &src,
                                 continue;
                             }
                             if (ic == '{' || ic == '[' || ic == '(') { ++d; ++i; continue; }
-                            if (ic == '}' || ic == ']' || ic == ')') { if (d > 0) --d; ++i; continue; }
+                            if (ic == '}' || ic == ']' || ic == ')') {
+                                if (d == 0) {
+                                    // Pattern default ends before the closing `}` / `]` of the pattern.
+                                    if (pattern_default) break;
+                                    ++i;
+                                    continue;
+                                }
+                                --d;
+                                ++i;
+                                continue;
+                            }
                             if (d == 0 && (ic == ',' || ic == ';')) break;
                             ++i;
                         }
@@ -1012,8 +1089,6 @@ static std::string rewriteIdents(const std::string &src,
             i = j;
             continue;
         }
-
-        // Expression-body arrows keep param scopes open after `=>` without `{`; this rewriter does not pop those scopes at depth-0 `;` / `,` / `)` / `}`, so identifier replacement can miss or over-apply inside expression-arrow bodies.
 
         out.push_back(c);
         ++i;
@@ -1536,10 +1611,12 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             if (std::regex_search(body, m, import_named) && m.position() == 0) {
                 std::string specs = m[1].str();
                 size_t pos = 0;
+                bool any_named = false;
                 while (pos < specs.size()) {
                     size_t comma = specs.find(',', pos);
                     std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
                     if (!part.empty()) {
+                        any_named = true;
                         auto as_pos = part.find(" as ");
                         if (as_pos != std::string::npos)
                             imports.push_back({trim(part.substr(as_pos + 4)), trim(part.substr(0, as_pos)), m[3].str()});
@@ -1549,6 +1626,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                     if (comma == std::string::npos) break;
                     pos = comma + 1;
                 }
+                // `import {} from 'dep'` still evaluates the dependency (side effects / missing module).
+                if (!any_named)
+                    imports.push_back({"", "", m[3].str()});
                 body = body.substr(m.length());
                 changed = true;
                 continue;

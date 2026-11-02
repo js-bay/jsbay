@@ -112,8 +112,7 @@ static void release(JsbayHermesContextOpaque *c, jsi::Value *v) {
         }
     }
     if (!gone) return;
-    // Settlement records are keyed by JS object identity (see hermes_object_identity),
-    // not by this wrapper address — cleanup is via hermes_promise_forget / context_free.
+    // Settlement records are keyed by JS object identity (see hermes_object_identity), not by this wrapper address — cleanup is via hermes_promise_forget / context_free.
 }
 
 static char *dupCString(const std::string &s) {
@@ -723,10 +722,11 @@ static int32_t hermesToInt32Number(double d) {
 }
 
 // ECMAScript ToNumber into *out. On failure sets pending throw and returns false.
+// Do not call the Number constructor: Hermes Number(bigint) may coerce instead of throwing, and objects whose ToPrimitive is a BigInt must also TypeError like QuickJS/JSC.
 static bool hermesToNumber(JsbayHermesContext *c, HermesValue v, double *out) {
     if (!out) return false;
     if (!v) {
-        *out = std::numeric_limits<double>::quiet_NaN(); // Number(undefined)
+        *out = std::numeric_limits<double>::quiet_NaN(); // ToNumber(undefined)
         return true;
     }
     jsi::Value &val = *asVal(v);
@@ -734,14 +734,31 @@ static bool hermesToNumber(JsbayHermesContext *c, HermesValue v, double *out) {
         *out = val.getNumber();
         return true;
     }
+    if (val.isBool()) {
+        *out = val.getBool() ? 1.0 : 0.0;
+        return true;
+    }
+    if (val.isNull()) {
+        *out = 0.0;
+        return true;
+    }
+    if (val.isUndefined()) {
+        *out = std::numeric_limits<double>::quiet_NaN();
+        return true;
+    }
     if (!c || !c->rt) return false;
+    // Remaining types (string / bigint / symbol / object): unary `+` is ToNumber, so BigInt and ToPrimitive→BigInt throw TypeError like QuickJS/JSC (unlike Hermes Number(bigint)).
     try {
-        auto Number = c->rt->global().getPropertyAsFunction(*c->rt, "Number");
-        jsi::Value n = Number.call(*c->rt, val);
+        constexpr const char *kSlot = "__jsbay_tonumber_arg";
+        c->rt->global().setProperty(*c->rt, kSlot, val);
+        jsi::Value n = c->rt->evaluateJavaScript(
+            std::make_shared<jsi::StringBuffer>("(+__jsbay_tonumber_arg)"), "<jsbay-tonumber>");
+        c->rt->global().setProperty(*c->rt, kSlot, jsi::Value::undefined());
         if (!n.isNumber()) return false;
         *out = n.getNumber();
         return true;
     } catch (const jsi::JSError &e) {
+        try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw.clear();
         try {
             c->pending_throw_value = std::make_unique<jsi::Value>(*c->rt, e.value());
@@ -751,10 +768,12 @@ static bool hermesToNumber(JsbayHermesContext *c, HermesValue v, double *out) {
         }
         return false;
     } catch (const std::exception &e) {
+        try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw_value.reset();
         c->pending_throw = e.what();
         return false;
     } catch (...) {
+        try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw_value.reset();
         c->pending_throw = "TypeError";
         return false;

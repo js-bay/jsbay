@@ -422,23 +422,26 @@ pub const Transport = struct {
     }
 
     pub fn broadcastText(self: *Transport, message: []const u8) void {
-        // Snapshot retained leases; socket I/O happens only on session writers.
-        var snapshot: std.ArrayList(*Session) = .empty;
-        defer snapshot.deinit(self.allocator);
-        // `append` can fail after earlier leases were retained.  Keep their release paired with the temporary snapshot on every return path.
-        defer for (snapshot.items) |sess| sess.release();
-        {
-            self.sessions_mu.lock();
-            defer self.sessions_mu.unlock();
-            for (self.sessions.items) |sess| {
-                sess.retain();
-                snapshot.append(self.allocator, sess) catch {
-                    sess.release();
-                    return;
-                };
-            }
+        // Allocate the lease snapshot before retaining anything. An append-while-retaining
+        // loop can fail mid-growth after some sessions were already retained; pairing those
+        // releases with a growable ArrayList is easy to get wrong under concurrent allocator
+        // pressure. Exact alloc-or-fail keeps OOM from observing any broadcast lease.
+        self.sessions_mu.lock();
+        const n = self.sessions.items.len;
+        const snapshot = self.allocator.alloc(*Session, n) catch {
+            self.sessions_mu.unlock();
+            return;
+        };
+        for (self.sessions.items, 0..) |sess, i| {
+            sess.retain();
+            snapshot[i] = sess;
         }
-        for (snapshot.items) |sess| {
+        self.sessions_mu.unlock();
+        defer self.allocator.free(snapshot);
+        defer for (snapshot) |sess| sess.release();
+
+        // Socket I/O happens only on session writers.
+        for (snapshot) |sess| {
             _ = sess.enqueue(.text, message, true);
         }
     }
