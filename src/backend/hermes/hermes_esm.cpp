@@ -656,7 +656,7 @@ static std::string rewriteIdents(const std::string &src,
                 while (pk2 > 0 && isIdent(out[pk2 - 1])) --pk2;
                 while (pk2 > 0 && std::isspace(static_cast<unsigned char>(out[pk2 - 1]))) --pk2;
             }
-            // Parenthesized arrow params also establish a ParamList: look ahead for `)=>`.
+            // Parenthesized arrow params establish a ParamList too: look ahead past the matching `)` for `=>` so bindings register before import rewrite.
             auto parenFollowedByArrow = [&](size_t open_idx) -> bool {
                 size_t p = open_idx + 1;
                 int depth = 1;
@@ -700,8 +700,8 @@ static std::string rewriteIdents(const std::string &src,
                         }
                         continue;
                     }
-                    if (ch == '(' || ch == '{' || ch == '[') { ++depth; ++p; continue; }
-                    if (ch == ')' || ch == '}' || ch == ']') {
+                    if (ch == '(') { ++depth; ++p; continue; }
+                    if (ch == ')') {
                         --depth; ++p;
                         if (depth == 0) break;
                         continue;
@@ -1568,60 +1568,55 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     };
     eatImports();
 
-    // Re-export dependency loads go into the static prelude (native ESM order: deps before body).
+    // Re-export dependency loads go into the static prelude (native ESM: all static deps before module body).
+    // Process named and star re-exports left-to-right so prelude require order matches source order.
     std::vector<std::string> reexport_prelude;
     std::vector<std::string> star_reexport_nss;
     std::vector<std::string> post_epilogue;
-
-    // export { a, b as c } from 'mod';
     {
-        static const std::regex re(R"(export\s*\{([^}]*)\}\s*from\s*(['\"])([^'\"]+)\2\s*;?)");
-        std::smatch m;
+        static const std::regex re_named(R"(export\s*\{([^}]*)\}\s*from\s*(['"])([^'"]+)\2\s*;?)");
+        static const std::regex re_star(R"(export\s*\*\s*from\s*(['"])([^'"]+)\1\s*;?)");
+        static int reexport_ns = 0;
         for (;;) {
             std::string blanked = blankNonCode(body);
-            if (!std::regex_search(blanked, m, re)) break;
-            // Specs / module from the blanked match spans on the live body (same offsets).
-            std::string specs = body.substr(m.position(1), m.length(1));
-            std::string mod = body.substr(m.position(3), m.length(3));
-            static int reexport_ns = 0;
-            std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
-            reexport_prelude.push_back("var " + ns + " = require(\"" + mod + "\");");
-            std::string repl;
-            size_t pos = 0;
-            while (pos < specs.size()) {
-                size_t comma = specs.find(',', pos);
-                std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
-                if (!part.empty()) {
-                    std::string imported, exported;
-                    auto as_pos = part.find(" as ");
-                    if (as_pos != std::string::npos) {
-                        imported = trim(part.substr(0, as_pos));
-                        exported = trim(part.substr(as_pos + 4));
-                    } else {
-                        imported = exported = part;
+            std::smatch m_named, m_star;
+            bool has_named = std::regex_search(blanked, m_named, re_named);
+            bool has_star = std::regex_search(blanked, m_star, re_star);
+            if (!has_named && !has_star) break;
+            const bool take_star = has_star && (!has_named || m_star.position() < m_named.position());
+            if (take_star) {
+                std::string mod = body.substr(m_star.position(2), m_star.length(2));
+                std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
+                reexport_prelude.push_back("var " + ns + " = require(\"" + mod + "\");");
+                star_reexport_nss.push_back(ns);
+                body.replace(m_star.position(), m_star.length(), "");
+            } else {
+                // Specs / module from the blanked match spans on the live body (same offsets).
+                std::string specs = body.substr(m_named.position(1), m_named.length(1));
+                std::string mod = body.substr(m_named.position(3), m_named.length(3));
+                std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
+                reexport_prelude.push_back("var " + ns + " = require(\"" + mod + "\");");
+                std::string repl;
+                size_t pos = 0;
+                while (pos < specs.size()) {
+                    size_t comma = specs.find(',', pos);
+                    std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+                    if (!part.empty()) {
+                        std::string imported, exported;
+                        auto as_pos = part.find(" as ");
+                        if (as_pos != std::string::npos) {
+                            imported = trim(part.substr(0, as_pos));
+                            exported = trim(part.substr(as_pos + 4));
+                        } else {
+                            imported = exported = part;
+                        }
+                        repl += exportLiveGetter(exported, ns + "." + imported);
                     }
-                    repl += exportLiveGetter(exported, ns + "." + imported);
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
                 }
-                if (comma == std::string::npos) break;
-                pos = comma + 1;
+                body.replace(m_named.position(), m_named.length(), repl);
             }
-            body.replace(m.position(), m.length(), repl);
-        }
-    }
-
-    // export * from 'mod';: collect deps for prelude; emit ambiguity-aware bindings after explicit exports.
-    {
-        static const std::regex re(R"(export\s*\*\s*from\s*(['\"])([^'\"]+)\1\s*;?)");
-        static int star_ns = 0;
-        for (;;) {
-            std::string blanked = blankNonCode(body);
-            std::smatch m;
-            if (!std::regex_search(blanked, m, re)) break;
-            std::string mod = body.substr(m.position(2), m.length(2));
-            std::string ns = "__jsbay_star" + std::to_string(star_ns++);
-            reexport_prelude.push_back("var " + ns + " = require(\"" + mod + "\");");
-            star_reexport_nss.push_back(ns);
-            body.replace(m.position(), m.length(), "");
         }
     }
 
