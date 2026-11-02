@@ -298,9 +298,21 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
       if (detachedSet && detachedSet.has(src))
         throw new TypeError('Cannot perform ArrayBuffer.prototype.transfer on a detached ArrayBuffer');
       var len = src.byteLength;
-      var n = (newByteLength === undefined || newByteLength === null) ? len : Number(newByteLength);
-      if (!Number.isFinite(n) || n < 0) throw new RangeError('Invalid array buffer length');
-      n = Math.floor(n);
+      // Spec: undefined keeps source length; otherwise ToIndex (null/NaN/+0/-0 -> 0).
+      var n;
+      if (newByteLength === undefined) {
+        n = len;
+      } else {
+        n = Number(newByteLength);
+        if (n !== n || n === 0) {
+          n = 0;
+        } else {
+          if (!Number.isFinite(n)) throw new RangeError('Invalid array buffer length');
+          n = Math.trunc(n);
+          if (n < 0 || n > Number.MAX_SAFE_INTEGER)
+            throw new RangeError('Invalid array buffer length');
+        }
+      }
       var dst = new ArrayBuffer(n);
       var copy = Math.min(len, n);
       if (copy > 0) new Uint8Array(dst, 0, copy).set(new Uint8Array(src, 0, copy));
@@ -1925,65 +1937,26 @@ extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj
         }
 
         auto Object = rt.global().getPropertyAsFunction(rt, "Object");
-        auto getOwnDesc = Object.getPropertyAsFunction(rt, "getOwnPropertyDescriptor");
         auto defineProp = Object.getPropertyAsFunction(rt, "defineProperty");
-        auto delProp = rt.global().getPropertyAsObject(rt, "Reflect").getPropertyAsFunction(rt, "deleteProperty");
-        auto ArrayProto = rt.global()
-            .getPropertyAsFunction(rt, "Array")
-            .getPropertyAsObject(rt, "prototype");
 
-        struct Saved { std::string key; jsi::Value desc; };
-        std::vector<Saved> saved;
-        for (int i = 0; i < 64; i++) {
-            std::string ks = std::to_string(i);
-            jsi::Value desc = getOwnDesc.call(rt, ArrayProto, ks);
-            if (!desc.isObject()) continue;
-            jsi::Object d = desc.getObject(rt);
-            if (!d.getProperty(rt, "get").isObject() && !d.getProperty(rt, "set").isObject()) continue;
-            saved.push_back(Saved{ks, jsi::Value(rt, desc)});
-            delProp.call(rt, ArrayProto, ks);
-        }
-
-        jsi::Value keysVal;
-        try {
-            keysVal = c->pristine_object_keys->call(rt, target);
-        } catch (...) {
-            for (auto &s : saved) defineProp.call(rt, ArrayProto, s.key, s.desc);
-            throw;
-        }
-        for (auto &s : saved) defineProp.call(rt, ArrayProto, s.key, s.desc);
-
-        // Re-copy via defineProperty into a fresh array so even if Object.keys used [[Set]],
-        // the returned array was built while setters were masked; still rebuild for safety.
+        // Enumerate without mutating Array.prototype — Proxy ownKeys traps must observe
+        // unmodified global state, and trap mutations must not be overwritten by restore.
+        jsi::Value keysVal = c->pristine_object_keys->call(rt, target);
         if (!keysVal.isObject()) return hopOk(c, jsi::Value(jsi::Array(rt, 0)));
         jsi::Array names = keysVal.getObject(rt).asArray(rt);
         size_t n = names.size(rt);
-        std::vector<jsi::Value> elems;
-        elems.reserve(n);
-        for (size_t i = 0; i < n; i++) elems.emplace_back(names.getValueAtIndex(rt, i));
 
-        // Mask again while defining the result array elements.
-        saved.clear();
-        for (int i = 0; i < 64; i++) {
-            std::string ks = std::to_string(i);
-            jsi::Value desc = getOwnDesc.call(rt, ArrayProto, ks);
-            if (!desc.isObject()) continue;
-            jsi::Object d = desc.getObject(rt);
-            if (!d.getProperty(rt, "get").isObject() && !d.getProperty(rt, "set").isObject()) continue;
-            saved.push_back(Saved{ks, jsi::Value(rt, desc)});
-            delProp.call(rt, ArrayProto, ks);
-        }
+        // Rebuild via CreateDataProperty so the returned array never runs Array.prototype setters.
         jsi::Array result = jsi::Array(rt, 0);
-        for (size_t i = 0; i < elems.size(); i++) {
+        for (size_t i = 0; i < n; i++) {
             jsi::Object desc(rt);
-            desc.setProperty(rt, "value", elems[i]);
+            desc.setProperty(rt, "value", names.getValueAtIndex(rt, i));
             desc.setProperty(rt, "writable", true);
             desc.setProperty(rt, "enumerable", true);
             desc.setProperty(rt, "configurable", true);
             defineProp.call(rt, result, (double)i, desc);
         }
-        result.setProperty(rt, "length", (double)elems.size());
-        for (auto &s : saved) defineProp.call(rt, ArrayProto, s.key, s.desc);
+        result.setProperty(rt, "length", (double)n);
         return hopOk(c, jsi::Value(std::move(result)));
     } catch (const jsi::JSError &e) {
         return hopFail(c, jsi::Value(*c->rt, e.value()));

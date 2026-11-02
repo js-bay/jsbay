@@ -34,6 +34,8 @@ fn dupeAndFree(src_opt: ?[*:0]u8) ?[]const u8 {
 pub const CompileOut = struct {
     bytes: ?[]u8 = null,
     err: ?[]const u8 = null,
+    /// true if `err` is heap-allocated (c_allocator); false for string literals.
+    err_is_heap: bool = false,
 };
 
 pub fn hermesCompileBytecode(source: []const u8, filename: []const u8) CompileOut {
@@ -42,11 +44,12 @@ pub fn hermesCompileBytecode(source: []const u8, filename: []const u8) CompileOu
     const file_ptr: [*]const u8 = if (filename.len > 0) filename.ptr else @as([*]const u8, @ptrCast("<eval>"));
     const r = hermes_compile_bytecode(src_ptr, source.len, file_ptr, if (filename.len > 0) filename.len else 6);
     if (r.err != null) {
-        const err = dupeAndFree(r.err) orelse "hermesc failed";
+        const duped = dupeAndFree(r.err);
+        const err = duped orelse "hermesc failed";
         if (r.bytes) |b| free(@ptrCast(b));
-        return .{ .bytes = null, .err = err };
+        return .{ .bytes = null, .err = err, .err_is_heap = duped != null };
     }
-    const ptr = r.bytes orelse return .{ .err = "no bytes" };
+    const ptr = r.bytes orelse return .{ .err = "no bytes", .err_is_heap = false };
     // Transfer malloc ownership into a Zig slice (caller frees via c_allocator / freeBytecode).
     const slice = ptr[0..r.len];
     return .{ .bytes = slice };
@@ -56,9 +59,10 @@ pub fn hermesRunBytecode(ctx: Context, bytes: []const u8) types.EvalResult {
     var decode_failed: c_int = 0;
     const r = hermes_run_bytecode_ex(ctx, if (bytes.len > 0) bytes.ptr else @as([*]const u8, @ptrFromInt(1)), bytes.len, &decode_failed);
     if (r.err != null) {
-        const err = dupeAndFree(r.err) orelse "bytecode run failed";
+        const duped = dupeAndFree(r.err);
+        const err = duped orelse "bytecode run failed";
         if (r.result) |p| free(@ptrCast(p));
-        return .{ .result = null, .err = err, .err_is_heap = true, .decode_failed = decode_failed != 0 };
+        return .{ .result = null, .err = err, .err_is_heap = duped != null, .decode_failed = decode_failed != 0 };
     }
     return .{ .result = dupeAndFree(r.result), .err = null, .decode_failed = false };
 }

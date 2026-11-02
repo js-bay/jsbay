@@ -90,7 +90,7 @@ pub fn compile(
             }
             const out = @import("../backend/hermes.zig").hermesCompileBytecode(source, filename);
             if (out.bytes) |b| return .{ .bytes = b, .err = null, .err_is_heap = false };
-            return .{ .bytes = null, .err = out.err, .err_is_heap = out.err != null };
+            return .{ .bytes = null, .err = out.err, .err_is_heap = out.err_is_heap };
         },
     }
 }

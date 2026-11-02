@@ -1,6 +1,4 @@
-//! setTimeout / setInterval / clearTimeout / clearInterval + queueMicrotask polyfill for Hermes.
-//! Native failures return `{__jsbay_timer_err}` and a JS wrapper throws — avoids throwing
-//! `jsi::JSError` across the hermes_bridge.o / libjsi.so exception ABI boundary (ABRT).
+//! setTimeout / setInterval / clearTimeout / clearInterval + queueMicrotask polyfill for Hermes. Native failures return `{__jsbay_timer_err}` and a JS wrapper throws — avoids throwing `jsi::JSError` across the hermes_bridge.o / libjsi.so exception ABI boundary (ABRT).
 
 const std = @import("std");
 const async_stack = @import("../../inspector/async_stack.zig");

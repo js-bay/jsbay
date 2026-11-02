@@ -1487,7 +1487,7 @@ extern "C" EscargotValue escargot_new_error(EscargotContext *c, int kind, const 
     return retain(c, er.result);
 }
 
-// ---- Round 3: construct / has / delete / keys / instanceof / promise / external / weak ----
+// ---- construct / has / delete / keys / instanceof / promise / external / weak ----
 
 static EscargotOpResult opFail(EscargotContextOpaque *c, ValueRef *exc) {
     EscargotOpResult out{nullptr, nullptr};

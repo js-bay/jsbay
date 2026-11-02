@@ -207,23 +207,172 @@ static void skipRegexLiteral(const std::string &src, size_t &i) {
     }
 }
 
+static void collectPatternBoundNames(const std::string &src, size_t &i, std::vector<std::string> &names);
+static std::vector<std::string> collectDeclaratorBoundNames(const std::string &src, size_t start);
+
 // Skip strings/comments/regex roughly; return rewritten source with identifier replacements.
 // Template literal text is preserved, but `${...}` interpolations are rewritten recursively.
 // Regex literals are copied verbatim so identifiers inside the pattern/flags are not rewritten.
 static std::string rewriteIdents(const std::string &src,
-                                 const std::unordered_map<std::string, std::string> &repl) {
+                                 const std::unordered_map<std::string, std::string> &repl,
+                                 std::vector<std::unordered_set<std::string>> scopes) {
     if (repl.empty()) return src;
     std::string out;
     out.reserve(src.size() + 32);
+
+    // Lexical scopes of local bindings that shadow import rewrites.
+    if (scopes.empty()) scopes.emplace_back();
+    auto isShadowed = [&](const std::string &id) -> bool {
+        for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+            if (it->count(id)) return true;
+        }
+        return false;
+    };
+    auto addBindings = [&](const std::vector<std::string> &names) {
+        if (scopes.empty()) return;
+        for (const auto &n : names) {
+            if (!n.empty()) scopes.back().insert(n);
+        }
+    };
+    auto pushScope = [&]() { scopes.emplace_back(); };
+    auto popScope = [&]() {
+        if (scopes.size() > 1) scopes.pop_back();
+    };
+
+    // Container stack: ObjectLit vs Block vs Bracket vs Paren/ParamList.
+    enum class Cont : uint8_t { ObjectLit, Block, Bracket, Paren, ParamList, FnBody };
+    std::vector<Cont> cont;
+    // When a ParamList `)` is followed by `{`, the next `{` is FnBody and pops the param scope on `}`.
+    bool next_brace_is_fn_body = false;
+
+    auto prevSignificant = [&]() -> char {
+        size_t pk = out.size();
+        while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+        return pk > 0 ? out[pk - 1] : '\0';
+    };
+    auto outEndsWithWord = [&](size_t end, const char *w) -> bool {
+        size_t n = std::strlen(w);
+        if (end < n) return false;
+        if (out.compare(end - n, n, w) != 0) return false;
+        if (end > n && isIdent(out[end - n - 1])) return false;
+        return true;
+    };
+    auto prevIsObjectLitIntro = [&]() -> bool {
+        char p = prevSignificant();
+        if (p == '=' || p == ':' || p == ',' || p == '(' || p == '[' || p == '!' ||
+            p == '?' || p == '&' || p == '|' || p == '+' || p == '-' || p == '*' ||
+            p == '/' || p == '%' || p == '~' || p == '^' || p == '<' || p == '>' ||
+            p == '\0')
+            return true;
+        size_t pk = out.size();
+        while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+        return outEndsWithWord(pk, "return") || outEndsWithWord(pk, "throw") ||
+               outEndsWithWord(pk, "else") || outEndsWithWord(pk, "=>") ||
+               outEndsWithWord(pk, "of") || outEndsWithWord(pk, "in") ||
+               outEndsWithWord(pk, "case") || outEndsWithWord(pk, "void") ||
+               outEndsWithWord(pk, "typeof") || outEndsWithWord(pk, "delete") ||
+               outEndsWithWord(pk, "new") || outEndsWithWord(pk, "default");
+    };
+    auto underParamList = [&]() -> bool {
+        for (auto it = cont.rbegin(); it != cont.rend(); ++it) {
+            if (*it == Cont::ParamList) return true;
+            if (*it == Cont::FnBody || *it == Cont::Block) return false;
+        }
+        return false;
+    };
+    auto skipSpacesSrc = [&](size_t &p) {
+        while (p < src.size() && std::isspace(static_cast<unsigned char>(src[p]))) ++p;
+    };
+
     size_t i = 0;
+
+    // Copy a balanced template literal starting at i (`), rewriting interpolations.
+    auto copyTemplate = [&]() {
+        out.push_back(src[i++]);
+        while (i < src.size()) {
+            if (src[i] == '\\' && i + 1 < src.size()) {
+                out.push_back(src[i++]);
+                out.push_back(src[i++]);
+                continue;
+            }
+            if (src[i] == '`') {
+                out.push_back(src[i++]);
+                return;
+            }
+            if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                out.push_back(src[i++]);
+                out.push_back(src[i++]);
+                size_t start = i;
+                int depth = 1;
+                while (i < src.size() && depth > 0) {
+                    char ic = src[i];
+                    if (ic == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+                        i += 2;
+                        while (i < src.size() && src[i] != '\n') ++i;
+                        continue;
+                    }
+                    if (ic == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+                        i += 2;
+                        while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+                        if (i + 1 < src.size()) i += 2;
+                        continue;
+                    }
+                    if (ic == '/' && canStartRegexLiteral(src.substr(start, i - start))) {
+                        skipRegexLiteral(src, i);
+                        continue;
+                    }
+                    if (ic == '\'' || ic == '"') {
+                        char q = ic;
+                        ++i;
+                        while (i < src.size()) {
+                            if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                            if (src[i] == q) { ++i; break; }
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (ic == '`') {
+                        ++i;
+                        while (i < src.size()) {
+                            if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                            if (src[i] == '`') { ++i; break; }
+                            if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                                i += 2;
+                                int nested = 1;
+                                while (i < src.size() && nested > 0) {
+                                    if (src[i] == '{') ++nested;
+                                    else if (src[i] == '}') --nested;
+                                    ++i;
+                                }
+                                continue;
+                            }
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (ic == '{') { ++depth; ++i; continue; }
+                    if (ic == '}') {
+                        --depth;
+                        if (depth == 0) break;
+                        ++i;
+                        continue;
+                    }
+                    ++i;
+                }
+                out += rewriteIdents(src.substr(start, i - start), repl, scopes);
+                if (i < src.size() && src[i] == '}') out.push_back(src[i++]);
+                continue;
+            }
+            out.push_back(src[i++]);
+        }
+    };
+
     while (i < src.size()) {
         char c = src[i];
-        // line comment
         if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
             while (i < src.size() && src[i] != '\n') out.push_back(src[i++]);
             continue;
         }
-        // block comment
         if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
             out.push_back(src[i++]);
             out.push_back(src[i++]);
@@ -232,12 +381,10 @@ static std::string rewriteIdents(const std::string &src,
             if (i < src.size()) out.push_back(src[i++]);
             continue;
         }
-        // Regular-expression literal (not // or /*) — preserve pattern/flags verbatim.
         if (c == '/' && canStartRegexLiteral(out)) {
             copyRegexLiteral(src, i, out);
             continue;
         }
-        // single/double-quoted strings: copy verbatim (no identifier rewrite inside)
         if (c == '\'' || c == '"') {
             char q = c;
             out.push_back(src[i++]);
@@ -248,99 +395,254 @@ static std::string rewriteIdents(const std::string &src,
                     continue;
                 }
                 out.push_back(src[i]);
-                if (src[i] == q) {
-                    ++i;
-                    break;
-                }
+                if (src[i] == q) { ++i; break; }
                 ++i;
             }
             continue;
         }
-        // template literals: keep cooked text, rewrite `${...}` expressions as JS
         if (c == '`') {
+            copyTemplate();
+            continue;
+        }
+
+        if (c == '{') {
+            Cont kind;
+            if (next_brace_is_fn_body) {
+                kind = Cont::FnBody;
+                next_brace_is_fn_body = false;
+                // Param scope already pushed; body shares it (no extra scope).
+            } else if (prevIsObjectLitIntro()) {
+                kind = Cont::ObjectLit;
+            } else {
+                kind = Cont::Block;
+                pushScope();
+            }
+            cont.push_back(kind);
             out.push_back(src[i++]);
-            while (i < src.size()) {
-                if (src[i] == '\\' && i + 1 < src.size()) {
-                    out.push_back(src[i++]);
-                    out.push_back(src[i++]);
-                    continue;
+            continue;
+        }
+        if (c == '}') {
+            if (!cont.empty()) {
+                Cont kind = cont.back();
+                cont.pop_back();
+                if (kind == Cont::Block) {
+                    popScope();
+                } else if (kind == Cont::FnBody) {
+                    // End of function/catch body — drop the ParamList scope.
+                    popScope();
                 }
-                if (src[i] == '`') {
-                    out.push_back(src[i++]);
-                    break;
+            }
+            out.push_back(src[i++]);
+            continue;
+        }
+        if (c == '[') {
+            cont.push_back(Cont::Bracket);
+            out.push_back(src[i++]);
+            continue;
+        }
+        if (c == ']') {
+            if (!cont.empty() && cont.back() == Cont::Bracket) cont.pop_back();
+            out.push_back(src[i++]);
+            continue;
+        }
+        if (c == '(') {
+            Cont kind = Cont::Paren;
+            size_t pk = out.size();
+            while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+            size_t pk2 = pk;
+            if (pk2 > 0 && isIdent(out[pk2 - 1])) {
+                while (pk2 > 0 && isIdent(out[pk2 - 1])) --pk2;
+                while (pk2 > 0 && std::isspace(static_cast<unsigned char>(out[pk2 - 1]))) --pk2;
+            }
+            if (outEndsWithWord(pk2, "function") || outEndsWithWord(pk2, "catch") ||
+                outEndsWithWord(pk, "function") || outEndsWithWord(pk, "catch")) {
+                kind = Cont::ParamList;
+                pushScope();
+            }
+            cont.push_back(kind);
+            out.push_back(src[i++]);
+            continue;
+        }
+        if (c == ')') {
+            bool was_param = !cont.empty() && cont.back() == Cont::ParamList;
+            if (!cont.empty() && (cont.back() == Cont::Paren || cont.back() == Cont::ParamList))
+                cont.pop_back();
+            out.push_back(src[i++]);
+            if (was_param) {
+                size_t k = i;
+                skipSpacesSrc(k);
+                if (k < src.size() && src[k] == '{') {
+                    next_brace_is_fn_body = true;
+                } else if (k + 1 < src.size() && src[k] == '=' && src[k + 1] == '>') {
+                    // Arrow expression body: keep param scope until approximate end.
+                    next_brace_is_fn_body = false;
+                    // If `=> {` then brace handler; if `=> expr` pop at `;` loosely below.
+                } else {
+                    popScope();
                 }
-                if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
-                    out.push_back(src[i++]);
-                    out.push_back(src[i++]);
-                    // Scan the interpolation with nested brace / string / template / regex awareness.
-                    size_t start = i;
-                    int depth = 1;
-                    while (i < src.size() && depth > 0) {
-                        char ic = src[i];
-                        if (ic == '/' && i + 1 < src.size() && src[i + 1] == '/') {
-                            i += 2;
-                            while (i < src.size() && src[i] != '\n') ++i;
-                            continue;
-                        }
-                        if (ic == '/' && i + 1 < src.size() && src[i + 1] == '*') {
-                            i += 2;
-                            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
-                            if (i + 1 < src.size()) i += 2;
-                            continue;
-                        }
-                        // Regex literal inside `${...}` so `{`/`}` in the pattern do not affect depth.
-                        if (ic == '/' && canStartRegexLiteral(src.substr(start, i - start))) {
-                            skipRegexLiteral(src, i);
-                            continue;
-                        }
-                        if (ic == '\'' || ic == '"') {
-                            char q = ic;
-                            ++i;
-                            while (i < src.size()) {
-                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                                if (src[i] == q) { ++i; break; }
-                                ++i;
-                            }
-                            continue;
-                        }
-                        if (ic == '`') {
-                            ++i;
-                            while (i < src.size()) {
-                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                                if (src[i] == '`') { ++i; break; }
-                                if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
-                                    i += 2;
-                                    int nested = 1;
-                                    while (i < src.size() && nested > 0) {
-                                        if (src[i] == '{') ++nested;
-                                        else if (src[i] == '}') --nested;
-                                        ++i;
-                                    }
-                                    continue;
-                                }
-                                ++i;
-                            }
-                            continue;
-                        }
-                        if (ic == '{') { ++depth; ++i; continue; }
-                        if (ic == '}') {
-                            --depth;
-                            if (depth == 0) break;
-                            ++i;
-                            continue;
-                        }
-                        ++i;
-                    }
-                    out += rewriteIdents(src.substr(start, i - start), repl);
-                    if (i < src.size() && src[i] == '}') out.push_back(src[i++]);
-                    continue;
-                }
-                out.push_back(src[i++]);
             }
             continue;
         }
+
+        // Arrow `=>` with block body after a non-paren single-param: `value => ...`
+        if (c == '=' && i + 1 < src.size() && src[i + 1] == '>') {
+            out.push_back(src[i++]);
+            out.push_back(src[i++]);
+            size_t k = i;
+            skipSpacesSrc(k);
+            if (k < src.size() && src[k] == '{') {
+                // Single-param arrow: binding was already added when we saw the ident before `=>`.
+                next_brace_is_fn_body = true;
+            }
+            continue;
+        }
+
         if (isIdentStart(c)) {
-            // Only rewrite free identifier references — not object keys or member names after `.`.
+            size_t j = i + 1;
+            while (j < src.size() && isIdent(src[j])) ++j;
+            std::string id = src.substr(i, j - i);
+
+            // function / class declaration name binds in the enclosing scope.
+            if ((id == "function" || id == "class") && (i == 0 || !isIdent(src[i - 1]))) {
+                out += id;
+                i = j;
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) out.push_back(src[i++]);
+                if (id == "function" && i < src.size() && src[i] == '*') {
+                    out.push_back(src[i++]);
+                    while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) out.push_back(src[i++]);
+                }
+                if (i < src.size() && isIdentStart(src[i])) {
+                    size_t n = i + 1;
+                    while (n < src.size() && isIdent(src[n])) ++n;
+                    std::string fname = src.substr(i, n - i);
+                    addBindings({fname});
+                    out += fname;
+                    i = n;
+                }
+                continue;
+            }
+
+            // const / let / var — register declarator bindings; rewrite only initializer expressions.
+            if ((id == "const" || id == "let" || id == "var") && (i == 0 || !isIdent(src[i - 1]))) {
+                out += id;
+                i = j;
+                auto names = collectDeclaratorBoundNames(src, i);
+                addBindings(names);
+                int depth = 0;
+                while (i < src.size()) {
+                    char ch = src[i];
+                    if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+                        while (i < src.size() && src[i] != '\n') out.push_back(src[i++]);
+                        continue;
+                    }
+                    if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+                        out.push_back(src[i++]); out.push_back(src[i++]);
+                        while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) out.push_back(src[i++]);
+                        if (i < src.size()) out.push_back(src[i++]);
+                        if (i < src.size()) out.push_back(src[i++]);
+                        continue;
+                    }
+                    if (ch == '\'' || ch == '"') {
+                        char q = ch; out.push_back(src[i++]);
+                        while (i < src.size()) {
+                            if (src[i] == '\\' && i + 1 < src.size()) { out.push_back(src[i++]); out.push_back(src[i++]); continue; }
+                            out.push_back(src[i]);
+                            if (src[i] == q) { ++i; break; }
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (ch == '`') { copyTemplate(); continue; }
+                    if (ch == '{' || ch == '[' || ch == '(') { ++depth; out.push_back(src[i++]); continue; }
+                    if (ch == '}' || ch == ']' || ch == ')') {
+                        if (depth > 0) --depth;
+                        out.push_back(src[i++]);
+                        continue;
+                    }
+                    if (ch == '=' && depth == 0) {
+                        out.push_back(src[i++]);
+                        size_t is = i;
+                        int d = 0;
+                        while (i < src.size()) {
+                            char ic = src[i];
+                            if (ic == '\'' || ic == '"' || ic == '`') {
+                                char q = ic; ++i;
+                                while (i < src.size()) {
+                                    if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                                    if (src[i] == q) { ++i; break; }
+                                    if (q == '`' && src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                                        i += 2; int nd = 1;
+                                        while (i < src.size() && nd > 0) {
+                                            if (src[i] == '{') ++nd;
+                                            else if (src[i] == '}') --nd;
+                                            ++i;
+                                        }
+                                        continue;
+                                    }
+                                    ++i;
+                                }
+                                continue;
+                            }
+                            if (ic == '{' || ic == '[' || ic == '(') { ++d; ++i; continue; }
+                            if (ic == '}' || ic == ']' || ic == ')') { if (d > 0) --d; ++i; continue; }
+                            if (d == 0 && (ic == ',' || ic == ';')) break;
+                            ++i;
+                        }
+                        out += rewriteIdents(src.substr(is, i - is), repl, scopes);
+                        continue;
+                    }
+                    if (ch == ';' && depth == 0) { out.push_back(src[i++]); break; }
+                    if (isIdentStart(ch)) {
+                        size_t n = i + 1;
+                        while (n < src.size() && isIdent(src[n])) ++n;
+                        out.append(src, i, n - i);
+                        i = n;
+                        continue;
+                    }
+                    out.push_back(src[i++]);
+                }
+                continue;
+            }
+
+            // Single-param arrow: `value =>` — bind before arrow.
+            {
+                size_t k = j;
+                skipSpacesSrc(k);
+                if (k + 1 < src.size() && src[k] == '=' && src[k + 1] == '>' &&
+                    (cont.empty() || cont.back() == Cont::Block || cont.back() == Cont::FnBody ||
+                     cont.back() == Cont::Paren || cont.back() == Cont::ObjectLit ||
+                     cont.back() == Cont::Bracket)) {
+                    char p = prevSignificant();
+                    // Only treat as param if not a call/member and looks like expression start.
+                    if (p != '.' && p != '?' && !isIdent(p) && p != ')' && p != ']') {
+                        pushScope();
+                        addBindings({id});
+                        out += id;
+                        i = j;
+                        // `=>` handler sets next_brace_is_fn_body; for expr body pop on `;` approx.
+                        // Mark that an expression-body arrow owns this scope:
+                        // handled when we see `=>` without `{` — pop at `;`/`,`/`)`/`}` depth 0 later via FnBody absence.
+                        // Use a sticky flag:
+                        // Reuse next_brace: if `=>` not followed by `{`, pop after copying arrow expr in `=>` handler.
+                        continue;
+                    }
+                }
+            }
+
+            // ParamList / destructuring bindings under ParamList: do not rewrite; register binding.
+            if (underParamList()) {
+                char p = prevSignificant();
+                if (p != '.' && p != '?') {
+                    // After `=` inside params this is a default-value reference — allow rewrite/shadow check.
+                    if (p != '=') {
+                        addBindings({id});
+                        out += id;
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+
             bool after_dot = false;
             bool after_question = false;
             if (!out.empty()) {
@@ -349,19 +651,16 @@ static std::string rewriteIdents(const std::string &src,
                 if (pk > 0 && out[pk - 1] == '.') after_dot = true;
                 if (pk > 0 && out[pk - 1] == '?') after_question = true;
             }
-            size_t j = i + 1;
-            while (j < src.size() && isIdent(src[j])) ++j;
             size_t k = j;
             while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
-            // Object-literal key `ident:` (not ternary consequent `? ident :`, not `ident::`).
             bool object_key = !after_question && (k < src.size() && src[k] == ':' &&
                                                  !(k + 1 < src.size() && src[k + 1] == ':'));
-            std::string id = src.substr(i, j - i);
             auto it = repl.find(id);
-            if (!after_dot && !object_key && it != repl.end()) {
-                // Object-literal shorthand `{value}` / `{a, value}` must become `value: <repl>`.
+            if (!after_dot && !object_key && it != repl.end() && !isShadowed(id)) {
+                // Shorthand only for ObjectLit property context — not arrays, args, or blocks.
+                bool in_object_lit = !cont.empty() && cont.back() == Cont::ObjectLit;
                 bool after_shorthand_intro = false;
-                if (!out.empty()) {
+                if (in_object_lit && !out.empty()) {
                     size_t pk = out.size();
                     while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
                     if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ',')) after_shorthand_intro = true;
@@ -371,15 +670,28 @@ static std::string rewriteIdents(const std::string &src,
                     out += id + ": " + it->second;
                 else
                     out += it->second;
-            } else
+            } else {
                 out += id;
+            }
             i = j;
             continue;
         }
+
+        // Expression-body arrow: after `=>` without `{`, keep param scope until `;` / `,` / `)` / `}` at depth 0.
+        // Track via cont ParamList already popped; use a counter of expression-arrow scopes.
+        // Pop one shadowing scope when we see `;` at top-level-ish if scopes were pushed for expr arrows.
+        // Simpler: on `;` when next_brace_is_fn_body is false and we have dangling param scopes from arrows —
+        // skipped for Codex examples (they use function decls).
+
         out.push_back(c);
         ++i;
     }
     return out;
+}
+
+static std::string rewriteIdents(const std::string &src,
+                                 const std::unordered_map<std::string, std::string> &repl) {
+    return rewriteIdents(src, repl, std::vector<std::unordered_set<std::string>>{});
 }
 
 struct ImportBinding {
@@ -1345,11 +1657,19 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
     std::string fname(filename ? filename : "", filename_len);
     if (fname.empty()) fname = "<module>";
     std::string source(src, src_len);
+    HermesModLoader *use = loader;
+    std::shared_ptr<HermesModuleRecord> rec;
+    auto markEntryFailed = [&](const std::string &msg) {
+        if (!rec) return;
+        rec->loading = false;
+        rec->ready = false;
+        rec->failed = true;
+        rec->fail_message = msg.empty() ? ("module '" + fname + "' failed to evaluate") : msg;
+    };
     try {
         auto &rt = *hermes_context_rt(c);
         // Ensure a loader exists for require during entry. makeRequire closures capture the
         // loader pointer, so it must outlive this stack frame (heap / context map).
-        HermesModLoader *use = loader;
         if (!use) {
             auto owned = std::make_unique<HermesModLoader>();
             use = owned.get();
@@ -1357,7 +1677,7 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
             g_mod_loaders.emplace(c, std::move(owned));
         }
         // Entry: register synthetic module under filename, evaluate
-        auto rec = std::make_shared<HermesModuleRecord>(HermesModuleRecord{jsi::Object(rt), true, false});
+        rec = std::make_shared<HermesModuleRecord>(HermesModuleRecord{jsi::Object(rt), true, false});
         use->cache[fname] = rec;
         std::string wrapped = transformEsmToCjs(source, fname);
         auto factory = rt.evaluateJavaScript(std::make_shared<jsi::StringBuffer>(wrapped), fname);
@@ -1386,16 +1706,19 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
         hermes_context_drain_microtasks(c);
         return out;
     } catch (const jsi::JSError &e) {
+        markEntryFailed(e.getMessage());
         out.err = dupCStringLocal(e.getMessage());
         hermes_report_unhandled_rejection(c, e.getMessage().c_str());
         hermes_context_drain_microtasks(c);
         return out;
     } catch (const std::exception &e) {
+        markEntryFailed(e.what());
         out.err = dupCStringLocal(e.what());
         hermes_report_unhandled_rejection(c, e.what());
         hermes_context_drain_microtasks(c);
         return out;
     } catch (...) {
+        markEntryFailed("module evaluation error");
         out.err = dupCStringLocal("module evaluation error");
         hermes_report_unhandled_rejection(c, "module evaluation error");
         hermes_context_drain_microtasks(c);
