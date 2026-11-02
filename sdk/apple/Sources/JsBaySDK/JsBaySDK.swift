@@ -111,6 +111,31 @@ public enum ValueKind: Equatable {
   case undefined, null, bool, number, string, object, array, function, symbol, bigInt
 }
 
+public enum SubmissionStatus: Int32, Equatable, Sendable {
+  case completed = 0
+  case exception = 1
+  case cancelled = 2
+}
+
+public enum ShutdownPhase: Int32, Equatable, Sendable {
+  case open = 0
+  case closing = 1
+  case sealed = 2
+  case drained = 3
+  case cancelled = 4
+}
+
+public struct SubmissionResult: Equatable, Sendable {
+  public let status: SubmissionStatus
+  public let errorData: [UInt8]
+  public var error: String { String(decoding: errorData, as: UTF8.self) }
+}
+
+public struct ShutdownStatus: Equatable, Sendable {
+  public let phase: ShutdownPhase
+  public let remainingMilliseconds: UInt64
+}
+
 public final class Value {
   fileprivate enum Ownership { case owned, borrowed, expiredBorrowed, closed }
   fileprivate weak var engine: Engine?
@@ -496,6 +521,10 @@ public final class Engine {
     let starter: SyncStarter
     init(_ starter: @escaping SyncStarter) { self.starter = starter }
   }
+  fileprivate final class SubmissionBinding {
+    let completion: (SubmissionResult) -> Void
+    init(_ completion: @escaping (SubmissionResult) -> Void) { self.completion = completion }
+  }
   fileprivate final class LoopBinding {
     private let lock = NSLock()
     private let runLoop: CFRunLoop
@@ -571,6 +600,7 @@ public final class Engine {
   public let id: Int32
   private let owner: pthread_t
   private let allowMainRunLoopAttach: Bool
+  private let generation: UInt64
   private var callbackScopes: [CallbackScope] = []
   private var loopBinding: UnsafeMutableRawPointer?
   private var loopRestoreFailure: Int32?
@@ -609,6 +639,13 @@ public final class Engine {
     guard created else {
       throw JsBayError.status(JsBayStatus.invalidArgument)
     }
+    var snapshot = jsbay_instance_snapshot_t()
+    snapshot.struct_size = UInt32(MemoryLayout<jsbay_instance_snapshot_t>.size)
+    guard jsbay_engine_snapshot(id, &snapshot) else {
+      jsbay_engine_destroy(id)
+      throw JsBayError.status(JsBayStatus.instanceNotFound)
+    }
+    self.generation = snapshot.generation
     let binding = LoopBinding(CFRunLoopGetCurrent(), id: id)
     let pointer = Unmanaged.passRetained(binding).toOpaque()
     let status = jsbay_engine_attach_loop(
@@ -923,9 +960,83 @@ public final class Engine {
     try requireOpen()
     return jsbay_engine_set_execution_time_limit(id, milliseconds)
   }
+  public func setExecutionBudget(milliseconds: UInt64) throws -> Bool {
+    try requireOpen()
+    return jsbay_engine_set_execution_budget(id, milliseconds)
+  }
   public func setMemoryLimit(bytes: UInt64) throws -> Bool {
     try requireOpen()
     return jsbay_engine_set_memory_limit(id, bytes)
+  }
+
+  /// Submits source to the core FIFO. A successful submission invokes completion once after its checkpoint.
+  @discardableResult public func postScript(
+    _ source: String, filename: String = "<submission>",
+    completion: ((SubmissionResult) -> Void)? = nil
+  ) throws -> Bool {
+    try requireOpen()
+    return try withUTF8(source) { sourceText in
+      try withUTF8(filename) { filenameText in
+        try postSubmission(completion) { callback, userData in
+          jsbay_engine_post_script(id, generation, sourceText, filenameText, callback, userData)
+        }
+      }
+    }
+  }
+
+  /// Posts an ordered core fence. Sealing rejects later submissions after admission.
+  @discardableResult public func postFence(
+    sealShutdown: Bool = false, completion: ((SubmissionResult) -> Void)? = nil
+  ) throws -> Bool {
+    try requireOpen()
+    return try postSubmission(completion) { callback, userData in
+      jsbay_engine_post_fence(id, generation, sealShutdown, callback, userData)
+    }
+  }
+
+  @discardableResult public func beginShutdown(graceMilliseconds: UInt64) throws -> Bool {
+    Engine.liveLock.lock()
+    defer { Engine.liveLock.unlock() }
+    guard isOpen, graceMilliseconds > 0 else { return false }
+    return jsbay_engine_begin_shutdown(id, generation, graceMilliseconds)
+  }
+
+  public func shutdownStatus() -> ShutdownStatus? {
+    Engine.liveLock.lock()
+    defer { Engine.liveLock.unlock() }
+    guard isOpen else { return nil }
+    var status = jsbay_shutdown_status_t()
+    guard jsbay_engine_shutdown_status(id, generation, &status),
+      let phase = ShutdownPhase(rawValue: Int32(status.phase.rawValue))
+    else { return nil }
+    return ShutdownStatus(phase: phase, remainingMilliseconds: status.remaining_ms)
+  }
+
+  /// Cancels only this engine's immutable core generation.
+  @discardableResult public func cancel() -> Bool {
+    Engine.liveLock.lock()
+    defer { Engine.liveLock.unlock() }
+    return isOpen && jsbay_engine_cancel(id, generation)
+  }
+
+  private func postSubmission(
+    _ completion: ((SubmissionResult) -> Void)?,
+    _ submit: (
+      (
+        @convention(c) (
+          Int32, UInt64, jsbay_submission_status_t, UnsafePointer<UInt8>?, Int,
+          UnsafeMutableRawPointer?
+        ) -> Void
+      )?, UnsafeMutableRawPointer?
+    ) -> Bool
+  ) throws -> Bool {
+    if let completion {
+      let userData = Unmanaged.passRetained(SubmissionBinding(completion)).toOpaque()
+      if submit(jsbaySwiftSubmissionComplete, userData) { return true }
+      Unmanaged<SubmissionBinding>.fromOpaque(userData).release()
+      return false
+    }
+    return submit(nil, nil)
   }
 
   public func setResourceLimits(_ limits: ResourceLimits) throws -> Bool {
@@ -1002,7 +1113,6 @@ public final class Engine {
       bgEffectiveMaxScriptTasks: usage.bg_effective_max_script_tasks,
       bgEffectiveMaxPendingBytes: usage.bg_effective_max_pending_bytes)
   }
-
   public struct MemoryUsage: Equatable {
     public var mallocCount: UInt64 = 0
     public var mallocSize: UInt64 = 0
@@ -1228,6 +1338,19 @@ private func jsbaySwiftSyncStart(
 private func jsbaySwiftSyncFinalize(_ userData: UnsafeMutableRawPointer?) {
   guard let userData else { return }
   Unmanaged<Engine.SyncBinding>.fromOpaque(userData).release()
+}
+
+private func jsbaySwiftSubmissionComplete(
+  _ instance: Int32, _ generation: UInt64, _ status: jsbay_submission_status_t,
+  _ errorData: UnsafePointer<UInt8>?, _ errorLength: Int, _ userData: UnsafeMutableRawPointer?
+) {
+  _ = instance
+  _ = generation
+  guard let userData else { return }
+  let binding = Unmanaged<Engine.SubmissionBinding>.fromOpaque(userData).takeRetainedValue()
+  guard let outcome = SubmissionStatus(rawValue: Int32(status.rawValue)) else { return }
+  let bytes = errorData.map { Array(UnsafeBufferPointer(start: $0, count: errorLength)) } ?? []
+  binding.completion(SubmissionResult(status: outcome, errorData: bytes))
 }
 
 private func jsbaySwiftLoopSchedule(

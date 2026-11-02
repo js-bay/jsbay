@@ -50,9 +50,16 @@ export interface NativeBridge {
   toUtf8(value: Raw): ArrayBuffer;
   toJson(value: Raw): ArrayBuffer;
   cacheHit(value: Raw): boolean;
+  postScript(engine: Raw, source: string, filename: string, callback: (outcome: { status: number; error: string }) => void): boolean;
+  postFence(engine: Raw, sealShutdown: boolean, callback: (outcome: { status: number; error: string }) => void): boolean;
   requestInterrupt(engine: Raw): boolean;
+  cancelEngine(instanceId: number, generation: bigint): boolean;
+  beginShutdown(instanceId: number, generation: bigint, graceMs: bigint): boolean;
+  shutdownStatus(instanceId: number, generation: bigint): { phase: number; remainingMs: bigint } | null;
   clearInterrupt(engine: Raw): boolean;
   setExecutionTimeLimit(engine: Raw, milliseconds: bigint): boolean;
+  setExecutionBudget(engine: Raw, milliseconds: bigint): boolean;
+  getValueUsage(engine: Raw): { live: bigint; peak: bigint; abandoned: bigint };
   setMemoryLimit(engine: Raw, bytes: bigint): boolean;
   getMemoryUsage(engine: Raw): {
     mallocCount: bigint; mallocSize: bigint; mallocLimit: bigint;

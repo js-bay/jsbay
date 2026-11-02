@@ -15,6 +15,7 @@ comptime {
         _ = @import("spike_smoke_tests.zig");
         _ = @import("spike_adversarial_tests.zig");
     }
+    _ = @import("../runtime/submission.zig");
     _ = @import("public_module_tests.zig");
     _ = @import("../script/typed_eval.zig");
     _ = @import("test_helpers.zig");
@@ -81,6 +82,8 @@ comptime {
     _ = @import("modules_tests.zig");
     if (!spike) {
         _ = @import("c_api_tests.zig");
+        _ = @import("submission_tests.zig");
+        _ = @import("runtime_boundary_tests.zig");
         _ = @import("borrowed_retain_tests.zig");
     }
     // object_ops: Escargot full; Hermes imported (trap/exception paths must not ABRT).

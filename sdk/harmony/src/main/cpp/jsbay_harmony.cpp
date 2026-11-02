@@ -14,11 +14,15 @@
 namespace {
 struct Engine;
 struct LoopBinding;
+struct SubmissionBinding;
+struct SubmissionRecord;
 struct Value {
     Engine *engine;
     jsbay_value_t handle;
     bool borrowed;
     bool live;
+    bool counted = false;
+    uint64_t usage_epoch = 0;
 };
 struct Binding {
     Engine *engine;
@@ -31,12 +35,29 @@ struct SyncBinding {
 struct Engine {
     napi_env env;
     int32_t id;
+    uint64_t generation = 0;
     std::thread::id owner;
     bool closed = false;
     std::atomic_uint32_t refs{1};
     LoopBinding *loop = nullptr;
     std::atomic_uint64_t loop_generation{0};
+    std::atomic_uint64_t owned_value_live{0};
+    std::atomic_uint64_t owned_value_peak{0};
+    std::atomic_uint64_t abandoned_value_count{0};
+    std::atomic_uint64_t value_usage_epoch{1};
     bool cleanup_registered = false;
+    SubmissionBinding *submissions = nullptr;
+};
+struct SubmissionBinding {
+    Engine *engine;
+    napi_threadsafe_function tsfn = nullptr;
+    std::atomic_bool accepting{true};
+};
+struct SubmissionRecord {
+    SubmissionBinding *binding;
+    napi_ref callback = nullptr;
+    int32_t status = JSBAY_SUBMISSION_CANCELLED;
+    std::string error;
 };
 struct LoopBinding {
     Engine *engine;
@@ -138,8 +159,77 @@ static Engine *unwrapEngine(napi_env env, napi_value v) {
     return napi_unwrap(env, v, reinterpret_cast<void **>(&out)) == napi_ok ? out : nullptr;
 }
 static void invalidate(Value *v);
+static void trackOwnedValue(Value *v) {
+    if (!v || v->borrowed || !v->engine)
+        return;
+    Engine *engine = v->engine;
+    v->counted = true;
+    v->usage_epoch = engine->value_usage_epoch.load(std::memory_order_acquire);
+    const uint64_t live = engine->owned_value_live.fetch_add(1, std::memory_order_acq_rel) + 1;
+    uint64_t peak = engine->owned_value_peak.load(std::memory_order_acquire);
+    while (peak < live &&
+           !engine->owned_value_peak.compare_exchange_weak(peak, live, std::memory_order_acq_rel)) {
+    }
+}
 static void clearLoop(Engine *engine);
 static void envCleanup(void *data);
+static void submissionDispatch(napi_env env, napi_value, void *, void *data) {
+    auto *record = static_cast<SubmissionRecord *>(data);
+    if (!record)
+        return;
+    if (env && record->callback) {
+        napi_value callback = nullptr, outcome = nullptr, status = nullptr, error = nullptr,
+                   ignored = nullptr;
+        if (napi_get_reference_value(env, record->callback, &callback) == napi_ok &&
+            napi_create_object(env, &outcome) == napi_ok &&
+            napi_create_int32(env, record->status, &status) == napi_ok &&
+            napi_create_string_utf8(env, record->error.c_str(), record->error.size(), &error) ==
+                napi_ok) {
+            napi_set_named_property(env, outcome, "status", status);
+            napi_set_named_property(env, outcome, "error", error);
+            (void)napi_call_function(env, undefined(env), callback, 1, &outcome, &ignored);
+            napi_value exception = nullptr;
+            (void)napi_get_and_clear_last_exception(env, &exception);
+        }
+        napi_delete_reference(env, record->callback);
+    }
+    releaseEngine(record->binding->engine);
+    delete record;
+}
+static void submissionComplete(int, uint64_t, jsbay_submission_status_t status,
+                               const uint8_t *error_data, size_t error_len, void *user_data) {
+    auto *record = static_cast<SubmissionRecord *>(user_data);
+    if (!record)
+        return;
+    record->status = static_cast<int32_t>(status);
+    if (error_data && error_len)
+        record->error.assign(reinterpret_cast<const char *>(error_data), error_len);
+    auto *binding = record->binding;
+    if (!binding || !binding->accepting.load(std::memory_order_acquire) ||
+        napi_call_threadsafe_function(binding->tsfn, record, napi_tsfn_nonblocking) != napi_ok) {
+        delete record;
+        if (binding)
+            releaseEngine(binding->engine);
+    }
+    if (binding)
+        (void)napi_release_threadsafe_function(binding->tsfn, napi_tsfn_release);
+}
+static void submissionFinalize(napi_env, void *data, void *) {
+    auto *binding = static_cast<SubmissionBinding *>(data);
+    if (!binding)
+        return;
+    releaseEngine(binding->engine);
+    delete binding;
+}
+static void detachSubmissions(Engine *engine, napi_threadsafe_function_release_mode mode) {
+    auto *binding = engine->submissions;
+    if (!binding)
+        return;
+    engine->submissions = nullptr;
+    if (mode == napi_tsfn_abort)
+        binding->accepting.store(false, std::memory_order_release);
+    (void)napi_release_threadsafe_function(binding->tsfn, mode);
+}
 static void detachEnvCleanup(Engine *engine);
 static bool requireEngine(napi_env env, Engine *e) {
     if (!e) {
@@ -169,6 +259,12 @@ static napi_value wrapValue(napi_env env, Engine *e, jsbay_value_t h, bool borro
             env, o, v,
             [](napi_env, void *data, void *) {
                 auto *value = static_cast<Value *>(data);
+                if (value->live && !value->borrowed && value->counted && value->engine &&
+                    value->usage_epoch ==
+                        value->engine->value_usage_epoch.load(std::memory_order_acquire)) {
+                    value->engine->owned_value_live.fetch_sub(1, std::memory_order_acq_rel);
+                    value->engine->abandoned_value_count.fetch_add(1, std::memory_order_acq_rel);
+                }
                 releaseEngine(value->engine);
                 delete value;
             },
@@ -179,6 +275,8 @@ static napi_value wrapValue(napi_env env, Engine *e, jsbay_value_t h, bool borro
         releaseEngine(e);
         return makeError(env, "cannot wrap JsBay Value");
     }
+    if (!borrowed)
+        trackOwnedValue(v);
     CallbackScope *value_scope = callback_scope;
     while (value_scope && value_scope->engine != e)
         value_scope = value_scope->parent;
@@ -254,6 +352,10 @@ static napi_value takeBoolResult(napi_env env, Engine *e, jsbay_status_t status,
 }
 static void invalidate(Value *v) {
     if (v) {
+        if (v->counted && v->engine &&
+            v->usage_epoch == v->engine->value_usage_epoch.load(std::memory_order_acquire))
+            v->engine->owned_value_live.fetch_sub(1, std::memory_order_acq_rel);
+        v->counted = false;
         v->live = false;
         v->handle = 0;
     }
@@ -635,6 +737,7 @@ static void envCleanup(void *data) {
         clearLoop(engine);
         if (!engine->closed) {
             engine->closed = true;
+            detachSubmissions(engine, napi_tsfn_abort);
             jsbay_engine_destroy(engine->id);
         }
         releaseEngine(engine);
@@ -788,18 +891,43 @@ static napi_value wrapCreatedEngine(napi_env env, int32_t id) {
     auto *e = new Engine;
     e->env = env;
     e->id = id;
+    jsbay_instance_snapshot_t created_snapshot{sizeof(created_snapshot)};
+    if (!jsbay_engine_snapshot(id, &created_snapshot)) {
+        delete e;
+        jsbay_engine_destroy(id);
+        return makeError(env, "cannot snapshot JsBay Engine");
+    }
+    e->generation = created_snapshot.generation;
     /* Owner is the creating Worker thread for the life of this Engine. Engine and Value N-API entry points reject other threads with JSBAY_WRONG_THREAD; do not move wrappers across Workers. */
     e->owner = std::this_thread::get_id();
+    auto *submissions = new SubmissionBinding{};
+    submissions->engine = e;
+    retainEngine(e);
+    napi_value submission_name;
+    napi_create_string_utf8(env, "jsbay submissions", NAPI_AUTO_LENGTH, &submission_name);
+    if (napi_create_threadsafe_function(env, nullptr, nullptr, submission_name, 0, 1, submissions,
+                                        submissionFinalize, submissions, submissionDispatch,
+                                        &submissions->tsfn) != napi_ok) {
+        releaseEngine(e);
+        delete submissions;
+        delete e;
+        jsbay_engine_destroy(id);
+        return makeError(env, "cannot create submission dispatcher");
+    }
+    e->submissions = submissions;
+    (void)napi_unref_threadsafe_function(env, submissions->tsfn);
     if (napi_wrap(
             env, o, e,
             [](napi_env, void *data, void *) { releaseEngine(static_cast<Engine *>(data)); },
             nullptr, nullptr) != napi_ok) {
+        detachSubmissions(e, napi_tsfn_abort);
         jsbay_engine_destroy(id);
-        delete e;
+        releaseEngine(e);
         return makeError(env, "cannot wrap JsBay Engine");
     }
     retainEngine(e);
     if (napi_add_env_cleanup_hook(env, envCleanup, e) != napi_ok) {
+        detachSubmissions(e, napi_tsfn_abort);
         releaseEngine(e);
         jsbay_engine_destroy(id);
         return makeError(env, "cannot register JsBay environment cleanup");
@@ -1030,7 +1158,12 @@ static napi_value closeEngine(napi_env env, napi_callback_info info) {
     clearLoop(e);
     detachEnvCleanup(e);
     e->closed = true;
+    e->value_usage_epoch.fetch_add(1, std::memory_order_acq_rel);
+    e->owned_value_live.store(0, std::memory_order_release);
+    e->owned_value_peak.store(0, std::memory_order_release);
+    e->abandoned_value_count.store(0, std::memory_order_release);
     jsbay_engine_destroy(e->id);
+    detachSubmissions(e, napi_tsfn_release);
     return undefined(env);
 }
 static napi_value evaluate(napi_env env, napi_callback_info info) {
@@ -1066,6 +1199,64 @@ static napi_value evaluate(napi_env env, napi_callback_info info) {
         napi_set_named_property(env, result, "cacheHit", did_hit);
     }
     return result;
+}
+static napi_value postSubmission(napi_env env, napi_callback_info info, bool fence) {
+    size_t n = fence ? 3 : 4;
+    napi_value a[4];
+    napi_get_cb_info(env, info, &n, a, nullptr, nullptr);
+    Engine *engine = n ? unwrapEngine(env, a[0]) : nullptr;
+    if ((fence ? (n < 2 || n > 3) : (n < 3 || n > 4)) || !requireEngine(env, engine))
+        return nullptr;
+    std::string source, filename;
+    bool seal = false;
+    napi_value callback_value = a[n - 1];
+    napi_valuetype callback_type;
+    if (napi_typeof(env, callback_value, &callback_type) != napi_ok)
+        return nullptr;
+    if (callback_type != napi_function)
+        callback_value = nullptr;
+    if (!fence && (!readUtf8(env, a[1], &source) || !readUtf8(env, a[2], &filename)))
+        return makeError(env, "postScript requires source and filename");
+    if (fence && n == 3 && napi_get_value_bool(env, a[1], &seal) != napi_ok)
+        return makeError(env, "postFence seal must be boolean");
+    auto *record = new SubmissionRecord{};
+    record->binding = engine->submissions;
+    if (callback_value &&
+        napi_create_reference(env, callback_value, 1, &record->callback) != napi_ok) {
+        delete record;
+        return makeError(env, "cannot retain submission callback");
+    }
+    retainEngine(engine);
+    if (napi_acquire_threadsafe_function(record->binding->tsfn) != napi_ok) {
+        if (record->callback)
+            napi_delete_reference(env, record->callback);
+        releaseEngine(engine);
+        delete record;
+        napi_value out;
+        napi_get_boolean(env, false, &out);
+        return out;
+    }
+    const bool accepted =
+        fence ? jsbay_engine_post_fence(engine->id, engine->generation, seal, submissionComplete,
+                                        record)
+              : jsbay_engine_post_script(engine->id, engine->generation, bytes(source),
+                                         bytes(filename), submissionComplete, record);
+    if (!accepted) {
+        if (record->callback)
+            napi_delete_reference(env, record->callback);
+        (void)napi_release_threadsafe_function(record->binding->tsfn, napi_tsfn_release);
+        releaseEngine(engine);
+        delete record;
+    }
+    napi_value out;
+    napi_get_boolean(env, accepted, &out);
+    return out;
+}
+static napi_value postScript(napi_env env, napi_callback_info info) {
+    return postSubmission(env, info, false);
+}
+static napi_value postFence(napi_env env, napi_callback_info info) {
+    return postSubmission(env, info, true);
 }
 static napi_value releaseValue(napi_env env, napi_callback_info info) {
     size_t n = 1;
@@ -1551,6 +1742,41 @@ static napi_value setTimeLimit(napi_env e, napi_callback_info i) {
 static napi_value setMemoryLimit(napi_env e, napi_callback_info i) {
     return engineBool(e, i, 2);
 }
+static napi_value setExecutionBudget(napi_env e, napi_callback_info i) {
+    size_t n = 2;
+    napi_value a[2];
+    napi_get_cb_info(e, i, &n, a, nullptr, nullptr);
+    Engine *engine = n ? unwrapEngine(e, a[0]) : nullptr;
+    if (n != 2 || !requireEngine(e, engine))
+        return nullptr;
+    uint64_t millis = 0;
+    bool lossless = false;
+    if (napi_get_value_bigint_uint64(e, a[1], &millis, &lossless) != napi_ok || !lossless)
+        return makeError(e, "budget must be a non-negative uint64 bigint");
+    napi_value out;
+    napi_get_boolean(e, jsbay_engine_set_execution_budget(engine->id, millis), &out);
+    return out;
+}
+static napi_value getValueUsage(napi_env env, napi_callback_info info) {
+    size_t n = 1;
+    napi_value a[1];
+    napi_get_cb_info(env, info, &n, a, nullptr, nullptr);
+    Engine *engine = n ? unwrapEngine(env, a[0]) : nullptr;
+    if (n != 1 || !requireEngine(env, engine))
+        return nullptr;
+    napi_value out;
+    if (napi_create_object(env, &out) != napi_ok)
+        return makeError(env, "cannot allocate ValueUsage");
+    auto put = [&](const char *key, uint64_t value) {
+        napi_value number;
+        napi_create_bigint_uint64(env, value, &number);
+        napi_set_named_property(env, out, key, number);
+    };
+    put("live", engine->owned_value_live.load(std::memory_order_acquire));
+    put("peak", engine->owned_value_peak.load(std::memory_order_acquire));
+    put("abandoned", engine->abandoned_value_count.load(std::memory_order_acquire));
+    return out;
+}
 static napi_value getMemoryUsage(napi_env env, napi_callback_info info) {
     size_t n = 1;
     napi_value a[1];
@@ -1693,6 +1919,59 @@ static napi_value requestInterruptById(napi_env env, napi_callback_info info) {
     napi_get_boolean(env, jsbay_engine_request_interrupt(id), &out);
     return out;
 }
+static napi_value cancelEngine(napi_env env, napi_callback_info info) {
+    size_t n = 2;
+    napi_value a[2];
+    napi_get_cb_info(env, info, &n, a, nullptr, nullptr);
+    int32_t id = 0;
+    uint64_t generation = 0;
+    bool lossless = false;
+    if (n != 2 || napi_get_value_int32(env, a[0], &id) != napi_ok ||
+        napi_get_value_bigint_uint64(env, a[1], &generation, &lossless) != napi_ok || !lossless)
+        return makeError(env, "cancelEngine requires an int32 id and uint64 generation bigint");
+    napi_value out;
+    napi_get_boolean(env, jsbay_engine_cancel(id, generation), &out);
+    return out;
+}
+static napi_value beginShutdown(napi_env env, napi_callback_info info) {
+    size_t n = 3;
+    napi_value a[3];
+    napi_get_cb_info(env, info, &n, a, nullptr, nullptr);
+    int32_t id = 0;
+    uint64_t generation = 0, millis = 0;
+    bool first = false, second = false;
+    if (n != 3 || napi_get_value_int32(env, a[0], &id) != napi_ok ||
+        napi_get_value_bigint_uint64(env, a[1], &generation, &first) != napi_ok || !first ||
+        napi_get_value_bigint_uint64(env, a[2], &millis, &second) != napi_ok || !second)
+        return makeError(env, "beginShutdown requires id, generation, and grace bigint");
+    napi_value out;
+    napi_get_boolean(env, jsbay_engine_begin_shutdown(id, generation, millis), &out);
+    return out;
+}
+static napi_value shutdownStatus(napi_env env, napi_callback_info info) {
+    size_t n = 2;
+    napi_value a[2];
+    napi_get_cb_info(env, info, &n, a, nullptr, nullptr);
+    int32_t id = 0;
+    uint64_t generation = 0;
+    bool lossless = false;
+    if (n != 2 || napi_get_value_int32(env, a[0], &id) != napi_ok ||
+        napi_get_value_bigint_uint64(env, a[1], &generation, &lossless) != napi_ok || !lossless)
+        return makeError(env, "shutdownStatus requires id and generation bigint");
+    jsbay_shutdown_status_t status{};
+    if (!jsbay_engine_shutdown_status(id, generation, &status)) {
+        napi_value none;
+        napi_get_null(env, &none);
+        return none;
+    }
+    napi_value out, phase, remaining;
+    napi_create_object(env, &out);
+    napi_create_int32(env, static_cast<int32_t>(status.phase), &phase);
+    napi_create_bigint_uint64(env, status.remaining_ms, &remaining);
+    napi_set_named_property(env, out, "phase", phase);
+    napi_set_named_property(env, out, "remainingMs", remaining);
+    return out;
+}
 static napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor p[] = {
         {"create", 0, create, 0, 0, 0, napi_default, 0},
@@ -1704,6 +1983,8 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"snapshotEngine", 0, snapshotEngine, 0, 0, 0, napi_default, 0},
         {"close", 0, closeEngine, 0, 0, 0, napi_default, 0},
         {"evaluate", 0, evaluate, 0, 0, 0, napi_default, 0},
+        {"postScript", 0, postScript, 0, 0, 0, napi_default, 0},
+        {"postFence", 0, postFence, 0, 0, 0, napi_default, 0},
         {"bind", 0, bind, 0, 0, 0, napi_default, 0},
         {"bindSync", 0, bindSync, 0, 0, 0, napi_default, 0},
         {"completeSync", 0, completeSync, 0, 0, 0, napi_default, 0},
@@ -1746,8 +2027,13 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"cacheHit", 0, cacheHit, 0, 0, 0, napi_default, 0},
         {"requestInterrupt", 0, requestInterrupt, 0, 0, 0, napi_default, 0},
         {"requestInterruptById", 0, requestInterruptById, 0, 0, 0, napi_default, 0},
+        {"cancelEngine", 0, cancelEngine, 0, 0, 0, napi_default, 0},
+        {"beginShutdown", 0, beginShutdown, 0, 0, 0, napi_default, 0},
+        {"shutdownStatus", 0, shutdownStatus, 0, 0, 0, napi_default, 0},
         {"clearInterrupt", 0, clearInterrupt, 0, 0, 0, napi_default, 0},
         {"setExecutionTimeLimit", 0, setTimeLimit, 0, 0, 0, napi_default, 0},
+        {"setExecutionBudget", 0, setExecutionBudget, 0, 0, 0, napi_default, 0},
+        {"getValueUsage", 0, getValueUsage, 0, 0, 0, napi_default, 0},
         {"setMemoryLimit", 0, setMemoryLimit, 0, 0, 0, napi_default, 0},
         {"getMemoryUsage", 0, getMemoryUsage, 0, 0, 0, napi_default, 0},
         {"runGc", 0, runGc, 0, 0, 0, napi_default, 0},

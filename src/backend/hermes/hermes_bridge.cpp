@@ -60,6 +60,8 @@ struct JsbayHermesContextOpaque {
     std::unique_ptr<jsi::Function> pristine_ta_buffer_get;
     std::unique_ptr<jsi::Function> pristine_ta_byte_offset_get;
     std::unique_ptr<jsi::Function> pristine_ta_byte_length_get;
+    // Pristine %TypedArray%.prototype[Symbol.toStringTag] getter (ignores instance own tags).
+    std::unique_ptr<jsi::Function> pristine_ta_to_string_tag_get;
     // %TypedArray% intrinsic (Uint8Array.__proto__) — instanceof brand check without global Uint8Array.
     std::unique_ptr<jsi::Function> pristine_typed_array_ctor;
     // Host WeakMap for stable JS object identity across distinct retained Value wrappers.
@@ -391,6 +393,7 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
                 Object.getOwnPropertyDescriptor(TAP, 'buffer').get,
                 Object.getOwnPropertyDescriptor(TAP, 'byteOffset').get,
                 Object.getOwnPropertyDescriptor(TAP, 'byteLength').get,
+                Object.getOwnPropertyDescriptor(TAP, Symbol.toStringTag).get,
                 Uint8Array.__proto__
               ];
             })()
@@ -403,17 +406,21 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
             arr.getValueAtIndex(*c->rt, 1).asObject(*c->rt).asFunction(*c->rt));
         c->pristine_ta_byte_length_get = std::make_unique<jsi::Function>(
             arr.getValueAtIndex(*c->rt, 2).asObject(*c->rt).asFunction(*c->rt));
-        c->pristine_typed_array_ctor = std::make_unique<jsi::Function>(
+        c->pristine_ta_to_string_tag_get = std::make_unique<jsi::Function>(
             arr.getValueAtIndex(*c->rt, 3).asObject(*c->rt).asFunction(*c->rt));
+        c->pristine_typed_array_ctor = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 4).asObject(*c->rt).asFunction(*c->rt));
     } catch (const std::exception &e) {
         c->pristine_ta_buffer_get.reset();
         c->pristine_ta_byte_offset_get.reset();
         c->pristine_ta_byte_length_get.reset();
+        c->pristine_ta_to_string_tag_get.reset();
         c->pristine_typed_array_ctor.reset();
     } catch (...) {
         c->pristine_ta_buffer_get.reset();
         c->pristine_ta_byte_offset_get.reset();
         c->pristine_ta_byte_length_get.reset();
+        c->pristine_ta_to_string_tag_get.reset();
         c->pristine_typed_array_ctor.reset();
     }
     return c;
@@ -639,11 +646,20 @@ extern "C" bool hermes_is_constructor(JsbayHermesContext *c, HermesValue v) {
 }
 
 extern "C" bool hermes_to_bool(HermesValue v) { return v && asVal(v)->isBool() && asVal(v)->getBool(); }
+// ECMAScript ToInt32 without float→int32 UB for out-of-range finite numbers.
+static int32_t hermesToInt32Number(double d) {
+    if (std::isnan(d) || std::isinf(d) || d == 0.0) return 0;
+    double truncated = std::trunc(d);
+    constexpr double kTwo32 = 4294967296.0;
+    double mod = std::fmod(truncated, kTwo32);
+    if (mod < 0.0) mod += kTwo32;
+    if (mod >= 2147483648.0) return static_cast<int32_t>(mod - kTwo32);
+    return static_cast<int32_t>(mod);
+}
+
 extern "C" int32_t hermes_to_int32(HermesValue v) {
     if (!v || !asVal(v)->isNumber()) return 0;
-    double d = asVal(v)->getNumber();
-    if (std::isnan(d) || std::isinf(d)) return 0;
-    return (int32_t)d; // truncate toward zero
+    return hermesToInt32Number(asVal(v)->getNumber());
 }
 extern "C" double hermes_to_float64(HermesValue v) {
     if (!v || !asVal(v)->isNumber()) return 0;
@@ -1347,19 +1363,13 @@ extern "C" uint8_t *hermes_typed_array_data(JsbayHermesContext *c, HermesValue t
         if (byte_offset) *byte_offset = off;
         if (byte_length) *byte_length = blen;
         if (kind) {
-            // Object.prototype.toString — does not fire own constructor getter.
+            // Use the captured pristine %TypedArray%.prototype[Symbol.toStringTag] getter so an
+            // instance own Symbol.toStringTag (or a replaced Object.prototype.toString) cannot spoof the element kind.
             std::string name;
             try {
-                auto Object = c->rt->global().getPropertyAsFunction(*c->rt, "Object");
-                auto proto = Object.getProperty(*c->rt, "prototype").asObject(*c->rt);
-                auto toString = proto.getProperty(*c->rt, "toString").asObject(*c->rt).asFunction(*c->rt);
-                auto tag = toString.callWithThis(*c->rt, o);
-                if (tag.isString()) {
-                    auto s = tag.getString(*c->rt).utf8(*c->rt);
-                    // "[object Uint8Array]" → "Uint8Array"
-                    if (s.size() > 16 && s.rfind("[object ", 0) == 0 && s.back() == ']') {
-                        name = s.substr(8, s.size() - 9);
-                    }
+                if (c->pristine_ta_to_string_tag_get) {
+                    auto tag = c->pristine_ta_to_string_tag_get->callWithThis(*c->rt, o);
+                    if (tag.isString()) name = tag.getString(*c->rt).utf8(*c->rt);
                 }
             } catch (...) {
             }

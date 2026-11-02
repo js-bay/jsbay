@@ -463,12 +463,20 @@ extern "C" bool escargot_is_constructor(EscargotContext *, EscargotValue v) {
 extern "C" bool escargot_to_bool(EscargotValue v) {
     return v && asVal(v)->isBoolean() && asVal(v)->asBoolean();
 }
+// ECMAScript ToInt32 without float→int32 UB for out-of-range finite numbers.
+static int32_t escargotToInt32Number(double d) {
+    if (std::isnan(d) || std::isinf(d) || d == 0.0) return 0;
+    double truncated = std::trunc(d);
+    constexpr double kTwo32 = 4294967296.0;
+    double mod = std::fmod(truncated, kTwo32);
+    if (mod < 0.0) mod += kTwo32;
+    if (mod >= 2147483648.0) return static_cast<int32_t>(mod - kTwo32);
+    return static_cast<int32_t>(mod);
+}
+
 extern "C" int32_t escargot_to_int32(EscargotValue v) {
     if (!v || !asVal(v)->isNumber()) return 0;
-    // ToInt32-style truncation toward zero (asInt32 may reject non-integers).
-    double d = asVal(v)->asNumber();
-    if (std::isnan(d) || std::isinf(d)) return 0;
-    return (int32_t)d;
+    return escargotToInt32Number(asVal(v)->asNumber());
 }
 extern "C" double escargot_to_float64(EscargotValue v) {
     if (!v || !asVal(v)->isNumber()) return 0;
@@ -1301,7 +1309,11 @@ static ValueRef *nativeTrampoline(ExecutionStateRef *state, ValueRef *thisValue,
             StringRef::createFromUTF8(msg.data(), msg.size())));
         return ValueRef::createUndefined();
     }
-    return result ? asVal(result) : ValueRef::createUndefined();
+    // Callback transferred an owned protect-map handle; release ownership while returning the ValueRef* to the VM.
+    if (!result) return ValueRef::createUndefined();
+    ValueRef *ret = asVal(result);
+    escargot_free_value(data->ctx, result);
+    return ret;
 }
 
 static EscargotValue escargotMakeFunctionOwned(EscargotContext *c, const char *name, EscargotNativeFn fn,
@@ -2355,11 +2367,16 @@ static ValueRef *nativeHandleTrampoline(ExecutionStateRef *state, ValueRef *this
     if (!c->pending_throw.empty()) {
         std::string msg = c->pending_throw;
         c->pending_throw.clear();
+        if (out) escargot_free_value(c, out);
         state->throwException(ErrorObjectRef::create(state, ErrorObjectRef::Code::None,
             StringRef::createFromUTF8(msg.data(), msg.size())));
         return ValueRef::createUndefined();
     }
-    return out ? asVal(out) : ValueRef::createUndefined();
+    // Same ownership rule as nativeTrampoline: drop protect-map ownership before returning to JS.
+    if (!out) return ValueRef::createUndefined();
+    ValueRef *ret = asVal(out);
+    escargot_free_value(c, out);
+    return ret;
 }
 
 extern "C" EscargotValue escargot_native_handle_create(EscargotContext *c, void *handle_data,

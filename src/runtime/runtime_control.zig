@@ -36,7 +36,11 @@ pub const MemoryUsage = extern struct {
     shape_count: u64 = 0,
 };
 
-/// Per-instance state shared between the public API (any thread) and the backend interrupt trampolines (JS thread). Fields are atomic; layout matches the `QjsInterruptState` / `JscInterruptState` extern structs declared in the backends so the trampolines can read this struct directly via a pointer cast.
+pub const ShutdownPhase = enum(c_int) { open = 0, closing = 1, sealed = 2, drained = 3, cancelled = 4 };
+
+pub const ShutdownStatus = struct { phase: ShutdownPhase, remaining_ms: u64 };
+
+/// Per-instance state shared between public control calls and backend interrupt trampolines. Registry access is serialized; interrupt flags and deadlines use atomic access. The backend extern structs must preserve this layout.
 pub const InterruptState = extern struct {
     /// Non-zero when an interrupt has been requested. Read by the trampoline on every interrupt check.
     interrupt_requested: u8 = 0,
@@ -45,6 +49,11 @@ pub const InterruptState = extern struct {
     deadline_ms: u64 = 0,
     /// Instance this state belongs to. -1 until init() fills it in.
     instance_id: i32 = -1,
+    budget_millis: u64 = 0,
+    budget_deadline_ms: u64 = 0,
+    budget_depth: usize = 0,
+    shutdown_deadline_ms: u64 = 0,
+    shutdown_phase: ShutdownPhase = .open,
 };
 
 // ---- Module-global state registry --------------------------------------------
@@ -86,6 +95,9 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
         .interrupt_requested = 0,
         .deadline_ms = 0,
         .instance_id = instance_id,
+        .budget_millis = 0,
+        .budget_deadline_ms = 0,
+        .budget_depth = 0,
     };
 
     registry_mutex.lock();
@@ -235,6 +247,90 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
     return true;
 }
 
+/// A generation-scoped host shutdown is terminal for this runtime generation. Engine-thread stop/restart paths may clear their bit, so this uses a separate bit that is cleared only when runtime-control state is destroyed.
+pub fn requestShutdownCancel(instance_id: i32) bool {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return false;
+    cancelShutdownState(state);
+    return true;
+}
+
+fn cancelShutdownState(state: *InterruptState) void {
+    state.shutdown_phase = .cancelled;
+    const flag: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+    _ = flag.fetchOr(4, .monotonic);
+}
+
+fn refreshShutdown(state: *InterruptState, now: u64) void {
+    if (state.shutdown_phase != .closing and state.shutdown_phase != .sealed) return;
+    const deadline: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
+    const at = deadline.load(.monotonic);
+    if (at != 0 and now >= at) cancelShutdownState(state);
+}
+
+/// Arm the generation's graceful-shutdown deadline without discarding messages already in a host transport. Repeated begins never extend the first deadline; the host sends its final fence through that same transport before sealing core submission.
+pub fn beginShutdown(instance_id: i32, millis: u64) bool {
+    if (millis == 0) return false;
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return false;
+    const now: u64 = @intCast(io.monotonicMilliseconds());
+    refreshShutdown(state, now);
+    if (state.shutdown_phase != .open) return state.shutdown_phase == .closing or state.shutdown_phase == .sealed;
+    const deadline: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
+    deadline.store(std.math.add(u64, now, millis) catch std.math.maxInt(u64), .monotonic);
+    state.shutdown_phase = .closing;
+    return true;
+}
+
+pub fn shutdownStatus(instance_id: i32) ?ShutdownStatus {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return null;
+    const now: u64 = @intCast(io.monotonicMilliseconds());
+    refreshShutdown(state, now);
+    const deadline: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
+    return .{ .phase = state.shutdown_phase, .remaining_ms = deadline.load(.monotonic) -| now };
+}
+
+/// User submissions remain admissible until the final transport marker seals the core FIFO. Internal dispatch and destruction retain their existing admission rules.
+pub fn canSubmit(instance_id: i32) bool {
+    const status = shutdownStatus(instance_id) orelse return false;
+    return status.phase == .open or status.phase == .closing;
+}
+
+/// Sealed shutdown rejects fresh synchronous VM entry while allowing already-admitted queue turns and their nested host callbacks to finish.
+pub fn canEnterExecution(instance_id: i32) bool {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return true;
+    refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
+    return state.shutdown_phase == .open or state.shutdown_phase == .closing or state.budget_depth != 0;
+}
+
+/// Called in the same instance admission critical section, only after the final fence has successfully entered the FIFO.
+pub fn sealShutdown(instance_id: i32) bool {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return false;
+    refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
+    if (state.shutdown_phase != .closing) return false;
+    state.shutdown_phase = .sealed;
+    return true;
+}
+
+/// A completed fence reports queue progress rather than script success. Its caller runs after the preceding task's microtask checkpoint.
+pub fn completeShutdownDrain(instance_id: i32) bool {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return false;
+    refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
+    if (state.shutdown_phase != .sealed) return false;
+    state.shutdown_phase = .drained;
+    return true;
+}
+
 pub fn clearStopInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
@@ -263,6 +359,42 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     return true;
 }
 
+/// Configure a deadline applied to each outer VM entry. Zero disables it; idle time never consumes this budget.
+pub fn setExecutionBudget(instance_id: i32, millis: u64) bool {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return false;
+    state.budget_millis = millis;
+    return true;
+}
+
+/// Nested VM entries retain the first deadline so a callback cannot extend its caller's budget.
+pub fn beginExecutionBudget(instance_id: i32) bool {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return false;
+    if (state.budget_depth == 0 and state.budget_millis != 0) {
+        const now: u64 = @intCast(io.monotonicMilliseconds());
+        const deadline: u64 = std.math.add(u64, now, state.budget_millis) catch std.math.maxInt(u64);
+        const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
+        deadline_ptr.store(deadline, .monotonic);
+    }
+    state.budget_depth += 1;
+    return true;
+}
+
+pub fn endExecutionBudget(instance_id: i32) void {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return;
+    std.debug.assert(state.budget_depth != 0);
+    state.budget_depth -= 1;
+    if (state.budget_depth == 0) {
+        const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
+        deadline_ptr.store(0, .monotonic);
+    }
+}
+
 /// Snapshot the remaining engine execution budget without entering the VM. Null means no configured deadline; zero means it has already elapsed.
 pub fn remainingExecutionLimitMillis(instance_id: i32) ?u64 {
     const deadline = executionDeadlineMillis(instance_id) orelse return null;
@@ -281,6 +413,30 @@ pub fn executionDeadlineMillis(instance_id: i32) ?u64 {
     const deadline = p.load(.monotonic);
     registry_mutex.unlock();
     return if (deadline == 0) null else deadline;
+}
+
+/// Earliest deadline across the absolute time limit, active VM-entry budget, and shutdown grace period. This leaves executionDeadlineMillis as the absolute-limit query for existing callers.
+pub fn effectiveExecutionDeadlineMillis(instance_id: i32) ?u64 {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return null;
+    const manual_ptr: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
+    const budget_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
+    const manual = manual_ptr.load(.monotonic);
+    const budget = budget_ptr.load(.monotonic);
+    const shutdown_ptr: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
+    const shutdown = shutdown_ptr.load(.monotonic);
+    var earliest: u64 = 0;
+    for ([_]u64{ manual, budget, shutdown }) |deadline| {
+        if (deadline != 0 and (earliest == 0 or deadline < earliest)) earliest = deadline;
+    }
+    return if (earliest == 0) null else earliest;
+}
+
+pub fn remainingEffectiveExecutionLimitMillis(instance_id: i32) ?u64 {
+    const deadline = effectiveExecutionDeadlineMillis(instance_id) orelse return null;
+    const now: u64 = @intCast(io.monotonicMilliseconds());
+    return if (now >= deadline) 0 else deadline - now;
 }
 
 /// True when a caller-requested interrupt bit is set. Lifecycle stop uses a separate bit (`isStopRequested`); do not treat stop as a user interrupt — waiters must report teardown as instance-gone.

@@ -5,7 +5,11 @@ const io = @import("../platform/io.zig");
 const testing = std.testing;
 const helpers = @import("test_helpers.zig");
 const async_bridge = @import("../runtime/async_bridge.zig");
+const host_value = @import("../abi/host_value.zig");
+const c_api = @import("../c_api.zig");
+const dispatch = @import("../runtime/dispatch.zig");
 const engine = @import("../engine.zig");
+const engine_thread = @import("../runtime/engine_thread.zig");
 const backend = @import("../backend.zig");
 const errors = @import("../value/errors.zig");
 const runtime_control = @import("../runtime/runtime_control.zig");
@@ -275,6 +279,65 @@ const StopAwait = struct {
         _ = runtime_control.requestStopInterrupt(self.instance_id);
     }
 };
+
+const ShutdownCancelAwait = struct {
+    instance_id: i32,
+    generation: u64,
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancel_accepted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    owner_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    watchdog_fired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn signal(_: c_int, user: ?*anyopaque, _: u32, _: ?[*]const host_value.HostValue, out: *host_value.HostValue) callconv(.c) c_int {
+        const self: *ShutdownCancelAwait = @ptrCast(@alignCast(user.?));
+        self.ready.store(true, .seq_cst);
+        host_value.clear(out);
+        return 0;
+    }
+
+    fn cancelAfterReady(self: *ShutdownCancelAwait) void {
+        waitForOrExit(&self.ready, 1_000, "awaitPromise did not install its pending handler");
+        self.cancel_accepted.store(c_api.jsbay_engine_cancel(self.instance_id, self.generation), .seq_cst);
+        const started = io.monotonicMilliseconds();
+        while (!self.owner_done.load(.seq_cst)) {
+            if (io.monotonicMilliseconds() - started >= 1_000) {
+                self.watchdog_fired.store(true, .seq_cst);
+                _ = runtime_control.requestStopInterrupt(self.instance_id);
+                return;
+            }
+            io.sleepMs(1);
+        }
+    }
+};
+
+test "async_bridge: generation cancellation releases a pending await" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            const ctx = engine.getContext(id) orelse return error.NoContext;
+            const token = dispatch.captureInstanceToken(id) orelse return error.MissingToken;
+            var cancel = ShutdownCancelAwait{ .instance_id = id, .generation = token.generation };
+            try testing.expect(engine_thread.hostInstall(id, "awaitReady", ShutdownCancelAwait.signal, @ptrCast(&cancel)));
+
+            const p = try stashAndFetch(id,
+                \\globalThis.__ab_v = new Promise(() => {});
+                \\globalThis.__ab_v.then = function(resolve, reject) {
+                \\  awaitReady();
+                \\  return Promise.prototype.then.call(this, resolve, reject);
+                \\};
+            );
+            defer ActiveEngine.freeValue(ctx, p);
+
+            const thread = try std.Thread.spawn(.{}, ShutdownCancelAwait.cancelAfterReady, .{&cancel});
+            const result = async_bridge.awaitPromise(id, p, .{});
+            cancel.owner_done.store(true, .seq_cst);
+            thread.join();
+
+            try testing.expect(cancel.cancel_accepted.load(.seq_cst));
+            try testing.expect(!cancel.watchdog_fired.load(.seq_cst));
+            try testing.expectError(async_bridge.AwaitError.InstanceGone, result);
+        }
+    }.run);
+}
 
 test "async_bridge: lifecycle stop ends a pending wait as instance gone" {
     try helpers.withDefaultEngine(struct {

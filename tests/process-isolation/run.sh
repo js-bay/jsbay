@@ -73,4 +73,27 @@ if ! printf '%s' "$HARNESS_OUT" | grep -q 'PASS: parent-survives-segfault-child'
   exit 1
 fi
 
+echo "== 3) harness status classification =="
+set +e
+STATUS_OUT="$($OUT/bin/process_isolation_harness --status-self-check 2>&1)"
+STATUS_RC=$?
+set -e
+printf '%s\n' "$STATUS_OUT"
+if [ "$STATUS_RC" -ne 0 ] || ! printf '%s' "$STATUS_OUT" | grep -q 'PASS: status-self-check'; then
+  echo "FAIL: fault status classification check failed"
+  exit 1
+fi
+echo "PASS: fault-status-classification"
+
+set +e
+EXEC_FAILURE_OUT="$($OUT/bin/process_isolation_harness --exec-failure-check 2>&1)"
+EXEC_FAILURE_RC=$?
+set -e
+printf '%s\n' "$EXEC_FAILURE_OUT"
+if [ "$EXEC_FAILURE_RC" -ne 0 ] || ! printf '%s' "$EXEC_FAILURE_OUT" | grep -q 'PASS: exec-failure-rejected'; then
+  echo "FAIL: exec failure was misclassified as a native fault"
+  exit 1
+fi
+echo "PASS: exec-failure-rejected"
+
 echo "PASS: process-isolation run.sh complete"

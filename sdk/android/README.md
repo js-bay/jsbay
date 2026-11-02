@@ -3,7 +3,7 @@
 `Engine` and `Value` are owner-thread objects. Close each owned `Value` and
 the engine on the thread that created the engine. Callback arguments are
 borrowed; call `retain()` before keeping one after the callback returns.
-`requestInterrupt()` and `stopLoop()` are the cross-thread operations.
+`requestInterrupt()`, `stopLoop()`, `beginShutdown()`, `shutdownStatus()`, and `cancel()` are the cross-thread control-plane operations.
 
 Do **not** create an `Engine` on the UI/main `Looper` in production: synchronous
 `evaluate` will ANR. Prefer `Engine.createOnBackground(id) { engine -> ... }`,
@@ -17,6 +17,8 @@ the app must survive an engine fault. See `docs/host-isolation.md`.
 Observability: optional `LogHandler` / `EventHandler` on create (or
 `setEventHandler` later), plus owner-thread `getMemoryUsage()` and `runGc()` for
 reporting pipelines.
+
+`postScript` and `postFence` submit work to the core FIFO; they do not add an Android queue. Capture completion outcomes after their checkpoint, including script exceptions and cancellation. `beginShutdown(graceMillis)` and a sealing `postFence` provide graceful drain; `shutdownStatus()` reports the core phase. `cancel()` is scoped to the immutable generation captured when this `Engine` was created, so it cannot cancel a replacement using the same id. `setExecutionBudget` sets the per-entry bound; `setExecutionTimeLimit` and `setMemoryLimit` retain their existing instance-wide meanings.
 
 ## Minimum supported versions
 

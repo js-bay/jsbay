@@ -20,6 +20,7 @@ const api_bind = @import("abi/api_bind.zig");
 const typed_bytecode = @import("script/typed_bytecode.zig");
 const native_sync = @import("js_event_loop").native_sync;
 const host_wake = @import("js_event_loop").host_wake;
+const submission = @import("runtime/submission.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -1007,6 +1008,11 @@ test "c_api: packed-alt adversarial when real non-primary packed" {
     }
 }
 
+pub const ShutdownStatusC = extern struct {
+    phase: c_int,
+    remaining_ms: u64,
+};
+
 /// One-shot fault for the next property-key copy shared by set/has/delete.
 const key_fault = if (builtin.is_test) struct {
     var fail_next_allocation = false;
@@ -1024,6 +1030,31 @@ const key_fault = if (builtin.is_test) struct {
     fn consume() bool {
         return false;
     }
+};
+
+const sync_start_observer = if (builtin.is_test) struct {
+    const Observer = *const fn (?*anyopaque) void;
+
+    var before_register: ?Observer = null;
+    var after_register: ?Observer = null;
+    var context: ?*anyopaque = null;
+
+    fn set(before: ?Observer, after: ?Observer, observer_context: ?*anyopaque) void {
+        before_register = before;
+        after_register = after;
+        context = observer_context;
+    }
+
+    fn notifyBeforeRegister() void {
+        if (before_register) |observer| observer(context);
+    }
+
+    fn notifyAfterRegister() void {
+        if (after_register) |observer| observer(context);
+    }
+} else struct {
+    fn notifyBeforeRegister() void {}
+    fn notifyAfterRegister() void {}
 };
 
 /// Test-only C-string helpers support Zig regression suites. Production imports receive an empty namespace and only expose the typed execution API.
@@ -1044,6 +1075,7 @@ pub const test_only = if (builtin.is_test) struct {
     pub const threadEvalCString = testThreadEvalCString;
     pub const dispatchCString = testDispatchCString;
     pub const failNextKeyAllocation = key_fault.request;
+    pub const setSyncStartObservers = sync_start_observer.set;
 } else struct {};
 
 // QuickJS measures this budget against the native stack pointer, so it must stay below common host thread stack sizes.
@@ -1413,6 +1445,16 @@ pub export fn jsbay_engine_request_interrupt(instance_id: c_int) bool {
     return accepted;
 }
 
+pub export fn jsbay_engine_cancel(instance_id: c_int, generation: u64) bool {
+    const id: i32 = @intCast(instance_id);
+    const lease = @import("runtime/instance_map.zig").beginControlPlane(id) orelse return false;
+    defer lease.end();
+    if (lease.inst.generation != generation) return false;
+    const accepted = runtime_control.requestShutdownCancel(id);
+    if (accepted) native_sync.cancelForInstance(id);
+    return accepted;
+}
+
 /// Clear a previously requested interrupt before evaluating more JavaScript.
 pub export fn jsbay_engine_clear_interrupt(instance_id: c_int) bool {
     if (!api_value.isOwner(@intCast(instance_id))) return false;
@@ -1428,6 +1470,48 @@ pub export fn jsbay_engine_set_execution_time_limit(instance_id: c_int, millis: 
         native_sync.tightenDeadlinesForInstance(id, deadline);
     };
     return accepted;
+}
+
+pub export fn jsbay_engine_set_execution_budget(instance_id: c_int, millis: u64) bool {
+    const id: i32 = @intCast(instance_id);
+    if (!api_value.isOwner(id)) return false;
+    return runtime_control.setExecutionBudget(id, millis);
+}
+
+/// Thread-safe generation-scoped shutdown deadline. A successful begin also tightens native synchronous waits that were already in progress.
+pub export fn jsbay_engine_begin_shutdown(instance_id: c_int, generation: u64, millis: u64) bool {
+    const id: i32 = @intCast(instance_id);
+    const lease = @import("runtime/instance_map.zig").beginControlPlane(id) orelse return false;
+    defer lease.end();
+    if (lease.inst.generation != generation) return false;
+    const accepted = runtime_control.beginShutdown(id, millis);
+    if (accepted) if (runtime_control.effectiveExecutionDeadlineMillis(id)) |deadline| {
+        native_sync.tightenDeadlinesForInstance(id, deadline);
+    };
+    return accepted;
+}
+
+/// Thread-safe generation-scoped status query. Returns false without modifying out when the generation is stale or the instance is unavailable.
+pub export fn jsbay_engine_shutdown_status(instance_id: c_int, generation: u64, out: ?*ShutdownStatusC) bool {
+    const destination = out orelse return false;
+    const id: i32 = @intCast(instance_id);
+    const lease = @import("runtime/instance_map.zig").beginControlPlane(id) orelse return false;
+    defer lease.end();
+    if (lease.inst.generation != generation) return false;
+    const status = runtime_control.shutdownStatus(id) orelse return false;
+    destination.* = .{ .phase = @backingInt(status.phase), .remaining_ms = status.remaining_ms };
+    return true;
+}
+
+pub export fn jsbay_engine_post_script(instance_id: c_int, generation: u64, source_arg: Utf8, filename_arg: Utf8, callback: ?submission.Callback, user_data: ?*anyopaque) bool {
+    const source = checkedUtf8(source_arg) orelse return false;
+    const filename = checkedUtf8(filename_arg) orelse return false;
+    if (!std.unicode.utf8ValidateSlice(source) or !std.unicode.utf8ValidateSlice(filename) or !noEmbeddedNul(filename)) return false;
+    return submission.postScript(@intCast(instance_id), generation, source, filename, callback, user_data);
+}
+
+pub export fn jsbay_engine_post_fence(instance_id: c_int, generation: u64, seal_shutdown: bool, callback: ?submission.Callback, user_data: ?*anyopaque) bool {
+    return submission.postFence(@intCast(instance_id), generation, seal_shutdown, callback, user_data);
 }
 
 /// Cap the runtime's heap at `bytes` (0 = unlimited). QuickJS enforces it via JS_SetMemoryLimit. JSC has no public heap-cap API and returns false (same contract as `runtime_control.setMemoryLimit` / the C header).
@@ -1662,7 +1746,7 @@ fn maybeFireInterrupted(id: i32) void {
         engine_events.fireInterrupted(id, 0, "interrupt requested");
         return;
     }
-    if (runtime_control.remainingExecutionLimitMillis(id)) |remaining| {
+    if (runtime_control.remainingEffectiveExecutionLimitMillis(id)) |remaining| {
         if (remaining == 0) engine_events.fireInterrupted(id, 0, "execution time limit");
     }
 }
@@ -1845,18 +1929,11 @@ const ApiOp = struct {
     ctx: ActiveEngine.Context,
     lease: engine_thread.EvalLease,
     entered_js: bool,
-    execution: ?@import("js_event_loop").Scheduler.Execution = null,
-
-    fn endExecution(self: *ApiOp) void {
-        if (self.execution) |*guard| guard.end();
-        self.execution = null;
-    }
+    execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
     fn deinit(self: *ApiOp) void {
-        if (self.execution != null) {
-            self.endExecution();
-            @import("runtime/js_scheduler.zig").checkpoint(self.id, self.ctx);
-        }
+        if (self.execution) |*execution| @import("runtime/js_scheduler.zig").checkpointAfterExecution(execution, self.ctx);
+        self.execution = null;
         // Raw typed operations below use backend C APIs directly.  Keep the QuickJS stack anchor around the entire admission lease, including re-entrant getter/toString/native-callback execution.
         if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
             if (self.entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(self.ctx);
@@ -1865,7 +1942,9 @@ const ApiOp = struct {
     }
 };
 
-fn beginApiOp(id: i32) union(enum) { ok: ApiOp, status: c_int } {
+const ApiOpResult = union(enum) { ok: ApiOp, status: c_int };
+
+fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
@@ -1883,7 +1962,23 @@ fn beginApiOp(id: i32) union(enum) { ok: ApiOp, status: c_int } {
         engine.finishEvalEntry(id, lease);
         return .{ .status = API_WRONG_THREAD };
     }
-    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .execution = @import("runtime/js_scheduler.zig").beginExecution(id) } };
+    if (!require_execution) return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js } };
+    const execution = @import("runtime/js_scheduler.zig").beginExecution(id) orelse {
+        if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+            if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
+        }
+        engine.finishEvalEntry(id, lease);
+        return .{ .status = API_INSTANCE_NOT_FOUND };
+    };
+    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .execution = execution } };
+}
+
+fn beginApiOp(id: i32) ApiOpResult {
+    return beginApiOpMode(id, true);
+}
+
+fn beginCleanupApiOp(id: i32) ApiOpResult {
+    return beginApiOpMode(id, false);
 }
 
 fn apiContext(instance_id: i32) union(enum) { ok: ActiveEngine.Context, status: c_int } {
@@ -1942,9 +2037,11 @@ fn apiStore(instance_id: i32, value: ActiveEngine.Value, out: *u64) c_int {
 }
 
 fn drainApiJobs(op: *ApiOp) bool {
-    op.endExecution();
     const map = @import("runtime/instance_map.zig");
-    if (!map.isTeardownPending(op.id)) @import("runtime/js_scheduler.zig").checkpoint(op.id, op.ctx);
+    if (op.execution) |*execution| {
+        if (!map.isTeardownPending(op.id)) @import("runtime/js_scheduler.zig").checkpointAfterExecution(execution, op.ctx) else execution.end();
+        op.execution = null;
+    }
     return !map.isTeardownPending(op.id);
 }
 
@@ -1970,16 +2067,16 @@ pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var op = switch (beginPackedCleanupOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
+        defer op.deinit();
         out_value.* = packed_api_value.retain(value) orelse return API_OUT_OF_MEMORY;
         return API_OK;
     }
     const instance_id = api_value.instanceFor(value) orelse return API_STALE_VALUE;
-    var op = switch (beginApiOp(instance_id)) {
+    var op = switch (beginCleanupApiOp(instance_id)) {
         .status => |status| return status,
         .ok => |ok| ok,
     };
@@ -1997,18 +2094,15 @@ pub export fn jsbay_value_release(value: u64) c_int {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var op = switch (beginPackedCleanupOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
+        defer op.deinit();
         return if (packed_api_value.release(value)) API_OK else API_STALE_VALUE;
     }
     const instance_id = api_value.instanceFor(value) orelse return API_STALE_VALUE;
-    // Release keeps a beginApiOp lease so freeValue cannot race destroyRuntime's freeContext.
-    // When teardown is already pending, beginApiOp fails and destroy's dropInstance frees the
-    // handle; hosts should release before destroy (embed checklist).
-    var op = switch (beginApiOp(instance_id)) {
+    var op = switch (beginCleanupApiOp(instance_id)) {
         .status => |status| return status,
         .ok => |ok| ok,
     };
@@ -2467,25 +2561,20 @@ const PackedJsOp = struct {
     ctx_addr: usize,
     lease: engine_thread.EvalLease,
     entered_js: bool,
-    execution: ?@import("js_event_loop").Scheduler.Execution = null,
-
-    fn endExecution(self: *PackedJsOp) void {
-        if (self.execution) |*guard| guard.end();
-        self.execution = null;
-    }
+    execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
     fn deinit(self: *PackedJsOp) void {
-        if (self.execution != null) {
-            self.endExecution();
-            @import("runtime/js_scheduler.zig").checkpointInstance(self.id);
-        }
+        if (self.execution) |*execution| @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(execution);
+        self.execution = null;
         if (self.entered_js) @import("backend_dispatch.zig").leaveJsPacked(self.tag, self.ctx_addr);
         engine.finishEvalEntry(self.id, self.lease);
     }
 };
 
 /// Admission lease for packed-alt value ops that may execute JavaScript (mirrors beginApiOp / beginValueOp).
-fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) union(enum) { ok: PackedJsOp, status: c_int } {
+const PackedJsOpResult = union(enum) { ok: PackedJsOp, status: c_int };
+
+fn beginPackedJsOpMode(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, require_execution: bool) PackedJsOpResult {
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
@@ -2498,14 +2587,28 @@ fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) 
         engine.finishEvalEntry(instance_id, lease);
         return .{ .status = API_WRONG_THREAD };
     }
+    if (!require_execution) return .{ .ok = .{ .id = instance_id, .tag = tag, .ctx_addr = ctx_addr, .lease = lease, .entered_js = true } };
+    const execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse {
+        @import("backend_dispatch.zig").leaveJsPacked(tag, ctx_addr);
+        engine.finishEvalEntry(instance_id, lease);
+        return .{ .status = API_INSTANCE_NOT_FOUND };
+    };
     return .{ .ok = .{
         .id = instance_id,
         .tag = tag,
         .ctx_addr = ctx_addr,
         .lease = lease,
         .entered_js = true,
-        .execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id),
+        .execution = execution,
     } };
+}
+
+fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) PackedJsOpResult {
+    return beginPackedJsOpMode(instance_id, tag, ctx_addr, true);
+}
+
+fn beginPackedCleanupOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) PackedJsOpResult {
+    return beginPackedJsOpMode(instance_id, tag, ctx_addr, false);
 }
 
 const PackedValueOp = struct {
@@ -2554,9 +2657,11 @@ fn beginPackedValueOp(handle: u64) union(enum) { ok: PackedValueOp, status: c_in
 }
 
 fn drainPackedJobs(js: *PackedJsOp) bool {
-    js.endExecution();
     const map = @import("runtime/instance_map.zig");
-    if (!map.isTeardownPending(js.id)) @import("runtime/js_scheduler.zig").checkpointInstance(js.id);
+    if (js.execution) |*execution| {
+        if (!map.isTeardownPending(js.id)) @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(execution) else execution.end();
+        js.execution = null;
+    }
     return !map.isTeardownPending(js.id);
 }
 
@@ -3630,23 +3735,26 @@ fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: us
     // This covers the host start callback and the native wait. A host may receive queued work while here, but a reentrant tick must not execute it.
     var sync_wait = @import("runtime/js_scheduler.zig").beginSyncWait(instance_id) orelse return API_INSTANCE_NOT_FOUND;
     defer sync_wait.end();
+    sync_start_observer.notifyBeforeRegister();
     const started = native_sync.start(instance_id) orelse return API_OUT_OF_MEMORY;
     defer native_sync.finish(started.id, started.request);
+    sync_start_observer.notifyAfterRegister();
 
     const started_at: u64 = @intCast(@import("platform/io.zig").monotonicMilliseconds());
     var deadline = std.math.add(u64, started_at, binding.timeout_ms) catch std.math.maxInt(u64);
-    if (runtime_control.executionDeadlineMillis(instance_id)) |execution_deadline| deadline = @min(deadline, execution_deadline);
+    if (runtime_control.effectiveExecutionDeadlineMillis(instance_id)) |execution_deadline| deadline = @min(deadline, execution_deadline);
     native_sync.tightenDeadline(started.request, deadline);
 
     // The host start callback receives borrowed JS handles only while it is running. It may complete inline, but must otherwise hand only the ID to its system completion path.
-    if (runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) {
+    const shutdown_cancelled = if (runtime_control.shutdownStatus(instance_id)) |shutdown| shutdown.phase == .cancelled else true;
+    if (shutdown_cancelled or runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) {
         native_sync.cancel(started.id);
     } else {
         binding.start(instance_id, binding.user_data, started.id, this_value, argc, args);
     }
 
     // A start callback can arm a shorter execution budget. Re-snapshot its absolute deadline after it returns, then tighten the request before waiting; a completion arriving after that deadline cannot win.
-    if (runtime_control.executionDeadlineMillis(instance_id)) |execution_deadline| {
+    if (runtime_control.effectiveExecutionDeadlineMillis(instance_id)) |execution_deadline| {
         deadline = @min(deadline, execution_deadline);
         native_sync.tightenDeadline(started.request, deadline);
     }

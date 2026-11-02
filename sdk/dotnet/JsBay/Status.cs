@@ -31,6 +31,25 @@ public enum ValueKind : int
     BigInt,
 }
 
+public enum SubmissionStatus : int
+{
+    Completed = 0,
+    Exception = 1,
+    Cancelled = 2,
+}
+
+public enum ShutdownPhase : int
+{
+    Open = 0,
+    Closing = 1,
+    Sealed = 2,
+    Drained = 3,
+    Cancelled = 4,
+}
+
+public readonly record struct SubmissionResult(SubmissionStatus Status, string Error);
+public readonly record struct ShutdownStatus(ShutdownPhase Phase, ulong RemainingMilliseconds);
+
 /// <summary>A non-JavaScript failure reported by the typed C API.</summary>
 public sealed class JsBayException : InvalidOperationException
 {

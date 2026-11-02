@@ -667,13 +667,12 @@ pub const TypedEvalEntry = struct {
     instance_id: i32,
     lease: EvalLease,
     result: ?@import("../script/typed_eval.zig").Result,
-    execution: ?@import("js_event_loop").Scheduler.Execution = null,
+    execution: ?@import("js_scheduler.zig").Execution = null,
 
     pub fn finish(self: *TypedEvalEntry) bool {
         if (self.execution) |value| {
             var guard = value;
-            guard.end();
-            if (instance_map.getPtrs(self.instance_id)) |ptrs| @import("js_scheduler.zig").checkpoint(self.instance_id, ptrs.ctx);
+            @import("js_scheduler.zig").checkpointInstanceAfterExecution(&guard);
         }
         if (!endEvalAndTakeDeferred(self.lease)) return false;
         engine.destroy(self.instance_id);

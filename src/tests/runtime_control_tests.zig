@@ -498,3 +498,58 @@ test "runtime_control: dead WeakMap keys are reclaimed across repeated collectio
         }
     }.run);
 }
+
+test "shutdown protocol: closing preserves transport work and seal rejects new submissions" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            try testing.expect(rc.beginShutdown(id, 60_000));
+            const first = rc.shutdownStatus(id).?;
+            try testing.expectEqual(rc.ShutdownPhase.closing, first.phase);
+            try testing.expect(rc.canSubmit(id));
+            try testing.expect(rc.beginShutdown(id, 120_000));
+            try testing.expect(rc.shutdownStatus(id).?.remaining_ms <= first.remaining_ms);
+            try testing.expect(rc.sealShutdown(id));
+            try testing.expect(!rc.canSubmit(id));
+            const rejected = engine.evalScript(id, "6 * 7", "sealed-entry.js");
+            defer helpers.freeEvalResult(rejected);
+            try testing.expect(rejected.err != null);
+            try testing.expect(rc.completeShutdownDrain(id));
+            try testing.expectEqual(rc.ShutdownPhase.drained, rc.shutdownStatus(id).?.phase);
+            try testing.expect(!rc.canSubmit(id));
+        }
+    }.run);
+}
+
+test "shutdown protocol: grace deadline interrupts without an owner-thread timer" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            try testing.expect(rc.setExecutionBudget(id, 0));
+            try testing.expect(rc.beginShutdown(id, 35));
+            const started = io.monotonicMilliseconds();
+            const result = engine.evalScript(id, "for (;;) {}", "shutdown-deadline.js");
+            defer helpers.freeEvalResult(result);
+            try testing.expect(result.err != null);
+            try testing.expect(io.monotonicMilliseconds() - started < 2000);
+            try testing.expectEqual(rc.ShutdownPhase.cancelled, rc.shutdownStatus(id).?.phase);
+            try testing.expect(!rc.completeShutdownDrain(id));
+            try testing.expect(rc.clearInterrupt(id));
+            try testing.expect(rc.clearStopInterrupt(id));
+            try testing.expect(!rc.canSubmit(id));
+        }
+    }.run);
+}
+
+test "shutdown protocol: shorter manual limit survives grace setup and zero grace is rejected" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            try testing.expect(!rc.beginShutdown(id, 0));
+            try testing.expectEqual(rc.ShutdownPhase.open, rc.shutdownStatus(id).?.phase);
+            try testing.expect(rc.setExecutionTimeLimit(id, 50));
+            const manual = rc.executionDeadlineMillis(id).?;
+            try testing.expect(rc.beginShutdown(id, 60_000));
+            try testing.expectEqual(manual, rc.effectiveExecutionDeadlineMillis(id).?);
+            try testing.expect(rc.requestShutdownCancel(id));
+            try testing.expectEqual(rc.ShutdownPhase.cancelled, rc.shutdownStatus(id).?.phase);
+        }
+    }.run);
+}

@@ -7,6 +7,7 @@ const sync = @import("zev");
 const backend = @import("../backend.zig");
 const tsfn = @import("tsfn.zig");
 const instance_map = @import("instance_map.zig");
+const resource_limits = @import("resource_limits.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -18,7 +19,14 @@ const ActiveEngine = backend.ActiveEngine;
 
 pub const NativeTask = struct {
     // Set only by admission; its reservation survives detached task snapshots.
-    resources: ?*@import("resource_limits.zig").Budget = null,
+    resources: ?*resource_limits.Budget = null,
+    /// The public submission queue uses script_task so hosts can account for copied source separately from arbitrary native work.
+    resource_kind: resource_limits.Kind = .native_task,
+    resource_bytes: usize = 0,
+    /// Called while the instance admission lock is held, before resource reservation. It must not invoke JS or wait.
+    admission_check: ?*const fn (?*anyopaque) bool = null,
+    /// Called only after this task has been appended while the instance admission lock is still held. It must not invoke JS or wait.
+    on_admitted: ?*const fn (?*anyopaque) void = null,
     ctx: ?*anyopaque,
     run: *const fn (?*anyopaque) void,
     cancel: ?*const fn (?*anyopaque) void = null,
@@ -34,6 +42,25 @@ pub const NativeTask = struct {
 pub const InstanceToken = extern struct {
     instance_id: i32,
     generation: u64,
+};
+
+/// A script submission reserves its copied payload budget before allocating source bytes. The control lease keeps the instance alive until the reservation is either released or committed into the native task queue.
+pub const TaskReservation = struct {
+    lease: ?instance_map.ControlLease,
+    resources: ?*resource_limits.Budget,
+    kind: resource_limits.Kind,
+    bytes: usize,
+
+    pub fn deinit(self: *TaskReservation) void {
+        if (self.resources) |resources| {
+            resources.release(self.kind, self.bytes);
+            self.resources = null;
+        }
+        if (self.lease) |lease| {
+            lease.end();
+            self.lease = null;
+        }
+    }
 };
 pub const NativeTaskQueue = struct {
     mutex: sync.Mutex = .{},
@@ -220,14 +247,45 @@ pub fn postTaskWithToken(token: InstanceToken, task: NativeTask) bool {
     return postTaskChecked(token.instance_id, token.generation, task);
 }
 
-fn postTaskChecked(instance_id: i32, expected_generation: ?u64, task: NativeTask) bool {
-    const Post = struct {
-        task: NativeTask,
-        expected_generation: ?u64,
+/// Reserve payload accounting before a caller copies source bytes. The later commit rechecks admission while holding the instance registry lock.
+pub fn reserveTaskWithToken(token: InstanceToken, kind: resource_limits.Kind, bytes: usize) ?TaskReservation {
+    const lease = instance_map.beginControlPlane(token.instance_id) orelse return null;
+    var reservation = TaskReservation{ .lease = lease, .resources = null, .kind = kind, .bytes = bytes };
+    const accepted = instance_map.withInstanceReturn(token.instance_id, struct {
+        lease_inst: *instance_map.EngineInstance,
+        generation: u64,
+        kind: resource_limits.Kind,
+        bytes: usize,
         pub fn call(self: @This(), inst: *instance_map.EngineInstance) ?bool {
-            if (inst.task_admission_closed) return false;
-            if (self.expected_generation) |generation| {
-                if (inst.teardown_pending or inst.generation != generation) return false;
+            if (inst != self.lease_inst or inst.task_admission_closed or inst.teardown_pending or inst.generation != self.generation) return false;
+            inst.native_task_queue.mutex.lock();
+            defer inst.native_task_queue.mutex.unlock();
+            if (inst.native_task_queue.closed) return false;
+            if (!inst.resources.reserve(self.kind, self.bytes)) return false;
+            return true;
+        }
+    }{ .lease_inst = lease.inst, .generation = token.generation, .kind = kind, .bytes = bytes }) orelse false;
+    if (!accepted) {
+        reservation.deinit();
+        return null;
+    }
+    reservation.resources = lease.inst.resources;
+    return reservation;
+}
+
+/// Append a previously reserved task. The reservation remains owned by the caller when this returns false.
+pub fn postReservedTaskWithToken(token: InstanceToken, reservation: *TaskReservation, task: NativeTask) bool {
+    const lease = reservation.lease orelse return false;
+    if (reservation.resources == null) return false;
+    const Commit = struct {
+        lease_inst: *instance_map.EngineInstance,
+        generation: u64,
+        reservation: *TaskReservation,
+        task: NativeTask,
+        pub fn call(self: @This(), inst: *instance_map.EngineInstance) ?bool {
+            if (inst != self.lease_inst or inst.task_admission_closed or inst.teardown_pending or inst.generation != self.generation) return false;
+            if (self.task.admission_check) |check| {
+                if (!check(self.task.ctx)) return false;
             }
             runPostCheckedHookForTesting();
             if (fail_next_queue_allocation_for_testing) {
@@ -237,13 +295,57 @@ fn postTaskChecked(instance_id: i32, expected_generation: ?u64, task: NativeTask
             inst.native_task_queue.mutex.lock();
             defer inst.native_task_queue.mutex.unlock();
             if (inst.native_task_queue.closed) return false;
-            if (!inst.resources.reserve(.native_task, 0)) return false;
+            var admitted_task = self.task;
+            admitted_task.resources = self.reservation.resources;
+            inst.native_task_queue.push(std.heap.c_allocator, admitted_task) catch return false;
+            self.reservation.resources = null;
+            if (admitted_task.on_admitted) |on_admitted| on_admitted(admitted_task.ctx);
+            inst.loop.wake();
+            return true;
+        }
+    };
+    const accepted = instance_map.withInstanceReturn(token.instance_id, Commit{
+        .lease_inst = lease.inst,
+        .generation = token.generation,
+        .reservation = reservation,
+        .task = task,
+    }) orelse false;
+    if (accepted) {
+        lease.end();
+        reservation.lease = null;
+        wakeInstance(token.instance_id);
+    }
+    return accepted;
+}
+
+fn postTaskChecked(instance_id: i32, expected_generation: ?u64, task: NativeTask) bool {
+    const Post = struct {
+        task: NativeTask,
+        expected_generation: ?u64,
+        pub fn call(self: @This(), inst: *instance_map.EngineInstance) ?bool {
+            if (inst.task_admission_closed) return false;
+            if (self.expected_generation) |generation| {
+                if (inst.teardown_pending or inst.generation != generation) return false;
+            }
+            if (self.task.admission_check) |check| {
+                if (!check(self.task.ctx)) return false;
+            }
+            runPostCheckedHookForTesting();
+            if (fail_next_queue_allocation_for_testing) {
+                fail_next_queue_allocation_for_testing = false;
+                return false;
+            }
+            inst.native_task_queue.mutex.lock();
+            defer inst.native_task_queue.mutex.unlock();
+            if (inst.native_task_queue.closed) return false;
+            if (!inst.resources.reserve(self.task.resource_kind, self.task.resource_bytes)) return false;
             var admitted_task = self.task;
             admitted_task.resources = inst.resources;
             inst.native_task_queue.push(std.heap.c_allocator, admitted_task) catch {
-                inst.resources.release(.native_task, 0);
+                inst.resources.release(self.task.resource_kind, self.task.resource_bytes);
                 return false;
             };
+            if (admitted_task.on_admitted) |on_admitted| on_admitted(admitted_task.ctx);
             inst.loop.wake();
             return true;
         }
@@ -267,7 +369,7 @@ pub fn releaseAllTasksForInstance(instance_id: i32) void {
     }{}) orelse return;
     defer pending.deinit(std.heap.c_allocator);
     for (pending.items) |task| {
-        defer if (task.resources) |resources| resources.release(.native_task, 0);
+        defer if (task.resources) |resources| resources.release(task.resource_kind, task.resource_bytes);
         if (task.cancel) |cancel| cancel(task.ctx);
         if (task.complete) |complete| complete(task.completion_ctx);
     }
@@ -292,7 +394,7 @@ pub fn closeInstanceTasks(instance_id: i32) bool {
         return true;
     }
     for (pending.items) |task| {
-        defer if (task.resources) |resources| resources.release(.native_task, 0);
+        defer if (task.resources) |resources| resources.release(task.resource_kind, task.resource_bytes);
         if (task.cancel) |cancel| cancel(task.ctx);
         if (task.complete) |complete| complete(task.completion_ctx);
     }
@@ -324,7 +426,7 @@ pub fn releaseTasksForOwner(instance_id: i32, owner: *anyopaque) void {
                 return inst.native_task_queue.takeFirstMatch(@ptrCast(&ctx_val), Ctx.pred);
             }
         }{ .owner = owner }) orelse return;
-        defer if (task.resources) |resources| resources.release(.native_task, 0);
+        defer if (task.resources) |resources| resources.release(task.resource_kind, task.resource_bytes);
         if (task.cancel) |cancel| cancel(task.ctx);
         if (task.complete) |complete| complete(task.completion_ctx);
     }
@@ -333,12 +435,14 @@ pub fn releaseTasksForOwner(instance_id: i32, owner: *anyopaque) void {
 pub const TaskCompletion = struct {
     instance_lease: *instance_map.EngineInstance,
     task: NativeTask,
+    queued: ?@import("js_scheduler.zig").Task = null,
     active: bool = true,
 
     pub fn finish(self: *TaskCompletion) void {
         if (!self.active) return;
         self.active = false;
-        defer if (self.task.resources) |resources| resources.release(.native_task, 0);
+        defer if (self.task.resources) |resources| resources.release(self.task.resource_kind, self.task.resource_bytes);
+        if (self.queued) |*queued| queued.endBudget();
         if (self.task.complete) |complete| complete(self.task.completion_ctx);
         instance_map.endDispatchTask(self.instance_lease);
     }
@@ -371,8 +475,8 @@ pub fn runOneTask(instance_id: i32, completion: *?TaskCompletion) bool {
     active_task_owner_frame = &owner_frame;
     task.run(task.ctx);
     active_task_owner_frame = owner_frame.parent;
-    _ = queued.end();
-    completion.* = .{ .instance_lease = instance_lease, .task = task };
+    _ = queued.endScheduler();
+    completion.* = .{ .instance_lease = instance_lease, .task = task, .queued = queued };
     return true;
 }
 
@@ -401,7 +505,7 @@ pub fn drainPausedDebuggerControl(instance_id: i32) usize {
                 }.pred);
             }
         }{}) orelse return executed;
-        defer if (task.resources) |resources| resources.release(.native_task, 0);
+        defer if (task.resources) |resources| resources.release(task.resource_kind, task.resource_bytes);
         if (task.thread_id_slot) |slot| slot.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
         {
             var owner_frame: TaskOwnerFrame = undefined;
@@ -515,6 +619,7 @@ pub fn tickInstance(instance_id: i32) usize {
 const DispatchTurn = struct {
     instance_id: i32,
     ran: bool = false,
+    task_budget_armed: bool = false,
     completion: ?TaskCompletion = null,
 
     fn self(context: ?*anyopaque) *DispatchTurn {
@@ -523,19 +628,27 @@ const DispatchTurn = struct {
     fn prepareNativeEvents(_: ?*anyopaque) void {}
     fn runOneSource(context: ?*anyopaque, source: @import("js_event_loop").Scheduler.TaskSource) bool {
         const turn = self(context);
+        const budget_armed = @import("runtime_control.zig").beginExecutionBudget(turn.instance_id);
         turn.ran = switch (source) {
             .native_dispatch => runOneTask(turn.instance_id, &turn.completion),
             .tsfn => tsfn.runOne(turn.instance_id),
             .host_script, .timer => false,
         };
+        if (turn.ran) {
+            turn.task_budget_armed = budget_armed;
+        } else if (budget_armed) @import("runtime_control.zig").endExecutionBudget(turn.instance_id);
         return turn.ran;
     }
     fn checkpoint(context: ?*anyopaque) void {
         const turn = self(context);
-        if (instance_map.getPtrs(turn.instance_id)) |ptrs| @import("js_scheduler.zig").checkpoint(turn.instance_id, ptrs.ctx);
+        @import("js_scheduler.zig").checkpointInstance(turn.instance_id);
     }
     fn finishTask(context: ?*anyopaque) void {
         const turn = self(context);
+        if (turn.task_budget_armed) {
+            turn.task_budget_armed = false;
+            @import("runtime_control.zig").endExecutionBudget(turn.instance_id);
+        }
         if (turn.completion) |*completion| completion.finish();
     }
 };

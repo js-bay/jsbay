@@ -44,6 +44,22 @@ SDK callbacks add a scope around this C contract. Borrowed argument wrappers exp
 
 A successful native binding transfers its `user_data` to the engine until actual instance teardown, after active JavaScript and native callbacks have unwound. Rebinding the same name or collecting the JavaScript function does not run its finalizer early. The finalizer runs once on the owner thread; a failed bind does not transfer ownership or call it. Finalizers may release host resources but must not call engine or value APIs. Destroy the engine while the language runtime owning those resources is still alive.
 
+## Queued submissions and shutdown
+
+The C ABI `jsbay_engine_post_script` and `jsbay_engine_post_fence` accept a captured instance generation and may be called from a producer thread. The language SDK `Engine` submission methods remain owner-thread operations, matching their object and platform-environment contracts. Each binding forwards work to the same core FIFO. Platform loop drivers provide wakeups rather than a second script queue.
+
+The core reserves queue budget before making its retained source and filename copies, which finish before submission returns. A successful admission transfers completion ownership to the core; it reports completed, exception, or cancelled once. Executed tasks complete after their microtask checkpoint; queued tasks cancelled during teardown settle without entering the VM. Rejection returns false without invoking completion. A fence covers preceding submissions and their immediate checkpoints, not future timers or messages still in another host transport. SDKs must copy borrowed error bytes during completion and contain host callback exceptions. An environment that is already being destroyed cannot receive new language callbacks.
+
+`jsbay_engine_begin_shutdown`, `jsbay_engine_shutdown_status`, and `jsbay_engine_cancel` are generation-scoped, data-only, cross-thread controls. The SDK equivalents are also available to an independent control thread so a busy owner can be interrupted. An old token cannot control a replacement engine that reused its ID. The first positive shutdown grace period installs a monotonic deadline; repeated successful calls cannot extend it.
+
+Beginning shutdown changes open to closing and leaves in-transit submissions admissible. The host stops external producers, finishes terminal-message production, and sends a sealing fence through the same transport as those messages. A successfully admitted sealing fence changes closing to sealed. Fresh submissions and fresh synchronous VM entries are then rejected, while accepted queue turns and their nested calls may finish. Fence completion changes sealed to drained before the deadline, or reports cancellation. Drained describes queue progress; the host must still destroy the engine and confirm its platform Worker or thread has exited.
+
+Executable Value operations on a sealed or drained engine return `JSBAY_INSTANCE_NOT_FOUND`. Retain and release keep their owner-thread lifetime protection and remain available until teardown begins; they do not enter JavaScript or run a checkpoint.
+
+Lifecycle cancellation observed at the core completion point takes precedence over a task's execution result, including an in-flight script interrupted by a shutdown deadline. Ordinary JavaScript throws and recoverable per-entry execution limits remain exceptions. Cancellation is terminal for that generation; clearing a manual interrupt cannot resume it.
+
+`jsbay_engine_set_execution_budget` and its SDK equivalents bound each outer VM entry, including nested callbacks and its checkpoint. Zero disables that budget. The absolute execution-time limit and heap limit retain their existing meanings. A deadline is cooperative and cannot preempt arbitrary native code; hosts retain an independent wakeup timer and platform-exit confirmation.
+
 ## Evaluation, values, and modules
 
 Evaluation is synchronous and produces either a live value or an owned thrown value. It is a microtask checkpoint: pending jobs run after the main operation, but a job failure does not replace the main result. If destruction starts during that checkpoint, no saved value is published.
@@ -64,8 +80,7 @@ The JavaScript event loop owns its monotonic clock, timers, waiting, and wakeups
 
 Persistent bytecode cache is optional and only active when both cache directory and version are supplied. Cache read, write, and compile failures fall back to one source execution; a cache failure must not run source twice. A cache hit means executable cached bytes were used, even if that code throws.
 
-Execution and memory limits are controls, not a process sandbox. Per-instance native admission budgets are set with `jsbay_engine_create_with_limits` / `jsbay_engine_set_resource_limits` and inspected with `jsbay_engine_get_resource_usage` and `jsbay_resource_global_usage`; process-wide caps remain shared and nonblocking within an admission class, with a 25% foreground headroom. See [runtime-limits.md](runtime-limits.md) and [backend selection](embedding.md#backend-selection).
-Execution and memory limits are controls, not a process sandbox. See [runtime-limits.md](runtime-limits.md), [host-isolation.md](host-isolation.md), and [backend selection](embedding.md#backend-selection).
+Execution and memory limits are controls, not a process sandbox. Per-instance native admission budgets are set with `jsbay_engine_create_with_limits` / `jsbay_engine_set_resource_limits` and inspected with `jsbay_engine_get_resource_usage` and `jsbay_resource_global_usage`; process-wide caps remain shared and nonblocking within an admission class, with a 25% foreground headroom. See [runtime-limits.md](runtime-limits.md), [host-isolation.md](host-isolation.md), and [backend selection](embedding.md#backend-selection).
 
 Owner-thread observability: `jsbay_engine_get_memory_usage`, `jsbay_engine_run_gc`, and `jsbay_engine_set_event_handler` (telemetry kinds for log / interrupt / memory limit / loop failed). The create-time `jsbay_log_handler_t` remains the console sink. Event handlers must not call engine or value APIs.
 

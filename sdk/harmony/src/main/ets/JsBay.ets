@@ -313,6 +313,16 @@ export interface MemoryUsage {
   shapeCount: bigint;
 }
 
+export interface ValueUsage {
+  live: bigint;
+  peak: bigint;
+  abandoned: bigint;
+}
+
+export interface ShutdownStatus { phase: number; remainingMs: bigint; }
+export interface QueueOutcome { status: number; error: string; }
+export type QueueCallback = (outcome: QueueOutcome) => void;
+
 export class Engine {
   private raw: NativeEngine;
   private instanceId: number;
@@ -362,6 +372,7 @@ export class Engine {
       if (limits === undefined) {
         return new Engine(native.create(instanceId), instanceId);
       }
+
       return new Engine(native.createWithLimits(
         instanceId,
         limits.maxTimers,
@@ -387,6 +398,14 @@ export class Engine {
     return invoke(() => Value.fromNative(checkedCacheDir !== undefined && checkedCacheVersion !== undefined
       ? native.evaluate(this.live(), checkedSource, checkedFilename, checkedCacheDir, checkedCacheVersion)
       : native.evaluate(this.live(), checkedSource, checkedFilename)));
+  }
+  postScript(source: string, filename: string, callback?: QueueCallback): boolean {
+    const done = callback === undefined ? (_: QueueOutcome): void => {} : callback;
+    return invoke(() => native.postScript(this.live(), requireWellFormedText(source), requireWellFormedText(filename), done) as boolean);
+  }
+  postFence(callback?: QueueCallback, sealShutdown: boolean = false): boolean {
+    const done = callback === undefined ? (_: QueueOutcome): void => {} : callback;
+    return invoke(() => native.postFence(this.live(), sealShutdown, done) as boolean);
   }
   global(): Value {
     return invoke(() => Value.fromNative(native.global(this.live())));
@@ -481,6 +500,7 @@ export class Engine {
       return JsBayStatus.InvalidArgument;
     }
     const checked = requireWellFormedText(data);
+
     return native.completeSync(requestId, outcome, kind, checked) as JsBayStatus;
   }
   runLoop(): void {
@@ -503,6 +523,7 @@ export class Engine {
     if (cls !== 0 && cls !== 1) {
       return false;
     }
+
     return native.setAdmissionClass(this.raw, cls) as boolean;
   }
   getAdmissionClass(): number {
@@ -512,6 +533,7 @@ export class Engine {
     if (this.closed) {
       return null;
     }
+
     return native.snapshotEngine(this.instanceId) as InstanceSnapshot | null;
   }
   static listEngines(): number[] {
@@ -520,12 +542,22 @@ export class Engine {
   static snapshot(id: number): InstanceSnapshot | null {
     return native.snapshotEngine(id) as InstanceSnapshot | null;
   }
+  static cancel(instanceId: number, generation: bigint): boolean {
+    return native.cancelEngine(instanceId, generation) as boolean;
+  }
+  static beginShutdown(instanceId: number, generation: bigint, graceMs: bigint): boolean {
+    return native.beginShutdown(instanceId, generation, graceMs) as boolean;
+  }
+  static shutdownStatus(instanceId: number, generation: bigint): ShutdownStatus | null {
+    return native.shutdownStatus(instanceId, generation) as ShutdownStatus | null;
+  }
   /** Keep-alive pause for Hide. Does not detach or clear JS VM timers; clears the platform setTimeout only. */
   suspendLoop(): boolean {
     if (this.closed) {
       return false;
     }
     this.clearLoopTimer();
+
     return native.suspendLoop(this.raw);
   }
   /** Resume after suspendLoop. Does not recreate the engine. */
@@ -543,6 +575,12 @@ export class Engine {
   }
   setExecutionTimeLimit(milliseconds: bigint): boolean {
     return invoke(() => native.setExecutionTimeLimit(this.live(), milliseconds) as boolean);
+  }
+  setExecutionBudget(milliseconds: bigint): boolean {
+    return invoke(() => native.setExecutionBudget(this.live(), milliseconds) as boolean);
+  }
+  getValueUsage(): ValueUsage {
+    return invoke(() => native.getValueUsage(this.live()) as ValueUsage);
   }
   setMemoryLimit(bytes: bigint): boolean {
     return invoke(() => native.setMemoryLimit(this.live(), bytes) as boolean);

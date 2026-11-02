@@ -31,6 +31,11 @@ pub const JscInterruptState = extern struct {
     _pad: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
     deadline_ms: u64,
     instance_id: i32 = -1,
+    budget_millis: u64 = 0,
+    budget_deadline_ms: u64 = 0,
+    budget_depth: usize = 0,
+    shutdown_deadline_ms: u64 = 0,
+    shutdown_phase: c_int = 0,
 };
 
 /// Trampoline for the execution-time-limit watchdog. The system JavaScriptCore build exercised here needs an explicit re-arm after a false return, despite the upstream header documenting that it should invoke the callback again.
@@ -42,11 +47,13 @@ fn jscShouldTerminate(ctx: jsc.JSContextRef, context: ?*anyopaque) callconv(.c) 
     if (req_ptr.load(.monotonic) != 0) return true;
 
     const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
+    const budget_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
+    const shutdown_ptr: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
+    const now: u64 = @intCast(io.monotonicMilliseconds());
     const deadline = deadline_ptr.load(.monotonic);
-    if (deadline != 0) {
-        const now: u64 = @intCast(io.monotonicMilliseconds());
-        if (now >= deadline) return true;
-    }
+    const budget_deadline = budget_ptr.load(.monotonic);
+    const shutdown_deadline = shutdown_ptr.load(.monotonic);
+    if ((deadline != 0 and now >= deadline) or (budget_deadline != 0 and now >= budget_deadline) or (shutdown_deadline != 0 and now >= shutdown_deadline)) return true;
     // Keep the same interval as installation so an interrupt requested after this check can still stop the running script on affected system builds.
     const group = jsc.JSContextGetGroup(ctx);
     JSContextGroupSetExecutionTimeLimit(group, watchdog_period_seconds, jscShouldTerminate, context);

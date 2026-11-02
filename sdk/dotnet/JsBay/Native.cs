@@ -47,6 +47,16 @@ internal static class Native
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void SyncStart(int instanceId, IntPtr userData, ulong requestId,
         ulong thisValue, nuint argc, IntPtr args);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate void SubmissionCallback(int instanceId, ulong generation, int status,
+        IntPtr errorData, nuint errorLength, IntPtr userData);
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ShutdownStatusNative
+    {
+        internal int Phase;
+        internal ulong RemainingMilliseconds;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct ResourceLimitsNative
@@ -144,8 +154,20 @@ internal static class Native
     [return: MarshalAs(UnmanagedType.I1)] internal static extern bool ClearInterrupt(int id);
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "jsbay_engine_set_execution_time_limit")]
     [return: MarshalAs(UnmanagedType.I1)] internal static extern bool SetExecutionTimeLimit(int id, ulong millis);
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "jsbay_engine_set_execution_budget")]
+    [return: MarshalAs(UnmanagedType.I1)] internal static extern bool SetExecutionBudget(int id, ulong millis);
     [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "jsbay_engine_set_memory_limit")]
     [return: MarshalAs(UnmanagedType.I1)] internal static extern bool SetMemoryLimit(int id, ulong bytes);
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "jsbay_engine_cancel")]
+    [return: MarshalAs(UnmanagedType.I1)] internal static extern bool Cancel(int id, ulong generation);
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "jsbay_engine_post_script")]
+    [return: MarshalAs(UnmanagedType.I1)] internal static extern bool PostScript(int id, ulong generation, Utf8 source, Utf8 filename, SubmissionCallback? callback, IntPtr userData);
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "jsbay_engine_post_fence")]
+    [return: MarshalAs(UnmanagedType.I1)] internal static extern bool PostFence(int id, ulong generation, [MarshalAs(UnmanagedType.I1)] bool sealShutdown, SubmissionCallback? callback, IntPtr userData);
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "jsbay_engine_begin_shutdown")]
+    [return: MarshalAs(UnmanagedType.I1)] internal static extern bool BeginShutdown(int id, ulong generation, ulong milliseconds);
+    [DllImport(Library, CallingConvention = CallingConvention.Cdecl, EntryPoint = "jsbay_engine_shutdown_status")]
+    [return: MarshalAs(UnmanagedType.I1)] internal static extern bool GetShutdownStatus(int id, ulong generation, out ShutdownStatusNative status);
 
 
     [StructLayout(LayoutKind.Sequential)]

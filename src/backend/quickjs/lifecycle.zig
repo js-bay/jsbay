@@ -446,7 +446,7 @@ pub const QuickJsBackend = struct {
 
         if (c.jsIsException(result)) {
             const msg = exception.getAndFormatException(ctx);
-            return .{ .result = null, .err = msg, .err_is_heap = true };
+            return .{ .result = null, .err = msg orelse "JavaScript error", .err_is_heap = msg != null };
         }
 
         const ret = if (c.jsIsUndefined(result) or c.jsIsNull(result))

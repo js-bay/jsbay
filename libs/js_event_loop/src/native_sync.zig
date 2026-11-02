@@ -246,6 +246,12 @@ pub const test_only = if (builtin.is_test) struct {
         next_id = id;
         ids_exhausted = false;
     }
+
+    pub fn activeRequestCount() usize {
+        registry_mutex.lock();
+        defer registry_mutex.unlock();
+        return requests.count();
+    }
 } else struct {
     fn notifyCompleteObserver() void {}
     fn notifyWaitObserver() void {}

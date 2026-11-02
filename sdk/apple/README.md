@@ -6,7 +6,7 @@ From this repository, `./build-apple.sh` (or `JSBAY_APPLE_BACKEND`) selects the 
 
 When declaring the dependency in another `Package.swift`, use the package identity SwiftPM resolves from the chosen repository URL in each `.product(..., package: ...)` entry. The two backend repository names can therefore require different `package:` values even though both expose the `JsBaySDK` and `JsBayObjC` products.
 
-`JsBaySDK` is the Swift façade for the public `jsbay.h` Value API. Add the packaged Swift package, create an `Engine` on the thread that will execute JavaScript, and keep all `Value` operations on that same thread. The SDK attaches its automatic driver to that thread's `CFRunLoop`; JavaScript timers run when the host runs that loop and applications never call `tick` or compute deadlines. `runLoop()` temporarily uses the core blocking loop and restores the automatic driver when it returns. `stopLoop()` and `requestInterrupt()` are safe from another thread.
+`JsBaySDK` is the Swift façade for the public `jsbay.h` Value API. Add the packaged Swift package, create an `Engine` on the thread that will execute JavaScript, and keep all `Value` operations on that same thread. The SDK attaches its automatic driver to that thread's `CFRunLoop`; JavaScript timers run when the host runs that loop and applications never call `tick` or compute deadlines. `runLoop()` temporarily uses the core blocking loop and restores the automatic driver when it returns. `stopLoop()`, `requestInterrupt()`, `beginShutdown`, `shutdownStatus`, and `cancel` are safe from another thread.
 
 ### Owner thread and multi-instance hosts
 
@@ -77,6 +77,8 @@ Mach-O member's actual deployment version before publishing the framework.
 Objective-C callers create `JSBayEngine` with `initWithIdentifier:error:` and `JSBayCacheOptions` with `initWithDirectory:version:`. Values come from an engine; sync completions come from a sync starter block. These types disable inherited `init` and `new` because those methods cannot supply the required state.
 
 `SyncCompletion` is a thread-safe, data-only token. A sync starter can hand it to a background queue to `resolveString` / `resolveBytes` / `reject` later (typed UTF-8 string or opaque bytes; not JSON-only). The starter's borrowed `Value` arguments still expire when the block returns.
+
+Swift `postScript` / `postFence` and Objective-C `postScript:filename:completion:error:` / `postFenceSealingShutdown:completion:error:` submit directly to the core FIFO and report completed, exception, or cancelled after their checkpoint. `beginShutdown` followed by a sealing fence drains accepted work; `shutdownStatus` reports the core phase. Each wrapper captures its creation generation, so `cancel` cannot affect a replacement sharing an identifier. `setExecutionBudget` bounds individual entries; execution-time and memory limits keep their existing instance-wide semantics.
 
 From the repository root, run these checks before changing the Apple SDK:
 

@@ -59,13 +59,19 @@ fn cNames(instance_id: i32, user_data: ?*anyopaque, out_names: *?[*]const [*]con
     if (box.names_fn) |f| f(instance_id, box.user_data, &list);
     if (list.len == 0) return;
     // Reuse / grow scratch on the box (stable for the duration of the C++ enumeration call).
+    // Allocate replacements first so a failed grow leaves the previous buffers intact for cFinalize.
     if (box.name_ptrs.len < list.len) {
+        const new_ptrs = std.heap.c_allocator.alloc([*]const u8, list.len) catch return;
+        const new_lens = std.heap.c_allocator.alloc(usize, list.len) catch {
+            std.heap.c_allocator.free(new_ptrs);
+            return;
+        };
         if (box.name_ptrs.len > 0) {
             std.heap.c_allocator.free(box.name_ptrs);
             std.heap.c_allocator.free(box.name_lens);
         }
-        box.name_ptrs = std.heap.c_allocator.alloc([*]const u8, list.len) catch return;
-        box.name_lens = std.heap.c_allocator.alloc(usize, list.len) catch return;
+        box.name_ptrs = new_ptrs;
+        box.name_lens = new_lens;
     }
     for (list, 0..) |n, i| {
         box.name_ptrs[i] = n.ptr;

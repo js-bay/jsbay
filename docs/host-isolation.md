@@ -8,9 +8,7 @@ or a .NET thread with a `SynchronizationContext`). Synchronous `evaluate` and
 value operations block the owner thread; putting that on the UI/main looper
 causes ANRs / freezes.
 
-`requestInterrupt` and `stopLoop` are the ordinary cross-thread controls. Every
-other engine/Value API, including `getMemoryUsage`, `runGc`, destroy, and release,
-must run on the owner thread.
+`requestInterrupt`, `stopLoop`, and generation-scoped shutdown controls may be called from a control thread. The C ABI also accepts cross-thread script and fence submissions; the language SDK wrappers bind submissions to the engine owner thread. Synchronous evaluation, Value operations (including release), `getMemoryUsage`, and `runGc` remain owner-thread operations. The C ABI `jsbay_engine_destroy` is thread-safe and joins teardown when called off-owner; SDK close/dispose follows each wrapper's owner-thread contract. See [api-contract.md](api-contract.md) for accepted-submission and cancellation semantics.
 
 ## Soft failure ≠ crash isolation
 
@@ -24,10 +22,13 @@ They do **not** isolate:
 - process-wide OOM killer decisions
 - deadlocks inside a host callback that never returns
 
-A time limit and an engine thread share the host process address space. When the
-host needs the app to survive an engine fault, run the engine in a **separate
-process** (Android `android:process`, iOS/macOS XPC, Windows job+process) and
-bridge with IPC. The public ABI remains a same-process thin layer.
+A time limit and an engine thread share the host process address space. When the host needs the app to survive an engine fault, it needs a supported separate-process boundary and IPC. The public ABI remains a same-process thin layer.
+
+Android supports a component `android:process` boundary. A production host must use a dedicated Service, bind over Binder, fail every in-flight request when the Service dies, and construct a fresh engine session before accepting new work.
+
+iOS applications cannot spawn a general child process. macOS XPC services do not establish an iOS product design. An iOS host therefore has no generic native-engine crash-isolation implementation in this SDK; `WKWebView` is a different backend with its own process model, not a recovery wrapper for this engine.
+
+Harmony child-process APIs require a device that supports them. Hosts must feature-detect the start result and retain same-process failure semantics when the platform returns `801` (not supported) or `16010004` (multi-process disabled).
 
 The Android device harness `tests/android-sdk/run-crash-isolation-device.sh`
 proves soft failures leave the process alive and documents the child-process
@@ -39,19 +40,15 @@ native-fault containment.
 Same-process JNI/N-API + `libjsbay` still share the host address space: a real
 native abort or segfault inside the engine kills that process.
 
-Containment requires an **out-of-process** boundary. The Linux harness `tests/process-isolation/run.sh` proves it on the host; Android / Apple / Harmony device runners live under `tests/android-sdk/run-process-isolation-device.sh`, `tests/apple-sdk/run-process-isolation-sim.sh`, and `tests/harmony-sdk/run-process-isolation-device.sh`:
+Containment requires an **out-of-process** boundary. The Linux harness `tests/process-isolation/run.sh` proves only a POSIX parent/child boundary on the host. Android / Apple / Harmony runners under `tests/android-sdk/run-process-isolation-device.sh`, `tests/apple-sdk/run-process-isolation-sim.sh`, and `tests/harmony-sdk/run-process-isolation-device.sh` are platform experiments; they do not by themselves prove a publishable mobile-app boundary:
 
 1. Default `-Dlibrary-only` ReleaseFast build exports **no**
    `jsbay_test_trigger_native_fault` (verified with `nm`).
 2. A test-only build with `-Dfault-injection=true` exports that C ABI (abort /
    intentional SIGSEGV / panic). Publish scripts never pass this flag.
-3. A parent process spawns a child that links the fault-injection library and
-   triggers the probe; the child dies; the **parent stays alive** and can spawn
-   a healthy evaluate child afterward.
+3. A parent process spawns a child that links the fault-injection library and triggers the probe; the child dies with the expected signal; the **parent stays alive** and can spawn a healthy evaluate child afterward.
 
-Recommended production shape: engine in a separate process (`android:process`,
-iOS/macOS XPC, Windows job+process) with a thin IPC bridge. The public product
-ABI stays same-process; hosts that need survival must own the process boundary.
+Recommended production shape: Android may use `android:process` with a thin IPC bridge. macOS may use XPC. iOS and unsupported Harmony devices have no equivalent product boundary here. The public product ABI stays same-process; hosts that need survival must own and test the process boundary.
 
 
 ## Observability APIs for reporting
@@ -90,27 +87,22 @@ Soft limits and wrong-thread checks still do **not** contain native faults in-pr
 
 
 
-## Harmony multi-process Ability sketch
+## Harmony child-process capability
 
 Same-process N-API + `libjsbay` still share the Ability process: a Zig abort
 kills that process. Soft limits / `Engine.close` ordering do **not** contain it.
 
-Containment on HarmonyOS:
+The SDK exposes ArkTS and native child-process APIs from API level 12. Availability depends on the device and system capabilities. Hosts must handle unsupported startup results and establish the child-process boundary before relying on native-fault isolation.
 
-1. Put the engine (or a fault probe) in a **second Ability** with
-   `"process": ":jsbay_probe"` in `module.json5` (must match `^[:][0-9a-zA-Z_]+$`,
-   ≤31 chars). That Ability runs in `bundleName:jsbay_probe`.
-2. UI / host Ability starts it via `startAbility`, watches death with
-   `appManager.on('applicationState')` / Ability lifecycle, then restarts.
-3. Link `-Dfault-injection=true` **only** into a test rebuild of the probe
-   process native library. Publish / `build-crash-isolation-hap.sh` product
-   cores must keep `nm` free of `jsbay_test_trigger_native_fault`.
+On a device where the API is supported, a host must:
 
-Device proof today:
+1. Start a child through the platform child-process API and use its documented IPC mechanism.
+2. Give each request a generation and deadline; fail outstanding requests when the child dies or IPC disconnects; construct a new engine generation before retrying.
+3. Link `-Dfault-injection=true` only into a test rebuild of the child native library. Publish product cores must keep `nm` free of `jsbay_test_trigger_native_fault`.
 
-- `tests/harmony-sdk/hap-crash-isolation/` ships `ProbeAbility` + CrashIsolation
-  soft/close harness (`JSBAY_CRASHISO_PASS` on device).
-- Shell-exec of a pushed ELF under `/data/local/tmp` remains **SELinux SKIP**.
-- Real Zig-abort death of `:jsbay_probe` while UI survives still needs the
-  fault-injection probe `.so` wired into ProbeAbility (not in product HAP).
+Harness coverage:
+
+- `tests/harmony-sdk/hap-crash-isolation/` exercises same-process execution limits and close ordering. Its success marker does not establish a child-process boundary.
+- Executing a standalone native binary through a shell does not establish the application's child-process and IPC capabilities; platform security policy may reject it.
+- Real child fault, parent survival, IPC failure, and fresh-generation recovery require a supported device and a fault-injection child test build.
 

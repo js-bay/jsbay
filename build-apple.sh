@@ -12,7 +12,6 @@
 #   JSBAY_SKIP_IOS_ZIG_CONSUMER=1
 #       Skip tests/zig-consumer `zig build check` for aarch64-ios when Zig 0.17
 #       cannot link against Xcode 26+ arm64e-only system TBDs. clang probes still run.
-#       Legacy alias: JS_BAY_SKIP_IOS_ZIG_CONSUMER.
 #   JSBAY_FORCE_IOS_ZIG_CONSUMER=1
 #       Always run the Zig iOS consumer even when the SDK looks arm64e-only.
 #       Legacy alias: JS_BAY_FORCE_IOS_ZIG_CONSUMER.
@@ -252,11 +251,11 @@ ios_sdk_libobjc_arm64e_only() {
 }
 
 check_ios_zig_consumer() {
-    if [ "${JSBAY_SKIP_IOS_ZIG_CONSUMER:-${JS_BAY_SKIP_IOS_ZIG_CONSUMER:-}}" = "1" ]; then
+    if [ "${JSBAY_SKIP_IOS_ZIG_CONSUMER:-}" = "1" ]; then
         echo "WARN: skipping Zig iOS consumer (JSBAY_SKIP_IOS_ZIG_CONSUMER=1); clang link_consumer_probes still validate linking"
         return 0
     fi
-    if [ "${JSBAY_FORCE_IOS_ZIG_CONSUMER:-${JS_BAY_FORCE_IOS_ZIG_CONSUMER:-}}" != "1" ] && ios_sdk_libobjc_arm64e_only; then
+    if [ "${JSBAY_FORCE_IOS_ZIG_CONSUMER:-}" != "1" ] && ios_sdk_libobjc_arm64e_only; then
         echo "WARN: skipping Zig iOS consumer — $IOS_SDK libobjc.A.tbd is arm64e-only; Zig 0.17 cannot link aarch64-ios against it (set JSBAY_FORCE_IOS_ZIG_CONSUMER=1 to override). clang link_consumer_probes still validate linking."
         return 0
     fi

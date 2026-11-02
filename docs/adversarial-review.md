@@ -1,19 +1,19 @@
 # Escargot / Hermes spike — open risks
 
-Hostile review snapshot of the Escargot / Hermes dual-backend spike (`-Dbackend=escargot|hermes`). Gated counts: Escargot **491 / 61 / 0**, Hermes **531 / 30 / 0**. See also `docs/capability.md` and `docs/production-gaps.md`.
+Current-state risk and capability notes for the Escargot / Hermes dual-backend spike (`-Dbackend=escargot|hermes`). These backends are experimental and not production-ready. See also `docs/capability.md` and `docs/production-gaps.md`.
 
 ## Correctness
 
 | Severity | Finding | Mitigation / note |
 |----------|---------|-------------------|
-| Blocker (pre-mainline) | Escargot Context is thread-affine: cross-thread `hostInstall` / AtomicString / GC can SEGV. Same-thread refuse + `skipEscargotEtHost` (~24) hide the crash; they do not fix it. | Document Escargot ET+host as same-thread only; do not read gated pass counts as thick C ABI parity. |
+| Blocker (pre-mainline) | Escargot Context is thread-affine: cross-thread `hostInstall` / AtomicString / GC can SEGV. Same-thread refuse + `skipEscargotEtHost` hide the crash; they do not fix it. | Document Escargot ET+host as same-thread only; do not read gated pass counts as thick C ABI parity. |
 | Blocker (product semantics) | Public `requestInterrupt` does not guarantee mid-script abort. Escargot has no public interrupt hook. Hermes does not arm sticky `asyncTriggerTimeout` on the user-interrupt path (stop/destroy use `requestStopInterrupt`). Spike returns `false` (`supportsMidScriptUserInterrupt`). | Keep return-value honesty; do not claim mid-script stop. |
 | Major | Hermes sticky `asyncTriggerTimeout` poisons later evals unless host exits call `softRearmHermesStopAfterHost` / drain. | Every new host exit must soft-rearm. |
 | Major | `native_handle` / External finalize is teardown-forced (`pending_finals`), not GC-precise. | Do not claim QJS-parity weak/GC finalizers. |
 | Major | Escargot DestroyDefer (destroy-from-host during direct eval) ABRTs under bdwgc — Skip avoids the crash. | Permanent gap; do not peel UnlessGreen blindly. |
 | Minor | Hermes transfer polyfill: source `byteLength` may stay non-zero after detach. | Documented quirk. |
 | Minor | Hermes bytecode error stacks may lack filename (SkipZigTest). | Treat as partial. |
-| Minor | No Hermes `ArrayBuffer.resize` (three permanent Skips). | Do not fake-resize. |
+| Minor | No Hermes `ArrayBuffer.resize` (permanent Skips). | Do not fake-resize. |
 
 ## API / ABI honesty
 
@@ -46,7 +46,7 @@ Hostile review snapshot of the Escargot / Hermes dual-backend spike (`-Dbackend=
 
 ## Android
 
-NDK r27c + AVD `jsbay_api34` (TCG): QuickJS / Escargot / Hermes x86_64 evaluate smokes and `check-c-abi` pass. Full gated suite is not run on the emulator. Details: `docs/android-box-status.md`.
+NDK + emulator smoke for QuickJS / Escargot / Hermes can evaluate basic scripts and `check-c-abi`. Full gated suite is not claimed on the emulator. Details: `docs/android-box-status.md`.
 
 ## Top blockers before mainline / production claims
 
