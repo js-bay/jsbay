@@ -1023,6 +1023,31 @@ const key_fault = if (builtin.is_test) struct {
     }
 };
 
+const sync_start_observer = if (builtin.is_test) struct {
+    const Observer = *const fn (?*anyopaque) void;
+
+    var before_register: ?Observer = null;
+    var after_register: ?Observer = null;
+    var context: ?*anyopaque = null;
+
+    fn set(before: ?Observer, after: ?Observer, observer_context: ?*anyopaque) void {
+        before_register = before;
+        after_register = after;
+        context = observer_context;
+    }
+
+    fn notifyBeforeRegister() void {
+        if (before_register) |observer| observer(context);
+    }
+
+    fn notifyAfterRegister() void {
+        if (after_register) |observer| observer(context);
+    }
+} else struct {
+    fn notifyBeforeRegister() void {}
+    fn notifyAfterRegister() void {}
+};
+
 /// Test-only C-string helpers support Zig regression suites. Production imports receive an empty namespace and only expose the typed execution API.
 pub const test_only = if (builtin.is_test) struct {
     pub const advance = testAdvance;
@@ -1041,6 +1066,7 @@ pub const test_only = if (builtin.is_test) struct {
     pub const threadEvalCString = testThreadEvalCString;
     pub const dispatchCString = testDispatchCString;
     pub const failNextKeyAllocation = key_fault.request;
+    pub const setSyncStartObservers = sync_start_observer.set;
 } else struct {};
 
 // QuickJS measures this budget against the native stack pointer, so it must stay below common host thread stack sizes.
@@ -3700,8 +3726,10 @@ fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: us
     // This covers the host start callback and the native wait. A host may receive queued work while here, but a reentrant tick must not execute it.
     var sync_wait = @import("runtime/js_scheduler.zig").beginSyncWait(instance_id) orelse return API_INSTANCE_NOT_FOUND;
     defer sync_wait.end();
+    sync_start_observer.notifyBeforeRegister();
     const started = native_sync.start(instance_id) orelse return API_OUT_OF_MEMORY;
     defer native_sync.finish(started.id, started.request);
+    sync_start_observer.notifyAfterRegister();
 
     const started_at: u64 = @intCast(@import("platform/io.zig").monotonicMilliseconds());
     var deadline = std.math.add(u64, started_at, binding.timeout_ms) catch std.math.maxInt(u64);
@@ -3709,7 +3737,8 @@ fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: us
     native_sync.tightenDeadline(started.request, deadline);
 
     // The host start callback receives borrowed JS handles only while it is running. It may complete inline, but must otherwise hand only the ID to its system completion path.
-    if (runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) {
+    const shutdown_cancelled = if (runtime_control.shutdownStatus(instance_id)) |shutdown| shutdown.phase == .cancelled else true;
+    if (shutdown_cancelled or runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) {
         native_sync.cancel(started.id);
     } else {
         binding.start(instance_id, binding.user_data, started.id, this_value, argc, args);

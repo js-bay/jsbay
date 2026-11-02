@@ -84,3 +84,44 @@ test "submission: packed-alt script and fence complete after its promise checkpo
         try std.testing.expectEqual(@as(f64, 42), number);
     }
 }
+
+test "submission: empty throws remain failures" {
+    try expectThrowDiagnostic("throw ''");
+}
+
+test "submission: surrogate throws have UTF-8 diagnostics" {
+    try expectThrowDiagnostic("throw '\\uD800'");
+    try expectThrowDiagnostic("throw new Error('\\uD800')");
+    try expectThrowDiagnostic("const failure = new Error('message'); failure.stack = '\\uD800'; throw failure;");
+}
+
+fn expectThrowDiagnostic(source: []const u8) !void {
+    var backends: [4]c_api.BackendC = undefined;
+    const count = c_api.jsbay_available_backends(&backends, backends.len);
+    for (backends[0..count]) |backend_tag| {
+        const id = helpers.nextInstanceId();
+        var options = c_api.EngineCreateOptionsC{ .struct_size = @sizeOf(c_api.EngineCreateOptionsC), .backend = backend_tag };
+        try std.testing.expect(c_api.jsbay_engine_create_with_options(id, &options));
+        defer c_api.jsbay_engine_destroy(id);
+        const token = dispatch.captureInstanceToken(id) orelse return error.MissingToken;
+        var probe = struct {
+            calls: usize = 0,
+            status: submission.Status = .completed,
+            valid_utf8: bool = false,
+            has_message: bool = false,
+            fn record(_: i32, _: u64, status: submission.Status, bytes: ?[*]const u8, length: usize, user_data: ?*anyopaque) callconv(.c) void {
+                const self: *@This() = @ptrCast(@alignCast(user_data orelse unreachable));
+                self.calls += 1;
+                self.status = status;
+                self.has_message = length > 0;
+                self.valid_utf8 = if (bytes) |ptr| std.unicode.utf8ValidateSlice(ptr[0..length]) else false;
+            }
+        }{};
+        try std.testing.expect(submission.postScript(id, token.generation, source, "<throw-submission>", @TypeOf(probe).record, @ptrCast(&probe)));
+        try std.testing.expect(dispatch.tickInstance(id) >= 1);
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try std.testing.expectEqual(submission.Status.exception, probe.status);
+        try std.testing.expect(probe.has_message);
+        try std.testing.expect(probe.valid_utf8);
+    }
+}

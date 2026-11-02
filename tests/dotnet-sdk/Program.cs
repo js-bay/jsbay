@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using JsBay;
 
 if (args.Length == 1)
@@ -224,6 +226,35 @@ using (var submitted = new Engine(41010))
     loopContext.PumpUntil(() => outcomes.Count == 4, TimeSpan.FromSeconds(2));
     Check.Equal(ShutdownPhase.Drained, submitted.GetShutdownStatus()!.Value.Phase, "dotnet shutdown drains through fence");
     Check.Equal(false, submitted.PostScript("1", "submission-rejected.js"), "dotnet sealed shutdown rejects new scripts");
+}
+
+{
+    var outcomes = new List<SubmissionResult>();
+    var stateType = typeof(Engine).GetNestedType("SubmissionState", BindingFlags.NonPublic)!;
+    var state = Activator.CreateInstance(stateType, (Action<SubmissionResult>)(outcomes.Add))!;
+    var handle = GCHandle.Alloc(state);
+    var bytes = new byte[] { 0xed, 0xa0, 0x80 };
+    var errorData = Marshal.AllocHGlobal(bytes.Length);
+    try
+    {
+        Marshal.Copy(bytes, 0, errorData, bytes.Length);
+        var complete = typeof(Engine).GetMethod("CompleteSubmission", BindingFlags.NonPublic | BindingFlags.Static)!;
+        complete.Invoke(null, new object?[] { 0, 0UL, (int)SubmissionStatus.Exception, errorData, (nuint)bytes.Length, GCHandle.ToIntPtr(handle) });
+    }
+    finally { Marshal.FreeHGlobal(errorData); }
+    Check.Equal(1, outcomes.Count, "dotnet malformed diagnostic completes exactly once");
+    Check.Equal(SubmissionStatus.Exception, outcomes[0].Status, "dotnet malformed diagnostic reports exception");
+    Check.Contains("\uFFFD", outcomes[0].Error, "dotnet malformed diagnostic uses replacement text");
+}
+
+using (var malformedDiagnostic = new Engine(41012))
+{
+    var outcomes = new List<SubmissionResult>();
+    Check.Equal(true, malformedDiagnostic.PostScript("throw '\\uD800'", "submission-malformed-diagnostic.js", outcomes.Add), "dotnet malformed diagnostic submission admission");
+    loopContext.PumpUntil(() => outcomes.Count == 1, TimeSpan.FromSeconds(2));
+    Check.Equal(1, outcomes.Count, "dotnet malformed diagnostic completes exactly once through the native callback");
+    Check.Equal(SubmissionStatus.Exception, outcomes[0].Status, "dotnet malformed diagnostic reports exception");
+    Check.Contains("\uFFFD", outcomes[0].Error, "dotnet malformed diagnostic uses replacement text");
 }
 
 using (var busySubmitted = new Engine(41011))

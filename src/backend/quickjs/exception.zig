@@ -33,6 +33,8 @@ pub fn getAndFormatException(ctx: ?*qjs.JSContext) ?[]const u8 {
     c.jsbay_qjs_JS_FreeValue(ctx, exc);
 
     if (buf.items.len == 0) return null;
+    // Diagnostics cross SDK boundaries that require valid UTF-8. Lone UTF-16 surrogates become replacement characters.
+    std.unicode.wtf8ToUtf8Lossy(buf.items, buf.items) catch return null;
     return buf.toOwnedSlice(std.heap.c_allocator) catch null;
 }
 

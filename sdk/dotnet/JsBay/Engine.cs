@@ -13,6 +13,8 @@ namespace JsBay;
 public sealed class Engine : IDisposable
 {
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
+    private static readonly UTF8Encoding ReplacementUtf8 = new(false, false);
+    private const string UndecodableSubmissionDiagnostic = "Submission diagnostic could not be decoded.";
     private readonly int ownerThreadId = Environment.CurrentManagedThreadId;
     private readonly object lifetime = new();
     private readonly ulong generation;
@@ -608,9 +610,18 @@ public sealed class Engine : IDisposable
                 return;
             }
 
+            string error;
             try
             {
-                var error = errorLength == 0 ? string.Empty : CopySubmissionError(errorData, errorLength);
+                error = errorLength == 0 ? string.Empty : CopySubmissionError(errorData, errorLength);
+            }
+            catch
+            {
+                error = UndecodableSubmissionDiagnostic;
+            }
+
+            try
+            {
                 state.Completion(new SubmissionResult((SubmissionStatus)status, error));
             }
             catch { }
@@ -622,7 +633,7 @@ public sealed class Engine : IDisposable
     {
         var bytes = new byte[checked((int)length)];
         Marshal.Copy(data, bytes, 0, bytes.Length);
-        return StrictUtf8.GetString(bytes);
+        return ReplacementUtf8.GetString(bytes);
     }
 
     private sealed class SubmissionState(Action<SubmissionResult> completion)

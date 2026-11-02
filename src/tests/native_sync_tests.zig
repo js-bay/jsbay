@@ -6,6 +6,7 @@ const testing = std.testing;
 const c_api = @import("../c_api.zig");
 const helpers = @import("test_helpers.zig");
 const io = @import("../platform/io.zig");
+const native_sync = @import("js_event_loop").native_sync;
 
 const kind_string: c_int = 0;
 const kind_bytes: c_int = 1;
@@ -59,6 +60,46 @@ fn start(instance_id: i32, data: ?*anyopaque, request_id: u64, _: u64, _: usize,
             probe.thread = std.Thread.spawn(.{}, completeLater, .{probe}) catch unreachable;
             probe.thread2 = std.Thread.spawn(.{}, interruptLater, .{probe}) catch unreachable;
         },
+    }
+}
+
+const ShutdownCancelProbe = struct {
+    id: i32,
+    generation: u64,
+    start_calls: usize = 0,
+    cancel_calls: usize = 0,
+
+    fn cancel(context: ?*anyopaque) void {
+        const self: *ShutdownCancelProbe = @ptrCast(@alignCast(context orelse unreachable));
+        self.cancel_calls += 1;
+        testing.expect(c_api.jsbay_engine_cancel(self.id, self.generation)) catch unreachable;
+    }
+
+    fn start(_: i32, context: ?*anyopaque, _: u64, _: u64, _: usize, _: ?[*]const u64) callconv(.c) void {
+        const self: *ShutdownCancelProbe = @ptrCast(@alignCast(context orelse unreachable));
+        self.start_calls += 1;
+    }
+};
+
+test "native sync: shutdown cancellation before or after registration skips host start" {
+    inline for ([_]enum { before, after }{ .before, .after }) |phase| {
+        const id = helpers.nextInstanceId();
+        try testing.expect(c_api.jsbay_engine_create(id, null, null));
+        defer c_api.jsbay_engine_destroy(id);
+        var snapshot: c_api.InstanceSnapshotC = undefined;
+        snapshot.struct_size = @sizeOf(c_api.InstanceSnapshotC);
+        try testing.expect(c_api.jsbay_engine_snapshot(id, &snapshot));
+        var probe = ShutdownCancelProbe{ .id = id, .generation = snapshot.generation };
+        var function: u64 = 0;
+        var exception: u64 = 0;
+        try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_bind_sync(id, .{ .data = "syncShutdownCancel".ptr, .len = 18 }, ShutdownCancelProbe.start, @ptrCast(&probe), null, 500, &function, &exception));
+        defer _ = c_api.jsbay_value_release(function);
+        c_api.test_only.setSyncStartObservers(if (phase == .before) ShutdownCancelProbe.cancel else null, if (phase == .after) ShutdownCancelProbe.cancel else null, @ptrCast(&probe));
+        defer c_api.test_only.setSyncStartObservers(null, null, null);
+        try evalException(id, "syncShutdownCancel()");
+        try testing.expectEqual(@as(usize, 1), probe.cancel_calls);
+        try testing.expectEqual(@as(usize, 0), probe.start_calls);
+        try testing.expectEqual(@as(usize, 0), native_sync.test_only.activeRequestCount());
     }
 }
 
