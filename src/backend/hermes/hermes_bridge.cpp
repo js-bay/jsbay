@@ -547,6 +547,55 @@ extern "C" HermesValue hermes_dup(JsbayHermesContext *c, HermesValue v) {
 }
 extern "C" void hermes_free_value(JsbayHermesContext *c, HermesValue v) { release(c, asVal(v)); }
 
+struct HermesRootIdentity {
+    enum class Kind { Weak, Strong };
+    Kind kind;
+    std::unique_ptr<jsi::WeakObject> weak;
+    std::unique_ptr<jsi::Value> strong;
+};
+
+extern "C" HermesRootIdentity *hermes_root_identity_create(JsbayHermesContext *c, HermesValue v) {
+    if (!c || !c->rt || !v) return nullptr;
+    try {
+        auto *id = new HermesRootIdentity();
+        jsi::Value &src = *asVal(v);
+        if (src.isObject()) {
+            id->kind = HermesRootIdentity::Kind::Weak;
+            id->weak = std::make_unique<jsi::WeakObject>(*c->rt, src.getObject(*c->rt));
+        } else {
+            // Primitives are not GC targets for Rooted; keep a durable copy outside the protect map.
+            id->kind = HermesRootIdentity::Kind::Strong;
+            id->strong = std::make_unique<jsi::Value>(*c->rt, src);
+        }
+        return id;
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" HermesValue hermes_root_protect(JsbayHermesContext *c, HermesRootIdentity *id) {
+    if (!c || !c->rt || !id) return nullptr;
+    try {
+        if (id->kind == HermesRootIdentity::Kind::Weak) {
+            if (!id->weak) return nullptr;
+            jsi::Value locked = id->weak->lock(*c->rt);
+            // WeakObject::lock returns undefined when the target has been collected.
+            if (locked.isUndefined()) return nullptr;
+            return retainMove(c, std::move(locked));
+        }
+        if (!id->strong) return nullptr;
+        return retainMove(c, jsi::Value(*c->rt, *id->strong));
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+extern "C" void hermes_root_identity_free(JsbayHermesContext *c, HermesRootIdentity *id) {
+    (void)c;
+    delete id;
+}
+
+
 extern "C" bool hermes_is_undefined(HermesValue v) { return !v || asVal(v)->isUndefined(); }
 extern "C" bool hermes_is_null(HermesValue v) { return v && asVal(v)->isNull(); }
 extern "C" bool hermes_is_bool(HermesValue v) { return v && asVal(v)->isBool(); }
@@ -1941,16 +1990,99 @@ extern "C" bool hermes_promise_create(JsbayHermesContext *c, HermesValue *out_pr
 }
 
 extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue promise, int state, HermesValue result) {
-    if (!c || !promise) return;
-    std::lock_guard<std::mutex> lock(c->promise_mu);
-    auto it = c->promise_state.find(asVal(promise));
-    if (it == c->promise_state.end()) return;
-    if (it->second.second) release(c, it->second.second);
-    jsi::Value *res = nullptr;
-    if (result) {
-        res = asVal(retainMove(c, jsi::Value(*c->rt, *asVal(result))));
+    if (!c || !c->rt || !promise) return;
+    jsi::Value *pkey = asVal(promise);
+
+    // Rejection reasons are not adopted — record immediately.
+    if (state == 2) {
+        jsi::Value *old_res = nullptr;
+        jsi::Value *new_res = nullptr;
+        if (result) {
+            try {
+                new_res = asVal(retainMove(c, jsi::Value(*c->rt, *asVal(result))));
+            } catch (...) {
+                new_res = nullptr;
+            }
+        }
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(c->promise_mu);
+            auto it = c->promise_state.find(pkey);
+            if (it != c->promise_state.end()) {
+                old_res = it->second.second;
+                it->second = {2, new_res};
+                found = true;
+            }
+        }
+        if (!found && new_res) release(c, new_res);
+        if (old_res) release(c, old_res);
+        return;
     }
-    it->second = {state, res};
+
+    if (state != 1) return;
+
+    // Resolve may adopt a thenable/promise. Leave the side table pending and update from
+    // the Deferred promise's own fulfillment/rejection handlers after microtask drain.
+    try {
+        auto &rt = *c->rt;
+        jsi::Object po = pkey->asObject(rt);
+        auto onFulfilled = jsi::Function::createFromHostFunction(
+            rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseFulfilled"), 1,
+            [c, pkey](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                jsi::Value v = (count >= 1) ? jsi::Value(rt2, args[0]) : jsi::Value::undefined();
+                jsi::Value *new_res = nullptr;
+                try {
+                    new_res = asVal(retainMove(c, std::move(v)));
+                } catch (...) {
+                    return jsi::Value::undefined();
+                }
+                jsi::Value *old_res = nullptr;
+                bool keep = false;
+                {
+                    std::lock_guard<std::mutex> lock(c->promise_mu);
+                    auto it = c->promise_state.find(pkey);
+                    if (it == c->promise_state.end() || it->second.first != 0) {
+                        // Forgotten or already recorded — drop the new retain.
+                    } else {
+                        old_res = it->second.second;
+                        it->second = {1, new_res};
+                        keep = true;
+                    }
+                }
+                if (!keep && new_res) release(c, new_res);
+                if (old_res) release(c, old_res);
+                return jsi::Value::undefined();
+            });
+        auto onRejected = jsi::Function::createFromHostFunction(
+            rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseRejected"), 1,
+            [c, pkey](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                jsi::Value v = (count >= 1) ? jsi::Value(rt2, args[0]) : jsi::Value::undefined();
+                jsi::Value *new_res = nullptr;
+                try {
+                    new_res = asVal(retainMove(c, std::move(v)));
+                } catch (...) {
+                    return jsi::Value::undefined();
+                }
+                jsi::Value *old_res = nullptr;
+                bool keep = false;
+                {
+                    std::lock_guard<std::mutex> lock(c->promise_mu);
+                    auto it = c->promise_state.find(pkey);
+                    if (it == c->promise_state.end() || it->second.first != 0) {
+                    } else {
+                        old_res = it->second.second;
+                        it->second = {2, new_res};
+                        keep = true;
+                    }
+                }
+                if (!keep && new_res) release(c, new_res);
+                if (old_res) release(c, old_res);
+                return jsi::Value::undefined();
+            });
+        auto then = po.getPropertyAsFunction(rt, "then");
+        then.callWithThis(rt, po, onFulfilled, onRejected);
+    } catch (...) {
+    }
 }
 
 extern "C" bool hermes_is_promise(JsbayHermesContext *c, HermesValue v) {

@@ -7,7 +7,7 @@
 //! - `Local` — backend Value. No retain; lifetime follows the active backend's ownership rules (refcount or GC root).
 //! - `Global(T)` — retained across scopes. `init` duplicates the value; the retained value is released on `reset` (or when the owning engine is destroyed, see `engine.destroy` → bookkeeping walk).
 //! - `Weak(T)` — **true weak** reference on JS objects. `get()` returns null once the target has been garbage collected. See "Weak semantics" below.
-//! - `Rooted` — refcounted GC root. `root` calls the backend protect only on the 0→1 edge; `unroot` releases only when the count returns to 0. `Global` is unchanged and still protects exactly once.
+//! - `Rooted` — refcounted GC root. `root` calls the backend protect only on the 0→1 edge; `unroot` releases only when the count returns to 0. On Hermes the protect-map wrapper is separate from a reusable weak identity so re-rooting a still-live object works after unroot. `Global` is unchanged and still protects exactly once.
 //! - `Scope` — threadlocal stack that `currentInstanceId()` reads. Not yet required before every API call; exists so consumers can query the active engine id without passing it everywhere.
 //! - `StackFrameScope` — thin wrapper around `dupValue` for values that need to escape a frame.
 //!
@@ -273,11 +273,18 @@ fn weakBackendRelease(ctx: ActiveEngine.Context, cell: *WeakCell) void {
 }
 
 /// One native retain (refcount dup or GC protect). Callers (Rooted) must not invoke this on every `root()`.
-fn rootBackendProtect(ctx: ActiveEngine.Context, v: Local) Local {
+/// Hermes uses `cell.identity` (weak object / durable primitive) so re-root works after the protect-map wrapper is released.
+fn rootBackendProtect(ctx: ActiveEngine.Context, cell: *RootCell) ?Local {
     return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootProtect(ctx, v),
-        .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootProtect(ctx, v),
-        .escargot, .hermes => ActiveEngine.dupValue(ctx, v),
+        .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootProtect(ctx, cell.val),
+        .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootProtect(ctx, cell.val),
+        .escargot => ActiveEngine.dupValue(ctx, cell.val),
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            const id = cell.identity orelse break :blk null;
+            const v = c.hermes_root_protect(ctx, @ptrCast(id));
+            break :blk if (v == null) null else v;
+        },
     };
 }
 
@@ -287,6 +294,24 @@ fn rootBackendUnprotect(ctx: ActiveEngine.Context, v: Local) void {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootUnprotect(ctx, v),
         .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootUnprotect(ctx, v),
         .escargot, .hermes => ActiveEngine.freeValue(ctx, v),
+    }
+}
+
+fn rootBackendIdentityCreate(ctx: ActiveEngine.Context, v: Local) ?*anyopaque {
+    return switch (backend.active_backend) {
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            break :blk @ptrCast(c.hermes_root_identity_create(ctx, v));
+        },
+        else => null,
+    };
+}
+
+fn rootBackendIdentityFree(ctx: ?ActiveEngine.Context, identity: ?*anyopaque) void {
+    const id = identity orelse return;
+    if (comptime backend.active_backend == .hermes) {
+        const c = @import("../backend/hermes/c_api.zig");
+        c.hermes_root_identity_free(ctx, @ptrCast(id));
     }
 }
 
@@ -456,10 +481,14 @@ pub fn Weak(comptime T: type) type {
 // ----------------------------------------------------------------------
 
 /// Heap cell for `Rooted`. The native retain is a single protect/dup held only while `root_count > 0`. Extra `root` calls bump the counter and do not call the backend again.
+///
+/// On Hermes, `identity` holds a reusable weak object reference (or durable primitive copy) separate from the protect-map wrapper in `val`. Unroot releases only the wrapper so a later `root` can protect the still-live object again.
 const RootCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
     val: ActiveEngine.Value,
+    /// Hermes-only durable identity (`HermesRootIdentity`). Null on other backends.
+    identity: ?*anyopaque = null,
     root_count: u32 = 0,
     /// True while the single native protect/dup from `rootBackendProtect` is outstanding.
     protected: bool = false,
@@ -468,11 +497,16 @@ const RootCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *RootCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
+        const ctx = ctxForInstance(cell.instance_id);
         if (cell.protected) {
-            if (ctxForInstance(cell.instance_id)) |ctx| {
-                rootBackendUnprotect(ctx, cell.val);
+            if (ctx) |c| {
+                rootBackendUnprotect(c, cell.val);
             }
             cell.protected = false;
+        }
+        if (cell.identity) |id| {
+            rootBackendIdentityFree(ctx, id);
+            cell.identity = null;
         }
         cell.root_count = 0;
         cell.released = true;
@@ -482,6 +516,8 @@ const RootCell = struct {
 /// Refcounted root of one JS value.
 ///
 /// `root` twice then `unroot` once leaves the value protected. A further `unroot` that brings the count to 0 drops the native retain, after which a GC may collect the object. `unroot` at 0 is a no-op. This does not change `Global`, which still protects exactly once in `init`.
+///
+/// Hermes keeps a weak identity across unroot so re-rooting a still-live object creates a fresh protect-map wrapper; other backends reuse the durable value handle itself.
 ///
 /// The cell is registered with engine bookkeeping so `engine.destroy` releases a leftover protect before the runtime is freed.
 pub const Rooted = struct {
@@ -493,14 +529,21 @@ pub const Rooted = struct {
         const ctx = ctxForInstance(instance_id) orelse {
             return Rooted{ .instance_id = instance_id, .cell = null };
         };
-        _ = ctx;
         const cell = std.heap.c_allocator.create(RootCell) catch {
             return Rooted{ .instance_id = instance_id, .cell = null };
         };
+        const identity = rootBackendIdentityCreate(ctx, v);
+        if (comptime backend.active_backend == .hermes) {
+            if (identity == null) {
+                std.heap.c_allocator.destroy(cell);
+                return Rooted{ .instance_id = instance_id, .cell = null };
+            }
+        }
         cell.* = .{
             .entry = .{ .reset_fn = RootCell.releaseValue },
             .instance_id = instance_id,
             .val = v,
+            .identity = identity,
         };
         registerEntry(instance_id, &cell.entry);
         return Rooted{ .instance_id = instance_id, .cell = cell };
@@ -517,7 +560,8 @@ pub const Rooted = struct {
         if (cell.released) return;
         if (cell.root_count == 0) {
             const ctx = ctxForInstance(self.instance_id) orelse return;
-            cell.val = rootBackendProtect(ctx, cell.val);
+            const protected_val = rootBackendProtect(ctx, cell) orelse return;
+            cell.val = protected_val;
             cell.protected = true;
         }
         cell.root_count += 1;
@@ -533,6 +577,10 @@ pub const Rooted = struct {
                 rootBackendUnprotect(ctx, cell.val);
             }
             cell.protected = false;
+            // Hermes: drop the freed wrapper address; re-root rebuilds from `identity`.
+            if (comptime backend.active_backend == .hermes) {
+                cell.val = ActiveEngine.undefinedValue();
+            }
         }
     }
 

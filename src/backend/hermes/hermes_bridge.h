@@ -46,6 +46,12 @@ HermesValue hermes_new_array(JsbayHermesContext *ctx, uint32_t len);
 HermesValue hermes_dup(JsbayHermesContext *ctx, HermesValue v);
 void hermes_free_value(JsbayHermesContext *ctx, HermesValue v);
 
+/* Rooted identity: reusable weak/strong reference separate from protect-map wrappers. */
+typedef struct HermesRootIdentity HermesRootIdentity;
+HermesRootIdentity *hermes_root_identity_create(JsbayHermesContext *ctx, HermesValue v);
+HermesValue hermes_root_protect(JsbayHermesContext *ctx, HermesRootIdentity *id);
+void hermes_root_identity_free(JsbayHermesContext *ctx, HermesRootIdentity *id);
+
 bool hermes_is_undefined(HermesValue v);
 bool hermes_is_null(HermesValue v);
 bool hermes_is_bool(HermesValue v);

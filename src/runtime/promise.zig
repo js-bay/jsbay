@@ -22,7 +22,7 @@
 //!
 //! On QuickJS, calling the resolve/reject function schedules the `.then` / `.catch` handlers as pending jobs. `resolve`/`reject` explicitly drains the job queue via `processPendingJobs` so callers see the side effects synchronously, mirroring the behaviour of `evalScript`. On JSC microtasks are drained automatically by the engine when control returns to the VM.
 //!
-//! `state` / `result` report pending, fulfilled, or rejected. On QuickJS that is `JS_PromiseState` / `JS_PromiseResult` (result fails while pending). On JSC the public C API cannot read promise state, so the record is the one written by `create` / `resolve` / `reject`.
+//! `state` / `result` report pending, fulfilled, or rejected. On QuickJS that is `JS_PromiseState` / `JS_PromiseResult` (result fails while pending). On JSC the public C API cannot read promise state, so the record is the one written by `create` / `resolve` / `reject`. On Hermes, reject records the reason immediately; resolve attaches fulfillment/rejection handlers so thenable adoption is reflected after microtask drain.
 //!
 //! `setRejectionTracker` registers a per-instance host callback. QuickJS uses `JS_SetHostPromiseRejectionTracker`; Escargot uses `VMInstanceRef::registerPromiseRejectCallback`. Both report an unhandled rejection only after the current microtask drain. A synchronous `.catch` therefore does not notify; a later `.catch` notifies with `handled=true`. JSC has no equivalent public hook (returns false). Hermes uses HermesInternal.enablePromiseRejectionTracker plus a host flush after microtask drain (Escargot-style).
 
@@ -98,19 +98,21 @@ pub const Deferred = struct {
             ActiveEngine.freeValue(ctx, r);
         }
 
-        // Drain microtask queue so .then / .catch callbacks run synchronously.
-        ActiveEngine.processPendingJobs(ctx);
-
         self.settled = true;
-        if (backend.isJscApiBackend(backend.active_backend) and call_ok) {
-            noteJscSettlement(ctx, self.instance_id, self.promise, slot == &self.resolve_fn, value);
-        }
+        // Hermes: note before drain so resolve attaches settlement handlers that this drain can run. Reject records immediately; resolve observes actual fulfillment/rejection (thenable adoption included).
         if (comptime backend.active_backend == .hermes) {
             if (call_ok) {
                 const c = @import("../backend/hermes/c_api.zig");
                 const st: c_int = if (slot == &self.resolve_fn) 1 else 2;
                 c.hermes_promise_note_settled(ctx, self.promise, st, value);
             }
+        }
+
+        // Drain microtask queue so .then / .catch callbacks run synchronously.
+        ActiveEngine.processPendingJobs(ctx);
+
+        if (backend.isJscApiBackend(backend.active_backend) and call_ok) {
+            noteJscSettlement(ctx, self.instance_id, self.promise, slot == &self.resolve_fn, value);
         }
         // Release the resolving callbacks but keep `promise_keep` alive — the caller may still be holding `self.promise` (e.g. it was already returned to JS, but the Deferred remains on their stack until deinit).
         self.resolve_fn.reset();
