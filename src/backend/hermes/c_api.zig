@@ -87,7 +87,7 @@ pub extern fn hermes_new_symbol(ctx: ?*Context, desc: ?[*]const u8, desc_len: us
 pub extern fn hermes_symbol_for(ctx: ?*Context, key: ?[*]const u8, key_len: usize) Value;
 
 pub extern fn hermes_is_date(ctx: ?*Context, v: Value) bool;
-pub extern fn hermes_date_to_ms(ctx: ?*Context, v: Value) i64;
+pub extern fn hermes_date_to_ms(ctx: ?*Context, v: Value, out: *i64) bool;
 pub extern fn hermes_new_date(ctx: ?*Context, ms: i64) Value;
 pub extern fn hermes_is_bigint(v: Value) bool;
 pub extern fn hermes_new_bigint_i64(ctx: ?*Context, v: i64) Value;

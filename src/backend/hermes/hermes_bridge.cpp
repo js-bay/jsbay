@@ -721,9 +721,14 @@ extern "C" HermesValue hermes_get_global(JsbayHermesContext *c) {
     catch (...) { return nullptr; }
 }
 extern "C" HermesValue hermes_get_property(JsbayHermesContext *c, HermesValue obj, const char *key) {
-    if (!c || !c->rt || !obj || !asVal(obj)->isObject()) return nullptr;
+    // GetV: null/undefined fail; other primitives ToObject then get. Non-result path cannot surface TypeError.
+    if (!c || !c->rt || !obj || !key) return nullptr;
     try {
-        return retainMove(c, asVal(obj)->getObject(*c->rt).getProperty(*c->rt, key));
+        if (asVal(obj)->isNull() || asVal(obj)->isUndefined()) return nullptr;
+        jsi::Object target = asVal(obj)->isObject()
+            ? asVal(obj)->getObject(*c->rt)
+            : c->rt->global().getPropertyAsFunction(*c->rt, "Object").call(*c->rt, *asVal(obj)).asObject(*c->rt);
+        return retainMove(c, target.getProperty(*c->rt, key));
     } catch (...) { return nullptr; }
 }
 extern "C" bool hermes_set_property(JsbayHermesContext *c, HermesValue obj, const char *key, HermesValue val) {
@@ -994,15 +999,18 @@ extern "C" bool hermes_is_date(JsbayHermesContext *c, HermesValue v) {
     if (!c || !c->rt || !v) return false;
     return instanceOfGlobal(*c->rt, *asVal(v), "Date");
 }
-extern "C" int64_t hermes_date_to_ms(JsbayHermesContext *c, HermesValue v) {
-    if (!c || !c->rt || !v) return 0;
+extern "C" bool hermes_date_to_ms(JsbayHermesContext *c, HermesValue v, int64_t *out) {
+    if (!c || !c->rt || !v || !out) return false;
     try {
         auto o = asVal(v)->getObject(*c->rt);
         auto getTime = o.getPropertyAsFunction(*c->rt, "getTime");
         auto r = getTime.callWithThis(*c->rt, o);
-        if (!r.isNumber()) return 0;
-        return (int64_t)r.getNumber();
-    } catch (...) { return 0; }
+        if (!r.isNumber()) return false;
+        double d = r.getNumber();
+        if (!std::isfinite(d)) return false;
+        *out = (int64_t)d;
+        return true;
+    } catch (...) { return false; }
 }
 extern "C" HermesValue hermes_new_date(JsbayHermesContext *c, int64_t ms) {
     if (!c || !c->rt) return nullptr;
@@ -1602,7 +1610,9 @@ extern "C" HermesValue hermes_new_error(JsbayHermesContext *c, int kind, const c
     } catch (...) { return nullptr; }
 }
 
-// ---- Round 3: construct / has / delete / keys / instanceof / promise / external / weak ----
+// ---- construct / has / delete / keys / instanceof / promise / external / weak ----
+
+static jsi::Value makeTypeError(jsi::Runtime &rt, const char *msg);
 
 static HermesOpResult hopFail(JsbayHermesContextOpaque *c, jsi::Value &&exc) {
     HermesOpResult out{nullptr, nullptr};
@@ -1640,9 +1650,16 @@ static HermesBoolOpResult hboolOk(bool v) { return HermesBoolOpResult{v, nullptr
 
 extern "C" HermesOpResult hermes_get_property_result(JsbayHermesContext *c, HermesValue obj, const char *key) {
     HermesOpResult out{nullptr, nullptr};
-    if (!c || !c->rt || !obj || !key || !asVal(obj)->isObject()) return out;
+    if (!c || !c->rt || !key) return out;
+    // hermes_undefined() is nullptr; null is a retained Null value. Both must TypeError (GetV / ToObject).
+    if (!obj || asVal(obj)->isUndefined() || asVal(obj)->isNull()) {
+        return hopFail(c, makeTypeError(*c->rt, "Cannot convert undefined or null to object"));
+    }
     try {
-        return hopOk(c, asVal(obj)->getObject(*c->rt).getProperty(*c->rt, key));
+        jsi::Object target = asVal(obj)->isObject()
+            ? asVal(obj)->getObject(*c->rt)
+            : c->rt->global().getPropertyAsFunction(*c->rt, "Object").call(*c->rt, *asVal(obj)).asObject(*c->rt);
+        return hopOk(c, target.getProperty(*c->rt, key));
     } catch (const jsi::JSError &e) {
         return hopFail(c, jsi::Value(*c->rt, e.value()));
     } catch (...) {

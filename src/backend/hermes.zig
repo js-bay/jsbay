@@ -144,7 +144,9 @@ pub const HermesBackend = struct {
     }
     pub fn toDateMs(ctx: Context, v: Value) ?i64 {
         if (!isDate(ctx, v)) return null;
-        return c_api.hermes_date_to_ms(ctx, v);
+        var out: i64 = 0;
+        if (!c_api.hermes_date_to_ms(ctx, v, &out)) return null;
+        return out;
     }
     pub fn newDate(ctx: Context, ms: i64) Value {
         return c_api.hermes_new_date(ctx, ms);

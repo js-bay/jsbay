@@ -557,11 +557,12 @@ extern "C" EscargotValue escargot_get_global(EscargotContext *c) {
 }
 
 extern "C" EscargotValue escargot_get_property(EscargotContext *c, EscargotValue obj, const char *key) {
+    // GetV via toObject; non-result path collapses TypeError to nullptr.
     if (!c || !obj || !key) return nullptr;
     auto er = Evaluator::execute(c->ctx.get(),
         [](ExecutionStateRef *state, ValueRef *o, const char *k) -> ValueRef * {
-            if (!o->isObject()) return ValueRef::createUndefined();
-            return o->asObject()->get(state, StringRef::createFromUTF8(k, std::strlen(k)));
+            ObjectRef *target = o->toObject(state);
+            return target->get(state, StringRef::createFromUTF8(k, std::strlen(k)));
         },
         asVal(obj), key);
     if (!er.isSuccessful()) return nullptr;
@@ -804,9 +805,12 @@ extern "C" bool escargot_is_date(EscargotContext *c, EscargotValue v) {
     (void)c;
     return v && asVal(v)->isDateObject();
 }
-extern "C" int64_t escargot_date_to_ms(EscargotContext *c, EscargotValue v) {
-    if (!c || !v || !asVal(v)->isDateObject()) return 0;
-    return (int64_t)asVal(v)->asDateObject()->primitiveValue();
+extern "C" bool escargot_date_to_ms(EscargotContext *c, EscargotValue v, int64_t *out) {
+    if (!c || !v || !out || !asVal(v)->isDateObject()) return false;
+    double d = asVal(v)->asDateObject()->primitiveValue();
+    if (!std::isfinite(d)) return false;
+    *out = (int64_t)d;
+    return true;
 }
 extern "C" EscargotValue escargot_new_date(EscargotContext *c, int64_t ms) {
     if (!c) return nullptr;
@@ -1544,8 +1548,9 @@ extern "C" EscargotOpResult escargot_get_property_result(EscargotContext *c, Esc
     if (!c || !obj || !key) return out;
     auto er = Evaluator::execute(c->ctx.get(),
         [](ExecutionStateRef *state, ValueRef *o, const char *k) -> ValueRef * {
-            if (!o->isObject()) return ValueRef::createUndefined();
-            return o->asObject()->get(state, StringRef::createFromUTF8(k, std::strlen(k)));
+            // GetV: null/undefined TypeError via toObject; other primitives box then get.
+            ObjectRef *target = o->toObject(state);
+            return target->get(state, StringRef::createFromUTF8(k, std::strlen(k)));
         },
         asVal(obj), key);
     if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));

@@ -1,6 +1,6 @@
-# Android Escargot / Hermes status
+# Android Escargot / Hermes support
 
-Current Android x86_64 spike status for Escargot and Hermes backends (NDK r27c, AVD `jsbay_api34`). Not a production packaging guide.
+Current constraints and reproducible verify steps for Escargot and Hermes on Android x86_64 (NDK r27c, AVD `jsbay_api34`). Not a production packaging guide.
 
 ## Toolchain
 
@@ -22,15 +22,33 @@ Current Android x86_64 spike status for Escargot and Hermes backends (NDK r27c, 
 
 Host `vendor/{escargot,hermes,icu}-install` trees are **linux glibc** — do not use them for Android links.
 
-## Smoke status
+## Constraints
 
-| Backend | Zig library-only | NDK shared `.so` | Emulator C ABI evaluate (`1+2`) | `check-c-abi` |
-|---------|------------------|------------------|----------------------------------|---------------|
-| QuickJS | yes | yes | pass (`jsbay-qjs-android-smoke-ok`) | pass |
-| Escargot | yes | yes (do not re-link `escargot_bridge.o`; already in the Zig archive) | pass (`jsbay-escargot-android-smoke-ok`) | pass |
-| Hermes | yes | yes (push x86_64 `libc++_shared.so`, not i686) | pass (`jsbay-hermes-android-smoke-ok`) | pass |
+- Spike support targets Android **x86_64** API 24+ with the NDK prefixes above; aarch64 Android engine prefixes are out of scope for this document.
+- Product packaging (AAR / multi-ABI) is separate; this page covers library-only Zig archives plus NDK shared objects linked from those archives.
+- Escargot NDK links must not re-link `escargot_bridge.o` (already in the Zig archive).
+- Hermes device/emulator `LD_LIBRARY_PATH` must include x86_64 `libhermes_{bridge,vm}.so`, `libjsi.so`, and x86_64 `libc++_shared.so` (not an i686 copy).
+- `jsbay_engine_create_with_options` is force-exported from library-only builds via `@export` in `src/root.zig`.
+- Zig 0.17 `process.run` does not PATH-search relative `cc`/`c++`; `tools/src/main.zig` `resolvePathCmd` uses absolute compiler paths for `check-c-abi`.
+- Full gated `unit_tests` on a TCG emulator is not part of the smoke path; host linux gated counts live in `docs/capability.md` / `docs/production-gaps.md`.
 
-`jsbay_engine_create_with_options` is force-exported from library-only builds via `@export` in `src/root.zig`. Zig 0.17 `process.run` does not PATH-search relative `cc`/`c++`; `tools/src/main.zig` `resolvePathCmd` uses absolute compiler paths for `check-c-abi`.
+## Verify (smoke)
+
+Build a library-only archive, NDK-link a shared object, push it to the AVD, and evaluate a trivial script through the C ABI (for example `1+2`). Then run host `check-c-abi` against the same ABI surface.
+
+```bash
+# Escargot Zig archive (paths relative to repo root; set android-sysroot to the NDK sysroot):
+# zig build -Dbackend=escargot -Dshared=false -Dlibrary-only=true -Dtarget=x86_64-linux-android.24 \
+#   -Descargot-install=vendor/escargot-android-install-x86_64 -Dandroid-sysroot=… -Dlibstdcxx=libc++_static.a
+
+# Hermes Zig archive:
+# zig build -Dbackend=hermes -Dshared=false -Dlibrary-only=true -Dtarget=x86_64-linux-android.24 \
+#   -Dhermes-install=vendor/hermes-android-install-x86_64 -Dicu-lib-dir=vendor/icu-android-prefix-x86_64/lib \
+#   -Dandroid-sysroot=… -Dlibstdcxx=…
+
+# After NDK link + adb push, confirm evaluate works; on the host:
+# zig build tool -- check-c-abi …
+```
 
 ## Escargot Android link sketch
 
@@ -51,9 +69,3 @@ Host `vendor/{escargot,hermes,icu}-install` trees are **linux glibc** — do not
 #      -lhermes_bridge -lhermesvm -ljsi -static-libstdc++ -llog -lm -ldl
 # Device: LD_LIBRARY_PATH must include libhermes_{bridge,vm}.so, libjsi.so, libc++_shared.so
 ```
-
-## Remaining
-
-- Full gated `unit_tests` on the TCG emulator: not run (too heavy). Host linux gated counts: see `docs/capability.md` / `docs/production-gaps.md`.
-- aarch64 Android engine prefixes + device smoke: not built.
-- Optional: single `build-android-{escargot,hermes}.sh` encoding stub dirs and link lines.

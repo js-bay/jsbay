@@ -111,7 +111,7 @@ uint32_t escargot_get_length(EscargotContext *ctx, EscargotValue obj); /* 0 if m
 
 /* ---- Date / BigInt / Map / Set ---- */
 bool escargot_is_date(EscargotContext *ctx, EscargotValue v);
-int64_t escargot_date_to_ms(EscargotContext *ctx, EscargotValue v); /* 0 on fail */
+bool escargot_date_to_ms(EscargotContext *ctx, EscargotValue v, int64_t *out);
 EscargotValue escargot_new_date(EscargotContext *ctx, int64_t ms);
 
 bool escargot_is_bigint(EscargotValue v);

@@ -107,7 +107,7 @@ HermesValue hermes_symbol_for(JsbayHermesContext *ctx, const char *key, size_t k
 
 /* ---- Date / BigInt / Map / Set ---- */
 bool hermes_is_date(JsbayHermesContext *ctx, HermesValue v);
-int64_t hermes_date_to_ms(JsbayHermesContext *ctx, HermesValue v);
+bool hermes_date_to_ms(JsbayHermesContext *ctx, HermesValue v, int64_t *out);
 HermesValue hermes_new_date(JsbayHermesContext *ctx, int64_t ms);
 
 bool hermes_is_bigint(HermesValue v);

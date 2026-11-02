@@ -84,7 +84,7 @@ pub extern fn escargot_strict_equal(ctx: ?*Context, a: Value, b: Value) bool;
 
 pub extern fn escargot_get_length(ctx: ?*Context, obj: Value) u32;
 pub extern fn escargot_is_date(ctx: ?*Context, v: Value) bool;
-pub extern fn escargot_date_to_ms(ctx: ?*Context, v: Value) i64;
+pub extern fn escargot_date_to_ms(ctx: ?*Context, v: Value, out: *i64) bool;
 pub extern fn escargot_new_date(ctx: ?*Context, ms: i64) Value;
 pub extern fn escargot_is_bigint(v: Value) bool;
 pub extern fn escargot_new_bigint_i64(v: i64) Value;
