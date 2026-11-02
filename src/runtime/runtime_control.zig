@@ -664,7 +664,29 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
                     .shape_count = snap.shape_count,
                 };
             },
-            .jsc, .escargot, .hermes => return .{},
+            .jsc => return .{},
+            .escargot => {
+                if (comptime backend.isEscargotBackend(backend.active_backend)) {
+                    const esc = @import("../backend/escargot/c_api.zig");
+                    const heap: u64 = esc.escargot_runtime_heap_size(m.runtime);
+                    const total: u64 = esc.escargot_runtime_total_size(m.runtime);
+                    return .{
+                        .malloc_size = total,
+                        .memory_used_size = heap,
+                    };
+                }
+                return .{};
+            },
+            .hermes => {
+                if (comptime backend.isHermesBackend(backend.active_backend)) {
+                    const hermes = @import("../backend/hermes/c_api.zig");
+                    return .{
+                        .malloc_size = hermes.hermes_runtime_allocated_bytes(m.runtime),
+                        .memory_used_size = hermes.hermes_runtime_heap_size(m.runtime),
+                    };
+                }
+                return .{};
+            },
         },
         .packed_alt => |a| {
             if (!backend.isQuickJsApiBackend(a.tag)) return .{};

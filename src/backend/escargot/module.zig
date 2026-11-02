@@ -7,8 +7,10 @@ const types = @import("../../types.zig");
 const Context = ?*anyopaque;
 
 const EscargotEvalResult = extern struct {
-    result: ?[*:0]u8,
-    err: ?[*:0]u8,
+    result: ?[*]u8,
+    result_len: usize,
+    err: ?[*]u8,
+    err_len: usize,
 };
 
 extern fn escargot_install_module_loader(
@@ -68,9 +70,9 @@ pub fn uninstallModuleLoader(ctx: Context) void {
     escargot_uninstall_module_loader(ctx);
 }
 
-fn dupeAndFree(src_opt: ?[*:0]u8) ?[]const u8 {
+fn dupeAndFreeLen(src_opt: ?[*]u8, len: usize) ?[]const u8 {
     const src = src_opt orelse return null;
-    const slice = std.mem.span(src);
+    const slice = src[0..len];
     const owned = std.heap.c_allocator.dupe(u8, slice) catch {
         free(@ptrCast(src));
         return null;
@@ -82,12 +84,12 @@ fn dupeAndFree(src_opt: ?[*:0]u8) ?[]const u8 {
 pub fn escargotEvalModule(ctx: Context, source: []const u8, filename: []const u8) types.EvalResult {
     const r = escargot_eval_module(ctx, source.ptr, source.len, filename.ptr, filename.len);
     if (r.err != null) {
-        const duped = dupeAndFree(r.err);
+        const duped = dupeAndFreeLen(r.err, r.err_len);
         const err = duped orelse "module evaluation failed";
         if (r.result) |p| free(@ptrCast(p));
         return .{ .result = null, .err = err, .err_is_heap = duped != null };
     }
-    return .{ .result = dupeAndFree(r.result), .err = null };
+    return .{ .result = dupeAndFreeLen(r.result, r.result_len), .err = null };
 }
 
 pub fn escargotImportModule(ctx: Context, specifier: []const u8) types.EvalResult {
@@ -97,10 +99,10 @@ pub fn escargotImportModule(ctx: Context, specifier: []const u8) types.EvalResul
     defer std.heap.c_allocator.free(spec_z);
     const r = escargot_import_module(ctx, spec_z.ptr);
     if (r.err != null) {
-        const duped = dupeAndFree(r.err);
+        const duped = dupeAndFreeLen(r.err, r.err_len);
         const err = duped orelse "module import failed";
         if (r.result) |p| free(@ptrCast(p));
         return .{ .result = null, .err = err, .err_is_heap = duped != null };
     }
-    return .{ .result = dupeAndFree(r.result), .err = null };
+    return .{ .result = dupeAndFreeLen(r.result, r.result_len), .err = null };
 }

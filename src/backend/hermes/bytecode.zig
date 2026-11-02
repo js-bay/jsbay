@@ -11,8 +11,10 @@ const HermesCompileResult = extern struct {
     err: ?[*:0]u8,
 };
 const HermesEvalResult = extern struct {
-    result: ?[*:0]u8,
-    err: ?[*:0]u8,
+    result: ?[*]u8,
+    result_len: usize,
+    err: ?[*]u8,
+    err_len: usize,
 };
 
 extern fn hermes_compile_bytecode(src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) HermesCompileResult;
@@ -30,6 +32,18 @@ fn dupeAndFree(src_opt: ?[*:0]u8) ?[]const u8 {
     free(@ptrCast(src));
     return owned;
 }
+
+fn dupeAndFreeLen(src_opt: ?[*]u8, len: usize) ?[]const u8 {
+    const src = src_opt orelse return null;
+    const slice = src[0..len];
+    const owned = std.heap.c_allocator.dupe(u8, slice) catch {
+        free(@ptrCast(src));
+        return null;
+    };
+    free(@ptrCast(src));
+    return owned;
+}
+
 
 pub const CompileOut = struct {
     bytes: ?[]u8 = null,
@@ -59,10 +73,10 @@ pub fn hermesRunBytecode(ctx: Context, bytes: []const u8) types.EvalResult {
     var decode_failed: c_int = 0;
     const r = hermes_run_bytecode_ex(ctx, if (bytes.len > 0) bytes.ptr else @as([*]const u8, @ptrFromInt(1)), bytes.len, &decode_failed);
     if (r.err != null) {
-        const duped = dupeAndFree(r.err);
+        const duped = dupeAndFreeLen(r.err, r.err_len);
         const err = duped orelse "bytecode run failed";
         if (r.result) |p| free(@ptrCast(p));
         return .{ .result = null, .err = err, .err_is_heap = duped != null, .decode_failed = decode_failed != 0 };
     }
-    return .{ .result = dupeAndFree(r.result), .err = null, .decode_failed = false };
+    return .{ .result = dupeAndFreeLen(r.result, r.result_len), .err = null, .decode_failed = false };
 }

@@ -50,6 +50,11 @@ static char *dupCStringLocal(const std::string &s) {
     return out;
 }
 
+static void hermesEvalSetErrLocal(HermesEvalResult &out, const std::string &s) {
+    out.err = dupCStringLocal(s);
+    out.err_len = out.err ? s.size() : 0;
+}
+
 static bool isIdentStart(char c) {
     return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
@@ -1406,7 +1411,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             } else {
                 body.replace(m.position(), std::strlen("export default "), "");
             }
-            epilogue.push_back("exports.default = " + name + ";");
+            epilogue.push_back(exportLiveGetter("default", name));
         } else {
             static const std::regex re_def(R"(export\s+default\s+)");
             blanked = blankNonCode(body);
@@ -1720,9 +1725,9 @@ static HermesModLoader *getLoader(JsbayHermesContext *ctx) {
 
 extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char *src, size_t src_len,
                                                const char *filename, size_t filename_len) {
-    HermesEvalResult out{nullptr, nullptr};
+    HermesEvalResult out{};
     if (!c || !hermes_context_rt(c) || !src) {
-        out.err = dupCStringLocal("invalid context");
+        hermesEvalSetErrLocal(out, "invalid context");
         return out;
     }
     HermesModLoader *loader = getLoader(c);
@@ -1755,7 +1760,7 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
         std::string wrapped = transformEsmToCjs(source, fname);
         auto factory = rt.evaluateJavaScript(std::make_shared<jsi::StringBuffer>(wrapped), fname);
         if (!factory.isObject() || !factory.getObject(rt).isFunction(rt)) {
-            out.err = dupCStringLocal("module factory is not a function");
+            hermesEvalSetErrLocal(out, "module factory is not a function");
             use->cache.erase(fname);
             return out;
         }
@@ -1784,19 +1789,19 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
         return out;
     } catch (const jsi::JSError &e) {
         markEntryFailed(e.getMessage());
-        out.err = dupCStringLocal(e.getMessage());
+        hermesEvalSetErrLocal(out, e.getMessage());
         hermes_report_unhandled_rejection(c, e.getMessage().c_str());
         hermes_context_drain_microtasks(c);
         return out;
     } catch (const std::exception &e) {
         markEntryFailed(e.what());
-        out.err = dupCStringLocal(e.what());
+        hermesEvalSetErrLocal(out, e.what());
         hermes_report_unhandled_rejection(c, e.what());
         hermes_context_drain_microtasks(c);
         return out;
     } catch (...) {
         markEntryFailed("module evaluation error");
-        out.err = dupCStringLocal("module evaluation error");
+        hermesEvalSetErrLocal(out, "module evaluation error");
         hermes_report_unhandled_rejection(c, "module evaluation error");
         hermes_context_drain_microtasks(c);
         return out;
@@ -1804,14 +1809,14 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
 }
 
 extern "C" HermesEvalResult hermes_import_module(JsbayHermesContext *c, const char *specifier) {
-    HermesEvalResult out{nullptr, nullptr};
+    HermesEvalResult out{};
     if (!c || !hermes_context_rt(c) || !specifier) {
-        out.err = dupCStringLocal("invalid context");
+        hermesEvalSetErrLocal(out, "invalid context");
         return out;
     }
     HermesModLoader *loader = getLoader(c);
     if (!loader || !loader->load) {
-        out.err = dupCStringLocal("no module loader configured");
+        hermesEvalSetErrLocal(out, "no module loader configured");
         return out;
     }
     try {
@@ -1821,17 +1826,17 @@ extern "C" HermesEvalResult hermes_import_module(JsbayHermesContext *c, const ch
         hermes_context_drain_microtasks(c);
         return out;
     } catch (const jsi::JSError &e) {
-        out.err = dupCStringLocal(e.getMessage());
+        hermesEvalSetErrLocal(out, e.getMessage());
         hermes_report_unhandled_rejection(c, e.getMessage().c_str());
         hermes_context_drain_microtasks(c);
         return out;
     } catch (const std::exception &e) {
-        out.err = dupCStringLocal(e.what());
+        hermesEvalSetErrLocal(out, e.what());
         hermes_report_unhandled_rejection(c, e.what());
         hermes_context_drain_microtasks(c);
         return out;
     } catch (...) {
-        out.err = dupCStringLocal("module import failed");
+        hermesEvalSetErrLocal(out, "module import failed");
         hermes_report_unhandled_rejection(c, "module import failed");
         hermes_context_drain_microtasks(c);
         return out;

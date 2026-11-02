@@ -139,6 +139,26 @@ static char *dupCString(const std::string &s) {
     return out;
 }
 
+static void escargotEvalSetResult(EscargotEvalResult &out, char *p, size_t len) {
+    out.result = p;
+    out.result_len = p ? len : 0;
+}
+
+static void escargotEvalSetErr(EscargotEvalResult &out, char *p, size_t len) {
+    out.err = p;
+    out.err_len = p ? len : 0;
+}
+
+static void escargotEvalSetErrStr(EscargotEvalResult &out, const std::string &s) {
+    out.err = dupCString(s);
+    out.err_len = out.err ? s.size() : 0;
+}
+
+static void escargotEvalSetResultStr(EscargotEvalResult &out, const std::string &s) {
+    out.result = dupCString(s);
+    out.result_len = out.result ? s.size() : 0;
+}
+
 static char *stringRefToUtf8(StringRef *s) {
     if (!s) return dupCString("");
     return dupCString(s->toStdUTF8String());
@@ -376,17 +396,19 @@ extern "C" void *escargot_context_get_opaque(EscargotContext *ctx) {
 
 extern "C" EscargotEvalResult escargot_eval(EscargotContext *c, const char *src, size_t src_len,
                                             const char *filename, size_t filename_len) {
-    EscargotEvalResult out{nullptr, nullptr};
+    EscargotEvalResult out{};
     if (!c || !c->ctx.get() || !src) {
-        out.err = dupCString("invalid context");
+        escargotEvalSetErrStr(out, "invalid context");
         return out;
     }
     auto source = StringRef::createFromUTF8(src, src_len);
     auto fname = StringRef::createFromUTF8(filename ? filename : "", filename_len);
     auto parsed = c->ctx.get()->scriptParser()->initializeScript(source, fname, false);
     if (!parsed.isSuccessful()) {
-        out.err = stringRefToUtf8(parsed.parseErrorMessage);
-        if (!out.err) out.err = dupCString("parse error");
+        std::string emsg;
+        if (parsed.parseErrorMessage) emsg = parsed.parseErrorMessage->toStdUTF8String();
+        if (emsg.empty()) emsg = "parse error";
+        escargotEvalSetErrStr(out, emsg);
         return out;
     }
     auto er = Evaluator::execute(c->ctx.get(),
@@ -395,27 +417,35 @@ extern "C" EscargotEvalResult escargot_eval(EscargotContext *c, const char *src,
         },
         parsed.script.get());
     if (!er.isSuccessful()) {
-        out.err = stringRefToUtf8(er.resultOrErrorToString(c->ctx.get()));
-        if (!out.err) out.err = dupCString("JavaScript error");
+        std::string msg;
+        if (auto *s = er.resultOrErrorToString(c->ctx.get())) msg = s->toStdUTF8String();
+        if (msg.empty()) msg = "JavaScript error";
         // resultOrErrorToString often omits sourceURL; append for host/tests.
-        if (out.err && filename && filename_len) {
-            std::string msg(out.err);
+        if (filename && filename_len) {
             std::string url(filename, filename_len);
             if (!url.empty() && msg.find(url) == std::string::npos) {
                 msg.append("\n    at ");
                 msg.append(url);
-                std::free(out.err);
-                out.err = dupCString(msg.c_str());
             }
         }
+        escargotEvalSetErrStr(out, msg);
         return out;
     }
     ValueRef *result = er.result;
     if (!result || result->isUndefined() || result->isNull()) return out;
     if (result->isObject()) {
-        out.result = escargot_json_stringify(c, result);
+        size_t n = 0;
+        // JSON text is length-aware via std::string path when available; fall back to strlen-free copy.
+        char *p = escargot_json_stringify(c, result);
+        if (p) {
+            // json_stringify uses stringRefToUtf8/dupCString — recover length from allocated content carefully via strnlen only if no embedded NUL expected; prefer measuring before free is impossible. Re-stringify through UTF8 string:
+            n = std::strlen(p); // JSON cannot embed raw NUL
+            escargotEvalSetResult(out, p, n);
+        }
     } else {
-        out.result = escargot_value_to_utf8(c, result);
+        size_t n = 0;
+        char *p = escargot_value_to_utf8_n(c, result, &n);
+        escargotEvalSetResult(out, p, n);
     }
     return out;
 }
@@ -2311,11 +2341,13 @@ extern "C" void escargot_uninstall_module_loader(EscargotContext *ctx) {
 
 static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *source,
                                            StringRef *fname, const std::string &cache_key) {
-    EscargotEvalResult out{nullptr, nullptr};
+    EscargotEvalResult out{};
     auto parsed = c->ctx.get()->scriptParser()->initializeScript(source, fname, true);
     if (!parsed.isSuccessful()) {
-        out.err = stringRefToUtf8(parsed.parseErrorMessage);
-        if (!out.err) out.err = dupCString("module parse error");
+        std::string __em;
+        if (auto *__sr = parsed.parseErrorMessage) __em = __sr->toStdUTF8String();
+        if (__em.empty()) __em = "module parse error";
+        escargotEvalSetErrStr(out, __em);
         return out;
     }
     cacheModule(c, cache_key, parsed.script.get());
@@ -2328,25 +2360,27 @@ static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *
         c->rt->vm.get()->executePendingJob();
     }
     if (!er.isSuccessful()) {
-        out.err = stringRefToUtf8(er.resultOrErrorToString(c->ctx.get()));
-        if (!out.err) out.err = dupCString("module evaluation error");
+        std::string __em;
+        if (auto *__sr = er.resultOrErrorToString(c->ctx.get())) __em = __sr->toStdUTF8String();
+        if (__em.empty()) __em = "module evaluation error";
+        escargotEvalSetErrStr(out, __em);
         return out;
     }
     ValueRef *result = er.result;
     if (!result || result->isUndefined() || result->isNull()) return out;
     if (result->isObject()) {
-        out.result = escargot_json_stringify(c, result);
+        { char *__p = escargot_json_stringify(c, result); escargotEvalSetResult(out, __p, __p ? std::strlen(__p) : 0); }
     } else {
-        out.result = escargot_value_to_utf8(c, result);
+        { size_t __n = 0; char *__p = escargot_value_to_utf8_n(c, result, &__n); escargotEvalSetResult(out, __p, __n); }
     }
     return out;
 }
 
 extern "C" EscargotEvalResult escargot_eval_module(EscargotContext *c, const char *src, size_t src_len,
                                                    const char *filename, size_t filename_len) {
-    EscargotEvalResult out{nullptr, nullptr};
+    EscargotEvalResult out{};
     if (!c || !c->ctx.get() || !src) {
-        out.err = dupCString("invalid context");
+        escargotEvalSetErrStr(out, "invalid context");
         return out;
     }
     auto source = StringRef::createFromUTF8(src, src_len);
@@ -2357,13 +2391,13 @@ extern "C" EscargotEvalResult escargot_eval_module(EscargotContext *c, const cha
 }
 
 extern "C" EscargotEvalResult escargot_import_module(EscargotContext *c, const char *specifier) {
-    EscargotEvalResult out{nullptr, nullptr};
+    EscargotEvalResult out{};
     if (!c || !c->ctx.get() || !specifier) {
-        out.err = dupCString("invalid context");
+        escargotEvalSetErrStr(out, "invalid context");
         return out;
     }
     if (!c->mod_load) {
-        out.err = dupCString("no module loader configured");
+        escargotEvalSetErrStr(out, "no module loader configured");
         return out;
     }
     std::string absPath = resolveModuleId(c, "", specifier);
@@ -2377,8 +2411,10 @@ extern "C" EscargotEvalResult escargot_import_module(EscargotContext *c, const c
             c->rt->vm.get()->executePendingJob();
         }
         if (!er.isSuccessful()) {
-            out.err = stringRefToUtf8(er.resultOrErrorToString(c->ctx.get()));
-            if (!out.err) out.err = dupCString("module evaluation error");
+            std::string __em;
+            if (auto *__sr = er.resultOrErrorToString(c->ctx.get())) __em = __sr->toStdUTF8String();
+            if (__em.empty()) __em = "module evaluation error";
+            escargotEvalSetErrStr(out, __em);
         }
         return out;
     }
@@ -2386,7 +2422,7 @@ extern "C" EscargotEvalResult escargot_import_module(EscargotContext *c, const c
     size_t src_len = 0;
     if (!c->mod_load(c->mod_ud, absPath.c_str(), &src_ptr, &src_len) || !src_ptr) {
         std::string msg = std::string("could not load module '") + absPath + "'";
-        out.err = dupCString(msg);
+        escargotEvalSetErrStr(out, msg);
         return out;
     }
     auto source = StringRef::createFromUTF8(src_ptr, src_len);

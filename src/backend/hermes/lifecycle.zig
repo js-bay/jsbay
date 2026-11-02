@@ -42,7 +42,7 @@ pub fn processPendingJobs(ctx: Context) void {
 pub fn eval(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
     const raw = c_api.hermes_eval(ctx, script.ptr, script.len, filename.ptr, filename.len);
     const result = if (raw.result) |p| blk: {
-        const s = std.mem.span(p);
+        const s = p[0..raw.result_len];
         const owned = std.heap.c_allocator.dupe(u8, s) catch {
             _ = std.c.free(p);
             if (raw.err) |e| _ = std.c.free(e);
@@ -52,7 +52,7 @@ pub fn eval(ctx: Context, script: []const u8, filename: []const u8) types.EvalRe
         break :blk owned;
     } else null;
     const err = if (raw.err) |p| blk: {
-        const s = std.mem.span(p);
+        const s = p[0..raw.err_len];
         const owned = std.heap.c_allocator.dupe(u8, s) catch {
             _ = std.c.free(p);
             if (result) |r| std.heap.c_allocator.free(r);

@@ -15,7 +15,9 @@ typedef void *EscargotValue;
 
 typedef struct {
     char *result; /* heap, caller frees; NULL if none */
+    size_t result_len; /* byte length of result; excludes NUL terminator */
     char *err;    /* heap, caller frees; NULL if none */
+    size_t err_len; /* byte length of err; excludes NUL terminator */
 } EscargotEvalResult;
 
 void escargot_globals_ensure(void);

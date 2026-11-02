@@ -14,7 +14,9 @@ typedef void *HermesValue;
 
 typedef struct {
     char *result;
+    size_t result_len; /* byte length of result; excludes NUL terminator */
     char *err;
+    size_t err_len; /* byte length of err; excludes NUL terminator */
 } HermesEvalResult;
 
 void hermes_globals_ensure(void);

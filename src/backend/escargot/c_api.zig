@@ -6,8 +6,10 @@ pub const Context = opaque {};
 pub const Value = ?*anyopaque;
 
 pub const EvalResultC = extern struct {
-    result: ?[*:0]u8,
-    err: ?[*:0]u8,
+    result: ?[*]u8,
+    result_len: usize,
+    err: ?[*]u8,
+    err_len: usize,
 };
 
 pub extern fn escargot_globals_ensure() void;

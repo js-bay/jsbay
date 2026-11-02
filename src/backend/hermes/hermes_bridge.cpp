@@ -124,6 +124,16 @@ static char *dupCString(const std::string &s) {
     return out;
 }
 
+static void hermesEvalSetResult(HermesEvalResult &out, const std::string &s) {
+    out.result = dupCString(s);
+    out.result_len = out.result ? s.size() : 0;
+}
+
+static void hermesEvalSetErr(HermesEvalResult &out, const std::string &s) {
+    out.err = dupCString(s);
+    out.err_len = out.err ? s.size() : 0;
+}
+
 // Prefer JSI ToString for numbers so 0.1 → "0.1" (not "%.17g" → "0.10000000000000001"),
 // including NaN / ±Infinity. Shared by display + UTF-8 export paths.
 static std::string numberToJsString(FbHermesRuntime &rt, const jsi::Value &result) {
@@ -284,8 +294,7 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
         c->rt->global().setProperty(*c->rt, "setImmediate", setImmediate);
     } catch (...) {
     }
-    // ArrayBuffer.prototype.transfer — Hermes pin has no native transfer; polyfill via
-    // copy + HermesInternal.detachArrayBuffer (test-methods). Escargot has native transfer.
+    // ArrayBuffer.prototype.transfer — Hermes pin has no native transfer; polyfill via copy + HermesInternal.detachArrayBuffer (test-methods). Escargot has native transfer.
     try {
         static const char kTransferPoly[] = R"JS(
 (function () {
@@ -508,9 +517,9 @@ static std::string formatJSError(const jsi::JSError &e) {
 
 extern "C" HermesEvalResult hermes_eval(JsbayHermesContext *c, const char *src, size_t src_len,
                                         const char *filename, size_t filename_len) {
-    HermesEvalResult out{nullptr, nullptr};
+    HermesEvalResult out{};
     if (!c || !c->rt) {
-        out.err = dupCString("no context");
+        hermesEvalSetErr(out, "no context");
         return out;
     }
     try {
@@ -523,13 +532,13 @@ extern "C" HermesEvalResult hermes_eval(JsbayHermesContext *c, const char *src, 
             // Match Escargot/jsbay: nullish completion yields null result, no err.
             return out;
         }
-        out.result = dupCString(valueToDisplayString(*c->rt, result));
+        hermesEvalSetResult(out, valueToDisplayString(*c->rt, result));
     } catch (const jsi::JSError &e) {
-        out.err = dupCString(formatJSError(e));
+        hermesEvalSetErr(out, formatJSError(e));
     } catch (const std::exception &e) {
-        out.err = dupCString(e.what());
+        hermesEvalSetErr(out, e.what());
     } catch (...) {
-        out.err = dupCString("unknown JS error");
+        hermesEvalSetErr(out, "unknown JS error");
     }
     return out;
 }
@@ -2171,10 +2180,19 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
         return;
     }
 
-    // Object resolve: resolve_fn already started adoption when the value is thenable. Observe the Deferred itself so settlement is recorded without a second Get(then) / then call on the adopted value. Do not re-queue host unhandled reports here — observation handlers participate in Hermes's handled/unhandled distinction; enablePromiseRejectionTracker remains the source of truth for application-visible rejection notifications.
+    // Object resolve: resolve_fn already started adoption when the value is thenable. Prefer observing an adopted Promise via instanceof (no second Get(then)) so handlers do not mark the Deferred handled and suppress application unhandled-rejection reporting. Custom thenables cannot be re-observed without another Get(then); observe the Deferred and re-queue host unhandled reporting to preserve equivalent tracker behavior.
     try {
         auto &rt = *c->rt;
         jsi::Object target = pvalue->asObject(rt);
+        bool requeue_host_unhandled = true;
+        try {
+            auto Promise = rt.global().getPropertyAsFunction(rt, "Promise");
+            if (asVal(result)->getObject(rt).instanceOf(rt, Promise)) {
+                target = asVal(result)->getObject(rt);
+                requeue_host_unhandled = false;
+            }
+        } catch (...) {
+        }
         auto onFulfilled = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseFulfilled"), 1,
             [c, key, recordPromiseState](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
@@ -2190,7 +2208,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
             });
         auto onRejected = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseRejected"), 1,
-            [c, key, recordPromiseState](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            [c, key, recordPromiseState, requeue_host_unhandled](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
                 jsi::Value v = (count >= 1) ? jsi::Value(rt2, args[0]) : jsi::Value::undefined();
                 jsi::Value *new_res = nullptr;
                 try {
@@ -2199,6 +2217,26 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                     return jsi::Value::undefined();
                 }
                 recordPromiseState(key, 2, new_res);
+                if (requeue_host_unhandled && c->rejection_fn) {
+                    std::string msg = "Promise rejected";
+                    try {
+                        if (count >= 1) {
+                            if (args[0].isString()) msg = args[0].getString(rt2).utf8(rt2);
+                            else if (args[0].isObject()) {
+                                auto o = args[0].getObject(rt2);
+                                if (o.hasProperty(rt2, "message")) {
+                                    auto m = o.getProperty(rt2, "message");
+                                    if (m.isString()) msg = m.getString(rt2).utf8(rt2);
+                                }
+                                if (msg == "Promise rejected") msg = args[0].toString(rt2).utf8(rt2);
+                            } else {
+                                msg = args[0].toString(rt2).utf8(rt2);
+                            }
+                        }
+                    } catch (...) {
+                    }
+                    c->pending_rejections.emplace_back(false, msg);
+                }
                 return jsi::Value::undefined();
             });
         auto then = target.getPropertyAsFunction(rt, "then");
@@ -2823,22 +2861,22 @@ extern "C" HermesEvalResult hermes_run_bytecode(JsbayHermesContext *ctx, const u
 
 extern "C" HermesEvalResult hermes_run_bytecode_ex(JsbayHermesContext *c, const uint8_t *bytes, size_t len,
                                                    int *out_decode_failed) {
-    HermesEvalResult out{nullptr, nullptr};
+    HermesEvalResult out{};
     if (out_decode_failed) *out_decode_failed = 0;
     if (!c || !c->rt) {
-        out.err = dupCString("no context");
+        hermesEvalSetErr(out, "no context");
         if (out_decode_failed) *out_decode_failed = 1;
         return out;
     }
     if (!bytes || len == 0) {
-        out.err = dupCString("bytecode buffer is empty");
+        hermesEvalSetErr(out, "bytecode buffer is empty");
         if (out_decode_failed) *out_decode_failed = 1;
         return out;
     }
     // Validate HBC header before execution. Script exceptions must never set decode_failed
     // (cache.zig would delete+retry and re-run side effects).
     if (len < 8) {
-        out.err = dupCString("bytecode buffer too short for HBC header");
+        hermesEvalSetErr(out, "bytecode buffer too short for HBC header");
         if (out_decode_failed) *out_decode_failed = 1;
         return out;
     }
@@ -2849,7 +2887,7 @@ extern "C" HermesEvalResult hermes_run_bytecode_ex(JsbayHermesContext *c, const 
         constexpr uint64_t kHbcMagic = 0x1F1903C103BC1FC6ull;
         constexpr uint64_t kHbcMagic2 = 0x1F1903C103BC1FC7ull;
         if (magic != kHbcMagic && magic != kHbcMagic2) {
-            out.err = dupCString("invalid HBC magic");
+            hermesEvalSetErr(out, "invalid HBC magic");
             if (out_decode_failed) *out_decode_failed = 1;
             return out;
         }
@@ -2858,7 +2896,7 @@ extern "C" HermesEvalResult hermes_run_bytecode_ex(JsbayHermesContext *c, const 
         auto buf = std::make_shared<HbcBuffer>(bytes, len);
         jsi::Value result = c->rt->evaluateJavaScript(std::move(buf), "<bytecode>");
         if (result.isUndefined() || result.isNull()) return out;
-        out.result = dupCString(valueToDisplayString(*c->rt, result));
+        hermesEvalSetResult(out, valueToDisplayString(*c->rt, result));
     } catch (const jsi::JSError &e) {
         // Executing (or post-validate load) script threw — not a decode failure.
         if (out_decode_failed) *out_decode_failed = 0;
@@ -2867,14 +2905,14 @@ extern "C" HermesEvalResult hermes_run_bytecode_ex(JsbayHermesContext *c, const 
             std::string stack = e.getStack();
             if (!stack.empty()) { msg.push_back('\n'); msg += stack; }
         } catch (...) {}
-        out.err = dupCString(msg);
+        hermesEvalSetErr(out, msg);
     } catch (const std::exception &e) {
         // Non-JS failures during load/execute after magic check: treat as decode.
         if (out_decode_failed) *out_decode_failed = 1;
-        out.err = dupCString(e.what());
+        hermesEvalSetErr(out, e.what());
     } catch (...) {
         if (out_decode_failed) *out_decode_failed = 1;
-        out.err = dupCString("unknown bytecode error");
+        hermesEvalSetErr(out, "unknown bytecode error");
     }
     return out;
 }
