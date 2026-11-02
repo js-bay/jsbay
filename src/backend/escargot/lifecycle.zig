@@ -30,6 +30,10 @@ pub fn runGc(rt: Runtime) void {
 }
 
 pub fn processPendingJobs(ctx: Context) void {
+    // Match QuickJS/JSC: Deferred.settleWith can call this while an outer script/native callback is still on the stack; gate so Promise reactions wait for the outer checkpoint.
+    if (ctx == null) return;
+    if (!@import("../../runtime/scheduler_gate.zig").allows(@ptrCast(ctx))) return;
+    defer @import("../../runtime/scheduler_gate.zig").finished(@ptrCast(ctx));
     c_api.escargot_process_pending_jobs(ctx);
 }
 

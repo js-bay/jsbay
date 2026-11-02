@@ -428,7 +428,7 @@ static std::string rewriteIdents(const std::string &src,
     };
 
     // Scan a matched `{...}` body (or top-level range) for `let`/`const` bindings in this lexical scope only.
-    // Nested `{...}` blocks are skipped so their bindings stay in the child scope; `for (let …)` still registers because parentheses are not skipped.
+    // Nested `{...}` blocks are skipped so their bindings stay in the child scope. Loop-header `let`/`const` (`for` / `for await`) are skipped here too — they get their own scope during rewrite rather than shadowing the enclosing function or block.
     // Registering before rewriting lets references that textually precede the declarator resolve to the local binding (TDZ / closure capture), matching native ESM.
     auto collectLexicalBindingsInRange = [&](size_t from, size_t to, std::unordered_set<std::string> &into) {
         size_t i = from;
@@ -516,6 +516,18 @@ static std::string rewriteIdents(const std::string &src,
                     skipNestedFunctionOrClass(id);
                     continue;
                 }
+                // `for (let|const …)` / `for await (let|const …)` bindings belong to the loop scope, not this range.
+                if (id == "for") {
+                    i = j;
+                    while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                    if (i + 5 <= src.size() && src.compare(i, 5, "await") == 0 &&
+                        (i + 5 == src.size() || !isIdent(src[i + 5]))) {
+                        i += 5;
+                        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                    }
+                    if (i < src.size() && src[i] == '(') skipBalanced('(', ')');
+                    continue;
+                }
                 if (id == "let" || id == "const") {
                     auto names = collectDeclaratorBoundNames(src, j);
                     for (const auto &n : names) if (!n.empty()) into.insert(n);
@@ -579,15 +591,16 @@ static std::string rewriteIdents(const std::string &src,
     };
 
     // Container stack: ObjectLit vs Block vs Bracket vs Paren/ParamList.
-    enum class Cont : uint8_t { ObjectLit, Block, Bracket, Paren, ParamList, FnBody };
+    enum class Cont : uint8_t { ObjectLit, Block, Bracket, Paren, ParamList, FnBody, ForHead };
     std::vector<Cont> cont;
     // When a ParamList `)` is followed by `{`, the next `{` is FnBody and pops the param scope on `}`.
     bool next_brace_is_fn_body = false;
+    // After `for (let|const …)` / `for await (…)`, pop the loop-header scope when its body ends: entries are `cont.size()` after the ForHead `)` — matched when a Block at that depth closes, or a `;` ends a non-braced body.
+    std::vector<size_t> for_scope_pop_at_block_depth;
+    std::vector<size_t> for_scope_pop_at_stmt_depth;
     // True while scanning a parameter default initializer (`=` … until `,`/`)` at ParamList depth).
     bool in_param_default = false;
-    // Expression-bodied arrows (`=> expr` without `{`): cont.size() when the body began.
-    // Pop the param scope when the expression ends at that container depth (`,` / `;`) or when
-    // an outer container closes (cont shrinks below the marker).
+    // Expression-bodied arrows (`=> expr` without `{`): cont.size() when the body began. Pop the param scope when the expression ends at that container depth (`,` / `;`) or when an outer container closes (cont shrinks below the marker).
     std::vector<size_t> expr_arrow_cont_depth;
     auto closeExprArrowsDeeperThan = [&](size_t depth) {
         while (!expr_arrow_cont_depth.empty() && expr_arrow_cont_depth.back() > depth) {
@@ -841,6 +854,14 @@ static std::string rewriteIdents(const std::string &src,
                 cont.pop_back();
                 if (kind == Cont::Block) {
                     popScope();
+                    // Loop-header scope whose body was this block, or a single-statement body that ended in a braced statement (`if`/`while`/…).
+                    if (!for_scope_pop_at_block_depth.empty() && cont.size() == for_scope_pop_at_block_depth.back()) {
+                        for_scope_pop_at_block_depth.pop_back();
+                        popScope();
+                    } else if (!for_scope_pop_at_stmt_depth.empty() && cont.size() == for_scope_pop_at_stmt_depth.back()) {
+                        for_scope_pop_at_stmt_depth.pop_back();
+                        popScope();
+                    }
                 } else if (kind == Cont::FnBody) {
                     // End of function/catch body — drop the ParamList scope.
                     popScope();
@@ -949,7 +970,21 @@ static std::string rewriteIdents(const std::string &src,
                 }
                 return false;
             };
-            if (outEndsWithWord(pk2, "function") || outEndsWithWord(pk2, "catch") ||
+            auto opensForHead = [&]() -> bool {
+                if (outEndsWithWord(pk, "for")) return true;
+                // `for await (`
+                if (!outEndsWithWord(pk, "await")) return false;
+                size_t before = pk;
+                if (before < 5) return false;
+                before -= 5; // len("await")
+                while (before > 0 && std::isspace(static_cast<unsigned char>(out[before - 1]))) --before;
+                return outEndsWithWord(before, "for");
+            };
+            if (opensForHead()) {
+                // Loop-header lexical bindings (`let`/`const`) live in this scope until the loop body ends.
+                kind = Cont::ForHead;
+                pushScope();
+            } else if (outEndsWithWord(pk2, "function") || outEndsWithWord(pk2, "catch") ||
                 outEndsWithWord(pk, "function") || outEndsWithWord(pk, "catch") ||
                 parenFollowedByArrow(i) || opensMethodParamList()) {
                 kind = Cont::ParamList;
@@ -962,7 +997,9 @@ static std::string rewriteIdents(const std::string &src,
         }
         if (c == ')') {
             bool was_param = !cont.empty() && cont.back() == Cont::ParamList;
-            if (!cont.empty() && (cont.back() == Cont::Paren || cont.back() == Cont::ParamList))
+            bool was_for_head = !cont.empty() && cont.back() == Cont::ForHead;
+            if (!cont.empty() && (cont.back() == Cont::Paren || cont.back() == Cont::ParamList ||
+                                  cont.back() == Cont::ForHead))
                 cont.pop_back();
             out.push_back(src[i++]);
             if (was_param) {
@@ -977,6 +1014,14 @@ static std::string rewriteIdents(const std::string &src,
                 } else {
                     popScope();
                 }
+            } else if (was_for_head) {
+                size_t k = i;
+                skipSpacesSrc(k);
+                if (k < src.size() && src[k] == '{') {
+                    for_scope_pop_at_block_depth.push_back(cont.size());
+                } else {
+                    for_scope_pop_at_stmt_depth.push_back(cont.size());
+                }
             }
             closeExprArrowsDeeperThan(cont.size());
             continue;
@@ -985,6 +1030,11 @@ static std::string rewriteIdents(const std::string &src,
         // End expression-arrow bodies at this container depth (array elements, args, sequence).
         if (c == ',' || c == ';') {
             closeExprArrowsAt(cont.size());
+            if (c == ';' && !for_scope_pop_at_stmt_depth.empty() &&
+                cont.size() == for_scope_pop_at_stmt_depth.back()) {
+                for_scope_pop_at_stmt_depth.pop_back();
+                popScope();
+            }
         }
 
         // Parameter / destructuring-default separators end a default initializer (not commas inside nested `(…)` of the default expr).
@@ -1157,8 +1207,8 @@ static std::string rewriteIdents(const std::string &src,
                 skipSpacesSrc(k);
                 if (k + 1 < src.size() && src[k] == '=' && src[k + 1] == '>' &&
                     (cont.empty() || cont.back() == Cont::Block || cont.back() == Cont::FnBody ||
-                     cont.back() == Cont::Paren || cont.back() == Cont::ObjectLit ||
-                     cont.back() == Cont::Bracket)) {
+                     cont.back() == Cont::Paren || cont.back() == Cont::ForHead ||
+                     cont.back() == Cont::ObjectLit || cont.back() == Cont::Bracket)) {
                     char p = prevSignificant();
                     // Only treat as param if not a call/member and looks like expression start.
                     if (p != '.' && p != '?' && !isIdent(p) && p != ')' && p != ']') {
@@ -1874,8 +1924,10 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         static const std::regex re_imp_side(R"(import\s*(['"])([^'"]+)\1)");
         auto collect_re = [&](const std::regex &re, bool is_reexport, int mod_group) {
             for (std::sregex_iterator it(blanked.begin(), blanked.end(), re), end; it != end; ++it) {
+                // Match on blankNonCode for structure; take specifier text from original `body` (blanked string interiors are spaces).
                 static_dep_occs.push_back(
-                    {static_cast<size_t>(it->position(mod_group)), it->str(mod_group), is_reexport});
+                    {static_cast<size_t>(it->position(mod_group)),
+                     body.substr(it->position(mod_group), it->length(mod_group)), is_reexport});
             }
         };
         collect_re(re_export_named, true, 2);

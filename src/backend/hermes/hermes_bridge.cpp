@@ -2025,7 +2025,11 @@ extern "C" HermesOpResult hermes_construct(JsbayHermesContext *c, HermesValue ct
 }
 
 extern "C" HermesBoolOpResult hermes_has_in(JsbayHermesContext *c, HermesValue obj, const char *key) {
-    if (!c || !c->rt || !obj || !key) return hboolOk(false);
+    if (!c || !c->rt || !key) return hboolOk(false);
+    // hermes_undefined() is nullptr; null is a retained Null value. Both must TypeError ('in' requires Object), not silent false.
+    if (!obj || asVal(obj)->isUndefined() || asVal(obj)->isNull()) {
+        return hboolFail(c, makeTypeError(*c->rt, "cannot use 'in' operator to search for a key in a non-object"));
+    }
     try {
         if (!asVal(obj)->isObject()) {
             return hboolFail(c, makeTypeError(*c->rt, "cannot use 'in' operator to search for a key in a non-object"));
@@ -2040,11 +2044,12 @@ extern "C" HermesBoolOpResult hermes_has_in(JsbayHermesContext *c, HermesValue o
 }
 
 extern "C" HermesBoolOpResult hermes_delete_property(JsbayHermesContext *c, HermesValue obj, const char *key) {
-    if (!c || !c->rt || !obj || !key) return hboolOk(false);
+    if (!c || !c->rt || !key) return hboolOk(false);
+    // hermes_undefined() is nullptr; null is a retained Null value. Both must TypeError (ToObject), not silent false.
+    if (!obj || asVal(obj)->isUndefined() || asVal(obj)->isNull()) {
+        return hboolFail(c, makeTypeError(*c->rt, "Cannot convert undefined or null to object"));
+    }
     try {
-        if (asVal(obj)->isNull() || asVal(obj)->isUndefined()) {
-            return hboolFail(c, makeTypeError(*c->rt, "Cannot convert undefined or null to object"));
-        }
         jsi::Object target = asVal(obj)->isObject()
             ? asVal(obj)->getObject(*c->rt)
             : c->rt->global().getPropertyAsFunction(*c->rt, "Object").call(*c->rt, *asVal(obj)).asObject(*c->rt);
