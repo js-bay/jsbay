@@ -1182,6 +1182,13 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
     return out;
 }
 
+
+// ESM namespace export: getter-only live forwarding. Local updates stay visible; importer writes fail (no namespace setter).
+static std::string exportLiveGetter(const std::string &exported, const std::string &expr) {
+    return "Object.defineProperty(exports,\"" + exported +
+           "\",{enumerable:true,configurable:true,get:function(){return " + expr + ";}});";
+}
+
 // Very small ESM→CJS transform covering modules_tests fixtures.
 static std::string transformEsmToCjs(const std::string &src, const std::string &filename) {
     (void)filename;
@@ -1338,9 +1345,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                     } else {
                         imported = exported = part;
                     }
-                    repl += "Object.defineProperty(exports,\"" + exported +
-                            "\",{enumerable:true,configurable:true,get:function(){return " + ns + "." +
-                            imported + ";}});";
+                    repl += exportLiveGetter(exported, ns + "." + imported);
                 }
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
@@ -1403,9 +1408,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             body.append(tmp, last, pos - last);
             std::string name = m[1].str();
             body += "function " + name;
-            epilogue.push_back("Object.defineProperty(exports,\"" + name +
-                               "\",{enumerable:true,configurable:true,get:function(){return " + name +
-                               ";},set:function(v){" + name + "=v;}});");
+            epilogue.push_back(exportLiveGetter(name, name));
             last = pos + m.length();
         }
         body.append(tmp, last, std::string::npos);
@@ -1424,9 +1427,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             body.replace(m.position(), m.length(), kind + " ");
             for (const auto &name : names) {
                 if (name.empty()) continue;
-                epilogue.push_back("Object.defineProperty(exports,\"" + name +
-                                   "\",{enumerable:true,configurable:true,get:function(){return " + name +
-                                   ";},set:function(v){" + name + "=v;}});");
+                epilogue.push_back(exportLiveGetter(name, name));
             }
         }
     }
@@ -1453,23 +1454,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                     } else {
                         local = exported = part;
                     }
-                    // Imported bindings are rewritten to non-assignable expressions (e.g. `(0, ns.x)`); emit getter-only forwarding for those.
-                    bool is_imported = false;
-                    for (const auto &ib : imports) {
-                        if (!ib.local.empty() && ib.local == local) {
-                            is_imported = true;
-                            break;
-                        }
-                    }
-                    if (is_imported) {
-                        repl += "Object.defineProperty(exports,\"" + exported +
-                                "\",{enumerable:true,configurable:true,get:function(){return " + local +
-                                ";}});";
-                    } else {
-                        repl += "Object.defineProperty(exports,\"" + exported +
-                                "\",{enumerable:true,configurable:true,get:function(){return " + local +
-                                ";},set:function(v){" + local + "=v;}});";
-                    }
+                    repl += exportLiveGetter(exported, local);
                 }
                 if (comma == std::string::npos) break;
                 pos = comma + 1;

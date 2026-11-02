@@ -65,6 +65,9 @@ struct JsbayHermesContextOpaque {
     std::unique_ptr<jsi::Function> pristine_ta_to_string_tag_get;
     // %TypedArray% intrinsic (Uint8Array.__proto__) — instanceof brand check without global Uint8Array.
     std::unique_ptr<jsi::Function> pristine_typed_array_ctor;
+    // Pristine Map.prototype / Set.prototype `size` getters (ignore own-property shadows / NaN).
+    std::unique_ptr<jsi::Function> pristine_map_size_get;
+    std::unique_ptr<jsi::Function> pristine_set_size_get;
     // Host WeakMap for stable JS object identity across distinct retained Value wrappers.
     std::unique_ptr<jsi::Object> identity_wm;
     uint64_t next_identity_id = 1;
@@ -420,6 +423,25 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
         c->pristine_ta_byte_length_get.reset();
         c->pristine_ta_to_string_tag_get.reset();
         c->pristine_typed_array_ctor.reset();
+    }
+    try {
+        const char *kGrabSize = R"JS(
+            (function () {
+              return [
+                Object.getOwnPropertyDescriptor(Map.prototype, 'size').get,
+                Object.getOwnPropertyDescriptor(Set.prototype, 'size').get
+              ];
+            })()
+        )JS";
+        auto arrVal = c->rt->evaluateJavaScript(std::make_shared<jsi::StringBuffer>(kGrabSize), "<jsbay-collection-size-getters>");
+        auto arr = arrVal.asObject(*c->rt).asArray(*c->rt);
+        c->pristine_map_size_get = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 0).asObject(*c->rt).asFunction(*c->rt));
+        c->pristine_set_size_get = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 1).asObject(*c->rt).asFunction(*c->rt));
+    } catch (...) {
+        c->pristine_map_size_get.reset();
+        c->pristine_set_size_get.reset();
     }
     return c;
 }
@@ -1151,19 +1173,30 @@ extern "C" bool hermes_set_add(JsbayHermesContext *c, HermesValue set, HermesVal
         return true;
     } catch (...) { return false; }
 }
-extern "C" size_t hermes_map_size(JsbayHermesContext *c, HermesValue map) {
-    if (!c || !c->rt || !map || !asVal(map)->isObject()) return 0;
+static size_t hermesSizeFromNumber(double d) {
+    if (!std::isfinite(d) || d < 0.0) return 0;
+    const double max_sz = static_cast<double>(std::numeric_limits<size_t>::max());
+    if (d > max_sz) return 0;
+    return static_cast<size_t>(d);
+}
+
+// Read Map/Set [[Size]] via the pristine prototype accessor captured at context creation.
+static size_t hermesIntrinsicCollectionSize(JsbayHermesContext *c, HermesValue coll, jsi::Function *size_get) {
+    if (!c || !c->rt || !coll || !asVal(coll)->isObject() || !size_get) return 0;
     try {
-        auto s = asVal(map)->getObject(*c->rt).getProperty(*c->rt, "size");
-        return s.isNumber() ? (size_t)s.getNumber() : 0;
-    } catch (...) { return 0; }
+        auto s = size_get->callWithThis(*c->rt, asVal(coll)->getObject(*c->rt));
+        if (!s.isNumber()) return 0;
+        return hermesSizeFromNumber(s.getNumber());
+    } catch (...) {
+        return 0;
+    }
+}
+
+extern "C" size_t hermes_map_size(JsbayHermesContext *c, HermesValue map) {
+    return hermesIntrinsicCollectionSize(c, map, c ? c->pristine_map_size_get.get() : nullptr);
 }
 extern "C" size_t hermes_set_size(JsbayHermesContext *c, HermesValue set) {
-    if (!c || !c->rt || !set || !asVal(set)->isObject()) return 0;
-    try {
-        auto s = asVal(set)->getObject(*c->rt).getProperty(*c->rt, "size");
-        return s.isNumber() ? (size_t)s.getNumber() : 0;
-    } catch (...) { return 0; }
+    return hermesIntrinsicCollectionSize(c, set, c ? c->pristine_set_size_get.get() : nullptr);
 }
 
 static char *stashAndEvalJson(JsbayHermesContext *c, HermesValue v, const char *slot, const char *expr) {
@@ -1873,38 +1906,12 @@ static bool hermesIsConstructor(jsi::Runtime &rt, const jsi::Value &v) {
         auto constructFn = Reflect.getPropertyAsFunction(rt, "construct");
         auto Object = rt.global().getPropertyAsFunction(rt, "Object");
         jsi::Array empty(rt, 0);
-        // Reflect.construct(Object, [], newTarget) throws if newTarget is not a constructor,
-        // without invoking newTarget.
+        // Reflect.construct(Object, [], newTarget) throws if newTarget is not a constructor, without invoking newTarget or reading its properties (Proxy construct trap safe).
         constructFn.call(rt, Object, empty, fn);
+        return true;
     } catch (...) {
         return false;
     }
-    // Hermes incorrectly treats concise methods as constructible. Real constructors either
-    // own a `prototype` data property or are bound functions of a constructor.
-    try {
-        auto hop = rt.global()
-            .getPropertyAsFunction(rt, "Object")
-            .getPropertyAsObject(rt, "prototype")
-            .getPropertyAsFunction(rt, "hasOwnProperty");
-        auto has = hop.callWithThis(rt, fn, "prototype");
-        if (has.isBool() && has.getBool()) return true;
-        auto FProto = rt.global()
-            .getPropertyAsFunction(rt, "Function")
-            .getPropertyAsObject(rt, "prototype");
-        auto toString = FProto.getPropertyAsFunction(rt, "toString");
-        auto sVal = toString.callWithThis(rt, fn);
-        if (sVal.isString()) {
-            std::string s = sVal.getString(rt).utf8(rt);
-            if (s.compare(0, 15, "function bound ") == 0) return true;
-            if (s.compare(0, 5, "class") == 0 || s.find("class ") != std::string::npos) {
-                // class expressions/declarations are constructors even when prototype check races
-                return true;
-            }
-        }
-    } catch (...) {
-        return true; // Reflect said yes; keep that if introspection fails
-    }
-    return false;
 }
 
 extern "C" HermesOpResult hermes_set_property_result(JsbayHermesContext *c, HermesValue obj, const char *key, HermesValue val) {
@@ -2128,25 +2135,53 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
 
     if (state != 1) return;
 
-    // Resolve may adopt a thenable/promise. Leave the side table pending and update from settlement handlers after microtask drain.
-    // Observe the adopted thenable (when present) rather than the Deferred promise itself, so attaching onRejected does not mark the Deferred as handled and suppress application-visible unhandled-rejection reporting.
+    auto recordPromiseState = [c](uint64_t key, int st, jsi::Value *new_res) {
+        jsi::Value *old_res = nullptr;
+        bool keep = false;
+        {
+            std::lock_guard<std::mutex> lock(c->promise_mu);
+            auto it = c->promise_state.find(key);
+            if (it == c->promise_state.end() || it->second.first != 0) {
+            } else {
+                old_res = it->second.second;
+                it->second = {st, new_res};
+                keep = true;
+            }
+        }
+        if (!keep && new_res) release(c, new_res);
+        if (old_res) release(c, old_res);
+    };
+
+    // Non-thenable resolve values fulfill without adoption — record immediately (mirrors reject).
+    bool maybe_thenable = false;
+    if (result && asVal(result)->isObject()) {
+        try {
+            jsi::Value then_v = asVal(result)->getObject(*c->rt).getProperty(*c->rt, "then");
+            maybe_thenable = then_v.isObject() && then_v.getObject(*c->rt).isFunction(*c->rt);
+        } catch (...) {
+            maybe_thenable = true;
+        }
+    }
+    if (!maybe_thenable) {
+        jsi::Value *new_res = nullptr;
+        if (result) {
+            try {
+                new_res = asVal(retainMove(c, jsi::Value(*c->rt, *asVal(result))));
+            } catch (...) {
+                new_res = nullptr;
+            }
+        }
+        recordPromiseState(key, 1, new_res);
+        return;
+    }
+
+    // Thenable/promise: resolve_fn already started adoption. Observe the Deferred itself (never call thenable.then again). onRejected marks the Deferred handled for the engine tracker; re-queue host unhandled reporting so rejection remains visible.
     try {
         auto &rt = *c->rt;
         jsi::Object target = pvalue->asObject(rt);
-        if (result && asVal(result)->isObject()) {
-            try {
-                jsi::Object cand = asVal(result)->getObject(rt);
-                jsi::Value then_v = cand.getProperty(rt, "then");
-                if (then_v.isObject() && then_v.getObject(rt).isFunction(rt)) {
-                    target = std::move(cand);
-                }
-            } catch (...) {
-                target = pvalue->asObject(rt);
-            }
-        }
         auto onFulfilled = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseFulfilled"), 1,
-            [c, key](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            [c, key, recordPromiseState](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
                 jsi::Value v = (count >= 1) ? jsi::Value(rt2, args[0]) : jsi::Value::undefined();
                 jsi::Value *new_res = nullptr;
                 try {
@@ -2154,26 +2189,12 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                 } catch (...) {
                     return jsi::Value::undefined();
                 }
-                jsi::Value *old_res = nullptr;
-                bool keep = false;
-                {
-                    std::lock_guard<std::mutex> lock(c->promise_mu);
-                    auto it = c->promise_state.find(key);
-                    if (it == c->promise_state.end() || it->second.first != 0) {
-                        // Forgotten or already recorded — drop the new retain.
-                    } else {
-                        old_res = it->second.second;
-                        it->second = {1, new_res};
-                        keep = true;
-                    }
-                }
-                if (!keep && new_res) release(c, new_res);
-                if (old_res) release(c, old_res);
+                recordPromiseState(key, 1, new_res);
                 return jsi::Value::undefined();
             });
         auto onRejected = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseRejected"), 1,
-            [c, key](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            [c, key, recordPromiseState](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
                 jsi::Value v = (count >= 1) ? jsi::Value(rt2, args[0]) : jsi::Value::undefined();
                 jsi::Value *new_res = nullptr;
                 try {
@@ -2181,20 +2202,27 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                 } catch (...) {
                     return jsi::Value::undefined();
                 }
-                jsi::Value *old_res = nullptr;
-                bool keep = false;
-                {
-                    std::lock_guard<std::mutex> lock(c->promise_mu);
-                    auto it = c->promise_state.find(key);
-                    if (it == c->promise_state.end() || it->second.first != 0) {
-                    } else {
-                        old_res = it->second.second;
-                        it->second = {2, new_res};
-                        keep = true;
+                recordPromiseState(key, 2, new_res);
+                if (c->rejection_fn) {
+                    std::string msg = "Promise rejected";
+                    try {
+                        if (count >= 1) {
+                            if (args[0].isString()) msg = args[0].getString(rt2).utf8(rt2);
+                            else if (args[0].isObject()) {
+                                auto o = args[0].getObject(rt2);
+                                if (o.hasProperty(rt2, "message")) {
+                                    auto m = o.getProperty(rt2, "message");
+                                    if (m.isString()) msg = m.getString(rt2).utf8(rt2);
+                                }
+                                if (msg == "Promise rejected") msg = args[0].toString(rt2).utf8(rt2);
+                            } else {
+                                msg = args[0].toString(rt2).utf8(rt2);
+                            }
+                        }
+                    } catch (...) {
                     }
+                    c->pending_rejections.emplace_back(false, msg);
                 }
-                if (!keep && new_res) release(c, new_res);
-                if (old_res) release(c, old_res);
                 return jsi::Value::undefined();
             });
         auto then = target.getPropertyAsFunction(rt, "then");
@@ -2894,8 +2922,7 @@ static void fireHermesNhBox(void *data) {
     bx->handle_data = nullptr;
     delete bx;
 }
-// Shared claim: NativeState + pending_finals each hold one ref. First release
-// fires the finalizer; last release deletes the claim shell (no UAF).
+// Shared claim: NativeState + pending_finals each hold one ref. First release fires the finalizer; last release deletes the claim shell (no UAF).
 struct HermesNhClaim {
     HermesNhBox *box = nullptr;
     bool fired = false;

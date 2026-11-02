@@ -49,7 +49,6 @@ fn callBridge(
 
 const MethodBox = struct {
     method: MethodFn,
-    handle: Value, // own protect retain (dup); survives setPropertyStr consume of caller's Value
 };
 
 fn methodBridge(
@@ -59,11 +58,10 @@ fn methodBridge(
     argc: usize,
     user_data: ?*anyopaque,
 ) callconv(.c) Value {
-    _ = this_val;
     const box: *MethodBox = @ptrCast(@alignCast(user_data orelse return null));
     const slice: []const Value = if (args) |a| a[0..argc] else &.{};
-    // Bound this: always the NativeHandle, so detached `const f = h.m; f()` still sees the handle.
-    return box.method(ctx, box.handle, slice);
+    // Receiver is Function.prototype.bind's [[BoundThis]] (GC-visible); detached `const f = h.m; f()` still sees the handle.
+    return box.method(ctx, this_val, slice);
 }
 
 pub fn create(ctx: Context, config: HandleData) Value {
@@ -86,28 +84,43 @@ pub fn createWithMethods(ctx: Context, config: HandleData, methods: []const Meth
 }
 
 fn methodBoxFree(ctx: ?*c_api.Context, user_data: ?*anyopaque) callconv(.c) void {
+    _ = ctx;
     const box: *MethodBox = @ptrCast(@alignCast(user_data orelse return));
-    if (ctx) |c| c_api.hermes_free_value(c, box.handle);
     std.heap.c_allocator.destroy(box);
+}
+
+/// Bind `fn_obj` to `handle` so the method keeps a GC edge to the receiver (no permanent protect-map root).
+fn bindMethodToHandle(ctx: Context, fn_obj: Value, handle: Value) Value {
+    const global = c_api.hermes_get_global(ctx) orelse return null;
+    defer c_api.hermes_free_value(ctx, global);
+    const Function = c_api.hermes_get_property(ctx, global, "Function") orelse return null;
+    defer c_api.hermes_free_value(ctx, Function);
+    const proto = c_api.hermes_get_property(ctx, Function, "prototype") orelse return null;
+    defer c_api.hermes_free_value(ctx, proto);
+    const bind_fn = c_api.hermes_get_property(ctx, proto, "bind") orelse return null;
+    defer c_api.hermes_free_value(ctx, bind_fn);
+    var err: ?[*:0]u8 = null;
+    const args = [_]Value{handle};
+    const bound = c_api.hermes_call(ctx, bind_fn, fn_obj, &args, 1, &err);
+    if (err) |e| _ = std.c.free(e);
+    return bound;
 }
 
 pub fn setMethod(ctx: Context, obj: Value, name: [*:0]const u8, method: MethodFn) void {
     if (obj == null) return;
-    const handle_dup = c_api.hermes_dup(ctx, obj);
-    if (handle_dup == null) return;
-    const box = std.heap.c_allocator.create(MethodBox) catch {
-        c_api.hermes_free_value(ctx, handle_dup);
-        return;
-    };
-    box.* = .{ .method = method, .handle = handle_dup };
-    // Function NativeState owns MethodBox: releases the retained handle when the method is no longer callable.
+    const box = std.heap.c_allocator.create(MethodBox) catch return;
+    box.* = .{ .method = method };
+    // Host function + Function.prototype.bind(handle): bound function holds a GC edge to the receiver; handle↔method cycles stay collectible.
     const fn_obj = c_api.hermes_make_function_ex(ctx, name, &methodBridge, box, &methodBoxFree);
     if (fn_obj == null) {
         // make_function_ex frees user_data via methodBoxFree on failure.
         return;
     }
-    _ = c_api.hermes_set_property(ctx, obj, name, fn_obj);
+    const bound = bindMethodToHandle(ctx, fn_obj, obj);
     c_api.hermes_free_value(ctx, fn_obj);
+    if (bound == null) return;
+    _ = c_api.hermes_set_property(ctx, obj, name, bound);
+    c_api.hermes_free_value(ctx, bound);
 }
 
 pub fn setStringProp(ctx: Context, obj: Value, name: [*:0]const u8, value: []const u8) void {

@@ -39,7 +39,7 @@ pub fn newArrayBufferFromBytes(
     user_data: ?*anyopaque,
 ) ?ActiveEngine.Value {
     const ctx = engine.getContext(instance_id) orelse {
-        // Instance missing. The caller's memory is still owned by them; fire the finalizer so they can release it. Matches napi-rs "on failure the finalizer runs" convention.
+        // Instance missing. The caller's memory is still owned by them; fire the finalizer so they can release it. On allocation failure the finalizer still runs exactly once with the original arguments.
         if (finalizer) |fin| fin(user_data, bytes, len);
         return null;
     };
