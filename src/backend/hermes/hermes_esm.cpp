@@ -437,36 +437,269 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
     return names;
 }
 
+// Rewrite import.meta / dynamic import() only in executable source (and inside
+// template interpolations). Strings, comments, and template cooked text stay intact.
+static std::string rewriteImportMetaAndDynamic(const std::string &src) {
+    std::string out;
+    out.reserve(src.size() + 64);
+    size_t i = 0;
+
+    auto copyQuoted = [&](char q) {
+        out.push_back(src[i++]);
+        while (i < src.size()) {
+            if (src[i] == '\\' && i + 1 < src.size()) {
+                out.push_back(src[i++]);
+                out.push_back(src[i++]);
+                continue;
+            }
+            out.push_back(src[i]);
+            if (src[i] == q) {
+                ++i;
+                break;
+            }
+            ++i;
+        }
+    };
+
+    auto scanBalancedCallEnd = [&](size_t open_paren) -> size_t {
+        // open_paren points at '(' of import(...). Return index past matching ')' or npos.
+        int depth = 0;
+        size_t p = open_paren;
+        while (p < src.size()) {
+            char ch = src[p];
+            if (ch == '\\' && p + 1 < src.size()) {
+                p += 2;
+                continue;
+            }
+            if (ch == '\'' || ch == '"' || ch == '`') {
+                char qq = ch;
+                ++p;
+                while (p < src.size()) {
+                    if (src[p] == '\\' && p + 1 < src.size()) {
+                        p += 2;
+                        continue;
+                    }
+                    if (src[p] == qq) {
+                        ++p;
+                        break;
+                    }
+                    // Nested template interpolations: skip coarsely by brace depth inside `${`.
+                    if (qq == '`' && src[p] == '$' && p + 1 < src.size() && src[p + 1] == '{') {
+                        p += 2;
+                        int nested = 1;
+                        while (p < src.size() && nested > 0) {
+                            if (src[p] == '{') ++nested;
+                            else if (src[p] == '}') --nested;
+                            ++p;
+                        }
+                        continue;
+                    }
+                    ++p;
+                }
+                continue;
+            }
+            if (ch == '(' || ch == '{' || ch == '[') {
+                ++depth;
+                ++p;
+                continue;
+            }
+            if (ch == ')' || ch == '}' || ch == ']') {
+                --depth;
+                ++p;
+                if (depth == 0) return p;
+                continue;
+            }
+            ++p;
+        }
+        return std::string::npos;
+    };
+
+    auto tryRewriteImportAt = [&]() -> bool {
+        if (i + 6 > src.size() || src.compare(i, 6, "import") != 0) return false;
+        if (i > 0 && isIdent(src[i - 1])) return false;
+        if (i + 6 < src.size() && isIdent(src[i + 6])) return false;
+
+        size_t k = i + 6;
+        while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
+
+        // import.meta
+        if (k + 4 < src.size() && src[k] == '.' && src.compare(k + 1, 4, "meta") == 0 &&
+            (k + 5 >= src.size() || !isIdent(src[k + 5]))) {
+            out += "(__jsbay_import_meta)";
+            i = k + 5;
+            return true;
+        }
+
+        // dynamic import( ... )
+        if (k >= src.size() || src[k] != '(') return false;
+        size_t arg = k + 1;
+        while (arg < src.size() && std::isspace(static_cast<unsigned char>(src[arg]))) ++arg;
+        if (arg >= src.size() || (src[arg] != '\'' && src[arg] != '"')) return false;
+        char q = src[arg++];
+        size_t spec_start = arg;
+        while (arg < src.size()) {
+            if (src[arg] == '\\' && arg + 1 < src.size()) {
+                arg += 2;
+                continue;
+            }
+            if (src[arg] == q) break;
+            ++arg;
+        }
+        if (arg >= src.size()) return false;
+        std::string spec = src.substr(spec_start, arg - spec_start);
+        ++arg; // closing quote
+        while (arg < src.size() && std::isspace(static_cast<unsigned char>(src[arg]))) ++arg;
+
+        if (arg < src.size() && src[arg] == ',') {
+            size_t end = scanBalancedCallEnd(k);
+            if (end == std::string::npos) return false;
+            out += "Promise.reject(new Error(\"import attributes not supported\"))";
+            i = end;
+            return true;
+        }
+        if (arg >= src.size() || src[arg] != ')') return false;
+        out += "Promise.resolve().then(function(){ return require(";
+        out.push_back(q);
+        out += spec;
+        out.push_back(q);
+        out += "); })";
+        i = arg + 1;
+        return true;
+    };
+
+    auto skipTemplateInterpolation = [&](size_t from) -> size_t {
+        // `from` is first char inside `${...}` (after '{'). Return index of matching '}'.
+        size_t p = from;
+        int depth = 1;
+        while (p < src.size() && depth > 0) {
+            char ic = src[p];
+            if (ic == '/' && p + 1 < src.size() && src[p + 1] == '/') {
+                p += 2;
+                while (p < src.size() && src[p] != '\n') ++p;
+                continue;
+            }
+            if (ic == '/' && p + 1 < src.size() && src[p + 1] == '*') {
+                p += 2;
+                while (p + 1 < src.size() && !(src[p] == '*' && src[p + 1] == '/')) ++p;
+                if (p + 1 < src.size()) p += 2;
+                continue;
+            }
+            if (ic == '\'' || ic == '"') {
+                char q = ic;
+                ++p;
+                while (p < src.size()) {
+                    if (src[p] == '\\' && p + 1 < src.size()) {
+                        p += 2;
+                        continue;
+                    }
+                    if (src[p] == q) {
+                        ++p;
+                        break;
+                    }
+                    ++p;
+                }
+                continue;
+            }
+            if (ic == '`') {
+                ++p;
+                while (p < src.size()) {
+                    if (src[p] == '\\' && p + 1 < src.size()) {
+                        p += 2;
+                        continue;
+                    }
+                    if (src[p] == '`') {
+                        ++p;
+                        break;
+                    }
+                    if (src[p] == '$' && p + 1 < src.size() && src[p + 1] == '{') {
+                        p += 2;
+                        int nested = 1;
+                        while (p < src.size() && nested > 0) {
+                            if (src[p] == '{') ++nested;
+                            else if (src[p] == '}') --nested;
+                            ++p;
+                        }
+                        continue;
+                    }
+                    ++p;
+                }
+                continue;
+            }
+            if (ic == '{') {
+                ++depth;
+                ++p;
+                continue;
+            }
+            if (ic == '}') {
+                --depth;
+                if (depth == 0) return p;
+                ++p;
+                continue;
+            }
+            ++p;
+        }
+        return p;
+    };
+
+    while (i < src.size()) {
+        char c = src[i];
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            while (i < src.size() && src[i] != '\n') out.push_back(src[i++]);
+            continue;
+        }
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            out.push_back(src[i++]);
+            out.push_back(src[i++]);
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) out.push_back(src[i++]);
+            if (i < src.size()) out.push_back(src[i++]);
+            if (i < src.size()) out.push_back(src[i++]);
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            copyQuoted(c);
+            continue;
+        }
+        if (c == '`') {
+            out.push_back(src[i++]);
+            while (i < src.size()) {
+                if (src[i] == '\\' && i + 1 < src.size()) {
+                    out.push_back(src[i++]);
+                    out.push_back(src[i++]);
+                    continue;
+                }
+                if (src[i] == '`') {
+                    out.push_back(src[i++]);
+                    break;
+                }
+                if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                    out.push_back(src[i++]);
+                    out.push_back(src[i++]);
+                    // i now at first char of the interpolation expression.
+                    size_t expr_start = i;
+                    size_t close = skipTemplateInterpolation(expr_start);
+                    out += rewriteImportMetaAndDynamic(src.substr(expr_start, close - expr_start));
+                    i = close;
+                    if (i < src.size() && src[i] == '}') out.push_back(src[i++]);
+                    continue;
+                }
+                out.push_back(src[i++]);
+            }
+            continue;
+        }
+        if (tryRewriteImportAt()) continue;
+        out.push_back(c);
+        ++i;
+    }
+    return out;
+}
+
 // Very small ESM→CJS transform covering modules_tests fixtures.
 static std::string transformEsmToCjs(const std::string &src, const std::string &filename) {
     (void)filename;
-    std::string body = src;
+    std::string body = rewriteImportMetaAndDynamic(src);
     std::vector<ImportBinding> imports;
     std::vector<std::string> prelude;
     std::vector<std::string> epilogue;
-
-    // import.meta → (__jsbay_import_meta)
-    {
-        static const std::regex meta_re(R"(import\.meta)");
-        body = std::regex_replace(body, meta_re, "(__jsbay_import_meta)");
-    }
-
-    // dynamic import('x', { with: ... }) → readable reject (no import-attributes surface).
-    // Match any two-arg import(... , ...) so nested { type: 'json' } braces are covered.
-    {
-        static const std::regex dyn_attr_re(
-            R"(import\s*\(\s*(['\"])([^'\"]+)\1\s*,\s*[^)]+\))");
-        body = std::regex_replace(
-            body, dyn_attr_re,
-            "Promise.reject(new Error(\"import attributes not supported\"))");
-    }
-    // dynamic import('x') → Promise.resolve().then(function(){ return require('x'); })
-    {
-        static const std::regex dyn_re(R"(import\s*\(\s*(['\"])([^'\"]+)\1\s*\))");
-        body = std::regex_replace(
-            body, dyn_re,
-            "Promise.resolve().then(function(){ return require($1$2$1); })");
-    }
 
     // Strip/collect import declarations (multi-form). Process repeatedly.
     auto eatImports = [&]() {

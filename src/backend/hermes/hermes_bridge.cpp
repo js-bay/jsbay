@@ -47,9 +47,9 @@ struct JsbayHermesContextOpaque {
     };
     std::mutex finals_mu;
     std::vector<PendingFinal *> pending_finals;
-    // Promise state side-table for Deferreds we create (pointer identity of retained Value*).
+    // Promise state side-table for Deferreds we create (JS object identity, not Value* wrapper).
     std::mutex promise_mu;
-    std::unordered_map<jsi::Value *, std::pair<int, jsi::Value *>> promise_state; // state, result retained ptr
+    std::unordered_map<uint64_t, std::pair<int, jsi::Value *>> promise_state; // state, result retained ptr
     // Captured at context_new before user code can replace page Object.keys / DataView.
     std::unique_ptr<jsi::Function> pristine_object_keys;
     std::unique_ptr<jsi::Object> pristine_dataview_proto;
@@ -109,18 +109,8 @@ static void release(JsbayHermesContextOpaque *c, jsi::Value *v) {
         }
     }
     if (!gone) return;
-    // Drop Deferred tracking when the retained promise wrapper dies so settled
-    // result graphs are not kept for the whole engine lifetime.
-    jsi::Value *result = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(c->promise_mu);
-        auto pit = c->promise_state.find(v);
-        if (pit != c->promise_state.end()) {
-            result = pit->second.second;
-            c->promise_state.erase(pit);
-        }
-    }
-    if (result) release(c, result);
+    // Settlement records are keyed by JS object identity (see hermes_object_identity),
+    // not by this wrapper address — cleanup is via hermes_promise_forget / context_free.
 }
 
 static char *dupCString(const std::string &s) {
@@ -1712,12 +1702,19 @@ extern "C" uint64_t hermes_object_identity(JsbayHermesContext *c, HermesValue v)
     }
 }
 
+static uint64_t hermesPromiseKey(JsbayHermesContext *c, HermesValue promise) {
+    if (!c || !promise) return 0;
+    return hermes_object_identity(c, promise);
+}
+
 extern "C" void hermes_promise_forget(JsbayHermesContext *c, HermesValue promise) {
     if (!c || !promise) return;
+    uint64_t key = hermesPromiseKey(c, promise);
+    if (key == 0) return;
     jsi::Value *result = nullptr;
     {
         std::lock_guard<std::mutex> lock(c->promise_mu);
-        auto it = c->promise_state.find(asVal(promise));
+        auto it = c->promise_state.find(key);
         if (it == c->promise_state.end()) return;
         result = it->second.second;
         c->promise_state.erase(it);
@@ -2027,8 +2024,13 @@ extern "C" bool hermes_promise_create(JsbayHermesContext *c, HermesValue *out_pr
         *out_resolve = retainMove(c, std::move(cap->resolve));
         *out_reject = retainMove(c, std::move(cap->reject));
         {
-            std::lock_guard<std::mutex> lock(c->promise_mu);
-            c->promise_state[asVal(*out_promise)] = {0, nullptr}; // pending
+            uint64_t key = hermesPromiseKey(c, *out_promise);
+            if (key == 0) {
+                // Identity WeakMap unavailable — fall back cannot track across wrappers.
+            } else {
+                std::lock_guard<std::mutex> lock(c->promise_mu);
+                c->promise_state[key] = {0, nullptr}; // pending
+            }
         }
         return true;
     } catch (...) {
@@ -2042,7 +2044,9 @@ extern "C" bool hermes_promise_create(JsbayHermesContext *c, HermesValue *out_pr
 
 extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue promise, int state, HermesValue result) {
     if (!c || !c->rt || !promise) return;
-    jsi::Value *pkey = asVal(promise);
+    uint64_t key = hermesPromiseKey(c, promise);
+    if (key == 0) return;
+    jsi::Value *pvalue = asVal(promise);
 
     // Rejection reasons are not adopted — record immediately.
     if (state == 2) {
@@ -2058,7 +2062,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
         bool found = false;
         {
             std::lock_guard<std::mutex> lock(c->promise_mu);
-            auto it = c->promise_state.find(pkey);
+            auto it = c->promise_state.find(key);
             if (it != c->promise_state.end()) {
                 old_res = it->second.second;
                 it->second = {2, new_res};
@@ -2076,10 +2080,10 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
     // the Deferred promise's own fulfillment/rejection handlers after microtask drain.
     try {
         auto &rt = *c->rt;
-        jsi::Object po = pkey->asObject(rt);
+        jsi::Object po = pvalue->asObject(rt);
         auto onFulfilled = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseFulfilled"), 1,
-            [c, pkey](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            [c, key](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
                 jsi::Value v = (count >= 1) ? jsi::Value(rt2, args[0]) : jsi::Value::undefined();
                 jsi::Value *new_res = nullptr;
                 try {
@@ -2091,7 +2095,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                 bool keep = false;
                 {
                     std::lock_guard<std::mutex> lock(c->promise_mu);
-                    auto it = c->promise_state.find(pkey);
+                    auto it = c->promise_state.find(key);
                     if (it == c->promise_state.end() || it->second.first != 0) {
                         // Forgotten or already recorded — drop the new retain.
                     } else {
@@ -2106,7 +2110,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
             });
         auto onRejected = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseRejected"), 1,
-            [c, pkey](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            [c, key](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
                 jsi::Value v = (count >= 1) ? jsi::Value(rt2, args[0]) : jsi::Value::undefined();
                 jsi::Value *new_res = nullptr;
                 try {
@@ -2118,7 +2122,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                 bool keep = false;
                 {
                     std::lock_guard<std::mutex> lock(c->promise_mu);
-                    auto it = c->promise_state.find(pkey);
+                    auto it = c->promise_state.find(key);
                     if (it == c->promise_state.end() || it->second.first != 0) {
                     } else {
                         old_res = it->second.second;
@@ -2149,19 +2153,22 @@ extern "C" bool hermes_is_promise(JsbayHermesContext *c, HermesValue v) {
 
 extern "C" int hermes_promise_state(JsbayHermesContext *c, HermesValue v) {
     if (!c || !v) return -1;
-    std::lock_guard<std::mutex> lock(c->promise_mu);
-    auto it = c->promise_state.find(asVal(v));
-    if (it == c->promise_state.end()) {
-        // Not a tracked Deferred — still detect Promise objects as unknown (-1) unless pending probe.
-        return hermes_is_promise(c, v) ? 0 : -1; // treat unknown JS promises as pending-ish; state/result limited
+    uint64_t key = hermesPromiseKey(c, v);
+    if (key != 0) {
+        std::lock_guard<std::mutex> lock(c->promise_mu);
+        auto it = c->promise_state.find(key);
+        if (it != c->promise_state.end()) return it->second.first;
     }
-    return it->second.first;
+    // Not a tracked Deferred — still detect Promise objects as unknown (-1) unless pending probe.
+    return hermes_is_promise(c, v) ? 0 : -1; // treat unknown JS promises as pending-ish; state/result limited
 }
 
 extern "C" HermesValue hermes_promise_result(JsbayHermesContext *c, HermesValue v) {
     if (!c || !v) return nullptr;
+    uint64_t key = hermesPromiseKey(c, v);
+    if (key == 0) return nullptr;
     std::lock_guard<std::mutex> lock(c->promise_mu);
-    auto it = c->promise_state.find(asVal(v));
+    auto it = c->promise_state.find(key);
     if (it == c->promise_state.end()) return nullptr;
     if (it->second.first != 1 && it->second.first != 2) return nullptr;
     if (!it->second.second) return nullptr;

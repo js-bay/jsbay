@@ -224,19 +224,26 @@ static void flushPendingRejections(EscargotContextOpaque *c) {
 
 extern "C" void escargot_globals_ensure(void) { ensureGlobals(); }
 
+// Depth of nested enter/leave on this OS thread. Threaded Escargot keeps TLS/GC state
+// per thread; runtime_new enters so VMInstanceRef::create is safe on any caller thread,
+// and runtime_free leaves once the VM is destroyed. engine_thread also enter/leaves.
+static thread_local int g_escargot_thread_depth = 0;
+
 extern "C" void escargot_thread_enter(void) {
     // ENABLE_THREADING: g_globalsInited is thread_local; each OS thread that touches
     // Escargot must initializeThread (Shell/cctest pattern). No-op when vendor is
     // non-threaded (supportsThreading()==false).
     if (!Globals::supportsThreading()) return;
-    if (!Globals::isInitialized()) {
+    if (g_escargot_thread_depth == 0 && !Globals::isInitialized()) {
         Globals::initializeThread();
     }
+    ++g_escargot_thread_depth;
 }
 
 extern "C" void escargot_thread_leave(void) {
     if (!Globals::supportsThreading()) return;
-    if (Globals::isInitialized()) {
+    if (g_escargot_thread_depth <= 0) return;
+    if (--g_escargot_thread_depth == 0 && Globals::isInitialized()) {
         Globals::finalizeThread();
     }
 }
@@ -247,12 +254,26 @@ extern "C" bool escargot_supports_threading(void) {
 
 extern "C" EscargotRuntime *escargot_runtime_new(void) {
     ensureGlobals();
+    // Same-thread engines (and creators on thread B after A already call_once'd globals)
+    // must still initialize this thread before VMInstanceRef::create.
+    escargot_thread_enter();
     auto *rt = new EscargotRuntimeOpaque();
-    rt->vm = VMInstanceRef::create();
+    try {
+        rt->vm = VMInstanceRef::create();
+    } catch (...) {
+        delete rt;
+        escargot_thread_leave();
+        return nullptr;
+    }
     return rt;
 }
 
-extern "C" void escargot_runtime_free(EscargotRuntime *rt) { delete rt; }
+extern "C" void escargot_runtime_free(EscargotRuntime *rt) {
+    if (!rt) return;
+    // Destroy the VM while this thread's Escargot TLS/GC is still initialized.
+    delete rt;
+    escargot_thread_leave();
+}
 extern "C" void escargot_runtime_gc(EscargotRuntime *rt) {
     (void)rt;
     Memory::gc();

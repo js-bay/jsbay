@@ -19,7 +19,7 @@ typedef struct {
 } EscargotEvalResult;
 
 void escargot_globals_ensure(void);
-/* Per-thread TLS/GC for Escargot engine_thread (Globals::initializeThread/finalizeThread). */
+/* Per-thread TLS/GC (Globals::initializeThread/finalizeThread). runtime_new/free also enter/leave. */
 void escargot_thread_enter(void);
 void escargot_thread_leave(void);
 bool escargot_supports_threading(void);
