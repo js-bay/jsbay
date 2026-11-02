@@ -13,7 +13,7 @@ const instance_map = @import("../runtime/instance_map.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
-/// Finalizer signature. Receives the pointer passed to `newExternal`. The callback runs during GC or context teardown — it MUST NOT execute JavaScript or touch the engine context (QuickJS finalizers receive a runtime, JSC finalizers receive nothing; both forbid re-entering JS).
+/// Finalizer signature. Receives the pointer passed to `newExternal`. The callback runs during GC or context teardown — it MUST NOT execute JavaScript or touch the engine context.
 pub const ExternalFinalizer = *const fn (*anyopaque) callconv(.c) void;
 
 /// Wrap an opaque native pointer as a JS object. The returned JS value is opaque to JS code — it has no properties and cannot be called.
@@ -66,7 +66,7 @@ pub fn newExternal(
 /// Extract the pointer from a previously-created External value. Returns `null` if `value` is not an External (including when it was created for a different engine instance — External values are not portable across engines because the class registration is per-process but the backing object lives in a specific runtime).
 pub fn getExternal(instance_id: i32, value: ActiveEngine.Value) ?*anyopaque {
     if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
-        // QuickJS class id is process-wide; no ctx needed. We still require the instance to exist so callers can't query after destroy().
+        // Class id is process-wide; no ctx needed. We still require the instance to exist so callers can't query after destroy().
         _ = engine.getContext(instance_id) orelse return null;
         const qjs_mod = @import("../backend.zig").ActiveEngineModule;
         return qjs_mod.qjsGetExternal(value);

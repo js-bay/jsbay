@@ -1,12 +1,6 @@
 //! Zero-copy buffer support — wrap a caller-owned byte slice as a JS ArrayBuffer (or Uint8Array view over it) without copying the payload.
 //!
-//! Backends expose this pattern natively:
-//!
-//!   * QuickJS: `JS_NewArrayBuffer(ctx, buf, len, 0, realloc_func, opaque, false)`
-//!   * JSC:     `JSObjectMakeArrayBufferWithBytesNoCopy`
-//!   * Escargot / Hermes: bridge helpers that attach a host finalizer to a buffer object
-//!
-//! The `finalizer` fires when the JS GC reclaims the ArrayBuffer wrapper; the caller is responsible for freeing the backing memory inside the finalizer (both backends will pass back the same pointer/length they received). Pass a `null` finalizer for memory that outlives the engine (static data) — nothing happens at collection time then.
+//! Each ActiveEngine backend constructs an ArrayBuffer that references the caller-owned bytes and installs a host finalizer. The `finalizer` fires when the JS GC reclaims the ArrayBuffer wrapper; the caller frees the backing memory inside the finalizer (the same pointer and length originally supplied). Pass a `null` finalizer for memory that outlives the engine (static data) — nothing happens at collection time then.
 //!
 //! Contract: operations on a given `instance_id` MUST happen on the owning thread. The finalizer itself is called from the GC and MUST NOT re-enter JS.
 

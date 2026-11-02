@@ -4,7 +4,7 @@
 //!
 //! ## Lifetime summary
 //!
-//! - `Local` — backend Value. No retain; lifetime is whatever the backend rules say (e.g. QuickJS refcount held by caller, JSC GC root).
+//! - `Local` — backend Value. No retain; lifetime follows the active backend's ownership rules (refcount or GC root).
 //! - `Global(T)` — retained across scopes. `init` duplicates the value; the retained value is released on `reset` (or when the owning engine is destroyed, see `engine.destroy` → bookkeeping walk).
 //! - `Weak(T)` — **true weak** reference on JS objects. `get()` returns null once the target has been garbage collected. See "Weak semantics" below.
 //! - `Rooted` — refcounted GC root. `root` calls the backend protect only on the 0→1 edge; `unroot` releases only when the count returns to 0. `Global` is unchanged and still protects exactly once.
@@ -15,13 +15,13 @@
 //!
 //! `Weak(T)` is a true weak reference when the target value is a JS **object** (including arrays, functions, plain objects, typed arrays). `.get()` returns null after the underlying object has been garbage collected.
 //!
-//! - **QuickJS**: implemented via *Option C* — a finalizer watcher object (`WeakWatcher` class, registered once per runtime) is attached to the target as a hidden property (`__$jsbay_qjs_Weak$__`). Because the target strongly references the watcher (not the other way around), the watcher becomes unreachable exactly when the target does; its finalizer then clears a shared `WatcherData` struct. The Zig-side `Weak.get()` reads that struct to decide whether the target is still live.
+//! - **Refcount backends**: a finalizer watcher object (`WeakWatcher` class, registered once per runtime) is attached to the target as a hidden property (`__$jsbay_qjs_Weak$__`). Because the target strongly references the watcher (not the other way around), the watcher becomes unreachable exactly when the target does; its finalizer then clears a shared `WatcherData` struct. The Zig-side `Weak.get()` reads that struct to decide whether the target is still live.
 //!
-//! - **JSC**: implemented via `JSWeakCreate` / `JSWeakGetObject` — the JavaScriptCore private-but-ABI-stable weak-reference API. Symbols live in `JavaScriptCore.framework` but are not declared in the public headers; they are declared manually in `backend/jsc/weak.zig`.
+//! - **GC backends with weak handles**: implemented via the backend weak-reference API declared in `backend/jsc/weak.zig` (`JSWeakCreate` / `JSWeakGetObject`).
 //!
 //! ### Primitives policy
 //!
-//! Non-object values (numbers, booleans, strings, null, undefined) are not subject to garbage collection in the same way — numbers/booleans are inlined in the tagged value, strings are refcounted (QJS) or interned (JSC). For these, `Weak.init` stores a retained copy and behaves like a tiny `Global` that never spontaneously clears. Callers that want strict "null after GC" semantics should wrap primitives in an object first.
+//! Non-object values (numbers, booleans, strings, null, undefined) are not subject to garbage collection in the same way — numbers/booleans are inlined in the tagged value; strings are refcounted or interned depending on the backend. For these, `Weak.init` stores a retained copy and behaves like a tiny `Global` that never spontaneously clears. Callers that want strict "null after GC" semantics should wrap primitives in an object first.
 //!
 //! ## Implementation note: heap-allocated handle
 //!
@@ -93,7 +93,7 @@ pub const StackFrameScope = struct {
         _ = self;
     }
 
-    /// Promote a value out of the frame. Duplicates the refcount (QuickJS) or calls JSValueProtect (JSC). The caller then owns the returned value and must free it via `ActiveEngine.freeValue`.
+    /// Promote a value out of the frame via the backend retain path. The caller then owns the returned value and must free it via `ActiveEngine.freeValue`.
     pub fn returnValue(self: *StackFrameScope, v: Local) Local {
         const ctx = ctxForInstance(self.instance_id) orelse return v;
         return ActiveEngine.dupValue(ctx, v);
@@ -132,15 +132,15 @@ const WeakKind = enum {
 
 /// Shared between a `Weak` cell and the backend-specific watcher.
 ///
-/// For QuickJS, the watcher JS object holds a pointer to this via its opaque slot; on finalize it sets `target_collected = true`. Because either side can outlive the other, we reference-count the struct:
+/// On refcount backends, the watcher JS object holds a pointer to this via its opaque slot; on finalize it sets `target_collected = true`. Because either side can outlive the other, we reference-count the struct:
 ///   - `+1` for the WeakCell while it holds a pointer
 ///   - `+1` for the watcher while its finalizer has not fired yet.
 ///
-/// For JSC, this struct just records the `JSWeakRef` in an opaque slot.
+/// On weak-handle backends, this struct records the weak ref in an opaque slot.
 pub const WatcherData = struct {
-    /// True once the backend's finalizer/weak-ref reports the target has been garbage collected. For JSC this is implicit (set by polling `JSWeakGetObject == NULL`) so we don't actually flip this bit on JSC; see `getLive`.
+    /// True once the backend's finalizer/weak-ref reports the target has been garbage collected. On weak-handle backends this may be implicit (polled null); see `getLive`.
     target_collected: bool = false,
-    /// Platform-opaque handle. On JSC this is the `JSWeakRef`; on QJS it's unused (the watcher JS object owns the lifetime).
+    /// Platform-opaque handle. On weak-handle backends this is the weak ref; on refcount backends it's unused (the watcher JS object owns the lifetime).
     native_handle: ?*anyopaque = null,
     ref_count: u32 = 1,
 
@@ -230,7 +230,7 @@ fn unregisterEntry(instance_id: i32, entry: *instance_map.RefEntry) void {
 // reference.zig owns the WatcherData lifetime; each backend provides a thin attach/get/release adapter declared as `jsbay_qjsWeakAttach`, `jsbay_qjsWeakGetLive`, `jsbay_qjsWeakRelease` (append-only additions at the end of each backend file).
 // ----------------------------------------------------------------------
 
-/// Called by a backend finalizer when it detects that the target of a Weak has been collected. Must be `callconv(.c)` so we can hand it to QuickJS as a class finalizer. Flips `target_collected` and releases the backend's reference on the `WatcherData`; safe to invoke even after the owning `Weak` was `reset()` (the WatcherData is refcounted).
+/// Called by a backend finalizer when it detects that the target of a Weak has been collected. Must be `callconv(.c)` for class-finalizer trampolines. Flips `target_collected` and releases the backend's reference on the `WatcherData`; safe to invoke even after the owning `Weak` was `reset()` (the WatcherData is refcounted).
 pub fn weakFinalizerCallback(opaque_ptr: ?*anyopaque) callconv(.c) void {
     const wd_ptr = opaque_ptr orelse return;
     const wd: *WatcherData = @ptrCast(@alignCast(wd_ptr));
@@ -246,7 +246,7 @@ fn weakBackendIsObject(ctx: ActiveEngine.Context, v: Local) bool {
     };
 }
 
-/// Attempt to install a backend-specific watcher on `v`. On success, populates `cell.watcher` and returns true. On failure (e.g. target frozen on QuickJS, or JSC alloc failure), returns false and the caller should fall back to strong retention.
+/// Attempt to install a backend-specific watcher on `v`. On success, populates `cell.watcher` and returns true. On failure (non-extensible target, or alloc failure), returns false and the caller should fall back to strong retention.
 fn weakBackendAttach(ctx: ActiveEngine.Context, cell: *WeakCell, v: Local) bool {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.jsbay_qjsWeakAttach(ctx, cell, v),
@@ -272,7 +272,7 @@ fn weakBackendRelease(ctx: ActiveEngine.Context, cell: *WeakCell) void {
     }
 }
 
-/// One native retain. QuickJS dups the refcount; JSC calls `JSValueProtect` once. Callers (Rooted) must not invoke this on every `root()`.
+/// One native retain (refcount dup or GC protect). Callers (Rooted) must not invoke this on every `root()`.
 fn rootBackendProtect(ctx: ActiveEngine.Context, v: Local) Local {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootProtect(ctx, v),
@@ -390,7 +390,7 @@ pub fn Weak(comptime T: type) type {
                     .val = v,
                 };
                 if (!weakBackendAttach(ctx, cell, v)) {
-                    // Fallback: the backend couldn't install a weak watcher (e.g. frozen target on QuickJS). Degrade to strong retention so the Weak is still usable.
+                    // Fallback: the backend couldn't install a weak watcher (e.g. non-extensible target). Degrade to strong retention so the Weak is still usable.
                     cell.kind = .primitive;
                     cell.val = ActiveEngine.dupValue(ctx, v);
                 }
