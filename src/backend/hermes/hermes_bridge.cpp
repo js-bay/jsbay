@@ -1292,13 +1292,12 @@ extern "C" bool hermes_is_array_buffer(JsbayHermesContext *c, HermesValue v) {
     try { return asVal(v)->getObject(*c->rt).isArrayBuffer(*c->rt); }
     catch (...) { return false; }
 }
-static bool hermesBrandIsDataView(FbHermesRuntime &rt, const jsi::Object &o) {
+static bool hermesBrandIsDataView(JsbayHermesContext *c, const jsi::Object &o) {
+    // Pristine DataView.prototype.buffer validates [[ViewedArrayBuffer]] without Object.prototype.toString / toStringTag.
+    if (!c || !c->rt || !c->pristine_dv_buffer_get) return false;
     try {
-        auto Object = rt.global().getPropertyAsObject(rt, "Object");
-        auto proto = Object.getPropertyAsObject(rt, "prototype");
-        auto toString = proto.getPropertyAsFunction(rt, "toString");
-        auto s = toString.callWithThis(rt, o);
-        return s.isString() && s.getString(rt).utf8(rt) == "[object DataView]";
+        c->pristine_dv_buffer_get->callWithThis(*c->rt, o);
+        return true;
     } catch (...) {
         return false;
     }
@@ -1346,7 +1345,7 @@ extern "C" bool hermes_is_data_view(JsbayHermesContext *c, HermesValue v) {
     if (!c || !c->rt || !v || !asVal(v)->isObject()) return false;
     try {
         auto o = asVal(v)->getObject(*c->rt);
-        return hermesBrandIsDataView(*c->rt, o);
+        return hermesBrandIsDataView(c, o);
     } catch (...) {
         return false;
     }
@@ -1478,7 +1477,7 @@ extern "C" uint8_t *hermes_data_view_data(JsbayHermesContext *c, HermesValue dv,
     if (!c || !c->rt || !dv || !asVal(dv)->isObject()) return nullptr;
     try {
         auto o = asVal(dv)->getObject(*c->rt);
-        if (!hermesBrandIsDataView(*c->rt, o)) return nullptr;
+        if (!hermesBrandIsDataView(c, o)) return nullptr;
         // Use pristine DataView.prototype getters so own-property shadows are ignored.
         auto bufVal = hermesDataViewProtoGet(c, o, "buffer");
         auto offVal = hermesDataViewProtoGet(c, o, "byteOffset");
@@ -1832,7 +1831,11 @@ static jsi::Value makeTypeError(jsi::Runtime &rt, const char *msg) {
 extern "C" HermesOpResult hermes_call_result(JsbayHermesContext *c, HermesValue fn, HermesValue this_val,
                                              const HermesValue *args, size_t argc) {
     HermesOpResult out{nullptr, nullptr};
-    if (!c || !c->rt || !fn) return out;
+    if (!c || !c->rt) return out;
+    // hermes_undefined() is nullptr; TypeError (not OOM) for the undefined/null non-callable sentinel.
+    if (!fn || asVal(fn)->isUndefined() || asVal(fn)->isNull()) {
+        return hopFail(c, makeTypeError(*c->rt, "not a function"));
+    }
     try {
         if (!asVal(fn)->isObject() || !asVal(fn)->getObject(*c->rt).isFunction(*c->rt)) {
             return hopFail(c, makeTypeError(*c->rt, "not a function"));
@@ -1922,7 +1925,11 @@ extern "C" HermesOpResult hermes_set_property_result(JsbayHermesContext *c, Herm
 extern "C" HermesOpResult hermes_construct(JsbayHermesContext *c, HermesValue ctor,
                                            const HermesValue *args, size_t argc) {
     HermesOpResult out{nullptr, nullptr};
-    if (!c || !c->rt || !ctor) return out;
+    if (!c || !c->rt) return out;
+    // hermes_undefined() is nullptr; TypeError (not OOM) for the undefined/null non-constructor sentinel.
+    if (!ctor || asVal(ctor)->isUndefined() || asVal(ctor)->isNull()) {
+        return hopFail(c, makeTypeError(*c->rt, "value is not a constructor"));
+    }
     try {
         if (!hermesIsConstructor(*c->rt, *asVal(ctor))) {
             return hopFail(c, makeTypeError(*c->rt, "value is not a constructor"));
@@ -1980,12 +1987,13 @@ extern "C" HermesBoolOpResult hermes_delete_property(JsbayHermesContext *c, Herm
 
 extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj) {
     HermesOpResult out{nullptr, nullptr};
-    if (!c || !c->rt || !obj) return out;
+    if (!c || !c->rt) return out;
+    // hermes_undefined() is nullptr; null is a retained Null value. Both must TypeError (ToObject).
+    if (!obj || asVal(obj)->isUndefined() || asVal(obj)->isNull()) {
+        return hopFail(c, makeTypeError(*c->rt, "Cannot convert undefined or null to object"));
+    }
     try {
         auto &rt = *c->rt;
-        if (asVal(obj)->isNull() || asVal(obj)->isUndefined()) {
-            return hopFail(c, makeTypeError(rt, "Cannot convert undefined or null to object"));
-        }
         jsi::Object target = asVal(obj)->isObject()
             ? asVal(obj)->getObject(rt)
             : rt.global().getPropertyAsFunction(rt, "Object").call(rt, *asVal(obj)).asObject(rt);

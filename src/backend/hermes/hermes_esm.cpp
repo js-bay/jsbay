@@ -677,11 +677,7 @@ static std::string rewriteIdents(const std::string &src,
             continue;
         }
 
-        // Expression-body arrow: after `=>` without `{`, keep param scope until `;` / `,` / `)` / `}` at depth 0.
-        // Track via cont ParamList already popped; use a counter of expression-arrow scopes.
-        // Pop one shadowing scope when we see `;` at top-level-ish if scopes were pushed for expr arrows.
-        // Simpler: on `;` when next_brace_is_fn_body is false and we have dangling param scopes from arrows —
-        // skipped for Codex examples (they use function decls).
+        // Expression-body arrows keep param scopes open after `=>` without `{`; this rewriter does not pop those scopes at depth-0 `;` / `,` / `)` / `}`, so identifier replacement can miss or over-apply inside expression-arrow bodies.
 
         out.push_back(c);
         ++i;
@@ -1474,7 +1470,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     out += body;
     out += "\n";
     for (auto &e : epilogue) out += e + "\n";
-    out += "return exports;\n})";
+    // Non-thenable completion: returning the namespace would assimilate an export named `then` and hang awaitThenable.
+    out += "return undefined;\n})";
     return out;
 }
 
@@ -1731,6 +1728,10 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
         if (result.isObject()) {
             rec->exports = result.getObject(rt);
             moduleObj.setProperty(rt, "exports", rec->exports);
+        } else {
+            // Completion is intentionally non-thenable; take the namespace from module.exports.
+            auto ex = moduleObj.getProperty(rt, "exports");
+            if (ex.isObject()) rec->exports = ex.getObject(rt);
         }
         rec->loading = false;
         rec->ready = true;

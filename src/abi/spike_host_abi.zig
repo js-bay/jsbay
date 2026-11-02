@@ -1,10 +1,7 @@
 //! Install pointer+length host functions on Escargot/Hermes globals (engine_thread hostInstall).
 //! Same HostValue ABI as QuickJS/JSC host_abi; trampoline uses ActiveEngine makeNativeFunction.
 //!
-//! Escargot: Context is thread-affine (Shell creates VM per worker thread). Creating
-//! Context on the calling thread then evaluating host globals on the engine thread
-//! SEGV's in AtomicString/GC. hostInstall is same-thread only on Escargot: refuse when
-//! the engine thread is already running; threadStart refuses if hosts are already installed.
+//! Escargot: Context is thread-affine (Shell creates VM per worker thread). Creating Context on the calling thread then evaluating host globals on the engine thread SEGV's in AtomicString/GC. hostInstall is same-thread only on Escargot: refuse when the engine thread is already running; threadStart refuses if hosts are already installed.
 //! Full "create Context on ET" would be a large lifecycle refactor — diminishing returns.
 
 const std = @import("std");
