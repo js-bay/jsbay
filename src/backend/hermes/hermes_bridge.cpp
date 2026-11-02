@@ -121,20 +121,21 @@ static char *dupCString(const std::string &s) {
     return out;
 }
 
+// Prefer JSI ToString for numbers so 0.1 → "0.1" (not "%.17g" → "0.10000000000000001"),
+// including NaN / ±Infinity. Shared by display + UTF-8 export paths.
+static std::string numberToJsString(FbHermesRuntime &rt, const jsi::Value &result) {
+    try {
+        return result.toString(rt).utf8(rt);
+    } catch (...) {
+        return "NaN";
+    }
+}
+
 static std::string valueToDisplayString(FbHermesRuntime &rt, const jsi::Value &result) {
     if (result.isUndefined()) return "undefined";
     if (result.isNull()) return "null";
     if (result.isBool()) return result.getBool() ? "true" : "false";
-    if (result.isNumber()) {
-        double d = result.getNumber();
-        char buf[64];
-        if (d == (double)(int64_t)d && d >= -9.0e15 && d <= 9.0e15) {
-            std::snprintf(buf, sizeof(buf), "%lld", (long long)(int64_t)d);
-        } else {
-            std::snprintf(buf, sizeof(buf), "%.17g", d);
-        }
-        return buf;
-    }
+    if (result.isNumber()) return numberToJsString(rt, result);
     if (result.isString()) return result.getString(rt).utf8(rt);
     // Eval display: prefer JSON for objects/arrays (match Escargot eval path).
     try {
@@ -155,16 +156,7 @@ static std::string valueToJsString(FbHermesRuntime &rt, const jsi::Value &result
     if (result.isUndefined()) return "undefined";
     if (result.isNull()) return "null";
     if (result.isBool()) return result.getBool() ? "true" : "false";
-    if (result.isNumber()) {
-        double d = result.getNumber();
-        char buf[64];
-        if (d == (double)(int64_t)d && d >= -9.0e15 && d <= 9.0e15) {
-            std::snprintf(buf, sizeof(buf), "%lld", (long long)(int64_t)d);
-        } else {
-            std::snprintf(buf, sizeof(buf), "%.17g", d);
-        }
-        return buf;
-    }
+    if (result.isNumber()) return numberToJsString(rt, result);
     if (result.isString()) return result.getString(rt).utf8(rt);
     try {
         return result.toString(rt).utf8(rt);

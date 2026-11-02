@@ -94,8 +94,122 @@ static std::string blankNonCode(const std::string &src) {
 }
 
 
-// Skip strings/comments roughly; return rewritten source with identifier replacements.
+// True when `/` after `preceding` can start a RegExp literal (vs division).
+// Practical heuristic: regex-ok after operators / expression-intro keywords / punctuators
+// and at start-of-input; division after identifiers, numbers, `)`, `]`, string/template closes.
+static bool canStartRegexLiteral(const std::string &preceding) {
+    size_t pk = preceding.size();
+    while (pk > 0 && std::isspace(static_cast<unsigned char>(preceding[pk - 1]))) --pk;
+    if (pk == 0) return true;
+
+    // Postfix ++ / -- → division (i++/x/, i--/x/).
+    if (pk >= 2 &&
+        ((preceding[pk - 1] == '+' && preceding[pk - 2] == '+') ||
+         (preceding[pk - 1] == '-' && preceding[pk - 2] == '-'))) {
+        size_t before = pk - 2;
+        while (before > 0 && std::isspace(static_cast<unsigned char>(preceding[before - 1]))) --before;
+        if (before > 0) {
+            char b = preceding[before - 1];
+            if (std::isalnum(static_cast<unsigned char>(b)) || b == '_' || b == '$' || b == ')' ||
+                b == ']' || b == '"' || b == '\'' || b == '`')
+                return false;
+        }
+    }
+
+    char prev = preceding[pk - 1];
+    if (prev == ')' || prev == ']' || prev == '"' || prev == '\'' || prev == '`') return false;
+
+    // Identifier / keyword / number token.
+    if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_' || prev == '$') {
+        size_t start = pk;
+        while (start > 0) {
+            char ch = preceding[start - 1];
+            if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '$')
+                --start;
+            else
+                break;
+        }
+        std::string word = preceding.substr(start, pk - start);
+        static const char *kws[] = {"return", "typeof", "instanceof", "in", "void", "new",
+                                    "delete", "throw", "case", "else", "do", "await", "yield"};
+        for (const char *kw : kws) {
+            if (word == kw) return true;
+        }
+        return false; // identifier or numeric literal → division
+    }
+
+    // Expression-introducing punctuators / operators (incl. + - for infix/prefix).
+    if (std::strchr("([{,;=!?:~&|^*%<>+-", prev) != nullptr) return true;
+    return false;
+}
+
+// Copy `/pattern/flags` verbatim from src[i] (i at opening `/`). Handles `\` escapes and
+// character classes so `/` inside `[...]` does not terminate the literal.
+static void copyRegexLiteral(const std::string &src, size_t &i, std::string &out) {
+    out.push_back(src[i++]); // opening /
+    bool in_class = false;
+    while (i < src.size()) {
+        char ch = src[i];
+        if (ch == '\\' && i + 1 < src.size()) {
+            out.push_back(src[i++]);
+            out.push_back(src[i++]);
+            continue;
+        }
+        if (ch == '[' && !in_class) {
+            in_class = true;
+            out.push_back(src[i++]);
+            continue;
+        }
+        if (ch == ']' && in_class) {
+            in_class = false;
+            out.push_back(src[i++]);
+            continue;
+        }
+        if (ch == '/' && !in_class) {
+            out.push_back(src[i++]); // closing /
+            while (i < src.size() && std::isalpha(static_cast<unsigned char>(src[i])))
+                out.push_back(src[i++]);
+            return;
+        }
+        // Unterminated regex (newline) — stop without consuming the newline.
+        if (ch == '\n' || ch == '\r') return;
+        out.push_back(src[i++]);
+    }
+}
+
+// Skip a regex literal in-place (no output); used by template `${...}` brace scanner.
+static void skipRegexLiteral(const std::string &src, size_t &i) {
+    ++i; // opening /
+    bool in_class = false;
+    while (i < src.size()) {
+        char ch = src[i];
+        if (ch == '\\' && i + 1 < src.size()) {
+            i += 2;
+            continue;
+        }
+        if (ch == '[' && !in_class) {
+            in_class = true;
+            ++i;
+            continue;
+        }
+        if (ch == ']' && in_class) {
+            in_class = false;
+            ++i;
+            continue;
+        }
+        if (ch == '/' && !in_class) {
+            ++i; // closing /
+            while (i < src.size() && std::isalpha(static_cast<unsigned char>(src[i]))) ++i;
+            return;
+        }
+        if (ch == '\n' || ch == '\r') return;
+        ++i;
+    }
+}
+
+// Skip strings/comments/regex roughly; return rewritten source with identifier replacements.
 // Template literal text is preserved, but `${...}` interpolations are rewritten recursively.
+// Regex literals are copied verbatim so identifiers inside the pattern/flags are not rewritten.
 static std::string rewriteIdents(const std::string &src,
                                  const std::unordered_map<std::string, std::string> &repl) {
     if (repl.empty()) return src;
@@ -116,6 +230,11 @@ static std::string rewriteIdents(const std::string &src,
             while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) out.push_back(src[i++]);
             if (i < src.size()) out.push_back(src[i++]);
             if (i < src.size()) out.push_back(src[i++]);
+            continue;
+        }
+        // Regular-expression literal (not // or /*) — preserve pattern/flags verbatim.
+        if (c == '/' && canStartRegexLiteral(out)) {
+            copyRegexLiteral(src, i, out);
             continue;
         }
         // single/double-quoted strings: copy verbatim (no identifier rewrite inside)
@@ -153,7 +272,7 @@ static std::string rewriteIdents(const std::string &src,
                 if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
                     out.push_back(src[i++]);
                     out.push_back(src[i++]);
-                    // Scan the interpolation with nested brace / string / template awareness.
+                    // Scan the interpolation with nested brace / string / template / regex awareness.
                     size_t start = i;
                     int depth = 1;
                     while (i < src.size() && depth > 0) {
@@ -167,6 +286,11 @@ static std::string rewriteIdents(const std::string &src,
                             i += 2;
                             while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
                             if (i + 1 < src.size()) i += 2;
+                            continue;
+                        }
+                        // Regex literal inside `${...}` so `{`/`}` in the pattern do not affect depth.
+                        if (ic == '/' && canStartRegexLiteral(src.substr(start, i - start))) {
+                            skipRegexLiteral(src, i);
                             continue;
                         }
                         if (ic == '\'' || ic == '"') {
