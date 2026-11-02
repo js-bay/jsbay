@@ -820,7 +820,6 @@ fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
 }
 
-
 fn spikeToUtf8(ctx: ActiveEngine.Context, comptime which: enum { escargot, hermes }, value: ActiveEngine.Value) BytesResult {
     const op = switch (which) {
         .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_value_to_string_result(ctx, value)),
