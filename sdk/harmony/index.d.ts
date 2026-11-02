@@ -142,6 +142,11 @@ export declare interface MemoryUsage {
   shapeCount: bigint;
 }
 
+export declare interface ValueUsage { live: bigint; peak: bigint; abandoned: bigint; }
+export declare interface ShutdownStatus { phase: number; remainingMs: bigint; }
+export declare interface QueueOutcome { status: number; error: string; }
+export type QueueCallback = (outcome: QueueOutcome) => void;
+
 export declare enum EngineEventKind {
   Log = 0,
   ExecutionInterrupted = 1,
@@ -156,6 +161,8 @@ export declare class Engine {
   static create(instanceId: number, limits?: ResourceLimits): Engine;
   static globalResourceUsage(): ResourceGlobalUsage;
   evaluate(source: string, filename: string, cacheDir?: string, cacheVersion?: string): Value;
+  postScript(source: string, filename: string, callback?: QueueCallback): boolean;
+  postFence(callback?: QueueCallback, sealShutdown?: boolean): boolean;
   global(): Value;
   newString(value: string): Value;
   newNumber(value: number): Value;
@@ -183,9 +190,14 @@ export declare class Engine {
   snapshot(): InstanceSnapshot | null;
   static listEngines(): number[];
   static snapshot(id: number): InstanceSnapshot | null;
+  static cancel(instanceId: number, generation: bigint): boolean;
+  static beginShutdown(instanceId: number, generation: bigint, graceMs: bigint): boolean;
+  static shutdownStatus(instanceId: number, generation: bigint): ShutdownStatus | null;
   requestInterrupt(): boolean;
   clearInterrupt(): boolean;
   setExecutionTimeLimit(milliseconds: bigint): boolean;
+  setExecutionBudget(milliseconds: bigint): boolean;
+  getValueUsage(): ValueUsage;
   setMemoryLimit(bytes: bigint): boolean;
   setResourceLimits(limits: ResourceLimits): boolean;
   resourceUsage(): ResourceUsage;

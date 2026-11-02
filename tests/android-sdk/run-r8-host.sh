@@ -32,4 +32,10 @@ if ! awk '/^io\.jsbay\.LoopDriver -> / { if ($3 == "io.jsbay.LoopDriver:") found
     echo "R8 did not retain the JNI-reflected LoopDriver" >&2
     exit 1
 fi
+for class in EventHandler LogHandler SubmissionCallback; do
+    if ! awk -v name="io.jsbay.$class" '$1 == name && $2 == "->" && $3 == name ":" { found=1 } END { exit found ? 0 : 1 }' "$OUT/mapping.txt"; then
+        echo "R8 did not retain the JNI-reflected $class" >&2
+        exit 1
+    fi
+done
 "$JDK_HOME/bin/java" -Xcheck:jni -Djava.library.path="$OUT/base" -cp "$OUT/consumer.jar" io.jsbay.consumer.HostLoopMain

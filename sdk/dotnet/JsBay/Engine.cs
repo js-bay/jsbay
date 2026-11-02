@@ -15,11 +15,13 @@ public sealed class Engine : IDisposable
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private readonly int ownerThreadId = Environment.CurrentManagedThreadId;
     private readonly object lifetime = new();
+    private readonly ulong generation;
     private readonly List<CallbackScope> callbackScopes = [];
     private bool open = true;
     private IntPtr loopBinding;
     private static readonly Native.LoopSchedule LoopScheduleEntry = ScheduleLoopTask;
     private static readonly Native.LoopCancel LoopCancelEntry = CancelLoopTask;
+    private static readonly Native.SubmissionCallback SubmissionEntry = CompleteSubmission;
 
 #if JSBAY_TEST_HOOKS
     internal static int TestCallbackSetupFailureStep
@@ -68,6 +70,13 @@ public sealed class Engine : IDisposable
         {
             throw new JsBayException(Status.InvalidArgument);
         }
+        var snapshot = TrySnapshot(id);
+        if (snapshot is null)
+        {
+            Native.Destroy(id);
+            throw new JsBayException(Status.InstanceNotFound);
+        }
+        generation = snapshot.Generation;
 
         var context = SynchronizationContext.Current;
         if (SupportsOwnerDispatch(context))
@@ -282,13 +291,13 @@ public sealed class Engine : IDisposable
     /// <summary>Future admissions only. Pair Hide→Background and Show→Foreground with Suspend/Resume.</summary>
     public bool SetAdmissionClass(AdmissionClass cls)
     {
-        ThrowIfDisposed();
+        RequireOpen();
         return Native.SetAdmissionClass(Id, (int)cls);
     }
 
     public AdmissionClass GetAdmissionClass()
     {
-        ThrowIfDisposed();
+        RequireOpen();
         return Native.GetAdmissionClass(Id, out var cls) ? (AdmissionClass)cls : AdmissionClass.Foreground;
     }
 
@@ -506,10 +515,120 @@ public sealed class Engine : IDisposable
         RequireOpen();
         return Native.SetExecutionTimeLimit(Id, milliseconds);
     }
+    public bool SetExecutionBudget(ulong milliseconds)
+    {
+        RequireOpen();
+        return Native.SetExecutionBudget(Id, milliseconds);
+    }
     public bool SetMemoryLimit(ulong bytes)
     {
         RequireOpen();
         return Native.SetMemoryLimit(Id, bytes);
+    }
+
+    /// <summary>Submits source to the core FIFO. An accepted callback runs once after its checkpoint.</summary>
+    public bool PostScript(string source, string filename = "<submission>", Action<SubmissionResult>? completion = null)
+    {
+        RequireOpen();
+        return WithUtf8(source, allowNul: true, sourceText => WithUtf8(filename, allowNul: false, filenameText =>
+            PostSubmission((callback, userData) => Native.PostScript(Id, generation, sourceText, filenameText, callback, userData), completion)));
+    }
+
+    /// <summary>Posts an ordered core fence. Sealing rejects later submissions after this fence is admitted.</summary>
+    public bool PostFence(bool sealShutdown = false, Action<SubmissionResult>? completion = null)
+    {
+        RequireOpen();
+        return PostSubmission((callback, userData) => Native.PostFence(Id, generation, sealShutdown, callback, userData), completion);
+    }
+
+    public bool BeginShutdown(ulong graceMilliseconds)
+    {
+        lock (lifetime)
+        {
+            return open && graceMilliseconds > 0 && Native.BeginShutdown(Id, generation, graceMilliseconds);
+        }
+    }
+
+    public ShutdownStatus? GetShutdownStatus()
+    {
+        lock (lifetime)
+        {
+            if (!open || !Native.GetShutdownStatus(Id, generation, out var status))
+            {
+                return null;
+            }
+
+            return new ShutdownStatus((ShutdownPhase)status.Phase, status.RemainingMilliseconds);
+        }
+    }
+
+    /// <summary>Generation-scoped cancellation that cannot affect a replacement engine using this ID.</summary>
+    public bool Cancel()
+    {
+        lock (lifetime)
+        {
+            return open && Native.Cancel(Id, generation);
+        }
+    }
+
+    private static bool PostSubmission(Func<Native.SubmissionCallback?, IntPtr, bool> submit, Action<SubmissionResult>? completion)
+    {
+        if (completion is null)
+        {
+            return submit(null, IntPtr.Zero);
+        }
+
+        var state = new SubmissionState(completion);
+        var handle = GCHandle.Alloc(state);
+        try
+        {
+            if (submit(SubmissionEntry, GCHandle.ToIntPtr(handle)))
+            {
+                return true;
+            }
+
+            handle.Free();
+            return false;
+        }
+        catch
+        {
+            handle.Free();
+            throw;
+        }
+    }
+
+    private static void CompleteSubmission(int _, ulong __, int status, IntPtr errorData, nuint errorLength, IntPtr userData)
+    {
+        var handle = GCHandle.FromIntPtr(userData);
+        try
+        {
+            var state = (SubmissionState)handle.Target!;
+            if (Interlocked.Exchange(ref state.Completed, 1) != 0)
+            {
+                return;
+            }
+
+            try
+            {
+                var error = errorLength == 0 ? string.Empty : CopySubmissionError(errorData, errorLength);
+                state.Completion(new SubmissionResult((SubmissionStatus)status, error));
+            }
+            catch { }
+        }
+        finally { handle.Free(); }
+    }
+
+    private static string CopySubmissionError(IntPtr data, nuint length)
+    {
+        var bytes = new byte[checked((int)length)];
+        Marshal.Copy(data, bytes, 0, bytes.Length);
+        return StrictUtf8.GetString(bytes);
+    }
+
+    private sealed class SubmissionState(Action<SubmissionResult> completion)
+    {
+        internal readonly Action<SubmissionResult> Completion = completion;
+        internal int Completed;
     }
 
     public bool SetResourceLimits(ResourceLimits limits)

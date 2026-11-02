@@ -14,6 +14,7 @@
 #include "jsbay_fault_injection.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,11 +90,48 @@ static int spawn_and_wait(char *const argv[], int *out_status, int *out_signaled
     return 0;
 }
 
-static int child_died_from_fault(int status, int signaled) {
-    if (signaled) return 1;
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
-    /* Some platforms / adb wrappers convert signal death to a non-zero exit. */
-    if (WIFEXITED(status) && WEXITSTATUS(status) != 0) return 1;
+static int child_died_from_fault(int signaled, int termsig, int kind) {
+    int expected_signal = 0;
+    if (kind == 0 || kind == 2) expected_signal = SIGABRT;
+    if (kind == 1) expected_signal = SIGSEGV;
+    return signaled && expected_signal != 0 && termsig == expected_signal;
+}
+
+static int status_self_check(void) {
+    int failures = 0;
+    if (child_died_from_fault(0, 0, 0)) {
+        fprintf(stderr, "FAIL: status-self-check accepted exec failure\n");
+        failures++;
+    }
+    if (!child_died_from_fault(1, SIGABRT, 0)) {
+        fprintf(stderr, "FAIL: status-self-check rejected abort signal\n");
+        failures++;
+    }
+    if (child_died_from_fault(1, SIGKILL, 0)) {
+        fprintf(stderr, "FAIL: status-self-check accepted wrong signal\n");
+        failures++;
+    }
+    if (failures == 0) {
+        printf("PASS: status-self-check\n");
+        return 0;
+    }
+    return 1;
+}
+
+static int exec_failure_check(void) {
+    char *missing_argv[] = {"/definitely-not-a-jsbay-child", NULL};
+    int status = 0;
+    int signaled = 0;
+    int termsig = 0;
+    if (spawn_and_wait(missing_argv, &status, &signaled, &termsig) != 0) {
+        fprintf(stderr, "FAIL: exec-failure-check spawn/wait failed\n");
+        return 1;
+    }
+    if (child_died_from_fault(signaled, termsig, 0)) {
+        fprintf(stderr, "FAIL: exec-failure-check accepted exec failure status=0x%x\n", status);
+        return 1;
+    }
+    printf("PASS: exec-failure-rejected status=0x%x\n", status);
     return 0;
 }
 
@@ -108,8 +146,8 @@ static void run_fault_round(char *self, int kind, const char *label) {
         fail(label, "spawn/wait failed");
         return;
     }
-    if (!child_died_from_fault(status, signaled)) {
-        fail(label, "child exited 0 instead of faulting");
+    if (!child_died_from_fault(signaled, termsig, kind)) {
+        fail(label, "child did not terminate with the expected signal");
         return;
     }
     snprintf(detail, sizeof(detail), "child_status=0x%x signaled=%d termsig=%d parent_alive=1", status,
@@ -218,7 +256,7 @@ static int storm_parallel(char *self, int n) {
             fail("storm-parallel", "waitpid failed");
             continue;
         }
-        if (WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0)) {
+        if (child_died_from_fault(WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : 0, 0)) {
             died++;
         } else {
             survived++;
@@ -247,6 +285,12 @@ static int storm_parallel(char *self, int n) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--status-self-check") == 0) {
+        return status_self_check();
+    }
+    if (argc >= 2 && strcmp(argv[1], "--exec-failure-check") == 0) {
+        return exec_failure_check();
+    }
     if (argc >= 2 && strcmp(argv[1], "--fault-child") == 0) {
         int kind = 0;
         if (argc >= 3) kind = atoi(argv[2]);

@@ -145,7 +145,7 @@ fn freeEvalResult(res: @import("types.zig").EvalResult) void {
     }
 }
 
-fn evalOnePlusOne(comptime tag: Backend, inst: BareInstance) !void {
+fn verifyArithmetic(comptime tag: Backend, inst: BareInstance) !void {
     const E = Engine(tag);
     const ctx = restorePtr(E.Context, inst.ctx_addr);
     const res = E.eval(ctx, "1+1", "<multi_pack>");
@@ -171,7 +171,7 @@ test "multi_pack: dual create real quickjs_ng and jsc when both packed" {
         try std.testing.expect(a.runtime_addr != b.runtime_addr);
         try std.testing.expect(a.ctx_addr != b.ctx_addr);
         // Prove both engines are usable in-process, not merely constructible.
-        try evalOnePlusOne(.quickjs_ng, a);
-        try evalOnePlusOne(.jsc, b);
+        try verifyArithmetic(.quickjs_ng, a);
+        try verifyArithmetic(.jsc, b);
     }
 }

@@ -313,6 +313,110 @@ struct SwiftConsumer {
     RunLoop.current.run(until: Date(timeIntervalSinceNow: 1))
     guard automaticTimerCount == 2 else { fatalError("CFRunLoop driver did not run both timers") }
 
+    let submissionEngine = try Engine(id: 81_008, allowMainRunLoopAttach: true)
+    defer { try? submissionEngine.close() }
+    var submissionOutcomes: [SubmissionStatus] = []
+    guard
+      try submissionEngine.postScript(
+        "globalThis.__swiftSubmission = 40 + 2", filename: "submission-ok.js",
+        completion: {
+          submissionOutcomes.append($0.status)
+        })
+    else { fatalError("Swift postScript admission") }
+    guard
+      try submissionEngine.postScript(
+        "throw new Error('submission')", filename: "submission-error.js",
+        completion: {
+          submissionOutcomes.append($0.status)
+        })
+    else { fatalError("Swift exception submission admission") }
+    guard try submissionEngine.postFence(completion: { submissionOutcomes.append($0.status) })
+    else {
+      fatalError("Swift postFence admission")
+    }
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+    guard submissionOutcomes == [.completed, .exception, .completed] else {
+      fatalError("Swift FIFO submission outcomes: \(submissionOutcomes)")
+    }
+    guard
+      try submissionEngine.evaluate("__swiftSubmission", filename: "submission-result.js").number()
+        == 42
+    else {
+      fatalError("Swift submission execution")
+    }
+    guard try submissionEngine.beginShutdown(graceMilliseconds: 1_000),
+      try submissionEngine.postFence(
+        sealShutdown: true,
+        completion: {
+          submissionOutcomes.append($0.status)
+        })
+    else { fatalError("Swift shutdown fence admission") }
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+    guard submissionEngine.shutdownStatus()?.phase == .drained else {
+      fatalError("Swift shutdown did not drain")
+    }
+    guard try !submissionEngine.postScript("1", filename: "submission-rejected.js") else {
+      fatalError("Swift sealed shutdown accepted a script")
+    }
+
+    let busySubmissionEngine = try Engine(id: 81_009, allowMainRunLoopAttach: true)
+    defer { try? busySubmissionEngine.close() }
+    let busyEntered = DispatchSemaphore(value: 0)
+    let controllerFinished = DispatchSemaphore(value: 0)
+    var busyOutcomes: [SubmissionStatus] = []
+    _ = try busySubmissionEngine.bind("swiftSubmissionBusyEntered") { _, _ in
+      busyEntered.signal()
+      return try busySubmissionEngine.undefined()
+    }
+    guard
+      try busySubmissionEngine.postScript(
+        "swiftSubmissionBusyEntered(); for (;;) {}", filename: "submission-busy.js",
+        completion: { busyOutcomes.append($0.status) })
+    else { fatalError("Swift busy submission admission") }
+    DispatchQueue.global().async {
+      defer { controllerFinished.signal() }
+      guard busyEntered.wait(timeout: .now() + 1) == .success else { return }
+      guard (try? busySubmissionEngine.beginShutdown(graceMilliseconds: 20)) == true else { return }
+    }
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 1))
+    _ = controllerFinished.wait(timeout: .now() + 1)
+    guard busyOutcomes == [.cancelled], busySubmissionEngine.shutdownStatus()?.phase == .cancelled
+    else {
+      fatalError("Swift foreign-thread shutdown did not cancel a running submission")
+    }
+
+    for _ in 0..<8 {
+      let pollingEngine = try Engine(id: 81_010, allowMainRunLoopAttach: true)
+      let pollingState = PollingState()
+      let pollingStarted = DispatchSemaphore(value: 0)
+      let pollingFinished = DispatchSemaphore(value: 0)
+      DispatchQueue.global().async {
+        pollingStarted.signal()
+        while true {
+          if !pollingState.shouldPoll() { break }
+          _ = pollingEngine.shutdownStatus()
+        }
+        pollingFinished.signal()
+      }
+      guard pollingStarted.wait(timeout: .now() + 1) == .success else {
+        fatalError("Swift shutdown poll controller did not start")
+      }
+      try pollingEngine.close()
+      let replacement = try Engine(id: 81_010, allowMainRunLoopAttach: true)
+      let replacementValue = try replacement.evaluate("40 + 2", filename: "polling-replacement.js")
+      guard try replacementValue.number() == 42 else {
+        fatalError("Swift same-id replacement after polling")
+      }
+      try replacementValue.close()
+      pollingState.stop()
+      guard pollingFinished.wait(timeout: .now() + 1) == .success,
+        pollingEngine.shutdownStatus() == nil
+      else {
+        fatalError("Swift shutdown polling raced with same-id replacement")
+      }
+      try replacement.close()
+    }
+
     let pending = try Engine(id: 81_006, allowMainRunLoopAttach: true)
     var closedTimerFired = false
     _ = try pending.bind("swiftClosedTimer") { _, _ in
@@ -494,6 +598,23 @@ struct SwiftConsumer {
     print("PASS: Apple P0 keep-alive (suspend/admission/sync-bytes)")
   }
 
+}
+
+private final class PollingState: @unchecked Sendable {
+  private let lock = NSLock()
+  private var polling = true
+
+  func shouldPoll() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return polling
+  }
+
+  func stop() {
+    lock.lock()
+    polling = false
+    lock.unlock()
+  }
 }
 
 #if JSBAY_SDK_APP_CONSUMER

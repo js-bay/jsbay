@@ -640,7 +640,7 @@ pub const TypedEvalEntry = struct {
     instance_id: i32,
     lease: EvalLease,
     result: ?@import("../script/typed_eval.zig").Result,
-    execution: ?@import("js_event_loop").Scheduler.Execution = null,
+    execution: ?@import("js_scheduler.zig").Execution = null,
 
     pub fn finish(self: *TypedEvalEntry) bool {
         if (self.execution) |value| {

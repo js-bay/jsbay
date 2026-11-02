@@ -20,6 +20,7 @@ const api_bind = @import("abi/api_bind.zig");
 const typed_bytecode = @import("script/typed_bytecode.zig");
 const native_sync = @import("js_event_loop").native_sync;
 const host_wake = @import("js_event_loop").host_wake;
+const submission = @import("runtime/submission.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -998,6 +999,11 @@ test "c_api: packed-alt adversarial when real non-primary packed" {
     }
 }
 
+pub const ShutdownStatusC = extern struct {
+    phase: c_int,
+    remaining_ms: u64,
+};
+
 /// One-shot fault for the next property-key copy shared by set/has/delete.
 const key_fault = if (builtin.is_test) struct {
     var fail_next_allocation = false;
@@ -1404,6 +1410,16 @@ pub export fn jsbay_engine_request_interrupt(instance_id: c_int) bool {
     return accepted;
 }
 
+pub export fn jsbay_engine_cancel(instance_id: c_int, generation: u64) bool {
+    const id: i32 = @intCast(instance_id);
+    const lease = @import("runtime/instance_map.zig").beginControlPlane(id) orelse return false;
+    defer lease.end();
+    if (lease.inst.generation != generation) return false;
+    const accepted = runtime_control.requestShutdownCancel(id);
+    if (accepted) native_sync.cancelForInstance(id);
+    return accepted;
+}
+
 /// Clear a previously requested interrupt before evaluating more JavaScript.
 pub export fn jsbay_engine_clear_interrupt(instance_id: c_int) bool {
     if (!api_value.isOwner(@intCast(instance_id))) return false;
@@ -1419,6 +1435,48 @@ pub export fn jsbay_engine_set_execution_time_limit(instance_id: c_int, millis: 
         native_sync.tightenDeadlinesForInstance(id, deadline);
     };
     return accepted;
+}
+
+pub export fn jsbay_engine_set_execution_budget(instance_id: c_int, millis: u64) bool {
+    const id: i32 = @intCast(instance_id);
+    if (!api_value.isOwner(id)) return false;
+    return runtime_control.setExecutionBudget(id, millis);
+}
+
+/// Thread-safe generation-scoped shutdown deadline. A successful begin also tightens native synchronous waits that were already in progress.
+pub export fn jsbay_engine_begin_shutdown(instance_id: c_int, generation: u64, millis: u64) bool {
+    const id: i32 = @intCast(instance_id);
+    const lease = @import("runtime/instance_map.zig").beginControlPlane(id) orelse return false;
+    defer lease.end();
+    if (lease.inst.generation != generation) return false;
+    const accepted = runtime_control.beginShutdown(id, millis);
+    if (accepted) if (runtime_control.effectiveExecutionDeadlineMillis(id)) |deadline| {
+        native_sync.tightenDeadlinesForInstance(id, deadline);
+    };
+    return accepted;
+}
+
+/// Thread-safe generation-scoped status query. Returns false without modifying out when the generation is stale or the instance is unavailable.
+pub export fn jsbay_engine_shutdown_status(instance_id: c_int, generation: u64, out: ?*ShutdownStatusC) bool {
+    const destination = out orelse return false;
+    const id: i32 = @intCast(instance_id);
+    const lease = @import("runtime/instance_map.zig").beginControlPlane(id) orelse return false;
+    defer lease.end();
+    if (lease.inst.generation != generation) return false;
+    const status = runtime_control.shutdownStatus(id) orelse return false;
+    destination.* = .{ .phase = @backingInt(status.phase), .remaining_ms = status.remaining_ms };
+    return true;
+}
+
+pub export fn jsbay_engine_post_script(instance_id: c_int, generation: u64, source_arg: Utf8, filename_arg: Utf8, callback: ?submission.Callback, user_data: ?*anyopaque) bool {
+    const source = checkedUtf8(source_arg) orelse return false;
+    const filename = checkedUtf8(filename_arg) orelse return false;
+    if (!std.unicode.utf8ValidateSlice(source) or !std.unicode.utf8ValidateSlice(filename) or !noEmbeddedNul(filename)) return false;
+    return submission.postScript(@intCast(instance_id), generation, source, filename, callback, user_data);
+}
+
+pub export fn jsbay_engine_post_fence(instance_id: c_int, generation: u64, seal_shutdown: bool, callback: ?submission.Callback, user_data: ?*anyopaque) bool {
+    return submission.postFence(@intCast(instance_id), generation, seal_shutdown, callback, user_data);
 }
 
 /// Cap the runtime's heap at `bytes` (0 = unlimited). QuickJS enforces it via JS_SetMemoryLimit. JSC has no public heap-cap API and returns false (same contract as `runtime_control.setMemoryLimit` / the C header).
@@ -1653,7 +1711,7 @@ fn maybeFireInterrupted(id: i32) void {
         engine_events.fireInterrupted(id, 0, "interrupt requested");
         return;
     }
-    if (runtime_control.remainingExecutionLimitMillis(id)) |remaining| {
+    if (runtime_control.remainingEffectiveExecutionLimitMillis(id)) |remaining| {
         if (remaining == 0) engine_events.fireInterrupted(id, 0, "execution time limit");
     }
 }
@@ -1836,7 +1894,7 @@ const ApiOp = struct {
     ctx: ActiveEngine.Context,
     lease: engine_thread.EvalLease,
     entered_js: bool,
-    execution: ?@import("js_event_loop").Scheduler.Execution = null,
+    execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
     fn endExecution(self: *ApiOp) void {
         if (self.execution) |*guard| guard.end();
@@ -2458,7 +2516,7 @@ const PackedJsOp = struct {
     ctx_addr: usize,
     lease: engine_thread.EvalLease,
     entered_js: bool,
-    execution: ?@import("js_event_loop").Scheduler.Execution = null,
+    execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
     fn endExecution(self: *PackedJsOp) void {
         if (self.execution) |*guard| guard.end();
@@ -3626,7 +3684,7 @@ fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: us
 
     const started_at: u64 = @intCast(@import("platform/io.zig").monotonicMilliseconds());
     var deadline = std.math.add(u64, started_at, binding.timeout_ms) catch std.math.maxInt(u64);
-    if (runtime_control.executionDeadlineMillis(instance_id)) |execution_deadline| deadline = @min(deadline, execution_deadline);
+    if (runtime_control.effectiveExecutionDeadlineMillis(instance_id)) |execution_deadline| deadline = @min(deadline, execution_deadline);
     native_sync.tightenDeadline(started.request, deadline);
 
     // The host start callback receives borrowed JS handles only while it is running. It may complete inline, but must otherwise hand only the ID to its system completion path.
@@ -3637,7 +3695,7 @@ fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: us
     }
 
     // A start callback can arm a shorter execution budget. Re-snapshot its absolute deadline after it returns, then tighten the request before waiting; a completion arriving after that deadline cannot win.
-    if (runtime_control.executionDeadlineMillis(instance_id)) |execution_deadline| {
+    if (runtime_control.effectiveExecutionDeadlineMillis(instance_id)) |execution_deadline| {
         deadline = @min(deadline, execution_deadline);
         native_sync.tightenDeadline(started.request, deadline);
     }

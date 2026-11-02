@@ -552,6 +552,153 @@ int jsbay_objc_sdk_probe(void) {
               error.localizedDescription);
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
         Check(automaticTimerCount == 2, @"CFRunLoop driver did not run both timers");
+        JSBayEngine *submission = [[JSBayEngine alloc] initWithIdentifier:81008
+                                                   allowMainRunLoopAttach:YES
+                                                                    error:&error];
+        Check(submission != nil, error.localizedDescription);
+        __block NSMutableArray<NSNumber *> *submissionOutcomes = [NSMutableArray array];
+        Check([submission postScript:@"globalThis.__objcSubmission = 40 + 2"
+                            filename:@"submission-ok.js"
+                          completion:^(JSBaySubmissionStatus status, NSData *errorData) {
+                              (void)errorData;
+                              [submissionOutcomes addObject:@(status)];
+                          }
+                               error:&error],
+              error.localizedDescription);
+        Check([submission postScript:@"throw new Error('submission')"
+                            filename:@"submission-error.js"
+                          completion:^(JSBaySubmissionStatus status, NSData *errorData) {
+                              (void)errorData;
+                              [submissionOutcomes addObject:@(status)];
+                          }
+                               error:&error],
+              error.localizedDescription);
+        Check([submission
+                  postFenceSealingShutdown:NO
+                                completion:^(JSBaySubmissionStatus status, NSData *errorData) {
+                                    (void)errorData;
+                                    [submissionOutcomes addObject:@(status)];
+                                }
+                                     error:&error],
+              error.localizedDescription);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
+        Check([submissionOutcomes isEqualToArray:@[
+                  @(JSBaySubmissionStatusCompleted), @(JSBaySubmissionStatusException),
+                  @(JSBaySubmissionStatusCompleted)
+              ]],
+              @"Objective-C FIFO submission outcomes");
+        double submissionValue = 0;
+        Check([[submission evaluate:@"__objcSubmission"
+                           filename:@"submission-result.js"
+                              cache:nil
+                              error:&error] numberValue:&submissionValue error:&error] &&
+                  submissionValue == 42,
+              @"Objective-C submission execution");
+        Check([submission beginShutdownWithGraceMilliseconds:1000 error:&error],
+              error.localizedDescription);
+        Check([submission postFenceSealingShutdown:YES completion:nil error:&error],
+              error.localizedDescription);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
+        Check(submission.shutdownStatus.phase == JSBayShutdownPhaseDrained,
+              @"Objective-C shutdown did not drain");
+        Check(![submission postScript:@"1"
+                             filename:@"submission-rejected.js"
+                           completion:nil
+                                error:&error],
+              @"Objective-C sealed shutdown accepted a script");
+        Check([submission close:&error], error.localizedDescription);
+
+        JSBayEngine *busySubmission = [[JSBayEngine alloc] initWithIdentifier:81009
+                                                       allowMainRunLoopAttach:YES
+                                                                        error:&error];
+        Check(busySubmission != nil, error.localizedDescription);
+        dispatch_semaphore_t busyEntered = dispatch_semaphore_create(0);
+        dispatch_semaphore_t controllerFinished = dispatch_semaphore_create(0);
+        __block JSBaySubmissionStatus busyOutcome = JSBaySubmissionStatusCompleted;
+        JSBayValue *busyBinding = [busySubmission
+                bind:@"objcSubmissionBusyEntered"
+            callback:^JSBayValue *(JSBayValue *thisValue, NSArray<JSBayValue *> *arguments,
+                                   NSError **callbackError) {
+                (void)thisValue;
+                (void)arguments;
+                (void)callbackError;
+                dispatch_semaphore_signal(busyEntered);
+                return [busySubmission undefinedValue:nil];
+            }
+               error:&error];
+        Check(busyBinding != nil, error.localizedDescription);
+        Check([busySubmission postScript:@"objcSubmissionBusyEntered(); for (;;) {}"
+                                filename:@"submission-busy.js"
+                              completion:^(JSBaySubmissionStatus status, NSData *errorData) {
+                                  (void)errorData;
+                                  busyOutcome = status;
+                              }
+                                   error:&error],
+              error.localizedDescription);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+            if (dispatch_semaphore_wait(busyEntered,
+                                        dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0)
+                (void)[busySubmission beginShutdownWithGraceMilliseconds:20 error:nil];
+            dispatch_semaphore_signal(controllerFinished);
+        });
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false);
+        Check(dispatch_semaphore_wait(controllerFinished,
+                                      dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0,
+              @"Objective-C shutdown controller did not finish");
+        Check(busyOutcome == JSBaySubmissionStatusCancelled &&
+                  busySubmission.shutdownStatus.phase == JSBayShutdownPhaseCancelled,
+              @"Objective-C foreign-thread shutdown did not cancel a running "
+              @"submission");
+        Check([busyBinding close:&error], error.localizedDescription);
+        Check([busySubmission close:&error], error.localizedDescription);
+
+        for (NSUInteger round = 0; round < 8; round++) {
+            JSBayEngine *polling = [[JSBayEngine alloc] initWithIdentifier:81010
+                                                    allowMainRunLoopAttach:YES
+                                                                     error:&error];
+            Check(polling != nil, error.localizedDescription);
+            NSLock *pollingLock = [NSLock new];
+            __block BOOL keepPolling = YES;
+            dispatch_semaphore_t pollingStarted = dispatch_semaphore_create(0);
+            dispatch_semaphore_t pollingFinished = dispatch_semaphore_create(0);
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                @autoreleasepool {
+                    dispatch_semaphore_signal(pollingStarted);
+                    for (;;) {
+                        [pollingLock lock];
+                        BOOL keep = keepPolling;
+                        [pollingLock unlock];
+                        if (!keep)
+                            break;
+                        (void)[polling shutdownStatus];
+                    }
+                    dispatch_semaphore_signal(pollingFinished);
+                }
+            });
+            Check(dispatch_semaphore_wait(pollingStarted,
+                                          dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0,
+                  @"Objective-C shutdown poll controller did not start");
+            Check([polling close:&error], error.localizedDescription);
+            JSBayEngine *replacementPolling = [[JSBayEngine alloc] initWithIdentifier:81010
+                                                               allowMainRunLoopAttach:YES
+                                                                                error:&error];
+            Check(replacementPolling != nil, error.localizedDescription);
+            double pollingAnswer = 0;
+            Check([[replacementPolling evaluate:@"40 + 2"
+                                       filename:@"polling-replacement.js"
+                                          cache:nil
+                                          error:&error] numberValue:&pollingAnswer error:&error] &&
+                      pollingAnswer == 42,
+                  @"Objective-C same-id replacement after polling");
+            [pollingLock lock];
+            keepPolling = NO;
+            [pollingLock unlock];
+            Check(dispatch_semaphore_wait(pollingFinished,
+                                          dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0 &&
+                      [polling shutdownStatus] == nil,
+                  @"Objective-C shutdown polling raced with same-id replacement");
+            Check([replacementPolling close:&error], error.localizedDescription);
+        }
 
         JSBayEngine *pending = [[JSBayEngine alloc] initWithIdentifier:81006
                                                 allowMainRunLoopAttach:YES

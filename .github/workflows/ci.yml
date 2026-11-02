@@ -201,6 +201,7 @@ jobs:
           test -f "$node_root/include/node/node_api.h"
           npm install --ignore-scripts --no-audit --no-fund --prefix "$RUNNER_TEMP/jsbay-typescript" typescript@5.6.3
           NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers/lib/libjsbay.a" TSC="$RUNNER_TEMP/jsbay-typescript/node_modules/typescript/lib/tsc.js" tests/harmony-sdk/run_facade_consumer.sh
+          NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers/lib/libjsbay.a" bash tests/harmony-sdk/run-lifecycle-suite.sh
 
       - name: .NET SDK consumer
         run: tests/dotnet-sdk/run.sh ${{ matrix.backend }}

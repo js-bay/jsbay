@@ -13,7 +13,7 @@ pub const ContextExecution = struct {
     instance_id: ?i32 = null,
     admitted: bool = true,
     lease: ?engine_thread.EvalLease = null,
-    execution: ?js_event_loop.Scheduler.Execution = null,
+    execution: ?Execution = null,
 
     pub fn isClosing(self: *const ContextExecution) bool {
         const id = self.instance_id orelse return false;
@@ -54,10 +54,40 @@ pub fn beginContextExecution(ctx: ActiveEngine.Context) ContextExecution {
     return .{ .ctx = ctx, .instance_id = id, .lease = lease, .execution = execution };
 }
 
-pub fn beginExecution(instance_id: i32) ?js_event_loop.Scheduler.Execution {
+pub const Execution = struct {
+    scheduler: js_event_loop.Scheduler.Execution,
+    instance_id: i32,
+    budget_armed: bool,
+    active: bool = true,
+
+    pub fn end(self: *Execution) void {
+        if (!self.active) return;
+        self.active = false;
+        self.scheduler.end();
+        if (self.budget_armed) @import("runtime_control.zig").endExecutionBudget(self.instance_id);
+    }
+};
+
+pub const Task = struct {
+    scheduler: js_event_loop.Scheduler.Task,
+    instance_id: i32,
+    budget_armed: bool,
+    active: bool = true,
+
+    pub fn end(self: *Task) bool {
+        if (!self.active) return false;
+        self.active = false;
+        const outer = self.scheduler.end();
+        if (self.budget_armed) @import("runtime_control.zig").endExecutionBudget(self.instance_id);
+        return outer;
+    }
+};
+
+pub fn beginExecution(instance_id: i32) ?Execution {
     if (engine_thread.ownerHasYielded(instance_id)) return null;
+    if (!@import("runtime_control.zig").canEnterExecution(instance_id)) return null;
     const instance = instance_map.getInstance(instance_id) orelse return null;
-    return instance.loop.scheduler.beginExecution();
+    return .{ .scheduler = instance.loop.scheduler.beginExecution(), .instance_id = instance_id, .budget_armed = @import("runtime_control.zig").beginExecutionBudget(instance_id) };
 }
 
 pub fn beginSyncWait(instance_id: i32) ?js_event_loop.Scheduler.SyncWait {
@@ -66,10 +96,11 @@ pub fn beginSyncWait(instance_id: i32) ?js_event_loop.Scheduler.SyncWait {
     return instance.loop.scheduler.beginSyncWait();
 }
 
-pub fn beginQueuedTask(instance_id: i32) ?js_event_loop.Scheduler.Task {
+pub fn beginQueuedTask(instance_id: i32) ?Task {
     if (engine_thread.ownerHasYielded(instance_id)) return null;
     const instance = instance_map.getInstance(instance_id) orelse return null;
-    return instance.loop.scheduler.beginQueuedTask();
+    const task = instance.loop.scheduler.beginQueuedTask() orelse return null;
+    return .{ .scheduler = task, .instance_id = instance_id, .budget_armed = @import("runtime_control.zig").beginExecutionBudget(instance_id) };
 }
 
 pub fn beginDebuggerControl(instance_id: i32) ?js_event_loop.Scheduler.DebuggerControl {
@@ -103,7 +134,11 @@ pub fn checkpoint(instance_id: i32, ctx: ActiveEngine.Context) void {
     defer guard.end();
     if (!instance.loop.scheduler.beginBackendDrain()) return;
     defer instance.loop.scheduler.endBackendDrain();
-    if (!instance_map.isTeardownPending(instance_id)) ActiveEngine.processPendingJobs(ctx);
+    if (!instance_map.isTeardownPending(instance_id)) {
+        if (!@import("runtime_control.zig").beginExecutionBudget(instance_id)) return;
+        defer @import("runtime_control.zig").endExecutionBudget(instance_id);
+        ActiveEngine.processPendingJobs(ctx);
+    }
 }
 
 /// Drain microtasks for mono or packed-alt instances (packed-alt must not use ActiveEngine.Context).
@@ -118,6 +153,8 @@ pub fn checkpointInstance(instance_id: i32) void {
             if (!instance.loop.scheduler.beginBackendDrain()) return;
             defer instance.loop.scheduler.endBackendDrain();
             if (!instance_map.isTeardownPending(instance_id)) {
+                if (!@import("runtime_control.zig").beginExecutionBudget(instance_id)) return;
+                defer @import("runtime_control.zig").endExecutionBudget(instance_id);
                 @import("../backend_dispatch.zig").processPendingJobsPacked(a.tag, .{
                     .runtime_addr = a.runtime_addr,
                     .ctx_addr = a.ctx_addr,

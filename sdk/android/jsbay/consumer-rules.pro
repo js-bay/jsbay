@@ -1,6 +1,8 @@
 # The JNI adapter resolves these public SDK classes and methods by JVM name.
 -keep class io.jsbay.Native { *; }
 -keep class io.jsbay.Engine { *; }
+-keep class io.jsbay.EventHandler { *; }
+-keep class io.jsbay.LogHandler { *; }
 -keep class io.jsbay.LoopDriver { *; }
 -keep class io.jsbay.Value { *; }
 -keep class io.jsbay.Callback { *; }
@@ -10,7 +12,6 @@
 -keep class io.jsbay.SyncStarter { *; }
 -keep class io.jsbay.SyncCall { *; }
 -keep class io.jsbay.SyncCompletion { *; }
-
 # JNI RegisterNatives resolves native methods by exact JVM name/descriptor.
 # Descriptor types must keep their JVM names or RegisterNatives fails at loadLibrary.
 -keep class io.jsbay.LogHandler { *; }
@@ -19,3 +20,4 @@
 -keepclasseswithmembernames,includedescriptorclasses class io.jsbay.Native {
     native <methods>;
 }
+-keep class io.jsbay.SubmissionCallback { *; }

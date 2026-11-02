@@ -207,6 +207,51 @@ using (var rebuilt = new Engine(41007))
     Check.Equal(42d, value.Number(), "timer close releases the instance ID");
 }
 
+using (var submitted = new Engine(41010))
+{
+    var outcomes = new List<SubmissionResult>();
+    Check.Equal(true, submitted.PostScript("globalThis.__dotnetSubmission = 40 + 2", "submission-ok.js", outcomes.Add), "dotnet postScript admission");
+    Check.Equal(true, submitted.PostScript("throw new Error('submission')", "submission-error.js", outcomes.Add), "dotnet exception submission admission");
+    Check.Equal(true, submitted.PostFence(false, outcomes.Add), "dotnet postFence admission");
+    loopContext.PumpUntil(() => outcomes.Count == 3, TimeSpan.FromSeconds(2));
+    Check.Equal(SubmissionStatus.Completed, outcomes[0].Status, "dotnet first submission completes");
+    Check.Equal(SubmissionStatus.Exception, outcomes[1].Status, "dotnet exception submission reports exception");
+    Check.Equal(SubmissionStatus.Completed, outcomes[2].Status, "dotnet fence completes after FIFO scripts");
+    using var answer = submitted.Evaluate("__dotnetSubmission", "submission-result.js");
+    Check.Equal(42d, answer.Number(), "dotnet submission execution");
+    Check.Equal(true, submitted.BeginShutdown(1_000), "dotnet beginShutdown admission");
+    Check.Equal(true, submitted.PostFence(true, outcomes.Add), "dotnet sealing fence admission");
+    loopContext.PumpUntil(() => outcomes.Count == 4, TimeSpan.FromSeconds(2));
+    Check.Equal(ShutdownPhase.Drained, submitted.GetShutdownStatus()!.Value.Phase, "dotnet shutdown drains through fence");
+    Check.Equal(false, submitted.PostScript("1", "submission-rejected.js"), "dotnet sealed shutdown rejects new scripts");
+}
+
+using (var busySubmitted = new Engine(41011))
+{
+    var entered = new ManualResetEventSlim();
+    var controllerFinished = new ManualResetEventSlim();
+    var outcomes = new List<SubmissionResult>();
+    using var busyEntered = busySubmitted.Bind("dotnetSubmissionBusyEntered", (_, _) =>
+    {
+        entered.Set();
+        return busySubmitted.Undefined();
+    });
+    Check.Equal(true, busySubmitted.PostScript("dotnetSubmissionBusyEntered(); for (;;) {}", "submission-busy.js", outcomes.Add), "dotnet busy submission admission");
+    _ = Task.Run(() =>
+    {
+        try
+        {
+            Check.Equal(true, entered.Wait(TimeSpan.FromSeconds(1)), "dotnet busy submission entered");
+            Check.Equal(true, busySubmitted.BeginShutdown(20), "dotnet foreign-thread beginShutdown admission");
+        }
+        finally { controllerFinished.Set(); }
+    });
+    loopContext.PumpUntil(() => outcomes.Count == 1, TimeSpan.FromSeconds(2));
+    Check.Equal(true, controllerFinished.Wait(TimeSpan.FromSeconds(1)), "dotnet shutdown controller finished");
+    Check.Equal(SubmissionStatus.Cancelled, outcomes[0].Status, "dotnet foreign-thread shutdown cancels running submission");
+    Check.Equal(ShutdownPhase.Cancelled, busySubmitted.GetShutdownStatus()!.Value.Phase, "dotnet foreign-thread shutdown terminal phase");
+}
+
 var ownerContext = SynchronizationContext.Current;
 try
 {

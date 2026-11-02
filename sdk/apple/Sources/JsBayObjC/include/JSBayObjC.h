@@ -33,6 +33,27 @@ typedef NS_ENUM(NSInteger, JSBayValueKind) {
     JSBayValueKindBigInt,
 };
 
+typedef NS_ENUM(NSInteger, JSBaySubmissionStatus) {
+    JSBaySubmissionStatusCompleted = 0,
+    JSBaySubmissionStatusException = 1,
+    JSBaySubmissionStatusCancelled = 2,
+};
+
+typedef NS_ENUM(NSInteger, JSBayShutdownPhase) {
+    JSBayShutdownPhaseOpen = 0,
+    JSBayShutdownPhaseClosing = 1,
+    JSBayShutdownPhaseSealed = 2,
+    JSBayShutdownPhaseDrained = 3,
+    JSBayShutdownPhaseCancelled = 4,
+};
+
+@interface JSBayShutdownStatus : NSObject
+@property(nonatomic, readonly) JSBayShutdownPhase phase;
+@property(nonatomic, readonly) uint64_t remainingMilliseconds;
+@end
+
+typedef void (^JSBaySubmissionCompletion)(JSBaySubmissionStatus status, NSData *errorData);
+
 @class JSBayEngine;
 @class JSBayValue;
 @class JSBaySyncCompletion;
@@ -212,7 +233,21 @@ typedef void (^JSBaySyncStarter)(JSBayValue *thisValue, NSArray<JSBayValue *> *a
 - (BOOL)clearInterrupt:(NSError *_Nullable *_Nullable)error;
 - (BOOL)setExecutionTimeLimitMilliseconds:(uint64_t)milliseconds
                                     error:(NSError *_Nullable *_Nullable)error;
+- (BOOL)setExecutionBudgetMilliseconds:(uint64_t)milliseconds
+                                 error:(NSError *_Nullable *_Nullable)error;
 - (BOOL)setMemoryLimitBytes:(uint64_t)bytes error:(NSError *_Nullable *_Nullable)error;
+- (BOOL)postScript:(NSString *)source
+          filename:(NSString *)filename
+        completion:(nullable JSBaySubmissionCompletion)completion
+             error:(NSError *_Nullable *_Nullable)error;
+- (BOOL)postFenceSealingShutdown:(BOOL)sealShutdown
+                      completion:(nullable JSBaySubmissionCompletion)completion
+                           error:(NSError *_Nullable *_Nullable)error;
+- (BOOL)beginShutdownWithGraceMilliseconds:(uint64_t)milliseconds
+                                     error:(NSError *_Nullable *_Nullable)error;
+- (nullable JSBayShutdownStatus *)shutdownStatus;
+/// Cancels only the generation created by this object.
+- (BOOL)cancel;
 - (BOOL)setResourceLimits:(JSBayResourceLimits *)limits error:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayResourceUsage *)resourceUsage:(NSError *_Nullable *_Nullable)error;
 + (nullable JSBayResourceGlobalUsage *)globalResourceUsage:(NSError *_Nullable *_Nullable)error;

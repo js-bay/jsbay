@@ -395,7 +395,7 @@ pub fn fireOneDue(instance_id: i32, now_ms: u64) bool {
     fireOne(instance_id, data, now_ms, &queued);
     return true;
 }
-fn fireOne(instance_id: i32, data: *TimerData, now_ms: u64, queued: *(@import("js_event_loop").Scheduler.Task)) void {
+fn fireOne(instance_id: i32, data: *TimerData, now_ms: u64, queued: *@import("js_scheduler.zig").Task) void {
     if (!data.is_interval) instance_map.withInstance(instance_id, struct {
         data: *TimerData,
         pub fn call(self: @This(), inst: *instance_map.EngineInstance) void {
