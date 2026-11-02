@@ -1434,8 +1434,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         if (ib.imported == ".") {
             ident_repl[ib.local] = ns;
         } else if (ib.imported == "default") {
-            // Read .default directly so `export default undefined` stays undefined.
-            ident_repl[ib.local] = ns + ".default";
+            // Unbound call form reading .default so `export default undefined` stays undefined and default callables keep this === undefined.
+            ident_repl[ib.local] = "(0, " + ns + ".default)";
         } else {
             // Unbound call form: `import { f }` must keep `f()` as an unbound call
             // (this === undefined), not `__jsbay_ns.f()` which binds this to the ns.

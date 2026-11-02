@@ -748,7 +748,7 @@ pub fn isDestroying(instance_id: i32) bool {
 
 /// Let another thread `evalScript` this instance. Only the engine thread may call it, and only after `threadStart`. Before the engine thread exists this is a no-op and returns true. A foreign caller returns false and does not abort.
 ///
-/// Mirrors ScriptX `ExitEngineScope`: the owner drops its claim, the other thread enters, then `reacquire` takes the claim back.
+/// Yield ownership: the owner drops its claim so another thread can enter, then `reacquire` takes the claim back.
 pub fn releaseForExternalEval(instance_id: i32) bool {
     const state = retain(instance_id) orelse return true;
     defer release(state);
@@ -773,8 +773,8 @@ pub fn reacquire(instance_id: i32) bool {
     if (state.yield_depth == 0) {
         // Block foreign eval before this thread owns the runtime again.
         state.yielded.store(false, .seq_cst);
-        if (backend.isJscApiBackend(backend.active_backend)) {
-            // Wait for an evaluation already admitted during the yield. Any queued caller rechecks `yielded` after acquiring the mutex.
+        if (backend.isJscApiBackend(backend.active_backend) or backend.isHermesBackend(backend.active_backend) or backend.isEscargotBackend(backend.active_backend)) {
+            // Wait for an evaluation already admitted during the yield (Hermes/Escargot resume is a no-op, so the lease still serializes foreign eval). Any queued caller rechecks `yielded` after acquiring the mutex.
             state.external_eval_mu.lock();
             state.external_eval_mu.unlock();
         }
@@ -827,7 +827,7 @@ const NativeTask = struct {
     data: ?*anyopaque,
 };
 
-/// Ask the engine thread to run `func` outside any JavaScript call. Used to yield the way ScriptX `ExitEngineScope` does: the owner is in native code, not inside eval. Returns false when the thread is not running or a task is already queued.
+/// Ask the engine thread to run `func` outside any JavaScript call so the owner can yield while in native code, not inside eval. Returns false when the thread is not running or a task is already queued.
 pub fn postToEngineThread(instance_id: i32, func: *const fn (?*anyopaque) void, data: ?*anyopaque) bool {
     const state = retain(instance_id) orelse return false;
     defer release(state);

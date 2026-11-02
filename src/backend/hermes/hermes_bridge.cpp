@@ -962,7 +962,7 @@ extern "C" uint32_t hermes_get_length(JsbayHermesContext *c, HermesValue obj) {
         auto len = asVal(obj)->getObject(*c->rt).getProperty(*c->rt, "length");
         if (!len.isNumber()) return 0;
         double d = len.getNumber();
-        if (d < 0) d = 0;
+        if (!std::isfinite(d) || d < 0) d = 0;
         if (d > 0xffffffffu) d = 0xffffffffu;
         return (uint32_t)d;
     } catch (...) { return 0; }

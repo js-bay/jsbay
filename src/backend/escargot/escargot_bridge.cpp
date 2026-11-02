@@ -51,8 +51,7 @@ struct NoCopyPack {
     void *user_data = nullptr;
     EscargotContextOpaque *owner = nullptr;
     bool fired = false;
-    // Set when context_free finalizes the pack but BackingStore may still invoke
-    // the C++ deleter later (Memory::gc is process-global). Late calls free the shell.
+    // Set when context_free finalizes the pack but BackingStore may still invoke the C++ deleter later (Memory::gc is process-global). Late calls free the shell.
     bool retired = false;
 };
 
@@ -834,7 +833,7 @@ extern "C" uint32_t escargot_get_length(EscargotContext *c, EscargotValue obj) {
             ValueRef *len = o->asObject()->get(state, StringRef::createFromASCII("length"));
             if (!len || !len->isNumber()) return ValueRef::create(0u);
             double d = len->asNumber();
-            if (d < 0) d = 0;
+            if (!std::isfinite(d) || d < 0) d = 0;
             if (d > 0xffffffffu) d = 0xffffffffu;
             return ValueRef::create((uint32_t)d);
         },
