@@ -95,6 +95,7 @@ static std::string blankNonCode(const std::string &src) {
 
 
 // Skip strings/comments roughly; return rewritten source with identifier replacements.
+// Template literal text is preserved, but `${...}` interpolations are rewritten recursively.
 static std::string rewriteIdents(const std::string &src,
                                  const std::unordered_map<std::string, std::string> &repl) {
     if (repl.empty()) return src;
@@ -117,8 +118,8 @@ static std::string rewriteIdents(const std::string &src,
             if (i < src.size()) out.push_back(src[i++]);
             continue;
         }
-        // strings
-        if (c == '\'' || c == '"' || c == '`') {
+        // single/double-quoted strings: copy verbatim (no identifier rewrite inside)
+        if (c == '\'' || c == '"') {
             char q = c;
             out.push_back(src[i++]);
             while (i < src.size()) {
@@ -133,6 +134,84 @@ static std::string rewriteIdents(const std::string &src,
                     break;
                 }
                 ++i;
+            }
+            continue;
+        }
+        // template literals: keep cooked text, rewrite `${...}` expressions as JS
+        if (c == '`') {
+            out.push_back(src[i++]);
+            while (i < src.size()) {
+                if (src[i] == '\\' && i + 1 < src.size()) {
+                    out.push_back(src[i++]);
+                    out.push_back(src[i++]);
+                    continue;
+                }
+                if (src[i] == '`') {
+                    out.push_back(src[i++]);
+                    break;
+                }
+                if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                    out.push_back(src[i++]);
+                    out.push_back(src[i++]);
+                    // Scan the interpolation with nested brace / string / template awareness.
+                    size_t start = i;
+                    int depth = 1;
+                    while (i < src.size() && depth > 0) {
+                        char ic = src[i];
+                        if (ic == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+                            i += 2;
+                            while (i < src.size() && src[i] != '\n') ++i;
+                            continue;
+                        }
+                        if (ic == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+                            i += 2;
+                            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+                            if (i + 1 < src.size()) i += 2;
+                            continue;
+                        }
+                        if (ic == '\'' || ic == '"') {
+                            char q = ic;
+                            ++i;
+                            while (i < src.size()) {
+                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                                if (src[i] == q) { ++i; break; }
+                                ++i;
+                            }
+                            continue;
+                        }
+                        if (ic == '`') {
+                            ++i;
+                            while (i < src.size()) {
+                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                                if (src[i] == '`') { ++i; break; }
+                                if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                                    i += 2;
+                                    int nested = 1;
+                                    while (i < src.size() && nested > 0) {
+                                        if (src[i] == '{') ++nested;
+                                        else if (src[i] == '}') --nested;
+                                        ++i;
+                                    }
+                                    continue;
+                                }
+                                ++i;
+                            }
+                            continue;
+                        }
+                        if (ic == '{') { ++depth; ++i; continue; }
+                        if (ic == '}') {
+                            --depth;
+                            if (depth == 0) break;
+                            ++i;
+                            continue;
+                        }
+                        ++i;
+                    }
+                    out += rewriteIdents(src.substr(start, i - start), repl);
+                    if (i < src.size() && src[i] == '}') out.push_back(src[i++]);
+                    continue;
+                }
+                out.push_back(src[i++]);
             }
             continue;
         }
@@ -349,7 +428,13 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             std::smatch m;
             if (!std::regex_search(blanked, m, re)) break;
             std::string mod = body.substr(m.position(2), m.length(2));
-            std::string repl = "Object.assign(exports, require(\"" + mod + "\"));";
+            // Live bindings via getters; exclude default per ExportEntriesFromModule.
+            std::string repl =
+                "(function(__jsbay_star){Object.keys(__jsbay_star).forEach(function(k){"
+                "if(k===\"default\"||Object.prototype.hasOwnProperty.call(exports,k))return;"
+                "Object.defineProperty(exports,k,{enumerable:true,configurable:true,"
+                "get:function(){return __jsbay_star[k];}});});})(require(\"" +
+                mod + "\"));";
             body.replace(m.position(), m.length(), repl);
         }
     }

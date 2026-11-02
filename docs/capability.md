@@ -158,24 +158,17 @@ zig build test-engine
 
 No CI job runs these backends yet (manual / optional).
 
-### Escargot `ESCARGOT_THREADING` rebuild (landed 2026-10-31 Asia/Shanghai)
+### Escargot threading build requirements
 
-Vendor `libescargot.a` + `libgc-lib.a` rebuilt and installed with:
+Vendor Escargot must be built with threading enabled. Required CMake flags:
 
 ```bash
-# reconfigured existing /tmp/escargot-build (source: /tmp/engine-dl/escargot-src)
 cmake ... -DESCARGOT_THREADING=ON -DESCARGOT_TLS_ACCESS_BY_PTHREAD_KEY=ON \
   -DCMAKE_BUILD_TYPE=Release -DESCARGOT_ENABLE_SHELL=ON \
   -DESCARGOT_LIBICU_SUPPORT=OFF -DESCARGOT_FORCE_TLS_DIALECT_GNU2=ON
-ninja -C /tmp/escargot-build
-# installed libescargot.a + libgc-lib.a → vendor/escargot-install/lib/
-# recompiled escargot_bridge.o
 ```
 
-Defines present: `ENABLE_THREADING`, `ENABLE_TLS_ACCESS_BY_PTHREAD_KEY`, `GC_THREAD_ISOLATE`.
-`Globals::supportsThreading()==true`. Zig link with `-fno-lld` / GNU2 TLS: **no TLSDESC failure**.
-Smoke `engine_thread post/wait eval` **un-Skipped and green**. Non-threaded backup kept at
-`/tmp/escargot-vendor-backup/` (restore if a future pin regresses).
+Supported threading configuration: `ENABLE_THREADING`, `ENABLE_TLS_ACCESS_BY_PTHREAD_KEY`, and `GC_THREAD_ISOLATE` must be present so `Globals::supportsThreading()` is true. Link Escargot with `-fno-lld` / GNU2 TLS so Zig does not hit TLSDESC failures on this pin.
 
 
 ## Remaining skips (engine / API limits)
