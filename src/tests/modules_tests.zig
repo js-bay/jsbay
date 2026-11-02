@@ -291,6 +291,50 @@ test "modules: parenthesized arrow param shadows imported binding" {
     try testing.expectEqual(@as(i64, 2), got);
 }
 
+test "modules: object method param shadows imported binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Method params must establish a ParamList scope (else `m((0, ns.value))` is a SyntaxError).
+    const src = "import { value } from 'dep';\nexport const result = { m(value) { return value; } }.m(2);\nglobalThis.__result__ = result;";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 2), got);
+}
+
+test "modules: compound param default rewrites imported binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Default-value expressions may reference imports throughout, not only the first ident after `=`.
+    const src = "import { value } from 'dep';\nexport function read(x = 1 + value) { return x; }\nglobalThis.__result__ = read();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 43), got);
+}
+
 test "modules: re-export dependency evaluates before module body" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);

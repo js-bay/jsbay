@@ -398,6 +398,8 @@ static std::string rewriteIdents(const std::string &src,
     std::vector<Cont> cont;
     // When a ParamList `)` is followed by `{`, the next `{` is FnBody and pops the param scope on `}`.
     bool next_brace_is_fn_body = false;
+    // True while scanning a parameter default initializer (`=` … until `,`/`)` at ParamList depth).
+    bool in_param_default = false;
 
     auto prevSignificant = [&]() -> char {
         size_t pk = out.size();
@@ -712,11 +714,35 @@ static std::string rewriteIdents(const std::string &src,
                 skipSpacesSrc(p);
                 return p + 1 < src.size() && src[p] == '=' && src[p + 1] == '>';
             };
+            // Object method params: `{ m(value) {…} }`, `{ [k](a){} }`, `{ *g(a){} }`, `{ async m(a){} }`, `{ get x(){} }`.
+            auto opensMethodParamList = [&]() -> bool {
+                if (cont.empty() || cont.back() != Cont::ObjectLit) return false;
+                size_t end = pk; // trailing spaces already stripped into pk
+                if (end == 0) return false;
+                // Computed method name ends with `]`.
+                if (out[end - 1] == ']') return true;
+                if (!isIdent(out[end - 1])) return false;
+                size_t name_start = end;
+                while (name_start > 0 && isIdent(out[name_start - 1])) --name_start;
+                size_t before = name_start;
+                while (before > 0 && std::isspace(static_cast<unsigned char>(out[before - 1]))) --before;
+                char bp = before > 0 ? out[before - 1] : '\0';
+                if (bp == '{' || bp == ',' || bp == '*') return true;
+                // get / set / async before the method name.
+                if (before > 0 && isIdent(out[before - 1])) {
+                    size_t ws = before;
+                    while (ws > 0 && isIdent(out[ws - 1])) --ws;
+                    std::string prev_word = out.substr(ws, before - ws);
+                    if (prev_word == "get" || prev_word == "set" || prev_word == "async") return true;
+                }
+                return false;
+            };
             if (outEndsWithWord(pk2, "function") || outEndsWithWord(pk2, "catch") ||
                 outEndsWithWord(pk, "function") || outEndsWithWord(pk, "catch") ||
-                parenFollowedByArrow(i)) {
+                parenFollowedByArrow(i) || opensMethodParamList()) {
                 kind = Cont::ParamList;
                 pushFunctionScope();
+                in_param_default = false;
             }
             cont.push_back(kind);
             out.push_back(src[i++]);
@@ -728,6 +754,7 @@ static std::string rewriteIdents(const std::string &src,
                 cont.pop_back();
             out.push_back(src[i++]);
             if (was_param) {
+                in_param_default = false;
                 size_t k = i;
                 skipSpacesSrc(k);
                 if (k < src.size() && src[k] == '{') {
@@ -740,6 +767,29 @@ static std::string rewriteIdents(const std::string &src,
                     popScope();
                 }
             }
+            continue;
+        }
+
+        // Parameter / destructuring-default separators end a default initializer (not commas inside nested `(…)` of the default expr).
+        if (c == ',' && underParamList() && !cont.empty() &&
+            (cont.back() == Cont::ParamList || cont.back() == Cont::ObjectLit ||
+             cont.back() == Cont::Bracket)) {
+            in_param_default = false;
+            out.push_back(src[i++]);
+            continue;
+        }
+
+        // Parameter / destructuring default: `=` under ParamList at pattern depth (not `=>` / `==` / compound assigns).
+        if (c == '=' && underParamList() && !cont.empty() &&
+            (cont.back() == Cont::ParamList || cont.back() == Cont::ObjectLit ||
+             cont.back() == Cont::Bracket) &&
+            !(i + 1 < src.size() && (src[i + 1] == '>' || src[i + 1] == '=')) &&
+            !(i > 0 && (src[i - 1] == '=' || src[i - 1] == '!' || src[i - 1] == '<' ||
+                        src[i - 1] == '>' || src[i - 1] == '+' || src[i - 1] == '-' ||
+                        src[i - 1] == '*' || src[i - 1] == '/' || src[i - 1] == '%' ||
+                        src[i - 1] == '&' || src[i - 1] == '|' || src[i - 1] == '^'))) {
+            in_param_default = true;
+            out.push_back(src[i++]);
             continue;
         }
 
@@ -891,11 +941,11 @@ static std::string rewriteIdents(const std::string &src,
             }
 
             // ParamList / destructuring bindings under ParamList: do not rewrite; register binding.
+            // Default-initializer expressions (after `=` until `,`/`)`) may reference imports — allow rewrite.
             if (underParamList()) {
                 char p = prevSignificant();
                 if (p != '.' && p != '?') {
-                    // After `=` inside params this is a default-value reference — allow rewrite/shadow check.
-                    if (p != '=') {
+                    if (!in_param_default) {
                         addBindings({id});
                         out += id;
                         i = j;

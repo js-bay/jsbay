@@ -58,9 +58,9 @@ pub fn sameValue(ctx: Context, a: Value, b: Value) bool {
 pub fn strictEqual(ctx: Context, a: Value, b: Value) bool {
     return c_api.hermes_strict_equal(ctx, a, b);
 }
-pub fn toBool(_: Context, v: Value) ?bool {
+pub fn toBool(ctx: Context, v: Value) ?bool {
     if (v == null) return null;
-    return c_api.hermes_to_bool(v);
+    return c_api.hermes_to_bool(ctx, v);
 }
 pub fn toInt32(ctx: Context, v: Value) ?i32 {
     if (v == null) return null;

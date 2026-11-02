@@ -511,8 +511,29 @@ extern "C" bool escargot_is_constructor(EscargotContext *, EscargotValue v) {
     return asVal(v)->asFunctionObject()->isConstructor();
 }
 
-extern "C" bool escargot_to_bool(EscargotValue v) {
-    return v && asVal(v)->isBoolean() && asVal(v)->asBoolean();
+// ECMAScript ToBoolean. Objects/symbols are always true; 0/NaN/-0, "", 0n, null, undefined are false.
+extern "C" bool escargot_to_bool(EscargotContext *c, EscargotValue v) {
+    if (!v) return false;
+    ValueRef *val = asVal(v);
+    if (val->isUndefined() || val->isNull()) return false;
+    if (val->isBoolean()) return val->asBoolean();
+    if (val->isNumber()) {
+        double d = val->asNumber();
+        return d != 0.0 && !std::isnan(d);
+    }
+    if (val->isString()) return val->asString()->length() != 0;
+    if (val->isSymbol() || val->isObject()) return true;
+    // BigInt (and any remaining): Boolean(v) — only 0n is falsy.
+    if (!c) return false;
+    auto er = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, ValueRef *arg) -> ValueRef * {
+            auto *Boolean = state->context()->globalObject()->get(
+                state, StringRef::createFromASCII("Boolean"));
+            ValueRef *args[] = {arg};
+            return Boolean->call(state, ValueRef::createUndefined(), 1, args);
+        },
+        val);
+    return er.isSuccessful() && er.result && er.result->isBoolean() && er.result->asBoolean();
 }
 // ECMAScript ToInt32 without float→int32 UB for out-of-range finite numbers.
 static int32_t escargotToInt32Number(double d) {
@@ -1332,10 +1353,7 @@ extern "C" uint8_t *escargot_data_view_data(EscargotContext *c, EscargotValue dv
     size_t off = view->byteOffset();
     size_t len = view->byteLength();
     uint8_t *p = view->rawBuffer(); // view-relative
-    // Escargot OOB-after-resize zeros view offset/length and clears view rawBuffer while
-    // the backing store may still be live (m_wasResetByInvalidByteLength). That must not
-    // look like a legitimate empty DataView (which keeps a non-null view pointer into the
-    // buffer, or is the empty-on-empty-AB case). Match QuickJS → null / INVALID copy.
+    // Escargot OOB-after-resize zeros view offset/length and clears view rawBuffer while the backing store may still be live (m_wasResetByInvalidByteLength). That must not look like a legitimate empty DataView (which keeps a non-null view pointer into the buffer, or is the empty-on-empty-AB case). Match QuickJS → null / INVALID copy.
     if (!p) {
         if (len == 0 && off == 0 && ab_len == 0 && !base) {
             if (byte_offset) *byte_offset = 0;

@@ -63,7 +63,7 @@ bool escargot_is_array(EscargotContext *ctx, EscargotValue v);
 bool escargot_is_function(EscargotContext *ctx, EscargotValue v);
 bool escargot_is_constructor(EscargotContext *ctx, EscargotValue v);
 
-bool escargot_to_bool(EscargotValue v);
+bool escargot_to_bool(EscargotContext *ctx, EscargotValue v);
 /* ToNumber then ToInt32 / identity. On conversion failure sets pending throw and returns false. */
 bool escargot_to_int32(EscargotContext *ctx, EscargotValue v, int32_t *out);
 bool escargot_to_float64(EscargotContext *ctx, EscargotValue v, double *out);

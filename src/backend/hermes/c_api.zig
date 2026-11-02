@@ -53,7 +53,7 @@ pub extern fn hermes_is_object(v: Value) bool;
 pub extern fn hermes_is_array(ctx: ?*Context, v: Value) bool;
 pub extern fn hermes_is_function(ctx: ?*Context, v: Value) bool;
 pub extern fn hermes_is_constructor(ctx: ?*Context, v: Value) bool;
-pub extern fn hermes_to_bool(v: Value) bool;
+pub extern fn hermes_to_bool(ctx: ?*Context, v: Value) bool;
 pub extern fn hermes_to_int32(ctx: ?*Context, v: Value, out: *i32) bool;
 pub extern fn hermes_to_float64(ctx: ?*Context, v: Value, out: *f64) bool;
 pub extern fn hermes_value_to_utf8(ctx: ?*Context, v: Value) ?[*:0]u8;

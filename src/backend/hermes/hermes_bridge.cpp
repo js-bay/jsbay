@@ -686,7 +686,31 @@ extern "C" bool hermes_is_constructor(JsbayHermesContext *c, HermesValue v) {
     }
 }
 
-extern "C" bool hermes_to_bool(HermesValue v) { return v && asVal(v)->isBool() && asVal(v)->getBool(); }
+// ECMAScript ToBoolean. Objects/symbols are always true; 0/NaN/-0, "", 0n, null, undefined are false.
+extern "C" bool hermes_to_bool(JsbayHermesContext *c, HermesValue v) {
+    if (!v) return false;
+    jsi::Value &val = *asVal(v);
+    if (val.isUndefined() || val.isNull()) return false;
+    if (val.isBool()) return val.getBool();
+    if (val.isNumber()) {
+        double d = val.getNumber();
+        return d != 0.0 && !std::isnan(d);
+    }
+    if (val.isSymbol() || val.isObject()) return true;
+    // String / BigInt need the runtime.
+    if (!c || !c->rt) return false;
+    try {
+        if (val.isString()) return !val.getString(*c->rt).utf8(*c->rt).empty();
+        if (val.isBigInt()) {
+            auto zero = jsi::BigInt::fromInt64(*c->rt, 0);
+            auto bi = val.getBigInt(*c->rt);
+            return !jsi::BigInt::strictEquals(*c->rt, bi, zero);
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
 // ECMAScript ToInt32 without float→int32 UB for out-of-range finite numbers.
 static int32_t hermesToInt32Number(double d) {
     if (std::isnan(d) || std::isinf(d) || d == 0.0) return 0;

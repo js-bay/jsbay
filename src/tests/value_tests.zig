@@ -481,6 +481,9 @@ test "value: getPropertyBool returns bool when present, null otherwise" {
             value.registerFunction(inst, null, "gpbm", &hGetPropBoolMissing);
             try helpers.expectEvalEquals(inst, "String(gpb({active:true}))", "true");
             try helpers.expectEvalEquals(inst, "String(gpb({active:false}))", "false");
+            // ToBoolean coercion: truthy/falsy non-booleans (QuickJS/JSC parity).
+            try helpers.expectEvalEquals(inst, "String(gpb({active:1}))", "true");
+            try helpers.expectEvalEquals(inst, "String(gpb({active:0}))", "false");
             try helpers.expectEvalEquals(inst, "String(gpbm({}))", "false");
         }
     }.run);
