@@ -48,13 +48,14 @@ Checklist: `/workspace/codex-pr7-findings.md` (37 findings)
 
 ## Theme commits (this work)
 
-See `git log` after HEAD `b9d39fa` for SHAs. Planned groups:
+Local commits on top of `b9d39fa` (not pushed from box):
 
-1. Hermes bridge: identity callWithThis, setTimeout removal, to_string_result, make_function_ex ownership
-2. Hermes ESM: blankNonCode + named re-export init load
-3. Escargot bridge: foreach fidelity, to_string_result, make_function_ex
-4. Zig ABI/adapters: toUtf8, timers free, MethodBox, log_user_data
-5. Docs/comments: attribution neutralization + this report
+1. `49e49a4` fix(hermes): identity callWithThis, to_string_result, MethodBox ownership
+2. `832e1a6` fix(hermes-esm): blankNonCode export scan and named re-export init
+3. `cd8891a` fix(escargot): foreach fidelity, to_string_result, MethodBox teardown
+4. `9ba1930` fix(abi): exception-preserving toUtf8 and EngineCreateOptions size gate
+5. `91160ae` docs: neutralize attribution comments and add Codex fix report
+6. tip docs commit: record Codex fix commit SHAs in report (`git log -1 --oneline`)
 
 ## Builds / tests
 
