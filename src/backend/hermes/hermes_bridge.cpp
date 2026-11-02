@@ -1619,13 +1619,15 @@ static HermesOpResult hopOk(JsbayHermesContextOpaque *c, jsi::Value &&v) {
 
 extern "C" HermesOpResult hermes_value_to_string_result(JsbayHermesContext *c, HermesValue v) {
     HermesOpResult out{nullptr, nullptr};
-    if (!c || !c->rt || !v) return out;
+    if (!c || !c->rt) return out;
     try {
-        if (asVal(v)->isString()) {
-            return hopOk(c, jsi::Value(*c->rt, *asVal(v)));
+        // Null handle is the undefined sentinel (hermes_undefined); ToString → "undefined".
+        jsi::Value local = v ? jsi::Value(*c->rt, *asVal(v)) : jsi::Value::undefined();
+        if (local.isString()) {
+            return hopOk(c, std::move(local));
         }
         // Ordinary ToString: preserve throws from valueOf/toString instead of substituting.
-        jsi::String s = asVal(v)->toString(*c->rt);
+        jsi::String s = local.toString(*c->rt);
         return hopOk(c, jsi::Value(std::move(s)));
     } catch (const jsi::JSError &e) {
         return hopFail(c, jsi::Value(*c->rt, e.value()));
@@ -2867,16 +2869,22 @@ struct HermesNhState : jsi::NativeState {
 extern "C" HermesValue hermes_native_handle_create(JsbayHermesContext *c, void *handle_data,
                                                    HermesNativeFn call_fn, HermesNhFinalize finalize) {
     if (!c || !c->rt || !handle_data) return nullptr;
+    HermesNhBox *box = nullptr;
+    HermesNhClaim *claim = nullptr;
+    JsbayHermesContextOpaque::PendingFinal *pf = nullptr;
+    std::shared_ptr<HermesNhState> state;
     try {
-        auto *box = new HermesNhBox{handle_data, call_fn, finalize, c};
-        auto *claim = new HermesNhClaim{box, false};
+        box = new HermesNhBox{handle_data, call_fn, finalize, c};
+        // refs=1 for pending_finals until NativeState attaches (then refs=2).
+        claim = new HermesNhClaim{box, false, 1};
         // pending_finals owns the claim lifetime if NativeState never runs first.
-        auto *pf = new JsbayHermesContextOpaque::PendingFinal{&fireHermesNhClaim, claim, false};
+        pf = new JsbayHermesContextOpaque::PendingFinal{&fireHermesNhClaim, claim, false};
         {
             std::lock_guard<std::mutex> lock(c->finals_mu);
             c->pending_finals.push_back(pf);
         }
-        auto state = std::make_shared<HermesNhState>(claim);
+        state = std::make_shared<HermesNhState>(claim);
+        claim->refs = 2;
         if (call_fn) {
             // Closure retains HermesNhState independently of the JS-mutable __jsbay_nh holder,
             // so deleting/overwriting that property cannot free the box while h is still callable.
@@ -2924,6 +2932,34 @@ extern "C" HermesValue hermes_native_handle_create(JsbayHermesContext *c, void *
         o.setNativeState(*c->rt, state);
         return retainMove(c, jsi::Value(std::move(o)));
     } catch (...) {
+        // Construction failed after pending_finals claim — disarm without user finalize so Zig keeps HandleData.
+        if (claim && claim->box) {
+            claim->box->finalize = nullptr;
+            claim->box->handle_data = nullptr;
+        }
+        state.reset();
+        if (pf) {
+            std::lock_guard<std::mutex> lock(c->finals_mu);
+            auto &vec = c->pending_finals;
+            vec.erase(std::remove(vec.begin(), vec.end(), pf), vec.end());
+            delete pf;
+            pf = nullptr;
+            if (claim) {
+                releaseHermesNhClaim(claim);
+                claim = nullptr;
+            }
+        } else if (claim) {
+            if (claim->box) {
+                delete claim->box;
+                claim->box = nullptr;
+            }
+            delete claim;
+            claim = nullptr;
+        } else if (box) {
+            box->finalize = nullptr;
+            box->handle_data = nullptr;
+            delete box;
+        }
         return nullptr;
     }
 }

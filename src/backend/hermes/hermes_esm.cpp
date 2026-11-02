@@ -358,9 +358,20 @@ static std::string rewriteIdents(const std::string &src,
                                                  !(k + 1 < src.size() && src[k + 1] == ':'));
             std::string id = src.substr(i, j - i);
             auto it = repl.find(id);
-            if (!after_dot && !object_key && it != repl.end())
-                out += it->second;
-            else
+            if (!after_dot && !object_key && it != repl.end()) {
+                // Object-literal shorthand `{value}` / `{a, value}` must become `value: <repl>`.
+                bool after_shorthand_intro = false;
+                if (!out.empty()) {
+                    size_t pk = out.size();
+                    while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+                    if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ',')) after_shorthand_intro = true;
+                }
+                bool ahead_shorthand_end = (k < src.size() && (src[k] == ',' || src[k] == '}'));
+                if (after_shorthand_intro && ahead_shorthand_end)
+                    out += id + ": " + it->second;
+                else
+                    out += it->second;
+            } else
                 out += id;
             i = j;
             continue;
@@ -900,20 +911,22 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 changed = true;
                 continue;
             }
-            // Also allow imports after newlines mid-file: search next import at line start
+            // Also allow imports after newlines mid-file: search next import at line start on blankNonCode so commented-out `import` is ignored; mutate live body at those offsets.
             static const std::regex any_import(R"((^|\n)(\s*import\s))");
-            if (std::regex_search(body, m, any_import)) {
-                size_t start = m.position() + (m[1].matched ? m[1].length() : 0);
-                if (start > 0) {
-                    // Move that import to front by rotating — simpler: extract line
-                    size_t line_end = body.find('\n', start);
-                    std::string line = body.substr(start, line_end == std::string::npos ? std::string::npos : line_end - start + (line_end == std::string::npos ? 0 : 1));
-                    // If line looks like import, cut and prepend processing
-                    if (line.find("import") != std::string::npos) {
-                        body.erase(start, line.size());
-                        body = line + body;
-                        changed = true;
-                        continue;
+            {
+                std::string blanked = blankNonCode(body);
+                if (std::regex_search(blanked, m, any_import)) {
+                    size_t start = m.position() + (m[1].matched ? m[1].length() : 0);
+                    if (start > 0) {
+                        // Move that import to front by rotating — extract line from live body.
+                        size_t line_end = body.find('\n', start);
+                        std::string line = body.substr(start, line_end == std::string::npos ? std::string::npos : line_end - start + (line_end == std::string::npos ? 0 : 1));
+                        if (line.find("import") != std::string::npos) {
+                            body.erase(start, line.size());
+                            body = line + body;
+                            changed = true;
+                            continue;
+                        }
                     }
                 }
             }

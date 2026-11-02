@@ -2381,10 +2381,7 @@ static void fireNativeHandlePending(void *data) {
     bx->handle_data = nullptr;
     delete bx;
 }
-// NOTE: Do NOT register Memory::gcRegisterFinalizer on the NH object while also
-// using pending_finals teardown. Escargot has no unregister API; GC after
-// context-free leftover fire UAF'd the deleted NativeHandleBox (adversarial /
-// host_object suite ABRT). Teardown-forced finalize remains the contract.
+// NOTE: Do not register Memory::gcRegisterFinalizer on the NH object while also using pending_finals teardown. Escargot has no unregister API, so GC finalizers cannot safely coexist with teardown-owned finalization. Teardown-forced finalize remains the contract.
 
 static ValueRef *nativeHandleTrampoline(ExecutionStateRef *state, ValueRef *thisValue, size_t argc, ValueRef **argv,
                                           bool isConstructCall) {
