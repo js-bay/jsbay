@@ -89,7 +89,7 @@ const Fixture = struct {
             \\({ name: 'sweep', blob: 'x'.repeat(40000),
             \\   rows: Array.from({ length: 1500 }, (_, i) => ({ i, label: 'row-' + i, nested: { even: i % 2 === 0 } })) })
         );
-        self.big_string = try self.evaluateOk("'h\\u00e9llo-\\u4e16\\u754c-'.repeat(8000)");
+        self.big_string = try self.evaluateOk("'h\\u00e9llo-\\u03ba\\u03cc\\u03c3\\u03bc\\u03bf\\u03c2-'.repeat(8000)");
         self.expected_json = try self.textOf(c_api.jsbay_value_to_json, self.big_object);
         self.expected_utf8 = try self.textOf(c_api.jsbay_value_to_utf8, self.big_string);
         try testing.expect(self.expected_json.len > 40000);

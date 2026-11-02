@@ -14,7 +14,7 @@ const value = @import("../value/root.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
-const boundary_message = "错误 👍";
+const boundary_message = "error 👍";
 
 fn installThrower(id: i32) void {
     const ctx = engine.getContext(id) orelse return;
@@ -73,7 +73,7 @@ fn installThrower(id: i32) void {
 test "exception boundary: eval Error message keeps utf-8 and the next eval works" {
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
-            const res = engine.evalScript(id, "throw new Error('错误 👍');", "<boundary>");
+            const res = engine.evalScript(id, "throw new Error('error 👍');", "<boundary>");
             defer helpers.freeEvalResult(res);
             const err = res.err orelse return error.ExpectedException;
             try testing.expect(std.mem.indexOf(u8, err, boundary_message) != null);

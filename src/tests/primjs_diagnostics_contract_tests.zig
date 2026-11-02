@@ -283,8 +283,8 @@ const InspectorEnabledTests = if (build_options.inspector) struct {
         const alloc = testing.allocator;
         var session = try openSession(alloc, "diagnostics-heap-property-name-precision");
         defer session.deinit();
-        const key_a = "中文属性名中文属性名中文属性名中文属性名中文属性名中文属性名中文属性名中文属性名A";
-        const key_b = "中文属性名中文属性名中文属性名中文属性名中文属性名中文属性名中文属性名中文属性名B";
+        const key_a = "ονόμαονόμαονόμαονόμαονόμαονόμαονόμαονόμαA";
+        const key_b = "ονόμαονόμαονόμαονόμαονόμαονόμαονόμαονόμαB";
         const source =
             "globalThis.__heap_name_gets=0;" ++
             "globalThis.heap_name_precision={};" ++

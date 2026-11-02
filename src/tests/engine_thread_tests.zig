@@ -218,7 +218,7 @@ const StringArgsProbe = struct {
     ) callconv(.c) c_int {
         const self: *StringArgsProbe = @ptrCast(@alignCast(user.?));
         self.calls += 1;
-        const expected = [_][]const u8{ "alpha", "你好", "", "x\x00y" };
+        const expected = [_][]const u8{ "alpha", "γειά", "", "x\x00y" };
         if (argc != expected.len or argv == null) {
             self.valid = false;
         } else {
@@ -2062,7 +2062,7 @@ test "JSC c abi host: string arguments preserve values, empty strings, and embed
 
     var job = RunJob{
         .id = id,
-        .src = "hostStrings('alpha', '\\u4f60\\u597d', '', 'x' + String.fromCharCode(0) + 'y')",
+        .src = "hostStrings('alpha', '\\u03b3\\u03b5\\u03b9\\u03ac', '', 'x' + String.fromCharCode(0) + 'y')",
         .filename = "<host-strings>",
         .timeout_ms = 2000,
     };

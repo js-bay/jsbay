@@ -25,8 +25,8 @@ test "string roundtrip preserves embedded NUL, ASCII, and non-ASCII" {
             try expectRoundTrip(ctx, "a\x00b\x00");
             try expectRoundTrip(ctx, "");
             try expectRoundTrip(ctx, "ascii");
-            try expectRoundTrip(ctx, "你好");
-            try expectRoundTrip(ctx, "a\x00你");
+            try expectRoundTrip(ctx, "γειά");
+            try expectRoundTrip(ctx, "a\x00Σ");
             try expectRoundTrip(ctx, "🙂");
         }
     }.run);
