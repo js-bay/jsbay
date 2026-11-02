@@ -218,17 +218,20 @@ static std::string rewriteIdents(const std::string &src,
         if (isIdentStart(c)) {
             // Only rewrite free identifier references — not object keys or member names after `.`.
             bool after_dot = false;
+            bool after_question = false;
             if (!out.empty()) {
-                size_t k = out.size();
-                while (k > 0 && std::isspace(static_cast<unsigned char>(out[k - 1]))) --k;
-                if (k > 0 && out[k - 1] == '.') after_dot = true;
+                size_t pk = out.size();
+                while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+                if (pk > 0 && out[pk - 1] == '.') after_dot = true;
+                if (pk > 0 && out[pk - 1] == '?') after_question = true;
             }
             size_t j = i + 1;
             while (j < src.size() && isIdent(src[j])) ++j;
             size_t k = j;
             while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
-            // Object-literal key `ident:` (but not `ident::` labels / TypeScript).
-            bool object_key = (k < src.size() && src[k] == ':' && !(k + 1 < src.size() && src[k + 1] == ':'));
+            // Object-literal key `ident:` (not ternary consequent `? ident :`, not `ident::`).
+            bool object_key = !after_question && (k < src.size() && src[k] == ':' &&
+                                                 !(k + 1 < src.size() && src[k + 1] == ':'));
             std::string id = src.substr(i, j - i);
             auto it = repl.find(id);
             if (!after_dot && !object_key && it != repl.end())
@@ -254,6 +257,184 @@ static std::string trim(std::string s) {
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
     while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
     return s;
+}
+
+// Collect bound names from a binding pattern (`ident`, `{a, b: c}`, `[x, ...y]`).
+static void collectPatternBoundNames(const std::string &src, size_t &i, std::vector<std::string> &names) {
+    while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+    if (i >= src.size()) return;
+    if (src[i] == '{') {
+        ++i;
+        while (i < src.size()) {
+            while (i < src.size() && (std::isspace(static_cast<unsigned char>(src[i])) || src[i] == ',')) ++i;
+            if (i >= src.size()) return;
+            if (src[i] == '}') { ++i; return; }
+            if (src[i] == '.' && i + 2 < src.size() && src[i + 1] == '.' && src[i + 2] == '.') {
+                i += 3;
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                size_t j = i;
+                while (j < src.size() && isIdent(src[j])) ++j;
+                if (j > i) names.push_back(src.substr(i, j - i));
+                i = j;
+                continue;
+            }
+            if (src[i] == '{' || src[i] == '[') {
+                collectPatternBoundNames(src, i, names);
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                if (i < src.size() && src[i] == '=') {
+                    ++i;
+                    int depth = 0;
+                    while (i < src.size()) {
+                        char ch = src[i];
+                        if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                        if (ch == '\'' || ch == '"' || ch == '`') {
+                            char q = ch; ++i;
+                            while (i < src.size()) {
+                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                                if (src[i] == q) { ++i; break; }
+                                ++i;
+                            }
+                            continue;
+                        }
+                        if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                        if (ch == '}' || ch == ']' || ch == ')') {
+                            if (depth == 0) break;
+                            --depth; ++i; continue;
+                        }
+                        if (depth == 0 && (ch == ',' || ch == '}')) break;
+                        ++i;
+                    }
+                }
+                continue;
+            }
+            if (!isIdentStart(src[i])) { ++i; continue; }
+            size_t j = i + 1;
+            while (j < src.size() && isIdent(src[j])) ++j;
+            std::string first = src.substr(i, j - i);
+            i = j;
+            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            if (i < src.size() && src[i] == ':') {
+                ++i;
+                collectPatternBoundNames(src, i, names);
+            } else {
+                names.push_back(first);
+                if (i < src.size() && src[i] == '=') {
+                    ++i;
+                    int depth = 0;
+                    while (i < src.size()) {
+                        char ch = src[i];
+                        if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                        if (ch == '\'' || ch == '"' || ch == '`') {
+                            char q = ch; ++i;
+                            while (i < src.size()) {
+                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                                if (src[i] == q) { ++i; break; }
+                                ++i;
+                            }
+                            continue;
+                        }
+                        if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                        if (ch == '}' || ch == ']' || ch == ')') {
+                            if (depth == 0) break;
+                            --depth; ++i; continue;
+                        }
+                        if (depth == 0 && (ch == ',' || ch == '}')) break;
+                        ++i;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if (src[i] == '[') {
+        ++i;
+        while (i < src.size()) {
+            while (i < src.size() && (std::isspace(static_cast<unsigned char>(src[i])) || src[i] == ',')) ++i;
+            if (i >= src.size()) return;
+            if (src[i] == ']') { ++i; return; }
+            if (src[i] == '.' && i + 2 < src.size() && src[i + 1] == '.' && src[i + 2] == '.') {
+                i += 3;
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                size_t j = i;
+                while (j < src.size() && isIdent(src[j])) ++j;
+                if (j > i) names.push_back(src.substr(i, j - i));
+                i = j;
+                continue;
+            }
+            collectPatternBoundNames(src, i, names);
+            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            if (i < src.size() && src[i] == '=') {
+                ++i;
+                int depth = 0;
+                while (i < src.size()) {
+                    char ch = src[i];
+                    if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                    if (ch == '\'' || ch == '"' || ch == '`') {
+                        char q = ch; ++i;
+                        while (i < src.size()) {
+                            if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                            if (src[i] == q) { ++i; break; }
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                    if (ch == '}' || ch == ']' || ch == ')') {
+                        if (depth == 0) break;
+                        --depth; ++i; continue;
+                    }
+                    if (depth == 0 && (ch == ',' || ch == ']')) break;
+                    ++i;
+                }
+            }
+        }
+        return;
+    }
+    if (!isIdentStart(src[i])) return;
+    size_t j = i + 1;
+    while (j < src.size() && isIdent(src[j])) ++j;
+    names.push_back(src.substr(i, j - i));
+    i = j;
+}
+
+// Bound names for `const/let/var` declarators starting at `start` (after the keyword).
+static std::vector<std::string> collectDeclaratorBoundNames(const std::string &src, size_t start) {
+    std::vector<std::string> names;
+    size_t i = start;
+    while (i < src.size()) {
+        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        if (i >= src.size() || src[i] == ';') break;
+        collectPatternBoundNames(src, i, names);
+        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        if (i < src.size() && src[i] == '=') {
+            ++i;
+            int depth = 0;
+            while (i < src.size()) {
+                char ch = src[i];
+                if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                if (ch == '\'' || ch == '"' || ch == '`') {
+                    char q = ch; ++i;
+                    while (i < src.size()) {
+                        if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                        if (src[i] == q) { ++i; break; }
+                        ++i;
+                    }
+                    continue;
+                }
+                if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                if (ch == '}' || ch == ']' || ch == ')') {
+                    if (depth > 0) --depth;
+                    ++i; continue;
+                }
+                if (depth == 0 && (ch == ',' || ch == ';')) break;
+                ++i;
+            }
+        }
+        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        if (i < src.size() && src[i] == ',') { ++i; continue; }
+        break;
+    }
+    return names;
 }
 
 // Very small ESM→CJS transform covering modules_tests fixtures.
@@ -482,7 +663,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         body.append(tmp, last, std::string::npos);
     }
 
-    // export const/let/var name = ...
+    // export const/let/var ... — publish every bound name (multi-decl + destructuring).
     {
         static const std::regex re(R"(export\s+(const|let|var)\s+)");
         std::smatch m;
@@ -490,12 +671,11 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             std::string blanked = blankNonCode(body);
             if (!std::regex_search(blanked, m, re)) break;
             size_t start = m.position() + m.length();
-            size_t i = start;
-            while (i < body.size() && isIdent(body[i])) ++i;
-            std::string name = body.substr(start, i - start);
             std::string kind = m[1].str();
+            auto names = collectDeclaratorBoundNames(body, start);
             body.replace(m.position(), m.length(), kind + " ");
-            if (!name.empty()) {
+            for (const auto &name : names) {
+                if (name.empty()) continue;
                 epilogue.push_back("Object.defineProperty(exports,\"" + name +
                                    "\",{enumerable:true,configurable:true,get:function(){return " + name +
                                    ";},set:function(v){" + name + "=v;}});");

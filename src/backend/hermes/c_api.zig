@@ -127,6 +127,7 @@ pub extern fn hermes_throw(ctx: ?*Context, message: [*:0]const u8) void;
 pub extern fn hermes_atom_new(ctx: ?*Context, utf8: [*]const u8, len: usize) ?*anyopaque;
 pub extern fn hermes_atom_free(atom: ?*anyopaque) void;
 pub extern fn hermes_atom_to_utf8(ctx: ?*Context, atom: ?*anyopaque) ?[*:0]u8;
+pub extern fn hermes_atom_to_utf8_n(ctx: ?*Context, atom: ?*anyopaque, out_len: *usize) ?[*]u8;
 pub extern fn hermes_get_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque) Value;
 pub extern fn hermes_set_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque, val: Value) bool;
 pub extern fn hermes_has_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque) bool;

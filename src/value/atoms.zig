@@ -81,9 +81,9 @@ pub fn atomToString(allocator: std.mem.Allocator, instance_id: i32, atom: Atom) 
         .escargot => {
             const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
             const handle: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
-            const p = c_api.escargot_atom_to_utf8(ctx, handle) orelse return null;
-            const s = std.mem.span(p);
-            const out = allocator.dupe(u8, s) catch {
+            var len: usize = 0;
+            const p = c_api.escargot_atom_to_utf8_n(ctx, handle, &len) orelse return null;
+            const out = allocator.dupe(u8, p[0..len]) catch {
                 _ = std.c.free(p);
                 return null;
             };
@@ -93,9 +93,9 @@ pub fn atomToString(allocator: std.mem.Allocator, instance_id: i32, atom: Atom) 
         .hermes => {
             const c_api = @import("../backend.zig").ActiveEngineModule.c_api_mod;
             const handle: ?*anyopaque = @ptrFromInt(@as(usize, @intCast(atom.repr)));
-            const p = c_api.hermes_atom_to_utf8(ctx, handle) orelse return null;
-            const s = std.mem.span(p);
-            const out = allocator.dupe(u8, s) catch {
+            var len: usize = 0;
+            const p = c_api.hermes_atom_to_utf8_n(ctx, handle, &len) orelse return null;
+            const out = allocator.dupe(u8, p[0..len]) catch {
                 _ = std.c.free(p);
                 return null;
             };

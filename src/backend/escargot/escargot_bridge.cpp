@@ -1387,6 +1387,17 @@ extern "C" char *escargot_atom_to_utf8(EscargotContext *c, EscargotAtom atom) {
     if (!atom) return nullptr;
     return stringRefToUtf8(static_cast<AtomicStringRef *>(atom)->string());
 }
+/* Length-aware atom decode (preserves embedded NUL). Caller frees; *out_len excludes terminator. */
+extern "C" char *escargot_atom_to_utf8_n(EscargotContext *c, EscargotAtom atom, size_t *out_len) {
+    (void)c;
+    if (out_len) *out_len = 0;
+    if (!atom) return nullptr;
+    StringRef *s = static_cast<AtomicStringRef *>(atom)->string();
+    if (!s) return nullptr;
+    std::string utf8 = s->toStdUTF8String();
+    if (out_len) *out_len = utf8.size();
+    return dupCString(utf8);
+}
 extern "C" EscargotValue escargot_get_property_atom(EscargotContext *c, EscargotValue obj, EscargotAtom atom) {
     if (!c || !obj || !atom) return nullptr;
     auto er = Evaluator::execute(c->ctx.get(),

@@ -16,6 +16,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <functional>
 #include <fstream>
 #include <sstream>
 #include <unistd.h>
@@ -75,6 +76,9 @@ struct JsbayHermesContextOpaque {
     bool rejection_hook_installed = false;
     int32_t rejection_timer_next = 1;
     std::unordered_map<int32_t, std::shared_ptr<bool>> rejection_timer_cancelled;
+    // Owned HostFnState cleanups run before protect-map teardown so MethodBox free cannot UAF.
+    std::mutex host_fn_mu;
+    std::vector<std::function<void()>> host_fn_invalidate;
 };
 
 static void hermes_flush_pending_rejections(JsbayHermesContext *c);
@@ -433,6 +437,17 @@ extern "C" void hermes_context_free(JsbayHermesContext *ctx) {
     ctx->pending_throw_value.reset();
     // Drop ESM cache (jsi::Object) before tearing down the Runtime / protect table.
     hermes_uninstall_module_loader(ctx);
+    // Release owned HostFnState user_data (e.g. MethodBox → hermes_free_value) while protect map lives.
+    {
+        std::vector<std::function<void()>> invalidate;
+        {
+            std::lock_guard<std::mutex> lock(ctx->host_fn_mu);
+            invalidate.swap(ctx->host_fn_invalidate);
+        }
+        for (auto &fn : invalidate) {
+            if (fn) fn();
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(ctx->protect_mu);
         ctx->protect.clear();
@@ -817,12 +832,18 @@ struct HostFnState : jsi::NativeState {
     HermesNativeDataFree user_data_free = nullptr;
     HostFnState(JsbayHermesContextOpaque *c, HermesNativeFn f, void *ud, HermesNativeDataFree free_ud)
         : ctx(c), fn(f), user_data(ud), user_data_free(free_ud) {}
-    ~HostFnState() override {
-        if (user_data_free && user_data) {
-            user_data_free(ctx, user_data);
-            user_data = nullptr;
-        }
+    // Call while the Hermes context is still alive; later destructor becomes a no-op.
+    void releaseOwned() {
+        HermesNativeDataFree free_ud = user_data_free;
+        void *ud = user_data;
+        JsbayHermesContextOpaque *c = ctx;
+        user_data_free = nullptr;
+        user_data = nullptr;
+        ctx = nullptr;
+        fn = nullptr;
+        if (free_ud && ud) free_ud(c, ud);
     }
+    ~HostFnState() override { releaseOwned(); }
 };
 
 static bool instanceOfGlobal(FbHermesRuntime &rt, const jsi::Value &v, const char *ctorName) {
@@ -1430,11 +1451,19 @@ static HermesValue hermesMakeFunctionOwned(JsbayHermesContext *c, const char *na
     std::shared_ptr<HostFnState> state;
     try {
         state = std::make_shared<HostFnState>(c, fn, user_data, free_ud);
+        {
+            std::weak_ptr<HostFnState> weak = state;
+            std::lock_guard<std::mutex> lock(c->host_fn_mu);
+            c->host_fn_invalidate.push_back([weak]() {
+                if (auto s = weak.lock()) s->releaseOwned();
+            });
+        }
         std::string n = name ? name : "native";
         auto host = jsi::Function::createFromHostFunction(
             *c->rt, jsi::PropNameID::forUtf8(*c->rt, n), 0,
             [state](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
                 JsbayHermesContextOpaque *ctx = state->ctx;
+                if (!ctx || !state->fn) return jsi::Value::undefined();
                 std::vector<HermesValue> argv;
                 argv.reserve(count);
                 for (size_t i = 0; i < count; ++i) {
@@ -1514,6 +1543,18 @@ extern "C" void hermes_atom_free(HermesAtom atom) {
 extern "C" char *hermes_atom_to_utf8(JsbayHermesContext *, HermesAtom atom) {
     if (!atom) return nullptr;
     return dupCString(*static_cast<std::string *>(atom));
+}
+/* Length-aware atom decode (preserves embedded NUL). Caller frees; *out_len excludes terminator. */
+extern "C" char *hermes_atom_to_utf8_n(JsbayHermesContext *, HermesAtom atom, size_t *out_len) {
+    if (out_len) *out_len = 0;
+    if (!atom) return nullptr;
+    const std::string &s = *static_cast<std::string *>(atom);
+    char *out = static_cast<char *>(std::malloc(s.size() + 1));
+    if (!out) return nullptr;
+    if (!s.empty()) std::memcpy(out, s.data(), s.size());
+    out[s.size()] = 0;
+    if (out_len) *out_len = s.size();
+    return out;
 }
 extern "C" HermesValue hermes_get_property_atom(JsbayHermesContext *c, HermesValue obj, HermesAtom atom) {
     if (!c || !c->rt || !obj || !atom || !asVal(obj)->isObject()) return nullptr;
@@ -2632,8 +2673,9 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
             dup2(err_fd, 2);
             close(err_fd);
         }
-        execl(hermesc.c_str(), hermesc.c_str(), "-O0", "-g1", "-emit-binary",
-              out_arg.c_str(), js_path.c_str(), (char *)nullptr);
+        // execlp searches PATH when findHermesc() returns a bare "hermesc".
+        execlp(hermesc.c_str(), hermesc.c_str(), "-O0", "-g1", "-emit-binary",
+               out_arg.c_str(), js_path.c_str(), (char *)nullptr);
         _exit(127);
     } else if (pid > 0) {
         if (err_fd >= 0) close(err_fd);

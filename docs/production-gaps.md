@@ -38,16 +38,30 @@ Fact source: `docs/capability.md`. Gaps ranked by impact on embedding hosts. Thi
 | Soft `getMemoryUsage` | Non-QJS field layout; `malloc_size` ≈ heap/allocated; `setMemoryLimit` still refused |
 | CI matrix + ABI freeze | Prerequisite for a production tag |
 
+## Current backend limitations
+
+- Escargot: no mid-script interrupt API; Context is thread-affine (host/dispatch engine-thread cases are skipped); no on-disk bytecode blob; `setMemoryLimit` always false; finalize/weak paths are teardown-forced; ET×host hard rejects remain.
+- Hermes: user `requestInterrupt` does not arm sticky mid-script stop; `setMemoryLimit` always false (use create-time `MaxHeapSize`); no native `ArrayBuffer.resize`; ESM is a host-side transform with remaining shim limits; async/async-generator fixtures are stripped in this build; finalize/weak paths are teardown-forced.
+- Neither backend is in the mainline CI matrix; treat capability and gap docs as the contract until a production tag.
+
 ## Verify
 
+Rebuild install prefixes and bridges from a clean checkout when needed:
+
 ```bash
-export JSBAY_LIBSTDCXX=/home/box/.local/gcc-root/usr/lib/gcc/x86_64-linux-gnu/14/libstdc++.a
-export JSBAY_ICU_LIB_DIR=/workspace/jsbay-dual-spike/vendor/icu-prefix/lib
+./scripts/rebuild-icu-prefix.sh
+./scripts/rebuild-escargot-install.sh
+./scripts/rebuild-hermes-install.sh
+```
+
+Then run the engine suite with backend-specific link flags (paths are local install prefixes under `vendor/`):
+
+```bash
 zig build test-engine -Dbackend=escargot -Dlibstdcxx="$JSBAY_LIBSTDCXX"
 zig build test-engine -Dbackend=hermes -Dlibstdcxx="$JSBAY_LIBSTDCXX" -Dicu-lib-dir="$JSBAY_ICU_LIB_DIR"
 ```
 
-Install prefixes live under `vendor/{escargot,hermes}-install`. Rebuild Escargot `escargot_bridge.o` after bridge edits; rebuild Hermes `libhermes_bridge.so` after bridge edits (do not link a Hermes bridge `.o` into Zig).
+`JSBAY_LIBSTDCXX` should point at a libstdc++ static archive compatible with the bridge; `JSBAY_ICU_LIB_DIR` defaults to `vendor/icu-prefix/lib` after the ICU rebuild script. Install prefixes live under `vendor/{escargot,hermes}-install`. Rebuild Escargot `escargot_bridge.o` after bridge edits; rebuild Hermes `libhermes_bridge.so` after bridge edits (do not link a Hermes bridge `.o` into Zig).
 
 ### Escargot mid-script interrupt — permanent gap
 
@@ -55,15 +69,7 @@ Pinned `vendor/escargot-install/include/EscargotPublic.h` and `vendor/escargot/s
 
 ### Skip classes (summary)
 
-| Class | Hermes (~30) | Escargot (~61) |
-|-------|--------------|----------------|
-| Permanent | resize×3; CJS bytecode cache; spike-wide (dataview/exception/engine/cjs); transfer tight cap; ESM build cuts | EtHost×24 (Context thread affinity); NativeInterrupt×5; DestroyDefer×2 (bdwgc ABRT); no bytecode blob; same spike-wide |
-| Peeled | destroy-defer / nested / filename / after-stop | after-stop / nested / filename-throw; memory smoke |
-| Peelable but not cheap | none left cheap | DestroyDefer needs lifecycle rewrite; EtHost = per-ET Context |
-
-### Gated counts
-
-- Escargot: **491 pass / 61 skip / 0 fail**
-- Hermes: **531 pass / 30 skip / 0 fail**
-
-Further peel of Escargot ET+host / interrupt / DestroyDefer, or Hermes resize / `setMemoryLimit`, needs upstream work or a large refactor.
+| Class | Hermes | Escargot |
+|-------|--------|----------|
+| Permanent | `ArrayBuffer.resize`; CJS bytecode cache; spike-wide dataview/exception/engine/cjs cuts; transfer tight cap; ESM build cuts | EtHost (Context thread affinity); NativeInterrupt; DestroyDefer (bdwgc ABRT); no bytecode blob; same spike-wide cuts |
+| Needs upstream or large refactor | native `setMemoryLimit` / resize | DestroyDefer lifecycle; per-ET Context for EtHost; public interrupt API |

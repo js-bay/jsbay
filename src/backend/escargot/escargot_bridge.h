@@ -170,6 +170,7 @@ typedef void *EscargotAtom;
 EscargotAtom escargot_atom_new(EscargotContext *ctx, const char *utf8, size_t len);
 void escargot_atom_free(EscargotAtom atom); /* no-op: AtomicStringRef is VM-lifetime */
 char *escargot_atom_to_utf8(EscargotContext *ctx, EscargotAtom atom); /* heap; caller frees */
+char *escargot_atom_to_utf8_n(EscargotContext *ctx, EscargotAtom atom, size_t *out_len); /* heap; caller frees */
 EscargotValue escargot_get_property_atom(EscargotContext *ctx, EscargotValue obj, EscargotAtom atom);
 bool escargot_set_property_atom(EscargotContext *ctx, EscargotValue obj, EscargotAtom atom, EscargotValue val);
 bool escargot_has_property_atom(EscargotContext *ctx, EscargotValue obj, EscargotAtom atom);

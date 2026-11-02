@@ -167,6 +167,7 @@ typedef void *HermesAtom;
 HermesAtom hermes_atom_new(JsbayHermesContext *ctx, const char *utf8, size_t len);
 void hermes_atom_free(HermesAtom atom);
 char *hermes_atom_to_utf8(JsbayHermesContext *ctx, HermesAtom atom);
+char *hermes_atom_to_utf8_n(JsbayHermesContext *ctx, HermesAtom atom, size_t *out_len);
 HermesValue hermes_get_property_atom(JsbayHermesContext *ctx, HermesValue obj, HermesAtom atom);
 bool hermes_set_property_atom(JsbayHermesContext *ctx, HermesValue obj, HermesAtom atom, HermesValue val);
 bool hermes_has_property_atom(JsbayHermesContext *ctx, HermesValue obj, HermesAtom atom);
