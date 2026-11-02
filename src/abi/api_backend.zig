@@ -30,7 +30,8 @@ pub fn toUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult 
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsToUtf8(ctx, value),
         .jsc => jscToUtf8(ctx, value),
-        .escargot, .hermes => .{ .bytes = ActiveEngine.valueToStringAlloc(std.heap.c_allocator, ctx, value) },
+        .escargot => spikeToUtf8(ctx, .escargot, value),
+        .hermes => spikeToUtf8(ctx, .hermes, value),
     };
 }
 
@@ -817,6 +818,20 @@ fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     defer std.heap.c_allocator.free(msg_z);
     const v = c.escargot_new_error(ctx, 0, msg_z.ptr);
     return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+}
+
+
+fn spikeToUtf8(ctx: ActiveEngine.Context, comptime which: enum { escargot, hermes }, value: ActiveEngine.Value) BytesResult {
+    const op = switch (which) {
+        .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_value_to_string_result(ctx, value)),
+        .hermes => hermesOp(@import("../backend/hermes/c_api.zig").hermes_value_to_string_result(ctx, value)),
+    };
+    if (op.exception) |exception| return .{ .exception = exception };
+    if (op.out_of_memory) return .{ .out_of_memory = true };
+    const str_val = op.value orelse return .{ .out_of_memory = true };
+    defer ActiveEngine.freeValue(ctx, str_val);
+    const bytes = ActiveEngine.valueToStringAlloc(std.heap.c_allocator, ctx, str_val) orelse return .{ .out_of_memory = true };
+    return .{ .bytes = bytes };
 }
 
 fn spikeToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value, comptime which: enum { escargot, hermes }) BytesResult {

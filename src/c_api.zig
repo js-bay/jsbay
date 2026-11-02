@@ -148,7 +148,7 @@ pub export fn jsbay_engine_create_with_options(
         options.log_handler
     else
         null;
-    const log_user_data: ?*anyopaque = if (options.struct_size >= @sizeOf(EngineCreateOptionsC))
+    const log_user_data: ?*anyopaque = if (options.struct_size >= @offsetOf(EngineCreateOptionsC, "log_user_data") + @sizeOf(?*anyopaque))
         options.log_user_data
     else
         null;
