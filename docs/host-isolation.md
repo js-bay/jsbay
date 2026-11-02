@@ -92,7 +92,7 @@ Soft limits and wrong-thread checks still do **not** contain native faults in-pr
 Same-process N-API + `libjsbay` still share the Ability process: a Zig abort
 kills that process. Soft limits / `Engine.close` ordering do **not** contain it.
 
-The SDK exposes ArkTS and native child-process APIs from API level 12. They are not universally available. A phone-class emulator returned `801` while starting an ArkTS child process with `isolationMode: true`; the parent Ability continued. Do not treat the API declaration as a guarantee for a phone application.
+The SDK exposes ArkTS and native child-process APIs from API level 12. Availability depends on the device and system capabilities. Hosts must handle unsupported startup results and establish the child-process boundary before relying on native-fault isolation.
 
 On a device where the API is supported, a host must:
 
@@ -100,9 +100,9 @@ On a device where the API is supported, a host must:
 2. Give each request a generation and deadline; fail outstanding requests when the child dies or IPC disconnects; construct a new engine generation before retrying.
 3. Link `-Dfault-injection=true` only into a test rebuild of the child native library. Publish product cores must keep `nm` free of `jsbay_test_trigger_native_fault`.
 
-Device proof today:
+Harness coverage:
 
-- `tests/harmony-sdk/hap-crash-isolation/` ships a same-process soft/close harness (`JSBAY_CRASHISO_PASS` on device).
-- Shell-exec of a pushed ELF under `/data/local/tmp` remains **SELinux SKIP**.
-- Real child fault, parent survival, IPC failure, and fresh-generation recovery require a supported device and a fault-injection child test build. They are not established by the same-process harness.
+- `tests/harmony-sdk/hap-crash-isolation/` exercises same-process execution limits and close ordering. Its success marker does not establish a child-process boundary.
+- Executing a standalone native binary through a shell does not establish the application's child-process and IPC capabilities; platform security policy may reject it.
+- Real child fault, parent survival, IPC failure, and fresh-generation recovery require a supported device and a fault-injection child test build.
 

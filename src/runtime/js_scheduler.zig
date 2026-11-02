@@ -26,8 +26,10 @@ pub const ContextExecution = struct {
     }
 
     pub fn checkpoint(self: *ContextExecution) void {
-        self.endExecution();
-        if (self.instance_id) |id| {
+        if (self.execution) |*execution| {
+            checkpointAfterExecution(execution, self.ctx);
+            self.execution = null;
+        } else if (self.instance_id) |id| {
             @import("js_scheduler.zig").checkpoint(id, self.ctx);
         } else {
             ActiveEngine.processPendingJobs(self.ctx);
@@ -58,27 +60,63 @@ pub const Execution = struct {
     scheduler: js_event_loop.Scheduler.Execution,
     instance_id: i32,
     budget_armed: bool,
-    active: bool = true,
+    scheduler_active: bool = true,
+    budget_active: bool = true,
 
-    pub fn end(self: *Execution) void {
-        if (!self.active) return;
-        self.active = false;
+    pub fn endScheduler(self: *Execution) void {
+        if (!self.scheduler_active) return;
+        self.scheduler_active = false;
         self.scheduler.end();
+    }
+
+    pub fn endBudget(self: *Execution) void {
+        if (!self.budget_active) return;
+        self.budget_active = false;
         if (self.budget_armed) @import("runtime_control.zig").endExecutionBudget(self.instance_id);
     }
+
+    pub fn end(self: *Execution) void {
+        self.endScheduler();
+        self.endBudget();
+    }
 };
+
+/// Drain a checkpoint after leaving the scheduler execution scope while retaining its original runtime budget lease.
+pub fn checkpointAfterExecution(execution: *Execution, ctx: ActiveEngine.Context) void {
+    execution.endScheduler();
+    checkpoint(execution.instance_id, ctx);
+    execution.endBudget();
+}
+
+/// Packed variant of checkpointAfterExecution.
+pub fn checkpointInstanceAfterExecution(execution: *Execution) void {
+    execution.endScheduler();
+    checkpointInstance(execution.instance_id);
+    execution.endBudget();
+}
 
 pub const Task = struct {
     scheduler: js_event_loop.Scheduler.Task,
     instance_id: i32,
     budget_armed: bool,
-    active: bool = true,
+    scheduler_active: bool = true,
+    budget_active: bool = true,
+
+    pub fn endScheduler(self: *Task) bool {
+        if (!self.scheduler_active) return false;
+        self.scheduler_active = false;
+        return self.scheduler.end();
+    }
+
+    pub fn endBudget(self: *Task) void {
+        if (!self.budget_active) return;
+        self.budget_active = false;
+        if (self.budget_armed) @import("runtime_control.zig").endExecutionBudget(self.instance_id);
+    }
 
     pub fn end(self: *Task) bool {
-        if (!self.active) return false;
-        self.active = false;
-        const outer = self.scheduler.end();
-        if (self.budget_armed) @import("runtime_control.zig").endExecutionBudget(self.instance_id);
+        const outer = self.endScheduler();
+        self.endBudget();
         return outer;
     }
 };

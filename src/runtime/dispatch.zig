@@ -435,12 +435,14 @@ pub fn releaseTasksForOwner(instance_id: i32, owner: *anyopaque) void {
 pub const TaskCompletion = struct {
     instance_lease: *instance_map.EngineInstance,
     task: NativeTask,
+    queued: ?@import("js_scheduler.zig").Task = null,
     active: bool = true,
 
     pub fn finish(self: *TaskCompletion) void {
         if (!self.active) return;
         self.active = false;
         defer if (self.task.resources) |resources| resources.release(self.task.resource_kind, self.task.resource_bytes);
+        if (self.queued) |*queued| queued.endBudget();
         if (self.task.complete) |complete| complete(self.task.completion_ctx);
         instance_map.endDispatchTask(self.instance_lease);
     }
@@ -473,8 +475,8 @@ pub fn runOneTask(instance_id: i32, completion: *?TaskCompletion) bool {
     active_task_owner_frame = &owner_frame;
     task.run(task.ctx);
     active_task_owner_frame = owner_frame.parent;
-    _ = queued.end();
-    completion.* = .{ .instance_lease = instance_lease, .task = task };
+    _ = queued.endScheduler();
+    completion.* = .{ .instance_lease = instance_lease, .task = task, .queued = queued };
     return true;
 }
 
@@ -617,6 +619,7 @@ pub fn tickInstance(instance_id: i32) usize {
 const DispatchTurn = struct {
     instance_id: i32,
     ran: bool = false,
+    task_budget_armed: bool = false,
     completion: ?TaskCompletion = null,
 
     fn self(context: ?*anyopaque) *DispatchTurn {
@@ -625,11 +628,15 @@ const DispatchTurn = struct {
     fn prepareNativeEvents(_: ?*anyopaque) void {}
     fn runOneSource(context: ?*anyopaque, source: @import("js_event_loop").Scheduler.TaskSource) bool {
         const turn = self(context);
+        const budget_armed = @import("runtime_control.zig").beginExecutionBudget(turn.instance_id);
         turn.ran = switch (source) {
             .native_dispatch => runOneTask(turn.instance_id, &turn.completion),
             .tsfn => tsfn.runOne(turn.instance_id),
             .host_script, .timer => false,
         };
+        if (turn.ran) {
+            turn.task_budget_armed = budget_armed;
+        } else if (budget_armed) @import("runtime_control.zig").endExecutionBudget(turn.instance_id);
         return turn.ran;
     }
     fn checkpoint(context: ?*anyopaque) void {
@@ -638,6 +645,10 @@ const DispatchTurn = struct {
     }
     fn finishTask(context: ?*anyopaque) void {
         const turn = self(context);
+        if (turn.task_budget_armed) {
+            turn.task_budget_armed = false;
+            @import("runtime_control.zig").endExecutionBudget(turn.instance_id);
+        }
         if (turn.completion) |*completion| completion.finish();
     }
 };

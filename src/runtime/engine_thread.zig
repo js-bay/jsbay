@@ -645,8 +645,7 @@ pub const TypedEvalEntry = struct {
     pub fn finish(self: *TypedEvalEntry) bool {
         if (self.execution) |value| {
             var guard = value;
-            guard.end();
-            if (instance_map.getPtrs(self.instance_id)) |ptrs| @import("js_scheduler.zig").checkpoint(self.instance_id, ptrs.ctx);
+            @import("js_scheduler.zig").checkpointInstanceAfterExecution(&guard);
         }
         if (!endEvalAndTakeDeferred(self.lease)) return false;
         engine.destroy(self.instance_id);

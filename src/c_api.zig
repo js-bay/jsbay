@@ -1896,16 +1896,9 @@ const ApiOp = struct {
     entered_js: bool,
     execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
-    fn endExecution(self: *ApiOp) void {
-        if (self.execution) |*guard| guard.end();
-        self.execution = null;
-    }
-
     fn deinit(self: *ApiOp) void {
-        if (self.execution != null) {
-            self.endExecution();
-            @import("runtime/js_scheduler.zig").checkpoint(self.id, self.ctx);
-        }
+        if (self.execution) |*execution| @import("runtime/js_scheduler.zig").checkpointAfterExecution(execution, self.ctx);
+        self.execution = null;
         // Raw typed operations below use backend C APIs directly.  Keep the QuickJS stack anchor around the entire admission lease, including re-entrant getter/toString/native-callback execution.
         if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
             if (self.entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(self.ctx);
@@ -1914,7 +1907,9 @@ const ApiOp = struct {
     }
 };
 
-fn beginApiOp(id: i32) union(enum) { ok: ApiOp, status: c_int } {
+const ApiOpResult = union(enum) { ok: ApiOp, status: c_int };
+
+fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
@@ -1932,7 +1927,23 @@ fn beginApiOp(id: i32) union(enum) { ok: ApiOp, status: c_int } {
         engine.finishEvalEntry(id, lease);
         return .{ .status = API_WRONG_THREAD };
     }
-    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .execution = @import("runtime/js_scheduler.zig").beginExecution(id) } };
+    if (!require_execution) return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js } };
+    const execution = @import("runtime/js_scheduler.zig").beginExecution(id) orelse {
+        if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+            if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
+        }
+        engine.finishEvalEntry(id, lease);
+        return .{ .status = API_INSTANCE_NOT_FOUND };
+    };
+    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .execution = execution } };
+}
+
+fn beginApiOp(id: i32) ApiOpResult {
+    return beginApiOpMode(id, true);
+}
+
+fn beginCleanupApiOp(id: i32) ApiOpResult {
+    return beginApiOpMode(id, false);
 }
 
 fn apiContext(instance_id: i32) union(enum) { ok: ActiveEngine.Context, status: c_int } {
@@ -1991,9 +2002,11 @@ fn apiStore(instance_id: i32, value: ActiveEngine.Value, out: *u64) c_int {
 }
 
 fn drainApiJobs(op: *ApiOp) bool {
-    op.endExecution();
     const map = @import("runtime/instance_map.zig");
-    if (!map.isTeardownPending(op.id)) @import("runtime/js_scheduler.zig").checkpoint(op.id, op.ctx);
+    if (op.execution) |*execution| {
+        if (!map.isTeardownPending(op.id)) @import("runtime/js_scheduler.zig").checkpointAfterExecution(execution, op.ctx) else execution.end();
+        op.execution = null;
+    }
     return !map.isTeardownPending(op.id);
 }
 
@@ -2019,16 +2032,16 @@ pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var op = switch (beginPackedCleanupOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
+        defer op.deinit();
         out_value.* = packed_api_value.retain(value) orelse return API_OUT_OF_MEMORY;
         return API_OK;
     }
     const instance_id = api_value.instanceFor(value) orelse return API_STALE_VALUE;
-    var op = switch (beginApiOp(instance_id)) {
+    var op = switch (beginCleanupApiOp(instance_id)) {
         .status => |status| return status,
         .ok => |ok| ok,
     };
@@ -2046,18 +2059,15 @@ pub export fn jsbay_value_release(value: u64) c_int {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
         const entry = packed_api_value.get(value) orelse return API_STALE_VALUE;
-        var packed_js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
+        var op = switch (beginPackedCleanupOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        defer packed_js.deinit();
+        defer op.deinit();
         return if (packed_api_value.release(value)) API_OK else API_STALE_VALUE;
     }
     const instance_id = api_value.instanceFor(value) orelse return API_STALE_VALUE;
-    // Release keeps a beginApiOp lease so freeValue cannot race destroyRuntime's freeContext.
-    // When teardown is already pending, beginApiOp fails and destroy's dropInstance frees the
-    // handle; hosts should release before destroy (embed checklist).
-    var op = switch (beginApiOp(instance_id)) {
+    var op = switch (beginCleanupApiOp(instance_id)) {
         .status => |status| return status,
         .ok => |ok| ok,
     };
@@ -2518,23 +2528,18 @@ const PackedJsOp = struct {
     entered_js: bool,
     execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
-    fn endExecution(self: *PackedJsOp) void {
-        if (self.execution) |*guard| guard.end();
-        self.execution = null;
-    }
-
     fn deinit(self: *PackedJsOp) void {
-        if (self.execution != null) {
-            self.endExecution();
-            @import("runtime/js_scheduler.zig").checkpointInstance(self.id);
-        }
+        if (self.execution) |*execution| @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(execution);
+        self.execution = null;
         if (self.entered_js) @import("backend_dispatch.zig").leaveJsPacked(self.tag, self.ctx_addr);
         engine.finishEvalEntry(self.id, self.lease);
     }
 };
 
 /// Admission lease for packed-alt value ops that may execute JavaScript (mirrors beginApiOp / beginValueOp).
-fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) union(enum) { ok: PackedJsOp, status: c_int } {
+const PackedJsOpResult = union(enum) { ok: PackedJsOp, status: c_int };
+
+fn beginPackedJsOpMode(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, require_execution: bool) PackedJsOpResult {
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
@@ -2547,14 +2552,28 @@ fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) 
         engine.finishEvalEntry(instance_id, lease);
         return .{ .status = API_WRONG_THREAD };
     }
+    if (!require_execution) return .{ .ok = .{ .id = instance_id, .tag = tag, .ctx_addr = ctx_addr, .lease = lease, .entered_js = true } };
+    const execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse {
+        @import("backend_dispatch.zig").leaveJsPacked(tag, ctx_addr);
+        engine.finishEvalEntry(instance_id, lease);
+        return .{ .status = API_INSTANCE_NOT_FOUND };
+    };
     return .{ .ok = .{
         .id = instance_id,
         .tag = tag,
         .ctx_addr = ctx_addr,
         .lease = lease,
         .entered_js = true,
-        .execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id),
+        .execution = execution,
     } };
+}
+
+fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) PackedJsOpResult {
+    return beginPackedJsOpMode(instance_id, tag, ctx_addr, true);
+}
+
+fn beginPackedCleanupOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) PackedJsOpResult {
+    return beginPackedJsOpMode(instance_id, tag, ctx_addr, false);
 }
 
 const PackedValueOp = struct {
@@ -2603,9 +2622,11 @@ fn beginPackedValueOp(handle: u64) union(enum) { ok: PackedValueOp, status: c_in
 }
 
 fn drainPackedJobs(js: *PackedJsOp) bool {
-    js.endExecution();
     const map = @import("runtime/instance_map.zig");
-    if (!map.isTeardownPending(js.id)) @import("runtime/js_scheduler.zig").checkpointInstance(js.id);
+    if (js.execution) |*execution| {
+        if (!map.isTeardownPending(js.id)) @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(execution) else execution.end();
+        js.execution = null;
+    }
     return !map.isTeardownPending(js.id);
 }
 

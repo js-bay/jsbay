@@ -54,6 +54,8 @@ The core reserves queue budget before making its retained source and filename co
 
 Beginning shutdown changes open to closing and leaves in-transit submissions admissible. The host stops external producers, finishes terminal-message production, and sends a sealing fence through the same transport as those messages. A successfully admitted sealing fence changes closing to sealed. Fresh submissions and fresh synchronous VM entries are then rejected, while accepted queue turns and their nested calls may finish. Fence completion changes sealed to drained before the deadline, or reports cancellation. Drained describes queue progress; the host must still destroy the engine and confirm its platform Worker or thread has exited.
 
+Executable Value operations on a sealed or drained engine return `JSBAY_INSTANCE_NOT_FOUND`. Retain and release keep their owner-thread lifetime protection and remain available until teardown begins; they do not enter JavaScript or run a checkpoint.
+
 Lifecycle cancellation observed at the core completion point takes precedence over a task's execution result, including an in-flight script interrupted by a shutdown deadline. Ordinary JavaScript throws and recoverable per-entry execution limits remain exceptions. Cancellation is terminal for that generation; clearing a manual interrupt cannot resume it.
 
 `jsbay_engine_set_execution_budget` and its SDK equivalents bound each outer VM entry, including nested callbacks and its checkpoint. Zero disables that budget. The absolute execution-time limit and heap limit retain their existing meanings. A deadline is cooperative and cannot preempt arbitrary native code; hosts retain an independent wakeup timer and platform-exit confirmation.

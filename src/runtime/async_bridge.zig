@@ -162,6 +162,9 @@ fn abortReason(instance_id: i32, lease: engine_thread.EvalLease) ?AwaitError {
     if (instance_map.isTeardownPending(instance_id) or engine_thread.deferredDestroyRequested(lease)) {
         return error.InstanceGone;
     }
+    if (runtime_control.shutdownStatus(instance_id)) |shutdown| {
+        if (shutdown.phase == .cancelled) return error.InstanceGone;
+    }
     // Stop bit first. `isInterruptRequested` is user-bit only so a stop that races in between these checks cannot be misreported as Interrupted.
     if (runtime_control.isStopRequested(instance_id)) return error.InstanceGone;
     if (runtime_control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| {

@@ -54,6 +54,7 @@ comptime {
     _ = @import("modules_tests.zig");
     _ = @import("c_api_tests.zig");
     _ = @import("submission_tests.zig");
+    _ = @import("runtime_boundary_tests.zig");
     _ = @import("borrowed_retain_tests.zig");
     _ = @import("object_ops_tests.zig");
     _ = @import("runtime_control_tests.zig");
