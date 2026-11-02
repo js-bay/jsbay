@@ -294,13 +294,14 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
   if (!HI || typeof HI.detachArrayBuffer !== 'function') return;
   var detachedSet = typeof WeakSet === 'function' ? new WeakSet() : null;
   if (typeof ArrayBuffer.prototype.transfer !== 'function') {
+    var abByteLengthGet = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get;
     ArrayBuffer.prototype.transfer = function (newByteLength) {
       var src = this;
       if (!(src instanceof ArrayBuffer))
         throw new TypeError('Method ArrayBuffer.prototype.transfer called on incompatible receiver');
       if (detachedSet && detachedSet.has(src))
         throw new TypeError('Cannot perform ArrayBuffer.prototype.transfer on a detached ArrayBuffer');
-      var len = src.byteLength;
+      var len = abByteLengthGet.call(src);
       // Spec: undefined keeps source length; otherwise ToIndex (null/NaN/+0/-0 -> 0).
       var n;
       if (newByteLength === undefined) {
@@ -1075,7 +1076,11 @@ extern "C" bool hermes_date_to_ms(JsbayHermesContext *c, HermesValue v, int64_t 
         if (!r.isNumber()) return false;
         double d = r.getNumber();
         if (!std::isfinite(d)) return false;
-        *out = (int64_t)d;
+        // Reject values outside signed 64-bit before converting (float-cast-overflow UB).
+        constexpr double kInt64MinAsDouble = -9223372036854775808.0; // -2^63 exact
+        constexpr double kInt64MaxExclusive = 9223372036854775808.0; // 2^63 exact
+        if (!(d >= kInt64MinAsDouble && d < kInt64MaxExclusive)) return false;
+        *out = static_cast<int64_t>(d);
         return true;
     } catch (...) { return false; }
 }
@@ -2152,17 +2157,8 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
         if (old_res) release(c, old_res);
     };
 
-    // Non-thenable resolve values fulfill without adoption — record immediately (mirrors reject).
-    bool maybe_thenable = false;
-    if (result && asVal(result)->isObject()) {
-        try {
-            jsi::Value then_v = asVal(result)->getObject(*c->rt).getProperty(*c->rt, "then");
-            maybe_thenable = then_v.isObject() && then_v.getObject(*c->rt).isFunction(*c->rt);
-        } catch (...) {
-            maybe_thenable = true;
-        }
-    }
-    if (!maybe_thenable) {
+    // Non-object resolve values cannot be thenables — record immediately (mirrors reject). Do not probe .then on objects: resolve_fn already performed Promise Resolve's user-visible Get(then).
+    if (!result || !asVal(result)->isObject()) {
         jsi::Value *new_res = nullptr;
         if (result) {
             try {
@@ -2175,7 +2171,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
         return;
     }
 
-    // Thenable/promise: resolve_fn already started adoption. Observe the Deferred itself (never call thenable.then again). onRejected marks the Deferred handled for the engine tracker; re-queue host unhandled reporting so rejection remains visible.
+    // Object resolve: resolve_fn already started adoption when the value is thenable. Observe the Deferred itself so settlement is recorded without a second Get(then) / then call on the adopted value. Do not re-queue host unhandled reports here — observation handlers participate in Hermes's handled/unhandled distinction; enablePromiseRejectionTracker remains the source of truth for application-visible rejection notifications.
     try {
         auto &rt = *c->rt;
         jsi::Object target = pvalue->asObject(rt);
@@ -2203,26 +2199,6 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                     return jsi::Value::undefined();
                 }
                 recordPromiseState(key, 2, new_res);
-                if (c->rejection_fn) {
-                    std::string msg = "Promise rejected";
-                    try {
-                        if (count >= 1) {
-                            if (args[0].isString()) msg = args[0].getString(rt2).utf8(rt2);
-                            else if (args[0].isObject()) {
-                                auto o = args[0].getObject(rt2);
-                                if (o.hasProperty(rt2, "message")) {
-                                    auto m = o.getProperty(rt2, "message");
-                                    if (m.isString()) msg = m.getString(rt2).utf8(rt2);
-                                }
-                                if (msg == "Promise rejected") msg = args[0].toString(rt2).utf8(rt2);
-                            } else {
-                                msg = args[0].toString(rt2).utf8(rt2);
-                            }
-                        }
-                    } catch (...) {
-                    }
-                    c->pending_rejections.emplace_back(false, msg);
-                }
                 return jsi::Value::undefined();
             });
         auto then = target.getPropertyAsFunction(rt, "then");

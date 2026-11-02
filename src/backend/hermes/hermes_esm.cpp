@@ -101,8 +101,7 @@ static std::string blankNonCode(const std::string &src) {
 
 
 // True when `/` after `preceding` can start a RegExp literal (vs division).
-// Practical heuristic: regex-ok after operators / expression-intro keywords / punctuators
-// and at start-of-input; division after identifiers, numbers, `)`, `]`, string/template closes.
+// Practical heuristic: regex-ok after operators / expression-intro keywords / punctuators and at start-of-input; division after identifiers, numbers, `)`, `]`, string/template closes.
 static bool canStartRegexLiteral(const std::string &preceding) {
     size_t pk = preceding.size();
     while (pk > 0 && std::isspace(static_cast<unsigned char>(preceding[pk - 1]))) --pk;
@@ -149,8 +148,7 @@ static bool canStartRegexLiteral(const std::string &preceding) {
     return false;
 }
 
-// Copy `/pattern/flags` verbatim from src[i] (i at opening `/`). Handles `\` escapes and
-// character classes so `/` inside `[...]` does not terminate the literal.
+// Copy `/pattern/flags` verbatim from src[i] (i at opening `/`). Handles `\` escapes and character classes so `/` inside `[...]` does not terminate the literal.
 static void copyRegexLiteral(const std::string &src, size_t &i, std::string &out) {
     out.push_back(src[i++]); // opening /
     bool in_class = false;
@@ -692,8 +690,31 @@ static std::string rewriteIdents(const std::string &src,
             while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
             bool object_key = !after_question && (k < src.size() && src[k] == ':' &&
                                                  !(k + 1 < src.size() && src[k + 1] == ':'));
+            // Method / accessor keys (`value()`, `get value()`, `set value()`, `async value()`, `*value()`) are names, not references.
+            bool method_key = false;
+            if (!after_dot && !after_question && !cont.empty() && cont.back() == Cont::ObjectLit &&
+                k < src.size() && src[k] == '(') {
+                size_t pk = out.size();
+                while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+                if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ',' || out[pk - 1] == '*')) {
+                    method_key = true;
+                } else if (pk > 0 && (std::isalnum(static_cast<unsigned char>(out[pk - 1])) ||
+                                      out[pk - 1] == '_' || out[pk - 1] == '$')) {
+                    size_t start = pk;
+                    while (start > 0) {
+                        char ch = out[start - 1];
+                        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '$')
+                            --start;
+                        else
+                            break;
+                    }
+                    std::string prev_word = out.substr(start, pk - start);
+                    if (prev_word == "get" || prev_word == "set" || prev_word == "async")
+                        method_key = true;
+                }
+            }
             auto it = repl.find(id);
-            if (!after_dot && !object_key && it != repl.end() && !isShadowed(id)) {
+            if (!after_dot && !object_key && !method_key && it != repl.end() && !isShadowed(id)) {
                 // Shorthand only for ObjectLit property context — not arrays, args, or blocks.
                 bool in_object_lit = !cont.empty() && cont.back() == Cont::ObjectLit;
                 bool after_shorthand_intro = false;
