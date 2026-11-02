@@ -84,9 +84,7 @@ pub fn install(
         return false;
     };
     const global = backend.ActiveEngine.getGlobalObject(ctx);
-    // defineDataProperty: Escargot/Hermes both refuse non-configurable globals (e.g. Infinity).
-    // Checking the op result and killSlot on failure keeps hasBindings/threadStart honest.
-    // (Hermes setProperty is sloppy-Put and can silently "succeed" without replacing Infinity.)
+    // defineDataProperty: Escargot/Hermes both refuse non-configurable globals (e.g. Infinity). Checking the op result and killSlot on failure keeps hasBindings/threadStart honest. (Hermes setProperty is sloppy-Put and can silently "succeed" without replacing Infinity.)
     const installed = backend.ActiveEngine.defineDataProperty(ctx, global, name_z.ptr, js_fn, true);
     backend.ActiveEngine.freeValue(ctx, js_fn);
     backend.ActiveEngine.freeValue(ctx, global);

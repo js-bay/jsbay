@@ -656,8 +656,65 @@ static std::string rewriteIdents(const std::string &src,
                 while (pk2 > 0 && isIdent(out[pk2 - 1])) --pk2;
                 while (pk2 > 0 && std::isspace(static_cast<unsigned char>(out[pk2 - 1]))) --pk2;
             }
+            // Parenthesized arrow params also establish a ParamList: look ahead for `)=>`.
+            auto parenFollowedByArrow = [&](size_t open_idx) -> bool {
+                size_t p = open_idx + 1;
+                int depth = 1;
+                while (p < src.size() && depth > 0) {
+                    char ch = src[p];
+                    if (ch == '/' && p + 1 < src.size() && src[p + 1] == '/') {
+                        p += 2;
+                        while (p < src.size() && src[p] != '\n') ++p;
+                        continue;
+                    }
+                    if (ch == '/' && p + 1 < src.size() && src[p + 1] == '*') {
+                        p += 2;
+                        while (p + 1 < src.size() && !(src[p] == '*' && src[p + 1] == '/')) ++p;
+                        if (p + 1 < src.size()) p += 2;
+                        continue;
+                    }
+                    if (ch == '\'' || ch == '"') {
+                        char q = ch; ++p;
+                        while (p < src.size()) {
+                            if (src[p] == '\\' && p + 1 < src.size()) { p += 2; continue; }
+                            if (src[p] == q) { ++p; break; }
+                            ++p;
+                        }
+                        continue;
+                    }
+                    if (ch == '`') {
+                        ++p;
+                        while (p < src.size()) {
+                            if (src[p] == '\\' && p + 1 < src.size()) { p += 2; continue; }
+                            if (src[p] == '`') { ++p; break; }
+                            if (src[p] == '$' && p + 1 < src.size() && src[p + 1] == '{') {
+                                p += 2; int d = 1;
+                                while (p < src.size() && d > 0) {
+                                    if (src[p] == '{') ++d;
+                                    else if (src[p] == '}') --d;
+                                    ++p;
+                                }
+                                continue;
+                            }
+                            ++p;
+                        }
+                        continue;
+                    }
+                    if (ch == '(' || ch == '{' || ch == '[') { ++depth; ++p; continue; }
+                    if (ch == ')' || ch == '}' || ch == ']') {
+                        --depth; ++p;
+                        if (depth == 0) break;
+                        continue;
+                    }
+                    ++p;
+                }
+                if (depth != 0) return false;
+                skipSpacesSrc(p);
+                return p + 1 < src.size() && src[p] == '=' && src[p + 1] == '>';
+            };
             if (outEndsWithWord(pk2, "function") || outEndsWithWord(pk2, "catch") ||
-                outEndsWithWord(pk, "function") || outEndsWithWord(pk, "catch")) {
+                outEndsWithWord(pk, "function") || outEndsWithWord(pk, "catch") ||
+                parenFollowedByArrow(i)) {
                 kind = Cont::ParamList;
                 pushFunctionScope();
             }
@@ -1511,6 +1568,11 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     };
     eatImports();
 
+    // Re-export dependency loads go into the static prelude (native ESM order: deps before body).
+    std::vector<std::string> reexport_prelude;
+    std::vector<std::string> star_reexport_nss;
+    std::vector<std::string> post_epilogue;
+
     // export { a, b as c } from 'mod';
     {
         static const std::regex re(R"(export\s*\{([^}]*)\}\s*from\s*(['\"])([^'\"]+)\2\s*;?)");
@@ -1523,7 +1585,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             std::string mod = body.substr(m.position(3), m.length(3));
             static int reexport_ns = 0;
             std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
-            std::string repl = "var " + ns + " = require(\"" + mod + "\");";
+            reexport_prelude.push_back("var " + ns + " = require(\"" + mod + "\");");
+            std::string repl;
             size_t pos = 0;
             while (pos < specs.size()) {
                 size_t comma = specs.find(',', pos);
@@ -1546,22 +1609,19 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // export * from 'mod';
+    // export * from 'mod';: collect deps for prelude; emit ambiguity-aware bindings after explicit exports.
     {
         static const std::regex re(R"(export\s*\*\s*from\s*(['\"])([^'\"]+)\1\s*;?)");
+        static int star_ns = 0;
         for (;;) {
             std::string blanked = blankNonCode(body);
             std::smatch m;
             if (!std::regex_search(blanked, m, re)) break;
             std::string mod = body.substr(m.position(2), m.length(2));
-            // Live bindings via getters; exclude default per ExportEntriesFromModule.
-            std::string repl =
-                "(function(__jsbay_star){Object.keys(__jsbay_star).forEach(function(k){"
-                "if(k===\"default\"||Object.prototype.hasOwnProperty.call(exports,k))return;"
-                "Object.defineProperty(exports,k,{enumerable:true,configurable:true,"
-                "get:function(){return __jsbay_star[k];}});});})(require(\"" +
-                mod + "\"));";
-            body.replace(m.position(), m.length(), repl);
+            std::string ns = "__jsbay_star" + std::to_string(star_ns++);
+            reexport_prelude.push_back("var " + ns + " = require(\"" + mod + "\");");
+            star_reexport_nss.push_back(ns);
+            body.replace(m.position(), m.length(), "");
         }
     }
 
@@ -1679,6 +1739,29 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
+    // Named / star re-export requires follow ordinary imports in the prelude (static dependency phase).
+    for (auto &p : reexport_prelude) prelude.push_back(p);
+
+    // Star re-exports: track provenance across deps; omit ambiguous names unless an explicit export already resolved them.
+    if (!star_reexport_nss.empty()) {
+        std::string star;
+        star += "var __jsbay_star_prov=Object.create(null);";
+        for (const auto &ns : star_reexport_nss) {
+            star += "Object.keys(" + ns + ").forEach(function(k){";
+            star += "if(k===\"default\")return;";
+            star += "if(Object.prototype.hasOwnProperty.call(__jsbay_star_prov,k)){";
+            star += "if(__jsbay_star_prov[k]!==" + ns + ")__jsbay_star_prov[k]=null;";
+            star += "}else{__jsbay_star_prov[k]=" + ns + ";}});";
+        }
+        star += "Object.keys(__jsbay_star_prov).forEach(function(k){";
+        star += "var __jsbay_src=__jsbay_star_prov[k];";
+        star += "if(__jsbay_src==null)return;";
+        star += "if(Object.prototype.hasOwnProperty.call(exports,k))return;";
+        star += "Object.defineProperty(exports,k,{enumerable:true,configurable:true,get:function(){return __jsbay_src[k];}});";
+        star += "});";
+        post_epilogue.push_back(star);
+    }
+
     body = rewriteIdents(body, ident_repl);
 
     std::string out = "(async function(exports,require,module,__filename,__dirname,__jsbay_import_meta){\n\"use strict\";\n";
@@ -1686,6 +1769,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     out += body;
     out += "\n";
     for (auto &e : epilogue) out += e + "\n";
+    for (auto &e : post_epilogue) out += e + "\n";
     // Non-thenable completion: returning the namespace would assimilate an export named `then` and hang awaitThenable.
     out += "return undefined;\n})";
     return out;
