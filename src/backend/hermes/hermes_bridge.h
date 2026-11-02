@@ -150,7 +150,10 @@ uint8_t *hermes_data_view_data(JsbayHermesContext *ctx, HermesValue dv, size_t *
 /* ---- Native function ---- */
 typedef HermesValue (*HermesNativeFn)(JsbayHermesContext *ctx, HermesValue this_val,
                                       const HermesValue *args, size_t argc, void *user_data);
+typedef void (*HermesNativeDataFree)(JsbayHermesContext *ctx, void *user_data);
 HermesValue hermes_make_function(JsbayHermesContext *ctx, const char *name, HermesNativeFn fn, void *user_data);
+HermesValue hermes_make_function_ex(JsbayHermesContext *ctx, const char *name, HermesNativeFn fn, void *user_data,
+                                    HermesNativeDataFree free_ud);
 void hermes_throw(JsbayHermesContext *ctx, const char *message);
 
 /* ---- Atoms (heap UTF-8 string handle) ---- */
@@ -182,6 +185,7 @@ typedef struct {
 HermesOpResult hermes_get_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key);
 HermesOpResult hermes_json_parse_result(JsbayHermesContext *ctx, const char *utf8, size_t len);
 HermesOpResult hermes_json_stringify_result(JsbayHermesContext *ctx, HermesValue v);
+HermesOpResult hermes_value_to_string_result(JsbayHermesContext *ctx, HermesValue v);
 HermesOpResult hermes_set_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key, HermesValue val);
 HermesOpResult hermes_call_result(JsbayHermesContext *ctx, HermesValue fn, HermesValue this_val,
                                   const HermesValue *args, size_t argc);

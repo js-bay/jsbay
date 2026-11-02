@@ -85,6 +85,12 @@ pub fn createWithMethods(ctx: Context, config: HandleData, methods: []const Meth
     return obj;
 }
 
+fn methodBoxFree(ctx: ?*c_api.Context, user_data: ?*anyopaque) callconv(.c) void {
+    const box: *MethodBox = @ptrCast(@alignCast(user_data orelse return));
+    if (ctx) |c| c_api.hermes_free_value(c, box.handle);
+    std.heap.c_allocator.destroy(box);
+}
+
 pub fn setMethod(ctx: Context, obj: Value, name: [*:0]const u8, method: MethodFn) void {
     if (obj == null) return;
     const handle_dup = c_api.hermes_dup(ctx, obj);
@@ -94,10 +100,10 @@ pub fn setMethod(ctx: Context, obj: Value, name: [*:0]const u8, method: MethodFn
         return;
     };
     box.* = .{ .method = method, .handle = handle_dup };
-    const fn_obj = c_api.hermes_make_function(ctx, name, &methodBridge, box);
+    // Function NativeState owns MethodBox: releases the retained handle when the method is no longer callable.
+    const fn_obj = c_api.hermes_make_function_ex(ctx, name, &methodBridge, box, &methodBoxFree);
     if (fn_obj == null) {
-        c_api.hermes_free_value(ctx, handle_dup);
-        std.heap.c_allocator.destroy(box);
+        // make_function_ex frees user_data via methodBoxFree on failure.
         return;
     }
     _ = c_api.hermes_set_property(ctx, obj, name, fn_obj);

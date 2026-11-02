@@ -168,7 +168,9 @@ pub fn callFunctionNoArgs(ctx: Context, fn_val: Value) ?[]const u8 {
     var err: ?[*:0]u8 = null;
     const this_val = c_api.hermes_get_global(ctx);
     defer c_api.hermes_free_value(ctx, this_val);
-    _ = c_api.hermes_call(ctx, fn_val, this_val, null, 0, &err);
+    const result = c_api.hermes_call(ctx, fn_val, this_val, null, 0, &err);
+    // hermes_call retainMoves the return value; always release the owned handle.
+    defer if (result != null) c_api.hermes_free_value(ctx, result);
     if (err) |e| {
         const s = std.mem.span(e);
         const owned = std.heap.c_allocator.dupe(u8, s) catch {

@@ -745,10 +745,19 @@ struct ExternalBuffer : public jsi::MutableBuffer {
     uint8_t *data() override { return ptr_; }
 };
 
-struct HostFnState {
+struct HostFnState : jsi::NativeState {
     JsbayHermesContextOpaque *ctx = nullptr;
     HermesNativeFn fn = nullptr;
     void *user_data = nullptr;
+    HermesNativeDataFree user_data_free = nullptr;
+    HostFnState(JsbayHermesContextOpaque *c, HermesNativeFn f, void *ud, HermesNativeDataFree free_ud)
+        : ctx(c), fn(f), user_data(ud), user_data_free(free_ud) {}
+    ~HostFnState() override {
+        if (user_data_free && user_data) {
+            user_data_free(ctx, user_data);
+            user_data = nullptr;
+        }
+    }
 };
 
 static bool instanceOfGlobal(FbHermesRuntime &rt, const jsi::Value &v, const char *ctorName) {
@@ -1356,10 +1365,12 @@ extern "C" uint8_t *hermes_data_view_data(JsbayHermesContext *c, HermesValue dv,
     } catch (...) { return nullptr; }
 }
 
-extern "C" HermesValue hermes_make_function(JsbayHermesContext *c, const char *name, HermesNativeFn fn, void *user_data) {
+static HermesValue hermesMakeFunctionOwned(JsbayHermesContext *c, const char *name, HermesNativeFn fn,
+                                            void *user_data, HermesNativeDataFree free_ud) {
     if (!c || !c->rt || !fn) return nullptr;
+    std::shared_ptr<HostFnState> state;
     try {
-        auto *state = new HostFnState{c, fn, user_data};
+        state = std::make_shared<HostFnState>(c, fn, user_data, free_ud);
         std::string n = name ? name : "native";
         auto host = jsi::Function::createFromHostFunction(
             *c->rt, jsi::PropNameID::forUtf8(*c->rt, n), 0,
@@ -1396,8 +1407,23 @@ extern "C" HermesValue hermes_make_function(JsbayHermesContext *c, const char *n
                 hermes_free_value(ctx, out);
                 return result;
             });
+        // Keep HostFnState alive with the JS function so user_data cleanup runs on GC / runtime teardown.
+        host.setNativeState(*c->rt, state);
         return retainMove(c, jsi::Value(std::move(host)));
-    } catch (...) { return nullptr; }
+    } catch (...) {
+        // If HostFnState was constructed, its destructor already ran free_ud.
+        if (!state && free_ud && user_data) free_ud(c, user_data);
+        return nullptr;
+    }
+}
+
+extern "C" HermesValue hermes_make_function(JsbayHermesContext *c, const char *name, HermesNativeFn fn, void *user_data) {
+    return hermesMakeFunctionOwned(c, name, fn, user_data, nullptr);
+}
+
+extern "C" HermesValue hermes_make_function_ex(JsbayHermesContext *c, const char *name, HermesNativeFn fn,
+                                               void *user_data, HermesNativeDataFree free_ud) {
+    return hermesMakeFunctionOwned(c, name, fn, user_data, free_ud);
 }
 
 
@@ -1498,6 +1524,23 @@ static HermesOpResult hopOk(JsbayHermesContextOpaque *c, jsi::Value &&v) {
     out.value = retainMove(c, std::move(v));
     return out;
 }
+
+extern "C" HermesOpResult hermes_value_to_string_result(JsbayHermesContext *c, HermesValue v) {
+    HermesOpResult out{nullptr, nullptr};
+    if (!c || !c->rt || !v) return out;
+    try {
+        if (asVal(v)->isString()) {
+            return hopOk(c, jsi::Value(*c->rt, *asVal(v)));
+        }
+        // Ordinary ToString: preserve throws from valueOf/toString instead of substituting.
+        jsi::String s = asVal(v)->toString(*c->rt);
+        return hopOk(c, jsi::Value(std::move(s)));
+    } catch (const jsi::JSError &e) {
+        return hopFail(c, jsi::Value(*c->rt, e.value()));
+    } catch (...) {
+        return out;
+    }
+}
 static HermesBoolOpResult hboolFail(JsbayHermesContextOpaque *c, jsi::Value &&exc) {
     HermesBoolOpResult out{false, nullptr};
     out.exception = retainMove(c, std::move(exc));
@@ -1551,16 +1594,18 @@ extern "C" uint64_t hermes_object_identity(JsbayHermesContext *c, HermesValue v)
     try {
         auto &rt = *c->rt;
         auto o = asVal(v)->getObject(rt);
-        auto has = c->identity_wm->getPropertyAsFunction(rt, "has");
-        if (has.call(rt, *c->identity_wm, o).getBool()) {
-            auto get = c->identity_wm->getPropertyAsFunction(rt, "get");
-            auto idVal = get.call(rt, *c->identity_wm, o);
+        auto &wm = *c->identity_wm;
+        // WeakMap methods require the map as `this`; Function::call does not bind receiver.
+        auto has = wm.getPropertyAsFunction(rt, "has");
+        if (has.callWithThis(rt, wm, o).getBool()) {
+            auto get = wm.getPropertyAsFunction(rt, "get");
+            auto idVal = get.callWithThis(rt, wm, o);
             return idVal.isNumber() ? (uint64_t)idVal.getNumber() : 0;
         }
         uint64_t id = c->next_identity_id++;
         if (id == 0) id = c->next_identity_id++;
-        auto set = c->identity_wm->getPropertyAsFunction(rt, "set");
-        set.call(rt, *c->identity_wm, o, (double)id);
+        auto set = wm.getPropertyAsFunction(rt, "set");
+        set.callWithThis(rt, wm, o, (double)id);
         return id;
     } catch (...) {
         return 0;
@@ -2758,77 +2803,9 @@ extern "C" bool hermes_set_rejection_tracker(JsbayHermesContext *ctx, int32_t in
                 return true;
             }
             auto hiObj = hi.getObject(rt);
-            auto st = rt.global().getProperty(rt, "setTimeout");
-            auto ct = rt.global().getProperty(rt, "clearTimeout");
-            if (st.isObject() && st.getObject(rt).isFunction(rt)) {
-                auto orig = std::make_shared<jsi::Function>(st.getObject(rt).getFunction(rt));
-                std::shared_ptr<jsi::Function> origClear;
-                if (ct.isObject() && ct.getObject(rt).isFunction(rt)) {
-                    origClear = std::make_shared<jsi::Function>(ct.getObject(rt).getFunction(rt));
-                }
-                auto wrap = jsi::Function::createFromHostFunction(
-                    rt, jsi::PropNameID::forAscii(rt, "setTimeout"), 2,
-                    [orig, ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
-                                size_t count) -> jsi::Value {
-                        if (count >= 2 && ctx->rejection_fn && args[1].isNumber()) {
-                            double d = args[1].getNumber();
-                            if ((d == 100.0 || d == 2000.0) &&
-                                args[0].isObject() && args[0].getObject(rt0).isFunction(rt0)) {
-                                auto cancelled = std::make_shared<bool>(false);
-                                int32_t tid = ctx->rejection_timer_next++;
-                                if (tid <= 0) tid = ctx->rejection_timer_next = 1;
-                                ctx->rejection_timer_cancelled[tid] = cancelled;
-                                auto fn = std::make_shared<jsi::Function>(
-                                    args[0].getObject(rt0).getFunction(rt0));
-                                // Defer one extra microtask turn so a `.catch` attached in the
-                                // same drain (Escargot/QJS semantics) can clearTimeout first.
-                                rt0.queueMicrotask(jsi::Function::createFromHostFunction(
-                                    rt0, jsi::PropNameID::forAscii(rt0, "rejTO1"), 0,
-                                    [cancelled, fn, ctx, tid](jsi::Runtime &rt1, const jsi::Value &,
-                                                              const jsi::Value *, size_t) -> jsi::Value {
-                                        if (*cancelled) {
-                                            ctx->rejection_timer_cancelled.erase(tid);
-                                            return jsi::Value::undefined();
-                                        }
-                                        rt1.queueMicrotask(jsi::Function::createFromHostFunction(
-                                            rt1, jsi::PropNameID::forAscii(rt1, "rejTO2"), 0,
-                                            [cancelled, fn, ctx, tid](jsi::Runtime &rt2, const jsi::Value &,
-                                                                      const jsi::Value *, size_t) -> jsi::Value {
-                                                ctx->rejection_timer_cancelled.erase(tid);
-                                                if (*cancelled) return jsi::Value::undefined();
-                                                try {
-                                                    fn->call(rt2);
-                                                } catch (...) {
-                                                }
-                                                return jsi::Value::undefined();
-                                            }));
-                                        return jsi::Value::undefined();
-                                    }));
-                                return jsi::Value((double)tid);
-                            }
-                        }
-                        return orig->call(rt0, args, count);
-                    });
-                rt.global().setProperty(rt, "setTimeout", wrap);
-                auto wrapClear = jsi::Function::createFromHostFunction(
-                    rt, jsi::PropNameID::forAscii(rt, "clearTimeout"), 1,
-                    [origClear, ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
-                                     size_t count) -> jsi::Value {
-                        if (count >= 1 && args[0].isNumber()) {
-                            int32_t tid = (int32_t)args[0].getNumber();
-                            auto it = ctx->rejection_timer_cancelled.find(tid);
-                            if (it != ctx->rejection_timer_cancelled.end()) {
-                                *it->second = true;
-                                ctx->rejection_timer_cancelled.erase(it);
-                                return jsi::Value::undefined();
-                            }
-                        }
-                        if (origClear) return origClear->call(rt0, args, count);
-                        return jsi::Value::undefined();
-                    });
-                rt.global().setProperty(rt, "clearTimeout", wrapClear);
-            }
-
+            // Do not wrap global setTimeout/clearTimeout. allRejections delivers
+            // onUnhandled/onHandled directly; timer interception would accelerate
+            // ordinary application delays of 100/2000ms into microtasks.
             auto enable = hiObj.getProperty(rt, "enablePromiseRejectionTracker");
             if (enable.isObject() && enable.getObject(rt).isFunction(rt)) {
                 auto hostUnhandled = jsi::Function::createFromHostFunction(
