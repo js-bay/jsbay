@@ -15,6 +15,11 @@ pub const QjsInterruptState = extern struct {
     /// Absolute deadline in milliseconds since engine start (monotonic); zero means "no limit". Read atomically.
     deadline_ms: u64,
     instance_id: i32 = -1,
+    budget_millis: u64 = 0,
+    budget_deadline_ms: u64 = 0,
+    budget_depth: usize = 0,
+    shutdown_deadline_ms: u64 = 0,
+    shutdown_phase: c_int = 0,
 };
 
 /// C trampoline: called by QuickJS periodically during JS execution. Returns non-zero to trigger interrupt (QuickJS throws InternalError).
@@ -27,11 +32,13 @@ fn qjsInterruptTrampoline(_: ?*qjs.JSRuntime, opaque_ptr: ?*anyopaque) callconv(
     if (req_ptr.load(.monotonic) != 0) return 1;
 
     const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
+    const budget_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
+    const shutdown_ptr: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
+    const now: u64 = @intCast(io.monotonicMilliseconds());
     const deadline = deadline_ptr.load(.monotonic);
-    if (deadline != 0) {
-        const now: u64 = @intCast(io.monotonicMilliseconds());
-        if (now >= deadline) return 1;
-    }
+    const budget_deadline = budget_ptr.load(.monotonic);
+    const shutdown_deadline = shutdown_ptr.load(.monotonic);
+    if ((deadline != 0 and now >= deadline) or (budget_deadline != 0 and now >= budget_deadline) or (shutdown_deadline != 0 and now >= shutdown_deadline)) return 1;
     if (state.instance_id >= 0) {
         if (@import("../../inspector/sample_hook.zig").load()) |hook| hook(state.instance_id);
     }

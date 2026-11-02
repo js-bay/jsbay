@@ -115,7 +115,7 @@ pub const Budget = struct {
             .foreground => global_byte_cap,
             .background => bgEffectiveByteCap(),
         };
-        if (bytes > max_payload_bytes or bytes > self.limits.max_pending_bytes -| self.bytes or bytes > process_byte_cap -| global_bytes) return false;
+        if ((kind != .script_task and bytes > max_payload_bytes) or bytes > self.limits.max_pending_bytes -| self.bytes or bytes > process_byte_cap -| global_bytes) return false;
         self.counts[i] += 1;
         global_counts[i] += 1;
         self.bytes += bytes;

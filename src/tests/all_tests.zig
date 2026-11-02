@@ -4,6 +4,7 @@ const backend = @import("../backend.zig");
 const build_options = @import("build_options");
 
 comptime {
+    _ = @import("../runtime/submission.zig");
     _ = @import("public_module_tests.zig");
     _ = @import("../script/typed_eval.zig");
     _ = @import("test_helpers.zig");
@@ -52,6 +53,8 @@ comptime {
     _ = @import("mapset_tests.zig");
     _ = @import("modules_tests.zig");
     _ = @import("c_api_tests.zig");
+    _ = @import("submission_tests.zig");
+    _ = @import("runtime_boundary_tests.zig");
     _ = @import("borrowed_retain_tests.zig");
     _ = @import("object_ops_tests.zig");
     _ = @import("runtime_control_tests.zig");

@@ -81,7 +81,7 @@ bool jsbay_engine_create_with_options(int instance_id, const jsbay_engine_create
 
 /* All out_* arguments in this header are required and must be non-NULL unless a declaration explicitly says otherwise. The only optional output is evaluate_options.out_cache_hit. */
 
-/* instance_id is supplied by the caller. Except request_interrupt, stop_loop, suspend, resume, is_suspended, list, snapshot, set/get_admission_class, resource_global_usage, and destroy, every API here runs on the owning thread, including release. Every output is cleared before work begins. On JSBAY_OK, out_value is non-zero and out_exception is zero; on JSBAY_EXCEPTION, out_value is zero and out_exception is a non-zero live thrown JS value (it need not be an Error); all other failures leave both outputs zero. */
+/* instance_id is supplied by the caller. Except generation-scoped submission/shutdown controls, request_interrupt, stop_loop, suspend, resume, is_suspended, list, snapshot, set/get_admission_class, resource_global_usage, and destroy, every API here runs on the owning thread, including release. Every output is cleared before work begins. On JSBAY_OK, out_value is non-zero and out_exception is zero; on JSBAY_EXCEPTION, out_value is zero and out_exception is a non-zero live thrown JS value (it need not be an Error); all other failures leave both outputs zero. */
 
 /* Process-wide build identity. No instance required; thread-safe. out must be non-NULL and struct_size must be at least sizeof(*out). On success the string pointers are library-owned NUL-terminated C strings that remain valid for the lifetime of the loaded library (do not free them). commit is "" when the build did not record a git revision. backend is the compile-time -Dbackend tag: "quickjs_ng", "quickjs", or "jsc". Returns false when out is NULL or struct_size is too small. */
 typedef struct {
@@ -175,8 +175,33 @@ bool jsbay_engine_create_with_limits(int instance_id, jsbay_log_handler_t log_ha
 void jsbay_engine_destroy(int instance_id);
 bool jsbay_engine_request_interrupt(int instance_id);
 bool jsbay_engine_clear_interrupt(int instance_id);
+bool jsbay_engine_cancel(int instance_id, uint64_t generation);
 bool jsbay_engine_set_execution_time_limit(int instance_id, uint64_t millis);
+bool jsbay_engine_set_execution_budget(int instance_id, uint64_t millis);
 bool jsbay_engine_set_memory_limit(int instance_id, uint64_t bytes);
+
+typedef enum {
+    JSBAY_SUBMISSION_COMPLETED = 0,
+    JSBAY_SUBMISSION_EXCEPTION = 1,
+    JSBAY_SUBMISSION_CANCELLED = 2,
+} jsbay_submission_status_t;
+typedef void (*jsbay_submission_callback_t)(int instance_id, uint64_t generation, jsbay_submission_status_t status, const uint8_t *error_data, size_t error_len, void *user_data);
+/* Thread-safe generation-scoped submission. source and filename are copied before this returns. An accepted submission invokes callback exactly once after its VM checkpoint; rejected submissions return false and never invoke callback. Lifecycle cancellation observed at core completion takes precedence over execution results; ordinary exceptions and recoverable execution limits report EXCEPTION. error_data is valid only during callback. */
+bool jsbay_engine_post_script(int instance_id, uint64_t generation, jsbay_utf8_t source, jsbay_utf8_t filename, jsbay_submission_callback_t callback, void *user_data);
+/* A fence has no JS body and completes after every preceding submission checkpoint. seal_shutdown seals only after the fence was admitted; its completion changes a sealed shutdown to drained, or reports cancelled when the deadline has expired. */
+bool jsbay_engine_post_fence(int instance_id, uint64_t generation, bool seal_shutdown, jsbay_submission_callback_t callback, void *user_data);
+
+typedef enum {
+    JSBAY_SHUTDOWN_OPEN = 0,
+    JSBAY_SHUTDOWN_CLOSING = 1,
+    JSBAY_SHUTDOWN_SEALED = 2,
+    JSBAY_SHUTDOWN_DRAINED = 3,
+    JSBAY_SHUTDOWN_CANCELLED = 4,
+} jsbay_shutdown_phase_t;
+typedef struct { jsbay_shutdown_phase_t phase; uint64_t remaining_ms; } jsbay_shutdown_status_t;
+/* Thread-safe generation-scoped shutdown control. begin_shutdown accepts a positive grace period once; repeated successful calls do not extend it. */
+bool jsbay_engine_begin_shutdown(int instance_id, uint64_t generation, uint64_t millis);
+bool jsbay_engine_shutdown_status(int instance_id, uint64_t generation, jsbay_shutdown_status_t *out);
 /* Replace per-instance Limits for future admissions. limits must be non-NULL with struct_size == sizeof(*limits). Existing reservations stay until released. */
 bool jsbay_engine_set_resource_limits(int instance_id, const jsbay_resource_limits_t *limits);
 /* Owner-thread snapshot of this instance's reservations and Limits. out->struct_size must be sizeof(*out) on entry. */
@@ -236,7 +261,7 @@ typedef void (*jsbay_engine_event_handler_t)(const jsbay_engine_event_t *event, 
 /* Owner-thread registration. Pass NULL handler to clear. Returns false if missing/wrong thread. */
 bool jsbay_engine_set_event_handler(int instance_id, jsbay_engine_event_handler_t handler, void *user_data);
 
-/* The only normal script execution entry point. source and filename are UTF-8 bytes. options may be NULL; otherwise struct_size must be sizeof(*options), and cache_dir/cache_version must both be empty or both non-empty. A cache failure evaluates source once. */
+/* The synchronous owner-thread script execution entry point. source and filename are UTF-8 bytes. options may be NULL; otherwise struct_size must be sizeof(*options), and cache_dir/cache_version must both be empty or both non-empty. A cache failure evaluates source once. */
 jsbay_status_t jsbay_engine_evaluate(int instance_id, jsbay_utf8_t source,
                                        jsbay_utf8_t filename,
                                        const jsbay_engine_evaluate_options_t *options,

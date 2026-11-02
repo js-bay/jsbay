@@ -1,6 +1,6 @@
 # js-bay .NET SDK
 
-`JsBay.Engine` is a thin .NET binding for the stable daily C API in `include/jsbay.h`. It does not create an engine thread, queue work, or provide a module loader. Create it on the thread that will run JavaScript, then call `Dispose` on that same thread.
+`JsBay.Engine` is a thin .NET binding for the C API in `include/jsbay.h`. It uses the core submission queue and the host's owner-thread dispatcher. Create it on the thread that will run JavaScript, then call `Dispose` on that same thread.
 
 ```csharp
 using JsBay;
@@ -29,9 +29,11 @@ Values created inside a callback are released automatically when the callback en
 
 `BindSync` is for a system request that must look synchronous to JavaScript while its work completes on another thread. Its starter receives borrowed `SyncCall` values and a thread-safe `SyncCompletion`; schedule the native work, return immediately, then call `ResolveString`, `ResolveBytes`, or `Reject` once. The completion token accepts only copied bytes and has no `Value`, so it is safe to pass to a thread-pool task. It is intentionally unsuitable for work that needs the owner thread's event loop to make progress.
 
+`PostScript` and `PostFence` submit directly to the core FIFO and report completed, exception, or cancelled after their checkpoint. `BeginShutdown` followed by `PostFence(true, ...)` drains accepted work, and `GetShutdownStatus` reports the core phase. `Cancel` is scoped to the generation captured at construction, so it cannot affect a replacement using the same id. `SetExecutionBudget` bounds one entry; `SetExecutionTimeLimit` and `SetMemoryLimit` retain their instance-wide meanings.
+
 Owner-thread observability: `GetMemoryUsage()`, `RunGc()`, and `SetEventHandler`. `CreateOnBackground` is a thin `Task.Run` helper — prefer a dedicated owner thread with a real `SynchronizationContext` for production timers. Same-process native faults still kill the host; see `docs/host-isolation.md`.
 
-Only `Engine.RequestInterrupt()` and `Engine.StopLoop()` are safe from a non-owner thread. `Dispose`, evaluation, conversion, binding, values, and inspector calls are owner-thread operations. Construction attaches the event loop only to a custom current `SynchronizationContext` whose `Post` implementation always dispatches asynchronously to the creating thread and remains available until `Dispose`; a rejected dispatch or a callback on another thread puts the loop into `LoopFailed`, which the creating thread observes on its next engine operation. A context that only inherits the base `SynchronizationContext.Post` implementation has no fixed owner thread, so use `RunLoop()` on the creating thread instead. The SDK does not declare finalizers because finalizer threads cannot satisfy that rule; use `using` or call `Dispose` explicitly.
+`Engine.RequestInterrupt()`, `Engine.StopLoop()`, `Engine.BeginShutdown()`, `Engine.GetShutdownStatus()`, and `Engine.Cancel()` are safe from a non-owner thread. `Dispose`, evaluation, conversion, binding, values, and inspector calls are owner-thread operations. Construction attaches the event loop only to a custom current `SynchronizationContext` whose `Post` implementation always dispatches asynchronously to the creating thread and remains available until `Dispose`; a rejected dispatch or a callback on another thread puts the loop into `LoopFailed`, which the creating thread observes on its next engine operation. A context that only inherits the base `SynchronizationContext.Post` implementation has no fixed owner thread, so use `RunLoop()` on the creating thread instead. The SDK does not declare finalizers because finalizer threads cannot satisfy that rule; use `using` or call `Dispose` explicitly.
 
 The application supplies the platform-specific `jsbay` native library through the normal .NET native library search path. This package does not ship a Node/Electron adapter and does not select a runtime backend.
 

@@ -2,7 +2,10 @@ package io.jsbay.consumer
 
 import io.jsbay.Engine
 import io.jsbay.JsBayException
+import io.jsbay.ShutdownPhase
 import io.jsbay.Status
+import io.jsbay.SubmissionResult
+import io.jsbay.SubmissionStatus
 import io.jsbay.SyncCompletion
 import io.jsbay.Value
 import io.jsbay.ValueKind
@@ -539,6 +542,66 @@ fun runKotlinConsumer() {
         }
     }
     check(closeLate!!.tryResolveString("1") == Status.STALE_VALUE) { "Kotlin close rejects late completion" }
+    Engine(7104).use { submitted ->
+        val outcomes = mutableListOf<SubmissionResult>()
+        check(submitted.postScript("globalThis.__submitted = 40 + 2", "submission-ok.js") { outcomes += it }) {
+            "Kotlin postScript admission"
+        }
+        check(submitted.postScript("throw new Error('submission')", "submission-error.js") { outcomes += it }) {
+            "Kotlin exception submission admission"
+        }
+        check(submitted.postFence(completion = { outcomes += it })) { "Kotlin postFence admission" }
+        android.os.Looper
+            .myLooper()
+            .advanceBy(100)
+        check(
+            outcomes.map { it.status } ==
+                listOf(SubmissionStatus.COMPLETED, SubmissionStatus.EXCEPTION, SubmissionStatus.COMPLETED),
+        ) {
+            "Kotlin FIFO submission outcomes: $outcomes"
+        }
+        submitted.evaluate("__submitted", "submission-result.js").use { check(it.number() == 42.0) }
+        check(submitted.beginShutdown(1_000)) { "Kotlin beginShutdown admission" }
+        check(submitted.postFence(sealShutdown = true) { outcomes += it }) { "Kotlin sealing fence admission" }
+        android.os.Looper
+            .myLooper()
+            .advanceBy(100)
+        check(submitted.shutdownStatus()?.phase == ShutdownPhase.DRAINED) { "Kotlin shutdown drains through fence" }
+        check(!submitted.postScript("1", "submission-rejected.js")) { "Kotlin sealed shutdown rejects new scripts" }
+    }
+    Engine(7105).use { busy ->
+        val outcomes = mutableListOf<SubmissionResult>()
+        val entered = java.util.concurrent.CountDownLatch(1)
+        busy
+            .bind("submissionBusyEntered") { _, _ ->
+                entered.countDown()
+                busy.undefined()
+            }.use {
+                check(
+                    busy.postScript("submissionBusyEntered(); for (;;) {}", "submission-busy.js") { outcomes += it },
+                ) {
+                    "Kotlin busy submission admission"
+                }
+                val controller =
+                    Thread {
+                        check(
+                            entered.await(1, java.util.concurrent.TimeUnit.SECONDS),
+                        ) { "Kotlin busy submission entered" }
+                        check(busy.beginShutdown(20)) { "Kotlin foreign-thread beginShutdown admission" }
+                    }
+                controller.start()
+                android.os.Looper
+                    .myLooper()
+                    .advanceBy(200)
+                controller.join()
+            }
+        check(outcomes.singleOrNull()?.status == SubmissionStatus.CANCELLED) {
+            "Kotlin foreign-thread shutdown cancels a running submission: $outcomes"
+        }
+        check(busy.shutdownStatus()?.phase == ShutdownPhase.CANCELLED) {
+            "Kotlin foreign-thread shutdown terminal phase"
+        }
+    }
     val closed = Engine(mainInstanceId)
     closed.close()
     Engine(mainInstanceId).use { replacement ->

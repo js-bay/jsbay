@@ -56,6 +56,11 @@ internal object Native {
         millis: Long,
     ): Boolean
 
+    external fun executionBudget(
+        id: Int,
+        millis: Long,
+    ): Boolean
+
     external fun memoryLimit(
         id: Int,
         bytes: Long,
@@ -90,6 +95,37 @@ internal object Native {
     external fun listEngines(): IntArray
 
     external fun snapshotEngine(id: Int): LongArray?
+
+    external fun cancel(
+        id: Int,
+        generation: Long,
+    ): Boolean
+
+    external fun postScript(
+        id: Int,
+        generation: Long,
+        source: ByteArray,
+        filename: String,
+        callback: SubmissionCallback?,
+    ): Boolean
+
+    external fun postFence(
+        id: Int,
+        generation: Long,
+        sealShutdown: Boolean,
+        callback: SubmissionCallback?,
+    ): Boolean
+
+    external fun beginShutdown(
+        id: Int,
+        generation: Long,
+        millis: Long,
+    ): Boolean
+
+    external fun shutdownStatus(
+        id: Int,
+        generation: Long,
+    ): LongArray?
 
     external fun runLoopTask(
         binding: Long,

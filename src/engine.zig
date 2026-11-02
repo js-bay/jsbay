@@ -216,11 +216,7 @@ pub fn evalScript(instance_id: i32, script: []const u8, filename: []const u8) Ev
         .mono => |m| ActiveEngine.eval(m.ctx, script, filename),
         .packed_alt => |a| @import("backend_dispatch.zig").evalPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }, script, filename),
     };
-    execution.end();
-    switch (inst.engine_handles) {
-        .mono => |m| @import("runtime/js_scheduler.zig").checkpoint(instance_id, m.ctx),
-        .packed_alt => |a| @import("backend_dispatch.zig").processPendingJobsPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }),
-    }
+    @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(&execution);
     _ = ptrs;
     if (result.err) |message| @import("inspector/root.zig").exceptions.reportUncaught(instance_id, message, filename);
     return result;
@@ -257,8 +253,7 @@ pub fn evalModule(instance_id: i32, source: []const u8, filename: []const u8) Ev
         .quickjs, .quickjs_ng => @import("backend.zig").ActiveEngineModule.evalAsModule(ptrs.ctx, source, filename),
         .jsc => @import("backend/jsc.zig").jscEvalModule(ptrs.ctx, source, filename),
     };
-    execution.end();
-    @import("runtime/js_scheduler.zig").checkpoint(instance_id, ptrs.ctx);
+    @import("runtime/js_scheduler.zig").checkpointAfterExecution(&execution, ptrs.ctx);
     return result;
 }
 
@@ -276,8 +271,7 @@ pub fn importModule(instance_id: i32, entry_specifier: []const u8) EvalResult {
         return missingInstanceResult();
     var execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse return missingInstanceResult();
     defer {
-        execution.end();
-        @import("runtime/js_scheduler.zig").checkpoint(instance_id, ptrs.ctx);
+        @import("runtime/js_scheduler.zig").checkpointAfterExecution(&execution, ptrs.ctx);
     }
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
@@ -343,6 +337,7 @@ const event_loop = @import("js_event_loop");
 const TurnContext = struct {
     instance_id: i32,
     native_completion: ?dispatch.TaskCompletion = null,
+    task_budget_armed: bool = false,
     fn self(context: ?*anyopaque) *TurnContext {
         return @ptrCast(@alignCast(context.?));
     }
@@ -364,18 +359,28 @@ const TurnContext = struct {
     fn runOneTask(context: ?*anyopaque, source: event_loop.Scheduler.TaskSource, now: u64) bool {
         const turn = self(context);
         if (instance_map.isTeardownPending(turn.instance_id)) return false;
-        return switch (source) {
+        const budget_armed = @import("runtime/runtime_control.zig").beginExecutionBudget(turn.instance_id);
+        const ran = switch (source) {
             .host_script => runOneAsync(turn.instance_id),
             .native_dispatch => dispatch.runOneTask(turn.instance_id, &turn.native_completion),
             .tsfn => @import("runtime/tsfn.zig").runOne(turn.instance_id),
             .timer => timers.fireOneDue(turn.instance_id, now),
         };
+        if (ran) {
+            turn.task_budget_armed = budget_armed;
+        } else if (budget_armed) @import("runtime/runtime_control.zig").endExecutionBudget(turn.instance_id);
+        return ran;
     }
     fn checkpoint(context: ?*anyopaque) void {
         const id = self(context).instance_id;
         if (!instance_map.isTeardownPending(id)) @import("runtime/js_scheduler.zig").checkpointInstance(id);
     }
     fn finishTask(context: ?*anyopaque) void {
+        const turn = self(context);
+        if (turn.task_budget_armed) {
+            turn.task_budget_armed = false;
+            @import("runtime/runtime_control.zig").endExecutionBudget(turn.instance_id);
+        }
         if (self(context).native_completion) |*completion| completion.finish();
         self(context).native_completion = null;
     }

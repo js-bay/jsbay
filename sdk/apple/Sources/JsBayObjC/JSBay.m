@@ -12,6 +12,7 @@ NSErrorUserInfoKey const JSBayExceptionValueKey = @"JSBayExceptionValue";
 @interface JSBayEngine ()
 @property(nonatomic) pthread_t owner;
 @property(atomic) BOOL open;
+@property(nonatomic) uint64_t generation;
 @property(nonatomic) BOOL allowMainRunLoopAttach;
 @property(nonatomic) void *loopUserData;
 @property(nonatomic) jsbay_status_t loopRestoreFailure;
@@ -28,8 +29,36 @@ NSErrorUserInfoKey const JSBayExceptionValueKey = @"JSBayExceptionValue";
 - (void)endCallbackScope:(JSBayCallbackScope *)scope;
 @end
 
+@interface JSBaySubmissionBinding : NSObject
+@property(nonatomic, copy) JSBaySubmissionCompletion completion;
+@end
+@implementation JSBaySubmissionBinding
+@end
+
+static void JSBaySubmissionComplete(int instanceID, uint64_t generation,
+                                    jsbay_submission_status_t status, const uint8_t *errorData,
+                                    size_t errorLength, void *userData) {
+    (void)instanceID;
+    (void)generation;
+    if (!userData)
+        return;
+    JSBaySubmissionBinding *binding = CFBridgingRelease(userData);
+    NSData *error =
+        errorLength ? [NSData dataWithBytes:errorData length:errorLength] : [NSData data];
+    @try {
+        binding.completion((JSBaySubmissionStatus)status, error);
+    } @catch (NSException *unused) {
+        (void)unused;
+    }
+}
+
 @interface JSBayCacheOptions ()
 @property(nonatomic) BOOL didHit;
+@end
+
+@interface JSBayShutdownStatus ()
+@property(nonatomic, readwrite) JSBayShutdownPhase phase;
+@property(nonatomic, readwrite) uint64_t remainingMilliseconds;
 @end
 
 @interface JSBayValue ()
@@ -903,6 +932,9 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
 @implementation JSBayInstanceSnapshot
 @end
 
+@implementation JSBayShutdownStatus
+@synthesize phase = _phase, remainingMilliseconds = _remainingMilliseconds;
+@end
 @implementation JSBayEngine
 @synthesize identifier = _identifier, owner = _owner, open = _open, scopes = _scopes,
             allowMainRunLoopAttach = _allowMainRunLoopAttach, loopUserData = _loopUserData,
@@ -976,6 +1008,14 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
             *error = JSBayStatusError(JSBAY_INVALID_ARGUMENT);
         return nil;
     }
+    jsbay_instance_snapshot_t snapshot = {.struct_size = sizeof(snapshot)};
+    if (!jsbay_engine_snapshot(identifier, &snapshot)) {
+        jsbay_engine_destroy(identifier);
+        if (error)
+            *error = JSBayStatusError(JSBAY_INSTANCE_NOT_FOUND);
+        return nil;
+    }
+    _generation = snapshot.generation;
     JSBayLoopBinding *binding = [[JSBayLoopBinding alloc] initWithRunLoop:CFRunLoopGetCurrent()
                                                                identifier:identifier];
     void *user = (void *)CFBridgingRetain(binding);
@@ -1443,10 +1483,84 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
         return NO;
     return jsbay_engine_set_execution_time_limit(_identifier, x);
 }
+- (BOOL)setExecutionBudgetMilliseconds:(uint64_t)x error:(NSError **)e {
+    if (![self requireOpen:e])
+        return NO;
+    return jsbay_engine_set_execution_budget(_identifier, x);
+}
 - (BOOL)setMemoryLimitBytes:(uint64_t)x error:(NSError **)e {
     if (![self requireOpen:e])
         return NO;
     return jsbay_engine_set_memory_limit(_identifier, x);
+}
+- (BOOL)postScript:(NSString *)source
+          filename:(NSString *)filename
+        completion:(JSBaySubmissionCompletion)completion
+             error:(NSError **)error {
+    if (![self requireOpen:error])
+        return NO;
+    NSData *sourceData, *filenameData;
+    jsbay_utf8_t sourceText, filenameText;
+    if (!JSBayUTF8(source, &sourceData, &sourceText, error) ||
+        !JSBayUTF8(filename, &filenameData, &filenameText, error))
+        return NO;
+    void *user =
+        completion ? (void *)CFBridgingRetain([[JSBaySubmissionBinding alloc] init]) : NULL;
+    if (completion)
+        ((__bridge JSBaySubmissionBinding *)user).completion = completion;
+    BOOL accepted = jsbay_engine_post_script(_identifier, _generation, sourceText, filenameText,
+                                             completion ? JSBaySubmissionComplete : NULL, user);
+    if (!accepted && user)
+        CFBridgingRelease(user);
+    return accepted;
+}
+- (BOOL)postFenceSealingShutdown:(BOOL)sealShutdown
+                      completion:(JSBaySubmissionCompletion)completion
+                           error:(NSError **)error {
+    if (![self requireOpen:error])
+        return NO;
+    void *user =
+        completion ? (void *)CFBridgingRetain([[JSBaySubmissionBinding alloc] init]) : NULL;
+    if (completion)
+        ((__bridge JSBaySubmissionBinding *)user).completion = completion;
+    BOOL accepted = jsbay_engine_post_fence(_identifier, _generation, sealShutdown,
+                                            completion ? JSBaySubmissionComplete : NULL, user);
+    if (!accepted && user)
+        CFBridgingRelease(user);
+    return accepted;
+}
+- (BOOL)beginShutdownWithGraceMilliseconds:(uint64_t)milliseconds error:(NSError **)error {
+    if (!milliseconds)
+        return NO;
+    NSLock *lock = JSBayEngineStateLock();
+    [lock lock];
+    BOOL result = self.open && jsbay_engine_begin_shutdown(_identifier, _generation, milliseconds);
+    [lock unlock];
+    return result;
+}
+- (JSBayShutdownStatus *)shutdownStatus {
+    NSLock *lock = JSBayEngineStateLock();
+    [lock lock];
+    if (!self.open) {
+        [lock unlock];
+        return nil;
+    }
+    jsbay_shutdown_status_t status;
+    BOOL found = jsbay_engine_shutdown_status(_identifier, _generation, &status);
+    [lock unlock];
+    if (!found)
+        return nil;
+    JSBayShutdownStatus *out = [JSBayShutdownStatus new];
+    out.phase = (JSBayShutdownPhase)status.phase;
+    out.remainingMilliseconds = status.remaining_ms;
+    return out;
+}
+- (BOOL)cancel {
+    NSLock *lock = JSBayEngineStateLock();
+    [lock lock];
+    BOOL result = self.open && jsbay_engine_cancel(_identifier, _generation);
+    [lock unlock];
+    return result;
 }
 - (BOOL)setResourceLimits:(JSBayResourceLimits *)limits error:(NSError **)e {
     if (![self requireOpen:e])

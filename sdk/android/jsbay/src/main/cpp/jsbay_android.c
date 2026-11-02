@@ -388,6 +388,157 @@ static jboolean mem(JNIEnv *e, jclass c, jint id, jlong n) {
     (void)c;
     return n >= 0 && jsbay_engine_set_memory_limit(id, (uint64_t)n);
 }
+static jboolean execution_budget(JNIEnv *e, jclass c, jint id, jlong n) {
+    (void)e;
+    (void)c;
+    return n >= 0 && jsbay_engine_set_execution_budget(id, (uint64_t)n);
+}
+
+typedef struct {
+    JavaVM *vm;
+    jobject callback;
+    jmethodID complete;
+    atomic_bool completed;
+} submission_binding;
+
+static void submission_complete(int instance_id, uint64_t generation,
+                                jsbay_submission_status_t status, const uint8_t *error_data,
+                                size_t error_len, void *user_data) {
+    (void)instance_id;
+    (void)generation;
+    submission_binding *binding = user_data;
+    if (!binding || atomic_exchange_explicit(&binding->completed, true, memory_order_acq_rel))
+        return;
+    JNIEnv *env = NULL;
+    bool attached = false;
+    if ((*binding->vm)->GetEnv(binding->vm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+#if defined(__ANDROID__)
+        if ((*binding->vm)->AttachCurrentThread(binding->vm, &env, NULL) != JNI_OK)
+#else
+        if ((*binding->vm)->AttachCurrentThread(binding->vm, (void **)&env, NULL) != JNI_OK)
+#endif
+            env = NULL;
+        else
+            attached = true;
+    }
+    if (env) {
+        jbyteArray error = (*env)->NewByteArray(env, (jsize)error_len);
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+        if (error && error_len) {
+            (*env)->SetByteArrayRegion(env, error, 0, (jsize)error_len, (const jbyte *)error_data);
+            if ((*env)->ExceptionCheck(env)) {
+                (*env)->ExceptionClear(env);
+                (*env)->DeleteLocalRef(env, error);
+                error = NULL;
+            }
+        }
+        (*env)->CallVoidMethod(env, binding->callback, binding->complete, (jint)status, error);
+        if ((*env)->ExceptionCheck(env))
+            (*env)->ExceptionClear(env);
+        if (error)
+            (*env)->DeleteLocalRef(env, error);
+        (*env)->DeleteGlobalRef(env, binding->callback);
+    }
+    if (attached)
+        (*binding->vm)->DetachCurrentThread(binding->vm);
+    free(binding);
+}
+
+static submission_binding *submission_binding_create(JNIEnv *env, jobject callback) {
+    if (!callback)
+        return NULL;
+    submission_binding *binding = calloc(1, sizeof(*binding));
+    if (!binding)
+        return NULL;
+    if ((*env)->GetJavaVM(env, &binding->vm) != JNI_OK) {
+        free(binding);
+        return NULL;
+    }
+    jclass cls = (*env)->GetObjectClass(env, callback);
+    binding->complete = cls ? (*env)->GetMethodID(env, cls, "onComplete", "(I[B)V") : NULL;
+    if (cls)
+        (*env)->DeleteLocalRef(env, cls);
+    binding->callback = binding->complete ? (*env)->NewGlobalRef(env, callback) : NULL;
+    if (!binding->callback) {
+        free(binding);
+        return NULL;
+    }
+    return binding;
+}
+
+static void submission_binding_destroy(JNIEnv *env, submission_binding *binding) {
+    if (!binding)
+        return;
+    if (binding->callback)
+        (*env)->DeleteGlobalRef(env, binding->callback);
+    free(binding);
+}
+
+static jboolean post_script(JNIEnv *env, jclass c, jint id, jlong generation, jbyteArray source,
+                            jstring filename, jobject callback) {
+    (void)c;
+    jsize source_len = source ? (*env)->GetArrayLength(env, source) : 0;
+    jbyte *source_data = source_len ? (*env)->GetByteArrayElements(env, source, NULL) : NULL;
+    jbyteArray filename_hold;
+    jsbay_utf8_t filename_text = utf(env, filename, &filename_hold);
+    if ((source_len && !source_data) || (!filename_text.data && filename_text.len != 0)) {
+        if (source_data)
+            (*env)->ReleaseByteArrayElements(env, source, source_data, JNI_ABORT);
+        done(env, filename_hold, filename_text);
+        return JNI_FALSE;
+    }
+    submission_binding *binding = submission_binding_create(env, callback);
+    if (callback && !binding) {
+        if (source_data)
+            (*env)->ReleaseByteArrayElements(env, source, source_data, JNI_ABORT);
+        done(env, filename_hold, filename_text);
+        return JNI_FALSE;
+    }
+    bool accepted = jsbay_engine_post_script(
+        id, (uint64_t)generation, (jsbay_utf8_t){(const uint8_t *)source_data, (size_t)source_len},
+        filename_text, binding ? submission_complete : NULL, binding);
+    if (source_data)
+        (*env)->ReleaseByteArrayElements(env, source, source_data, JNI_ABORT);
+    done(env, filename_hold, filename_text);
+    if (!accepted)
+        submission_binding_destroy(env, binding);
+    return accepted;
+}
+
+static jboolean post_fence(JNIEnv *env, jclass c, jint id, jlong generation, jboolean seal,
+                           jobject callback) {
+    (void)c;
+    submission_binding *binding = submission_binding_create(env, callback);
+    if (callback && !binding)
+        return JNI_FALSE;
+    bool accepted = jsbay_engine_post_fence(id, (uint64_t)generation, seal == JNI_TRUE,
+                                            binding ? submission_complete : NULL, binding);
+    if (!accepted)
+        submission_binding_destroy(env, binding);
+    return accepted;
+}
+
+static jboolean begin_shutdown(JNIEnv *env, jclass c, jint id, jlong generation, jlong millis) {
+    (void)env;
+    (void)c;
+    return millis > 0 && jsbay_engine_begin_shutdown(id, (uint64_t)generation, (uint64_t)millis);
+}
+
+static jlongArray shutdown_status(JNIEnv *env, jclass c, jint id, jlong generation) {
+    (void)c;
+    jsbay_shutdown_status_t status;
+    if (!jsbay_engine_shutdown_status(id, (uint64_t)generation, &status))
+        return NULL;
+    jlong values[2] = {(jlong)status.phase, (jlong)status.remaining_ms};
+    return pack_longs(env, values, 2);
+}
+
+static jboolean cancel_generation(JNIEnv *env, jclass c, jint id, jlong generation) {
+    (void)env;
+    (void)c;
+    return jsbay_engine_cancel(id, (uint64_t)generation);
+}
 typedef struct {
     JavaVM *vm;
     jobject driver;
@@ -1541,6 +1692,7 @@ static JNINativeMethod methods[] = {
     {"requestInterrupt", "(I)Z", ri},
     {"clearInterrupt", "(I)Z", ci},
     {"timeLimit", "(IJ)Z", limit},
+    {"executionBudget", "(IJ)Z", execution_budget},
     {"memoryLimit", "(IJ)Z", mem},
     {"attachLoop", "(I)J", attach_loop},
     {"detachLoop", "(IJ)I", detach_loop},
@@ -1554,6 +1706,11 @@ static JNINativeMethod methods[] = {
     {"getAdmissionClass", "(I)I", get_admission_class},
     {"listEngines", "()[I", engine_list},
     {"snapshotEngine", "(I)[J", engine_snapshot},
+    {"cancel", "(IJ)Z", cancel_generation},
+    {"postScript", "(IJ[BLjava/lang/String;Lio/jsbay/SubmissionCallback;)Z", post_script},
+    {"postFence", "(IJZLio/jsbay/SubmissionCallback;)Z", post_fence},
+    {"beginShutdown", "(IJJ)Z", begin_shutdown},
+    {"shutdownStatus", "(IJ)[J", shutdown_status},
     {"runLoopTask", "(JJ)V", run_loop_task},
     {"evaluate", "(I[BLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)[J", eval},
     {"retain", "(J)[J", retain},

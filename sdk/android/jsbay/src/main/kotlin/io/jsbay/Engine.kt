@@ -21,6 +21,7 @@ class Engine
         ) : this(id, EngineOptions(logHandler = logHandler, eventHandler = eventHandler))
 
         private val owner = Thread.currentThread()
+        private val generation: Long
 
         @Volatile private var closed = false
         private var loopBinding: Long = 0
@@ -48,6 +49,11 @@ class Engine
                     else -> Native.create(id)
                 }
             if (!created) throw JsBayException(Status.INVALID_ARGUMENT)
+            generation = Native.snapshotEngine(id)?.getOrNull(1)
+                ?: run {
+                    Native.destroy(id)
+                    throw JsBayException(Status.INSTANCE_NOT_FOUND)
+                }
             // Handlers path uses plain create under the hood; apply limits afterward when both are set.
             if ((logHandler != null || eventHandler != null) && limits != null) {
                 if (!Native.setResourceLimits(
@@ -287,6 +293,81 @@ class Engine
                 !closed && Native.stopLoop(id)
             }
 
+        fun setExecutionBudget(millis: Long): Boolean {
+            checkOwner()
+            return Native.executionBudget(id, millis)
+        }
+
+        fun setMemoryLimit(bytes: Long): Boolean {
+            checkOwner()
+            return Native.memoryLimit(id, bytes)
+        }
+
+        /** Submits source to the core FIFO. Completion runs once after its VM checkpoint. */
+        @JvmOverloads fun postScript(
+            source: String,
+            filename: String = "<submission>",
+            completion: ((SubmissionResult) -> Unit)? = null,
+        ): Boolean {
+            checkOwner()
+            return Native.postScript(
+                id,
+                generation,
+                text(source).toByteArray(Charsets.UTF_8),
+                text(filename),
+                submissionCallback(completion),
+            )
+        }
+
+        /** Posts an ordered core fence. Sealing rejects later submissions after admission. */
+        @JvmOverloads fun postFence(
+            sealShutdown: Boolean = false,
+            completion: ((SubmissionResult) -> Unit)? = null,
+        ): Boolean {
+            checkOwner()
+            return Native.postFence(id, generation, sealShutdown, submissionCallback(completion))
+        }
+
+        private fun submissionCallback(completion: ((SubmissionResult) -> Unit)?): SubmissionCallback? =
+            completion?.let { callback ->
+                SubmissionCallback { status, error ->
+                    callback(
+                        SubmissionResult(
+                            SubmissionStatus.of(status),
+                            (error ?: byteArrayOf()).toString(Charsets.UTF_8),
+                        ),
+                    )
+                }
+            }
+
+        fun beginShutdown(graceMillis: Long): Boolean =
+            synchronized(lifecycleLock) {
+                !closed && graceMillis > 0 && Native.beginShutdown(id, generation, graceMillis)
+            }
+
+        fun shutdownStatus(): ShutdownStatus? =
+            synchronized(lifecycleLock) {
+                if (closed) return@synchronized null
+                val raw = Native.shutdownStatus(id, generation) ?: return@synchronized null
+                if (raw.size < 2) return@synchronized null
+                ShutdownPhase.of(raw[0].toInt())?.let { ShutdownStatus(it, raw[1]) }
+            }
+
+        /** Cancels only the immutable generation created by this Engine object. */
+        fun cancel(): Boolean = synchronized(lifecycleLock) { !closed && Native.cancel(id, generation) }
+
+        fun setResourceLimits(limits: ResourceLimits): Boolean {
+            checkOwner()
+            return Native.setResourceLimits(
+                id,
+                limits.maxTimers,
+                limits.maxTsfnHandles,
+                limits.maxPendingCalls,
+                limits.maxPendingBytes,
+                limits.maxPendingTasks,
+            )
+        }
+
         /**
          * Keep-alive pause for multi-runtime Hide. Cancels pending loop tasks without
          * detaching the Looper binding or clearing timers/VM state. May be called from any thread.
@@ -333,23 +414,6 @@ class Engine
         fun setExecutionTimeLimit(millis: Long): Boolean {
             checkOwner()
             return Native.timeLimit(id, millis)
-        }
-
-        fun setMemoryLimit(bytes: Long): Boolean {
-            checkOwner()
-            return Native.memoryLimit(id, bytes)
-        }
-
-        fun setResourceLimits(limits: ResourceLimits): Boolean {
-            checkOwner()
-            return Native.setResourceLimits(
-                id,
-                limits.maxTimers,
-                limits.maxTsfnHandles,
-                limits.maxPendingCalls,
-                limits.maxPendingBytes,
-                limits.maxPendingTasks,
-            )
         }
 
         fun resourceUsage(): ResourceUsage {
