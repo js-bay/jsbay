@@ -1304,9 +1304,11 @@ static bool hermesBrandIsDataView(JsbayHermesContext *c, const jsi::Object &o) {
 }
 
 static bool hermesBrandIsTypedArray(JsbayHermesContext *c, const jsi::Object &o) {
-    if (!c || !c->rt || !c->pristine_typed_array_ctor) return false;
+    // Pristine %TypedArray%.prototype.buffer validates [[ViewedArrayBuffer]] without prototype-chain instanceof (Object.setPrototypeOf(typedArray, null) must still brand-check).
+    if (!c || !c->rt || !c->pristine_ta_buffer_get) return false;
     try {
-        return c->rt->instanceOf(o, *c->pristine_typed_array_ctor);
+        c->pristine_ta_buffer_get->callWithThis(*c->rt, o);
+        return true;
     } catch (...) {
         return false;
     }
@@ -2126,10 +2128,22 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
 
     if (state != 1) return;
 
-    // Resolve may adopt a thenable/promise. Leave the side table pending and update from the Deferred promise's own fulfillment/rejection handlers after microtask drain.
+    // Resolve may adopt a thenable/promise. Leave the side table pending and update from settlement handlers after microtask drain.
+    // Observe the adopted thenable (when present) rather than the Deferred promise itself, so attaching onRejected does not mark the Deferred as handled and suppress application-visible unhandled-rejection reporting.
     try {
         auto &rt = *c->rt;
-        jsi::Object po = pvalue->asObject(rt);
+        jsi::Object target = pvalue->asObject(rt);
+        if (result && asVal(result)->isObject()) {
+            try {
+                jsi::Object cand = asVal(result)->getObject(rt);
+                jsi::Value then_v = cand.getProperty(rt, "then");
+                if (then_v.isObject() && then_v.getObject(rt).isFunction(rt)) {
+                    target = std::move(cand);
+                }
+            } catch (...) {
+                target = pvalue->asObject(rt);
+            }
+        }
         auto onFulfilled = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseFulfilled"), 1,
             [c, key](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
@@ -2183,8 +2197,8 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                 if (old_res) release(c, old_res);
                 return jsi::Value::undefined();
             });
-        auto then = po.getPropertyAsFunction(rt, "then");
-        then.callWithThis(rt, po, onFulfilled, onRejected);
+        auto then = target.getPropertyAsFunction(rt, "then");
+        then.callWithThis(rt, target, onFulfilled, onRejected);
     } catch (...) {
     }
 }

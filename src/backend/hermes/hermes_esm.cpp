@@ -57,8 +57,10 @@ static bool isIdent(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
 
-// Same length as src, with string/template/comment interiors blanked to spaces so
-// export/import regexes cannot match text that is not executable source.
+static bool canStartRegexLiteral(const std::string &preceding);
+static void blankRegexLiteral(std::string &out, size_t &i);
+
+// Same length as src, with string/template/comment/regexp interiors blanked to spaces so export/import regexes cannot match text that is not executable source.
 static std::string blankNonCode(const std::string &src) {
     std::string out = src;
     size_t i = 0;
@@ -75,6 +77,10 @@ static std::string blankNonCode(const std::string &src) {
             while (i + 1 < out.size() && !(out[i] == '*' && out[i + 1] == '/')) { out[i] = ' '; ++i; }
             if (i < out.size()) out[i++] = ' ';
             if (i < out.size()) out[i++] = ' ';
+            continue;
+        }
+        if (c == '/' && canStartRegexLiteral(out.substr(0, i))) {
+            blankRegexLiteral(out, i);
             continue;
         }
         if (c == '\'' || c == '"' || c == '`') {
@@ -204,6 +210,37 @@ static void skipRegexLiteral(const std::string &src, size_t &i) {
         }
         if (ch == '\n' || ch == '\r') return;
         ++i;
+    }
+}
+
+// Blank `/pattern/flags` interiors in-place (keep delimiters/flags length); used by blankNonCode.
+static void blankRegexLiteral(std::string &out, size_t &i) {
+    ++i; // keep opening /
+    bool in_class = false;
+    while (i < out.size()) {
+        char ch = out[i];
+        if (ch == '\\' && i + 1 < out.size()) {
+            out[i] = out[i + 1] = ' ';
+            i += 2;
+            continue;
+        }
+        if (ch == '[' && !in_class) {
+            in_class = true;
+            out[i++] = ' ';
+            continue;
+        }
+        if (ch == ']' && in_class) {
+            in_class = false;
+            out[i++] = ' ';
+            continue;
+        }
+        if (ch == '/' && !in_class) {
+            ++i; // keep closing /
+            while (i < out.size() && std::isalpha(static_cast<unsigned char>(out[i]))) ++i;
+            return;
+        }
+        if (ch == '\n' || ch == '\r') return;
+        out[i++] = ' ';
     }
 }
 
@@ -880,8 +917,7 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
     return names;
 }
 
-// Rewrite import.meta / dynamic import() only in executable source (and inside
-// template interpolations). Strings, comments, and template cooked text stay intact.
+// Rewrite import.meta / dynamic import() only in executable source (and inside template interpolations). Strings, comments, regexp literals, and template cooked text stay intact.
 static std::string rewriteImportMetaAndDynamic(const std::string &src) {
     std::string out;
     out.reserve(src.size() + 64);
@@ -1102,6 +1138,10 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
             while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) out.push_back(src[i++]);
             if (i < src.size()) out.push_back(src[i++]);
             if (i < src.size()) out.push_back(src[i++]);
+            continue;
+        }
+        if (c == '/' && canStartRegexLiteral(out)) {
+            copyRegexLiteral(src, i, out);
             continue;
         }
         if (c == '\'' || c == '"') {
@@ -1457,8 +1497,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             // Unbound call form reading .default so `export default undefined` stays undefined and default callables keep this === undefined.
             ident_repl[ib.local] = "(0, " + ns + ".default)";
         } else {
-            // Unbound call form: `import { f }` must keep `f()` as an unbound call
-            // (this === undefined), not `__jsbay_ns.f()` which binds this to the ns.
+            // Unbound call form: `import { f }` must keep `f()` as an unbound call (this === undefined), not `__jsbay_ns.f()` which binds this to the ns.
             ident_repl[ib.local] = "(0, " + ns + "." + ib.imported + ")";
         }
     }
