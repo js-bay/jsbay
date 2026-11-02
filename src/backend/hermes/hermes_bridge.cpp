@@ -170,11 +170,8 @@ static std::string valueToJsString(FbHermesRuntime &rt, const jsi::Value &result
     if (result.isBool()) return result.getBool() ? "true" : "false";
     if (result.isNumber()) return numberToJsString(rt, result);
     if (result.isString()) return result.getString(rt).utf8(rt);
-    try {
-        return result.toString(rt).utf8(rt);
-    } catch (...) {
-        return "[object Object]";
-    }
+    // Propagate toString/valueOf failures so hermes_value_to_utf8_n / NativeArgs.toString return null like QuickJS/JSC.
+    return result.toString(rt).utf8(rt);
 }
 
 extern "C" void hermes_globals_ensure(void) {}
@@ -3159,6 +3156,8 @@ static void hermes_flush_pending_rejections(JsbayHermesContext *c) {
     auto pending = std::move(c->pending_rejections);
     c->pending_rejections.clear();
     for (auto &p : pending) {
+        // Host may unregister via promise.setRejectionTracker(..., null, null) during a callback.
+        if (!c->rejection_fn) break;
         try {
             c->rejection_fn(c->rejection_instance_id, p.first, p.second.c_str(), p.second.size(),
                             c->rejection_ud);

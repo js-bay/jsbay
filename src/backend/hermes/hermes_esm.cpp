@@ -129,8 +129,7 @@ static bool canStartRegexLiteral(const std::string &preceding) {
     char prev = preceding[pk - 1];
     if (prev == ']' || prev == '"' || prev == '\'' || prev == '`') return false;
     if (prev == ')') {
-        // Closing a call/group is division, but `if (…)` / `while (…)` / `for (…)` / `with (…)` / `switch (…)`
-        // leave the grammar where `/…/` can start a RegExp literal.
+        // Closing a call/group is division, but `if (…)` / `while (…)` / `for (…)` / `with (…)` / `switch (…)` leave the grammar where `/…/` can start a RegExp literal.
         int depth = 0;
         size_t j = pk;
         while (j > 0) {
@@ -428,6 +427,157 @@ static std::string rewriteIdents(const std::string &src,
         }
     };
 
+    // Scan a matched `{...}` body (or top-level range) for `let`/`const` bindings in this lexical scope only.
+    // Nested `{...}` blocks are skipped so their bindings stay in the child scope; `for (let …)` still registers because parentheses are not skipped.
+    // Registering before rewriting lets references that textually precede the declarator resolve to the local binding (TDZ / closure capture), matching native ESM.
+    auto collectLexicalBindingsInRange = [&](size_t from, size_t to, std::unordered_set<std::string> &into) {
+        size_t i = from;
+        auto skipLineComment = [&]() {
+            i += 2;
+            while (i < src.size() && src[i] != '\n') ++i;
+        };
+        auto skipBlockComment = [&]() {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            if (i + 1 < src.size()) i += 2;
+        };
+        auto skipQuoted = [&](char q) {
+            ++i;
+            while (i < src.size()) {
+                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                if (src[i] == q) { ++i; break; }
+                ++i;
+            }
+        };
+        auto skipTemplate = [&]() {
+            ++i;
+            while (i < src.size()) {
+                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                if (src[i] == '`') { ++i; break; }
+                if (src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                    i += 2;
+                    int d = 1;
+                    while (i < src.size() && d > 0) {
+                        if (src[i] == '{') ++d;
+                        else if (src[i] == '}') --d;
+                        ++i;
+                    }
+                    continue;
+                }
+                ++i;
+            }
+        };
+        auto skipBalanced = [&](char open_ch, char close_ch) {
+            int d = 0;
+            while (i < src.size()) {
+                char ch = src[i];
+                if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') { skipLineComment(); continue; }
+                if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
+                if (ch == '\'' || ch == '"') { char q = ch; skipQuoted(q); continue; }
+                if (ch == '`') { skipTemplate(); continue; }
+                if (ch == open_ch) { ++d; ++i; continue; }
+                if (ch == close_ch) {
+                    --d;
+                    ++i;
+                    if (d == 0) return;
+                    continue;
+                }
+                ++i;
+            }
+        };
+        auto skipNestedFunctionOrClass = [&](const std::string &kw) {
+            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            if (kw == "function" && i < src.size() && src[i] == '*') {
+                ++i;
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            }
+            if (i < src.size() && isIdentStart(src[i])) {
+                while (i < src.size() && isIdent(src[i])) ++i;
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            }
+            if (i < src.size() && src[i] == '(') skipBalanced('(', ')');
+            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            if (i < src.size() && src[i] == '{') skipBalanced('{', '}');
+        };
+        while (i < to && i < src.size()) {
+            char c = src[i];
+            if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') { skipLineComment(); continue; }
+            if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
+            if (c == '\'' || c == '"') { skipQuoted(c); continue; }
+            if (c == '`') { skipTemplate(); continue; }
+            // Nested block: its let/const belong to the child scope, not this one.
+            if (c == '{') { skipBalanced('{', '}'); continue; }
+            if (isIdentStart(c) && (i == from || !isIdent(src[i - 1]))) {
+                size_t j = i + 1;
+                while (j < src.size() && isIdent(src[j])) ++j;
+                std::string id = src.substr(i, j - i);
+                if (id == "function" || id == "class") {
+                    i = j;
+                    skipNestedFunctionOrClass(id);
+                    continue;
+                }
+                if (id == "let" || id == "const") {
+                    auto names = collectDeclaratorBoundNames(src, j);
+                    for (const auto &n : names) if (!n.empty()) into.insert(n);
+                    i = j;
+                    continue;
+                }
+                i = j;
+                continue;
+            }
+            ++i;
+        }
+    };
+
+    // Match end of `{...}` starting at open_idx (`{`), returning exclusive end index of the interior (before `}`), or src.size().
+    auto balancedBlockInterior = [&](size_t open_idx) -> std::pair<size_t, size_t> {
+        size_t body_start = open_idx + 1;
+        int depth = 1;
+        size_t p = body_start;
+        while (p < src.size() && depth > 0) {
+            char ch = src[p];
+            if (ch == '/' && p + 1 < src.size() && src[p + 1] == '/') {
+                p += 2; while (p < src.size() && src[p] != '\n') ++p; continue;
+            }
+            if (ch == '/' && p + 1 < src.size() && src[p + 1] == '*') {
+                p += 2; while (p + 1 < src.size() && !(src[p] == '*' && src[p + 1] == '/')) ++p;
+                if (p + 1 < src.size()) p += 2; continue;
+            }
+            if (ch == '\'' || ch == '"') {
+                char q = ch; ++p;
+                while (p < src.size()) {
+                    if (src[p] == '\\' && p + 1 < src.size()) { p += 2; continue; }
+                    if (src[p] == q) { ++p; break; }
+                    ++p;
+                }
+                continue;
+            }
+            if (ch == '`') {
+                ++p;
+                while (p < src.size()) {
+                    if (src[p] == '\\' && p + 1 < src.size()) { p += 2; continue; }
+                    if (src[p] == '`') { ++p; break; }
+                    if (src[p] == '$' && p + 1 < src.size() && src[p + 1] == '{') {
+                        p += 2; int d = 1;
+                        while (p < src.size() && d > 0) {
+                            if (src[p] == '{') ++d;
+                            else if (src[p] == '}') --d;
+                            ++p;
+                        }
+                        continue;
+                    }
+                    ++p;
+                }
+                continue;
+            }
+            if (ch == '{') { ++depth; ++p; continue; }
+            if (ch == '}') { --depth; ++p; continue; }
+            ++p;
+        }
+        size_t body_end = (depth == 0) ? (p - 1) : src.size();
+        return {body_start, body_end};
+    };
+
     // Container stack: ObjectLit vs Block vs Bracket vs Paren/ParamList.
     enum class Cont : uint8_t { ObjectLit, Block, Bracket, Paren, ParamList, FnBody };
     std::vector<Cont> cont;
@@ -574,6 +724,9 @@ static std::string rewriteIdents(const std::string &src,
         }
     };
 
+    // Module / inherited scopes: register let/const for the whole range before rewriting so early references see local bindings.
+    if (!scopes.empty()) collectLexicalBindingsInRange(0, src.size(), scopes.back());
+
     while (i < src.size()) {
         char c = src[i];
         if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
@@ -665,12 +818,18 @@ static std::string rewriteIdents(const std::string &src,
                     }
                     size_t body_end = (depth == 0) ? (p - 1) : src.size();
                     collectVarBindingsInRange(body_start, body_end, scopes.back());
+                    collectLexicalBindingsInRange(body_start, body_end, scopes.back());
                 }
             } else if (prevIsObjectLitIntro()) {
                 kind = Cont::ObjectLit;
             } else {
                 kind = Cont::Block;
                 pushScope();
+                // Pre-collect this block's let/const so references before the declarator bind locally.
+                if (!scopes.empty()) {
+                    auto range = balancedBlockInterior(i);
+                    collectLexicalBindingsInRange(range.first, range.second, scopes.back());
+                }
             }
             cont.push_back(kind);
             out.push_back(src[i++]);
@@ -1696,11 +1855,59 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             }
         }
     };
+    // Record ordinary-import and re-export dependency sites in source order before eatImports rotates mid-file imports.
+    struct StaticDepOcc {
+        size_t pos = 0;
+        std::string module;
+        bool is_reexport = false;
+    };
+    std::vector<StaticDepOcc> static_dep_occs;
+    {
+        std::string blanked = blankNonCode(body);
+        static const std::regex re_export_named(R"(export\s*\{[^}]*\}\s*from\s*(['"])([^'"]+)\1)");
+        static const std::regex re_export_star(R"(export\s*\*\s*(?:as\s+[A-Za-z_$][\w$]*\s+)?from\s*(['"])([^'"]+)\1)");
+        static const std::regex re_imp_def_named(
+            R"(import\s+[A-Za-z_$][\w$]*\s*,\s*\{[^}]*\}\s*from\s*(['"])([^'"]+)\1)");
+        static const std::regex re_imp_named(R"(import\s*\{[^}]*\}\s*from\s*(['"])([^'"]+)\1)");
+        static const std::regex re_imp_ns(R"(import\s*\*\s*as\s+[A-Za-z_$][\w$]*\s*from\s*(['"])([^'"]+)\1)");
+        static const std::regex re_imp_default(R"(import\s+[A-Za-z_$][\w$]*\s+from\s*(['"])([^'"]+)\1)");
+        static const std::regex re_imp_side(R"(import\s*(['"])([^'"]+)\1)");
+        auto collect_re = [&](const std::regex &re, bool is_reexport, int mod_group) {
+            for (std::sregex_iterator it(blanked.begin(), blanked.end(), re), end; it != end; ++it) {
+                static_dep_occs.push_back(
+                    {static_cast<size_t>(it->position(mod_group)), it->str(mod_group), is_reexport});
+            }
+        };
+        collect_re(re_export_named, true, 2);
+        collect_re(re_export_star, true, 2);
+        collect_re(re_imp_def_named, false, 2);
+        collect_re(re_imp_named, false, 2);
+        collect_re(re_imp_ns, false, 2);
+        collect_re(re_imp_default, false, 2);
+        collect_re(re_imp_side, false, 2);
+        std::sort(static_dep_occs.begin(), static_dep_occs.end(),
+                  [](const StaticDepOcc &a, const StaticDepOcc &b) {
+                      if (a.pos != b.pos) return a.pos < b.pos;
+                      return a.is_reexport < b.is_reexport;
+                  });
+        // Deduplicate identical (pos, module, kind) hits from overlapping import patterns.
+        {
+            std::vector<StaticDepOcc> filtered;
+            for (const auto &o : static_dep_occs) {
+                if (!filtered.empty() && filtered.back().pos == o.pos && filtered.back().module == o.module &&
+                    filtered.back().is_reexport == o.is_reexport)
+                    continue;
+                filtered.push_back(o);
+            }
+            static_dep_occs.swap(filtered);
+        }
+    }
     eatImports();
 
     // Re-export dependency loads go into the static prelude (native ESM: all static deps before module body).
     // Process named and star re-exports left-to-right so prelude require order matches source order.
-    std::vector<std::string> reexport_prelude;
+    // Each entry is (module, require-line); merged with ordinary imports by static_dep_occs source order below.
+    std::vector<std::pair<std::string, std::string>> reexport_prelude;
     std::vector<std::string> star_reexport_nss;
     std::vector<std::string> post_epilogue;
     {
@@ -1717,7 +1924,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             if (take_star) {
                 std::string mod = body.substr(m_star.position(2), m_star.length(2));
                 std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
-                reexport_prelude.push_back("var " + ns + " = require(\"" + mod + "\");");
+                reexport_prelude.push_back({mod, "var " + ns + " = require(\"" + mod + "\");"});
                 star_reexport_nss.push_back(ns);
                 body.replace(m_star.position(), m_star.length(), "");
             } else {
@@ -1725,7 +1932,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 std::string specs = body.substr(m_named.position(1), m_named.length(1));
                 std::string mod = body.substr(m_named.position(3), m_named.length(3));
                 std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
-                reexport_prelude.push_back("var " + ns + " = require(\"" + mod + "\");");
+                reexport_prelude.push_back({mod, "var " + ns + " = require(\"" + mod + "\");"});
                 std::string repl;
                 size_t pos = 0;
                 while (pos < specs.size()) {
@@ -1840,16 +2047,18 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // Build require prelude + live import bindings
+    // Build require prelude + live import bindings.
+    // Ordinary imports and re-export dependencies share one source-ordered static dependency prelude (native ESM init order).
     std::unordered_map<std::string, std::string> ident_repl;
     int ns_i = 0;
     std::unordered_map<std::string, std::string> mod_to_ns;
+    std::unordered_map<std::string, std::string> import_require_line;
     for (auto &ib : imports) {
         if (ib.module.empty()) continue;
         if (!mod_to_ns.count(ib.module)) {
             std::string ns = "__jsbay_ns" + std::to_string(ns_i++);
             mod_to_ns[ib.module] = ns;
-            prelude.push_back("var " + ns + " = require(\"" + ib.module + "\");");
+            import_require_line[ib.module] = "var " + ns + " = require(\"" + ib.module + "\");";
         }
         if (ib.local.empty()) continue; // side-effect only
         std::string ns = mod_to_ns[ib.module];
@@ -1864,8 +2073,40 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // Named / star re-export requires follow ordinary imports in the prelude (static dependency phase).
-    for (auto &p : reexport_prelude) prelude.push_back(p);
+    std::unordered_map<std::string, std::vector<std::string>> reexport_require_lines;
+    for (auto &p : reexport_prelude) reexport_require_lines[p.first].push_back(p.second);
+    std::unordered_map<std::string, size_t> reexport_emit_idx;
+    std::unordered_set<std::string> import_emitted;
+    for (const auto &occ : static_dep_occs) {
+        if (occ.is_reexport) {
+            auto it = reexport_require_lines.find(occ.module);
+            if (it == reexport_require_lines.end()) continue;
+            size_t &idx = reexport_emit_idx[occ.module];
+            if (idx >= it->second.size()) continue;
+            prelude.push_back(it->second[idx++]);
+        } else {
+            if (import_emitted.count(occ.module)) continue;
+            auto it = import_require_line.find(occ.module);
+            if (it == import_require_line.end()) continue;
+            prelude.push_back(it->second);
+            import_emitted.insert(occ.module);
+        }
+    }
+    // Flush any requires not matched by the pre-scan (defensive; preserve relative registration order).
+    for (const auto &ib : imports) {
+        if (ib.module.empty() || import_emitted.count(ib.module)) continue;
+        auto it = import_require_line.find(ib.module);
+        if (it == import_require_line.end()) continue;
+        prelude.push_back(it->second);
+        import_emitted.insert(ib.module);
+    }
+    {
+        std::unordered_map<std::string, size_t> seen;
+        for (const auto &p : reexport_prelude) {
+            size_t n = seen[p.first]++;
+            if (n >= reexport_emit_idx[p.first]) prelude.push_back(p.second);
+        }
+    }
 
     // Star re-exports: track provenance across deps; omit ambiguous names unless an explicit export already resolved them.
     if (!star_reexport_nss.empty()) {
