@@ -34,6 +34,7 @@ pub const max_retained_source_bytes: usize = 8 * 1024 * 1024;
 
 pub const PauseHook = *const fn (instance_id: i32, info: PauseInfo) void;
 pub const ScriptHook = *const fn (instance_id: i32, info: ScriptInfo) void;
+pub const BreakLocationsHook = *const fn (instance_id: i32, script_id: u32) void;
 
 pub const ExceptionPause = enum(u8) { none, uncaught, all };
 
@@ -73,13 +74,16 @@ const SourceLocation = struct {
 const Binding = struct {
     instance_id: i32,
     runtime: ?*anyopaque,
-    armed: std.atomic.Value(bool) = .init(false),
+    source_armed: std.atomic.Value(bool) = .init(false),
+    execution_armed: std.atomic.Value(bool) = .init(false),
+    source_collection_owned: std.atomic.Value(bool) = .init(false),
     // Set during engine teardown. A binding can retain reader-thread configuration, but it must never be attached to a destroyed engine.
     abandoned: bool = false,
     handler_install_thread_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     alive: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
     pause: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     suppress: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    condition_source_suppression: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     skip_all_pauses: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     breakpoints_active: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
     break_requested: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -100,7 +104,7 @@ const Binding = struct {
     breakpoints: std.ArrayList(Breakpoint) = .empty,
     scripts: std.ArrayList(Script) = .empty,
     script_bytes: usize = 0,
-    // `noteScript` runs immediately before each host evaluation. This retains the exact journal entry even when a URL has several source revisions.
+    // Compiler callbacks publish each successful compilation into the bounded journal.
     active_script_id: u32 = 0,
     // The native collector ends with a filename-less completion callback. Remember the entry chosen by its location callbacks until that marker.
     collecting_script_id: u32 = 0,
@@ -109,6 +113,7 @@ const Binding = struct {
     paused_url_len: usize = 0,
     // After resume, ignore this exact frame line once. Nested eval resets QuickJS's last-line cache, so the same breakpoint would hit again. A callee's lines must not cancel that skip, or step-over stops on the call a second time when the callee returns.
     skip_line: i32 = -1,
+    skip_column: i32 = -1,
     skip_depth: i32 = 0,
     skip_url: [512]u8 = undefined,
     skip_url_len: usize = 0,
@@ -144,10 +149,12 @@ var table_mutex: sync.Mutex = .{};
 var table: ?std.AutoHashMap(i32, *Binding) = null;
 var pause_hook: std.atomic.Value(?PauseHook) = .init(null);
 var script_hook: std.atomic.Value(?ScriptHook) = .init(null);
+var break_locations_hook: std.atomic.Value(?BreakLocationsHook) = .init(null);
 
 test "debugger hook storage uses atomic publication slots" {
     try std.testing.expect(@TypeOf(pause_hook) == std.atomic.Value(?PauseHook));
     try std.testing.expect(@TypeOf(script_hook) == std.atomic.Value(?ScriptHook));
+    try std.testing.expect(@TypeOf(break_locations_hook) == std.atomic.Value(?BreakLocationsHook));
 }
 
 fn bindings() *std.AutoHashMap(i32, *Binding) {
@@ -162,37 +169,51 @@ pub fn setHooks(on_pause: ?PauseHook, on_script: ?ScriptHook) void {
     script_hook.store(on_script, .seq_cst);
 }
 
+pub fn setBreakLocationsHook(hook: ?BreakLocationsHook) void {
+    break_locations_hook.store(hook, .seq_cst);
+}
+
 pub fn attach(instance_id: i32, runtime: *anyopaque) bool {
+    if (!attachSourceCollector(instance_id, runtime)) return false;
+    const binding = lockBinding(instance_id) orelse return false;
+    defer binding.mutex.unlock();
+    if (binding.abandoned) return false;
+    // A second client can enable Debugger while a live client has already requested a pause. Only a cold-to-live transition discards stale state from a retired session.
+    if (binding.alive.load(.seq_cst) == 0) binding.break_requested.store(0, .seq_cst);
+    binding.alive.store(1, .seq_cst);
+    armExecution(binding);
+    return true;
+}
+
+pub fn attachSourceCollector(instance_id: i32, runtime: *anyopaque) bool {
     if (comptime !@import("build_options").inspector) return false;
-    if (comptime !backend.supportsDebugger(backend.active_backend)) return false;
+    if (comptime !backend.supportsSourceJournal(backend.active_backend)) return false;
     table_mutex.lock();
     defer table_mutex.unlock();
     const map = bindings();
     if (map.get(instance_id)) |existing| {
-        // A binding may have been prepared by the transport while the first Debugger.enable waits for an owner turn. Only this owner-side path gives it a runtime and installs native callbacks.
+        // A binding may have been prepared by the transport while the first Debugger.enable waits for an owner turn. Collector admission gives it a runtime but does not install execution callbacks.
         existing.mutex.lock();
         defer existing.mutex.unlock();
         if (existing.abandoned) return false;
         existing.runtime = runtime;
-        // Only a cold-to-live admission discards stale pause state. A second DevTools session must not erase a pause requested by an already live session while it waits for the owner to run.
-        if (existing.alive.load(.seq_cst) == 0) {
-            existing.break_requested.store(0, .seq_cst);
-        }
-        existing.alive.store(1, .seq_cst);
-        arm(existing);
+        existing.source_collection_owned.store(true, .seq_cst);
+        armSource(existing);
         return true;
     }
     const binding = std.heap.c_allocator.create(Binding) catch return false;
     binding.* = .{
         .instance_id = instance_id,
         .runtime = runtime,
+        .alive = std.atomic.Value(u8).init(0),
     };
     map.put(instance_id, binding) catch {
         destroyBinding(binding);
         return false;
     };
     binding.mutex.lock();
-    arm(binding);
+    binding.source_collection_owned.store(true, .seq_cst);
+    armSource(binding);
     binding.mutex.unlock();
     return true;
 }
@@ -200,7 +221,7 @@ pub fn attach(instance_id: i32, runtime: *anyopaque) bool {
 /// Retain reader-thread Debugger configuration while the first enable is queued. A prepared binding intentionally has no runtime and is never armed; `attach` is the sole owner-thread transition that installs native callbacks.
 pub fn prepare(instance_id: i32) bool {
     if (comptime !@import("build_options").inspector) return false;
-    if (comptime !backend.supportsDebugger(backend.active_backend)) return false;
+    if (comptime !backend.supportsSourceJournal(backend.active_backend)) return false;
     table_mutex.lock();
     defer table_mutex.unlock();
     const map = bindings();
@@ -244,7 +265,8 @@ pub fn detach(instance_id: i32) void {
     binding.value.alive.store(0, .seq_cst);
     binding.value.pause.store(0, .seq_cst);
     binding.value.break_requested.store(0, .seq_cst);
-    disarm(binding.value);
+    disarmExecution(binding.value);
+    disarmSource(binding.value);
     binding.value.mutex.unlock();
     destroyBinding(binding.value);
 }
@@ -256,13 +278,31 @@ pub fn coolDown(instance_id: i32) void {
     binding.alive.store(0, .seq_cst);
     binding.pause.store(0, .seq_cst);
     binding.break_requested.store(0, .seq_cst);
-    disarm(binding);
-    for (binding.scripts.items) |script| freeScript(script);
-    binding.scripts.clearRetainingCapacity();
-    binding.script_bytes = 0;
+    disarmExecution(binding);
+    // Keep the bounded journal until engine teardown so bytecode that outlives a DevTools session retains its compiler identity after reconnect.
     binding.active_script_id = 0;
     binding.collecting_script_id = 0;
     binding.paused_script_tag = 0;
+}
+
+/// Reader-thread session closure must immediately make execution callbacks inert. Native handler removal remains owner-thread work in `coolDown` so it never races a running VM callback.
+pub fn deactivateExecution(instance_id: i32) void {
+    const binding = lockBinding(instance_id) orelse return;
+    defer binding.mutex.unlock();
+    binding.alive.store(0, .seq_cst);
+    binding.pause.store(0, .seq_cst);
+    binding.break_requested.store(0, .seq_cst);
+}
+
+pub fn stopCollector(instance_id: i32) void {
+    const binding = lockBinding(instance_id) orelse return;
+    defer binding.mutex.unlock();
+    binding.alive.store(0, .seq_cst);
+    binding.pause.store(0, .seq_cst);
+    binding.break_requested.store(0, .seq_cst);
+    disarmExecution(binding);
+    binding.source_collection_owned.store(false, .seq_cst);
+    disarmSource(binding);
 }
 
 pub fn setBreakpointsActive(instance_id: i32, active: bool) void {
@@ -420,11 +460,10 @@ pub fn pausedReason(instance_id: i32) PauseReason {
 }
 
 pub fn noteScript(instance_id: i32, url: []const u8, source: []const u8) void {
-    if (comptime !@import("build_options").inspector) return;
-    const binding = lookup(instance_id) orelse return;
-    if (!binding.armed.load(.seq_cst)) return;
-    // This may prewarm the bounded source journal, but native locations and frames resolve only through evaluator-assigned tags.
-    _ = registerScript(instance_id, url, source);
+    _ = instance_id;
+    _ = url;
+    _ = source;
+    // Compiler callbacks publish source metadata only after a successful compilation. Pre-publication would create phantom scriptParsed events for syntax failures and duplicate sourceURL identities.
 }
 
 fn registerScript(instance_id: i32, url: []const u8, source: []const u8) u32 {
@@ -440,15 +479,6 @@ fn registerScript(instance_id: i32, url: []const u8, source: []const u8) u32 {
         return 0;
     }
     binding.next_note_generation +%= 1;
-    for (binding.scripts.items) |*script| {
-        if (std.mem.eql(u8, script.url, url) and std.mem.eql(u8, script.source, source)) {
-            binding.active_script_id = script.id;
-            script.last_note_generation = note_generation;
-            const id = script.id;
-            binding.mutex.unlock();
-            return id;
-        }
-    }
     const id = binding.next_script_id;
     if (id == 0) {
         binding.mutex.unlock();
@@ -583,12 +613,15 @@ pub fn locationsFor(instance_id: i32, url: []const u8, line: i32) []BreakLocatio
     var list: std.ArrayList(BreakLocation) = .empty;
     for (binding.scripts.items) |script| {
         if (!std.mem.eql(u8, script.url, url)) continue;
-        if (line - 1 > script.end_line) continue;
+        const breakpoint = for (binding.breakpoints.items) |bp| {
+            if (bp.id == breakpoint_id) break bp;
+        } else continue;
+        const resolved = resolveBreakpoint(script, breakpoint) orelse continue;
         list.append(std.heap.c_allocator, .{
             .breakpoint_id = breakpoint_id,
             .script_id = script.id,
-            .line = line,
-            .column = 0,
+            .line = resolved.line,
+            .column = resolved.column,
         }) catch {};
     }
     return list.toOwnedSlice(std.heap.c_allocator) catch &.{};
@@ -610,13 +643,12 @@ pub fn breakpointsOnScript(instance_id: i32, script_id: u32) []BreakLocation {
     var list: std.ArrayList(BreakLocation) = .empty;
     for (binding.breakpoints.items) |bp| {
         if (!urlPatternMatch(bp, script.url)) continue;
-        if (bp.line - 1 > script.end_line) continue;
-        const column = firstBreakColumn(script.source, bp.line, bp.column) orelse continue;
+        const resolved = resolveBreakpoint(script, bp) orelse continue;
         list.append(std.heap.c_allocator, .{
             .breakpoint_id = bp.id,
             .script_id = script.id,
-            .line = bp.line,
-            .column = column,
+            .line = resolved.line,
+            .column = resolved.column,
         }) catch {};
     }
     return list.toOwnedSlice(std.heap.c_allocator) catch &.{};
@@ -638,13 +670,12 @@ pub fn locationsForId(instance_id: i32, id: u32) []BreakLocation {
     var list: std.ArrayList(BreakLocation) = .empty;
     for (binding.scripts.items) |script| {
         if (!urlPatternMatch(bp, script.url)) continue;
-        if (bp.line - 1 > script.end_line) continue;
-        const column = firstBreakColumn(script.source, bp.line, bp.column) orelse continue;
+        const resolved = resolveBreakpoint(script, bp) orelse continue;
         list.append(std.heap.c_allocator, .{
             .breakpoint_id = bp.id,
             .script_id = script.id,
-            .line = bp.line,
-            .column = column,
+            .line = resolved.line,
+            .column = resolved.column,
         }) catch {};
     }
     return list.toOwnedSlice(std.heap.c_allocator) catch &.{};
@@ -727,7 +758,7 @@ pub fn copyDebugStack(instance_id: i32) []DebugFrame {
             .url = std.heap.c_allocator.dupe(u8, url) catch &.{},
             .line = frame.line,
             .column = column,
-            .script_tag = if (comptime backend.active_backend == .quickjs_ng) frame.script_tag else 0,
+            .script_tag = if (comptime backend.supportsSourceJournal(backend.active_backend)) frame.script_tag else 0,
         };
     }
     return out;
@@ -770,7 +801,7 @@ pub fn writeDebugStack(instance_id: i32, out: []StackFrameBuf) usize {
         dst.url_len = url_len;
         dst.line = frame.line;
         dst.column = if (frame.column > 0) frame.column - 1 else 0;
-        dst.script_tag = if (comptime backend.active_backend == .quickjs_ng) frame.script_tag else 0;
+        dst.script_tag = if (comptime backend.supportsSourceJournal(backend.active_backend)) frame.script_tag else 0;
     }
     return count;
 }
@@ -838,6 +869,7 @@ fn continueWith(instance_id: i32, mode: StepMode) void {
     binding.skip_url_len = n;
     binding.skip_script_tag = binding.paused_script_tag;
     binding.skip_line = binding.paused_line.load(.seq_cst);
+    binding.skip_column = binding.paused_column.load(.seq_cst);
     binding.skip_depth = binding.paused_depth;
     binding.skip_seen_same = false;
     binding.skip_saw_deeper = false;
@@ -845,7 +877,7 @@ fn continueWith(instance_id: i32, mode: StepMode) void {
     binding.pause.store(0, .seq_cst);
 }
 
-fn finishStepOut(binding: *Binding, url: []const u8, line: i32, depth: i32, script_tag: u64) bool {
+fn finishStepOut(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) bool {
     binding.mutex.lock();
     defer binding.mutex.unlock();
     if (binding.mode != .step_out or depth >= binding.paused_depth) return false;
@@ -855,6 +887,7 @@ fn finishStepOut(binding: *Binding, url: []const u8, line: i32, depth: i32, scri
     binding.skip_url_len = n;
     binding.skip_script_tag = script_tag;
     binding.skip_line = line;
+    binding.skip_column = column;
     binding.skip_depth = depth;
     binding.skip_seen_same = true;
     binding.skip_saw_deeper = false;
@@ -863,17 +896,18 @@ fn finishStepOut(binding: *Binding, url: []const u8, line: i32, depth: i32, scri
     return true;
 }
 
-fn consumeSkip(binding: *Binding, url: []const u8, line: i32, depth: i32, script_tag: u64) bool {
+fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) bool {
     binding.mutex.lock();
     defer binding.mutex.unlock();
     if (binding.skip_line < 0) return false;
-    const same = binding.skip_script_tag == script_tag and binding.skip_line == line and binding.skip_depth == depth and
+    const same = binding.skip_script_tag == script_tag and binding.skip_line == line and binding.skip_column == column and binding.skip_depth == depth and
         binding.skip_url_len == url.len and
         std.mem.eql(u8, binding.skip_url[0..binding.skip_url_len], url);
     if (same) {
         if (binding.skip_saw_deeper) {
             // The call we stepped over returned to its own line.
             binding.skip_line = -1;
+            binding.skip_column = -1;
             binding.skip_url_len = 0;
             binding.skip_script_tag = 0;
             return true;
@@ -883,6 +917,7 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, depth: i32, script
             return true;
         }
         binding.skip_line = -1;
+        binding.skip_column = -1;
         binding.skip_url_len = 0;
         binding.skip_script_tag = 0;
         return false;
@@ -892,6 +927,7 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, depth: i32, script
         return false;
     }
     binding.skip_line = -1;
+    binding.skip_column = -1;
     binding.skip_url_len = 0;
     binding.skip_script_tag = 0;
     return false;
@@ -920,37 +956,56 @@ fn lockBinding(instance_id: i32) ?*Binding {
     return binding;
 }
 
-fn arm(binding: *Binding) void {
+fn armSource(binding: *Binding) void {
     if (comptime !@import("build_options").inspector) return;
-    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
-    if (binding.armed.load(.seq_cst)) return;
+    if (comptime !backend.supportsSourceJournal(backend.active_backend)) return;
+    if (binding.source_armed.load(.seq_cst)) return;
     const rt = binding.runtime orelse return;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
-    qjs.JS_SetLocationHandler(@ptrCast(rt), @ptrCast(&locationTrampoline), binding);
+    qjs.JS_SetScriptTagHandler(@ptrCast(rt), @ptrCast(&scriptTagTrampoline), binding);
     if (comptime backend.active_backend == .quickjs_ng) {
-        qjs.JS_SetScriptTagHandler(@ptrCast(rt), @ptrCast(&scriptTagTrampoline), binding);
         qjs.JS_SetBreakLocationHandler(@ptrCast(rt), @ptrCast(&breakLocationTrampoline), binding);
     }
-    qjs.JS_SetExceptionHandler(@ptrCast(rt), @ptrCast(&exceptionTrampoline), binding);
-    qjs.JS_SetDebuggerHandler(@ptrCast(rt), @ptrCast(&debuggerTrampoline), binding);
-    binding.handler_install_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
-    binding.armed.store(true, .seq_cst);
+    binding.source_armed.store(true, .seq_cst);
 }
 
-fn disarm(binding: *Binding) void {
+fn armExecution(binding: *Binding) void {
     if (comptime !@import("build_options").inspector) return;
-    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
-    if (!binding.armed.swap(false, .seq_cst)) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
+    if (binding.execution_armed.load(.seq_cst)) return;
     const rt = binding.runtime orelse return;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
-    qjs.JS_SetLocationHandler(@ptrCast(rt), null, null);
     if (comptime backend.active_backend == .quickjs_ng) {
-        qjs.JS_SetScriptTagHandler(@ptrCast(rt), null, null);
-        qjs.JS_SetBreakLocationHandler(@ptrCast(rt), null, null);
+        qjs.JS_SetLocationHandler(@ptrCast(rt), @ptrCast(&locationTrampoline), binding);
+        qjs.JS_SetExceptionHandler(@ptrCast(rt), @ptrCast(&exceptionTrampoline), binding);
+        qjs.JS_SetDebuggerHandler(@ptrCast(rt), @ptrCast(&debuggerTrampoline), binding);
     }
-    qjs.JS_SetExceptionHandler(@ptrCast(rt), null, null);
-    qjs.JS_SetDebuggerHandler(@ptrCast(rt), null, null);
+    binding.handler_install_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    binding.execution_armed.store(true, .seq_cst);
+}
+
+fn disarmExecution(binding: *Binding) void {
+    if (comptime !@import("build_options").inspector) return;
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+    if (!binding.execution_armed.swap(false, .seq_cst)) return;
+    const rt = binding.runtime orelse return;
+    const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
+    if (comptime backend.active_backend == .quickjs_ng) {
+        qjs.JS_SetLocationHandler(@ptrCast(rt), null, null);
+        qjs.JS_SetExceptionHandler(@ptrCast(rt), null, null);
+        qjs.JS_SetDebuggerHandler(@ptrCast(rt), null, null);
+    }
     binding.handler_install_thread_id.store(0, .seq_cst);
+}
+
+fn disarmSource(binding: *Binding) void {
+    if (comptime !@import("build_options").inspector) return;
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+    if (!binding.source_armed.swap(false, .seq_cst)) return;
+    const rt = binding.runtime orelse return;
+    const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
+    qjs.JS_SetScriptTagHandler(@ptrCast(rt), null, null);
+    if (comptime backend.active_backend == .quickjs_ng) qjs.JS_SetBreakLocationHandler(@ptrCast(rt), null, null);
 }
 
 fn destroyBinding(binding: *Binding) void {
@@ -1029,11 +1084,11 @@ test "debugger: script info clone releases every partial allocation on OOM" {
     }.run, .{script});
 }
 
-fn shouldPause(binding: *Binding, url: []const u8, line: i32, depth: i32, script_tag: u64) ?PauseReason {
-    return breakpointHit(binding, url, line, depth, script_tag);
+fn shouldPause(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) ?PauseReason {
+    return breakpointHit(binding, url, line, column, depth, script_tag);
 }
 
-fn breakpointHit(binding: *Binding, url: []const u8, line: i32, depth: i32, script_tag: u64) ?PauseReason {
+fn breakpointHit(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) ?PauseReason {
     binding.mutex.lock();
     if (binding.break_requested.swap(0, .seq_cst) != 0) {
         binding.mutex.unlock();
@@ -1056,10 +1111,13 @@ fn breakpointHit(binding: *Binding, url: []const u8, line: i32, depth: i32, scri
     var index: usize = 0;
     while (index < binding.breakpoints.items.len) : (index += 1) {
         const bp = binding.breakpoints.items[index];
-        if (bp.line != line or !urlPatternMatch(bp, url)) continue;
-        if (scriptByTagLocked(binding, script_tag)) |script| {
-            if (firstBreakColumn(script.source, line, bp.column) == null) continue;
-        }
+        const tagged_script = scriptByTagLocked(binding, script_tag);
+        const breakpoint_url = if (tagged_script) |script| script.url else url;
+        if (!urlPatternMatch(bp, breakpoint_url)) continue;
+        if (tagged_script) |script| {
+            const resolved = resolveBreakpoint(script.*, bp) orelse continue;
+            if (resolved.line != line or resolved.column != column) continue;
+        } else if (bp.line != line or bp.column != column) continue;
         const cond = std.heap.c_allocator.dupe(u8, bp.condition) catch continue;
         binding.mutex.unlock();
         const ok = cond.len == 0 or conditionPasses(binding, cond);
@@ -1105,6 +1163,8 @@ fn isBlackboxed(binding: *Binding, url: []const u8) bool {
 fn conditionPasses(binding: *Binding, expr: []const u8) bool {
     binding.suppress.store(1, .seq_cst);
     defer binding.suppress.store(0, .seq_cst);
+    _ = binding.condition_source_suppression.fetchAdd(1, .seq_cst);
+    defer _ = binding.condition_source_suppression.fetchSub(1, .seq_cst);
     const wrapped = std.fmt.allocPrint(std.heap.c_allocator, "!!({s})", .{expr}) catch return false;
     defer std.heap.c_allocator.free(wrapped);
     const result = evalDebugFrame(binding.instance_id, 0, wrapped);
@@ -1125,6 +1185,25 @@ fn firstBreakColumn(source: []const u8, line: i32, requested: i32) ?i32 {
         }
     }
     return null;
+}
+
+/// Maps a requested breakpoint to the earliest executable location at or after it. QuickJS-NG supplies these locations from compiled bytecode; other backends retain source-only resolution because they have no execution callback.
+fn resolveBreakpoint(script: Script, bp: Breakpoint) ?struct { line: i32, column: i32 } {
+    if (comptime backend.active_backend == .quickjs_ng) {
+        if (!script.break_locations_collected or script.break_locations_truncated) return null;
+        var resolved: ?SourceLocation = null;
+        for (script.break_locations.items) |location| {
+            if (location.line < bp.line) continue;
+            if (location.line == bp.line and location.column < bp.column) continue;
+            if (resolved == null or location.line < resolved.?.line or (location.line == resolved.?.line and location.column < resolved.?.column)) {
+                resolved = location;
+            }
+        }
+        if (resolved) |location| return .{ .line = location.line, .column = location.column };
+        return null;
+    }
+    const column = firstBreakColumn(script.source, bp.line, bp.column) orelse return null;
+    return .{ .line = bp.line, .column = column };
 }
 
 fn columnOnLine(line_text: []const u8, requested: i32) ?i32 {
@@ -1198,17 +1277,6 @@ fn matchStar(atom: Atom, rest: []const u8, text: []const u8) bool {
     }
 }
 
-fn pauseColumn(binding: *Binding, url: []const u8, line: i32, hook_column: i32, script_tag: u64) i32 {
-    binding.mutex.lock();
-    defer binding.mutex.unlock();
-    for (binding.breakpoints.items) |bp| {
-        if (bp.line != line or !urlPatternMatch(bp, url)) continue;
-        const script = scriptByTagLocked(binding, script_tag) orelse return hook_column;
-        return firstBreakColumn(script.source, line, bp.column) orelse hook_column;
-    }
-    return hook_column;
-}
-
 /// Runs after an NG compilation unit is complete but before it can execute. Returning the retained journal id makes the native bytecode tag stable for its lifetime; a failed allocation deliberately returns zero (unknown).
 fn scriptTagTrampoline(
     _: ?*anyopaque,
@@ -1218,11 +1286,11 @@ fn scriptTagTrampoline(
     opaque_ptr: ?*anyopaque,
 ) callconv(.c) u64 {
     const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return 0));
-    if (binding.alive.load(.seq_cst) == 0 or filename == null or source == null) return 0;
-    const url = std.mem.span(filename);
-    if (url.len == 0) return 0;
+    if (!binding.source_collection_owned.load(.seq_cst) or binding.condition_source_suppression.load(.seq_cst) != 0 or filename == null or source == null) return 0;
+    const filename_text = std.mem.span(filename);
+    if (filename_text.len == 0) return 0;
     const text = source[0..source_len];
-    return registerScript(binding.instance_id, url, text);
+    return registerScript(binding.instance_id, filename_text, text);
 }
 
 /// Called by the QuickJS-NG evaluator before it releases the top-level bytecode. It only copies source metadata into the bounded journal; it must not execute JavaScript or take ownership of engine values.
@@ -1237,15 +1305,21 @@ fn breakLocationTrampoline(
     opaque_ptr: ?*anyopaque,
 ) callconv(.c) void {
     const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return));
-    if (binding.alive.load(.seq_cst) == 0) return;
+    if (!binding.source_collection_owned.load(.seq_cst)) return;
     binding.mutex.lock();
-    defer binding.mutex.unlock();
     if (complete != 0) {
-        const script = scriptByTagLocked(binding, script_tag) orelse return;
+        const script = scriptByTagLocked(binding, script_tag) orelse {
+            binding.mutex.unlock();
+            return;
+        };
         script.break_locations_collected = true;
         script.break_locations_truncated = truncated != 0;
+        const script_id = script.id;
+        binding.mutex.unlock();
+        if (break_locations_hook.load(.seq_cst)) |hook| hook(binding.instance_id, script_id);
         return;
     }
+    defer binding.mutex.unlock();
     _ = filename;
     const script = scriptByTagLocked(binding, script_tag) orelse return;
     if (line <= 0 or script.break_locations_truncated) return;
@@ -1291,14 +1365,13 @@ fn locationTrampoline(
     if (binding.suppress.load(.seq_cst) != 0) return;
     if (binding.alive.load(.seq_cst) == 0) return;
     const url = if (filename == null) "" else std.mem.span(filename);
-    const explicit_pause = binding.break_requested.load(.seq_cst) != 0;
-    if (!explicit_pause and consumeSkip(binding, url, line, depth, script_tag)) return;
-    if (!explicit_pause and finishStepOut(binding, url, line, depth, script_tag)) return;
-    if (!explicit_pause and isBlackboxed(binding, url)) return;
-    const reason = shouldPause(binding, url, line, depth, script_tag) orelse return;
     const hook_column: i32 = if (column > 0) column - 1 else 0;
-    const column0 = if (reason == .breakpoint) pauseColumn(binding, url, line, hook_column, script_tag) else hook_column;
-    enterPause(binding, url, line, column0, depth, reason, script_tag);
+    const explicit_pause = binding.break_requested.load(.seq_cst) != 0;
+    if (!explicit_pause and consumeSkip(binding, url, line, hook_column, depth, script_tag)) return;
+    if (!explicit_pause and finishStepOut(binding, url, line, hook_column, depth, script_tag)) return;
+    if (!explicit_pause and isBlackboxed(binding, url)) return;
+    const reason = shouldPause(binding, url, line, hook_column, depth, script_tag) orelse return;
+    enterPause(binding, url, line, hook_column, depth, reason, script_tag);
 }
 
 fn exceptionTrampoline(

@@ -126,7 +126,7 @@ pub fn Module(comptime Host: type) type {
 
             // Indirect eval compiles the user text as "<input>". Register that script first so Debugger.paused can point Sources at a real scriptId.
             debugger_mod.noteScript(state.instance_id, "<input>", box.expression);
-            const res = engine.evalScript(state.instance_id, wrapped, "<inspector>");
+            const res = engine.evalScriptWithOptions(state.instance_id, wrapped, "<inspector>", .{ .report_uncaught = false });
             defer {
                 if (res.result) |s| std.heap.c_allocator.free(@constCast(s));
                 if (res.err_is_heap) {
@@ -342,7 +342,7 @@ pub fn Module(comptime Host: type) type {
             };
             defer state.allocator.free(wrapped);
 
-            const compile_res = engine.evalScript(state.instance_id, wrapped, "<inspector-call>");
+            const compile_res = engine.evalScriptWithOptions(state.instance_id, wrapped, "<inspector-call>", .{ .report_uncaught = false });
             defer {
                 if (compile_res.result) |s| std.heap.c_allocator.free(@constCast(s));
                 if (compile_res.err_is_heap) {

@@ -16,6 +16,10 @@ test "inspector task count rolls back failed posts and canceled tasks" {
     try inspector.state.TestCases.taskCountRollsBackFailedPostsAndCanceledTasks();
 }
 
+test "Performance measurement follows effective session lifecycle" {
+    try inspector.state.TestCases.performanceMeasurementTracksEffectiveSessionsAndTeardown();
+}
+
 test "public and console groups with the same name release independently" {
     try inspector.object_table.TestCases.publicAndConsoleGroupsWithSameNameReleaseIndependently();
 }

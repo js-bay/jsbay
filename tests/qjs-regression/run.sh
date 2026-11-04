@@ -62,30 +62,22 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# build.zig stays the authority for patch order; this list must match it.
+# Read patch order from the same build definition used for engine artifacts.
 if [ "$engine" = quickjs_ng ]; then
     src=$root/vendor/quickjs-ng
     patch_command=patch-quickjs-ng
     zig_fn=preparePatchedQuickJsNg
-    patches=(quickjs-ng-debugger quickjs-ng-debugger-pause quickjs-ng-dataview-native
-        quickjs-ng-optional-inspector quickjs-ng-heap-labels quickjs-ng-break-locations
-        quickjs-ng-script-tags quickjs-ng-inspector-off)
 else
     src=$root/vendor/quickjs
     patch_command=patch-quickjs
     zig_fn=preparePatchedQuickJs
-    patches=(quickjs-finalizer quickjs-heap quickjs-async-stack quickjs-ubsan
-        quickjs-array-identity quickjs-dataview-native quickjs-heap-labels
-        quickjs-promise-then quickjs-inspector-off quickjs-transfer-neuter)
 fi
 [ -f "$src/quickjs.c" ] || { echo "engine source missing (submodule not checked out?): $src" >&2; exit 66; }
 
-want=$(printf 'vendor/%s.patch\n' "${patches[@]}")
-have=$(awk -v fn="fn $zig_fn(" 'index($0, fn) {on=1} on && /^}/ {exit} on' "$root/build.zig" |
+patch_paths=$(awk -v fn="fn $zig_fn(" 'index($0, fn) {on=1} on && /^}/ {exit} on' "$root/build.zig" |
     grep -o 'vendor/[A-Za-z0-9_.-]*\.patch' || true)
-if [ "$want" != "$have" ]; then
-    echo "patch list in this script differs from build.zig $zig_fn; update it to match." >&2
-    printf 'script:\n%s\nbuild.zig:\n%s\n' "$want" "$have" >&2
+if [ -z "$patch_paths" ]; then
+    echo "no engine patches found in build.zig $zig_fn" >&2
     exit 70
 fi
 
@@ -93,7 +85,7 @@ tree=$work/tree
 mkdir -p "$tree"
 if [ "$patched" = 1 ]; then
     patch_args=()
-    for p in "${patches[@]}"; do patch_args+=("$root/vendor/$p.patch"); done
+    while IFS= read -r p; do patch_args+=("$root/$p"); done <<<"$patch_paths"
     zig build --build-file "$root/build.zig" tool -- "$patch_command" "$src" "$tree" "${patch_args[@]}" >"$work/patch.log" 2>&1 ||
         { cat "$work/patch.log" >&2; echo "applying patches failed" >&2; exit 1; }
 else

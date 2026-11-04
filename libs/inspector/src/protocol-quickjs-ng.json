@@ -2489,6 +2489,9 @@
       ],
       "commands": [
         {
+          "name": "collectGarbage"
+        },
+        {
           "name": "takeHeapSnapshot",
           "parameters": [
             {
@@ -2527,6 +2530,24 @@
             {
               "name": "chunk",
               "type": "string"
+            }
+          ]
+        },
+        {
+          "name": "reportHeapSnapshotProgress",
+          "parameters": [
+            {
+              "name": "done",
+              "type": "integer"
+            },
+            {
+              "name": "total",
+              "type": "integer"
+            },
+            {
+              "name": "finished",
+              "optional": true,
+              "type": "boolean"
             }
           ]
         }

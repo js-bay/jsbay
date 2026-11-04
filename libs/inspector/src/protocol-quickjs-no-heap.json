@@ -1270,6 +1270,521 @@
       ]
     },
     {
+      "domain": "Debugger",
+      "description": "Debugger domain exposes JavaScript debugging capabilities. It allows setting and removing\nbreakpoints, stepping through execution, exploring stack traces, etc.",
+      "dependencies": [
+        "Runtime"
+      ],
+      "types": [
+        {
+          "id": "BreakpointId",
+          "description": "Breakpoint identifier.",
+          "type": "string"
+        },
+        {
+          "id": "CallFrameId",
+          "description": "Call frame identifier.",
+          "type": "string"
+        },
+        {
+          "id": "Location",
+          "description": "Location in the source code.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "scriptId",
+              "description": "Script identifier as reported in the `Debugger.scriptParsed`.",
+              "$ref": "Runtime.ScriptId"
+            },
+            {
+              "name": "lineNumber",
+              "description": "Line number in the script (0-based).",
+              "type": "integer"
+            },
+            {
+              "name": "columnNumber",
+              "description": "Column number in the script (0-based).",
+              "optional": true,
+              "type": "integer"
+            }
+          ]
+        },
+        {
+          "id": "ScriptPosition",
+          "description": "Location in the source code.",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "lineNumber",
+              "type": "integer"
+            },
+            {
+              "name": "columnNumber",
+              "type": "integer"
+            }
+          ]
+        },
+        {
+          "id": "LocationRange",
+          "description": "Location range within one script.",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "scriptId",
+              "$ref": "Runtime.ScriptId"
+            },
+            {
+              "name": "start",
+              "$ref": "ScriptPosition"
+            },
+            {
+              "name": "end",
+              "$ref": "ScriptPosition"
+            }
+          ]
+        },
+        {
+          "id": "CallFrame",
+          "description": "JavaScript call frame. Array of call frames form the call stack.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "callFrameId",
+              "description": "Call frame identifier. This identifier is only valid while the virtual machine is paused.",
+              "$ref": "CallFrameId"
+            },
+            {
+              "name": "functionName",
+              "description": "Name of the JavaScript function called on this call frame.",
+              "type": "string"
+            },
+            {
+              "name": "functionLocation",
+              "description": "Location in the source code.",
+              "optional": true,
+              "$ref": "Location"
+            },
+            {
+              "name": "location",
+              "description": "Location in the source code.",
+              "$ref": "Location"
+            },
+            {
+              "name": "url",
+              "description": "JavaScript script name or url.\nDeprecated in favor of using the `location.scriptId` to resolve the URL via a previously\nsent `Debugger.scriptParsed` event.",
+              "deprecated": true,
+              "type": "string"
+            },
+            {
+              "name": "scopeChain",
+              "description": "Scope chain for this call frame.",
+              "type": "array",
+              "items": {
+                "$ref": "Scope"
+              }
+            },
+            {
+              "name": "this",
+              "description": "`this` object for this call frame.",
+              "$ref": "Runtime.RemoteObject"
+            },
+            {
+              "name": "returnValue",
+              "description": "The value being returned, if the function is at return point.",
+              "optional": true,
+              "$ref": "Runtime.RemoteObject"
+            },
+            {
+              "name": "canBeRestarted",
+              "description": "Valid only while the VM is paused and indicates whether this frame\ncan be restarted or not. Note that a `true` value here does not\nguarantee that Debugger#restartFrame with this CallFrameId will be\nsuccessful, but it is very likely.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            }
+          ]
+        },
+        {
+          "id": "Scope",
+          "description": "Scope description.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "type",
+              "description": "Scope type.",
+              "type": "string",
+              "enum": [
+                "global",
+                "local",
+                "with",
+                "closure",
+                "catch",
+                "block",
+                "script",
+                "eval",
+                "module",
+                "wasm-expression-stack"
+              ]
+            },
+            {
+              "name": "object",
+              "description": "Object representing the scope. For `global` and `with` scopes it represents the actual\nobject; for the rest of the scopes, it is artificial transient object enumerating scope\nvariables as its properties.",
+              "$ref": "Runtime.RemoteObject"
+            },
+            {
+              "name": "name",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "startLocation",
+              "description": "Location in the source code where scope starts",
+              "optional": true,
+              "$ref": "Location"
+            },
+            {
+              "name": "endLocation",
+              "description": "Location in the source code where scope ends",
+              "optional": true,
+              "$ref": "Location"
+            },
+            {
+              "name": "emptyReason",
+              "description": "Present if the scope has no variable values to show. Absent means that\nthe scope declares at least one variable with an available value.\nEmpty scopes are retained in the scope chain because\nthey can be targeted via `evaluateOnCallFrame` (using `scopeNumber`) or\nmatched against scopes in source maps.",
+              "experimental": true,
+              "optional": true,
+              "type": "string",
+              "enum": [
+                "no-variables",
+                "all-unavailable"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "SearchMatch",
+          "description": "Search match for resource.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "lineNumber",
+              "description": "Line number in resource content.",
+              "type": "number"
+            },
+            {
+              "name": "lineContent",
+              "description": "Line with match content.",
+              "type": "string"
+            }
+          ]
+        },
+        {
+          "id": "BreakLocation",
+          "type": "object",
+          "properties": [
+            {
+              "name": "scriptId",
+              "description": "Script identifier as reported in the `Debugger.scriptParsed`.",
+              "$ref": "Runtime.ScriptId"
+            },
+            {
+              "name": "lineNumber",
+              "description": "Line number in the script (0-based).",
+              "type": "integer"
+            },
+            {
+              "name": "columnNumber",
+              "description": "Column number in the script (0-based).",
+              "optional": true,
+              "type": "integer"
+            },
+            {
+              "name": "type",
+              "optional": true,
+              "type": "string",
+              "enum": [
+                "debuggerStatement",
+                "call",
+                "return"
+              ]
+            }
+          ]
+        },
+        {
+          "id": "WasmDisassemblyChunk",
+          "experimental": true,
+          "type": "object",
+          "properties": [
+            {
+              "name": "lines",
+              "description": "The next chunk of disassembled lines.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "bytecodeOffsets",
+              "description": "The bytecode offsets describing the start of each line.",
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            }
+          ]
+        },
+        {
+          "id": "ScriptLanguage",
+          "description": "Enum of possible script languages.",
+          "type": "string",
+          "enum": [
+            "JavaScript",
+            "WebAssembly"
+          ]
+        },
+        {
+          "id": "DebugSymbols",
+          "description": "Debug symbols available for a wasm script.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "type",
+              "description": "Type of the debug symbols.",
+              "type": "string",
+              "enum": [
+                "SourceMap",
+                "EmbeddedDWARF",
+                "ExternalDWARF"
+              ]
+            },
+            {
+              "name": "externalURL",
+              "description": "URL of the external symbol source.",
+              "optional": true,
+              "type": "string"
+            }
+          ]
+        },
+        {
+          "id": "ResolvedBreakpoint",
+          "type": "object",
+          "properties": [
+            {
+              "name": "breakpointId",
+              "description": "Breakpoint unique identifier.",
+              "$ref": "BreakpointId"
+            },
+            {
+              "name": "location",
+              "description": "Actual breakpoint location.",
+              "$ref": "Location"
+            }
+          ]
+        }
+      ],
+      "commands": [
+        {
+          "name": "disable",
+          "description": "Disables debugger for given page."
+        },
+        {
+          "name": "enable",
+          "description": "Enables debugger for the given page. Clients should not assume that the debugging has been\nenabled until the result for this command is received.",
+          "parameters": [
+            {
+              "name": "maxScriptsCacheSize",
+              "description": "The maximum size in bytes of collected scripts (not referenced by other heap objects)\nthe debugger can hold. Puts no limit if parameter is omitted.",
+              "experimental": true,
+              "optional": true,
+              "type": "number"
+            }
+          ],
+          "returns": [
+            {
+              "name": "debuggerId",
+              "description": "Unique identifier of the debugger.",
+              "experimental": true,
+              "$ref": "Runtime.UniqueDebuggerId"
+            }
+          ]
+        },
+        {
+          "name": "getScriptSource",
+          "description": "Returns source for the script with given id.",
+          "parameters": [
+            {
+              "name": "scriptId",
+              "description": "Id of the script to get source for.",
+              "$ref": "Runtime.ScriptId"
+            }
+          ],
+          "returns": [
+            {
+              "name": "scriptSource",
+              "description": "Script source (empty in case of Wasm bytecode).",
+              "type": "string"
+            },
+            {
+              "name": "bytecode",
+              "description": "Wasm bytecode. (Encoded as a base64 string when passed over JSON)",
+              "optional": true,
+              "type": "string"
+            }
+          ]
+        },
+        {
+          "name": "setAsyncCallStackDepth",
+          "description": "Enables or disables async call stacks tracking.",
+          "parameters": [
+            {
+              "name": "maxDepth",
+              "description": "Maximum depth of async call stacks. Setting to `0` will effectively disable collecting async\ncall stacks (default).",
+              "type": "integer"
+            }
+          ]
+        }
+      ],
+      "events": [
+        {
+          "name": "scriptParsed",
+          "description": "Fired when virtual machine parses script. This event is also fired for all known and uncollected\nscripts upon enabling debugger.",
+          "parameters": [
+            {
+              "name": "scriptId",
+              "description": "Identifier of the script parsed.",
+              "$ref": "Runtime.ScriptId"
+            },
+            {
+              "name": "url",
+              "description": "URL or name of the script parsed (if any).",
+              "type": "string"
+            },
+            {
+              "name": "startLine",
+              "description": "Line offset of the script within the resource with given URL (for script tags).",
+              "type": "integer"
+            },
+            {
+              "name": "startColumn",
+              "description": "Column offset of the script within the resource with given URL.",
+              "type": "integer"
+            },
+            {
+              "name": "endLine",
+              "description": "Last line of the script.",
+              "type": "integer"
+            },
+            {
+              "name": "endColumn",
+              "description": "Length of the last line of the script.",
+              "type": "integer"
+            },
+            {
+              "name": "executionContextId",
+              "description": "Specifies script creation context.",
+              "$ref": "Runtime.ExecutionContextId"
+            },
+            {
+              "name": "hash",
+              "description": "Content hash of the script, SHA-256.",
+              "type": "string"
+            },
+            {
+              "name": "buildId",
+              "description": "For Wasm modules, the content of the `build_id` custom section. For JavaScript the `debugId` magic comment.",
+              "type": "string"
+            },
+            {
+              "name": "executionContextAuxData",
+              "description": "Embedder-specific auxiliary data likely matching {isDefault: boolean, type: 'default'|'isolated'|'worker', frameId: string}",
+              "optional": true,
+              "type": "object"
+            },
+            {
+              "name": "isLiveEdit",
+              "description": "True, if this script is generated as a result of the live edit operation.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "sourceMapURL",
+              "description": "URL of source map associated with script (if any).",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "hasSourceURL",
+              "description": "True, if this script has sourceURL.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "isModule",
+              "description": "True, if this script is ES6 module.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "length",
+              "description": "This script length.",
+              "optional": true,
+              "type": "integer"
+            },
+            {
+              "name": "stackTrace",
+              "description": "JavaScript top stack frame of where the script parsed event was triggered if available.",
+              "experimental": true,
+              "optional": true,
+              "$ref": "Runtime.StackTrace"
+            },
+            {
+              "name": "codeOffset",
+              "description": "If the scriptLanguage is WebAssembly, the code section offset in the module.",
+              "experimental": true,
+              "optional": true,
+              "type": "integer"
+            },
+            {
+              "name": "scriptLanguage",
+              "description": "The language of the script.",
+              "experimental": true,
+              "optional": true,
+              "$ref": "Debugger.ScriptLanguage"
+            },
+            {
+              "name": "debugSymbols",
+              "description": "If the scriptLanguage is WebAssembly, the source of debug symbols for the module.",
+              "experimental": true,
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "Debugger.DebugSymbols"
+              }
+            },
+            {
+              "name": "embedderName",
+              "description": "The name the embedder supplied for this script.",
+              "experimental": true,
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "resolvedBreakpoints",
+              "description": "The list of set breakpoints in this script if calls to `setBreakpointByUrl`\nmatches this script's URL or hash. Clients that use this list can ignore the\n`breakpointResolved` event. They are equivalent.",
+              "experimental": true,
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "ResolvedBreakpoint"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "domain": "Profiler",
       "dependencies": [
         "Runtime",
@@ -1486,6 +2001,96 @@
               "$ref": "Profile"
             }
           ]
+        }
+      ],
+      "events": []
+    },
+    {
+      "domain": "HeapProfiler",
+      "experimental": true,
+      "dependencies": [
+        "Runtime"
+      ],
+      "types": [
+        {
+          "id": "HeapSnapshotObjectId",
+          "description": "Heap snapshot object id.",
+          "type": "string"
+        },
+        {
+          "id": "SamplingHeapProfileNode",
+          "description": "Sampling Heap Profile node. Holds callsite information, allocation statistics and child nodes.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "callFrame",
+              "description": "Function location.",
+              "$ref": "Runtime.CallFrame"
+            },
+            {
+              "name": "selfSize",
+              "description": "Allocations size in bytes for the node excluding children.",
+              "type": "number"
+            },
+            {
+              "name": "id",
+              "description": "Node id. Ids are unique across all profiles collected between startSampling and stopSampling.",
+              "type": "integer"
+            },
+            {
+              "name": "children",
+              "description": "Child nodes.",
+              "type": "array",
+              "items": {
+                "$ref": "SamplingHeapProfileNode"
+              }
+            }
+          ]
+        },
+        {
+          "id": "SamplingHeapProfileSample",
+          "description": "A single sample from a sampling profile.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "size",
+              "description": "Allocation size in bytes attributed to the sample.",
+              "type": "number"
+            },
+            {
+              "name": "nodeId",
+              "description": "Id of the corresponding profile tree node.",
+              "type": "integer"
+            },
+            {
+              "name": "ordinal",
+              "description": "Time-ordered sample ordinal number. It is unique across all profiles retrieved\nbetween startSampling and stopSampling.",
+              "type": "number"
+            }
+          ]
+        },
+        {
+          "id": "SamplingHeapProfile",
+          "description": "Sampling profile.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "head",
+              "$ref": "SamplingHeapProfileNode"
+            },
+            {
+              "name": "samples",
+              "type": "array",
+              "items": {
+                "$ref": "SamplingHeapProfileSample"
+              }
+            }
+          ]
+        }
+      ],
+      "commands": [
+        {
+          "name": "collectGarbage"
         }
       ],
       "events": []

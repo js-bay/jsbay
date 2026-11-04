@@ -11,7 +11,7 @@
 //!
 //! Backend notes:
 //! - QuickJS: full native support via `JS_SetInterruptHandler`. The JS VM throws an InternalError on the next interrupt check.
-//! - JSC: uses the private `JSContextGroupSetExecutionTimeLimit` API (symbol ships in JavaScriptCore.framework, even though the public header hides it). The system JSC build exercised here needs the callback to explicitly re-arm its next 50ms check after it returns false, despite the upstream header documenting automatic continuation. This keeps `requestInterrupt` and execution deadlines responsive there. `runGc` uses the public `JSGarbageCollect` and is reliable on all JSC builds. Memory usage is not queryable through JSC's public C API and is reported as zeros.
+//! - JSC: uses the private `JSContextGroupSetExecutionTimeLimit` API exported by JavaScriptCore.framework. The callback explicitly re-arms its next 50ms check after returning false so interrupts and deadlines do not depend on framework-specific callback repetition. `runGc` requests collection through the public `JSGarbageCollect` API; completion timing is controlled by the framework. Memory usage is not queryable through JSC's public C API and is reported as zeros.
 
 const std = @import("std");
 const io = @import("../platform/io.zig");

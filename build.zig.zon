@@ -45,5 +45,7 @@
         "vendor/quickjs-ng-break-locations.patch",
         "vendor/quickjs-ng-script-tags.patch",
         "vendor/quickjs-ng-inspector-off.patch",
+        "vendor/quickjs-ng-location-precision.patch",
+        "vendor/quickjs-script-tags.patch",
     },
 }
