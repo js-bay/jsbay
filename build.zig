@@ -863,8 +863,7 @@ fn addEscargotSources(b: *std.Build, m: *std.Build.Module, install_prefix: []con
 }
 
 fn addHermesSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8, icu_lib_dir: []const u8) void {
-    // Hermes/JSI C bridge as a shared lib (libhermes_bridge.so), not a .o into the Zig
-    // binary. HostFunction throw paths must unwind with GCC libstdc++/libgcc_s that hermesvm.so uses.
+    // Hermes/JSI C bridge as a shared lib (libhermes_bridge.so), not a .o into the Zig binary. HostFunction throw paths must unwind with GCC libstdc++/libgcc_s that hermesvm.so uses.
     _ = libstdcxx;
     const install = b.path(install_prefix);
     m.addIncludePath(b.path("src/backend/hermes"));

@@ -857,7 +857,7 @@ static std::string rewriteIdents(const std::string &src,
     bool next_brace_is_fn_body = false;
     // `class` / `class Name` / `class … extends …` schedules the next non-object-literal `{` as ClassBody (nested classes nest the counter).
     int class_body_braces_pending = 0;
-    // After `for (let|const …)` / `for await (…)`, pop the loop-header scope when its body ends: entries are `cont.size()` after the ForHead `)` — matched when a Block at that depth closes, or a `;` ends a non-braced body.
+    // After `for (let|const …)` / `for await (…)`, pop the loop-header scope when its body ends: entries are `cont.size()` after the ForHead `)` — matched when a Block at that depth closes, or a `;` ends a non-braced body. For unbraced bodies, defer the pop while `else` / `catch` / `finally` continues the body statement.
     std::vector<size_t> for_scope_pop_at_block_depth;
     std::vector<size_t> for_scope_pop_at_stmt_depth;
     // True while scanning a parameter default initializer (`=` … until `,`/`)` at ParamList depth).
@@ -939,6 +939,36 @@ static std::string rewriteIdents(const std::string &src,
     };
     auto skipSpacesSrc = [&](size_t &p) {
         while (p < src.size() && std::isspace(static_cast<unsigned char>(src[p]))) ++p;
+    };
+    // Skip spaces and // /* */ comments so statement-continuation lookahead sees `else` / `catch` / `finally`.
+    auto skipSpacesAndCommentsSrc = [&](size_t &p) {
+        while (p < src.size()) {
+            if (std::isspace(static_cast<unsigned char>(src[p]))) { ++p; continue; }
+            if (src[p] == '/' && p + 1 < src.size() && src[p + 1] == '/') {
+                p += 2;
+                while (p < src.size() && src[p] != '\n') ++p;
+                continue;
+            }
+            if (src[p] == '/' && p + 1 < src.size() && src[p + 1] == '*') {
+                p += 2;
+                while (p + 1 < src.size() && !(src[p] == '*' && src[p + 1] == '/')) ++p;
+                if (p + 1 < src.size()) p += 2;
+                continue;
+            }
+            break;
+        }
+    };
+    // True when the statement after `pos` continues via else / catch / finally (keep loop-header scope alive).
+    auto statementContinuesAfter = [&](size_t pos) -> bool {
+        skipSpacesAndCommentsSrc(pos);
+        auto atWord = [&](const char *w) -> bool {
+            size_t n = std::strlen(w);
+            if (pos + n > src.size()) return false;
+            if (src.compare(pos, n, w) != 0) return false;
+            if (pos + n < src.size() && isIdent(src[pos + n])) return false;
+            return true;
+        };
+        return atWord("else") || atWord("catch") || atWord("finally");
     };
 
     size_t i = 0;
@@ -1159,8 +1189,11 @@ static std::string rewriteIdents(const std::string &src,
                             for_scope_pop_at_block_depth.pop_back();
                             popScope();
                         } else if (!for_scope_pop_at_stmt_depth.empty() && cont.size() == for_scope_pop_at_stmt_depth.back()) {
-                            for_scope_pop_at_stmt_depth.pop_back();
-                            popScope();
+                            // Unbraced loop body may be `if`/`try`; keep header scope through else/catch/finally.
+                            if (!statementContinuesAfter(i + 1)) {
+                                for_scope_pop_at_stmt_depth.pop_back();
+                                popScope();
+                            }
                         }
                     }
                 } else if (kind == Cont::FnBody) {
@@ -1366,8 +1399,11 @@ static std::string rewriteIdents(const std::string &src,
             closeExprArrowsAt(cont.size());
             if (c == ';' && !for_scope_pop_at_stmt_depth.empty() &&
                 cont.size() == for_scope_pop_at_stmt_depth.back()) {
-                for_scope_pop_at_stmt_depth.pop_back();
-                popScope();
+                // `if (cond); else …` / similar — defer until the continued statement ends.
+                if (!statementContinuesAfter(i + 1)) {
+                    for_scope_pop_at_stmt_depth.pop_back();
+                    popScope();
+                }
             }
         }
 
@@ -2637,7 +2673,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     // export default ...
     {
         static const std::regex re_fn(R"(export\s+default\s+function\s*([A-Za-z_$][\w$]*)?)");
-        static const std::regex re_class(R"(export\s+default\s+class\s*([A-Za-z_$][\w$]*)?)");
+        // Do not treat `extends` as an anonymous default class name (`export default class extends Base {}`).
+        static const std::regex re_class(R"(export\s+default\s+class(?:\s+(?!extends\b)([A-Za-z_$][\w$]*))?)");
         std::smatch m;
         std::string blanked = blankNonCode(body);
         if (std::regex_search(blanked, m, re_fn)) {
@@ -2705,14 +2742,15 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // export { a, b as c };
+    // export { a, b as c }; — require a non-identifier boundary so names like `__default_export {}` are not eaten.
     {
-        static const std::regex re(R"(export\s*\{([^}]*)\}\s*;?)");
+        static const std::regex re(R"((^|[^\w$])export\s*\{([^}]*)\}\s*;?)");
         std::smatch m;
         for (;;) {
             std::string blanked = blankNonCode(body);
             if (!std::regex_search(blanked, m, re)) break;
-            std::string specs = body.substr(m.position(1), m.length(1));
+            std::string prefix = m[1].str(); // start-of-string or the boundary char
+            std::string specs = body.substr(m.position(2), m.length(2));
             std::string repl;
             size_t pos = 0;
             while (pos < specs.size()) {
@@ -2732,7 +2770,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
             }
-            body.replace(m.position(), m.length(), repl);
+            body.replace(m.position(), m.length(), prefix + repl);
         }
     }
 
