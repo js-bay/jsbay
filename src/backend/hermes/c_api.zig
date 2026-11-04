@@ -231,3 +231,12 @@ pub extern fn hermes_set_rejection_tracker(
     fn_ptr: ?RejectionTrackerFn,
     userdata: ?*anyopaque,
 ) bool;
+
+pub const HostProgressFn = *const fn (userdata: ?*anyopaque) callconv(.c) void;
+
+pub extern fn hermes_set_host_progress(
+    ctx: ?*Context,
+    fn_ptr: ?HostProgressFn,
+    userdata: ?*anyopaque,
+) void;
+

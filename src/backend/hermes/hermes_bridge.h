@@ -291,13 +291,16 @@ HermesEvalResult hermes_import_module(JsbayHermesContext *ctx, const char *speci
 char *hermes_esm_transform_source(const char *src, size_t src_len, const char *filename);
 
 
-/* Host Promise rejection tracker (Escargot-style). Prefer HermesInternal hooks;
-   also used for module-shim top-level throws that settle via awaitThenable. */
+/* Host Promise rejection tracker (Escargot-style). Prefer HermesInternal hooks; also used for module-shim top-level throws that settle via awaitThenable. */
 typedef void (*HermesRejectionTrackerFn)(int32_t instance_id, bool handled,
                                          const char *reason, size_t reason_len, void *ud);
 bool hermes_set_rejection_tracker(JsbayHermesContext *ctx, int32_t instance_id,
                                   HermesRejectionTrackerFn fn, void *ud);
 void hermes_report_unhandled_rejection(JsbayHermesContext *ctx, const char *message);
+
+/* Host macrotask progress during sync TLA waits (timers / host scripts / native). Zig registers this so awaitThenable can settle `await new Promise(r => setTimeout(r, 0))`. */
+typedef void (*HermesHostProgressFn)(void *ud);
+void hermes_set_host_progress(JsbayHermesContext *ctx, HermesHostProgressFn fn, void *ud);
 
 #ifdef __cplusplus
 }
@@ -305,5 +308,6 @@ void hermes_report_unhandled_rejection(JsbayHermesContext *ctx, const char *mess
 namespace facebook { namespace hermes { class HermesRuntime; } }
 facebook::hermes::HermesRuntime *hermes_context_rt(JsbayHermesContext *c);
 void hermes_context_drain_microtasks(JsbayHermesContext *c);
+void hermes_context_pump_host_tasks(JsbayHermesContext *c);
 #endif
 

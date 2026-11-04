@@ -111,11 +111,37 @@ fn jsReportUncaughtMicrotask(ctx: ?*c_api.Context, _: Value, args: ?[*]const Val
     return value_mod.undefinedValue();
 }
 
+fn hostProgressPump(ud: ?*anyopaque) callconv(.c) void {
+    const ctx: Context = @ptrCast(@alignCast(ud));
+    const id = blk: {
+        if (@import("../../runtime/instance_map.zig").findByContextAddr(@intFromPtr(ctx))) |found| break :blk found;
+        const from_opaque = instanceIdFromCtx(ctx);
+        if (from_opaque == 0) return;
+        break :blk from_opaque;
+    };
+    const instance = @import("../../runtime/instance_map.zig").getInstance(id) orelse return;
+    // Temporarily suspend the outer eval execution depth so due timers / host tasks can run during sync TLA waits.
+    const sched = &instance.loop.scheduler;
+    const saved_depth = sched.execution_depth;
+    const saved_checkpoint = sched.checkpoint_active;
+    sched.execution_depth = 0;
+    sched.checkpoint_active = false;
+    defer {
+        sched.execution_depth = saved_depth;
+        sched.checkpoint_active = saved_checkpoint;
+    }
+    const now: u64 = @intCast(@import("../../platform/io.zig").monotonicMilliseconds());
+    timers_mod.fireDue(id, now);
+}
+
 pub fn registerTimers(ctx: Context) void {
     bindGlobal(ctx, "setTimeout", jsSetTimeout);
     bindGlobal(ctx, "setInterval", jsSetInterval);
     bindGlobal(ctx, "clearTimeout", jsClearTimer);
     bindGlobal(ctx, "clearInterval", jsClearTimer);
+
+    // Let hermes_esm awaitThenable pump host macrotasks (setTimeout) while synchronously settling top-level await.
+    c_api.hermes_set_host_progress(ctx, hostProgressPump, ctx);
 
     // Wrap so native failure objects become JS exceptions without crossing the jsi throw ABI.
     const wrap = value_mod.evalValue(ctx, timer_throw_wrap, "<timer-wrap>");

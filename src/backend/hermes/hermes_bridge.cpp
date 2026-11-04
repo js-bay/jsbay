@@ -91,6 +91,9 @@ struct JsbayHermesContextOpaque {
     bool rejection_hook_installed = false;
     int32_t rejection_timer_next = 1;
     std::unordered_map<int32_t, std::shared_ptr<bool>> rejection_timer_cancelled;
+    // Host macrotask pump for sync TLA waits (registered from Zig).
+    HermesHostProgressFn host_progress_fn = nullptr;
+    void *host_progress_ud = nullptr;
     // Owned HostFnState cleanups run before protect-map teardown so MethodBox free cannot UAF.
     std::mutex host_fn_mu;
     std::vector<std::function<void()>> host_fn_invalidate;
@@ -2322,7 +2325,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
         return;
     }
 
-    // Object resolve: resolve_fn already started adoption when the value is thenable. Prefer observing an adopted Promise via instanceof (no second Get(then)) so handlers do not mark the Deferred handled and suppress application unhandled-rejection reporting. Custom thenables cannot be re-observed without another Get(then); observe the Deferred and re-queue host unhandled reporting to preserve equivalent tracker behavior.
+    // Object resolve: resolve_fn already started adoption when the value is thenable. Prefer observing an adopted Promise via instanceof (no second Get(then)) so handlers do not mark the Deferred handled and suppress application unhandled-rejection reporting. Custom thenables cannot be re-observed without another Get(then); observe the Deferred and re-queue host unhandled reporting only when the Deferred had no prior reject handlers (Hermes Promise `_h` stays 1 after our observer alone; `_h >= 2` means an application `.catch`/`.then` was already attached).
     try {
         auto &rt = *c->rt;
         jsi::Object target = pvalue->asObject(rt);
@@ -2335,6 +2338,8 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
             }
         } catch (...) {
         }
+        // Retain the Deferred so the reject observer can re-check handling after settlement.
+        auto deferred_keep = std::make_shared<jsi::Value>(rt, *pvalue);
         auto onFulfilled = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseFulfilled"), 1,
             [c, key, recordPromiseState](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
@@ -2350,7 +2355,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
             });
         auto onRejected = jsi::Function::createFromHostFunction(
             rt, jsi::PropNameID::forAscii(rt, "jsbayPromiseRejected"), 1,
-            [c, key, recordPromiseState, requeue_host_unhandled](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            [c, key, recordPromiseState, requeue_host_unhandled, deferred_keep](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
                 jsi::Value v = (count >= 1) ? jsi::Value(rt2, args[0]) : jsi::Value::undefined();
                 jsi::Value *new_res = nullptr;
                 try {
@@ -2360,24 +2365,35 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                 }
                 recordPromiseState(key, 2, new_res);
                 if (requeue_host_unhandled && c->rejection_fn) {
-                    std::string msg = "Promise rejected";
+                    // Our observer alone leaves Hermes Promise `_h == 1`; a prior/sibling application handler yields `_h >= 2` — skip the compensatory unhandled report so `.catch()` suppresses it.
+                    bool app_handled = false;
                     try {
-                        if (count >= 1) {
-                            if (args[0].isString()) msg = args[0].getString(rt2).utf8(rt2);
-                            else if (args[0].isObject()) {
-                                auto o = args[0].getObject(rt2);
-                                if (o.hasProperty(rt2, "message")) {
-                                    auto m = o.getProperty(rt2, "message");
-                                    if (m.isString()) msg = m.getString(rt2).utf8(rt2);
-                                }
-                                if (msg == "Promise rejected") msg = args[0].toString(rt2).utf8(rt2);
-                            } else {
-                                msg = args[0].toString(rt2).utf8(rt2);
-                            }
+                        if (deferred_keep && deferred_keep->isObject()) {
+                            jsi::Value h = deferred_keep->getObject(rt2).getProperty(rt2, "_h");
+                            if (h.isNumber() && h.getNumber() >= 2.0) app_handled = true;
                         }
                     } catch (...) {
                     }
-                    c->pending_rejections.emplace_back(false, msg);
+                    if (!app_handled) {
+                        std::string msg = "Promise rejected";
+                        try {
+                            if (count >= 1) {
+                                if (args[0].isString()) msg = args[0].getString(rt2).utf8(rt2);
+                                else if (args[0].isObject()) {
+                                    auto o = args[0].getObject(rt2);
+                                    if (o.hasProperty(rt2, "message")) {
+                                        auto m = o.getProperty(rt2, "message");
+                                        if (m.isString()) msg = m.getString(rt2).utf8(rt2);
+                                    }
+                                    if (msg == "Promise rejected") msg = args[0].toString(rt2).utf8(rt2);
+                                } else {
+                                    msg = args[0].toString(rt2).utf8(rt2);
+                                }
+                            }
+                        } catch (...) {
+                        }
+                        c->pending_rejections.emplace_back(false, msg);
+                    }
                 }
                 return jsi::Value::undefined();
             });
@@ -3281,6 +3297,20 @@ void hermes_context_drain_microtasks(JsbayHermesContext *c) {
     if (!c || !c->rt) return;
     try { c->rt->drainMicrotasks(); } catch (...) {}
     hermes_flush_pending_rejections(c);
+}
+
+extern "C" void hermes_set_host_progress(JsbayHermesContext *ctx, HermesHostProgressFn fn, void *ud) {
+    if (!ctx) return;
+    ctx->host_progress_fn = fn;
+    ctx->host_progress_ud = ud;
+}
+
+void hermes_context_pump_host_tasks(JsbayHermesContext *c) {
+    if (!c || !c->host_progress_fn) return;
+    try {
+        c->host_progress_fn(c->host_progress_ud);
+    } catch (...) {
+    }
 }
 
 extern "C" void hermes_report_unhandled_rejection(JsbayHermesContext *ctx, const char *message) {

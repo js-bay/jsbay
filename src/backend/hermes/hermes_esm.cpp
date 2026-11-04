@@ -2754,10 +2754,10 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
 
     // export default ...
     {
-        // Optional `async` and generator `*` must be recognized before the name so anonymous defaults keep `async function*` (not `function __default_export*`).
-        static const std::regex re_fn(R"(export\s+default\s+(async\s+)?function(\s*\*)?\s*([A-Za-z_$][\w$]*)?)");
+        // Optional `async` and generator `*` must be recognized before the name so anonymous defaults keep `async function*` (not `function __default_export*`). Keyword boundaries: `(?![\w$])` after `function`/`class` so identifiers like `functionCall` / `classFactory` stay default-expression exports.
+        static const std::regex re_fn(R"(export\s+default\s+(async\s+)?function(?![\w$])(\s*\*)?\s*([A-Za-z_$][\w$]*)?)");
         // Do not treat `extends` as an anonymous default class name (`export default class extends Base {}`).
-        static const std::regex re_class(R"(export\s+default\s+class(?:\s+(?!extends\b)([A-Za-z_$][\w$]*))?)");
+        static const std::regex re_class(R"(export\s+default\s+class(?![\w$])(?:\s+(?!extends\b)([A-Za-z_$][\w$]*))?)");
         std::smatch m;
         std::string blanked = blankNonCode(body);
         if (std::regex_search(blanked, m, re_fn)) {
@@ -2767,7 +2767,11 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             if (!m[3].matched) {
                 body.replace(m.position(), m.length(), async_kw + "function" + star + " " + name);
             } else {
-                body.replace(m.position(), std::strlen("export default "), "");
+                // Strip the matched `export`…`default`… prefix by its actual length (whitespace may span lines); leave `async`/`function`/name in place.
+                std::string matched = blanked.substr(m.position(0), m.length(0));
+                size_t rel = m[1].matched ? matched.find("async") : matched.find("function");
+                size_t cut = (rel == std::string::npos) ? m.length(0) : rel;
+                body.replace(m.position(), cut, "");
             }
             epilogue.push_back(exportLiveGetter("default", name));
         } else if (std::regex_search(blanked = blankNonCode(body), m, re_class)) {
@@ -2776,7 +2780,11 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             if (!m[1].matched) {
                 body.replace(m.position(), m.length(), "class " + name);
             } else {
-                body.replace(m.position(), std::strlen("export default "), "");
+                // Strip the matched `export`…`default`… prefix by its actual length; leave `class Name` in place.
+                std::string matched = blanked.substr(m.position(0), m.length(0));
+                size_t rel = matched.find("class");
+                size_t cut = (rel == std::string::npos) ? m.length(0) : rel;
+                body.replace(m.position(), cut, "");
             }
             epilogue.push_back(exportLiveGetter("default", name));
         } else {
@@ -3062,8 +3070,11 @@ static jsi::Value awaitThenable(JsbayHermesContext *c, FbHermesRuntime &rt, jsi:
 
     then_v.getObject(rt).getFunction(rt).callWithThis(rt, obj, onFulfilled, onRejected);
 
+    // Drain microtasks and pump host tasks (timers / native / host scripts) so TLA can await setTimeout and similar macrotasks.
     for (int i = 0; i < 100000 && !box->done; ++i) {
         hermes_context_drain_microtasks(c);
+        if (box->done) break;
+        hermes_context_pump_host_tasks(c);
     }
     if (!box->done) throw jsi::JSError(rt, "module async evaluation timed out");
     if (!box->ok) throw jsi::JSError(rt, box->err);
