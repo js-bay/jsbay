@@ -1831,6 +1831,70 @@ static std::string trim(std::string s) {
     return s;
 }
 
+// Split `left as right` where `as` is a keyword with arbitrary JS whitespace on either side (space/tab/newline). Returns false for a plain binding (no alias).
+static bool splitAsAlias(const std::string &part, std::string &left, std::string &right) {
+    size_t i = 0;
+    while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i]))) ++i;
+    if (i >= part.size() || !isIdentStart(part[i])) return false;
+    size_t left_start = i;
+    while (i < part.size() && isIdent(part[i])) ++i;
+    size_t left_end = i;
+    while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i]))) ++i;
+    if (i + 2 > part.size() || part[i] != 'a' || part[i + 1] != 's') return false;
+    if (i + 2 < part.size() && isIdent(part[i + 2])) return false;
+    i += 2;
+    while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i]))) ++i;
+    if (i >= part.size() || !isIdentStart(part[i])) return false;
+    size_t right_start = i;
+    while (i < part.size() && isIdent(part[i])) ++i;
+    size_t right_end = i;
+    while (i < part.size() && std::isspace(static_cast<unsigned char>(part[i]))) ++i;
+    if (i != part.size()) return false;
+    left.assign(part, left_start, left_end - left_start);
+    right.assign(part, right_start, right_end - right_start);
+    return true;
+}
+
+// Collect every identifier token in executable source (string/comment/regexp interiors blanked) so generated bindings can avoid collisions.
+static void collectIdentTokens(const std::string &src, std::unordered_set<std::string> &out) {
+    const std::string blanked = blankNonCode(src);
+    for (size_t i = 0; i < blanked.size();) {
+        if (isIdentStart(blanked[i])) {
+            size_t j = i + 1;
+            while (j < blanked.size() && isIdent(blanked[j])) ++j;
+            out.insert(blanked.substr(i, j - i));
+            i = j;
+            continue;
+        }
+        ++i;
+    }
+}
+
+static std::string allocFreshIdent(std::unordered_set<std::string> &used, const std::string &prefix) {
+    for (int n = 0;; ++n) {
+        std::string name = prefix + std::to_string(n);
+        if (!used.count(name)) {
+            used.insert(name);
+            return name;
+        }
+    }
+}
+
+// Prefer `preferred` when free; otherwise append a decimal suffix until unused.
+static std::string allocFreshIdentExact(std::unordered_set<std::string> &used, const std::string &preferred) {
+    if (!used.count(preferred)) {
+        used.insert(preferred);
+        return preferred;
+    }
+    for (int n = 0;; ++n) {
+        std::string name = preferred + std::to_string(n);
+        if (!used.count(name)) {
+            used.insert(name);
+            return name;
+        }
+    }
+}
+
 // Skip string / template / comment starting at `i` (for balanced-bracket scanners).
 static bool skipStringTemplateOrComment(const std::string &src, size_t &i) {
     if (i >= src.size()) return false;
@@ -2557,6 +2621,12 @@ static std::string exportNamedReexport(const std::string &exported, const std::s
 // Very small ESM→CJS transform covering modules_tests fixtures.
 static std::string transformEsmToCjs(const std::string &src, const std::string &filename) {
     (void)filename;
+    // Seed reserved names from the original module so generated bindings (__jsbay_ns*, __default_export, …) cannot collide with user declarations.
+    std::unordered_set<std::string> used_idents;
+    collectIdentTokens(src, used_idents);
+    for (const char *r : {kWrapExports, kWrapRequire, kWrapModule, kWrapFilename, kWrapDirname, kWrapImportMeta, kWrapObject,
+                          kWrapDefineProperty})
+        used_idents.insert(r);
     std::string body = rewriteImportMetaAndDynamic(src);
     std::vector<ImportBinding> imports;
     std::vector<std::string> prelude;
@@ -2602,9 +2672,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                     size_t comma = specs.find(',', pos);
                     std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
                     if (!part.empty()) {
-                        auto as_pos = part.find(" as ");
-                        if (as_pos != std::string::npos)
-                            imports.push_back({trim(part.substr(as_pos + 4)), trim(part.substr(0, as_pos)), m[4].str()});
+                        std::string alias_left, alias_right;
+                        if (splitAsAlias(part, alias_left, alias_right))
+                            imports.push_back({alias_right, alias_left, m[4].str()});
                         else
                             imports.push_back({part, part, m[4].str()});
                     }
@@ -2623,9 +2693,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                     std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
                     if (!part.empty()) {
                         any_named = true;
-                        auto as_pos = part.find(" as ");
-                        if (as_pos != std::string::npos)
-                            imports.push_back({trim(part.substr(as_pos + 4)), trim(part.substr(0, as_pos)), m[3].str()});
+                        std::string alias_left, alias_right;
+                        if (splitAsAlias(part, alias_left, alias_right))
+                            imports.push_back({alias_right, alias_left, m[3].str()});
                         else
                             imports.push_back({part, part, m[3].str()});
                     }
@@ -2767,7 +2837,6 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         static const std::regex re_named(R"(export\s*\{([^}]*)\}\s*from\s*(['"])([^'"]+)\2\s*;?)");
         // Optional `as name` covers `export * as ns from 'dep'` (namespace re-export); bare `export * from` stays a star re-export.
         static const std::regex re_star(R"(export\s*\*\s*(?:as\s+([A-Za-z_$][\w$]*)\s+)?from\s*(['"])([^'"]+)\2\s*;?)");
-        int reexport_ns = 0; // per-transform only; not process-wide (Hermes instances can transform concurrently)
         for (;;) {
             std::string blanked = blankNonCode(body);
             std::smatch m_named, m_star;
@@ -2778,7 +2847,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             if (take_star) {
                 // Group 1 = optional namespace export name; group 3 = module specifier (quote is group 2).
                 std::string mod = body.substr(m_star.position(3), m_star.length(3));
-                std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
+                std::string ns = allocFreshIdent(used_idents, "__jsbay_re");
                 reexport_prelude.push_back({mod, "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + mod + "\");"});
                 if (m_star[1].matched) {
                     // `export * as ns from 'dep'`: expose the dependency namespace under `ns`, do not flatten star bindings.
@@ -2792,7 +2861,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 // Specs / module from the blanked match spans on the live body (same offsets).
                 std::string specs = body.substr(m_named.position(1), m_named.length(1));
                 std::string mod = body.substr(m_named.position(3), m_named.length(3));
-                std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
+                std::string ns = allocFreshIdent(used_idents, "__jsbay_re");
                 reexport_prelude.push_back({mod, "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + mod + "\");"});
                 std::string repl;
                 size_t pos = 0;
@@ -2801,13 +2870,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                     std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
                     if (!part.empty()) {
                         std::string imported, exported;
-                        auto as_pos = part.find(" as ");
-                        if (as_pos != std::string::npos) {
-                            imported = trim(part.substr(0, as_pos));
-                            exported = trim(part.substr(as_pos + 4));
-                        } else {
+                        if (!splitAsAlias(part, imported, exported))
                             imported = exported = part;
-                        }
                         repl += exportNamedReexport(exported, ns, imported);
                     }
                     if (comma == std::string::npos) break;
@@ -2829,7 +2893,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         if (std::regex_search(blanked, m, re_fn)) {
             std::string async_kw = m[1].matched ? body.substr(m.position(1), m.length(1)) : "";
             std::string star = m[2].matched ? body.substr(m.position(2), m.length(2)) : "";
-            std::string name = m[3].matched ? body.substr(m.position(3), m.length(3)) : "__default_export";
+            std::string name = m[3].matched ? body.substr(m.position(3), m.length(3))
+                                            : allocFreshIdentExact(used_idents, "__default_export");
             if (!m[3].matched) {
                 body.replace(m.position(), m.length(), async_kw + "function" + star + " " + name);
             } else {
@@ -2842,7 +2907,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             epilogue.push_back(exportLiveGetter("default", name));
         } else if (std::regex_search(blanked = blankNonCode(body), m, re_class)) {
             // Keep a module-scoped class declaration (named or synthetic) so local refs resolve; publish via getter.
-            std::string name = m[1].matched ? body.substr(m.position(1), m.length(1)) : "__default_export";
+            std::string name = m[1].matched ? body.substr(m.position(1), m.length(1))
+                                            : allocFreshIdentExact(used_idents, "__default_export");
             if (!m[1].matched) {
                 body.replace(m.position(), m.length(), "class " + name);
             } else {
@@ -2858,8 +2924,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             blanked = blankNonCode(body);
             if (std::regex_search(blanked, m, re_def)) {
                 // Store the expression in an internal binding and expose a read-only live export (native ESM semantics).
-                body.replace(m.position(), m.length(), "var __jsbay_default = ");
-                epilogue.push_back(exportLiveGetter("default", "__jsbay_default"));
+                std::string def_bind = allocFreshIdentExact(used_idents, "__jsbay_default");
+                body.replace(m.position(), m.length(), "var " + def_bind + " = ");
+                epilogue.push_back(exportLiveGetter("default", def_bind));
             }
         }
     }
@@ -2922,6 +2989,25 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
+    // Allocate import namespace locals before local `export {…}` so imported bindings can publish leaf provenance for diamond star-merge.
+    std::unordered_map<std::string, std::string> mod_to_ns;
+    std::unordered_map<std::string, std::string> import_require_line;
+    for (auto &ib : imports) {
+        if (ib.module.empty()) continue;
+        if (!mod_to_ns.count(ib.module)) {
+            std::string ns = allocFreshIdent(used_idents, "__jsbay_ns");
+            mod_to_ns[ib.module] = ns;
+            import_require_line[ib.module] = "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + ib.module + "\");";
+        }
+    }
+    // local name → (nsVar, importedBinding) for ordinary named/default imports (not namespace objects).
+    std::unordered_map<std::string, std::pair<std::string, std::string>> import_local_origin;
+    for (auto &ib : imports) {
+        if (ib.local.empty() || ib.module.empty() || ib.imported == ".") continue;
+        if (!import_local_origin.count(ib.local))
+            import_local_origin.emplace(ib.local, std::make_pair(mod_to_ns[ib.module], ib.imported));
+    }
+
     // export { a, b as c }; — require a non-identifier boundary so names like `__default_export {}` are not eaten.
     {
         static const std::regex re(R"((^|[^\w$])export\s*\{([^}]*)\}\s*;?)");
@@ -2938,14 +3024,14 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
                 if (!part.empty()) {
                     std::string local, exported;
-                    auto as_pos = part.find(" as ");
-                    if (as_pos != std::string::npos) {
-                        local = trim(part.substr(0, as_pos));
-                        exported = trim(part.substr(as_pos + 4));
-                    } else {
+                    if (!splitAsAlias(part, local, exported))
                         local = exported = part;
-                    }
-                    repl += exportLiveGetter(exported, local);
+                    auto origin = import_local_origin.find(local);
+                    if (origin != import_local_origin.end())
+                        // Carry the imported binding's leaf provenance through local export lists (import-then-export diamond).
+                        repl += exportNamedReexport(exported, origin->second.first, origin->second.second);
+                    else
+                        repl += exportLiveGetter(exported, local);
                 }
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
@@ -2958,17 +3044,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     //
     // Ordinary imports and re-export dependencies share one source-ordered static dependency prelude (native ESM init order).
     std::unordered_map<std::string, std::string> ident_repl;
-    int ns_i = 0;
-    std::unordered_map<std::string, std::string> mod_to_ns;
-    std::unordered_map<std::string, std::string> import_require_line;
     for (auto &ib : imports) {
-        if (ib.module.empty()) continue;
-        if (!mod_to_ns.count(ib.module)) {
-            std::string ns = "__jsbay_ns" + std::to_string(ns_i++);
-            mod_to_ns[ib.module] = ns;
-            import_require_line[ib.module] = "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + ib.module + "\");";
-        }
-        if (ib.local.empty()) continue; // side-effect only
+        if (ib.module.empty() || ib.local.empty()) continue; // side-effect only
         std::string ns = mod_to_ns[ib.module];
         if (ib.imported == ".") {
             ident_repl[ib.local] = ns;
@@ -3018,22 +3095,24 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
 
     // Star re-exports: compare leaf origins `{m,b}` (module identity + binding name) for ambiguity, but read values from the immediate star source namespace so renamed named re-exports (`export {original as renamed}`) stay reachable under the export name. Omit ambiguous names unless an explicit export already resolved them; record leaf origins on this module for further star re-exports.
     if (!star_reexport_nss.empty()) {
+        std::string star_prov = allocFreshIdentExact(used_idents, "__jsbay_star_prov");
+        std::string star_ns_map = allocFreshIdentExact(used_idents, "__jsbay_star_ns");
         std::string star;
-        star += std::string("var __jsbay_star_prov=") + kWrapObject + ".create(null);";
-        star += std::string("var __jsbay_star_ns=") + kWrapObject + ".create(null);";
+        star += "var " + star_prov + "=" + kWrapObject + ".create(null);";
+        star += "var " + star_ns_map + "=" + kWrapObject + ".create(null);";
         star += std::string("if(!") + kWrapObject + ".prototype.hasOwnProperty.call(" + kWrapExports + ",\"__jsbay_star_origin\"))";
         star += std::string(kWrapDefineProperty) + "(" + kWrapExports + ",\"__jsbay_star_origin\",{value:" + kWrapObject + ".create(null),configurable:true});";
         for (const auto &ns : star_reexport_nss) {
             star += std::string(kWrapObject) + ".keys(" + ns + ").forEach(function(k){";
             star += "if(k===\"default\"||k===\"__jsbay_star_origin\")return;";
             star += std::string("var __jsbay_origin=(") + ns + ".__jsbay_star_origin&&" + kWrapObject + ".prototype.hasOwnProperty.call(" + ns + ".__jsbay_star_origin,k))?" + ns + ".__jsbay_star_origin[k]:{m:" + ns + ",b:k};";
-            star += std::string("if(") + kWrapObject + ".prototype.hasOwnProperty.call(__jsbay_star_prov,k)){";
-            star += "if(__jsbay_star_prov[k]==null||__jsbay_star_prov[k].m!==__jsbay_origin.m||__jsbay_star_prov[k].b!==__jsbay_origin.b){__jsbay_star_prov[k]=null;__jsbay_star_ns[k]=null;}";
-            star += "}else{__jsbay_star_prov[k]=__jsbay_origin;__jsbay_star_ns[k]=" + ns + ";}});";
+            star += std::string("if(") + kWrapObject + ".prototype.hasOwnProperty.call(" + star_prov + ",k)){";
+            star += "if(" + star_prov + "[k]==null||" + star_prov + "[k].m!==__jsbay_origin.m||" + star_prov + "[k].b!==__jsbay_origin.b){" + star_prov + "[k]=null;" + star_ns_map + "[k]=null;}";
+            star += "}else{" + star_prov + "[k]=__jsbay_origin;" + star_ns_map + "[k]=" + ns + ";}});";
         }
-        star += std::string(kWrapObject) + ".keys(__jsbay_star_prov).forEach(function(k){";
-        star += "var __jsbay_src=__jsbay_star_prov[k];";
-        star += "var __jsbay_lookup=__jsbay_star_ns[k];";
+        star += std::string(kWrapObject) + ".keys(" + star_prov + ").forEach(function(k){";
+        star += "var __jsbay_src=" + star_prov + "[k];";
+        star += "var __jsbay_lookup=" + star_ns_map + "[k];";
         star += "if(__jsbay_src==null)return;";
         star += std::string("if(") + kWrapObject + ".prototype.hasOwnProperty.call(" + kWrapExports + ",k))return;";
         star += std::string(kWrapDefineProperty) + "(" + kWrapExports + ",k,{enumerable:true,configurable:false,get:function(){return __jsbay_lookup[k];}});";

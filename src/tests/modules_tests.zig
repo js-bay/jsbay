@@ -1018,6 +1018,85 @@ test "modules: diamond named re-export keeps a shared originating binding" {
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__value__"));
 }
 
+
+test "modules: diamond import-then-export keeps a shared originating binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    // Branches import a named binding then re-export it locally; hub star-merge must see shared leaf provenance.
+    try ctx.modules.put("base", "export const value = 42;");
+    try ctx.modules.put("left", "import { value } from 'base'; export { value };");
+    try ctx.modules.put("right", "import { value } from 'base'; export { value };");
+    try ctx.modules.put("hub", "export * from 'left'; export * from 'right';");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import * as ns from 'hub';
+        \\globalThis.__value__ = ns.value;
+        \\globalThis.__hasValue__ = Object.prototype.hasOwnProperty.call(ns, 'value');
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try helpers.expectEvalEquals(id, "globalThis.__hasValue__", "true");
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__value__"));
+}
+
+test "modules: named import alias accepts newline around as" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Newline (and not only a single space) may separate the imported name from `as`.
+    const src =
+        \\import {value
+        \\as local} from 'dep';
+        \\export function read(){return local;}
+        \\globalThis.__read__ = read();
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__read__"));
+}
+
+test "modules: generated import ns name avoids colliding with module bindings" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // User binding `__jsbay_ns0` must not clash with the transform's first import namespace local.
+    const src =
+        \\import {value} from 'dep';
+        \\const __jsbay_ns0 = 7;
+        \\export const result = value + __jsbay_ns0;
+        \\globalThis.__result__ = result;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 49), try helpers.evalInt(id, "globalThis.__result__"));
+}
+
 test "modules: diamond renamed re-exports of distinct bindings stay ambiguous" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
