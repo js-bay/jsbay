@@ -379,6 +379,28 @@ test "modules: for-of iterable rewrites imported binding" {
     try testing.expectEqual(@as(i64, 42), got);
 }
 
+test "modules: imported binding rewritten in computed destructuring key" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Computed key `[value]` is an expression (must rewrite import); binding `x` stays local.
+    const src = "import { value } from 'dep';\nexport function read(){ const {[value]: x} = {42: 7}; return x; }\nglobalThis.__result__ = read();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 7), got);
+}
+
 test "modules: for-in right-hand side rewrites imported binding" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);

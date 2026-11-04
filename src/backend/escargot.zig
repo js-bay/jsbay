@@ -224,11 +224,10 @@ pub const EscargotBackend = struct {
     pub fn dataViewInfo(ctx: Context, v: Value) ?struct { bytes: []u8, byte_offset: usize, byte_length: usize } {
         var off: usize = 0;
         var len: usize = 0;
-        const ptr = c_api.escargot_data_view_data(ctx, v, &off, &len) orelse return null;
-        // Escargot ArrayBufferViewRef::rawBuffer() is already advanced by byteOffset
-        // (NAPI parity). NativeArgs.getDataView re-applies byte_offset onto buffer.bytes,
-        // so report a view-relative window with offset 0 (off captured only for the C ABI).
-        return .{ .bytes = ptr[0..len], .byte_offset = 0, .byte_length = len };
+        var buflen: usize = 0;
+        const ptr = c_api.escargot_data_view_data(ctx, v, &off, &len, &buflen) orelse return null;
+        // Full ArrayBuffer backing range + view window (matches JSC/QJS DataViewPayload contract).
+        return .{ .bytes = ptr[0..buflen], .byte_offset = off, .byte_length = len };
     }
     pub fn newDataViewFromBuffer(ctx: Context, ab: Value, byte_offset: usize, byte_length: usize) Value {
         return c_api.escargot_new_data_view(ctx, ab, byte_offset, byte_length);

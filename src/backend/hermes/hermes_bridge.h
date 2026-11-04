@@ -154,7 +154,8 @@ HermesValue hermes_new_typed_array(JsbayHermesContext *ctx, HermesValue ab, int 
 uint8_t *hermes_typed_array_data(JsbayHermesContext *ctx, HermesValue ta, size_t *byte_offset,
                                  size_t *byte_length, int *kind);
 HermesValue hermes_new_data_view(JsbayHermesContext *ctx, HermesValue ab, size_t byte_offset, size_t byte_length);
-uint8_t *hermes_data_view_data(JsbayHermesContext *ctx, HermesValue dv, size_t *byte_offset, size_t *byte_length);
+uint8_t *hermes_data_view_data(JsbayHermesContext *ctx, HermesValue dv, size_t *byte_offset, size_t *byte_length,
+                               size_t *buffer_byte_length);
 
 /* ---- Native function ---- */
 typedef HermesValue (*HermesNativeFn)(JsbayHermesContext *ctx, HermesValue this_val,
@@ -286,6 +287,9 @@ void hermes_uninstall_module_loader(JsbayHermesContext *ctx);
 HermesEvalResult hermes_eval_module(JsbayHermesContext *ctx, const char *src, size_t src_len,
                                     const char *filename, size_t filename_len);
 HermesEvalResult hermes_import_module(JsbayHermesContext *ctx, const char *specifier);
+/* Malloc'd ESM-to-CJS transform text (caller frees). Spike/test helper for rewriter checks. */
+char *hermes_esm_transform_source(const char *src, size_t src_len, const char *filename);
+
 
 /* Host Promise rejection tracker (Escargot-style). Prefer HermesInternal hooks;
    also used for module-shim top-level throws that settle via awaitThenable. */

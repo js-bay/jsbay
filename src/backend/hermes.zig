@@ -221,9 +221,10 @@ pub const HermesBackend = struct {
     pub fn dataViewInfo(ctx: Context, v: Value) ?struct { bytes: []u8, byte_offset: usize, byte_length: usize } {
         var off: usize = 0;
         var len: usize = 0;
-        const ptr = c_api.hermes_data_view_data(ctx, v, &off, &len) orelse return null;
-        // Bridge returns a pointer already advanced by byteOffset; NativeArgs re-applies offset.
-        return .{ .bytes = ptr[0..len], .byte_offset = 0, .byte_length = len };
+        var buflen: usize = 0;
+        const ptr = c_api.hermes_data_view_data(ctx, v, &off, &len, &buflen) orelse return null;
+        // Full ArrayBuffer backing range + view window (matches JSC/QJS DataViewPayload contract).
+        return .{ .bytes = ptr[0..buflen], .byte_offset = off, .byte_length = len };
     }
     pub fn newDataViewFromBuffer(ctx: Context, ab: Value, byte_offset: usize, byte_length: usize) Value {
         return c_api.hermes_new_data_view(ctx, ab, byte_offset, byte_length);

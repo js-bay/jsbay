@@ -121,7 +121,7 @@ pub extern fn hermes_array_buffer_data(ctx: ?*Context, ab: Value, out_len: *usiz
 pub extern fn hermes_new_typed_array(ctx: ?*Context, ab: Value, kind: c_int, byte_offset: usize, length: usize) Value;
 pub extern fn hermes_typed_array_data(ctx: ?*Context, ta: Value, byte_offset: *usize, byte_length: *usize, kind: *c_int) ?[*]u8;
 pub extern fn hermes_new_data_view(ctx: ?*Context, ab: Value, byte_offset: usize, byte_length: usize) Value;
-pub extern fn hermes_data_view_data(ctx: ?*Context, dv: Value, byte_offset: *usize, byte_length: *usize) ?[*]u8;
+pub extern fn hermes_data_view_data(ctx: ?*Context, dv: Value, byte_offset: *usize, byte_length: *usize, buffer_byte_length: *usize) ?[*]u8;
 pub const NativeDataFree = *const fn (ctx: ?*Context, user_data: ?*anyopaque) callconv(.c) void;
 pub extern fn hermes_make_function(ctx: ?*Context, name: [*:0]const u8, fn_ptr: NativeFn, user_data: ?*anyopaque) Value;
 pub extern fn hermes_make_function_ex(ctx: ?*Context, name: [*:0]const u8, fn_ptr: NativeFn, user_data: ?*anyopaque, free_ud: ?NativeDataFree) Value;

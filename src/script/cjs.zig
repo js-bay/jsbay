@@ -471,9 +471,7 @@ pub fn evalCachedCjs(
     version: []const u8,
 ) CjsCacheResult {
     if (!@import("build_options").bytecode_cache) return plainCjs(instance_id, source, filename);
-    // JSC/Escargot have no QJS-shaped CJS bytecode replay; Hermes .hbc is a different format
-    // (hermesCompileBytecode / hermesRunBytecode). Bypass so stale or engine-native blobs cannot
-    // block plain require()/evalAsCjs.
+    // JSC/Escargot have no QJS-shaped CJS bytecode replay; Hermes .hbc is a different format (hermesCompileBytecode / hermesRunBytecode). Bypass so stale or engine-native blobs cannot block plain require()/evalAsCjs.
     if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend))
         return plainCjs(instance_id, source, filename);
     // Small modules are cheaper to parse than to read/deserialize back.

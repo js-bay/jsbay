@@ -252,8 +252,9 @@ pub fn getBufferView(instance_id: i32, value: ActiveEngine.Value) ?BufferView {
             if (c_api.escargot_is_data_view(value)) {
                 var off: usize = 0;
                 var len: usize = 0;
-                const ptr = c_api.escargot_data_view_data(ctx, value, &off, &len) orelse return null;
-                return .{ .ptr = ptr, .len = len };
+                var buflen: usize = 0;
+                const ptr = c_api.escargot_data_view_data(ctx, value, &off, &len, &buflen) orelse return null;
+                return .{ .ptr = ptr + off, .len = len };
             }
             return null;
         },
@@ -271,8 +272,9 @@ pub fn getBufferView(instance_id: i32, value: ActiveEngine.Value) ?BufferView {
             if (c_api.hermes_is_data_view(ctx, value)) {
                 var off: usize = 0;
                 var len: usize = 0;
-                const ptr = c_api.hermes_data_view_data(ctx, value, &off, &len) orelse return null;
-                return .{ .ptr = ptr, .len = len };
+                var buflen: usize = 0;
+                const ptr = c_api.hermes_data_view_data(ctx, value, &off, &len, &buflen) orelse return null;
+                return .{ .ptr = ptr + off, .len = len };
             }
             return null;
         },

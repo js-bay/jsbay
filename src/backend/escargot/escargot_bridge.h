@@ -158,7 +158,8 @@ EscargotValue escargot_new_typed_array(EscargotContext *ctx, EscargotValue ab, i
 uint8_t *escargot_typed_array_data(EscargotContext *ctx, EscargotValue ta, size_t *byte_offset,
                                    size_t *byte_length, int *kind);
 EscargotValue escargot_new_data_view(EscargotContext *ctx, EscargotValue ab, size_t byte_offset, size_t byte_length);
-uint8_t *escargot_data_view_data(EscargotContext *ctx, EscargotValue dv, size_t *byte_offset, size_t *byte_length);
+uint8_t *escargot_data_view_data(EscargotContext *ctx, EscargotValue dv, size_t *byte_offset, size_t *byte_length,
+                                 size_t *buffer_byte_length);
 
 /* ---- Native function ---- */
 typedef EscargotValue (*EscargotNativeFn)(EscargotContext *ctx, EscargotValue this_val,

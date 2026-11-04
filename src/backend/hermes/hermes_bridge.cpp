@@ -309,12 +309,12 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
       if (detachedSet && detachedSet.has(src))
         throw new TypeError('Cannot perform ArrayBuffer.prototype.transfer on a detached ArrayBuffer');
       var len = abByteLengthGet.call(src);
-      // Spec: undefined keeps source length; otherwise ToIndex (null/NaN/+0/-0 -> 0).
+      // Spec: undefined keeps source length; otherwise ToNumber (unary +; BigInt throws TypeError) then ToIndex (null/NaN/+0/-0 -> 0).
       var n;
       if (newByteLength === undefined) {
         n = len;
       } else {
-        n = Number(newByteLength);
+        n = +newByteLength;
         if (n !== n || n === 0) {
           n = 0;
         } else {
@@ -1617,7 +1617,8 @@ extern "C" HermesValue hermes_new_data_view(JsbayHermesContext *c, HermesValue a
         return retainMove(c, DV.callAsConstructor(*c->rt, *asVal(ab), (double)byte_offset, (double)byte_length));
     } catch (...) { return nullptr; }
 }
-extern "C" uint8_t *hermes_data_view_data(JsbayHermesContext *c, HermesValue dv, size_t *byte_offset, size_t *byte_length) {
+extern "C" uint8_t *hermes_data_view_data(JsbayHermesContext *c, HermesValue dv, size_t *byte_offset, size_t *byte_length,
+                                            size_t *buffer_byte_length) {
     if (!c || !c->rt || !dv || !asVal(dv)->isObject()) return nullptr;
     try {
         auto o = asVal(dv)->getObject(*c->rt);
@@ -1635,16 +1636,18 @@ extern "C" uint8_t *hermes_data_view_data(JsbayHermesContext *c, HermesValue dv,
         if (off > cap || len > cap - off) return nullptr;
         if (byte_offset) *byte_offset = off;
         if (byte_length) *byte_length = len;
+        if (buffer_byte_length) *buffer_byte_length = cap;
         uint8_t *data = buf.data(*c->rt);
         if (!data) {
-            if (len == 0) {
+            // Empty ArrayBuffer: return a stable non-null sentinel for the zero-length full buffer.
+            if (cap == 0) {
                 static uint8_t empty_dv_sentinel;
                 return &empty_dv_sentinel;
             }
             return nullptr;
         }
-        // Return view-relative pointer; Zig dataViewInfo zeros byte_offset for getDataView.
-        return data + off;
+        // Full ArrayBuffer backing range; Zig dataViewInfo applies byte_offset/byte_length (JSC/QJS contract).
+        return data;
     } catch (...) { return nullptr; }
 }
 

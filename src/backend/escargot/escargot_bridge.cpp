@@ -1355,7 +1355,8 @@ extern "C" EscargotValue escargot_new_data_view(EscargotContext *c, EscargotValu
     if (!er.isSuccessful()) return nullptr;
     return retain(c, er.result);
 }
-extern "C" uint8_t *escargot_data_view_data(EscargotContext *c, EscargotValue dv, size_t *byte_offset, size_t *byte_length) {
+extern "C" uint8_t *escargot_data_view_data(EscargotContext *c, EscargotValue dv, size_t *byte_offset, size_t *byte_length,
+                                              size_t *buffer_byte_length) {
     (void)c;
     if (!dv || !asVal(dv)->isDataViewObject()) return nullptr;
     auto *view = asVal(dv)->asArrayBufferView();
@@ -1370,12 +1371,13 @@ extern "C" uint8_t *escargot_data_view_data(EscargotContext *c, EscargotValue dv
     size_t ab_len = buf->byteLength();
     size_t off = view->byteOffset();
     size_t len = view->byteLength();
-    uint8_t *p = view->rawBuffer(); // view-relative
+    uint8_t *p = view->rawBuffer(); // non-null when the view window is attached
     // Escargot OOB-after-resize zeros view offset/length and clears view rawBuffer while the backing store may still be live (m_wasResetByInvalidByteLength). That must not look like a legitimate empty DataView (which keeps a non-null view pointer into the buffer, or is the empty-on-empty-AB case). Match QuickJS → null / INVALID copy.
     if (!p) {
         if (len == 0 && off == 0 && ab_len == 0 && !base) {
             if (byte_offset) *byte_offset = 0;
             if (byte_length) *byte_length = 0;
+            if (buffer_byte_length) *buffer_byte_length = 0;
             static uint8_t empty_dv_sentinel;
             return &empty_dv_sentinel;
         }
@@ -1384,7 +1386,9 @@ extern "C" uint8_t *escargot_data_view_data(EscargotContext *c, EscargotValue dv
     if (off > ab_len || len > ab_len - off) return nullptr;
     if (byte_offset) *byte_offset = off;
     if (byte_length) *byte_length = len;
-    return p;
+    if (buffer_byte_length) *buffer_byte_length = ab_len;
+    // Full ArrayBuffer backing range; Zig dataViewInfo applies byte_offset/byte_length (JSC/QJS contract).
+    return base ? base : p;
 }
 
 struct NativeFnData {

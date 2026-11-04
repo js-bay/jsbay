@@ -284,6 +284,8 @@ static void blankRegexLiteral(std::string &out, size_t &i) {
 static void collectPatternBoundNames(const std::string &src, size_t &i, std::vector<std::string> &names);
 static std::vector<std::string> collectDeclaratorBoundNames(const std::string &src, size_t start);
 static std::vector<std::string> collectParamListBoundNames(const std::string &src, size_t open_paren);
+static bool takeBalancedBracketExpr(const std::string &src, size_t &i, size_t &expr_start, size_t &expr_end);
+static char prevSignificantChar(const std::string &src, size_t pos);
 
 // Skip strings/comments/regex roughly; return rewritten source with identifier replacements.
 // Template literal text is preserved, but `${...}` interpolations are rewritten recursively.
@@ -953,6 +955,26 @@ static std::string rewriteIdents(const std::string &src,
             continue;
         }
         if (c == '[') {
+            // Object literal / class-body / binding computed key: rewrite the interior as an expression (imports), not as bindings.
+            if (!cont.empty() && (cont.back() == Cont::ObjectLit || cont.back() == Cont::ClassBody)) {
+                char prev = 0;
+                size_t pk = out.size();
+                while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+                if (pk > 0) prev = out[pk - 1];
+                // Key position after `{` / `,` / class ASI `;`/`}` / `*` (generator) — not after `:` (nested array binding).
+                if (prev == '{' || prev == ',' ||
+                    (cont.back() == Cont::ClassBody && (prev == ';' || prev == '}' || prev == '*'))) {
+                    out.push_back('[');
+                    size_t es = 0, ee = 0;
+                    if (!takeBalancedBracketExpr(src, i, es, ee)) {
+                        while (i < src.size()) out.push_back(src[i++]);
+                        continue;
+                    }
+                    out += rewriteIdents(src.substr(es, ee - es), repl, scopes);
+                    out.push_back(']');
+                    continue;
+                }
+            }
             cont.push_back(Cont::Bracket);
             out.push_back(src[i++]);
             continue;
@@ -1206,7 +1228,8 @@ static std::string rewriteIdents(const std::string &src,
                 auto names = collectDeclaratorBoundNames(src, i);
                 if (id == "var") addVarBindings(names);
                 else addBindings(names);
-                int depth = 0;
+                // Nest stack distinguishes object vs array patterns so computed keys (`{[expr]: x}`) rewrite `expr`.
+                std::vector<char> nest;
                 while (i < src.size()) {
                     char ch = src[i];
                     if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') {
@@ -1231,20 +1254,43 @@ static std::string rewriteIdents(const std::string &src,
                         continue;
                     }
                     if (ch == '`') { copyTemplate(); continue; }
-                    if (ch == '{' || ch == '[' || ch == '(') { ++depth; out.push_back(src[i++]); continue; }
-                    if (ch == '}' || ch == ']' || ch == ')') {
-                        if (depth > 0) --depth;
+                    if (ch == '[') {
+                        char prev = prevSignificantChar(src, i);
+                        // Object-pattern computed key: rewrite the expression inside `[...]`, keep binding names untouched.
+                        if (!nest.empty() && nest.back() == '{' && (prev == '{' || prev == ',')) {
+                            out.push_back('[');
+                            size_t es = 0, ee = 0;
+                            if (!takeBalancedBracketExpr(src, i, es, ee)) {
+                                // Unterminated: copy remaining raw.
+                                while (i < src.size()) out.push_back(src[i++]);
+                                break;
+                            }
+                            out += rewriteIdents(src.substr(es, ee - es), repl, scopes);
+                            out.push_back(']');
+                            continue;
+                        }
+                        nest.push_back('[');
                         out.push_back(src[i++]);
                         continue;
                     }
-// Declarator initializer (depth 0) or binding-pattern default (depth > 0): rewrite imports in the expression.
+                    if (ch == '{' || ch == '(') {
+                        nest.push_back(ch);
+                        out.push_back(src[i++]);
+                        continue;
+                    }
+                    if (ch == '}' || ch == ']' || ch == ')') {
+                        if (!nest.empty()) nest.pop_back();
+                        out.push_back(src[i++]);
+                        continue;
+                    }
+                    // Declarator initializer (nest empty) or binding-pattern default (nest non-empty): rewrite imports in the expression.
                     if (ch == '=' &&
                         !(i + 1 < src.size() && (src[i + 1] == '>' || src[i + 1] == '=')) &&
                         !(i > 0 && (src[i - 1] == '=' || src[i - 1] == '!' || src[i - 1] == '<' ||
                                     src[i - 1] == '>' || src[i - 1] == '+' || src[i - 1] == '-' ||
                                     src[i - 1] == '*' || src[i - 1] == '/' || src[i - 1] == '%' ||
                                     src[i - 1] == '&' || src[i - 1] == '|' || src[i - 1] == '^'))) {
-                        const bool pattern_default = depth > 0;
+                        const bool pattern_default = !nest.empty();
                         out.push_back(src[i++]);
                         size_t is = i;
                         int d = 0;
@@ -1286,12 +1332,12 @@ static std::string rewriteIdents(const std::string &src,
                         out += rewriteIdents(src.substr(is, i - is), repl, scopes);
                         continue;
                     }
-                    if (ch == ';' && depth == 0) { out.push_back(src[i++]); break; }
+                    if (ch == ';' && nest.empty()) { out.push_back(src[i++]); break; }
                     if (isIdentStart(ch)) {
                         size_t n = i + 1;
                         while (n < src.size() && isIdent(src[n])) ++n;
                         // for-of / for-in header boundary: leave `of`/`in` + iterable for the outer rewrite pass.
-                        if (depth == 0) {
+                        if (nest.empty()) {
                             const std::string kw = src.substr(i, n - i);
                             if (kw == "of" || kw == "in") break;
                         }
@@ -1429,6 +1475,83 @@ static std::string trim(std::string s) {
     return s;
 }
 
+// Skip string / template / comment starting at `i` (for balanced-bracket scanners).
+static bool skipStringTemplateOrComment(const std::string &src, size_t &i) {
+    if (i >= src.size()) return false;
+    char ch = src[i];
+    if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+        i += 2;
+        while (i < src.size() && src[i] != '\n') ++i;
+        return true;
+    }
+    if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+        i += 2;
+        while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+        if (i + 1 < src.size()) i += 2;
+        return true;
+    }
+    if (ch == '\'' || ch == '"' || ch == '`') {
+        char q = ch; ++i;
+        while (i < src.size()) {
+            if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+            if (q == '`' && src[i] == '$' && i + 1 < src.size() && src[i + 1] == '{') {
+                i += 2; int nd = 1;
+                while (i < src.size() && nd > 0) {
+                    if (src[i] == '\'' || src[i] == '"' || src[i] == '`') {
+                        // Nested quotes inside ${}: reuse this helper via a local scan of quotes only for depth bookkeeping of braces.
+                        char nq = src[i]; ++i;
+                        while (i < src.size()) {
+                            if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                            if (src[i] == nq) { ++i; break; }
+                            ++i;
+                        }
+                        continue;
+                    }
+                    if (src[i] == '{') ++nd;
+                    else if (src[i] == '}') --nd;
+                    ++i;
+                }
+                continue;
+            }
+            if (src[i] == q) { ++i; break; }
+            ++i;
+        }
+        return true;
+    }
+    return false;
+}
+
+// `i` at `[`; on success leaves `i` past matching `]`, sets expr_start/expr_end to the interior.
+static bool takeBalancedBracketExpr(const std::string &src, size_t &i, size_t &expr_start, size_t &expr_end) {
+    if (i >= src.size() || src[i] != '[') return false;
+    ++i;
+    expr_start = i;
+    int d = 1;
+    while (i < src.size() && d > 0) {
+        if (skipStringTemplateOrComment(src, i)) continue;
+        char ch = src[i];
+        if (ch == '[') { ++d; ++i; continue; }
+        if (ch == ']') {
+            --d;
+            if (d == 0) { expr_end = i; ++i; return true; }
+            ++i;
+            continue;
+        }
+        ++i;
+    }
+    return false;
+}
+
+static char prevSignificantChar(const std::string &src, size_t pos) {
+    size_t p = pos;
+    while (p > 0) {
+        --p;
+        unsigned char c = static_cast<unsigned char>(src[p]);
+        if (!std::isspace(c)) return static_cast<char>(c);
+    }
+    return 0;
+}
+
 // Collect bound names from a binding pattern (`ident`, `{a, b: c}`, `[x, ...y]`).
 static void collectPatternBoundNames(const std::string &src, size_t &i, std::vector<std::string> &names) {
     while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
@@ -1448,7 +1571,74 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
                 i = j;
                 continue;
             }
-            if (src[i] == '{' || src[i] == '[') {
+            if (src[i] == '[') {
+                // Computed key `[expr]: binding` — do not collect names from expr; collect the binding after `:`.
+                size_t save = i;
+                size_t es = 0, ee = 0;
+                if (!takeBalancedBracketExpr(src, i, es, ee)) return;
+                (void)es; (void)ee;
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                if (i < src.size() && src[i] == ':') {
+                    ++i;
+                    collectPatternBoundNames(src, i, names);
+                    while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                    if (i < src.size() && src[i] == '=') {
+                        ++i;
+                        int depth = 0;
+                        while (i < src.size()) {
+                            char ch = src[i];
+                            if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                            if (ch == '\'' || ch == '"' || ch == '`') {
+                                char q = ch; ++i;
+                                while (i < src.size()) {
+                                    if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                                    if (src[i] == q) { ++i; break; }
+                                    ++i;
+                                }
+                                continue;
+                            }
+                            if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                            if (ch == '}' || ch == ']' || ch == ')') {
+                                if (depth == 0) break;
+                                --depth; ++i; continue;
+                            }
+                            if (depth == 0 && (ch == ',' || ch == '}')) break;
+                            ++i;
+                        }
+                    }
+                    continue;
+                }
+                // Nested array pattern (not a computed key).
+                i = save;
+                collectPatternBoundNames(src, i, names);
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                if (i < src.size() && src[i] == '=') {
+                    ++i;
+                    int depth = 0;
+                    while (i < src.size()) {
+                        char ch = src[i];
+                        if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                        if (ch == '\'' || ch == '"' || ch == '`') {
+                            char q = ch; ++i;
+                            while (i < src.size()) {
+                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                                if (src[i] == q) { ++i; break; }
+                                ++i;
+                            }
+                            continue;
+                        }
+                        if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                        if (ch == '}' || ch == ']' || ch == ')') {
+                            if (depth == 0) break;
+                            --depth; ++i; continue;
+                        }
+                        if (depth == 0 && (ch == ',' || ch == '}')) break;
+                        ++i;
+                    }
+                }
+                continue;
+            }
+            if (src[i] == '{') {
                 collectPatternBoundNames(src, i, names);
                 while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
                 if (i < src.size() && src[i] == '=') {
@@ -2372,6 +2562,12 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     // Non-thenable completion: returning the namespace would assimilate an export named `then` and hang awaitThenable.
     out += "return undefined;\n})";
     return out;
+}
+
+extern "C" char *hermes_esm_transform_source(const char *src, size_t src_len, const char *filename) {
+    if (!src) return nullptr;
+    std::string out = transformEsmToCjs(std::string(src, src_len), filename ? filename : "<transform>");
+    return dupCStringLocal(out);
 }
 
 static std::string resolveId(HermesModLoader *loader, const std::string &referrer, const std::string &specifier) {

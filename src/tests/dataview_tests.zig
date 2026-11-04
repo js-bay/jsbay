@@ -39,6 +39,9 @@ var g_big_i64: ?i64 = null;
 var g_f32_bits: ?u32 = null;
 var g_f64_bits: ?u64 = null;
 var g_is_dv: ?bool = null;
+var g_dv_off: ?usize = null;
+var g_dv_len: ?usize = null;
+var g_dv_buflen: ?usize = null;
 
 fn reset() void {
     g_i32_le = null;
@@ -49,6 +52,9 @@ fn reset() void {
     g_f32_bits = null;
     g_f64_bits = null;
     g_is_dv = null;
+    g_dv_off = null;
+    g_dv_len = null;
+    g_dv_buflen = null;
 }
 
 // ========================================================================
@@ -165,6 +171,15 @@ fn hIsDataView(_: i32, args: value.NativeArgs) value.NativeResult {
     return .{ .boolean = r };
 }
 
+// Report DataViewPayload window metadata: byte_offset must be the real view offset into the full backing buffer.
+fn hInspectDV(_: i32, args: value.NativeArgs) value.NativeResult {
+    const dv = args.getDataView(0) orelse return .null_val;
+    g_dv_off = dv.byte_offset;
+    g_dv_len = dv.byte_length;
+    g_dv_buflen = dv.buffer.bytes.len;
+    return .{ .number = @floatFromInt(dv.byte_offset) };
+}
+
 // ========================================================================
 // 1) Native -> JS: construct a DataView, verify in JS
 // ========================================================================
@@ -188,6 +203,26 @@ test "dataview: native constructs DataView at offset 4 / length 8; JS sees bytes
 // ========================================================================
 // 2) JS -> Native: read Int32 LE / BE at offset 4
 // ========================================================================
+
+test "dataview: JS-to-native preserves full backing buffer offset and length" {
+    reset();
+    const id = helpers.nextInstanceId();
+    try helpers.withEngine(id, .{}, struct {
+        fn run(inst: i32) !void {
+            value.registerFunction(inst, null, "inspectDV", &hInspectDV);
+            try helpers.expectEvalEquals(inst,
+                \\(function(){
+                \\  const ab = new ArrayBuffer(16);
+                \\  const dv = new DataView(ab, 4, 8);
+                \\  return String(inspectDV(dv));
+                \\})()
+            , "4");
+            try testing.expectEqual(@as(?usize, 4), g_dv_off);
+            try testing.expectEqual(@as(?usize, 8), g_dv_len);
+            try testing.expectEqual(@as(?usize, 16), g_dv_buflen);
+        }
+    }.run);
+}
 
 test "dataview: read Int32 with both endianness settings at offset 4" {
     reset();
