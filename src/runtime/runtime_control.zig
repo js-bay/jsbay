@@ -13,7 +13,7 @@
 //! - QuickJS: full native support via `JS_SetInterruptHandler`. The JS VM throws an InternalError on the next interrupt check.
 //! - JSC: uses the private `JSContextGroupSetExecutionTimeLimit` API (symbol ships in JavaScriptCore.framework, even though the public header hides it). The system JSC build exercised here needs the callback to explicitly re-arm its next 50ms check after it returns false, despite the upstream header documenting automatic continuation. This keeps `requestInterrupt` and execution deadlines responsive there. `runGc` uses the public `JSGarbageCollect` and is reliable on all JSC builds. Memory usage is not queryable through JSC's public C API and is reported as zeros.
 //! - Escargot: `runGc` → `Memory::gc`. Soft `getMemoryUsage` via `Memory::heapSize`/`totalSize`. No public heap cap (`setMemoryLimit` false). No mid-script interrupt in this pin.
-//! - Hermes: `runGc` via instrumentation collectGarbage. Soft `getMemoryUsage` via getHeapInfo. `setMemoryLimit` false (use EngineConfig.max_heap_size / -Dhermes-max-heap at create). User `requestInterrupt` is bit-only (no sticky Timeout AsyncBreak); mid-script abort via stop/destroy + softRearm/drain.
+//! - Hermes: `runGc` via `instrumentation().collectGarbage`. Soft `getMemoryUsage` via `getHeapInfo` (`hermes_allocatedBytes`/`hermes_heapSize`). `setMemoryLimit` false (use EngineConfig.max_heap_size / -Dhermes-max-heap at create; GCConfig.MaxHeapSize create-time only). User `requestInterrupt` sets a bit only (does **not** call `asyncTriggerTimeout` — sticky Timeout AsyncBreak would poison later evals); mid-script abort is via stop/destroy → `requestStopInterrupt` + softRearm/drain. Escargot: bit only, **no** mid-script abort.
 
 const std = @import("std");
 const io = @import("../platform/io.zig");
@@ -199,11 +199,51 @@ pub fn deinit(instance_id: i32) bool {
     return true;
 }
 
+fn hermesTriggerTimeout(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const inst = instance_map.getInstance(instance_id) orelse return;
+    const her = @import("../backend/hermes.zig");
+    her.c_api_mod.hermes_runtime_async_trigger_timeout(inst.monoRuntime().?);
+}
+
+fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const inst = instance_map.getInstance(instance_id) orelse return;
+    const her = @import("../backend/hermes.zig");
+    if (millis == 0) {
+        her.c_api_mod.hermes_runtime_unwatch_time_limit(inst.monoRuntime().?);
+        return;
+    }
+    const capped: u32 = if (millis > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(millis);
+    her.c_api_mod.hermes_runtime_watch_time_limit(inst.monoRuntime().?, capped);
+}
+
+fn hermesDrainAsyncTimeout(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const inst = instance_map.getInstance(instance_id) orelse return;
+    const her = @import("../backend/hermes.zig");
+    her.c_api_mod.hermes_runtime_drain_async_timeout(inst.monoRuntime().?);
+}
+
+/// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from requestStopInterrupt (destroy/stop) therefore kills finite work after a host callback (`hostDestroy(); 42`). Call from the host trampoline on the way back into JS: clear sticky bits on every eval-active instance on this thread (nested destroy can arm outer frames too), then arm a short watch so loops still abort soon.
+pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const et = @import("engine_thread.zig");
+    rearmOneHermesStop(instance_id);
+    et.forEachEvalActiveOnCurrentThread(rearmOneHermesStop);
+}
+
+fn rearmOneHermesStop(instance_id: i32) void {
+    if (!isStopRequested(instance_id)) return;
+    hermesDrainAsyncTimeout(instance_id);
+    hermesWatchTimeLimit(instance_id, 25);
+}
+
 /// Request that the JS runtime interrupt execution on the next interrupt check. Thread-safe. Returns false if the instance was never init()'d or has been deinit()'d.
 ///
 /// After the script throws, call `clearInterrupt` to reset the flag.
 /// True when `requestInterrupt` can abort mid-script JS (QuickJS/NG via interrupt handler; JSC via time-limit callback).
-/// Escargot/Hermes: false — user interrupt is not advertised as mid-script cancel.
+/// Escargot/Hermes spikes: false — user interrupt must not be advertised as mid-script cancel.
 pub fn supportsMidScriptUserInterrupt() bool {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng, .jsc => true,
@@ -211,9 +251,12 @@ pub fn supportsMidScriptUserInterrupt() bool {
     };
 }
 
+/// Request mid-script interrupt when the backend supports it.
+/// Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed).
+/// Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
     if (!supportsMidScriptUserInterrupt()) {
-        // Refuse mid-script claim for Escargot/Hermes; do not arm the user bit.
+        // Refuse to claim mid-script stop. Do not set the user bit (avoids false isInterruptRequested).
         registry_mutex.lock();
         defer registry_mutex.unlock();
         _ = registry.get(instance_id) orelse return false;
@@ -230,20 +273,30 @@ pub fn requestInterrupt(instance_id: i32) bool {
 /// Clear a pending user interrupt. Lifecycle shutdown owns a separate bit, so this cannot resume a script that is being stopped.
 pub fn clearInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const state = registry.get(instance_id) orelse return false;
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchAnd(~@as(u8, 1), .monotonic);
+    registry_mutex.unlock();
+    // Unwatch only — do not evaluate here (may race a live mid-script eval).
+    // Sticky Timeout AsyncBreak from stop/destroy is drained in clearStopInterrupt after join.
+    hermesWatchTimeLimit(instance_id, 0);
     return true;
 }
 
 /// Request an interrupt owned by lifecycle shutdown without clearing a caller's explicit interrupt request or a configured deadline.
 pub fn requestStopInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const state = registry.get(instance_id) orelse return false;
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchOr(2, .monotonic);
+    registry_mutex.unlock();
+    hermesTriggerTimeout(instance_id);
     return true;
 }
 
@@ -333,10 +386,16 @@ pub fn completeShutdownDrain(instance_id: i32) bool {
 
 pub fn clearStopInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const state = registry.get(instance_id) orelse return false;
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchAnd(~@as(u8, 2), .monotonic);
+    registry_mutex.unlock();
+    // threadStop → requestStopInterrupt → asyncTriggerTimeout is sticky on Hermes.
+    hermesWatchTimeLimit(instance_id, 0);
+    hermesDrainAsyncTimeout(instance_id);
     return true;
 }
 
@@ -356,6 +415,7 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     // Saturate instead of wrapping: an absurdly large `millis` must mean "effectively no deadline", never wrap to an already-expired one.
     const deadline = std.math.add(u64, now, millis) catch std.math.maxInt(u64);
     p.store(deadline, .monotonic);
+    // Hermes: do not arm IHermes watchTimeLimit here — an expired watch stays sticky and poisons later evals. Deadlines are enforced at job/sync wait boundaries via deadline_ms; mid-script cancel uses requestStopInterrupt → asyncTriggerTimeout.
     return true;
 }
 

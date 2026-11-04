@@ -335,6 +335,50 @@ test "modules: class method param shadows imported binding" {
     try testing.expectEqual(@as(i64, 2), got);
 }
 
+test "modules: named class method param shadows imported binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Named class declarations still schedule Cont::ClassBody for the following `{`; method params must open ParamList.
+    const src = "import { value } from 'dep';\nclass C { m(value) { return value; } }\nglobalThis.__result__ = new C().m(2);";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 2), got);
+}
+
+test "modules: extends class method param shadows imported binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // `class C extends Object {…}` must still treat the body as Cont::ClassBody so method params are not rewritten to the import.
+    const src = "import { value } from 'dep';\nclass C extends Object { m(value) { return value; } }\nglobalThis.__result__ = new C().m(2);";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 2), got);
+}
+
 test "modules: compound param default rewrites imported binding" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
