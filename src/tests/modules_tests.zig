@@ -974,6 +974,80 @@ test "modules: diamond named re-export keeps a shared originating binding" {
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__value__"));
 }
 
+test "modules: star re-export forwards renamed named re-export" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    // Lookup must use the immediate star source (left.renamed), not the leaf provenance namespace (base.renamed).
+    try ctx.modules.put("base", "export const original = 42;");
+    try ctx.modules.put("left", "export { original as renamed } from 'base';");
+    try ctx.modules.put("hub", "export * from 'left';");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import * as ns from 'hub';
+        \\globalThis.__renamed__ = ns.renamed;
+        \\globalThis.__hasRenamed__ = Object.prototype.hasOwnProperty.call(ns, 'renamed');
+        \\globalThis.__hasOriginal__ = Object.prototype.hasOwnProperty.call(ns, 'original');
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try helpers.expectEvalEquals(id, "globalThis.__hasRenamed__", "true");
+    try helpers.expectEvalEquals(id, "globalThis.__hasOriginal__", "false");
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__renamed__"));
+}
+
+test "modules: default export named generator function" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("m", "export default function* gen(){ yield 42; }");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import g from 'm';
+        \\globalThis.__v__ = g().next().value;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__v__"));
+}
+
+test "modules: default export anonymous generator function" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("m", "export default function*(){ yield 7; }");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import g from 'm';
+        \\globalThis.__v__ = g().next().value;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__v__"));
+}
+
+
 test "modules: circular imports do not deadlock" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
