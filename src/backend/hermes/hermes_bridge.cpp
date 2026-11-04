@@ -1189,13 +1189,41 @@ extern "C" bool hermes_bigint_to_u64_ctx(JsbayHermesContext *c, HermesValue v, u
     } catch (...) { return false; }
 }
 
+// Pristine Map.prototype.size / Set.prototype.size validate [[MapData]] / [[SetData]] without Object.prototype.toString / toStringTag.
+static bool hermesBrandIsMap(JsbayHermesContext *c, const jsi::Object &o) {
+    if (!c || !c->rt || !c->pristine_map_size_get) return false;
+    try {
+        auto s = c->pristine_map_size_get->callWithThis(*c->rt, o);
+        return s.isNumber();
+    } catch (...) {
+        return false;
+    }
+}
+static bool hermesBrandIsSet(JsbayHermesContext *c, const jsi::Object &o) {
+    if (!c || !c->rt || !c->pristine_set_size_get) return false;
+    try {
+        auto s = c->pristine_set_size_get->callWithThis(*c->rt, o);
+        return s.isNumber();
+    } catch (...) {
+        return false;
+    }
+}
+
 extern "C" bool hermes_is_map(JsbayHermesContext *c, HermesValue v) {
-    if (!c || !c->rt || !v) return false;
-    return instanceOfGlobal(*c->rt, *asVal(v), "Map");
+    if (!c || !c->rt || !v || !asVal(v)->isObject()) return false;
+    try {
+        return hermesBrandIsMap(c, asVal(v)->getObject(*c->rt));
+    } catch (...) {
+        return false;
+    }
 }
 extern "C" bool hermes_is_set(JsbayHermesContext *c, HermesValue v) {
-    if (!c || !c->rt || !v) return false;
-    return instanceOfGlobal(*c->rt, *asVal(v), "Set");
+    if (!c || !c->rt || !v || !asVal(v)->isObject()) return false;
+    try {
+        return hermesBrandIsSet(c, asVal(v)->getObject(*c->rt));
+    } catch (...) {
+        return false;
+    }
 }
 extern "C" HermesValue hermes_new_map(JsbayHermesContext *c) {
     if (!c || !c->rt) return nullptr;

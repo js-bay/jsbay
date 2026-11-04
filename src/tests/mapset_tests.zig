@@ -152,6 +152,18 @@ test "map: isMap rejects plain objects, arrays, Sets" {
     }.run);
 }
 
+test "map: isMap ignores Symbol.toStringTag spoofing" {
+    const id = helpers.nextInstanceId();
+    try helpers.withEngine(id, .{}, struct {
+        fn run(inst: i32) !void {
+            value.registerFunction(inst, null, "probe", &hProbeMap);
+            // Own toStringTag must not hide a real Map or promote a plain object.
+            try helpers.expectEvalEquals(inst, "(() => { const m = new Map(); m[Symbol.toStringTag] = 'Custom'; return String(probe(m)); })()", "true");
+            try helpers.expectEvalEquals(inst, "String(probe({ [Symbol.toStringTag]: 'Map' }))", "false");
+        }
+    }.run);
+}
+
 // ========================================================================
 // Set tests.
 // ========================================================================
@@ -208,6 +220,17 @@ test "set: isSet rejects arrays, Maps, plain objects" {
             try helpers.expectEvalEquals(inst, "String(probe(new Map()))", "false");
             try helpers.expectEvalEquals(inst, "String(probe({}))", "false");
             try helpers.expectEvalEquals(inst, "String(probe(new Set()))", "true");
+        }
+    }.run);
+}
+
+test "set: isSet ignores Symbol.toStringTag spoofing" {
+    const id = helpers.nextInstanceId();
+    try helpers.withEngine(id, .{}, struct {
+        fn run(inst: i32) !void {
+            value.registerFunction(inst, null, "probe", &hProbeSet);
+            try helpers.expectEvalEquals(inst, "(() => { const s = new Set(); s[Symbol.toStringTag] = 'Custom'; return String(probe(s)); })()", "true");
+            try helpers.expectEvalEquals(inst, "String(probe({ [Symbol.toStringTag]: 'Set' }))", "false");
         }
     }.run);
 }

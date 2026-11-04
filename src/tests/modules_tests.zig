@@ -466,6 +466,28 @@ test "modules: extends class method param shadows imported binding" {
     try testing.expectEqual(@as(i64, 2), got);
 }
 
+test "modules: class method key after preceding method is not rewritten" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Class ASI lets a second method key follow a preceding method's `}` without a semicolon; that key must stay a name, not an import rewrite.
+    const src = "import { value } from 'dep';\nexport const C = class { first() {} value() { return 2; } };\nglobalThis.__result__ = new C().value();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 2), got);
+}
+
 test "modules: compound param default rewrites imported binding" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);

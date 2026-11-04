@@ -1044,8 +1044,8 @@ static std::string rewriteIdents(const std::string &src,
                 while (before > 0 && std::isspace(static_cast<unsigned char>(out[before - 1]))) --before;
                 char bp = before > 0 ? out[before - 1] : '\0';
                 if (bp == '{' || bp == ',' || bp == '*') return true;
-                // Class fields/methods are often semicolon-separated.
-                if (in_class && bp == ';') return true;
+                // Class fields/methods are often semicolon-separated; ASI also allows the next method key right after a preceding method's closing `}`.
+                if (in_class && (bp == ';' || bp == '}')) return true;
                 // get / set / async / static before the method name.
                 if (before > 0 && isIdent(out[before - 1])) {
                     size_t ws = before;
@@ -1364,8 +1364,9 @@ static std::string rewriteIdents(const std::string &src,
                 k < src.size() && src[k] == '(') {
                 size_t pk = out.size();
                 while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+                // Class ASI: a preceding method's `}` is a valid boundary for the next method key (no semicolon required).
                 if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ',' || out[pk - 1] == '*' ||
-                               (in_class_body_for_key && out[pk - 1] == ';'))) {
+                               (in_class_body_for_key && (out[pk - 1] == ';' || out[pk - 1] == '}')))) {
                     method_key = true;
                 } else if (pk > 0 && (std::isalnum(static_cast<unsigned char>(out[pk - 1])) ||
                                       out[pk - 1] == '_' || out[pk - 1] == '$')) {
