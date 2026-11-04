@@ -447,8 +447,7 @@ pub fn runCommonJS(instance_id: i32, bytes: []const u8, filename: []const u8) Cj
             return .{ .err = "runCommonJS not supported on JSC", .err_is_heap = false };
         },
         .escargot, .hermes => {
-            // No stable bytecode blob on Escargot; Hermes .hbc path is separate (hermesCompileBytecode).
-            // Text CJS goes through require()/evalAsCjs + evalValue.
+            // No stable bytecode blob on Escargot; Hermes .hbc path is separate (hermesCompileBytecode). Text CJS goes through require()/evalAsCjs + evalValue.
             return .{ .err = "runCommonJS bytecode path not supported on Escargot/Hermes", .err_is_heap = false };
         },
     }

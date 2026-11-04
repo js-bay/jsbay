@@ -1339,18 +1339,27 @@ static std::string rewriteIdents(const std::string &src,
                 while (before > 0 && std::isspace(static_cast<unsigned char>(out[before - 1]))) --before;
                 return outEndsWithWord(before, "for");
             };
+            // `function` / `catch` introduce ParamList only as bare keywords — exclude member calls (`.catch(` / `.function(`).
+            auto isBareParamIntroKeyword = [&](size_t end, const char *w) -> bool {
+                if (!outEndsWithWord(end, w)) return false;
+                size_t n = std::strlen(w);
+                size_t before = end - n;
+                while (before > 0 && std::isspace(static_cast<unsigned char>(out[before - 1]))) --before;
+                if (before > 0 && out[before - 1] == '.') return false;
+                return true;
+            };
             if (opensForHead()) {
                 // Loop-header lexical bindings (`let`/`const`) live in this scope until the loop body ends.
                 kind = Cont::ForHead;
                 pushScope();
-            } else if (outEndsWithWord(pk2, "function") || outEndsWithWord(pk2, "catch") ||
-                outEndsWithWord(pk, "function") || outEndsWithWord(pk, "catch") ||
+            } else if (isBareParamIntroKeyword(pk2, "function") || isBareParamIntroKeyword(pk2, "catch") ||
+                isBareParamIntroKeyword(pk, "function") || isBareParamIntroKeyword(pk, "catch") ||
                 parenFollowedByArrow(i) || opensMethodParamList()) {
                 kind = Cont::ParamList;
                 pushFunctionScope();
                 in_param_default = false;
                 // Named function expression: bind the name in this function environment only.
-                if ((outEndsWithWord(pk2, "function") || outEndsWithWord(pk, "function")) &&
+                if ((isBareParamIntroKeyword(pk2, "function") || isBareParamIntroKeyword(pk, "function")) &&
                     !pending_named_expr_bindings.empty()) {
                     addBindings({pending_named_expr_bindings.back()});
                     pending_named_expr_bindings.pop_back();
@@ -1672,7 +1681,8 @@ static std::string rewriteIdents(const std::string &src,
                 if (pk > 0 && out[pk - 1] == '?') after_question = true;
             }
             size_t k = j;
-            while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
+            // Property-boundary lookahead must ignore comments (`{value /*c*/}` / `{value /*c*/: x}`), not only whitespace.
+            skipSpacesAndCommentsSrc(k);
             // Property keys are only excluded inside object literals; a following colon alone is also the consequent/alternate separator in `?:`.
             bool in_object_lit_for_key = !cont.empty() && cont.back() == Cont::ObjectLit;
             bool object_key = in_object_lit_for_key && !after_question && (k < src.size() && src[k] == ':' &&
@@ -1704,8 +1714,26 @@ static std::string rewriteIdents(const std::string &src,
                         method_key = true;
                 }
             }
+            // Labels live in a separate namespace from values: do not rewrite label declarations or `break`/`continue` label operands.
+            bool label_operand = false;
+            {
+                size_t lpk = out.size();
+                while (lpk > 0 && std::isspace(static_cast<unsigned char>(out[lpk - 1]))) --lpk;
+                if (outEndsWithWord(lpk, "break") || outEndsWithWord(lpk, "continue")) label_operand = true;
+            }
+            bool label_decl = false;
+            if (!after_dot && !after_question && !in_object_lit_for_key && !label_operand) {
+                size_t lk = j;
+                skipSpacesAndCommentsSrc(lk);
+                if (lk < src.size() && src[lk] == ':' && !(lk + 1 < src.size() && src[lk + 1] == ':')) {
+                    size_t lpk = out.size();
+                    while (lpk > 0 && std::isspace(static_cast<unsigned char>(out[lpk - 1]))) --lpk;
+                    // `case value:` is an expression, not a label declaration.
+                    if (!outEndsWithWord(lpk, "case")) label_decl = true;
+                }
+            }
             auto it = repl.find(id);
-            if (!after_dot && !object_key && !method_key && it != repl.end() && !isShadowed(id)) {
+            if (!after_dot && !object_key && !method_key && !label_decl && !label_operand && it != repl.end() && !isShadowed(id)) {
                 // Shorthand only for ObjectLit property context — not arrays, args, or blocks.
                 bool in_object_lit = !cont.empty() && cont.back() == Cont::ObjectLit;
                 bool after_shorthand_intro = false;
@@ -1950,6 +1978,32 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
             if (i < src.size() && src[i] == ':') {
                 ++i;
                 collectPatternBoundNames(src, i, names);
+                // Renamed binding may carry a default (`{x: y = value}`); skip it like shorthand/computed-key branches so initializer idents are not collected as locals.
+                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                if (i < src.size() && src[i] == '=') {
+                    ++i;
+                    int depth = 0;
+                    while (i < src.size()) {
+                        char ch = src[i];
+                        if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                        if (ch == '\'' || ch == '"' || ch == '`') {
+                            char q = ch; ++i;
+                            while (i < src.size()) {
+                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                                if (src[i] == q) { ++i; break; }
+                                ++i;
+                            }
+                            continue;
+                        }
+                        if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                        if (ch == '}' || ch == ']' || ch == ')') {
+                            if (depth == 0) break;
+                            --depth; ++i; continue;
+                        }
+                        if (depth == 0 && (ch == ',' || ch == '}')) break;
+                        ++i;
+                    }
+                }
             } else {
                 names.push_back(first);
                 if (i < src.size() && src[i] == '=') {
