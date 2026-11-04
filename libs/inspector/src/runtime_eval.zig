@@ -30,6 +30,7 @@ pub fn Module(comptime Host: type) type {
         const sendEvalException = remote_object.sendEvalException;
         const sendSimpleRemoteObject = remote_object.sendSimpleRemoteObject;
         const writeRemoteObject = remote_object.writeRemoteObject;
+        const writeConsoleChildRemoteObjectEx = remote_object.writeConsoleChildRemoteObjectEx;
         const writeRemoteObjectByValue = remote_object.writeRemoteObjectByValue;
         const parseObjectId = remote_object.parseObjectId;
         const buildEvalScript = remote_object.buildEvalScript;
@@ -146,7 +147,7 @@ pub fn Module(comptime Host: type) type {
             if (box.await_promise) {
                 if (value_opt) |value| {
                     defer ActiveEngine.freeValue(ctx, value);
-                    _ = @import("await_promise.zig").Module(Host).attach(state, box.session_id, box.request_id, ctx, value, box.return_by_value, if (box.object_group.len == 0) null else box.object_group);
+                    _ = @import("await_promise.zig").Module(Host).attach(state, box.session_id, box.request_id, ctx, value, box.return_by_value, if (box.object_group.len == 0) null else box.object_group, false);
                 } else {
                     sendInvalidParams(state, box.session_id, box.request_id, "awaitPromise requires a Promise result");
                 }
@@ -226,7 +227,9 @@ pub fn Module(comptime Host: type) type {
             }
 
             var group_copy: []u8 = &.{};
+            var object_group_supplied = false;
             if (params_val.object.get("objectGroup")) |g| {
+                object_group_supplied = true;
                 if (g == .string and g.string.len != 0) {
                     group_copy = alloc.dupe(u8, g.string) catch {
                         alloc.free(expr_copy);
@@ -314,6 +317,7 @@ pub fn Module(comptime Host: type) type {
                 .run_fn = runCallFunctionOn,
                 .expression = expr_copy,
                 .object_group = group_copy,
+                .call_object_group_supplied = object_group_supplied,
                 .call_this_id = this_id,
                 .call_has_this = has_this,
                 .call_args = args_owned,
@@ -369,11 +373,13 @@ pub fn Module(comptime Host: type) type {
 
             // Resolve `this` binding — either the retained target, or globalThis.
             var this_val: ActiveEngine.Value = undefined;
+            var console_origin = false;
             if (box.call_has_this) {
-                this_val = state.object_table.get(box.call_this_id) orelse {
+                this_val = state.object_table.getForSession(box.session_id, box.call_this_id) orelse {
                     sendObjectNotFound(state, box.session_id, box.request_id);
                     return;
                 };
+                console_origin = state.object_table.isConsole(box.call_this_id);
             } else {
                 this_val = global;
             }
@@ -393,7 +399,7 @@ pub fn Module(comptime Host: type) type {
                     .value_number => |n| ActiveEngine.newFloat64Val(ctx, n),
                     .value_string => |s| ActiveEngine.newStringVal(ctx, s),
                     .object_id => |oid| blk: {
-                        const stored = state.object_table.get(oid) orelse {
+                        const stored = state.object_table.getForSession(box.session_id, oid) orelse {
                             arg_build_failed = true;
                             break :blk ActiveEngine.newUndefinedVal(ctx);
                         };
@@ -417,8 +423,9 @@ pub fn Module(comptime Host: type) type {
             };
             defer ActiveEngine.freeValue(ctx, result);
 
+            const effective_console_origin = console_origin and (!box.call_object_group_supplied or std.mem.eql(u8, box.object_group, "console"));
             if (box.await_promise) {
-                _ = @import("await_promise.zig").Module(Host).attach(state, box.session_id, box.request_id, ctx, result, box.return_by_value, if (box.object_group.len == 0) null else box.object_group);
+                _ = @import("await_promise.zig").Module(Host).attach(state, box.session_id, box.request_id, ctx, result, box.return_by_value, if (box.object_group.len == 0) null else box.object_group, effective_console_origin);
                 return;
             }
 
@@ -433,7 +440,11 @@ pub fn Module(comptime Host: type) type {
                     return;
                 };
             } else {
-                writeRemoteObject(state, ctx, w, result, group_opt) catch return;
+                if (effective_console_origin) {
+                    writeConsoleChildRemoteObjectEx(state, ctx, w, result, box.session_id, false) catch return;
+                } else {
+                    writeRemoteObject(state, ctx, w, result, group_opt) catch return;
+                }
             }
             w.writeAll("}}") catch return;
             sendJson(state, box.session_id, aw.written());

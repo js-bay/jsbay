@@ -141,6 +141,49 @@ fn extractObject(text: []const u8, start: usize) ?[]const u8 {
     return null;
 }
 
+fn responseForMarker(text: []const u8, marker: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOf(u8, text, marker) orelse return null;
+    if (at == 0) return null;
+    return extractObject(text, at - 1);
+}
+
+fn commandResponse(session: *Session, params_method: []const u8, params: []const u8) ![]const u8 {
+    const start = session.conn.got.items.len;
+    const id = try session.conn.command(params_method, params);
+    const marker = try idMarker(session.conn.alloc, id);
+    defer session.conn.alloc.free(marker);
+    var replied = false;
+    var spins: usize = 0;
+    while (!replied and spins < 40) : (spins += 1) {
+        _ = dispatch.tickInstance(session.id);
+        replied = try session.conn.waitFrom(start, marker, 1);
+    }
+    try session.conn.expect(replied);
+    return responseForMarker(session.conn.got.items, marker) orelse error.TestUnexpectedResult;
+}
+
+fn responseObjectId(alloc: std.mem.Allocator, response: []const u8) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response, .{});
+    defer parsed.deinit();
+    const id = parsed.value.object.get("result").?.object.get("result").?.object.get("objectId").?.string;
+    return alloc.dupe(u8, id);
+}
+
+fn callConsoleObject(session: *Session, root_id: []const u8, object_group: ?[]const u8) ![]u8 {
+    const params = if (object_group) |group|
+        try std.fmt.allocPrint(session.conn.alloc, "{{\"objectId\":\"{s}\",\"functionDeclaration\":\"function() {{ return this; }}\",\"objectGroup\":\"{s}\"}}", .{ root_id, group })
+    else
+        try std.fmt.allocPrint(session.conn.alloc, "{{\"objectId\":\"{s}\",\"functionDeclaration\":\"function() {{ return this; }}\"}}", .{root_id});
+    defer session.conn.alloc.free(params);
+    return responseObjectId(session.conn.alloc, try commandResponse(session, "Runtime.callFunctionOn", params));
+}
+
+fn getPropertiesResponse(session: *Session, object_id: []const u8) ![]const u8 {
+    const params = try std.fmt.allocPrint(session.conn.alloc, "{{\"objectId\":\"{s}\"}}", .{object_id});
+    defer session.conn.alloc.free(params);
+    return commandResponse(session, "Runtime.getProperties", params);
+}
+
 fn nthConsoleEvent(
     alloc: std.mem.Allocator,
     text: []const u8,
@@ -356,7 +399,7 @@ test "cdp: discardConsoleEntries drops the replay buffer" {
     try testing.expectEqual(@as(usize, 0), countEvents(second.got.items));
 }
 
-test "cdp: console object handles are released when their buffered event is evicted" {
+test "cdp: console object handles remain available after their buffered event is evicted" {
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-console-evict-handles");
@@ -389,7 +432,192 @@ test "cdp: console object handles are released when their buffered event is evic
         replied = try session.conn.waitFrom(0, props_marker, 1);
     }
     try session.conn.expect(replied);
-    try testing.expect(std.mem.indexOf(u8, session.conn.got.items, "Could not find object with given id") != null);
+    const reply_marker = std.mem.lastIndexOf(u8, session.conn.got.items, props_marker) orelse return error.TestUnexpectedResult;
+    const reply = extractObject(session.conn.got.items, reply_marker - 1) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, reply, "\"name\":\"staleConsoleObject\"") != null);
+}
+
+test "cdp: Runtime.disable keeps previously delivered console handles" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-console-disable-handle");
+    defer session.deinit();
+    try enableRuntime(&session.conn);
+    const logged = engine.evalScript(session.id, "console.log({survivesDisable: true})", "console-disable.js");
+    defer discardEval(logged);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait("survivesDisable", 40));
+    var event = try nthConsoleEvent(alloc, session.conn.got.items, 0, 0);
+    defer event.deinit();
+    const object_id = event.value.object.get("params").?.object.get("args").?.array.items[0].object.get("objectId").?.string;
+    const object_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\"}}", .{object_id});
+    defer alloc.free(object_params);
+    const disable_id = try session.conn.command("Runtime.disable", "");
+    const disable_marker = try idMarker(alloc, disable_id);
+    defer alloc.free(disable_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(disable_marker, 40));
+    const props_id = try session.conn.command("Runtime.getProperties", object_params);
+    const props_marker = try idMarker(alloc, props_id);
+    defer alloc.free(props_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(props_marker, 40));
+    const reply = responseForMarker(session.conn.got.items, props_marker) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, reply, "survivesDisable") != null);
+}
+
+test "cdp: console handles are isolated by session and releaseObjectGroup only releases the caller" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-console-lease-a");
+    defer session.deinit();
+    var second = try openConn(alloc, inspector.boundPort(session.handle), "cdp-console-lease-a");
+    defer second.deinit();
+    try enableRuntime(&session.conn);
+    try enableRuntime(&second);
+
+    const logged = engine.evalScript(session.id, "console.log({sessionLease: {nestedLease: true}})", "console-lease.js");
+    defer discardEval(logged);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait("sessionLease", 40));
+    try second.expect(try second.wait("sessionLease", 40));
+
+    var a_event = try nthConsoleEvent(alloc, session.conn.got.items, 0, 0);
+    defer a_event.deinit();
+    const object_id = a_event.value.object.get("params").?.object.get("args").?.array.items[0].object.get("objectId").?.string;
+    const object_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\"}}", .{object_id});
+    defer alloc.free(object_params);
+
+    const release_id = try session.conn.command("Runtime.releaseObject", object_params);
+    const release_marker = try idMarker(alloc, release_id);
+    defer alloc.free(release_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(release_marker, 40));
+
+    const a_props_id = try session.conn.command("Runtime.getProperties", object_params);
+    const a_marker = try idMarker(alloc, a_props_id);
+    defer alloc.free(a_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(a_marker, 40));
+    const a_reply = responseForMarker(session.conn.got.items, a_marker) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, a_reply, "Could not find object with given id") != null);
+
+    const b_props_id = try second.command("Runtime.getProperties", object_params);
+    const b_marker = try idMarker(alloc, b_props_id);
+    defer alloc.free(b_marker);
+    _ = dispatch.tickInstance(session.id);
+    try second.expect(try second.wait(b_marker, 40));
+    const b_reply = responseForMarker(second.got.items, b_marker) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, b_reply, "sessionLease") != null);
+
+    const group_id = try second.command("Runtime.releaseObjectGroup", "{\"objectGroup\":\"console\"}");
+    const group_marker = try idMarker(alloc, group_id);
+    defer alloc.free(group_marker);
+    _ = dispatch.tickInstance(session.id);
+    try second.expect(try second.wait(group_marker, 40));
+    const released_props_id = try second.command("Runtime.getProperties", object_params);
+    const released_marker = try idMarker(alloc, released_props_id);
+    defer alloc.free(released_marker);
+    _ = dispatch.tickInstance(session.id);
+    try second.expect(try second.wait(released_marker, 40));
+    const released_reply = responseForMarker(second.got.items, released_marker) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, released_reply, "Could not find object with given id") != null);
+}
+
+test "cdp: console descendants remain session-owned through properties and callFunctionOn" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-console-descendants");
+    defer session.deinit();
+    try enableRuntime(&session.conn);
+    const logged = engine.evalScript(session.id, "console.log({child: {value: 9}})", "console-descendants.js");
+    defer discardEval(logged);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait("child", 40));
+    var event = try nthConsoleEvent(alloc, session.conn.got.items, 0, 0);
+    defer event.deinit();
+    const root_id = event.value.object.get("params").?.object.get("args").?.array.items[0].object.get("objectId").?.string;
+    const root_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\"}}", .{root_id});
+    defer alloc.free(root_params);
+
+    const props_id = try session.conn.command("Runtime.getProperties", root_params);
+    const props_marker = try idMarker(alloc, props_id);
+    defer alloc.free(props_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(props_marker, 40));
+    const props = responseForMarker(session.conn.got.items, props_marker) orelse return error.TestUnexpectedResult;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, props, .{});
+    defer parsed.deinit();
+    const child_id = parsed.value.object.get("result").?.object.get("result").?.array.items[0].object.get("value").?.object.get("objectId").?.string;
+    const child_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\"}}", .{child_id});
+    defer alloc.free(child_params);
+
+    const call_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\",\"functionDeclaration\":\"function() {{ return this; }}\"}}", .{root_id});
+    defer alloc.free(call_params);
+    const call_id = try session.conn.command("Runtime.callFunctionOn", call_params);
+    const call_marker = try idMarker(alloc, call_id);
+    defer alloc.free(call_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(call_marker, 40));
+    const call_reply = responseForMarker(session.conn.got.items, call_marker) orelse return error.TestUnexpectedResult;
+    var call_parsed = try std.json.parseFromSlice(std.json.Value, alloc, call_reply, .{});
+    defer call_parsed.deinit();
+    const call_id_value = call_parsed.value.object.get("result").?.object.get("result").?.object.get("objectId").?.string;
+    const call_object_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\"}}", .{call_id_value});
+    defer alloc.free(call_object_params);
+
+    const clear_id = try session.conn.command("Runtime.discardConsoleEntries", "");
+    const clear_marker = try idMarker(alloc, clear_id);
+    defer alloc.free(clear_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(clear_marker, 40));
+    const child_props_id = try session.conn.command("Runtime.getProperties", child_params);
+    const child_marker = try idMarker(alloc, child_props_id);
+    defer alloc.free(child_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(child_marker, 40));
+    const child_reply = responseForMarker(session.conn.got.items, child_marker) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, child_reply, "Could not find object with given id") != null);
+    const call_props_id = try session.conn.command("Runtime.getProperties", call_object_params);
+    const call_props_marker = try idMarker(alloc, call_props_id);
+    defer alloc.free(call_props_marker);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait(call_props_marker, 40));
+    const call_props_reply = responseForMarker(session.conn.got.items, call_props_marker) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, call_props_reply, "Could not find object with given id") != null);
+}
+
+test "cdp: callFunctionOn objectGroup controls console descendant ownership" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-console-call-groups");
+    defer session.deinit();
+    try enableRuntime(&session.conn);
+    const logged = engine.evalScript(session.id, "console.log({callGroupValue: 1})", "console-call-groups.js");
+    defer discardEval(logged);
+    _ = dispatch.tickInstance(session.id);
+    try session.conn.expect(try session.conn.wait("callGroupValue", 40));
+    var event = try nthConsoleEvent(alloc, session.conn.got.items, 0, 0);
+    defer event.deinit();
+    const root_id = event.value.object.get("params").?.object.get("args").?.array.items[0].object.get("objectId").?.string;
+
+    const default_id = try callConsoleObject(&session, root_id, null);
+    defer alloc.free(default_id);
+    const console_id = try callConsoleObject(&session, root_id, "console");
+    defer alloc.free(console_id);
+    const custom_id = try callConsoleObject(&session, root_id, "custom-call-group");
+    defer alloc.free(custom_id);
+    const empty_id = try callConsoleObject(&session, root_id, "");
+    defer alloc.free(empty_id);
+
+    _ = try commandResponse(&session, "Runtime.discardConsoleEntries", "");
+    try testing.expect(std.mem.indexOf(u8, try getPropertiesResponse(&session, default_id), "Could not find object with given id") != null);
+    try testing.expect(std.mem.indexOf(u8, try getPropertiesResponse(&session, console_id), "Could not find object with given id") != null);
+    try testing.expect(std.mem.indexOf(u8, try getPropertiesResponse(&session, custom_id), "callGroupValue") != null);
+    try testing.expect(std.mem.indexOf(u8, try getPropertiesResponse(&session, empty_id), "callGroupValue") != null);
+
+    _ = try commandResponse(&session, "Runtime.releaseObjectGroup", "{\"objectGroup\":\"custom-call-group\"}");
+    try testing.expect(std.mem.indexOf(u8, try getPropertiesResponse(&session, custom_id), "Could not find object with given id") != null);
 }
 
 test "cdp: discardConsoleEntries keeps non-console object handles" {

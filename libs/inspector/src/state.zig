@@ -53,12 +53,13 @@ pub fn Module(comptime Host: type) type {
         pub const BufferedConsole = struct {
             entries: [][]u8 = &.{},
             owned: bool = false,
+            failed: bool = false,
         };
 
-        // One buffered console event. `group` names exactly the ObjectTable entries retained while serializing this event; it is never exposed through CDP.
+        // One buffered console event. `object_ids` names exactly the ObjectTable entries retained while serializing this event; it is never exposed through CDP.
         pub const ConsoleEntry = struct {
             json: []u8,
-            group: ?[]u8 = null,
+            object_ids: []u64 = &.{},
         };
 
         // Test-only observation of whether a live Inspector owns a clean realm for Runtime reflection. It observes the registered state and creates nothing.
@@ -584,6 +585,16 @@ pub fn Module(comptime Host: type) type {
             return false;
         }
 
+        // Keep session membership and console-child admission under the state-to-object lock order so a closed session cannot acquire a new lease.
+        pub fn retainConsoleChildForLiveSession(state: *InspectorState, ctx: backend.ActiveEngine.Context, session_id: transport_mod.SessionId, value: backend.ActiveEngine.Value) ?u64 {
+            state.mutex.lock();
+            defer state.mutex.unlock();
+            for (state.sessions.items) |session| {
+                if (session.id == session_id) return state.object_table.retainConsoleChild(ctx, session_id, value);
+            }
+            return null;
+        }
+
         pub fn sessionCount(state: *InspectorState) usize {
             state.mutex.lock();
             defer state.mutex.unlock();
@@ -825,22 +836,53 @@ pub fn Module(comptime Host: type) type {
             state: *InspectorState,
             json: []const u8,
             ctx: ?backend.ActiveEngine.Context,
-            group: ?[]const u8,
+            object_ids: []const u64,
             enabled_out: *std.ArrayList(transport_mod.SessionId),
         ) !void {
             const copy = try state.allocator.dupe(u8, json);
-            const group_copy = if (group) |name| state.allocator.dupe(u8, name) catch {
+            const ids_copy = state.allocator.dupe(u64, object_ids) catch {
                 state.allocator.free(copy);
                 return error.OutOfMemory;
-            } else null;
+            };
 
             state.mutex.lock();
             state.console_entries.ensureTotalCapacity(state.allocator, state.console_entries.items.len + 1) catch {
                 state.mutex.unlock();
                 state.allocator.free(copy);
-                if (group_copy) |name| state.allocator.free(name);
+                state.allocator.free(ids_copy);
                 return error.OutOfMemory;
             };
+
+            const enabled_start = enabled_out.items.len;
+            for (state.sessions.items) |s| {
+                if (s.runtime_enabled) {
+                    enabled_out.append(state.allocator, s.id) catch {
+                        state.mutex.unlock();
+                        if (ctx) |js_ctx| {
+                            for (enabled_out.items[enabled_start..]) |granted| {
+                                for (object_ids) |id| _ = state.object_table.releaseConsoleLease(js_ctx, granted, id);
+                            }
+                        }
+                        enabled_out.shrinkRetainingCapacity(enabled_start);
+                        state.allocator.free(copy);
+                        state.allocator.free(ids_copy);
+                        return error.OutOfMemory;
+                    };
+                    state.object_table.grantConsoleLease(s.id, object_ids) catch {
+                        _ = enabled_out.pop();
+                        state.mutex.unlock();
+                        if (ctx) |js_ctx| {
+                            for (enabled_out.items[enabled_start..]) |granted| {
+                                for (object_ids) |id| _ = state.object_table.releaseConsoleLease(js_ctx, granted, id);
+                            }
+                        }
+                        enabled_out.shrinkRetainingCapacity(enabled_start);
+                        state.allocator.free(copy);
+                        state.allocator.free(ids_copy);
+                        return error.OutOfMemory;
+                    };
+                }
+            }
 
             var evicted: ?ConsoleEntry = null;
             const console_pending = state.console_entries.items.len - state.console_entries_head;
@@ -852,7 +894,7 @@ pub fn Module(comptime Host: type) type {
                     state.console_entries_head = 0;
                 }
             }
-            state.console_entries.appendAssumeCapacity(.{ .json = copy, .group = group_copy });
+            state.console_entries.appendAssumeCapacity(.{ .json = copy, .object_ids = ids_copy });
             if (state.console_entries_head >= 32) {
                 const pend = state.console_entries.items[state.console_entries_head..];
                 var write: usize = 0;
@@ -863,11 +905,6 @@ pub fn Module(comptime Host: type) type {
                 state.console_entries_head = 0;
             }
             _ = console_entry_live.fetchAdd(1, .monotonic);
-            for (state.sessions.items) |s| {
-                if (s.runtime_enabled) {
-                    enabled_out.append(state.allocator, s.id) catch {};
-                }
-            }
             state.mutex.unlock();
             if (evicted) |old| {
                 freeConsoleEntry(state, old, ctx);
@@ -877,15 +914,8 @@ pub fn Module(comptime Host: type) type {
 
         fn freeConsoleEntry(state: *InspectorState, entry: ConsoleEntry, ctx: ?backend.ActiveEngine.Context) void {
             state.allocator.free(entry.json);
-            if (entry.group) |name| {
-                defer state.allocator.free(name);
-                if (ctx) |js_ctx| {
-                    _ = state.object_table.releaseConsoleGroup(js_ctx, name);
-                } else {
-                    // Real QuickJS console callbacks always supply ArgView.ctx. A synthetic callback must not discard a group it cannot release.
-                    std.debug.assert(false);
-                }
-            }
+            defer state.allocator.free(entry.object_ids);
+            if (ctx) |js_ctx| state.object_table.releaseConsoleCache(js_ctx, entry.object_ids);
         }
 
         fn exerciseBufferConsoleEventAllocationFailure(allocator: std.mem.Allocator) !void {
@@ -905,13 +935,101 @@ pub fn Module(comptime Host: type) type {
             defer deinitConsoleBuffer(&state);
             var enabled: std.ArrayList(transport_mod.SessionId) = .empty;
             defer enabled.deinit(allocator);
-            try bufferConsoleEvent(&state, "console-json", null, "console-group", &enabled);
+            try bufferConsoleEvent(&state, "console-json", null, &.{}, &enabled);
         }
 
         pub const TestCases = if (@import("builtin").is_test) struct {
             pub fn consoleBufferReleasesEveryPartialAllocationFailure() !void {
                 const testing = std.testing;
                 try testing.checkAllAllocationFailures(testing.allocator, exerciseBufferConsoleEventAllocationFailure, .{});
+            }
+
+            pub fn closedSessionRejectsLateConsoleChildren() !void {
+                if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+                const testing = std.testing;
+                const engine = Host.engine;
+                const instance_id: i32 = 61_801;
+                const session_id: transport_mod.SessionId = 703;
+                try testing.expect(engine.create(instance_id, .{}));
+                defer engine.destroy(instance_id);
+                const ctx = engine.getContext(instance_id).?;
+                const value = backend.ActiveEngine.getGlobalObject(ctx);
+                defer backend.ActiveEngine.freeValue(ctx, value);
+
+                var state = InspectorState{
+                    .instance_id = instance_id,
+                    .allocator = testing.allocator,
+                    .transport = undefined,
+                    .title = &.{},
+                    .url = &.{},
+                    .target_id = &.{},
+                    .sessions = .empty,
+                    .object_table = ObjectTable.init(testing.allocator),
+                };
+                defer state.sessions.deinit(testing.allocator);
+                defer state.deinitSynchronization();
+                defer state.object_table.deinit(ctx);
+                try testing.expect(addSession(&state, session_id));
+                const retained_id = retainConsoleChildForLiveSession(&state, ctx, session_id, value).?;
+                try testing.expect(removeSession(&state, session_id));
+                state.object_table.markConsoleSessionClosed(session_id);
+                state.object_table.drainClosedConsoleSessions(ctx);
+                try testing.expect(state.object_table.get(retained_id) == null);
+                const entries_before_late_child = state.object_table.entries.count();
+                try testing.expect(retainConsoleChildForLiveSession(&state, ctx, session_id, value) == null);
+                try testing.expectEqual(entries_before_late_child, state.object_table.entries.count());
+            }
+
+            pub fn replayLeaseFailureClosesOnlyFailedSession() !void {
+                if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+                const testing = std.testing;
+                const engine = Host.engine;
+                const instance_id: i32 = 61_802;
+                const failed_session: transport_mod.SessionId = 704;
+                const healthy_session: transport_mod.SessionId = 705;
+                try testing.expect(engine.create(instance_id, .{}));
+                defer engine.destroy(instance_id);
+                const ctx = engine.getContext(instance_id).?;
+                const value = backend.ActiveEngine.getGlobalObject(ctx);
+                defer backend.ActiveEngine.freeValue(ctx, value);
+
+                var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = std.math.maxInt(usize), .resize_fail_index = std.math.maxInt(usize) });
+                var state = InspectorState{
+                    .instance_id = instance_id,
+                    .allocator = failing.allocator(),
+                    .transport = undefined,
+                    .title = &.{},
+                    .url = &.{},
+                    .target_id = &.{},
+                    .sessions = .empty,
+                    .object_table = ObjectTable.init(failing.allocator()),
+                };
+                defer state.sessions.deinit(failing.allocator());
+                defer state.deinitSynchronization();
+                defer state.object_table.deinit(ctx);
+                defer deinitConsoleBuffer(&state);
+                try testing.expect(addSession(&state, failed_session));
+                try testing.expect(addSession(&state, healthy_session));
+                const object_id = state.object_table.retainConsole(ctx, value, null).?;
+                try state.object_table.grantConsoleLease(failed_session, &.{});
+                var enabled: std.ArrayList(transport_mod.SessionId) = .empty;
+                defer enabled.deinit(failing.allocator());
+                try bufferConsoleEvent(&state, "replay-grant", ctx, &.{object_id}, &enabled);
+
+                failing.fail_index = failing.alloc_index + 2;
+                const replay = enableRuntimeAndCopyConsole(&state, failed_session);
+                try testing.expect(replay.failed);
+                try testing.expect(failing.has_induced_failure);
+                try testing.expect(state.object_table.getForSession(failed_session, object_id) == null);
+
+                failing.fail_index = std.math.maxInt(usize);
+                failing.resize_fail_index = std.math.maxInt(usize);
+                setSessionRuntimeEnabled(&state, healthy_session, true);
+                try bufferConsoleEvent(&state, "healthy-live", ctx, &.{object_id}, &enabled);
+                try testing.expectEqual(healthy_session, enabled.pop().?);
+                state.object_table.drainClosedConsoleSessions(ctx);
+                try testing.expect(!state.object_table.console_leases.contains(failed_session));
+                try testing.expect(state.object_table.getForSession(healthy_session, object_id) != null);
             }
 
             const lifecycle_test = struct {
@@ -1188,12 +1306,15 @@ pub fn Module(comptime Host: type) type {
         ) BufferedConsole {
             state.mutex.lock();
             defer state.mutex.unlock();
+            var found_session = false;
             for (state.sessions.items) |*s| {
                 if (s.id == session_id) {
                     s.runtime_enabled = true;
+                    found_session = true;
                     break;
                 }
             }
+            if (!found_session) return .{};
             const pending = state.console_entries.items[state.console_entries_head..];
             const n = pending.len;
             if (n == 0) return .{};
@@ -1207,6 +1328,20 @@ pub fn Module(comptime Host: type) type {
                 };
                 out[filled] = dup;
                 filled += 1;
+            }
+            for (pending) |entry| {
+                state.object_table.grantConsoleLease(session_id, entry.object_ids) catch {
+                    for (out) |entry_copy| state.allocator.free(entry_copy);
+                    state.allocator.free(out);
+                    for (state.sessions.items) |*session| {
+                        if (session.id == session_id) {
+                            session.runtime_enabled = false;
+                            break;
+                        }
+                    }
+                    state.object_table.markConsoleSessionClosed(session_id);
+                    return .{ .failed = true };
+                };
             }
             return .{ .entries = out, .owned = true };
         }
@@ -1227,7 +1362,11 @@ pub fn Module(comptime Host: type) type {
             state.mutex.unlock();
             const pending = entries.items[head..];
             const n = pending.len;
-            for (pending) |entry| freeConsoleEntry(state, entry, ctx);
+            for (pending) |entry| {
+                state.allocator.free(entry.json);
+                state.allocator.free(entry.object_ids);
+            }
+            state.object_table.discardConsole(ctx);
             entries.deinit(state.allocator);
             if (n != 0) _ = console_entry_live.fetchSub(n, .monotonic);
         }
@@ -1243,7 +1382,7 @@ pub fn Module(comptime Host: type) type {
             const n = pending.len;
             for (pending) |entry| {
                 state.allocator.free(entry.json);
-                if (entry.group) |name| state.allocator.free(name);
+                state.allocator.free(entry.object_ids);
             }
             entries.deinit(state.allocator);
             if (n != 0) _ = console_entry_live.fetchSub(n, .monotonic);

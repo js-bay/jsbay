@@ -170,7 +170,7 @@ const InspectorEnabledTests = if (@import("build_options").inspector) struct {
         const id = helpers.nextInstanceId();
         try testing.expect(engine.create(id, .{}));
         defer engine.destroy(id);
-        const handle = try inspector.start(id, .{});
+        const handle = try inspector.start(id, .{ .port = 0, .target_id = "cold-listener-console" });
 
         const evaluated = engine.evalScript(id, "globalThis.coldServerContract = 1;", "cold-contract-no-client.js");
         defer helpers.freeEvalResult(evaluated);
@@ -198,7 +198,7 @@ const InspectorEnabledTests = if (@import("build_options").inspector) struct {
         const id = helpers.nextInstanceId();
         try testing.expect(engine.create(id, .{}));
         defer engine.destroy(id);
-        const handle = try inspector.start(id, .{});
+        const handle = try inspector.start(id, .{ .port = 0, .target_id = "cold-listener-console" });
         defer inspector.stop(handle);
         cold_probe.resetDebugStackCopies();
         const evaluated = engine.evalScript(id, "console.log('cold listener');", "cold-listener-console.js");
