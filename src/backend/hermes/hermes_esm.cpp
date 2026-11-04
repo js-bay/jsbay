@@ -1,4 +1,5 @@
 // Hermes spike ESM ModuleLoader — host-side transform (Hermes pin disables native CJS/ESM codegen).
+//
 // Transforms a subset of import/export into a CommonJS-like wrapper evaluated via JSI.
 #include "hermes_bridge.h"
 
@@ -62,6 +63,14 @@ static bool isIdent(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
 
+// Collision-free CJS wrapper parameter names so user ESM bindings named `exports` / `require` / `module` / `__filename` / `__dirname` do not clash with factory params (params share the module body scope).
+static constexpr const char *kWrapExports = "__jsbay_exports";
+static constexpr const char *kWrapRequire = "__jsbay_require";
+static constexpr const char *kWrapModule = "__jsbay_module";
+static constexpr const char *kWrapFilename = "__jsbay_filename";
+static constexpr const char *kWrapDirname = "__jsbay_dirname";
+static constexpr const char *kWrapImportMeta = "__jsbay_import_meta";
+
 static bool canStartRegexLiteral(const std::string &preceding);
 static void blankRegexLiteral(std::string &out, size_t &i);
 
@@ -106,6 +115,7 @@ static std::string blankNonCode(const std::string &src) {
 
 
 // True when `/` after `preceding` can start a RegExp literal (vs division).
+//
 // Practical heuristic: regex-ok after operators / expression-intro keywords / punctuators and at start-of-input; division after identifiers, numbers, `)`, `]`, string/template closes.
 static bool canStartRegexLiteral(const std::string &preceding) {
     size_t pk = preceding.size();
@@ -161,6 +171,142 @@ static bool canStartRegexLiteral(const std::string &preceding) {
             --j;
         }
         return false;
+    }
+
+    if (prev == '}') {
+        // Closing `}` may end a statement block (regex ok: `if (…) {} /re/`) or an object/function expression (division: `x={}/y`).
+        int depth = 0;
+        size_t j = pk;
+        while (j > 0) {
+            char ch = preceding[j - 1];
+            if (ch == '}') {
+                ++depth;
+                --j;
+                continue;
+            }
+            if (ch == '{') {
+                --depth;
+                --j;
+                if (depth != 0) continue;
+                while (j > 0 && std::isspace(static_cast<unsigned char>(preceding[j - 1]))) --j;
+                if (j == 0) return true; // block at input start
+                char before = preceding[j - 1];
+                // Nested/adjacent statement blocks.
+                if (before == ';' || before == '{' || before == '}') return true;
+                if (before == ')') {
+                    // `if (…) {…}` / `while` / `for` / `switch` / `with` / `catch` / `function …(…) {…}`.
+                    int pdepth = 0;
+                    size_t k = j;
+                    while (k > 0) {
+                        char c2 = preceding[k - 1];
+                        if (c2 == ')') {
+                            ++pdepth;
+                            --k;
+                            continue;
+                        }
+                        if (c2 == '(') {
+                            --pdepth;
+                            --k;
+                            if (pdepth != 0) continue;
+                            while (k > 0 && std::isspace(static_cast<unsigned char>(preceding[k - 1]))) --k;
+                            size_t end = k;
+                            while (k > 0) {
+                                char w = preceding[k - 1];
+                                if (!(std::isalnum(static_cast<unsigned char>(w)) || w == '_' || w == '$')) break;
+                                --k;
+                            }
+                            std::string word = preceding.substr(k, end - k);
+                            if (word == "if" || word == "while" || word == "for" || word == "with" ||
+                                word == "switch" || word == "catch" || word == "function")
+                                return true;
+                            // Named function/catch: `function ident(` — look one token further back.
+                            while (k > 0 && std::isspace(static_cast<unsigned char>(preceding[k - 1]))) --k;
+                            size_t end2 = k;
+                            while (k > 0) {
+                                char w = preceding[k - 1];
+                                if (!(std::isalnum(static_cast<unsigned char>(w)) || w == '_' || w == '$')) break;
+                                --k;
+                            }
+                            std::string word2 = preceding.substr(k, end2 - k);
+                            if (word2 == "function" || word2 == "catch") return true;
+                            return false; // call/group expression body
+                        }
+                        --k;
+                    }
+                    return false;
+                }
+                // Arrow block body `=>{…}` ends an expression → division.
+                if (before == '>' && j >= 2 && preceding[j - 2] == '=') return false;
+                if (std::isalnum(static_cast<unsigned char>(before)) || before == '_' || before == '$') {
+                    size_t end = j;
+                    size_t k = j;
+                    while (k > 0) {
+                        char w = preceding[k - 1];
+                        if (!(std::isalnum(static_cast<unsigned char>(w)) || w == '_' || w == '$')) break;
+                        --k;
+                    }
+                    std::string word = preceding.substr(k, end - k);
+                    if (word == "else" || word == "try" || word == "finally" || word == "do" ||
+                        word == "catch" || word == "class" || word == "function")
+                        return true;
+                    // Expression keywords introducing an object literal.
+                    if (word == "return" || word == "throw" || word == "yield" || word == "await" ||
+                        word == "typeof" || word == "new" || word == "void" || word == "delete" ||
+                        word == "case" || word == "in" || word == "instanceof" || word == "of")
+                        return false;
+                    while (k > 0 && std::isspace(static_cast<unsigned char>(preceding[k - 1]))) --k;
+                    // `class Name extends Base {` — heritage ends with an ident.
+                    if (k >= 7 && preceding.compare(k - 7, 7, "extends") == 0) return true;
+                    size_t end2 = k;
+                    while (k > 0) {
+                        char w = preceding[k - 1];
+                        if (!(std::isalnum(static_cast<unsigned char>(w)) || w == '_' || w == '$')) break;
+                        --k;
+                    }
+                    std::string word2 = preceding.substr(k, end2 - k);
+                    if (word2 == "class" || word2 == "extends") return true;
+                    return false;
+                }
+                if (before == ':') {
+                    // `label:{…}` / `case 1:{…}` → statement; `key:{…}` in object → expression.
+                    size_t k = j - 1; // at ':'
+                    while (k > 0 && std::isspace(static_cast<unsigned char>(preceding[k - 1]))) --k;
+                    if (k > 0 && (preceding[k - 1] == '"' || preceding[k - 1] == '\'' || preceding[k - 1] == '`')) {
+                        char q = preceding[k - 1];
+                        --k;
+                        while (k > 0) {
+                            if (k >= 2 && preceding[k - 1] == '\\') {
+                                k -= 2;
+                                continue;
+                            }
+                            if (preceding[k - 1] == q) {
+                                --k;
+                                break;
+                            }
+                            --k;
+                        }
+                    } else {
+                        while (k > 0) {
+                            char w = preceding[k - 1];
+                            if (!(std::isalnum(static_cast<unsigned char>(w)) || w == '_' || w == '$')) break;
+                            --k;
+                        }
+                    }
+                    while (k > 0 && std::isspace(static_cast<unsigned char>(preceding[k - 1]))) --k;
+                    if (k > 0 && (preceding[k - 1] == '{' || preceding[k - 1] == ',')) return false;
+                    return true;
+                }
+                // Expression-introducing punctuators before `{` → object/expr → division.
+                if (before == '=' || before == '(' || before == '[' || before == ',' || before == '?' ||
+                    before == '!' || before == '~' || before == '&' || before == '|' || before == '^' ||
+                    before == '*' || before == '%' || before == '<' || before == '>' || before == '+' ||
+                    before == '-' || before == '.')
+                    return false;
+                return true;
+            }
+            --j;
+        }
+        return true; // unmatched `}` — statement-ish boundary
     }
 
     // Identifier / keyword / number token.
@@ -288,7 +434,9 @@ static bool takeBalancedBracketExpr(const std::string &src, size_t &i, size_t &e
 static char prevSignificantChar(const std::string &src, size_t pos);
 
 // Skip strings/comments/regex roughly; return rewritten source with identifier replacements.
+//
 // Template literal text is preserved, but `${...}` interpolations are rewritten recursively.
+//
 // Regex literals are copied verbatim so identifiers inside the pattern/flags are not rewritten.
 static std::string rewriteIdents(const std::string &src,
                                  const std::unordered_map<std::string, std::string> &repl,
@@ -485,9 +633,7 @@ static std::string rewriteIdents(const std::string &src,
         }
     };
 
-    // Scan a matched `{...}` body (or top-level range) for `let`/`const` bindings in this lexical scope only.
-    // Nested `{...}` blocks are skipped so their bindings stay in the child scope. Loop-header `let`/`const` (`for` / `for await`) are skipped here too — they get their own scope during rewrite rather than shadowing the enclosing function or block.
-    // Registering before rewriting lets references that textually precede the declarator resolve to the local binding (TDZ / closure capture), matching native ESM.
+    // Scan a matched `{...}` body (or top-level range) for `let`/`const` bindings in this lexical scope only. Nested `{...}` blocks are skipped so their bindings stay in the child scope. Loop-header `let`/`const` (`for` / `for await`) are skipped here too — they get their own scope during rewrite rather than shadowing the enclosing function or block. Registering before rewriting lets references that textually precede the declarator resolve to the local binding (TDZ / closure capture), matching native ESM.
     auto collectLexicalBindingsInRange = [&](size_t from, size_t to, std::unordered_set<std::string> &into) {
         size_t i = from;
         auto skipLineComment = [&]() {
@@ -919,8 +1065,7 @@ static std::string rewriteIdents(const std::string &src,
             if (next_brace_is_fn_body) {
                 kind = Cont::FnBody;
                 next_brace_is_fn_body = false;
-                // Param scope already pushed; body shares it (no extra scope).
-                // Collect function-scoped `var` bindings now so they shadow imports for the whole body, including references that appear before the declarator.
+                // Param scope already pushed; body shares it (no extra scope). Collect function-scoped `var` bindings now so they shadow imports for the whole body, including references that appear before the declarator.
                 if (!scopes.empty()) {
                     size_t body_start = i + 1;
                     int depth = 1;
@@ -1297,6 +1442,7 @@ static std::string rewriteIdents(const std::string &src,
             }
 
             // const / let / var — register declarator bindings; rewrite only initializer expressions.
+            //
             // `var` is function-scoped (or module-scoped): keep it active for the enclosing function, not the current block.
             if ((id == "const" || id == "let" || id == "var") && (i == 0 || !isIdent(src[i - 1]))) {
                 out += id;
@@ -1456,15 +1602,14 @@ static std::string rewriteIdents(const std::string &src,
                         addBindings({id});
                         out += id;
                         i = j;
-                        // `=>` handler sets next_brace_is_fn_body; for expr body pop on `;` approx.
-                        // Mark that an expression-body arrow owns this scope: handled when we see `=>` without `{` — pop at `;`/`,`/`)`/`}` depth 0 later via FnBody absence.
-                        // Use a sticky flag: Reuse next_brace: if `=>` not followed by `{`, pop after copying arrow expr in `=>` handler.
+                        // `=>` handler sets next_brace_is_fn_body; for expr body pop on `;` approx. Mark that an expression-body arrow owns this scope: handled when we see `=>` without `{` — pop at `;`/`,`/`)`/`}` depth 0 later via FnBody absence. Use a sticky flag: Reuse next_brace: if `=>` not followed by `{`, pop after copying arrow expr in `=>` handler.
                         continue;
                     }
                 }
             }
 
             // ParamList / destructuring bindings under ParamList: do not rewrite; register binding.
+            //
             // Default-initializer expressions (after `=` until `,`/`)`) may reference imports — allow rewrite.
             if (underParamList()) {
                 char p = prevSignificant();
@@ -2067,7 +2212,7 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
         // import.meta
         if (k + 4 < src.size() && src[k] == '.' && src.compare(k + 1, 4, "meta") == 0 &&
             (k + 5 >= src.size() || !isIdent(src[k + 5]))) {
-            out += "(__jsbay_import_meta)";
+            out += std::string("(") + kWrapImportMeta + ")";
             i = k + 5;
             return true;
         }
@@ -2100,7 +2245,7 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
             return true;
         }
         if (arg >= src.size() || src[arg] != ')') return false;
-        out += "Promise.resolve().then(function(){ return require(";
+        out += std::string("Promise.resolve().then(function(){ return ") + kWrapRequire + "(";
         out.push_back(q);
         out += spec;
         out.push_back(q);
@@ -2242,7 +2387,7 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
 
 // ESM namespace export: getter-only live forwarding. Local updates stay visible; importer writes fail (no namespace setter).
 static std::string exportLiveGetter(const std::string &exported, const std::string &expr) {
-    return "Object.defineProperty(exports,\"" + exported +
+    return std::string("Object.defineProperty(") + kWrapExports + ",\"" + exported +
            "\",{enumerable:true,configurable:true,get:function(){return " + expr + ";}});";
 }
 
@@ -2431,7 +2576,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     eatImports();
 
     // Re-export dependency loads go into the static prelude (native ESM: all static deps before module body).
+    //
     // Process named and star re-exports left-to-right so prelude require order matches source order.
+    //
     // Each entry is (module, require-line); merged with ordinary imports by static_dep_occs source order below.
     std::vector<std::pair<std::string, std::string>> reexport_prelude;
     std::vector<std::string> star_reexport_nss;
@@ -2450,7 +2597,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             if (take_star) {
                 std::string mod = body.substr(m_star.position(2), m_star.length(2));
                 std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
-                reexport_prelude.push_back({mod, "var " + ns + " = require(\"" + mod + "\");"});
+                reexport_prelude.push_back({mod, "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + mod + "\");"});
                 star_reexport_nss.push_back(ns);
                 body.replace(m_star.position(), m_star.length(), "");
             } else {
@@ -2458,7 +2605,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 std::string specs = body.substr(m_named.position(1), m_named.length(1));
                 std::string mod = body.substr(m_named.position(3), m_named.length(3));
                 std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
-                reexport_prelude.push_back({mod, "var " + ns + " = require(\"" + mod + "\");"});
+                reexport_prelude.push_back({mod, "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + mod + "\");"});
                 std::string repl;
                 size_t pos = 0;
                 while (pos < specs.size()) {
@@ -2500,7 +2647,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             static const std::regex re_def(R"(export\s+default\s+)");
             blanked = blankNonCode(body);
             if (std::regex_search(blanked, m, re_def)) {
-                body.replace(m.position(), m.length(), "exports.default = ");
+                body.replace(m.position(), m.length(), std::string(kWrapExports) + ".default = ");
             }
         }
     }
@@ -2574,6 +2721,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     }
 
     // Build require prelude + live import bindings.
+    //
     // Ordinary imports and re-export dependencies share one source-ordered static dependency prelude (native ESM init order).
     std::unordered_map<std::string, std::string> ident_repl;
     int ns_i = 0;
@@ -2584,7 +2732,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         if (!mod_to_ns.count(ib.module)) {
             std::string ns = "__jsbay_ns" + std::to_string(ns_i++);
             mod_to_ns[ib.module] = ns;
-            import_require_line[ib.module] = "var " + ns + " = require(\"" + ib.module + "\");";
+            import_require_line[ib.module] = "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + ib.module + "\");";
         }
         if (ib.local.empty()) continue; // side-effect only
         std::string ns = mod_to_ns[ib.module];
@@ -2634,13 +2782,12 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // Star re-exports: track originating binding across deps; omit ambiguous names unless an explicit export already resolved them.
-    // Intermediate namespace objects from a diamond (a and b both re-export the same base binding) must not mark the name ambiguous — compare leaf origins, and record origins on this module for further star re-exports.
+    // Star re-exports: track originating binding across deps; omit ambiguous names unless an explicit export already resolved them. Intermediate namespace objects from a diamond (a and b both re-export the same base binding) must not mark the name ambiguous — compare leaf origins, and record origins on this module for further star re-exports.
     if (!star_reexport_nss.empty()) {
         std::string star;
         star += "var __jsbay_star_prov=Object.create(null);";
-        star += "if(!Object.prototype.hasOwnProperty.call(exports,\"__jsbay_star_origin\"))";
-        star += "Object.defineProperty(exports,\"__jsbay_star_origin\",{value:Object.create(null),configurable:true});";
+        star += std::string("if(!Object.prototype.hasOwnProperty.call(") + kWrapExports + ",\"__jsbay_star_origin\"))";
+        star += std::string("Object.defineProperty(") + kWrapExports + ",\"__jsbay_star_origin\",{value:Object.create(null),configurable:true});";
         for (const auto &ns : star_reexport_nss) {
             star += "Object.keys(" + ns + ").forEach(function(k){";
             star += "if(k===\"default\"||k===\"__jsbay_star_origin\")return;";
@@ -2652,16 +2799,18 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         star += "Object.keys(__jsbay_star_prov).forEach(function(k){";
         star += "var __jsbay_src=__jsbay_star_prov[k];";
         star += "if(__jsbay_src==null)return;";
-        star += "if(Object.prototype.hasOwnProperty.call(exports,k))return;";
-        star += "Object.defineProperty(exports,k,{enumerable:true,configurable:true,get:function(){return __jsbay_src[k];}});";
-        star += "exports.__jsbay_star_origin[k]=__jsbay_src;";
+        star += std::string("if(Object.prototype.hasOwnProperty.call(") + kWrapExports + ",k))return;";
+        star += std::string("Object.defineProperty(") + kWrapExports + ",k,{enumerable:true,configurable:true,get:function(){return __jsbay_src[k];}});";
+        star += std::string(kWrapExports) + ".__jsbay_star_origin[k]=__jsbay_src;";
         star += "});";
         post_epilogue.push_back(star);
     }
 
     body = rewriteIdents(body, ident_repl);
 
-    std::string out = "(async function(exports,require,module,__filename,__dirname,__jsbay_import_meta){\n\"use strict\";\n";
+    std::string out = std::string("(async function(") + kWrapExports + "," + kWrapRequire + "," +
+        kWrapModule + "," + kWrapFilename + "," + kWrapDirname + "," + kWrapImportMeta +
+        "){\n\"use strict\";\n";
     for (auto &p : prelude) out += p + "\n";
     out += body;
     out += "\n";

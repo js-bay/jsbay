@@ -82,6 +82,7 @@ struct EscargotContextOpaque {
     std::vector<std::pair<std::string, PersistentRefHolder<ScriptRef>>> module_cache;
 
     // Host promise-rejection tracker (VMInstanceRef::registerPromiseRejectCallback).
+    //
     // Queue unhandled rejects; flush after microtask drain (process_pending_jobs).
     struct PendingRejection {
         ValueRef *promise = nullptr; // retained via protect map
@@ -247,15 +248,11 @@ static void flushPendingRejections(EscargotContextOpaque *c) {
 
 extern "C" void escargot_globals_ensure(void) { ensureGlobals(); }
 
-// Depth of nested enter/leave on this OS thread. Threaded Escargot keeps TLS/GC state
-// per thread; runtime_new enters so VMInstanceRef::create is safe on any caller thread,
-// and runtime_free leaves once the VM is destroyed. engine_thread also enter/leaves.
+// Depth of nested enter/leave on this OS thread. Threaded Escargot keeps TLS/GC state per thread; runtime_new enters so VMInstanceRef::create is safe on any caller thread, and runtime_free leaves once the VM is destroyed. engine_thread also enter/leaves.
 static thread_local int g_escargot_thread_depth = 0;
 
 extern "C" void escargot_thread_enter(void) {
-    // ENABLE_THREADING: g_globalsInited is thread_local; each OS thread that touches
-    // Escargot must initializeThread (Shell/cctest pattern). No-op when vendor is
-    // non-threaded (supportsThreading()==false).
+    // ENABLE_THREADING: g_globalsInited is thread_local; each OS thread that touches Escargot must initializeThread (Shell/cctest pattern). No-op when vendor is non-threaded (supportsThreading()==false).
     if (!Globals::supportsThreading()) return;
     if (g_escargot_thread_depth == 0 && !Globals::isInitialized()) {
         Globals::initializeThread();
@@ -277,8 +274,7 @@ extern "C" bool escargot_supports_threading(void) {
 
 extern "C" EscargotRuntime *escargot_runtime_new(void) {
     ensureGlobals();
-    // Same-thread engines (and creators on thread B after A already call_once'd globals)
-    // must still initialize this thread before VMInstanceRef::create.
+    // Same-thread engines (and creators on thread B after A already call_once'd globals) must still initialize this thread before VMInstanceRef::create.
     escargot_thread_enter();
     auto *rt = new EscargotRuntimeOpaque();
     try {
@@ -563,6 +559,7 @@ static int32_t escargotToInt32Number(double d) {
 }
 
 // ECMAScript ToNumber into *out. On failure sets pending throw and returns false.
+//
 // Prefer ToNumber semantics (unary +) over Number(...): BigInt must TypeError like QuickJS/JSC.
 static bool escargotToNumber(EscargotContext *c, EscargotValue v, double *out) {
     if (!out) return false;
@@ -2333,8 +2330,7 @@ PlatformRef::LoadModuleResult BridgePlatform::onLoadModule(
     if (!parsed.isSuccessful()) {
         return LoadModuleResult(parsed.parseErrorCode, parsed.parseErrorMessage);
     }
-    // Cache before return so circular imports find this ScriptRef while its own
-    // dependencies are still loading (didLoadModule also caches; cacheModule is idempotent).
+    // Cache before return so circular imports find this ScriptRef while its own dependencies are still loading (didLoadModule also caches; cacheModule is idempotent).
     cacheModule(c, absPath, parsed.script.get());
     return LoadModuleResult(parsed.script.get());
 }

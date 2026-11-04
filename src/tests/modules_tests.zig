@@ -722,6 +722,93 @@ test "modules: regex initializer comma does not invent a local binding" {
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__result__"));
 }
 
+test "modules: top-level lexical bindings may use CJS wrapper param names" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Factory params must use collision-free internals so these module-body lexicals parse and export.
+    const src =
+        \\export const module = 42;
+        \\export const exports = 7;
+        \\export const require = 3;
+        \\export const __filename = 11;
+        \\export const __dirname = 13;
+        \\globalThis.__module__ = module;
+        \\globalThis.__exports__ = exports;
+        \\globalThis.__require__ = require;
+        \\globalThis.__filename_bind__ = __filename;
+        \\globalThis.__dirname_bind__ = __dirname;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__module__"));
+    try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__exports__"));
+    try testing.expectEqual(@as(i64, 3), try helpers.evalInt(id, "globalThis.__require__"));
+    try testing.expectEqual(@as(i64, 11), try helpers.evalInt(id, "globalThis.__filename_bind__"));
+    try testing.expectEqual(@as(i64, 13), try helpers.evalInt(id, "globalThis.__dirname_bind__"));
+}
+
+test "modules: exported CJS-param-named bindings are visible to importers" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("mod", "export const module = 42; export const exports = 7;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import { module, exports } from 'mod';
+        \\globalThis.__module__ = module;
+        \\globalThis.__exports__ = exports;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__module__"));
+    try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__exports__"));
+}
+
+test "modules: regex literal after braced if-statement is not rewritten as import" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // After `if (…) {}`, `/value/` must stay a RegExp (not become an import member reference).
+    const src =
+        \\import { value } from 'dep';
+        \\export function read() {
+        \\  let hit = false;
+        \\  if (true) {}
+        \\  /value/.test('value') && (hit = true);
+        \\  return hit && value === 42;
+        \\}
+        \\globalThis.__result__ = read();
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try helpers.expectEvalEquals(id, "globalThis.__result__", "true");
+}
+
 test "modules: regex initializer does not publish a ghost export name" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
