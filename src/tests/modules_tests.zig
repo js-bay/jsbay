@@ -313,6 +313,28 @@ test "modules: object method param shadows imported binding" {
     try testing.expectEqual(@as(i64, 2), got);
 }
 
+test "modules: class method param shadows imported binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Class-body methods are Cont::ClassBody (not ObjectLit); params must still open ParamList so `value` is not rewritten to the import.
+    const src = "import { value } from 'dep';\nexport const C = class { m(value) { return value; } };\nglobalThis.__result__ = new C().m(2);";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 2), got);
+}
+
 test "modules: compound param default rewrites imported binding" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
@@ -390,9 +412,7 @@ test "modules: circular imports do not deadlock" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
-    // Classic A↔B cycle. Escargot leaves the reverse *named* import of a function
-    // in TDZ even after evaluation, so bPlusA must not call aFn — the unused
-    // import still establishes the cycle; aPlusB proves the forward cross-call.
+    // Classic A↔B cycle. Escargot leaves the reverse *named* import of a function in TDZ even after evaluation, so bPlusA must not call aFn — the unused import still establishes the cycle; aPlusB proves the forward cross-call.
     // Calls run after evalModule (top-level calls during linking hit TDZ).
     try ctx.modules.put("a",
         \\import { bFn } from 'b';

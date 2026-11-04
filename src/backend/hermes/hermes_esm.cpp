@@ -590,11 +590,13 @@ static std::string rewriteIdents(const std::string &src,
         return {body_start, body_end};
     };
 
-    // Container stack: ObjectLit vs Block vs Bracket vs Paren/ParamList.
-    enum class Cont : uint8_t { ObjectLit, Block, Bracket, Paren, ParamList, FnBody, ForHead };
+    // Container stack: ObjectLit vs Block vs ClassBody vs Bracket vs Paren/ParamList.
+    enum class Cont : uint8_t { ObjectLit, Block, ClassBody, Bracket, Paren, ParamList, FnBody, ForHead };
     std::vector<Cont> cont;
     // When a ParamList `)` is followed by `{`, the next `{` is FnBody and pops the param scope on `}`.
     bool next_brace_is_fn_body = false;
+    // `class` / `class Name` / `class … extends …` schedules the next non-object-literal `{` as ClassBody (nested classes nest the counter).
+    int class_body_braces_pending = 0;
     // After `for (let|const …)` / `for await (…)`, pop the loop-header scope when its body ends: entries are `cont.size()` after the ForHead `)` — matched when a Block at that depth closes, or a `;` ends a non-braced body.
     std::vector<size_t> for_scope_pop_at_block_depth;
     std::vector<size_t> for_scope_pop_at_stmt_depth;
@@ -646,7 +648,7 @@ static std::string rewriteIdents(const std::string &src,
     auto underParamList = [&]() -> bool {
         for (auto it = cont.rbegin(); it != cont.rend(); ++it) {
             if (*it == Cont::ParamList) return true;
-            if (*it == Cont::FnBody || *it == Cont::Block) return false;
+            if (*it == Cont::FnBody || *it == Cont::Block || *it == Cont::ClassBody) return false;
         }
         return false;
     };
@@ -835,6 +837,15 @@ static std::string rewriteIdents(const std::string &src,
                 }
             } else if (prevIsObjectLitIntro()) {
                 kind = Cont::ObjectLit;
+            } else if (class_body_braces_pending > 0) {
+                kind = Cont::ClassBody;
+                --class_body_braces_pending;
+                pushScope();
+                // Class fields are not let/const; static blocks / method bodies are nested and collected in their own scopes.
+                if (!scopes.empty()) {
+                    auto range = balancedBlockInterior(i);
+                    collectLexicalBindingsInRange(range.first, range.second, scopes.back());
+                }
             } else {
                 kind = Cont::Block;
                 pushScope();
@@ -852,15 +863,17 @@ static std::string rewriteIdents(const std::string &src,
             if (!cont.empty()) {
                 Cont kind = cont.back();
                 cont.pop_back();
-                if (kind == Cont::Block) {
+                if (kind == Cont::Block || kind == Cont::ClassBody) {
                     popScope();
                     // Loop-header scope whose body was this block, or a single-statement body that ended in a braced statement (`if`/`while`/…).
-                    if (!for_scope_pop_at_block_depth.empty() && cont.size() == for_scope_pop_at_block_depth.back()) {
-                        for_scope_pop_at_block_depth.pop_back();
-                        popScope();
-                    } else if (!for_scope_pop_at_stmt_depth.empty() && cont.size() == for_scope_pop_at_stmt_depth.back()) {
-                        for_scope_pop_at_stmt_depth.pop_back();
-                        popScope();
+                    if (kind == Cont::Block) {
+                        if (!for_scope_pop_at_block_depth.empty() && cont.size() == for_scope_pop_at_block_depth.back()) {
+                            for_scope_pop_at_block_depth.pop_back();
+                            popScope();
+                        } else if (!for_scope_pop_at_stmt_depth.empty() && cont.size() == for_scope_pop_at_stmt_depth.back()) {
+                            for_scope_pop_at_stmt_depth.pop_back();
+                            popScope();
+                        }
                     }
                 } else if (kind == Cont::FnBody) {
                     // End of function/catch body — drop the ParamList scope.
@@ -947,9 +960,11 @@ static std::string rewriteIdents(const std::string &src,
                 skipSpacesSrc(p);
                 return p + 1 < src.size() && src[p] == '=' && src[p + 1] == '>';
             };
-            // Object method params: `{ m(value) {…} }`, `{ [k](a){} }`, `{ *g(a){} }`, `{ async m(a){} }`, `{ get x(){} }`.
+            // Object / class method params: `{ m(value) {…} }`, `class { m(value) {…} }`, `{ [k](a){} }`, `{ *g(a){} }`, `{ async m(a){} }`, `{ get x(){} }`, `static m(a){}`.
             auto opensMethodParamList = [&]() -> bool {
-                if (cont.empty() || cont.back() != Cont::ObjectLit) return false;
+                const bool in_obj = !cont.empty() && cont.back() == Cont::ObjectLit;
+                const bool in_class = !cont.empty() && cont.back() == Cont::ClassBody;
+                if (!in_obj && !in_class) return false;
                 size_t end = pk; // trailing spaces already stripped into pk
                 if (end == 0) return false;
                 // Computed method name ends with `]`.
@@ -961,12 +976,15 @@ static std::string rewriteIdents(const std::string &src,
                 while (before > 0 && std::isspace(static_cast<unsigned char>(out[before - 1]))) --before;
                 char bp = before > 0 ? out[before - 1] : '\0';
                 if (bp == '{' || bp == ',' || bp == '*') return true;
-                // get / set / async before the method name.
+                // Class fields/methods are often semicolon-separated.
+                if (in_class && bp == ';') return true;
+                // get / set / async / static before the method name.
                 if (before > 0 && isIdent(out[before - 1])) {
                     size_t ws = before;
                     while (ws > 0 && isIdent(out[ws - 1])) --ws;
                     std::string prev_word = out.substr(ws, before - ws);
                     if (prev_word == "get" || prev_word == "set" || prev_word == "async") return true;
+                    if (in_class && prev_word == "static") return true;
                 }
                 return false;
             };
@@ -1097,6 +1115,16 @@ static std::string rewriteIdents(const std::string &src,
                     out += fname;
                     i = n;
                 }
+                if (id == "class") {
+                    // Only real class declarations/expressions (`class {` / `class X {` / `class … extends …`), not `{ class(){} }` / `{ class: 1 }`.
+                    size_t la = i;
+                    while (la < src.size() && std::isspace(static_cast<unsigned char>(src[la]))) ++la;
+                    bool is_decl = la < src.size() && src[la] == '{';
+                    if (!is_decl && la + 7 <= src.size() && src.compare(la, 7, "extends") == 0 &&
+                        (la + 7 == src.size() || !isIdent(src[la + 7])))
+                        is_decl = true;
+                    if (is_decl) ++class_body_braces_pending;
+                }
                 continue;
             }
 
@@ -1206,8 +1234,8 @@ static std::string rewriteIdents(const std::string &src,
                 size_t k = j;
                 skipSpacesSrc(k);
                 if (k + 1 < src.size() && src[k] == '=' && src[k + 1] == '>' &&
-                    (cont.empty() || cont.back() == Cont::Block || cont.back() == Cont::FnBody ||
-                     cont.back() == Cont::Paren || cont.back() == Cont::ForHead ||
+                    (cont.empty() || cont.back() == Cont::Block || cont.back() == Cont::ClassBody ||
+                     cont.back() == Cont::FnBody || cont.back() == Cont::Paren || cont.back() == Cont::ForHead ||
                      cont.back() == Cont::ObjectLit || cont.back() == Cont::Bracket)) {
                     char p = prevSignificant();
                     // Only treat as param if not a call/member and looks like expression start.
@@ -1254,13 +1282,15 @@ static std::string rewriteIdents(const std::string &src,
             bool in_object_lit_for_key = !cont.empty() && cont.back() == Cont::ObjectLit;
             bool object_key = in_object_lit_for_key && !after_question && (k < src.size() && src[k] == ':' &&
                                                  !(k + 1 < src.size() && src[k + 1] == ':'));
-            // Method / accessor keys (`value()`, `get value()`, `set value()`, `async value()`, `*value()`) are names, not references.
+            // Method / accessor keys (`value()`, `get value()`, `set value()`, `async value()`, `*value()`, class `static value()`) are names, not references.
             bool method_key = false;
-            if (!after_dot && !after_question && in_object_lit_for_key &&
+            bool in_class_body_for_key = !cont.empty() && cont.back() == Cont::ClassBody;
+            if (!after_dot && !after_question && (in_object_lit_for_key || in_class_body_for_key) &&
                 k < src.size() && src[k] == '(') {
                 size_t pk = out.size();
                 while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
-                if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ',' || out[pk - 1] == '*')) {
+                if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ',' || out[pk - 1] == '*' ||
+                               (in_class_body_for_key && out[pk - 1] == ';'))) {
                     method_key = true;
                 } else if (pk > 0 && (std::isalnum(static_cast<unsigned char>(out[pk - 1])) ||
                                       out[pk - 1] == '_' || out[pk - 1] == '$')) {
@@ -1273,7 +1303,8 @@ static std::string rewriteIdents(const std::string &src,
                             break;
                     }
                     std::string prev_word = out.substr(start, pk - start);
-                    if (prev_word == "get" || prev_word == "set" || prev_word == "async")
+                    if (prev_word == "get" || prev_word == "set" || prev_word == "async" ||
+                        (in_class_body_for_key && prev_word == "static"))
                         method_key = true;
                 }
             }

@@ -1982,7 +1982,11 @@ static bool hermesIsConstructor(jsi::Runtime &rt, const jsi::Value &v) {
 
 extern "C" HermesOpResult hermes_set_property_result(JsbayHermesContext *c, HermesValue obj, const char *key, HermesValue val) {
     HermesOpResult out{nullptr, nullptr};
-    if (!c || !c->rt || !obj || !key) return out;
+    if (!c || !c->rt || !key) return out;
+    // hermes_undefined() is nullptr; null is a retained Null value. Both must TypeError (SetV / ToObject), not empty OpResult/OOM.
+    if (!obj || asVal(obj)->isUndefined() || asVal(obj)->isNull()) {
+        return hopFail(c, makeTypeError(*c->rt, "Cannot convert undefined or null to object"));
+    }
     try {
         if (!asVal(obj)->isObject()) {
             return hopFail(c, makeTypeError(*c->rt, "cannot set property of non-object"));
@@ -2365,9 +2369,11 @@ static void fireHermesExtBox(void *data) {
 
 extern "C" HermesValue hermes_new_external(JsbayHermesContext *c, void *ptr, HermesExternalFinalizer fin) {
     if (!c || !c->rt) return nullptr;
+    HermesExtBox *box = nullptr;
+    JsbayHermesContextOpaque::PendingFinal *pf = nullptr;
     try {
-        auto *box = new HermesExtBox{ptr, fin};
-        auto *pf = new JsbayHermesContextOpaque::PendingFinal{&fireHermesExtBox, box, false};
+        box = new HermesExtBox{ptr, fin};
+        pf = new JsbayHermesContextOpaque::PendingFinal{&fireHermesExtBox, box, false};
         {
             std::lock_guard<std::mutex> lock(c->finals_mu);
             c->pending_finals.push_back(pf);
@@ -2377,6 +2383,19 @@ extern "C" HermesValue hermes_new_external(JsbayHermesContext *c, void *ptr, Her
         o.setNativeState(*c->rt, state);
         return retainMove(c, jsi::Value(std::move(o)));
     } catch (...) {
+        // Construction failed after pending_finals registration — drop without firing user finalizer; leave payload with the caller.
+        if (pf) {
+            std::lock_guard<std::mutex> lock(c->finals_mu);
+            auto &vec = c->pending_finals;
+            vec.erase(std::remove(vec.begin(), vec.end(), pf), vec.end());
+            delete pf;
+            pf = nullptr;
+        }
+        if (box) {
+            box->fin = nullptr;
+            delete box;
+            box = nullptr;
+        }
         return nullptr;
     }
 }
