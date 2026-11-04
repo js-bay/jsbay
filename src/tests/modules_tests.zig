@@ -643,6 +643,109 @@ test "modules: function declaration shadows import for earlier references in the
     try testing.expectEqual(@as(i64, 2), try helpers.evalInt(id, "globalThis.__result__"));
 }
 
+test "modules: named function expression does not shadow import in enclosing expression" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Named function expression binds only inside itself; the later `value` must resolve to the import.
+    const src =
+        \\import { value } from 'dep';
+        \\export function read() {
+        \\  return [function value() { return 2; }, value][1];
+        \\}
+        \\globalThis.__result__ = read();
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__result__"));
+}
+
+test "modules: named class expression does not shadow import in enclosing expression" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import { value } from 'dep';
+        \\export function read() {
+        \\  return [class value {}, value][1];
+        \\}
+        \\globalThis.__result__ = read();
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__result__"));
+}
+
+test "modules: regex initializer comma does not invent a local binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // A comma inside `/,value/` must not be treated as a declarator separator that registers `value` locally.
+    const src =
+        \\import { value } from 'dep';
+        \\export function read() {
+        \\  const re = /,value/;
+        \\  return value;
+        \\}
+        \\globalThis.__result__ = read();
+        \\globalThis.__re__ = String(/,value/);
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__result__"));
+}
+
+test "modules: regex initializer does not publish a ghost export name" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    try ctx.modules.put("mod", "export const pattern = /,ghost/;");
+    const src =
+        \\import * as ns from 'mod';
+        \\globalThis.__hasPattern__ = Object.prototype.hasOwnProperty.call(ns, 'pattern');
+        \\globalThis.__hasGhost__ = Object.prototype.hasOwnProperty.call(ns, 'ghost');
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try helpers.expectEvalEquals(id, "globalThis.__hasPattern__", "true");
+    try helpers.expectEvalEquals(id, "globalThis.__hasGhost__", "false");
+}
+
 test "modules: diamond star re-export keeps a shared originating binding" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);

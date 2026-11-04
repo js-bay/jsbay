@@ -183,8 +183,7 @@ static std::string valueToJsString(FbHermesRuntime &rt, const jsi::Value &result
 
 extern "C" void hermes_globals_ensure(void) {}
 
-// max_heap_bytes==0 → Hermes default MaxHeapSize (3GiB). Non-zero sets GCConfig at
-// Runtime create time only; there is no runtime setMemoryLimit on Hermes.
+// max_heap_bytes==0 → Hermes default MaxHeapSize (3GiB). Non-zero sets GCConfig at Runtime create time only; there is no runtime setMemoryLimit on Hermes.
 extern "C" JsbayHermesRuntime *hermes_runtime_new(uint64_t max_heap_bytes) {
     auto *rt = new JsbayHermesRuntimeOpaque();
     auto gc_builder = ::hermes::vm::GCConfig::Builder();
@@ -1712,8 +1711,7 @@ static HermesValue hermesMakeFunctionOwned(JsbayHermesContext *c, const char *na
                     std::string msg = ctx->pending_throw;
                     ctx->pending_throw.clear();
                     if (out) hermes_free_value(ctx, out);
-                    // Must share one libstdc++ with hermesvm/jsi (see addHermesSources: shared .so,
-                    // not a second static libstdc++.a) or JSError RTTI/unwind ABRTs.
+                    // Must share one libstdc++ with hermesvm/jsi (see addHermesSources: shared .so, not a second static libstdc++.a) or JSError RTTI/unwind ABRTs.
                     throw jsi::JSError(rt, msg);
                 }
                 if (!out) return jsi::Value::undefined();
@@ -1972,8 +1970,7 @@ static jsi::Value makeTypeError(jsi::Runtime &rt, const char *msg) {
         if (err.isObject()) {
             err.getObject(rt).setProperty(rt, "name", "TypeError");
         }
-        // If page TypeError is still a proper function with [[Construct]] and prototype, prefer it
-        // only when its name stays TypeError after construct — otherwise keep the Error+name path.
+        // If page TypeError is still a proper function with [[Construct]] and prototype, prefer it only when its name stays TypeError after construct — otherwise keep the Error+name path.
         try {
             auto TE = rt.global().getPropertyAsFunction(rt, "TypeError");
             auto te = TE.callAsConstructor(rt, msg ? msg : "TypeError");
@@ -2842,8 +2839,7 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
         out.err = dupCString("null source");
         return out;
     }
-    // Prefer a temp path whose basename matches the caller's filename so -g1
-    // debug info / stack traces carry "my-module.js" etc.
+    // Prefer a temp path whose basename matches the caller's filename so -g1 debug info / stack traces carry "my-module.js" etc.
     std::string base = "script.js";
     if (filename && filename_len) {
         std::string f(filename, filename_len);
@@ -2863,8 +2859,7 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
         base = clean.empty() ? "script.js" : clean;
     }
     std::string js_path = std::string("/tmp/jsbay-hbc-XXXXXX-") + base;
-    // mkstemps needs the template to end with the suffix after XXXXXX
-    // Use a fixed suffix ".js" template then rename to include basename.
+    // mkstemps needs the template to end with the suffix after XXXXXX. Use a fixed suffix ".js" template then rename to include basename.
     char js_tmpl[] = "/tmp/jsbay-hbc-XXXXXX.js";
     char hbc_path[] = "/tmp/jsbay-hbc-XXXXXX.hbc";
     int js_fd = mkstemps(js_tmpl, 3);
@@ -3005,8 +3000,7 @@ extern "C" HermesEvalResult hermes_run_bytecode_ex(JsbayHermesContext *c, const 
         if (out_decode_failed) *out_decode_failed = 1;
         return out;
     }
-    // Validate HBC header before execution. Script exceptions must never set decode_failed
-    // (cache.zig would delete+retry and re-run side effects).
+    // Validate HBC header before execution. Script exceptions must never set decode_failed (cache.zig would delete+retry and re-run side effects).
     if (len < 8) {
         hermesEvalSetErr(out, "bytecode buffer too short for HBC header");
         if (out_decode_failed) *out_decode_failed = 1;
@@ -3272,9 +3266,7 @@ extern "C" bool hermes_set_rejection_tracker(JsbayHermesContext *ctx, int32_t in
                 return true;
             }
             auto hiObj = hi.getObject(rt);
-            // Do not wrap global setTimeout/clearTimeout. allRejections delivers
-            // onUnhandled/onHandled directly; timer interception would accelerate
-            // ordinary application delays of 100/2000ms into microtasks.
+            // Do not wrap global setTimeout/clearTimeout. allRejections delivers onUnhandled/onHandled directly; timer interception would accelerate ordinary application delays of 100/2000ms into microtasks.
             auto enable = hiObj.getProperty(rt, "enablePromiseRejectionTracker");
             if (enable.isObject() && enable.getObject(rt).isFunction(rt)) {
                 auto hostUnhandled = jsi::Function::createFromHostFunction(

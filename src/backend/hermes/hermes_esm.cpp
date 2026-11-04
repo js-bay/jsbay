@@ -571,17 +571,57 @@ static std::string rewriteIdents(const std::string &src,
                 std::string id = src.substr(i, j - i);
                 if (id == "function" || id == "class") {
                     i = j;
-                    // Register the declaration name for this enclosing scope before skipping nested params/body, so references that textually precede the declarator bind locally (TDZ / import shadowing), matching native ESM.
-                    size_t name_pos = i;
-                    while (name_pos < src.size() && std::isspace(static_cast<unsigned char>(src[name_pos]))) ++name_pos;
-                    if (id == "function" && name_pos < src.size() && src[name_pos] == '*') {
-                        ++name_pos;
+                    // Declaration names bind in this enclosing scope; expression names stay inside the nested function/class environment only.
+                    auto isExprContextBefore = [&](size_t kw_pos) -> bool {
+                        size_t pk = kw_pos;
+                        while (pk > from && std::isspace(static_cast<unsigned char>(src[pk - 1]))) --pk;
+                        // `async function` keeps the context from before `async`.
+                        if (pk >= 5 && src.compare(pk - 5, 5, "async") == 0 &&
+                            (pk == 5 || !isIdent(src[pk - 6]))) {
+                            pk -= 5;
+                            while (pk > from && std::isspace(static_cast<unsigned char>(src[pk - 1]))) --pk;
+                        }
+                        char p = pk > from ? src[pk - 1] : (pk > 0 ? src[pk - 1] : '\0');
+                        // At range start, treat as declaration unless the char immediately before `from` is expression punctuation (caller range is body interior).
+                        if (pk == from && from > 0) {
+                            size_t q = from;
+                            while (q > 0 && std::isspace(static_cast<unsigned char>(src[q - 1]))) --q;
+                            p = q > 0 ? src[q - 1] : '\0';
+                        }
+                        if (p == '=' || p == '(' || p == '[' || p == ',' || p == '!' || p == '?' ||
+                            p == '&' || p == '|' || p == '+' || p == '-' || p == '*' || p == '/' ||
+                            p == '%' || p == '~' || p == '^' || p == '<' || p == '>' || p == ':')
+                            return true;
+                        auto endsWithWord = [&](size_t end, const char *w) -> bool {
+                            size_t n = std::strlen(w);
+                            if (end < n) return false;
+                            if (src.compare(end - n, n, w) != 0) return false;
+                            if (end > n && isIdent(src[end - n - 1])) return false;
+                            return true;
+                        };
+                        return endsWithWord(pk, "return") || endsWithWord(pk, "throw") ||
+                               endsWithWord(pk, "else") || endsWithWord(pk, "=>") ||
+                               endsWithWord(pk, "of") || endsWithWord(pk, "in") ||
+                               endsWithWord(pk, "case") || endsWithWord(pk, "void") ||
+                               endsWithWord(pk, "typeof") || endsWithWord(pk, "delete") ||
+                               endsWithWord(pk, "new") || endsWithWord(pk, "default") ||
+                               endsWithWord(pk, "yield") || endsWithWord(pk, "await");
+                    };
+                    // `i` was advanced past the keyword; keyword starts at j - id.size()... actually i==j after `i = j`, keyword is [j-id.size(), j).
+                    const size_t kw_pos = j - id.size();
+                    const bool is_expr = isExprContextBefore(kw_pos);
+                    if (!is_expr) {
+                        size_t name_pos = i;
                         while (name_pos < src.size() && std::isspace(static_cast<unsigned char>(src[name_pos]))) ++name_pos;
-                    }
-                    if (name_pos < src.size() && isIdentStart(src[name_pos])) {
-                        size_t n = name_pos + 1;
-                        while (n < src.size() && isIdent(src[n])) ++n;
-                        into.insert(src.substr(name_pos, n - name_pos));
+                        if (id == "function" && name_pos < src.size() && src[name_pos] == '*') {
+                            ++name_pos;
+                            while (name_pos < src.size() && std::isspace(static_cast<unsigned char>(src[name_pos]))) ++name_pos;
+                        }
+                        if (name_pos < src.size() && isIdentStart(src[name_pos])) {
+                            size_t n = name_pos + 1;
+                            while (n < src.size() && isIdent(src[n])) ++n;
+                            into.insert(src.substr(name_pos, n - name_pos));
+                        }
                     }
                     skipNestedFunctionOrClass(id);
                     continue;
@@ -674,6 +714,8 @@ static std::string rewriteIdents(const std::string &src,
     bool in_param_default = false;
     // Expression-bodied arrows (`=> expr` without `{`): cont.size() when the body began. Pop the param scope when the expression ends at that container depth (`,` / `;`) or when an outer container closes (cont shrinks below the marker).
     std::vector<size_t> expr_arrow_cont_depth;
+    // Named function/class *expression* names bind only in their own environment (not the enclosing scope). Stash here and inject when ParamList / ClassBody opens.
+    std::vector<std::string> pending_named_expr_bindings;
     auto closeExprArrowsDeeperThan = [&](size_t depth) {
         while (!expr_arrow_cont_depth.empty() && expr_arrow_cont_depth.back() > depth) {
             expr_arrow_cont_depth.pop_back();
@@ -714,6 +756,28 @@ static std::string rewriteIdents(const std::string &src,
                outEndsWithWord(pk, "case") || outEndsWithWord(pk, "void") ||
                outEndsWithWord(pk, "typeof") || outEndsWithWord(pk, "delete") ||
                outEndsWithWord(pk, "new") || outEndsWithWord(pk, "default");
+    };
+    // True when `function` / `class` starts an expression (name must not shadow the enclosing scope).
+    auto isFnOrClassExpressionContext = [&]() -> bool {
+        size_t pk = out.size();
+        while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+        // `async function name` keeps the context from before `async`.
+        if (outEndsWithWord(pk, "async")) {
+            pk -= 5;
+            while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+        }
+        char p = pk > 0 ? out[pk - 1] : '\0';
+        if (p == '=' || p == '(' || p == '[' || p == ',' || p == '!' || p == '?' ||
+            p == '&' || p == '|' || p == '+' || p == '-' || p == '*' || p == '/' ||
+            p == '%' || p == '~' || p == '^' || p == '<' || p == '>' || p == ':')
+            return true;
+        return outEndsWithWord(pk, "return") || outEndsWithWord(pk, "throw") ||
+               outEndsWithWord(pk, "else") || outEndsWithWord(pk, "=>") ||
+               outEndsWithWord(pk, "of") || outEndsWithWord(pk, "in") ||
+               outEndsWithWord(pk, "case") || outEndsWithWord(pk, "void") ||
+               outEndsWithWord(pk, "typeof") || outEndsWithWord(pk, "delete") ||
+               outEndsWithWord(pk, "new") || outEndsWithWord(pk, "default") ||
+               outEndsWithWord(pk, "yield") || outEndsWithWord(pk, "await");
     };
     auto underParamList = [&]() -> bool {
         for (auto it = cont.rbegin(); it != cont.rend(); ++it) {
@@ -911,6 +975,10 @@ static std::string rewriteIdents(const std::string &src,
                 kind = Cont::ClassBody;
                 --class_body_braces_pending;
                 pushScope();
+                if (!pending_named_expr_bindings.empty()) {
+                    addBindings({pending_named_expr_bindings.back()});
+                    pending_named_expr_bindings.pop_back();
+                }
                 // Class fields are not let/const; static blocks / method bodies are nested and collected in their own scopes.
                 if (!scopes.empty()) {
                     auto range = balancedBlockInterior(i);
@@ -1098,6 +1166,12 @@ static std::string rewriteIdents(const std::string &src,
                 kind = Cont::ParamList;
                 pushFunctionScope();
                 in_param_default = false;
+                // Named function expression: bind the name in this function environment only.
+                if ((outEndsWithWord(pk2, "function") || outEndsWithWord(pk, "function")) &&
+                    !pending_named_expr_bindings.empty()) {
+                    addBindings({pending_named_expr_bindings.back()});
+                    pending_named_expr_bindings.pop_back();
+                }
                 // Parameter scope binds every formal for the whole list (incl. TDZ for later params referenced in earlier defaults), matching native ESM before any default initializer is rewritten.
                 addBindings(collectParamListBoundNames(src, i));
             }
@@ -1190,8 +1264,9 @@ static std::string rewriteIdents(const std::string &src,
             while (j < src.size() && isIdent(src[j])) ++j;
             std::string id = src.substr(i, j - i);
 
-            // function / class declaration name binds in the enclosing scope.
+            // function / class: declaration names bind in the enclosing scope; expression names stay in their own environment.
             if ((id == "function" || id == "class") && (i == 0 || !isIdent(src[i - 1]))) {
+                const bool is_expr = isFnOrClassExpressionContext();
                 out += id;
                 i = j;
                 while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) out.push_back(src[i++]);
@@ -1203,7 +1278,8 @@ static std::string rewriteIdents(const std::string &src,
                     size_t n = i + 1;
                     while (n < src.size() && isIdent(src[n])) ++n;
                     std::string fname = src.substr(i, n - i);
-                    addBindings({fname});
+                    if (is_expr) pending_named_expr_bindings.push_back(fname);
+                    else addBindings({fname});
                     out += fname;
                     i = n;
                 }
@@ -1296,6 +1372,21 @@ static std::string rewriteIdents(const std::string &src,
                         int d = 0;
                         while (i < src.size()) {
                             char ic = src[i];
+                            if (ic == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+                                i += 2;
+                                while (i < src.size() && src[i] != '\n') ++i;
+                                continue;
+                            }
+                            if (ic == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+                                i += 2;
+                                while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+                                if (i + 1 < src.size()) i += 2;
+                                continue;
+                            }
+                            if (ic == '/' && canStartRegexLiteral(src.substr(0, i))) {
+                                skipRegexLiteral(src, i);
+                                continue;
+                            }
                             if (ic == '\'' || ic == '"' || ic == '`') {
                                 char q = ic; ++i;
                                 while (i < src.size()) {
@@ -1366,10 +1457,8 @@ static std::string rewriteIdents(const std::string &src,
                         out += id;
                         i = j;
                         // `=>` handler sets next_brace_is_fn_body; for expr body pop on `;` approx.
-                        // Mark that an expression-body arrow owns this scope:
-                        // handled when we see `=>` without `{` — pop at `;`/`,`/`)`/`}` depth 0 later via FnBody absence.
-                        // Use a sticky flag:
-                        // Reuse next_brace: if `=>` not followed by `{`, pop after copying arrow expr in `=>` handler.
+                        // Mark that an expression-body arrow owns this scope: handled when we see `=>` without `{` — pop at `;`/`,`/`)`/`}` depth 0 later via FnBody absence.
+                        // Use a sticky flag: Reuse next_brace: if `=>` not followed by `{`, pop after copying arrow expr in `=>` handler.
                         continue;
                     }
                 }
@@ -1771,6 +1860,21 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
             int depth = 0;
             while (i < src.size()) {
                 char ch = src[i];
+                if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+                    i += 2;
+                    while (i < src.size() && src[i] != '\n') ++i;
+                    continue;
+                }
+                if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+                    i += 2;
+                    while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+                    if (i + 1 < src.size()) i += 2;
+                    continue;
+                }
+                if (ch == '/' && canStartRegexLiteral(src.substr(0, i))) {
+                    skipRegexLiteral(src, i);
+                    continue;
+                }
                 if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
                 if (ch == '\'' || ch == '"' || ch == '`') {
                     char q = ch; ++i;
@@ -1838,6 +1942,10 @@ static std::vector<std::string> collectParamListBoundNames(const std::string &sr
                     i += 2;
                     while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
                     if (i + 1 < src.size()) i += 2;
+                    continue;
+                }
+                if (ch == '/' && canStartRegexLiteral(src.substr(0, i))) {
+                    skipRegexLiteral(src, i);
                     continue;
                 }
                 if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
