@@ -77,6 +77,8 @@ struct JsbayHermesContextOpaque {
     // Pristine JSON.parse / JSON.stringify (C ABI must ignore script-replaced globalThis.JSON).
     std::unique_ptr<jsi::Function> pristine_json_parse;
     std::unique_ptr<jsi::Function> pristine_json_stringify;
+    // Unary ToNumber helper `(function(x){return +x;})` — call with the value; never stash args in a mutable global slot.
+    std::unique_ptr<jsi::Function> pristine_to_number;
     // Host WeakMap for stable JS object identity across distinct retained Value wrappers.
     std::unique_ptr<jsi::Object> identity_wm;
     // Pristine WeakMap.prototype has/get/set — ignore script replacements of the mutable prototype.
@@ -505,6 +507,14 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
         c->pristine_json_parse.reset();
         c->pristine_json_stringify.reset();
     }
+    try {
+        jsi::Value to_number_fn = c->rt->evaluateJavaScript(
+            std::make_shared<jsi::StringBuffer>("(function(x){return +x;})"), "<jsbay-tonumber-fn>");
+        c->pristine_to_number = std::make_unique<jsi::Function>(
+            to_number_fn.getObject(*c->rt).getFunction(*c->rt));
+    } catch (...) {
+        c->pristine_to_number.reset();
+    }
     return c;
 }
 extern "C" void hermes_uninstall_module_loader(JsbayHermesContext *ctx);
@@ -809,18 +819,23 @@ static bool hermesToNumber(JsbayHermesContext *c, HermesValue v, double *out) {
         return true;
     }
     if (!c || !c->rt) return false;
-    // Remaining types (string / bigint / symbol / object): unary `+` is ToNumber, so BigInt and ToPrimitive→BigInt throw TypeError like QuickJS/JSC (unlike Hermes Number(bigint)).
+    // Remaining types (string / bigint / symbol / object): unary `+` is ToNumber, so BigInt and ToPrimitive→BigInt throw TypeError like QuickJS/JSC (unlike Hermes Number(bigint)). Pass the value as an argument to a captured converter — do not communicate through a script-visible global slot that can be shadowed, non-writable, or an accessor.
+    if (!c->pristine_to_number) {
+        try {
+            jsi::Value to_number_fn = c->rt->evaluateJavaScript(
+                std::make_shared<jsi::StringBuffer>("(function(x){return +x;})"), "<jsbay-tonumber-fn>");
+            c->pristine_to_number = std::make_unique<jsi::Function>(
+                to_number_fn.getObject(*c->rt).getFunction(*c->rt));
+        } catch (...) {
+            return false;
+        }
+    }
     try {
-        constexpr const char *kSlot = "__jsbay_tonumber_arg";
-        c->rt->global().setProperty(*c->rt, kSlot, val);
-        jsi::Value n = c->rt->evaluateJavaScript(
-            std::make_shared<jsi::StringBuffer>("(+__jsbay_tonumber_arg)"), "<jsbay-tonumber>");
-        c->rt->global().setProperty(*c->rt, kSlot, jsi::Value::undefined());
+        jsi::Value n = c->pristine_to_number->call(*c->rt, val);
         if (!n.isNumber()) return false;
         *out = n.getNumber();
         return true;
     } catch (const jsi::JSError &e) {
-        try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw.clear();
         c->pending_throw_set = false;
         try {
@@ -832,13 +847,11 @@ static bool hermesToNumber(JsbayHermesContext *c, HermesValue v, double *out) {
         }
         return false;
     } catch (const std::exception &e) {
-        try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw_value.reset();
         c->pending_throw = e.what();
         c->pending_throw_set = true;
         return false;
     } catch (...) {
-        try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw_value.reset();
         c->pending_throw = "TypeError";
         c->pending_throw_set = true;

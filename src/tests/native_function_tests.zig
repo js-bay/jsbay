@@ -641,8 +641,7 @@ test "native: recursion — JS calls native which evals JS that mutates global" 
 }
 
 test "native: string ownership — getPropertyString + freeString in loop (1000)" {
-    // Hermes: top-level `let` does not persist across evaluateJavaScript; use var.
-    // getPropertyString+freeString in the hot loop is fine (was misdiagnosed as JSI lifetime).
+    // Hermes: top-level `let` does not persist across evaluateJavaScript; use var. getPropertyString+freeString owns each returned buffer for the call duration and is safe in a hot loop.
     resetState();
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {

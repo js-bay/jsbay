@@ -2484,12 +2484,8 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
         if (i + 6 > src.size() || src.compare(i, 6, "import") != 0) return false;
         if (i > 0 && isIdent(src[i - 1])) return false;
         if (i + 6 < src.size() && isIdent(src[i + 6])) return false;
-        // Member access / method call: obj.import(...) is not dynamic import().
-        if (i > 0) {
-            size_t j = i;
-            while (j > 0 && std::isspace(static_cast<unsigned char>(src[j - 1]))) --j;
-            if (j > 0 && src[j - 1] == '.') return false;
-        }
+        // Member access / method call: obj.import(...) is not dynamic import(). Skip // and /* */ trivia so `obj./*c*/import("dep")` stays a member call.
+        if (i > 0 && prevSignificantSkippingComments(src, i) == '.') return false;
 
         size_t k = i + 6;
         while (k < src.size() && std::isspace(static_cast<unsigned char>(src[k]))) ++k;
@@ -2704,6 +2700,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     std::vector<ImportBinding> imports;
     std::vector<std::string> prelude;
     std::vector<std::string> epilogue;
+    // Function-declaration export getters (incl. default function) publish before the dependency prelude so cyclic importers see hoisted bindings during evaluation, matching native ESM instantiation order.
+    std::vector<std::string> hoisted_exports;
 
     // Strip/collect import declarations (multi-form). Process repeatedly.
     auto eatImports = [&]() {
@@ -2948,7 +2946,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 size_t cut = (rel == std::string::npos) ? m.length(0) : rel;
                 body.replace(m.position(), cut, "");
             }
-            epilogue.push_back(exportLiveGetter("default", name));
+            hoisted_exports.push_back(exportLiveGetter("default", name));
         } else if (std::regex_search(blanked = blankNonCode(body), m, re_class)) {
             // Keep a module-scoped class declaration (named or synthetic) so local refs resolve; publish via getter.
             std::string name = m[1].matched ? body.substr(m.position(1), m.length(1))
@@ -3009,7 +3007,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             std::string star = m[2].matched ? m[2].str() : "";
             std::string name = m[3].str();
             body += async_kw + "function" + star + " " + name;
-            epilogue.push_back(exportLiveGetter(name, name));
+            hoisted_exports.push_back(exportLiveGetter(name, name));
             last = pos + m.length();
         }
         body.append(tmp, last, std::string::npos);
@@ -3167,6 +3165,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         kWrapObject +
         "){\n\"use strict\";\n";
     out += std::string("var ") + kWrapDefineProperty + "=" + kWrapObject + ".defineProperty.bind(" + kWrapObject + ");\n";
+    for (auto &e : hoisted_exports) out += e + "\n";
     for (auto &p : prelude) out += p + "\n";
     out += body;
     out += "\n";
