@@ -262,8 +262,7 @@ extern "C" void hermes_runtime_unwatch_time_limit(JsbayHermesRuntime *rt) {
     }
 }
 
-// asyncTriggerTimeout sets a sticky Timeout AsyncBreak bit that survives unwatchTimeLimit.
-// A no-op eval with AsyncBreakCheckInEval clears it (throws once). Call after idle stop/destroy.
+// asyncTriggerTimeout sets a sticky Timeout AsyncBreak bit that survives unwatchTimeLimit. A no-op eval with AsyncBreakCheckInEval clears it (throws once). Call after idle stop/destroy.
 extern "C" void hermes_runtime_drain_async_timeout(JsbayHermesRuntime *rt) {
     if (!rt || !rt->rt) return;
     try {
@@ -761,8 +760,7 @@ static int32_t hermesToInt32Number(double d) {
     return static_cast<int32_t>(mod);
 }
 
-// ECMAScript ToNumber into *out. On failure sets pending throw and returns false.
-// Do not call the Number constructor: Hermes Number(bigint) may coerce instead of throwing, and objects whose ToPrimitive is a BigInt must also TypeError like QuickJS/JSC.
+// ECMAScript ToNumber into *out. On failure sets pending throw and returns false. Do not call the Number constructor: Hermes Number(bigint) may coerce instead of throwing, and objects whose ToPrimitive is a BigInt must also TypeError like QuickJS/JSC.
 static bool hermesToNumber(JsbayHermesContext *c, HermesValue v, double *out) {
     if (!out) return false;
     if (!v) {
@@ -1193,8 +1191,7 @@ extern "C" HermesValue hermes_new_bigint_u64(JsbayHermesContext *c, uint64_t v) 
 }
 extern "C" bool hermes_bigint_to_i64(HermesValue v, int64_t *out) {
     if (!v || !asVal(v)->isBigInt() || !out) return false;
-    // Need runtime — not available. Use truncate via a thread-local? Fail without ctx.
-    // Stored BigInt PointerValue can be truncated only with Runtime. Return false.
+    // Need runtime — not available. Use truncate via a thread-local? Fail without ctx. Stored BigInt PointerValue can be truncated only with Runtime. Return false.
     (void)v; (void)out;
     return false;
 }
@@ -2583,9 +2580,7 @@ static bool isCanonicalArrayIndex(const std::string &name, uint32_t *out) {
 
 static HermesHostBox *boxFromHostFnThis(jsi::Runtime &rt, const jsi::Value &thisVal) {
     if (!thisVal.isObject()) return nullptr;
-    // We stash the box pointer as a number on the helper object's __box field is unsafe.
-    // Instead host functions close over box via std::shared_ptr captured in the lambda... 
-    // For createFromHostFunction we need the box ptr; callers pass it via a holder object.
+    // We stash the box pointer as a number on the helper object's __box field is unsafe. Instead host functions close over box via std::shared_ptr captured in the lambda... For createFromHostFunction we need the box ptr; callers pass it via a holder object.
     (void)rt;
     return nullptr;
 }
@@ -2895,8 +2890,7 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
     }
 
     std::string hermesc = findHermesc();
-    // -g1 embeds location info (incl. source path basename) for stack traces.
-    // Use fork/exec (not system()) so filenames with shell metacharacters are safe.
+    // -g1 embeds location info (incl. source path basename) for stack traces. Use fork/exec (not system()) so filenames with shell metacharacters are safe.
     std::string out_arg = std::string("-out=") + hbc_path;
     char err_tmpl[] = "/tmp/jsbay-hermesc-XXXXXX.err";
     int err_fd = mkstemps(err_tmpl, 4);
@@ -3146,8 +3140,7 @@ extern "C" HermesValue hermes_native_handle_create(JsbayHermesContext *c, void *
                     hermes_free_value(ctx, out);
                     return result;
                 });
-            // Attach NativeState on a property holder? HostFunction may not support setNativeState.
-            // Store mapping: also set a hidden prop with an object carrying NativeState.
+            // Attach NativeState on a property holder? HostFunction may not support setNativeState. Store mapping: also set a hidden prop with an object carrying NativeState.
             jsi::Object holder(*c->rt);
             holder.setNativeState(*c->rt, state);
             host.setProperty(*c->rt, jsi::PropNameID::forUtf8(*c->rt, "__jsbay_nh"), holder);
