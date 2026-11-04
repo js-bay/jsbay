@@ -1,4 +1,4 @@
-//! setTimeout / setInterval / clearTimeout / clearInterval + queueMicrotask polyfill for Hermes. Native failures return `{__jsbay_timer_err}` and a JS wrapper throws — avoids throwing `jsi::JSError` across the hermes_bridge.o / libjsi.so exception ABI boundary (ABRT).
+//! setTimeout / setInterval / clearTimeout / clearInterval + queueMicrotask polyfill for Hermes. Native failures return `{__jsbay_timer_err, __jsbay_timer_err_kind}` and a JS wrapper throws TypeError for bad callbacks / Error for allocation — avoids throwing `jsi::JSError` across the hermes_bridge.o / libjsi.so exception ABI boundary (ABRT).
 
 const std = @import("std");
 const async_stack = @import("../../inspector/async_stack.zig");
@@ -21,7 +21,8 @@ const timer_throw_wrap =
     \\    var w=function(){
     \\      var r=raw.apply(this,arguments);
     \\      if(r&&typeof r==='object'&&typeof r.__jsbay_timer_err==='string'){
-    \\        throw new Error(r.__jsbay_timer_err);
+    \\        var C=r.__jsbay_timer_err_kind==='TypeError'?TypeError:Error;
+    \\        throw new C(r.__jsbay_timer_err);
     \\      }
     \\      return r;
     \\    };
@@ -38,7 +39,7 @@ fn instanceIdFromCtx(ctx: Context) i32 {
     return @bitCast(@as(u32, @truncate(@intFromPtr(p))));
 }
 
-fn failMsg(ctx: Context, msg: []const u8) Value {
+fn failMsg(ctx: Context, msg: []const u8, kind: []const u8) Value {
     const obj = value_mod.newObject(ctx);
     if (obj == null) return null;
     const s = value_mod.newStringVal(ctx, msg);
@@ -47,6 +48,12 @@ fn failMsg(ctx: Context, msg: []const u8) Value {
         return null;
     }
     value_mod.setPropertyStr(ctx, obj, "__jsbay_timer_err", s);
+    const k = value_mod.newStringVal(ctx, kind);
+    if (k == null) {
+        value_mod.freeValue(ctx, obj);
+        return null;
+    }
+    value_mod.setPropertyStr(ctx, obj, "__jsbay_timer_err_kind", k);
     return obj;
 }
 
@@ -61,7 +68,7 @@ fn bindGlobal(ctx: Context, name: [*:0]const u8, fn_ptr: c_api.NativeFn) void {
 
 fn createTimer(ctx: Context, args: ?[*]const Value, argc: usize, is_interval: bool) Value {
     if (argc < 1 or args == null or !value_mod.isFunction(ctx, args.?[0])) {
-        return failMsg(ctx, "Expected function");
+        return failMsg(ctx, "Expected function", "TypeError");
     }
     var delay_ms: u64 = 0;
     if (argc >= 2) {
@@ -71,12 +78,12 @@ fn createTimer(ctx: Context, args: ?[*]const Value, argc: usize, is_interval: bo
     }
     const id = instanceIdFromCtx(ctx);
     const callback = value_mod.dupValue(ctx, args.?[0]);
-    if (callback == null) return failMsg(ctx, "Timer allocation failed");
+    if (callback == null) return failMsg(ctx, "Timer allocation failed", "Error");
     const trace = async_stack.capture(id);
     const timer_id = timers_mod.schedule(id, ctx, callback, delay_ms, is_interval, trace) orelse {
         value_mod.freeValue(ctx, callback);
         if (trace) |captured| async_stack.freeTrace(captured);
-        return failMsg(ctx, "Timer allocation failed");
+        return failMsg(ctx, "Timer allocation failed", "Error");
     };
     return value_mod.newInt32Val(ctx, timer_id);
 }

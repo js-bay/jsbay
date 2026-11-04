@@ -50,9 +50,7 @@ pub const EngineConfig = struct {
     log_user_data: ?*anyopaque = null,
     /// Maximum stack size for the JS runtime in bytes. QuickJS: applied to runtime and capped to the executing native thread's available stack. JSC: ignored (not configurable via public API). Default: 1 MiB.
     max_stack_size: usize = 1024 * 1024,
-    /// Create-time max JS heap hint in bytes. `0` = backend default.
-    /// Hermes: applied as `GCConfig.MaxHeapSize` when the Runtime is created (also lowers `InitHeapSize` so Hermes does not clamp Max up). Overridable build default: `-Dhermes-max-heap=N`. Escargot / JSC / QuickJS: ignored here (QuickJS uses runtime `setMemoryLimit`).
-    /// This is **not** `setMemoryLimit` — on Hermes/Escargot `setMemoryLimit` still returns false.
+    /// Create-time max JS heap hint in bytes. `0` = backend default. Hermes: applied as `GCConfig.MaxHeapSize` when the Runtime is created (also lowers `InitHeapSize` so Hermes does not clamp Max up). Overridable build default: `-Dhermes-max-heap=N`. Escargot / JSC / QuickJS: ignored here (QuickJS uses runtime `setMemoryLimit`). This is **not** `setMemoryLimit` — on Hermes/Escargot `setMemoryLimit` still returns false.
     max_heap_size: usize = 0,
     /// Optional ES module loader vtable. When non-null, top-level `import` statements in sources evaluated through `engine.evalModule` / `engine.importModule` are dispatched here. The pointed-to `ModuleLoader` must outlive the engine instance — the engine does not take ownership.
     ///

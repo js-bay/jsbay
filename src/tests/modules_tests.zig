@@ -1018,7 +1018,6 @@ test "modules: diamond named re-export keeps a shared originating binding" {
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__value__"));
 }
 
-
 test "modules: diamond import-then-export keeps a shared originating binding" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
@@ -1070,6 +1069,85 @@ test "modules: named import alias accepts newline around as" {
     defer helpers.freeEvalResult(res);
     try testing.expect(res.err == null);
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__read__"));
+}
+
+test "modules: named import skips comments inside specifier list" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Comment trivia inside `{…}` must not become part of the binding name (default+named path too).
+    const src =
+        \\import def, { /* comment */ value } from 'dep';
+        \\export function read(){return value;}
+        \\globalThis.__read__ = read();
+        \\globalThis.__def__ = def;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__read__"));
+}
+
+test "modules: member access after comment is not rewritten as import" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 1;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // `obj./*c*/value` is a property access; `value` must not become the import binding rewrite.
+    const src =
+        \\import { value } from 'dep';
+        \\const obj = { value: 7 };
+        \\export function read(){ return obj./*c*/value; }
+        \\globalThis.__read__ = read();
+        \\globalThis.__import__ = value;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__read__"));
+    try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__import__"));
+}
+
+test "modules: semicolon-free export const respects ASI between declarations" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // First `export const` must not swallow `c` from the next declaration's declarator list.
+    const src =
+        \\export const a = 1
+        \\export const b = 2, c = 3;
+        \\globalThis.__a__ = a;
+        \\globalThis.__b__ = b;
+        \\globalThis.__c__ = c;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__a__"));
+    try testing.expectEqual(@as(i64, 2), try helpers.evalInt(id, "globalThis.__b__"));
+    try testing.expectEqual(@as(i64, 3), try helpers.evalInt(id, "globalThis.__c__"));
 }
 
 test "modules: generated import ns name avoids colliding with module bindings" {
@@ -1195,7 +1273,6 @@ test "modules: default export anonymous generator function" {
     try testing.expect(res.err == null);
     try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__v__"));
 }
-
 
 test "modules: circular imports do not deadlock" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;

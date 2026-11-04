@@ -348,6 +348,19 @@ test "timers: setTimeout with non-function throws TypeError at registration" {
     try helpers.evalErr(id, "setTimeout('not a function', 0);");
     try helpers.evalErr(id, "setTimeout(42, 0);");
     try helpers.evalErr(id, "setTimeout(null, 0);");
+    // Callback-validation failures must be TypeError (QuickJS/Escargot parity), not a plain Error.
+    try helpers.evalOk(id,
+        \\let ok = false;
+        \\try { setTimeout(null, 0); } catch (e) { ok = e instanceof TypeError; }
+        \\globalThis.__timerTypeErr__ = ok;
+    );
+    try helpers.expectEvalEquals(id, "globalThis.__timerTypeErr__", "true");
+    try helpers.evalOk(id,
+        \\let ok = false;
+        \\try { setInterval(42, 0); } catch (e) { ok = e instanceof TypeError; }
+        \\globalThis.__intervalTypeErr__ = ok;
+    );
+    try helpers.expectEvalEquals(id, "globalThis.__intervalTypeErr__", "true");
 }
 
 test "timers: setTimeout without delay argument defaults to 0" {

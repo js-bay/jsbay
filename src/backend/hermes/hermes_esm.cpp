@@ -458,6 +458,8 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
 static std::vector<std::string> collectParamListBoundNames(const std::string &src, size_t open_paren);
 static bool takeBalancedBracketExpr(const std::string &src, size_t &i, size_t &expr_start, size_t &expr_end);
 static char prevSignificantChar(const std::string &src, size_t pos);
+static char prevSignificantSkippingComments(const std::string &src, size_t pos);
+static void collectAsAliasSpecs(const std::string &specs, std::vector<std::pair<std::string, std::string>> &out);
 
 // Skip strings/comments/regex roughly; return rewritten source with identifier replacements.
 //
@@ -1698,13 +1700,13 @@ static std::string rewriteIdents(const std::string &src,
                 }
             }
 
+            // Skip preceding // /* */ trivia so `obj./*c*/value` stays a member access (property name not rewritten as import).
             bool after_dot = false;
             bool after_question = false;
             if (!out.empty()) {
-                size_t pk = out.size();
-                while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
-                if (pk > 0 && out[pk - 1] == '.') after_dot = true;
-                if (pk > 0 && out[pk - 1] == '?') after_question = true;
+                char prev = prevSignificantSkippingComments(out, out.size());
+                if (prev == '.') after_dot = true;
+                if (prev == '?') after_question = true;
             }
             size_t k = j;
             // Property-boundary lookahead must ignore comments (`{value /*c*/}` / `{value /*c*/: x}`), not only whitespace.
@@ -1948,6 +1950,99 @@ static void skipWsAndComments(const std::string &src, size_t &i) {
         if (std::isspace(static_cast<unsigned char>(src[i]))) { ++i; continue; }
         if (src[i] == '/' && skipStringTemplateOrComment(src, i)) continue;
         break;
+    }
+}
+
+// Significant char before `pos`, skipping spaces and // /* */ trivia (so `obj./*c*/id` still sees `.`).
+static char prevSignificantSkippingComments(const std::string &src, size_t pos) {
+    size_t pk = pos;
+    while (pk > 0) {
+        if (std::isspace(static_cast<unsigned char>(src[pk - 1]))) { --pk; continue; }
+        if (pk >= 2 && src[pk - 2] == '*' && src[pk - 1] == '/') {
+            size_t q = pk - 2;
+            bool found = false;
+            while (q > 0) {
+                if (src[q - 1] == '/' && src[q] == '*') { pk = q - 1; found = true; break; }
+                --q;
+            }
+            if (!found) break;
+            continue;
+        }
+        // Line comment: drop from `//` through end-of-line trivia ending at pk.
+        size_t line_start = pk;
+        while (line_start > 0 && src[line_start - 1] != '\n') --line_start;
+        size_t slash = std::string::npos;
+        for (size_t t = line_start; t + 1 < pk; ++t) {
+            if (src[t] == '/' && src[t + 1] == '/') { slash = t; break; }
+            if (src[t] == '/' && src[t + 1] == '*') break;
+        }
+        if (slash != std::string::npos) { pk = slash; continue; }
+        break;
+    }
+    return pk > 0 ? src[pk - 1] : 0;
+}
+
+// True when `prev` can end an AssignmentExpression primary/postfix (ident, number, string/template close, )/]).
+static bool tokenCanEndAssignmentExpr(char prev) {
+    if (!prev) return false;
+    if (isIdent(prev) || std::isdigit(static_cast<unsigned char>(prev))) return true;
+    return prev == ')' || prev == ']' || prev == '}' || prev == '"' || prev == '\'' || prev == '`';
+}
+
+// `++` / `--` immediately before `linebreak_pos` (optional spaces) applied postfix to a prior ends-expr token.
+static bool atPostfixIncDecBefore(const std::string &src, size_t linebreak_pos) {
+    size_t p = linebreak_pos;
+    while (p > 0 && std::isspace(static_cast<unsigned char>(src[p - 1])) && src[p - 1] != '\n' && src[p - 1] != '\r')
+        --p;
+    if (p < 2) return false;
+    char a = src[p - 2], b = src[p - 1];
+    if (!((a == '+' && b == '+') || (a == '-' && b == '-'))) return false;
+    char before = prevSignificantSkippingComments(src, p - 2);
+    return tokenCanEndAssignmentExpr(before);
+}
+
+// After a LineTerminator at declarator depth 0, true when the next token continues the AssignmentExpression (no ASI).
+static bool canContinueExprAfterLineBreak(const std::string &src, size_t i) {
+    if (i >= src.size()) return false;
+    char c = src[i];
+    if (c == '.' || c == '(' || c == '[' || c == '`' || c == ',' || c == ';' ||
+        c == '+' || c == '-' || c == '*' || c == '/' || c == '%' || c == '^' || c == '&' || c == '|' ||
+        c == '?' || c == ':' || c == '=' || c == '<' || c == '>' || c == '!' || c == '~')
+        return true;
+    auto atWord = [&](const char *w) -> bool {
+        size_t n = std::strlen(w);
+        if (i + n > src.size()) return false;
+        if (src.compare(i, n, w) != 0) return false;
+        if (i + n < src.size() && isIdent(src[i + n])) return false;
+        return true;
+    };
+    return atWord("in") || atWord("instanceof");
+}
+
+// Parse `{…}` import/export specifier list into (left, right) pairs (`name` or `left as right`); skip // /* */ trivia so comments are not part of binding names.
+static void collectAsAliasSpecs(const std::string &specs, std::vector<std::pair<std::string, std::string>> &out) {
+    size_t i = 0;
+    while (i < specs.size()) {
+        skipWsAndComments(specs, i);
+        if (i >= specs.size()) break;
+        if (specs[i] == ',') { ++i; continue; }
+        if (!isIdentStart(specs[i])) { ++i; continue; }
+        size_t left_start = i;
+        while (i < specs.size() && isIdent(specs[i])) ++i;
+        std::string left = specs.substr(left_start, i - left_start);
+        skipWsAndComments(specs, i);
+        if (i + 2 <= specs.size() && specs[i] == 'a' && specs[i + 1] == 's' &&
+            (i + 2 == specs.size() || !isIdent(specs[i + 2]))) {
+            i += 2;
+            skipWsAndComments(specs, i);
+            if (i < specs.size() && isIdentStart(specs[i])) {
+                size_t right_start = i;
+                while (i < specs.size() && isIdent(specs[i])) ++i;
+                out.emplace_back(left, specs.substr(right_start, i - right_start));
+                continue;
+            }
+        }
+        out.emplace_back(left, left);
     }
 }
 
@@ -2211,6 +2306,19 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
                 if (ch == '}' || ch == ']' || ch == ')') {
                     if (depth > 0) --depth;
                     ++i; continue;
+                }
+                // ASI: semicolon-free `export const a=1\nexport const b=2,c=3` must end the first declaration before the next statement.
+                if (depth == 0 && (ch == '\n' || ch == '\r')) {
+                    char prev = prevSignificantSkippingComments(src, i);
+                    bool ended = tokenCanEndAssignmentExpr(prev) || atPostfixIncDecBefore(src, i);
+                    if (ended) {
+                        size_t la = i + 1;
+                        if (ch == '\r' && la < src.size() && src[la] == '\n') ++la;
+                        skipWsAndComments(src, la);
+                        if (!canContinueExprAfterLineBreak(src, la)) break;
+                    }
+                    ++i;
+                    continue;
                 }
                 if (depth == 0 && (ch == ',' || ch == ';')) break;
                 ++i;
@@ -2632,44 +2740,24 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             if (std::regex_search(rest, m, import_def_named) && m.position() == 0) {
                 imports.push_back({m[1].str(), "default", m[4].str()});
                 std::string specs = m[2].str();
-                size_t pos = 0;
-                while (pos < specs.size()) {
-                    size_t comma = specs.find(',', pos);
-                    std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
-                    if (!part.empty()) {
-                        std::string alias_left, alias_right;
-                        if (splitAsAlias(part, alias_left, alias_right))
-                            imports.push_back({alias_right, alias_left, m[4].str()});
-                        else
-                            imports.push_back({part, part, m[4].str()});
-                    }
-                    if (comma == std::string::npos) break;
-                    pos = comma + 1;
-                }
+                std::vector<std::pair<std::string, std::string>> parts;
+                collectAsAliasSpecs(specs, parts);
+                for (const auto &pr : parts)
+                    imports.push_back({pr.second, pr.first, m[4].str()});
                 consume_match(m);
                 continue;
             }
             if (std::regex_search(rest, m, import_named) && m.position() == 0) {
                 std::string specs = m[1].str();
-                size_t pos = 0;
-                bool any_named = false;
-                while (pos < specs.size()) {
-                    size_t comma = specs.find(',', pos);
-                    std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
-                    if (!part.empty()) {
-                        any_named = true;
-                        std::string alias_left, alias_right;
-                        if (splitAsAlias(part, alias_left, alias_right))
-                            imports.push_back({alias_right, alias_left, m[3].str()});
-                        else
-                            imports.push_back({part, part, m[3].str()});
-                    }
-                    if (comma == std::string::npos) break;
-                    pos = comma + 1;
-                }
+                std::vector<std::pair<std::string, std::string>> parts;
+                collectAsAliasSpecs(specs, parts);
                 // `import {} from 'dep'` still evaluates the dependency (side effects / missing module).
-                if (!any_named)
+                if (parts.empty())
                     imports.push_back({"", "", m[3].str()});
+                else {
+                    for (const auto &pr : parts)
+                        imports.push_back({pr.second, pr.first, m[3].str()});
+                }
                 consume_match(m);
                 continue;
             }
@@ -2829,19 +2917,10 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 std::string ns = allocFreshIdent(used_idents, "__jsbay_re");
                 reexport_prelude.push_back({mod, "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + mod + "\");"});
                 std::string repl;
-                size_t pos = 0;
-                while (pos < specs.size()) {
-                    size_t comma = specs.find(',', pos);
-                    std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
-                    if (!part.empty()) {
-                        std::string imported, exported;
-                        if (!splitAsAlias(part, imported, exported))
-                            imported = exported = part;
-                        repl += exportNamedReexport(exported, ns, imported);
-                    }
-                    if (comma == std::string::npos) break;
-                    pos = comma + 1;
-                }
+                std::vector<std::pair<std::string, std::string>> parts;
+                collectAsAliasSpecs(specs, parts);
+                for (const auto &pr : parts)
+                    repl += exportNamedReexport(pr.second, ns, pr.first);
                 body.replace(m_named.position(), m_named.length(), repl);
             }
         }
@@ -2983,23 +3062,17 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             std::string prefix = m[1].str(); // start-of-string or the boundary char
             std::string specs = body.substr(m.position(2), m.length(2));
             std::string repl;
-            size_t pos = 0;
-            while (pos < specs.size()) {
-                size_t comma = specs.find(',', pos);
-                std::string part = trim(specs.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
-                if (!part.empty()) {
-                    std::string local, exported;
-                    if (!splitAsAlias(part, local, exported))
-                        local = exported = part;
-                    auto origin = import_local_origin.find(local);
-                    if (origin != import_local_origin.end())
-                        // Carry the imported binding's leaf provenance through local export lists (import-then-export diamond).
-                        repl += exportNamedReexport(exported, origin->second.first, origin->second.second);
-                    else
-                        repl += exportLiveGetter(exported, local);
-                }
-                if (comma == std::string::npos) break;
-                pos = comma + 1;
+            std::vector<std::pair<std::string, std::string>> parts;
+            collectAsAliasSpecs(specs, parts);
+            for (const auto &pr : parts) {
+                const std::string &local = pr.first;
+                const std::string &exported = pr.second;
+                auto origin = import_local_origin.find(local);
+                if (origin != import_local_origin.end())
+                    // Carry the imported binding's leaf provenance through local export lists (import-then-export diamond).
+                    repl += exportNamedReexport(exported, origin->second.first, origin->second.second);
+                else
+                    repl += exportLiveGetter(exported, local);
             }
             body.replace(m.position(), m.length(), prefix + repl);
         }
