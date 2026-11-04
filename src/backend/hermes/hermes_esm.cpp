@@ -2699,7 +2699,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     std::vector<std::string> post_epilogue;
     {
         static const std::regex re_named(R"(export\s*\{([^}]*)\}\s*from\s*(['"])([^'"]+)\2\s*;?)");
-        static const std::regex re_star(R"(export\s*\*\s*from\s*(['"])([^'"]+)\1\s*;?)");
+        // Optional `as name` covers `export * as ns from 'dep'` (namespace re-export); bare `export * from` stays a star re-export.
+        static const std::regex re_star(R"(export\s*\*\s*(?:as\s+([A-Za-z_$][\w$]*)\s+)?from\s*(['"])([^'"]+)\2\s*;?)");
         static int reexport_ns = 0;
         for (;;) {
             std::string blanked = blankNonCode(body);
@@ -2709,11 +2710,18 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             if (!has_named && !has_star) break;
             const bool take_star = has_star && (!has_named || m_star.position() < m_named.position());
             if (take_star) {
-                std::string mod = body.substr(m_star.position(2), m_star.length(2));
+                // Group 1 = optional namespace export name; group 3 = module specifier (quote is group 2).
+                std::string mod = body.substr(m_star.position(3), m_star.length(3));
                 std::string ns = "__jsbay_re" + std::to_string(reexport_ns++);
                 reexport_prelude.push_back({mod, "var " + ns + " = " + std::string(kWrapRequire) + "(\"" + mod + "\");"});
-                star_reexport_nss.push_back(ns);
-                body.replace(m_star.position(), m_star.length(), "");
+                if (m_star[1].matched) {
+                    // `export * as ns from 'dep'`: expose the dependency namespace under `ns`, do not flatten star bindings.
+                    std::string as_name = body.substr(m_star.position(1), m_star.length(1));
+                    body.replace(m_star.position(), m_star.length(), exportLiveGetter(as_name, ns));
+                } else {
+                    star_reexport_nss.push_back(ns);
+                    body.replace(m_star.position(), m_star.length(), "");
+                }
             } else {
                 // Specs / module from the blanked match spans on the live body (same offsets).
                 std::string specs = body.substr(m_named.position(1), m_named.length(1));
@@ -2780,6 +2788,25 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 epilogue.push_back(exportLiveGetter("default", "__jsbay_default"));
             }
         }
+    }
+
+    // export class Name (named declaration; default class handled above). Reject `extends` as a false name.
+    {
+        static const std::regex re(R"(export\s+class\s+(?!extends\b)([A-Za-z_$][\w$]*))");
+        std::smatch m;
+        std::string tmp = body;
+        std::string blanked = blankNonCode(tmp);
+        body.clear();
+        size_t last = 0;
+        while (std::regex_search(blanked.cbegin() + last, blanked.cend(), m, re)) {
+            size_t pos = last + m.position();
+            body.append(tmp, last, pos - last);
+            std::string name = m[1].str();
+            body += "class " + name;
+            epilogue.push_back(exportLiveGetter(name, name));
+            last = pos + m.length();
+        }
+        body.append(tmp, last, std::string::npos);
     }
 
     // export [async] function name (including generators: preserve optional `async` and `*`)
