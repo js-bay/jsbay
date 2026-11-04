@@ -11,8 +11,7 @@ pub fn newRuntime() ?Runtime {
     return newRuntimeWithMaxHeap(0);
 }
 
-/// Create Hermes Runtime with optional create-time GCConfig.MaxHeapSize.
-/// `max_heap_bytes == 0` keeps Hermes default (3 GiB). Not a runtime setMemoryLimit.
+/// Create Hermes Runtime with optional create-time GCConfig.MaxHeapSize. `max_heap_bytes == 0` keeps Hermes default (3 GiB). Not a runtime setMemoryLimit.
 pub fn newRuntimeWithMaxHeap(max_heap_bytes: u64) ?Runtime {
     return c_api.hermes_runtime_new(max_heap_bytes);
 }

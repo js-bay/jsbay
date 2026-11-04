@@ -242,7 +242,9 @@ fn rearmOneHermesStop(instance_id: i32) void {
 /// Request that the JS runtime interrupt execution on the next interrupt check. Thread-safe. Returns false if the instance was never init()'d or has been deinit()'d.
 ///
 /// After the script throws, call `clearInterrupt` to reset the flag.
+///
 /// True when `requestInterrupt` can abort mid-script JS (QuickJS/NG via interrupt handler; JSC via time-limit callback).
+///
 /// Escargot/Hermes spikes: false — user interrupt must not be advertised as mid-script cancel.
 pub fn supportsMidScriptUserInterrupt() bool {
     return switch (backend.active_backend) {
@@ -251,9 +253,7 @@ pub fn supportsMidScriptUserInterrupt() bool {
     };
 }
 
-/// Request mid-script interrupt when the backend supports it.
-/// Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed).
-/// Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
+/// Request mid-script interrupt when the backend supports it. Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed). Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
     if (!supportsMidScriptUserInterrupt()) {
         // Refuse to claim mid-script stop. Do not set the user bit (avoids false isInterruptRequested).

@@ -62,6 +62,8 @@ struct EscargotContextOpaque {
     std::mutex protect_mu;
     std::unordered_map<ValueRef *, std::pair<int, PersistentRefHolder<ValueRef>>> protect;
     std::string pending_throw;
+    // True when escargot_throw recorded a pending string error (message may be empty).
+    bool pending_throw_set = false;
     // Owned exception Value for host trampoline (takes precedence over pending_throw string).
     EscargotValue pending_throw_value = nullptr;
     std::mutex buffers_mu;
@@ -334,6 +336,7 @@ extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
 extern "C" void escargot_context_free(EscargotContext *ctx) {
     if (!ctx) return;
     ctx->pending_throw.clear();
+    ctx->pending_throw_set = false;
     if (ctx->pending_throw_value) {
         escargot_free_value(ctx, ctx->pending_throw_value);
         ctx->pending_throw_value = nullptr;
@@ -593,6 +596,7 @@ static bool escargotToNumber(EscargotContext *c, EscargotValue v, double *out) {
         val);
     if (!er.isSuccessful()) {
         c->pending_throw.clear();
+        c->pending_throw_set = false;
         if (c->pending_throw_value) {
             escargot_free_value(c, c->pending_throw_value);
             c->pending_throw_value = nullptr;
@@ -601,6 +605,7 @@ static bool escargotToNumber(EscargotContext *c, EscargotValue v, double *out) {
             c->pending_throw_value = retain(c, er.error.value());
         } else {
             c->pending_throw = "TypeError";
+            c->pending_throw_set = true;
         }
         return false;
     }
@@ -1420,6 +1425,7 @@ static ValueRef *nativeTrampoline(ExecutionStateRef *state, ValueRef *thisValue,
     std::vector<EscargotValue> args(argc);
     for (size_t i = 0; i < argc; i++) args[i] = argv[i];
     data->ctx->pending_throw.clear();
+    data->ctx->pending_throw_set = false;
     if (data->ctx->pending_throw_value) {
         // Drop any stale retained exception before the callback.
         escargot_free_value(data->ctx, data->ctx->pending_throw_value);
@@ -1432,14 +1438,16 @@ static ValueRef *nativeTrampoline(ExecutionStateRef *state, ValueRef *thisValue,
         ValueRef *exc = asVal(pending);
         data->ctx->pending_throw_value = nullptr;
         data->ctx->pending_throw.clear();
+        data->ctx->pending_throw_set = false;
         if (result) escargot_free_value(data->ctx, result);
         escargot_free_value(data->ctx, pending);
         state->throwException(exc);
         return ValueRef::createUndefined();
     }
-    if (!data->ctx->pending_throw.empty()) {
+    if (data->ctx->pending_throw_set) {
         std::string msg = data->ctx->pending_throw;
         data->ctx->pending_throw.clear();
+        data->ctx->pending_throw_set = false;
         if (result) escargot_free_value(data->ctx, result);
         state->throwException(ErrorObjectRef::create(state, ErrorObjectRef::Code::TypeError,
             StringRef::createFromUTF8(msg.data(), msg.size())));
@@ -1494,13 +1502,17 @@ extern "C" EscargotValue escargot_make_function_ex(EscargotContext *c, const cha
 extern "C" void escargot_throw_value(EscargotContext *c, EscargotValue exception) {
     if (!c) return;
     c->pending_throw.clear();
+    c->pending_throw_set = false;
     if (c->pending_throw_value) {
         escargot_free_value(c, c->pending_throw_value);
         c->pending_throw_value = nullptr;
     }
     // Caller transferred ownership of the handle.
     c->pending_throw_value = exception;
-    if (!exception) c->pending_throw = "Error";
+    if (!exception) {
+        c->pending_throw = "Error";
+        c->pending_throw_set = true;
+    }
 }
 
 extern "C" void escargot_throw(EscargotContext *c, const char *message) {
@@ -1511,6 +1523,7 @@ extern "C" void escargot_throw(EscargotContext *c, const char *message) {
         c->pending_throw_value = nullptr;
     }
     c->pending_throw = message ? message : "Error";
+    c->pending_throw_set = true;
 }
 
 extern "C" EscargotAtom escargot_atom_new(EscargotContext *c, const char *utf8, size_t len) {
@@ -2505,20 +2518,23 @@ static ValueRef *nativeHandleTrampoline(ExecutionStateRef *state, ValueRef *this
     std::vector<EscargotValue> args(argc);
     for (size_t i = 0; i < argc; ++i) args[i] = argv[i];
     c->pending_throw.clear();
+    c->pending_throw_set = false;
     EscargotValue out = bx->call_fn(c, thisValue, args.data(), argc, bx->handle_data);
     if (c->pending_throw_value) {
         EscargotValue pending = c->pending_throw_value;
         ValueRef *exc = asVal(pending);
         c->pending_throw_value = nullptr;
         c->pending_throw.clear();
+        c->pending_throw_set = false;
         if (out) escargot_free_value(c, out);
         escargot_free_value(c, pending);
         state->throwException(exc);
         return ValueRef::createUndefined();
     }
-    if (!c->pending_throw.empty()) {
+    if (c->pending_throw_set) {
         std::string msg = c->pending_throw;
         c->pending_throw.clear();
+        c->pending_throw_set = false;
         if (out) escargot_free_value(c, out);
         state->throwException(ErrorObjectRef::create(state, ErrorObjectRef::Code::None,
             StringRef::createFromUTF8(msg.data(), msg.size())));

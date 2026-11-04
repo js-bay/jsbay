@@ -900,8 +900,9 @@ static std::string rewriteIdents(const std::string &src,
             return true;
         size_t pk = out.size();
         while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+        // `else {` introduces a statement block, not an object literal — keep lexical scope push/pop.
         return outEndsWithWord(pk, "return") || outEndsWithWord(pk, "throw") ||
-               outEndsWithWord(pk, "else") || outEndsWithWord(pk, "=>") ||
+               outEndsWithWord(pk, "=>") ||
                outEndsWithWord(pk, "of") || outEndsWithWord(pk, "in") ||
                outEndsWithWord(pk, "case") || outEndsWithWord(pk, "void") ||
                outEndsWithWord(pk, "typeof") || outEndsWithWord(pk, "delete") ||
@@ -2636,6 +2637,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     // export default ...
     {
         static const std::regex re_fn(R"(export\s+default\s+function\s*([A-Za-z_$][\w$]*)?)");
+        static const std::regex re_class(R"(export\s+default\s+class\s*([A-Za-z_$][\w$]*)?)");
         std::smatch m;
         std::string blanked = blankNonCode(body);
         if (std::regex_search(blanked, m, re_fn)) {
@@ -2646,11 +2648,22 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 body.replace(m.position(), std::strlen("export default "), "");
             }
             epilogue.push_back(exportLiveGetter("default", name));
+        } else if (std::regex_search(blanked = blankNonCode(body), m, re_class)) {
+            // Keep a module-scoped class declaration (named or synthetic) so local refs resolve; publish via getter.
+            std::string name = m[1].matched ? body.substr(m.position(1), m.length(1)) : "__default_export";
+            if (!m[1].matched) {
+                body.replace(m.position(), m.length(), "class " + name);
+            } else {
+                body.replace(m.position(), std::strlen("export default "), "");
+            }
+            epilogue.push_back(exportLiveGetter("default", name));
         } else {
             static const std::regex re_def(R"(export\s+default\s+)");
             blanked = blankNonCode(body);
             if (std::regex_search(blanked, m, re_def)) {
-                body.replace(m.position(), m.length(), std::string(kWrapExports) + ".default = ");
+                // Store the expression in an internal binding and expose a read-only live export (native ESM semantics).
+                body.replace(m.position(), m.length(), "var __jsbay_default = ");
+                epilogue.push_back(exportLiveGetter("default", "__jsbay_default"));
             }
         }
     }

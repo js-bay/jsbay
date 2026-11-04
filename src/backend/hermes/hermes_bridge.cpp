@@ -39,6 +39,8 @@ struct JsbayHermesContextOpaque {
     std::mutex protect_mu;
     std::unordered_map<jsi::Value *, std::pair<int, std::unique_ptr<jsi::Value>>> protect;
     std::string pending_throw;
+    // True when hermes_throw recorded a pending string error (message may be empty).
+    bool pending_throw_set = false;
     // Owned exception value for host trampoline (takes precedence over pending_throw string).
     std::unique_ptr<jsi::Value> pending_throw_value;
     struct PendingFinal {
@@ -489,6 +491,7 @@ extern "C" void hermes_uninstall_module_loader(JsbayHermesContext *ctx);
 extern "C" void hermes_context_free(JsbayHermesContext *ctx) {
     if (!ctx) return;
     ctx->pending_throw.clear();
+    ctx->pending_throw_set = false;
     ctx->pending_throw_value.reset();
     // Drop ESM cache (jsi::Object) before tearing down the Runtime / protect table.
     hermes_uninstall_module_loader(ctx);
@@ -798,22 +801,26 @@ static bool hermesToNumber(JsbayHermesContext *c, HermesValue v, double *out) {
     } catch (const jsi::JSError &e) {
         try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw.clear();
+        c->pending_throw_set = false;
         try {
             c->pending_throw_value = std::make_unique<jsi::Value>(*c->rt, e.value());
         } catch (...) {
             c->pending_throw_value.reset();
             c->pending_throw = e.getMessage();
+            c->pending_throw_set = true;
         }
         return false;
     } catch (const std::exception &e) {
         try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw_value.reset();
         c->pending_throw = e.what();
+        c->pending_throw_set = true;
         return false;
     } catch (...) {
         try { c->rt->global().setProperty(*c->rt, "__jsbay_tonumber_arg", jsi::Value::undefined()); } catch (...) {}
         c->pending_throw_value.reset();
         c->pending_throw = "TypeError";
+        c->pending_throw_set = true;
         return false;
     }
 }
@@ -1693,6 +1700,7 @@ static HermesValue hermesMakeFunctionOwned(JsbayHermesContext *c, const char *na
                 }
                 HermesValue this_h = retainMove(ctx, jsi::Value(rt, thisVal));
                 ctx->pending_throw.clear();
+                ctx->pending_throw_set = false;
                 ctx->pending_throw_value.reset();
                 HermesValue out = state->fn(ctx, this_h, argv.data(), count, state->user_data);
                 hermes_free_value(ctx, this_h);
@@ -1701,12 +1709,14 @@ static HermesValue hermesMakeFunctionOwned(JsbayHermesContext *c, const char *na
                     jsi::Value exc = std::move(*ctx->pending_throw_value);
                     ctx->pending_throw_value.reset();
                     ctx->pending_throw.clear();
+                    ctx->pending_throw_set = false;
                     if (out) hermes_free_value(ctx, out);
                     throw jsi::JSError(rt, std::move(exc));
                 }
-                if (!ctx->pending_throw.empty()) {
+                if (ctx->pending_throw_set) {
                     std::string msg = ctx->pending_throw;
                     ctx->pending_throw.clear();
+                    ctx->pending_throw_set = false;
                     if (out) hermes_free_value(ctx, out);
                     // Must share one libstdc++ with hermesvm/jsi (see addHermesSources: shared .so, not a second static libstdc++.a) or JSError RTTI/unwind ABRTs.
                     throw jsi::JSError(rt, msg);
@@ -1739,6 +1749,7 @@ extern "C" HermesValue hermes_make_function_ex(JsbayHermesContext *c, const char
 extern "C" void hermes_throw_value(JsbayHermesContext *c, HermesValue exception) {
     if (!c) return;
     c->pending_throw.clear();
+    c->pending_throw_set = false;
     c->pending_throw_value.reset();
     if (exception && asVal(exception)) {
         c->pending_throw_value = std::make_unique<jsi::Value>(*c->rt, *asVal(exception));
@@ -1754,6 +1765,7 @@ extern "C" void hermes_throw(JsbayHermesContext *c, const char *message) {
     if (!c) return;
     c->pending_throw_value.reset();
     c->pending_throw = message ? message : "Error";
+    c->pending_throw_set = true;
 }
 
 extern "C" HermesAtom hermes_atom_new(JsbayHermesContext *, const char *utf8, size_t len) {
@@ -3118,6 +3130,7 @@ extern "C" HermesValue hermes_native_handle_create(JsbayHermesContext *c, void *
                     for (size_t i = 0; i < count; ++i) argv.push_back(retainMove(ctx, jsi::Value(rt, args[i])));
                     HermesValue this_h = retainMove(ctx, jsi::Value(rt, thisVal));
                     ctx->pending_throw.clear();
+                    ctx->pending_throw_set = false;
                     ctx->pending_throw_value.reset();
                     HermesValue out = box->call_fn(ctx, this_h, argv.data(), count, box->handle_data);
                     hermes_free_value(ctx, this_h);
@@ -3126,12 +3139,14 @@ extern "C" HermesValue hermes_native_handle_create(JsbayHermesContext *c, void *
                         jsi::Value exc = std::move(*ctx->pending_throw_value);
                         ctx->pending_throw_value.reset();
                         ctx->pending_throw.clear();
+                        ctx->pending_throw_set = false;
                         if (out) hermes_free_value(ctx, out);
                         throw jsi::JSError(rt, std::move(exc));
                     }
-                    if (!ctx->pending_throw.empty()) {
+                    if (ctx->pending_throw_set) {
                         std::string msg = ctx->pending_throw;
                         ctx->pending_throw.clear();
+                        ctx->pending_throw_set = false;
                         if (out) hermes_free_value(ctx, out);
                         throw jsi::JSError(rt, msg);
                     }
