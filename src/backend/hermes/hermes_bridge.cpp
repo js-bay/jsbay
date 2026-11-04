@@ -1101,11 +1101,9 @@ extern "C" HermesValue hermes_new_symbol(JsbayHermesContext *c, const char *desc
     try {
         auto &rt = *c->rt;
         auto Sym = rt.global().getPropertyAsFunction(rt, "Symbol");
-        if (desc && desc_len > 0) {
-            auto s = jsi::String::createFromUtf8(rt, reinterpret_cast<const uint8_t *>(desc), desc_len);
-            return retainMove(c, Sym.call(rt, s));
-        }
-        return retainMove(c, Sym.call(rt));
+        // newSymbol always creates Symbol(desc), including Symbol("") when desc_len is 0; never omit the argument (Symbol() would leave .description undefined).
+        auto s = jsi::String::createFromUtf8(rt, reinterpret_cast<const uint8_t *>(desc ? desc : ""), desc ? desc_len : 0);
+        return retainMove(c, Sym.call(rt, s));
     } catch (...) { return nullptr; }
 }
 

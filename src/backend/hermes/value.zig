@@ -144,7 +144,9 @@ pub fn defineDataProperty(ctx: Context, obj: Value, key: [*:0]const u8, val: Val
     return c_api.hermes_define_data_property(ctx, obj, key, val, writable);
 }
 pub fn newSymbol(ctx: Context, desc: []const u8) ?Value {
-    const v = c_api.hermes_new_symbol(ctx, if (desc.len > 0) desc.ptr else null, desc.len);
+    // Empty description is Symbol(""); never pass null for a zero-length slice (that would omit the arg / treat it as Symbol()).
+    const ptr: [*]const u8 = if (desc.len > 0) desc.ptr else @as([*]const u8, @ptrCast(""));
+    const v = c_api.hermes_new_symbol(ctx, ptr, desc.len);
     return if (v == null) null else v;
 }
 pub fn symbolFor(ctx: Context, key: []const u8) ?Value {

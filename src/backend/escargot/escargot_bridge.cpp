@@ -380,8 +380,7 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
                 pk->deleter = nullptr;
                 d(u);
             }
-            // Do not delete: a later process-global GC may still invoke the
-            // BackingStore deleter; fireNoCopyPack will free the retired shell.
+            // Do not delete: a later process-global GC may still invoke the BackingStore deleter; fireNoCopyPack will free the retired shell.
             pk->retired = true;
         }
     }
@@ -865,9 +864,8 @@ extern "C" bool escargot_define_data_property(EscargotContext *c, EscargotValue 
 
 extern "C" EscargotValue escargot_new_symbol(EscargotContext *c, const char *desc, size_t desc_len) {
     if (!c) return nullptr;
-    OptionalRef<StringRef> d;
-    if (desc && desc_len > 0) d = StringRef::createFromUTF8(desc, desc_len);
-    else if (desc) d = StringRef::createFromUTF8(desc, strlen(desc));
+    // newSymbol always creates Symbol(desc), including Symbol("") when desc_len is 0; never omit the description (Symbol() would leave .description undefined).
+    OptionalRef<StringRef> d = StringRef::createFromUTF8(desc ? desc : "", desc ? desc_len : 0);
     SymbolRef *sym = SymbolRef::create(d);
     return retain(c, sym);
 }

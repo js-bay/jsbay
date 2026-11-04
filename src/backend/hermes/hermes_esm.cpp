@@ -283,6 +283,7 @@ static void blankRegexLiteral(std::string &out, size_t &i) {
 
 static void collectPatternBoundNames(const std::string &src, size_t &i, std::vector<std::string> &names);
 static std::vector<std::string> collectDeclaratorBoundNames(const std::string &src, size_t start);
+static std::vector<std::string> collectParamListBoundNames(const std::string &src, size_t open_paren);
 
 // Skip strings/comments/regex roughly; return rewritten source with identifier replacements.
 // Template literal text is preserved, but `${...}` interpolations are rewritten recursively.
@@ -1021,6 +1022,8 @@ static std::string rewriteIdents(const std::string &src,
                 kind = Cont::ParamList;
                 pushFunctionScope();
                 in_param_default = false;
+                // Parameter scope binds every formal for the whole list (incl. TDZ for later params referenced in earlier defaults), matching native ESM before any default initializer is rewritten.
+                addBindings(collectParamListBoundNames(src, i));
             }
             cont.push_back(kind);
             out.push_back(src[i++]);
@@ -1534,6 +1537,75 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
                     ++i; continue;
                 }
                 if (depth == 0 && (ch == ',' || ch == ';')) break;
+                ++i;
+            }
+        }
+        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        if (i < src.size() && src[i] == ',') { ++i; continue; }
+        break;
+    }
+    return names;
+}
+
+// Bound names for a parameter list starting at `open_paren` (`(`). Collects every formal before any default initializer is rewritten so later params shadow imports for the whole parameter scope (TDZ).
+static std::vector<std::string> collectParamListBoundNames(const std::string &src, size_t open_paren) {
+    std::vector<std::string> names;
+    if (open_paren >= src.size() || src[open_paren] != '(') return names;
+    size_t i = open_paren + 1;
+    while (i < src.size()) {
+        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        if (i >= src.size() || src[i] == ')') break;
+        if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            i += 2;
+            while (i < src.size() && src[i] != '\n') ++i;
+            continue;
+        }
+        if (src[i] == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            if (i + 1 < src.size()) i += 2;
+            continue;
+        }
+        if (src[i] == '.' && i + 2 < src.size() && src[i + 1] == '.' && src[i + 2] == '.') {
+            i += 3;
+            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            collectPatternBoundNames(src, i, names);
+            break;
+        }
+        collectPatternBoundNames(src, i, names);
+        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        if (i < src.size() && src[i] == '=') {
+            ++i;
+            int depth = 0;
+            while (i < src.size()) {
+                char ch = src[i];
+                if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+                    i += 2;
+                    while (i < src.size() && src[i] != '\n') ++i;
+                    continue;
+                }
+                if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+                    i += 2;
+                    while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+                    if (i + 1 < src.size()) i += 2;
+                    continue;
+                }
+                if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                if (ch == '\'' || ch == '"' || ch == '`') {
+                    char q = ch; ++i;
+                    while (i < src.size()) {
+                        if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
+                        if (src[i] == q) { ++i; break; }
+                        ++i;
+                    }
+                    continue;
+                }
+                if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                if (ch == '}' || ch == ']' || ch == ')') {
+                    if (depth == 0) break;
+                    --depth; ++i; continue;
+                }
+                if (depth == 0 && ch == ',') break;
                 ++i;
             }
         }

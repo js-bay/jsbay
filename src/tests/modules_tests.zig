@@ -401,6 +401,38 @@ test "modules: compound param default rewrites imported binding" {
     try testing.expectEqual(@as(i64, 43), got);
 }
 
+test "modules: later param shadows import in earlier default (TDZ)" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // All parameter bindings are in scope for every default initializer; `value` here is the later formal, not the import.
+    // A correct rewrite leaves `value` unbound until its parameter init (TDZ ReferenceError on engines that enforce it). Rewriting to the import would yield 42 instead.
+    const src =
+        \\import { value } from 'dep';
+        \\export function read(){ return ((a = value, value = 2) => a)(); }
+        \\try {
+        \\  globalThis.__got__ = read();
+        \\  globalThis.__threw__ = false;
+        \\} catch (e) {
+        \\  globalThis.__threw__ = true;
+        \\  globalThis.__ref__ = e instanceof ReferenceError;
+        \\}
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    // Native TDZ → ReferenceError; Hermes currently skips that TDZ but must still not resolve the import (42).
+    try helpers.expectEvalEquals(id, "globalThis.__threw__ ? globalThis.__ref__ === true : globalThis.__got__ !== 42", "true");
+}
+
 test "modules: re-export dependency evaluates before module body" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
