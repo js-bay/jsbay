@@ -130,7 +130,13 @@ pub fn Module(comptime Host: type) type {
                 .object_table = object_table.ObjectTable.init(alloc),
                 .engine_thread_id = .init(@intCast(std.Thread.getCurrentId())),
             };
+            if (Host.instance_map.getInstance(instance_id)) |instance| {
+                if (instance.execution_cpu) |ledger| {
+                    if (ledger.retain()) state.execution_cpu_ledger = ledger;
+                }
+            }
             errdefer state.deinitSynchronization();
+            errdefer state_mod.releaseExecutionCpuMeasurement(state);
             errdefer state.object_table.deinit(engine.getContext(instance_id));
             errdefer state.sessions.deinit(alloc);
             var intrinsics_captured = false;
@@ -181,6 +187,11 @@ pub fn Module(comptime Host: type) type {
 
             if (!state_mod.activateReservedStart(instance_id, state)) return StartError.AlreadyStarted;
             reservation_active = false;
+
+            // Inspector startup owns bounded compiler-source collection. Execution callbacks remain disarmed until a client enables Debugger.
+            if (comptime backend.supportsSourceJournal(backend.active_backend)) {
+                if (!Host.debugger.attachSourceCollector(instance_id, @ptrCast(runtime))) return StartError.OutOfMemory;
+            }
 
             if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
                 if (engine.getContext(instance_id)) |ctx| backend.ActiveEngineModule.exception.ensureRejectionTracker(ctx);
@@ -258,7 +269,7 @@ pub fn Module(comptime Host: type) type {
             defer engine_thread.endEval(lease);
             // Finalization runs on the JS owner after all session/reader work has drained, so disarming here cannot race a new state with the same id.
             debugger_cdp.stopInstance(state);
-            Host.debugger.coolDown(state.instance_id);
+            Host.debugger.stopCollector(state.instance_id);
             if (engine.getRuntime(state.instance_id)) |runtime| {
                 debugger_cdp.clearAsyncStackDepthOnOwner(state.instance_id, runtime);
             }
@@ -301,6 +312,7 @@ pub fn Module(comptime Host: type) type {
         fn destroyInspectorState(state: *InspectorState) void {
             const alloc = state.allocator;
             state_mod.discardPendingAsyncDepthReconciliation(state);
+            state_mod.releaseExecutionCpuMeasurement(state);
             state.deinitSynchronization();
             alloc.free(state.title);
             alloc.free(state.url);

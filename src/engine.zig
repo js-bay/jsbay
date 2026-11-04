@@ -125,8 +125,17 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
             std.heap.c_allocator.destroy(instance);
             return false;
         };
+        const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse {
+            resources.deinit();
+            ActiveEngine.freeContext(ctx);
+            ActiveEngine.freeRuntime(runtime);
+            loop.destroy();
+            std.heap.c_allocator.destroy(instance);
+            return false;
+        };
         instance.* = .{
             .resources = resources,
+            .execution_cpu = execution_cpu,
             .instance_id = instance_id,
             .engine_handles = .{ .mono = .{ .runtime = runtime, .ctx = ctx } },
             .loop = loop,
@@ -149,6 +158,7 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
             ActiveEngine.freeContext(ctx);
             ActiveEngine.freeRuntime(runtime);
             loop.destroy();
+            execution_cpu.close();
             resources.deinit();
             instance.deinitSynchronization();
             std.heap.c_allocator.destroy(instance);
@@ -175,8 +185,16 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
         std.heap.c_allocator.destroy(instance);
         return false;
     };
+    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse {
+        resources.deinit();
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        std.heap.c_allocator.destroy(instance);
+        return false;
+    };
     instance.* = .{
         .resources = resources,
+        .execution_cpu = execution_cpu,
         .instance_id = instance_id,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
         .loop = loop,
@@ -196,6 +214,7 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
     }{})) {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
+        execution_cpu.close();
         resources.deinit();
         instance.deinitSynchronization();
         std.heap.c_allocator.destroy(instance);
@@ -204,7 +223,16 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
     return true;
 }
 
+pub const EvalScriptOptions = struct {
+    report_uncaught: bool = true,
+};
+
 pub fn evalScript(instance_id: i32, script: []const u8, filename: []const u8) EvalResult {
+    return evalScriptWithOptions(instance_id, script, filename, .{});
+}
+
+/// Evaluates a script with the standard admission and debugger boundary. Callers that serialize evaluation failures into another protocol response can disable the independent uncaught-exception notification.
+pub fn evalScriptWithOptions(instance_id: i32, script: []const u8, filename: []const u8, options: EvalScriptOptions) EvalResult {
     // After threadStart, only the engine thread may eval. A foreign call fails here and does not run the script. Before the thread starts, and after it stops, the caller may eval.
     if (instance_map.getPtrs(instance_id) == null) {
         return missingInstanceResult();
@@ -237,7 +265,9 @@ pub fn evalScript(instance_id: i32, script: []const u8, filename: []const u8) Ev
     };
     @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(&execution);
     _ = ptrs;
-    if (result.err) |message| @import("inspector/root.zig").exceptions.reportUncaught(instance_id, message, filename);
+    if (options.report_uncaught) {
+        if (result.err) |message| @import("inspector/root.zig").exceptions.reportUncaught(instance_id, message, filename);
+    }
     return result;
 }
 
@@ -746,6 +776,7 @@ pub fn destroyRuntime(instance_id: i32) void {
 
     // Removing the instance under the registry lock excludes concurrent wakeAsync/dispatch calls before the native wait primitive is released.
     const removed = instance_map.remove(instance_id) orelse return;
+    if (removed.execution_cpu) |ledger| ledger.close();
     removed.resources.deinit();
     removed.loop.destroy();
     removed.deinitSynchronization();
@@ -839,8 +870,16 @@ test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Lin
         std.heap.c_allocator.destroy(instance);
         return error.BudgetFailed;
     };
+    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse {
+        resources.deinit();
+        backend_dispatch.destroyPacked(tag, handles);
+        loop.destroy();
+        std.heap.c_allocator.destroy(instance);
+        return error.Oom;
+    };
     instance.* = .{
         .resources = resources,
+        .execution_cpu = execution_cpu,
         .instance_id = id,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
         .loop = loop,
@@ -849,6 +888,7 @@ test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Lin
     if (!instance_map.insert(instance)) {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
+        execution_cpu.close();
         resources.deinit();
         instance.deinitSynchronization();
         std.heap.c_allocator.destroy(instance);

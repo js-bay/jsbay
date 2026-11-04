@@ -2,6 +2,7 @@ pub const InspectorHost = struct {
     pub const backend = @import("../backend.zig");
     pub const engine = @import("../engine.zig");
     pub const engine_thread = @import("../runtime/engine_thread.zig");
+    pub const execution_cpu = @import("../runtime/execution_cpu.zig");
     const root_dispatch = @import("../runtime/dispatch.zig");
     /// Inspector requests are explicit debugger/DevTools control work. The pause loop may execute them to inspect or resume the paused stack, but it never executes ordinary application tasks through this adapter.
     pub const dispatch = struct {
@@ -12,6 +13,11 @@ pub const InspectorHost = struct {
             var control = task;
             control.debugger_control = true;
             return root_dispatch.postTask(instance_id, control);
+        }
+
+        /// Queue ordinary owner work which must not run from the paused debugger control drain.
+        pub fn postBoundaryTask(instance_id: i32, task: NativeTask) bool {
+            return root_dispatch.postTask(instance_id, task);
         }
 
         pub const enterTaskOwnerFrame = root_dispatch.enterTaskOwnerFrame;

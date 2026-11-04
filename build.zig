@@ -753,6 +753,7 @@ fn preparePatchedQuickJsNg(b: *std.Build, tool: *std.Build.Step.Compile) std.Bui
     run.addFileArg(b.path("vendor/quickjs-ng-break-locations.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-script-tags.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-inspector-off.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-location-precision.patch"));
     return out;
 }
 
@@ -772,6 +773,7 @@ fn preparePatchedQuickJs(b: *std.Build, tool: *std.Build.Step.Compile) std.Build
     run.addFileArg(b.path("vendor/quickjs-promise-then.patch"));
     run.addFileArg(b.path("vendor/quickjs-inspector-off.patch"));
     run.addFileArg(b.path("vendor/quickjs-transfer-neuter.patch"));
+    run.addFileArg(b.path("vendor/quickjs-script-tags.patch"));
     return out;
 }
 
@@ -998,6 +1000,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-finalizer.patch"));
             hash.update(@embedFile("vendor/quickjs-heap.patch"));
             hash.update(@embedFile("vendor/quickjs-async-stack.patch"));
+            hash.update(@embedFile("vendor/quickjs-script-tags.patch"));
             hash.update(@embedFile("vendor/quickjs-ubsan.patch"));
             hash.update(@embedFile("vendor/quickjs-array-identity.patch"));
             hash.update(@embedFile("vendor/quickjs-dataview-native.patch"));
@@ -1019,6 +1022,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-ng-break-locations.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-script-tags.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-inspector-off.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-location-precision.patch"));
             hash.update(@embedFile("src/backend/quickjs_ng/qjs_wrapper_ng.c"));
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
         },

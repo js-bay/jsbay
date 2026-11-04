@@ -1201,13 +1201,49 @@ test "cdp: disabling Debugger in one session keeps another session enabled" {
     try testing.expectEqualStrings("42", box.result);
 }
 
-test "cdp: breakpoint column moves to the first breakable column" {
+test "cdp: enabling a second Debugger session preserves a pending pause" {
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var first = try openSession(alloc, "cdp-debugger-pending-pause");
+    defer first.deinit();
+
+    const peer_stream = try wire.connect(inspector.boundPort(first.handle));
+    errdefer peer_stream.close();
+    try wire.doWsHandshake(alloc, peer_stream, "cdp-debugger-pending-pause");
+    var peer = Session{
+        .alloc = alloc,
+        .id = first.id,
+        .handle = first.handle,
+        .stream = peer_stream,
+        .reader = wire.FrameReader.init(peer_stream),
+        .got = .empty,
+    };
+    defer {
+        peer.reader.deinit(alloc);
+        peer.stream.close();
+        peer.got.deinit(alloc);
+    }
+
+    try enableDebugger(&first);
+    const pause = try first.command("Debugger.pause", "");
+    try waitCommand(&first, pause);
+    try enableDebugger(&peer);
+
+    var box = EvalBox{ .id = first.id, .script = "globalThis.pendingPause = 1;", .filename = "pending-pause.js" };
+    defer box.deinit();
+    try peer.spawn(&box);
+    try peer.expect(try peer.wait("Debugger.paused", 80));
+    try resumeSession(&peer);
+    try testing.expect(box.ok);
+}
+
+test "cdp: NG breakpoint resolution reports a compiler location" {
     if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-column");
     defer session.deinit();
     try enableDebugger(&session);
-    var box = EvalBox{ .id = session.id, .script = "    var a = 1;\n", .filename = "indent.js" };
+    var box = EvalBox{ .id = session.id, .script = "    globalThis.indentValue = 1;\n", .filename = "indent.js" };
     defer box.deinit();
     try session.spawn(&box);
     try session.expect(try session.wait("\"url\":\"indent.js\"", 40));
@@ -1216,7 +1252,7 @@ test "cdp: breakpoint column moves to the first breakable column" {
     const marker = try idMarker(alloc, id);
     defer alloc.free(marker);
     try session.expect(try session.wait(marker, 40));
-    try testing.expect(std.mem.indexOf(u8, session.got.items, "\"columnNumber\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, session.got.items, "\"locations\":[{\"scriptId\":\"1\",\"lineNumber\":0,\"columnNumber\":4}]") != null);
 }
 
 test "cdp: urlRegex breakpoint hits a matching script" {

@@ -2405,6 +2405,96 @@
       "events": []
     },
     {
+      "domain": "HeapProfiler",
+      "experimental": true,
+      "dependencies": [
+        "Runtime"
+      ],
+      "types": [
+        {
+          "id": "HeapSnapshotObjectId",
+          "description": "Heap snapshot object id.",
+          "type": "string"
+        },
+        {
+          "id": "SamplingHeapProfileNode",
+          "description": "Sampling Heap Profile node. Holds callsite information, allocation statistics and child nodes.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "callFrame",
+              "description": "Function location.",
+              "$ref": "Runtime.CallFrame"
+            },
+            {
+              "name": "selfSize",
+              "description": "Allocations size in bytes for the node excluding children.",
+              "type": "number"
+            },
+            {
+              "name": "id",
+              "description": "Node id. Ids are unique across all profiles collected between startSampling and stopSampling.",
+              "type": "integer"
+            },
+            {
+              "name": "children",
+              "description": "Child nodes.",
+              "type": "array",
+              "items": {
+                "$ref": "SamplingHeapProfileNode"
+              }
+            }
+          ]
+        },
+        {
+          "id": "SamplingHeapProfileSample",
+          "description": "A single sample from a sampling profile.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "size",
+              "description": "Allocation size in bytes attributed to the sample.",
+              "type": "number"
+            },
+            {
+              "name": "nodeId",
+              "description": "Id of the corresponding profile tree node.",
+              "type": "integer"
+            },
+            {
+              "name": "ordinal",
+              "description": "Time-ordered sample ordinal number. It is unique across all profiles retrieved\nbetween startSampling and stopSampling.",
+              "type": "number"
+            }
+          ]
+        },
+        {
+          "id": "SamplingHeapProfile",
+          "description": "Sampling profile.",
+          "type": "object",
+          "properties": [
+            {
+              "name": "head",
+              "$ref": "SamplingHeapProfileNode"
+            },
+            {
+              "name": "samples",
+              "type": "array",
+              "items": {
+                "$ref": "SamplingHeapProfileSample"
+              }
+            }
+          ]
+        }
+      ],
+      "commands": [
+        {
+          "name": "collectGarbage"
+        }
+      ],
+      "events": []
+    },
+    {
       "domain": "Performance",
       "types": [
         {

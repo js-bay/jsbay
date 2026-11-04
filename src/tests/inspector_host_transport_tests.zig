@@ -18,6 +18,7 @@ const HostTransport = struct {
     close_during_deinit: bool = false,
     stop_on_send: ?*inspector.Handle = null,
     stop_on_method: ?[]const u8 = null,
+    fail_on_method: ?[]const u8 = null,
 
     const vtable: inspector.Transport.VTable = .{
         .start = start,
@@ -56,6 +57,12 @@ const HostTransport = struct {
 
     fn send(ctx: *anyopaque, session: inspector.SessionId, text: []const u8) bool {
         const self = from(ctx);
+        if (self.fail_on_method) |method| {
+            if (messageHasMethod(text, method)) {
+                self.fail_on_method = null;
+                return false;
+            }
+        }
         const copy = testing.allocator.dupe(u8, text) catch return false;
         self.frames.append(testing.allocator, .{ .session = session, .text = copy }) catch {
             testing.allocator.free(copy);
@@ -123,7 +130,44 @@ const HostTransport = struct {
         }
         return false;
     }
+
+    fn hasMethodSince(self: *const HostTransport, frame_start: usize, method: []const u8) bool {
+        for (self.frames.items[frame_start..]) |frame| {
+            var parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, frame.text, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+            const value = parsed.value.object.get("method") orelse continue;
+            if (value == .string and std.mem.eql(u8, value.string, method)) return true;
+        }
+        return false;
+    }
 };
+
+fn messageHasMethod(text: []const u8, method: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, text, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const value = parsed.value.object.get("method") orelse return false;
+    return value == .string and std.mem.eql(u8, value.string, method);
+}
+
+fn waitForReply(host: *HostTransport, instance_id: i32, session: inspector.SessionId, request_id: i64) !std.json.Parsed(std.json.Value) {
+    var attempts: usize = 0;
+    while (attempts < 40) : (attempts += 1) {
+        engine.runEventLoopOnce(instance_id);
+        const reply = host.reply(session, request_id) catch |err| switch (err) {
+            error.MissingReply => continue,
+            else => return err,
+        };
+        return reply;
+    }
+    return error.MissingReply;
+}
+
+fn expectErrorReply(reply: *const std.json.Parsed(std.json.Value)) !void {
+    try testing.expect(reply.value.object.get("result") == null);
+    try testing.expect(reply.value.object.get("error") != null);
+}
 
 fn enableRuntime(host: *HostTransport) !void {
     host.emit(.session_opened, 7, "");
@@ -179,6 +223,55 @@ const Enabled = if (options.inspector) struct {
         inspector.stop(handle);
         try testing.expectEqual(@as(usize, 1), host.deinit_count);
         try testing.expect(host.handler == null);
+    }
+
+    test "host transport rejects failed heap snapshot events without false completion and retries" {
+        if (comptime !backend.isQuickJsApiBackend(backend.active_backend) or !options.heap_snapshot) return error.SkipZigTest;
+        inline for ([_][]const u8{ "HeapProfiler.reportHeapSnapshotProgress", "HeapProfiler.addHeapSnapshotChunk" }) |rejected_method| {
+            const id = helpers.nextInstanceId();
+            try testing.expect(engine.create(id, .{}));
+            defer engine.destroy(id);
+            var host = HostTransport{};
+            host.init();
+            defer host.freeFrames();
+            const handle = try inspector.startWithTransport(id, &host.endpoint, .{});
+            defer if (host.handler != null) inspector.stop(handle);
+            host.emit(.session_opened, 7, "");
+
+            host.fail_on_method = rejected_method;
+            host.emit(.message, 7, "{\"id\":81,\"method\":\"HeapProfiler.takeHeapSnapshot\",\"params\":{\"reportProgress\":true}}");
+            var rejected = try waitForReply(&host, id, 7, 81);
+            defer rejected.deinit();
+            try expectErrorReply(&rejected);
+            try testing.expect(!host.hasMethod(rejected_method));
+
+            const retry_start = host.frames.items.len;
+            host.emit(.message, 7, "{\"id\":82,\"method\":\"HeapProfiler.takeHeapSnapshot\",\"params\":{\"reportProgress\":false}}");
+            var retried = try waitForReply(&host, id, 7, 82);
+            defer retried.deinit();
+            try testing.expect(retried.value.object.get("error") == null);
+            try testing.expect(retried.value.object.get("result") != null);
+            try testing.expect(host.hasMethodSince(retry_start, "HeapProfiler.addHeapSnapshotChunk"));
+            try testing.expect(!host.hasMethodSince(retry_start, "HeapProfiler.reportHeapSnapshotProgress"));
+        }
+    }
+
+    test "host transport can stop synchronously while heap snapshot progress is sent" {
+        if (comptime !backend.isQuickJsApiBackend(backend.active_backend) or !options.heap_snapshot) return error.SkipZigTest;
+        const id = helpers.nextInstanceId();
+        try testing.expect(engine.create(id, .{}));
+        defer engine.destroy(id);
+        var host = HostTransport{ .close_during_deinit = true };
+        host.init();
+        defer host.freeFrames();
+        const handle = try inspector.startWithTransport(id, &host.endpoint, .{});
+        defer if (host.handler != null) inspector.stop(handle);
+        host.stop_on_send = handle;
+        host.stop_on_method = "HeapProfiler.reportHeapSnapshotProgress";
+        host.emit(.session_opened, 7, "");
+        host.emit(.message, 7, "{\"id\":83,\"method\":\"HeapProfiler.takeHeapSnapshot\",\"params\":{\"reportProgress\":true}}");
+        engine.runEventLoopOnce(id);
+        try expectStopped(&host, "HeapProfiler.reportHeapSnapshotProgress");
     }
 
     test "host transport partial startup closes callbacks exactly once" {

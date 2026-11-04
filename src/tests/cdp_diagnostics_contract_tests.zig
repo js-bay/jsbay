@@ -135,6 +135,30 @@ fn snapshotPayload(alloc: std.mem.Allocator, payload: []const u8) ![]u8 {
     return out.toOwnedSlice(alloc);
 }
 
+fn expectEqualJsonValue(actual: std.json.Value, expected: std.json.Value) !void {
+    try testing.expect(@backingInt(actual) == @backingInt(expected));
+    switch (actual) {
+        .null => {},
+        .bool => |value| try testing.expectEqual(value, expected.bool),
+        .integer => |value| try testing.expectEqual(value, expected.integer),
+        .float => |value| try testing.expectEqual(value, expected.float),
+        .number_string => |value| try testing.expectEqualStrings(value, expected.number_string),
+        .string => |value| try testing.expectEqualStrings(value, expected.string),
+        .array => |values| {
+            try testing.expectEqual(values.items.len, expected.array.items.len);
+            for (values.items, expected.array.items) |item, other| try expectEqualJsonValue(item, other);
+        },
+        .object => |object| {
+            try testing.expectEqual(object.count(), expected.object.count());
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                const other = expected.object.get(entry.key_ptr.*) orelse return error.TestUnexpectedResult;
+                try expectEqualJsonValue(entry.value_ptr.*, other);
+            }
+        },
+    }
+}
+
 fn intAt(values: []const std.json.Value, index: usize) !i64 {
     if (index >= values.len or values[index] != .integer) return error.TestUnexpectedResult;
     return values[index].integer;
@@ -275,6 +299,27 @@ const InspectorEnabledTests = if (build_options.inspector) struct {
         try testing.expect(std.mem.indexOf(u8, session.got.items, "\"retainedSizeSupported\":false") != null);
         try testing.expectEqual(@as(i64, 0), try helpers.evalInt(session.id, "globalThis.__heap_gets"));
         try testing.expectEqual(@as(i64, 0), try helpers.evalInt(session.id, "globalThis.__heap_proxy_gets"));
+    }
+
+    test "cdp diagnostics: QuickJS heap snapshot persists the completion metadata in its raw JSON" {
+        if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+        const alloc = testing.allocator;
+        var session = try openSession(alloc, "diagnostics-heap-snapshot-metadata");
+        defer session.deinit();
+        try send(&session, "HeapProfiler.takeHeapSnapshot", "", 1);
+        try pumpResponse(&session, 1);
+        const snapshot = try snapshotPayload(alloc, session.got.items);
+        defer alloc.free(snapshot);
+        const raw = try std.json.parseFromSlice(std.json.Value, alloc, snapshot, .{});
+        defer raw.deinit();
+        const raw_snapshot = raw.value.object.get("snapshot") orelse return error.TestUnexpectedResult;
+        const raw_metadata = raw_snapshot.object.get("jsbaySnapshot") orelse return error.TestUnexpectedResult;
+        const response_line = try responseLine(session.got.items, 1);
+        const response = try std.json.parseFromSlice(std.json.Value, alloc, response_line, .{});
+        defer response.deinit();
+        const result = response.value.object.get("result") orelse return error.TestUnexpectedResult;
+        const response_metadata = result.object.get("jsbaySnapshot") orelse return error.TestUnexpectedResult;
+        try expectEqualJsonValue(raw_metadata, response_metadata);
     }
 
     // CDP property names are data, not display labels: a fixed-size scratch buffer or C-string treatment aliases keys and loses embedded NUL suffixes. Use long names and require the actual edge names, not substrings.
@@ -466,10 +511,11 @@ const InspectorEnabledTests = if (build_options.inspector) struct {
         if (ran.result) |v| std.heap.c_allocator.free(v);
         if (ran.err) |v| std.heap.c_allocator.free(v);
         inspector.testFailAllocationOnce(session.id, .heap_snapshot_chunk);
-        try send(&session, "HeapProfiler.takeHeapSnapshot", "", 1);
+        try send(&session, "HeapProfiler.takeHeapSnapshot", "{\"reportProgress\":true}", 1);
         try pumpResponse(&session, 1);
         try expectErrorResponse(session.got.items, 1);
         try testing.expect(std.mem.indexOf(u8, session.got.items, "HeapProfiler.addHeapSnapshotChunk") == null);
+        try testing.expect(std.mem.indexOf(u8, session.got.items, "HeapProfiler.reportHeapSnapshotProgress") == null);
         try send(&session, "HeapProfiler.takeHeapSnapshot", "", 2);
         try pumpResponse(&session, 2);
         try testing.expect(std.mem.indexOf(u8, session.got.items, "HeapProfiler.addHeapSnapshotChunk") != null);

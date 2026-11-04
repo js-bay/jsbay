@@ -14,6 +14,7 @@ const api_backend = @import("../abi/api_backend.zig");
 const debugger_mod = @import("../inspector/debugger.zig");
 const host_value = @import("../abi/host_value.zig");
 const instance_map = @import("instance_map.zig");
+const execution_cpu = @import("execution_cpu.zig");
 const io = @import("../platform/io.zig");
 const sync = @import("zev");
 const types = @import("../types.zig");
@@ -134,6 +135,7 @@ const State = struct {
     /// Engine thread has dropped its claim so another thread may eval. Nesting is `yield_depth`, touched only by the engine thread.
     yielded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     yield_depth: u32 = 0,
+    cpu_yield_pause: execution_cpu.PauseToken = .{},
     /// JavaScriptCore allows only one thread to touch a context at a time. This lease serializes foreign evaluations while the engine thread has yielded; QuickJS enforces ownership in its backend lifecycle.
     external_eval_mu: sync.Mutex = .{},
     external_eval_owner: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -755,6 +757,9 @@ pub fn releaseForExternalEval(instance_id: i32) bool {
     if (!isEngineThread(state)) return false;
     state.yield_depth += 1;
     if (state.yield_depth == 1) {
+        if (instance_map.getInstance(instance_id)) |instance| {
+            if (instance.execution_cpu) |ledger| state.cpu_yield_pause = execution_cpu.pauseForExternalEval(ledger);
+        }
         suspendBackend(instance_id);
         state.yielded.store(true, .seq_cst);
     }
@@ -778,6 +783,10 @@ pub fn reacquire(instance_id: i32) bool {
             state.external_eval_mu.unlock();
         }
         resumeBackend(instance_id);
+        execution_cpu.resumeAfterExternalEval(state.cpu_yield_pause);
+        state.cpu_yield_pause = .{};
+        // While yielded the loop reports no runnable work, so work queued meanwhile needs a wake to run.
+        engine.wakeAsync(instance_id);
     }
     return true;
 }

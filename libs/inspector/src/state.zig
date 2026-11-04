@@ -35,7 +35,7 @@ pub fn Module(comptime Host: type) type {
             performance_time_domain: PerformanceTimeDomain = .time_ticks,
         };
 
-        // CDP's declared Performance time domains. Command handling rejects `thread_ticks` until this process has a portable thread-CPU clock.
+        // CDP's declared Performance time domains. Command handling rejects `thread_ticks` until its timestamp semantics are implemented.
         pub const PerformanceTimeDomain = enum { time_ticks, thread_ticks };
 
         pub const PerformanceSession = struct {
@@ -101,6 +101,10 @@ pub fn Module(comptime Host: type) type {
             retired_next: ?*InspectorState = null,
             lifecycle: Lifecycle = .starting,
             sessions: std.ArrayList(Session),
+            /// Held for this inspector's lifetime so transport-side session changes never dereference an EngineInstance that may have been destroyed or reused.
+            execution_cpu_ledger: ?*Host.execution_cpu.Ledger = null,
+            /// True exactly when this state has contributed one measurement user to its retained ledger. Protected by `mutex`.
+            measurement_active: bool = false,
             /// Set on the transport thread whenever a session changes its async-stack request or disappears. The owner clears it only after applying the aggregate to the backend.
             async_depth_reconcile_pending: bool = false,
             /// Set only when the final Debugger session disappeared or Inspector is stopping. Async-depth requests alone must not detach a host-attached debugger.
@@ -197,6 +201,19 @@ pub fn Module(comptime Host: type) type {
 
         // Queue work that borrows `state`. Admission and queue insertion share the lifecycle lock so shutdown cannot remove a queue just before a new task recreates it. The task's completion callback clears the task marker before releasing the state lease.
         pub fn postInspectorTask(state: *InspectorState, task: dispatch.NativeTask) bool {
+            return postInspectorTaskWith(state, task, dispatch.postTask);
+        }
+
+        /// Queue an inspector operation only for a normal owner turn. Performance configuration changes its CPU measurement boundary, so it must not run while the debugger drains control work inside a paused script.
+        pub fn postInspectorBoundaryTask(state: *InspectorState, task: dispatch.NativeTask) bool {
+            return postInspectorTaskWith(state, task, dispatch.postBoundaryTask);
+        }
+
+        fn postInspectorTaskWith(
+            state: *InspectorState,
+            task: dispatch.NativeTask,
+            post: *const fn (i32, dispatch.NativeTask) bool,
+        ) bool {
             state.task_mutex.lock();
             defer state.task_mutex.unlock();
             if (state.closing) return false;
@@ -207,7 +224,7 @@ pub fn Module(comptime Host: type) type {
             leased.completion_ctx = state;
             leased.owner = state;
             leased.thread_id_slot = &state.engine_thread_id;
-            if (dispatch.postTask(state.instance_id, leased)) return true;
+            if (post(state.instance_id, leased)) return true;
             state.task_refs -= 1;
             state.inspector_task_refs -= 1;
             state.task_wake.broadcast();
@@ -518,6 +535,7 @@ pub fn Module(comptime Host: type) type {
             while (i < state.sessions.items.len) : (i += 1) {
                 if (state.sessions.items[i].id == session_id) {
                     _ = state.sessions.swapRemove(i);
+                    requestExecutionCpuMeasurementReconciliationLocked(state);
                     return true;
                 }
             }
@@ -541,6 +559,7 @@ pub fn Module(comptime Host: type) type {
                 if (state.sessions.items[i].id != session_id) continue;
                 const removed_debugger = state.sessions.items[i].debugger_enabled;
                 _ = state.sessions.swapRemove(i);
+                requestExecutionCpuMeasurementReconciliationLocked(state);
                 var has_debugger = false;
                 for (state.sessions.items) |session| {
                     if (session.debugger_enabled) {
@@ -709,9 +728,56 @@ pub fn Module(comptime Host: type) type {
                 } else {
                     session.performance_enabled = false;
                 }
+                reconcileExecutionCpuMeasurementOnOwnerLocked(state);
                 return .ok;
             }
             return .unknown_session;
+        }
+
+        fn reconcileExecutionCpuMeasurementOnOwnerLocked(state: *InspectorState) void {
+            var enabled = false;
+            for (state.sessions.items) |session| {
+                if (session.performance_enabled) {
+                    enabled = true;
+                    break;
+                }
+            }
+            if (enabled == state.measurement_active) return;
+            const ledger = state.execution_cpu_ledger orelse return;
+            if (enabled) ledger.enableOnOwner() else ledger.disableOnOwner();
+            state.measurement_active = enabled;
+        }
+
+        // Transport session removal cannot sample the owner's thread. Publish the logical state now and defer the physical decrement until the active CPU scope has ended.
+        fn requestExecutionCpuMeasurementReconciliationLocked(state: *InspectorState) void {
+            var enabled = false;
+            for (state.sessions.items) |session| {
+                if (session.performance_enabled) {
+                    enabled = true;
+                    break;
+                }
+            }
+            if (enabled == state.measurement_active) return;
+            const ledger = state.execution_cpu_ledger orelse return;
+            if (!enabled) ledger.requestDisableAtBoundary() else unreachable;
+            state.measurement_active = enabled;
+        }
+
+        pub fn releaseExecutionCpuMeasurement(state: *InspectorState) void {
+            state.mutex.lock();
+            const ledger = state.execution_cpu_ledger;
+            if (state.measurement_active) {
+                (ledger orelse unreachable).requestDisableAtBoundary();
+                state.measurement_active = false;
+            }
+            state.execution_cpu_ledger = null;
+            state.mutex.unlock();
+            if (ledger) |value| value.release();
+        }
+
+        pub fn executionCpuSeconds(state: *const InspectorState) ?f64 {
+            const ledger = state.execution_cpu_ledger orelse return null;
+            return ledger.seconds();
         }
 
         // Set the domain while disabled, as required by `Performance.setTimeDomain`.
@@ -1057,7 +1123,15 @@ pub fn Module(comptime Host: type) type {
                 try testing.expectEqual(@as(usize, 0), state.task_refs);
                 try testing.expect(!hasInspectorTasks(&state));
 
-                try testing.expect(postInspectorTask(&state, .{
+                dispatch.failNextQueueAllocationForTesting();
+                try testing.expect(!postInspectorBoundaryTask(&state, .{
+                    .ctx = &state,
+                    .run = lifecycle_test.heldTask,
+                }));
+                try testing.expectEqual(@as(usize, 0), state.task_refs);
+                try testing.expect(!hasInspectorTasks(&state));
+
+                try testing.expect(postInspectorBoundaryTask(&state, .{
                     .ctx = &state,
                     .run = lifecycle_test.heldTask,
                 }));
@@ -1065,6 +1139,45 @@ pub fn Module(comptime Host: type) type {
                 dispatch.releaseAllTasksForInstance(instance_id);
                 try testing.expectEqual(@as(usize, 0), state.task_refs);
                 try testing.expect(!hasInspectorTasks(&state));
+            }
+
+            pub fn performanceMeasurementTracksEffectiveSessionsAndTeardown() !void {
+                const testing = std.testing;
+                const ledger = Host.execution_cpu.Ledger.create() orelse return error.OutOfMemory;
+                defer ledger.close();
+                try testing.expect(ledger.retain());
+                var state = InspectorState{
+                    .instance_id = 61_773,
+                    .allocator = testing.allocator,
+                    .transport = undefined,
+                    .title = &.{},
+                    .url = &.{},
+                    .target_id = &.{},
+                    .sessions = .empty,
+                    .execution_cpu_ledger = ledger,
+                    .object_table = ObjectTable.init(testing.allocator),
+                };
+                defer {
+                    releaseExecutionCpuMeasurement(&state);
+                    state.sessions.deinit(testing.allocator);
+                    state.object_table.deinit(null);
+                    state.deinitSynchronization();
+                }
+                try testing.expect(addSession(&state, 1));
+                try testing.expect(addSession(&state, 2));
+                try testing.expectEqual(@as(usize, 0), ledger.measurement_users.load(.acquire));
+                try testing.expectEqual(.ok, configureSessionPerformance(&state, 1, true, null));
+                try testing.expectEqual(@as(usize, 1), ledger.measurement_users.load(.acquire));
+                try testing.expectEqual(.ok, configureSessionPerformance(&state, 1, true, null));
+                try testing.expectEqual(@as(usize, 1), ledger.measurement_users.load(.acquire));
+                try testing.expectEqual(.ok, configureSessionPerformance(&state, 2, true, null));
+                try testing.expectEqual(@as(usize, 1), ledger.measurement_users.load(.acquire));
+                try testing.expect(removeSession(&state, 1));
+                try testing.expectEqual(@as(usize, 1), ledger.measurement_users.load(.acquire));
+                try testing.expect(removeSession(&state, 2));
+                try testing.expectEqual(@as(usize, 1), ledger.measurement_users.load(.acquire));
+                ledger.applyPendingDisablesOnOwner();
+                try testing.expectEqual(@as(usize, 0), ledger.measurement_users.load(.acquire));
             }
         } else struct {};
 

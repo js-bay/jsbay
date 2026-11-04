@@ -9,6 +9,7 @@ const async_stack = @import("../inspector/async_stack.zig");
 const backend = @import("../backend.zig");
 const dispatch = @import("../runtime/dispatch.zig");
 const engine = @import("../engine.zig");
+const debugger_mod = @import("../inspector/debugger.zig");
 const inspector = @import("../inspector/root.zig");
 const inspector_state = @import("../inspector/root.zig").state;
 const helpers = @import("test_helpers.zig");
@@ -109,6 +110,20 @@ fn waitForPause(session: *Session, from: usize) !bool {
         if (std.mem.indexOf(u8, session.got.items[from..], "Debugger.paused") != null) return true;
     }
     return false;
+}
+
+fn firstPausedFrameMatches(events: []const u8, line: i32, column: i32) bool {
+    const paused_start = std.mem.indexOf(u8, events, "\"method\":\"Debugger.paused\"") orelse return false;
+    const paused_tail = events[paused_start..];
+    const paused_event = paused_tail[0 .. std.mem.indexOfScalar(u8, paused_tail, '\n') orelse paused_tail.len];
+    const frames_start = std.mem.indexOf(u8, paused_event, "\"callFrames\":[{") orelse return false;
+    const frame_tail = paused_event[frames_start..];
+    const location_start = std.mem.indexOf(u8, frame_tail, "\"location\":{") orelse return false;
+    const location_tail = frame_tail[location_start..];
+    const location_end = std.mem.indexOf(u8, location_tail, "},\"url\":") orelse return false;
+    var expected: [80]u8 = undefined;
+    const location = std.fmt.bufPrint(&expected, "\"lineNumber\":{d},\"columnNumber\":{d}", .{ line, column }) catch return false;
+    return std.mem.indexOf(u8, location_tail[0..location_end], location) != null;
 }
 
 test "debugger protocol: classic and JSC acknowledge enable without owner tick" {
@@ -235,5 +250,154 @@ test "debugger protocol: breakpoint configuration before first enable takes effe
     eval_thread.join();
 
     try testing.expect(paused);
+    try testing.expect(probe.result.err == null);
+}
+
+test "debugger protocol: NG pauses an old function compiled before Debugger.enable" {
+    if (comptime backend.active_backend != .quickjs_ng) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "preenabled-function-breakpoint");
+    defer session.deinit();
+
+    const source =
+        \\globalThis.__preenabledFunction = function() {
+        \\  const value = 40;
+        \\  return value + 2;
+        \\};
+        \\globalThis.__preenabledAfterFunction = true;
+    ;
+    const prepared = engine.evalScript(session.id, source, "preenabled-function.js");
+    defer if (prepared.result) |value| std.heap.c_allocator.free(value);
+    defer if (prepared.err) |value| if (prepared.err_is_heap) std.heap.c_allocator.free(value);
+    try testing.expect(prepared.err == null);
+    const script_id = debugger_mod.scriptIdForUrl(session.id, "preenabled-function.js");
+    try testing.expect(script_id != 0);
+    const locations = try debugger_mod.possibleBreakpoints(session.id, script_id, 0, 0, 4, 0);
+    defer std.heap.c_allocator.free(locations);
+    try testing.expect(locations.len != 0);
+
+    const enable_at = try send(&session, "Debugger.enable", "", 7401);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, enable_at, 7401), 7401));
+    // The requested constant declaration is removed by NG. Resolution must report and hit the following executable return line.
+    const breakpoint_at = try send(&session, "Debugger.setBreakpointByUrl", "{\"url\":\"preenabled-function.js\",\"lineNumber\":1}", 7402);
+    const breakpoint_response = try pumpResponse(&session, breakpoint_at, 7402);
+    try testing.expect(responseIsSuccess(breakpoint_response, 7402));
+    try testing.expect(std.mem.indexOf(u8, breakpoint_response, "\"scriptId\"") != null);
+    try testing.expect(std.mem.indexOf(u8, breakpoint_response, "\"lineNumber\":2") != null);
+    try testing.expect(std.mem.indexOf(u8, breakpoint_response, "\"columnNumber\":9") != null);
+
+    var probe: EvalProbe = .{ .id = session.id, .source = "globalThis.__preenabledFunction();", .filename = "preenabled-function-driver.js" };
+    defer probe.deinit();
+    const first_pause_from = session.got.items.len;
+    const eval_thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&probe});
+    const first_pause = try waitForPause(&session, first_pause_from);
+    try testing.expect(first_pause);
+    try testing.expect(std.mem.indexOf(u8, session.got.items[first_pause_from..], "preenabled-function.js") != null);
+    try testing.expect(std.mem.indexOf(u8, session.got.items[first_pause_from..], "\"columnNumber\":9") != null);
+    const step_pause_from = session.got.items.len;
+    const step_at = try send(&session, "Debugger.stepOver", "", 7403);
+    try testing.expect(try waitResponseWithoutTick(&session, step_at, 7403));
+    const stepped_pause = try waitForPause(&session, step_pause_from);
+    const resume_at = try send(&session, "Debugger.resume", "", 7404);
+    try testing.expect(try waitResponseWithoutTick(&session, resume_at, 7404));
+    eval_thread.join();
+
+    try testing.expect(stepped_pause);
+    try testing.expect(probe.result.err == null);
+}
+
+test "debugger protocol: NG resolves a pending breakpoint after compilation" {
+    if (comptime backend.active_backend != .quickjs_ng) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "pending-compiled-breakpoint");
+    defer session.deinit();
+
+    const enable_at = try send(&session, "Debugger.enable", "", 7501);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, enable_at, 7501), 7501));
+    const breakpoint_at = try send(&session, "Debugger.setBreakpointByUrl", "{\"url\":\"pending-compiled-breakpoint.js\",\"lineNumber\":1}", 7502);
+    const breakpoint_response = try pumpResponse(&session, breakpoint_at, 7502);
+    try testing.expect(responseIsSuccess(breakpoint_response, 7502));
+    try testing.expect(std.mem.indexOf(u8, breakpoint_response, "\"locations\":[]") != null);
+
+    const source =
+        \\globalThis.__pendingCompiledBreakpoint = function() {
+        \\  const value = 40;
+        \\  return value + 2;
+        \\};
+        \\globalThis.__pendingCompiledBreakpointValue = globalThis.__pendingCompiledBreakpoint();
+    ;
+    var probe: EvalProbe = .{ .id = session.id, .source = source, .filename = "pending-compiled-breakpoint.js" };
+    defer probe.deinit();
+    const from = session.got.items.len;
+    const eval_thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&probe});
+    const paused = try waitForPause(&session, from);
+    try testing.expect(paused);
+    const events = session.got.items[from..];
+    const parsed_at = std.mem.indexOf(u8, events, "Debugger.scriptParsed") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOfPos(u8, events, parsed_at + 1, "Debugger.scriptParsed") == null);
+    try testing.expect(std.mem.indexOf(u8, events, "Debugger.breakpointResolved") != null);
+    try testing.expect(std.mem.indexOf(u8, events, "\"lineNumber\":2") != null);
+
+    const resume_at = try send(&session, "Debugger.resume", "", 7503);
+    try testing.expect(try waitResponseWithoutTick(&session, resume_at, 7503));
+    eval_thread.join();
+    try testing.expect(probe.result.err == null);
+}
+
+test "debugger protocol: NG distinguishes two executable columns on one line" {
+    if (comptime backend.active_backend != .quickjs_ng) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "same-line-columns");
+    defer session.deinit();
+
+    const source = "globalThis.__sameLineFirst = Date.now(); globalThis.__sameLineSecond = Date.now();";
+    const prepared = engine.evalScript(session.id, source, "same-line-columns.js");
+    defer if (prepared.result) |value| std.heap.c_allocator.free(value);
+    defer if (prepared.err) |value| if (prepared.err_is_heap) std.heap.c_allocator.free(value);
+    try testing.expect(prepared.err == null);
+    const script_id = debugger_mod.scriptIdForUrl(session.id, "same-line-columns.js");
+    try testing.expect(script_id != 0);
+    const locations = try debugger_mod.possibleBreakpoints(session.id, script_id, 0, 0, 1, 0);
+    defer std.heap.c_allocator.free(locations);
+    var first: ?debugger_mod.BreakLocation = null;
+    var second: ?debugger_mod.BreakLocation = null;
+    for (locations, 0..) |location, index| {
+        for (locations[index + 1 ..]) |candidate| {
+            if (location.line == candidate.line and location.column != candidate.column) {
+                first = location;
+                second = candidate;
+                break;
+            }
+        }
+        if (second != null) break;
+    }
+    try testing.expect(first != null);
+    try testing.expect(second != null);
+
+    const enable_at = try send(&session, "Debugger.enable", "", 7601);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, enable_at, 7601), 7601));
+    inline for (.{ .{ first.?, 7602 }, .{ second.?, 7603 } }) |entry| {
+        const params = try std.fmt.allocPrint(alloc, "{{\"url\":\"same-line-columns.js\",\"lineNumber\":{d},\"columnNumber\":{d}}}", .{ entry[0].line - 1, entry[0].column });
+        defer alloc.free(params);
+        const breakpoint_at = try send(&session, "Debugger.setBreakpointByUrl", params, entry[1]);
+        const response = try pumpResponse(&session, breakpoint_at, entry[1]);
+        try testing.expect(responseIsSuccess(response, entry[1]));
+        const column = try std.fmt.allocPrint(alloc, "\"columnNumber\":{d}", .{entry[0].column});
+        defer alloc.free(column);
+        try testing.expect(std.mem.indexOf(u8, response, column) != null);
+    }
+
+    var probe: EvalProbe = .{ .id = session.id, .source = source, .filename = "same-line-columns.js" };
+    defer probe.deinit();
+    const eval_thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&probe});
+    var from = session.got.items.len;
+    inline for (.{ first.?, second.? }) |location| {
+        try testing.expect(try waitForPause(&session, from));
+        try testing.expect(firstPausedFrameMatches(session.got.items[from..], location.line - 1, location.column));
+        from = session.got.items.len;
+        const resume_at = try send(&session, "Debugger.resume", "", 7610 + @as(i64, @intCast(location.column)));
+        try testing.expect(try waitResponseWithoutTick(&session, resume_at, 7610 + @as(i64, @intCast(location.column))));
+    }
+    eval_thread.join();
     try testing.expect(probe.result.err == null);
 }

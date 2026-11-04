@@ -168,6 +168,53 @@ const StateTestHost = struct {
         pub const Mutex = TestMutex;
         pub const Condition = TestCondition;
     };
+    pub const execution_cpu = struct {
+        pub const Ledger = struct {
+            refs: std.atomic.Value(usize) = .init(1),
+            measurement_users: std.atomic.Value(usize) = .init(0),
+
+            pub fn create() ?*Ledger {
+                const ledger = std.heap.c_allocator.create(Ledger) catch return null;
+                ledger.* = .{};
+                return ledger;
+            }
+
+            pub fn retain(self: *Ledger) bool {
+                _ = self.refs.fetchAdd(1, .acq_rel);
+                return true;
+            }
+
+            pub fn release(self: *Ledger) void {
+                if (self.refs.fetchSub(1, .acq_rel) == 1) std.heap.c_allocator.destroy(self);
+            }
+
+            pub fn enable(self: *Ledger) void {
+                _ = self.measurement_users.fetchAdd(1, .acq_rel);
+            }
+
+            pub fn disable(self: *Ledger) void {
+                _ = self.measurement_users.fetchSub(1, .acq_rel);
+            }
+
+            pub fn requestDisableAtBoundary(self: *Ledger) void {
+                self.disable();
+            }
+
+            pub fn disableOnOwner(self: *Ledger) void {
+                self.disable();
+            }
+
+            pub fn enableOnOwner(self: *Ledger) void {
+                self.enable();
+            }
+
+            pub fn applyPendingDisablesOnOwner(_: *Ledger) void {}
+
+            pub fn seconds(_: *const Ledger) ?f64 {
+                return null;
+            }
+        };
+    };
 };
 
 test "console buffer releases every partial allocation failure" {

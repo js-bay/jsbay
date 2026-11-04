@@ -240,6 +240,58 @@ fn writeFile(io: std.Io, target: []const u8, contents: []const u8) !void {
     try Dir.cwd().writeFile(io, .{ .sub_path = target, .data = contents });
 }
 
+test "published package includes every engine patch build input" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(allocator, io);
+    const temp = try makeTemp(allocator, io, "jsbay-package-fetch");
+    defer Dir.cwd().deleteTree(io, temp) catch {};
+    const global_cache = try path(allocator, temp, &.{"global-cache"});
+    var env = try testing.environ.createMap(allocator);
+    defer env.deinit();
+    try env.put("ZIG_GLOBAL_CACHE_DIR", global_cache);
+    var fetched = sdk.Output{ .result = try std.process.run(allocator, io, .{
+        .argv = &.{ "zig", "fetch", cwd },
+        .cwd = .{ .path = cwd },
+        .environ_map = &env,
+        .stdout_limit = .limited(16 * 1024 * 1024),
+        .stderr_limit = .limited(16 * 1024 * 1024),
+    }), .allocator = allocator };
+    defer fetched.deinit();
+    try testing.expect(fetched.succeeded());
+    const hash = std.mem.trim(u8, fetched.result.stdout, " \t\r\n");
+    const archive = try path(allocator, global_cache, &.{ "p", try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{hash}) });
+    try Dir.cwd().access(io, archive, .{});
+    const extracted = try path(allocator, temp, &.{"extracted"});
+    try Dir.cwd().createDir(io, extracted, .default_dir);
+    var unpacked = try sdk.run(allocator, io, &.{ "tar", "-xzf", archive, "-C", extracted }, cwd);
+    defer unpacked.deinit();
+    try testing.expect(unpacked.succeeded());
+    const artifact = try path(allocator, extracted, &.{hash});
+    try testing.expect(try exists(io, allocator, artifact, &.{"build.zig"}));
+
+    const build = try read(allocator, io, cwd, &.{"build.zig"});
+    var lines = std.mem.splitScalar(u8, build, '\n');
+    var patch_inputs: usize = 0;
+    while (lines.next()) |line| {
+        const marker = "run.addFileArg(b.path(\"";
+        const start = std.mem.indexOf(u8, line, marker) orelse continue;
+        const rest = line[start + marker.len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse continue;
+        const input = rest[0..end];
+        if (std.mem.startsWith(u8, input, "vendor/") and std.mem.endsWith(u8, input, ".patch")) {
+            patch_inputs += 1;
+            if (!try exists(io, allocator, artifact, &.{input})) {
+                std.debug.print("missing fetched patch input: {s}\n", .{input});
+                return error.MissingFetchedPatchInput;
+            }
+        }
+    }
+    try testing.expect(patch_inputs != 0);
+}
+
 test "cache fingerprint changes for the wrapper and pinned QuickJS-NG input" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

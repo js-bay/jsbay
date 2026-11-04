@@ -27,6 +27,8 @@ comptime {
     _ = @import("engine_thread_tests.zig");
     if (!spike) {
         _ = @import("self_driven_loop_tests.zig");
+        _ = @import("shutdown_race_tests.zig");
+        _ = @import("execution_cpu_runtime_tests.zig");
         _ = @import("internal_thread_safety_tests.zig");
         _ = @import("debugger_tests.zig");
     }

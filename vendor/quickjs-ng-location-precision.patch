@@ -1,0 +1,213 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -446,6 +446,7 @@
+     JSScriptTagHandler *script_tag_handler;
+     void *script_tag_opaque;
+     int location_last_line;
++    int location_last_column;
+     void *location_last_func;
+     int location_force_notify;
+     JSExceptionHandler *exception_handler;
+@@ -2532,6 +2533,7 @@
+ #endif
+     rt->location_opaque = opaque;
+     rt->location_last_line = -1;
++    rt->location_last_column = -1;
+     rt->location_last_func = NULL;
+ }
+ 
+@@ -8691,17 +8693,62 @@
+    than deriving executable positions from source text. */
+ #define JS_BREAK_LOCATION_MAX 8192
+ #define JS_BREAK_LOCATION_MAX_DEPTH 32
++
++static int js_debug_opcode_size(uint8_t opcode);
++
++static int js_debug_next_pc2line(const uint8_t **pp, const uint8_t *p_end,
++                                 int *pc, int *line, int *col)
++{
++    const uint8_t *p = *pp;
++    int ret, new_line, new_col;
++    int32_t delta;
++    unsigned int op;
+ 
++    if (p >= p_end)
++        return 0;
++    op = *p++;
++    if (op == 0) {
++        uint32_t value;
++        ret = get_leb128(&value, p, p_end);
++        if (ret < 0 || value > INT_MAX - *pc)
++            return -1;
++        *pc += value;
++        p += ret;
++        ret = get_sleb128(&delta, p, p_end);
++        if (ret < 0)
++            return -1;
++        p += ret;
++        new_line = *line + delta;
++    } else {
++        op -= PC2LINE_OP_FIRST;
++        if (op > INT_MAX || op / PC2LINE_RANGE > INT_MAX - *pc)
++            return -1;
++        *pc += op / PC2LINE_RANGE;
++        new_line = *line + (op % PC2LINE_RANGE) + PC2LINE_BASE;
++    }
++    ret = get_sleb128(&delta, p, p_end);
++    if (ret < 0)
++        return -1;
++    p += ret;
++    new_col = *col + delta;
++    *pp = p;
++    *line = new_line;
++    *col = new_col;
++    return 1;
++}
++
+ static void js_collect_break_locations_one(JSContext *ctx,
+                                            JSFunctionBytecode *b,
+                                            JSFunctionBytecode **ancestors,
+                                            int depth, int *count,
+                                            int *truncated)
+ {
+-    const uint8_t *p, *p_end;
+-    int i, line, col, pc, ret, new_line, new_col;
+-    int32_t delta;
+-    unsigned int op;
++    const uint8_t *p = NULL, *p_end = NULL;
++    int i, ret, opcode_pc, opcode_size;
++    int line = b->line_num, col = b->col_num;
++    int next_pc = 0, next_line = b->line_num, next_col = b->col_num;
++    int have_next = 0;
++    int last_line = -1, last_col = -1;
+     const char *filename = NULL;
+ 
+     if (depth >= JS_BREAK_LOCATION_MAX_DEPTH) {
+@@ -8716,63 +8763,56 @@
+     if (b->filename)
+         filename = JS_AtomToCString(ctx, b->filename);
+     if (b->byte_code_len > 0) {
+-        line = b->line_num;
+-        col = b->col_num;
+-        if (line >= 1) {
+-            if (*count >= JS_BREAK_LOCATION_MAX) {
+-                *truncated = 1;
+-            } else {
+-                ctx->rt->break_location_handler(ctx, filename ? filename : "", line,
+-                                                col, b->debugger_script_tag, 0, 0,
+-                                                ctx->rt->break_location_opaque);
+-                (*count)++;
+-            }
+-        }
+         if (b->pc2line_buf) {
+             p = b->pc2line_buf;
+             p_end = p + b->pc2line_len;
+-            pc = 0;
+-            while (p < p_end && !*truncated) {
+-                op = *p++;
+-                if (op == 0) {
+-                    uint32_t value;
+-                    ret = get_leb128(&value, p, p_end);
+-                    if (ret < 0)
+-                        break;
+-                    pc += value;
+-                    p += ret;
+-                    ret = get_sleb128(&delta, p, p_end);
+-                    if (ret < 0)
+-                        break;
+-                    p += ret;
+-                    new_line = line + delta;
+-                } else {
+-                    op -= PC2LINE_OP_FIRST;
+-                    pc += op / PC2LINE_RANGE;
+-                    new_line = line + (op % PC2LINE_RANGE) + PC2LINE_BASE;
++            ret = js_debug_next_pc2line(&p, p_end, &next_pc, &next_line, &next_col);
++            if (ret < 0) {
++                *truncated = 1;
++                goto done;
++            }
++            have_next = ret;
++        }
++        for (opcode_pc = 0; opcode_pc < b->byte_code_len && !*truncated;) {
++            while (have_next && next_pc <= opcode_pc) {
++                line = next_line;
++                col = next_col;
++                ret = js_debug_next_pc2line(&p, p_end, &next_pc, &next_line, &next_col);
++                if (ret < 0) {
++                    *truncated = 1;
++                    goto done;
+                 }
+-                ret = get_sleb128(&delta, p, p_end);
+-                if (ret < 0)
+-                    break;
+-                p += ret;
+-                new_col = col + delta;
+-                if (pc >= b->byte_code_len)
+-                    break;
+-                line = new_line;
+-                col = new_col;
+-                if (line < 1)
+-                    continue;
++                have_next = ret;
++            }
++            if (line >= 1 && (line != last_line || col != last_col)) {
+                 if (*count >= JS_BREAK_LOCATION_MAX) {
+                     *truncated = 1;
+-                    break;
++                    goto done;
+                 }
+                 ctx->rt->break_location_handler(ctx, filename ? filename : "", line,
+                                                 col, b->debugger_script_tag, 0, 0,
+                                                 ctx->rt->break_location_opaque);
+                 (*count)++;
++                last_line = line;
++                last_col = col;
++            }
++            opcode_size = js_debug_opcode_size(b->byte_code_buf[opcode_pc]);
++            if (opcode_size <= 0 || opcode_size > b->byte_code_len - opcode_pc) {
++                *truncated = 1;
++                goto done;
++            }
++            opcode_pc += opcode_size;
++        }
++        while (have_next) {
++            ret = js_debug_next_pc2line(&p, p_end, &next_pc, &next_line, &next_col);
++            if (ret < 0) {
++                *truncated = 1;
++                goto done;
+             }
++            have_next = ret;
+         }
+     }
++done:
+     if (filename)
+         JS_FreeCString(ctx, filename);
+     for (i = 0; i < b->cpool_count && !*truncated; i++) {
+@@ -18788,10 +18828,11 @@
+     if (line < 0)
+         return;
+     force_notify = __atomic_exchange_n(&rt->location_force_notify, 0, __ATOMIC_SEQ_CST);
+-    if (line == rt->location_last_line && rt->location_last_func == b &&
+-        !force_notify)
++    if (line == rt->location_last_line && col == rt->location_last_column &&
++        rt->location_last_func == b && !force_notify)
+         return;
+     rt->location_last_line = line;
++    rt->location_last_column = col;
+     rt->location_last_func = b;
+     filename = NULL;
+     if (b->filename)
+@@ -23315,6 +23356,13 @@
+     opcode_info[(op) >= OP_TEMP_START ? \
+                 (op) + (OP_TEMP_END - OP_TEMP_START) : (op)]
+ 
++static int js_debug_opcode_size(uint8_t opcode)
++{
++    if (opcode == 0 || opcode >= OP_COUNT)
++        return 0;
++    return short_opcode_info(opcode).size;
++}
++
+ static void json_free_token(JSParseState *s, JSToken *token) {
+     // Only free actual allocated values
+     switch(token->val) {

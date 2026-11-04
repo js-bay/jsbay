@@ -595,5 +595,6 @@ jobs:
         shell: bash
         run: |
           if command -v dotnet >/dev/null 2>&1; then
+            cd "$RUNNER_TEMP"
             dotnet build-server shutdown
           fi

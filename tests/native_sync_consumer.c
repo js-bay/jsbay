@@ -44,7 +44,7 @@ int main(void) {
   CHECK(jsbay_engine_create(id, NULL, NULL));
   CHECK(jsbay_engine_bind_sync(id, TEXT("nativeSync"), start, &state, NULL, 100, &fn, &exception) == JSBAY_OK);
   CHECK(jsbay_value_release(fn) == JSBAY_OK);
-  CHECK(jsbay_engine_evaluate(id, TEXT("const wx={test:nativeSync}; const x=wx.test(); Number(x)+1"), TEXT("native-sync.js"), NULL, &value, &exception) == JSBAY_OK);
+  CHECK(jsbay_engine_evaluate(id, TEXT("const jsbayHost={invoke:nativeSync}; const x=jsbayHost.invoke(); Number(x)+1"), TEXT("native-sync.js"), NULL, &value, &exception) == JSBAY_OK);
   CHECK(jsbay_value_to_number(value, &number) == JSBAY_OK && number == 42);
   CHECK(jsbay_value_release(value) == JSBAY_OK);
   void *completion_result = NULL;

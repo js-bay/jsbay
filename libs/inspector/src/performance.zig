@@ -1,7 +1,7 @@
 pub fn Module(comptime Host: type) type {
     // CDP `Performance` domain backed only by measurements this runtime can make.
     //
-    // `Timestamp` is a process-monotonic timeTicks value in seconds. QuickJS exposes heap accounting through `JS_ComputeMemoryUsage`; JSC's public C API does not, so a JSC response deliberately contains only Timestamp. We do not report duration metrics because there is no low-cost, cross-backend execution accounting source for them.
+    // `Timestamp` is a process-monotonic timeTicks value in seconds. `JSBayExecutionCPUTime` is execution CPU attributed to this engine instance while Performance measurement is enabled. QuickJS exposes heap accounting through `JS_ComputeMemoryUsage`; JSC's public C API does not, so JSC omits heap byte metrics.
 
     return struct {
         const std = @import("std");
@@ -28,7 +28,7 @@ pub fn Module(comptime Host: type) type {
                     return;
                 };
                 if (!session.enabled) {
-                    sendMetrics(job, null);
+                    sendDisabledMetrics(job);
                     return;
                 }
                 // Reject unsupported threadTicks in restored session state. Normal command handling rejects threadTicks before it is committed to a session.
@@ -37,12 +37,52 @@ pub fn Module(comptime Host: type) type {
                     return;
                 }
                 const usage = if (comptime backend.isQuickJsApiBackend(backend.active_backend)) runtime_control.getMemoryUsage(job.state.instance_id) else null;
-                sendMetrics(job, usage);
+                sendMetrics(job, usage, state_mod.executionCpuSeconds(job.state));
             }
 
             fn cancel(ctx: ?*anyopaque) void {
                 const job: *Job = @ptrCast(@alignCast(ctx.?));
                 job.state.allocator.destroy(job);
+            }
+        };
+
+        const Configuration = union(enum) {
+            enable: ?TimeDomain,
+            disable,
+            set_time_domain: TimeDomain,
+        };
+
+        const ConfigurationTask = struct {
+            state: *InspectorState,
+            session_id: transport_mod.SessionId,
+            request_id: i64,
+            configuration: Configuration,
+
+            fn run(ctx: ?*anyopaque) void {
+                const task: *ConfigurationTask = @ptrCast(@alignCast(ctx.?));
+                defer task.state.allocator.destroy(task);
+                switch (task.configuration) {
+                    .enable => |domain| switch (state_mod.configureSessionPerformance(task.state, task.session_id, true, domain)) {
+                        .ok => json_writer.sendEmptyResult(task.state, task.session_id, task.request_id),
+                        .active_time_domain_conflict => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Cannot change time domain while Performance is enabled"),
+                        .unknown_session => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Inspector session is no longer active"),
+                    },
+                    .disable => switch (state_mod.configureSessionPerformance(task.state, task.session_id, false, null)) {
+                        .ok => json_writer.sendEmptyResult(task.state, task.session_id, task.request_id),
+                        .active_time_domain_conflict => unreachable,
+                        .unknown_session => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Inspector session is no longer active"),
+                    },
+                    .set_time_domain => |domain| switch (state_mod.setSessionPerformanceTimeDomain(task.state, task.session_id, domain)) {
+                        .ok => json_writer.sendEmptyResult(task.state, task.session_id, task.request_id),
+                        .enabled => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Cannot change time domain while Performance is enabled"),
+                        .unknown_session => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Inspector session is no longer active"),
+                    },
+                }
+            }
+
+            fn cancel(ctx: ?*anyopaque) void {
+                const task: *ConfigurationTask = @ptrCast(@alignCast(ctx.?));
+                task.state.allocator.destroy(task);
             }
         };
 
@@ -65,19 +105,11 @@ pub fn Module(comptime Host: type) type {
                         return;
                     }
                 }
-                switch (state_mod.configureSessionPerformance(state, session_id, true, time_domain)) {
-                    .ok => json_writer.sendEmptyResult(state, session_id, request_id),
-                    .active_time_domain_conflict => json_writer.sendError(state, session_id, request_id, -32000, "Cannot change time domain while Performance is enabled"),
-                    .unknown_session => json_writer.sendError(state, session_id, request_id, -32000, "Inspector session is no longer active"),
-                }
+                scheduleConfiguration(state, session_id, request_id, .{ .enable = time_domain });
                 return;
             }
             if (std.mem.eql(u8, method, "Performance.disable")) {
-                switch (state_mod.configureSessionPerformance(state, session_id, false, null)) {
-                    .ok => json_writer.sendEmptyResult(state, session_id, request_id),
-                    .active_time_domain_conflict => unreachable,
-                    .unknown_session => json_writer.sendError(state, session_id, request_id, -32000, "Inspector session is no longer active"),
-                }
+                scheduleConfiguration(state, session_id, request_id, .disable);
                 return;
             }
             if (std.mem.eql(u8, method, "Performance.setTimeDomain")) {
@@ -89,11 +121,7 @@ pub fn Module(comptime Host: type) type {
                     json_writer.sendError(state, session_id, request_id, -32000, "Performance threadTicks is unsupported by this runtime");
                     return;
                 }
-                switch (state_mod.setSessionPerformanceTimeDomain(state, session_id, time_domain)) {
-                    .ok => json_writer.sendEmptyResult(state, session_id, request_id),
-                    .enabled => json_writer.sendError(state, session_id, request_id, -32000, "Cannot change time domain while Performance is enabled"),
-                    .unknown_session => json_writer.sendError(state, session_id, request_id, -32000, "Inspector session is no longer active"),
-                }
+                scheduleConfiguration(state, session_id, request_id, .{ .set_time_domain = time_domain });
                 return;
             }
             if (std.mem.eql(u8, method, "Performance.getMetrics")) {
@@ -101,6 +129,18 @@ pub fn Module(comptime Host: type) type {
                 return;
             }
             json_writer.sendMethodNotFound(state, session_id, request_id, method);
+        }
+
+        fn scheduleConfiguration(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64, configuration: Configuration) void {
+            const task = state.allocator.create(ConfigurationTask) catch {
+                json_writer.sendError(state, session_id, request_id, -32000, "Unable to schedule Performance configuration");
+                return;
+            };
+            task.* = .{ .state = state, .session_id = session_id, .request_id = request_id, .configuration = configuration };
+            if (!state_mod.postInspectorBoundaryTask(state, .{ .ctx = task, .run = ConfigurationTask.run, .cancel = ConfigurationTask.cancel })) {
+                state.allocator.destroy(task);
+                json_writer.sendError(state, session_id, request_id, -32000, "Unable to schedule Performance configuration");
+            }
         }
 
         fn scheduleMetrics(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) void {
@@ -115,20 +155,27 @@ pub fn Module(comptime Host: type) type {
             }
         }
 
-        fn sendMetrics(job: *Job, usage: ?runtime_control.MemoryUsage) void {
+        fn sendMetrics(job: *Job, usage: ?runtime_control.MemoryUsage, execution_cpu_seconds: ?f64) void {
             var aw: std.Io.Writer.Allocating = .init(job.state.allocator);
             defer aw.deinit();
             const w = &aw.writer;
             w.print("{{\"id\":{d},\"result\":{{\"metrics\":[", .{job.request_id}) catch return;
             const now = monotonicMilliseconds();
+            w.print("{{\"name\":\"Timestamp\",\"value\":{d}.{d:0>3}}}", .{ now / 1000, now % 1000 }) catch return;
+            if (execution_cpu_seconds) |value| w.print(",{{\"name\":\"JSBayExecutionCPUTime\",\"value\":{e}}}", .{value}) catch return;
             if (usage) |memory| {
                 const used = if (memory.memory_used_size != 0) memory.memory_used_size else memory.malloc_size;
                 const total = @max(memory.malloc_size, used);
-                w.print("{{\"name\":\"Timestamp\",\"value\":{d}.{d:0>3}}},{{\"name\":\"JSHeapUsedSize\",\"value\":{d}}},{{\"name\":\"JSHeapTotalSize\",\"value\":{d}}}", .{ now / 1000, now % 1000, used, total }) catch return;
-            } else if (state_mod.sessionPerformance(job.state, job.session_id)) |session| {
-                if (session.enabled) w.print("{{\"name\":\"Timestamp\",\"value\":{d}.{d:0>3}}}", .{ now / 1000, now % 1000 }) catch return;
+                w.print(",{{\"name\":\"JSHeapUsedSize\",\"value\":{d}}},{{\"name\":\"JSHeapTotalSize\",\"value\":{d}}}", .{ used, total }) catch return;
             }
             w.writeAll("]}}") catch return;
+            json_writer.sendJson(job.state, job.session_id, aw.written());
+        }
+
+        fn sendDisabledMetrics(job: *Job) void {
+            var aw: std.Io.Writer.Allocating = .init(job.state.allocator);
+            defer aw.deinit();
+            aw.writer.print("{{\"id\":{d},\"result\":{{\"metrics\":[]}}}}", .{job.request_id}) catch return;
             json_writer.sendJson(job.state, job.session_id, aw.written());
         }
 

@@ -106,15 +106,8 @@ fn domainByName(domains: []const std.json.Value, name: []const u8) ?std.json.Val
 
 fn expectedDomains() []const []const u8 {
     return switch (backend.active_backend) {
-        .quickjs_ng => if (build_options.heap_snapshot)
-            &.{ "Runtime", "Debugger", "Profiler", "HeapProfiler", "Performance", "Schema" }
-        else
-            &.{ "Runtime", "Debugger", "Profiler", "Performance", "Schema" },
-        .quickjs => if (build_options.heap_snapshot)
-            &.{ "Runtime", "Profiler", "HeapProfiler", "Performance", "Schema" }
-        else
-            &.{ "Runtime", "Profiler", "Performance", "Schema" },
-        .jsc => &.{ "Runtime", "Performance", "Schema" },
+        .quickjs_ng, .quickjs => &.{ "Runtime", "Debugger", "Profiler", "HeapProfiler", "Performance", "Schema" },
+        .jsc => &.{ "Runtime", "HeapProfiler", "Performance", "Schema" },
         .escargot, .hermes => &.{ "Runtime", "Performance", "Schema" },
     };
 }
@@ -127,6 +120,18 @@ fn hasCommand(domain: std.json.Value, command_name: []const u8) bool {
         if (command != .object) continue;
         const name = command.object.get("name") orelse continue;
         if (name == .string and std.mem.eql(u8, name.string, command_name)) return true;
+    }
+    return false;
+}
+
+fn hasEvent(domain: std.json.Value, event_name: []const u8) bool {
+    if (domain != .object) return false;
+    const events = domain.object.get("events") orelse return false;
+    if (events != .array) return false;
+    for (events.array.items) |event| {
+        if (event != .object) continue;
+        const name = event.object.get("name") orelse continue;
+        if (name == .string and std.mem.eql(u8, name.string, event_name)) return true;
     }
     return false;
 }
@@ -207,14 +212,34 @@ test "cdp discovery: HTTP protocol describes only implemented domains with resol
         try testing.expect(hasCommand(domainByName(domains, "Profiler").?, "setSamplingInterval"));
         if (comptime build_options.heap_snapshot) {
             try testing.expect(hasCommand(domainByName(domains, "HeapProfiler").?, "takeHeapSnapshot"));
+            try testing.expect(hasCommand(domainByName(domains, "HeapProfiler").?, "collectGarbage"));
+            try testing.expect(hasEvent(domainByName(domains, "HeapProfiler").?, "addHeapSnapshotChunk"));
+            try testing.expect(hasEvent(domainByName(domains, "HeapProfiler").?, "reportHeapSnapshotProgress"));
         } else {
-            try testing.expect(domainByName(domains, "HeapProfiler") == null);
+            const heap = domainByName(domains, "HeapProfiler") orelse return error.TestUnexpectedResult;
+            try testing.expect(hasCommand(heap, "collectGarbage"));
+            try testing.expect(!hasCommand(heap, "takeHeapSnapshot"));
+            try testing.expect(!hasEvent(heap, "addHeapSnapshotChunk"));
+            try testing.expect(!hasEvent(heap, "reportHeapSnapshotProgress"));
         }
     } else {
         try testing.expect(!hasCommand(domainByName(domains, "Runtime").?, "awaitPromise"));
+        const heap = domainByName(domains, "HeapProfiler") orelse return error.TestUnexpectedResult;
+        try testing.expect(hasCommand(heap, "collectGarbage"));
+        try testing.expect(!hasCommand(heap, "takeHeapSnapshot"));
     }
     if (comptime backend.active_backend == .quickjs_ng) {
         try testing.expect(hasCommand(domainByName(domains, "Debugger").?, "setBreakpointByUrl"));
+    } else if (comptime backend.active_backend == .quickjs) {
+        const debugger = domainByName(domains, "Debugger") orelse return error.TestUnexpectedResult;
+        try testing.expect(hasCommand(debugger, "enable"));
+        try testing.expect(hasCommand(debugger, "disable"));
+        try testing.expect(hasCommand(debugger, "getScriptSource"));
+        try testing.expect(hasCommand(debugger, "setAsyncCallStackDepth"));
+        try testing.expect(hasEvent(debugger, "scriptParsed"));
+        try testing.expect(!hasCommand(debugger, "setBreakpointByUrl"));
+        try testing.expect(!hasCommand(debugger, "pause"));
+        try testing.expect(!hasCommand(debugger, "evaluateOnCallFrame"));
     }
 
     var types = std.StringHashMap(void).init(alloc);
@@ -247,7 +272,7 @@ test "cdp discovery: Schema.getDomains matches HTTP protocol capabilities" {
     try testing.expectEqual(expectedDomains().len, std.mem.count(u8, response, "\"name\":"));
 }
 
-test "cdp regression: heap snapshot disabled hides HeapProfiler from HTTP protocol and Schema" {
+test "cdp regression: heap snapshot disabled advertises collection without snapshots" {
     if (comptime !build_options.inspector or build_options.heap_snapshot) return error.SkipZigTest;
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
     const alloc = testing.allocator;
@@ -260,15 +285,16 @@ test "cdp regression: heap snapshot disabled hides HeapProfiler from HTTP protoc
     const protocol = try readHttp(alloc, http);
     defer alloc.free(protocol);
     try testing.expect(std.mem.startsWith(u8, protocol, "HTTP/1.1 200 OK"));
-    const http_advertises_heap = std.mem.indexOf(u8, protocol, "\"domain\": \"HeapProfiler\"") != null or
-        std.mem.indexOf(u8, protocol, "\"domain\":\"HeapProfiler\"") != null;
+    const http_advertises_collection = std.mem.indexOf(u8, protocol, "\"name\": \"collectGarbage\"") != null or
+        std.mem.indexOf(u8, protocol, "\"name\":\"collectGarbage\"") != null;
+    const http_advertises_snapshot = std.mem.indexOf(u8, protocol, "\"name\": \"takeHeapSnapshot\"") != null or
+        std.mem.indexOf(u8, protocol, "\"name\":\"takeHeapSnapshot\"") != null;
 
     const from = try send(&session, "Schema.getDomains", "", 41);
     const schema = try pumpResponse(&session, from, 41);
     const schema_advertises_heap = std.mem.indexOf(u8, schema, "\"name\":\"HeapProfiler\"") != null or
         std.mem.indexOf(u8, schema, "\"name\": \"HeapProfiler\"") != null;
-    std.debug.print("R1_F4_HTTP_HEAP={any} SCHEMA_HEAP={any}\n", .{ http_advertises_heap, schema_advertises_heap });
-    try testing.expect(!http_advertises_heap and !schema_advertises_heap);
+    try testing.expect(http_advertises_collection and !http_advertises_snapshot and schema_advertises_heap);
 }
 
 test "cdp discovery: engine destruction announces Runtime.executionContextDestroyed" {

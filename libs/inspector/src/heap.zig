@@ -1,7 +1,7 @@
 pub fn Module(comptime Host: type) type {
-    // `Runtime.getHeapUsage` and `HeapProfiler.takeHeapSnapshot`.
+    // Native heap usage, snapshots, and explicit garbage collection.
     //
-    // Both sample on the JS thread. The snapshot walks live QuickJS objects and emits one DevTools node per object. ArrayBuffer nodes use the buffer's byte length as `self_size`.
+    // Operations run on the JS owner thread. Snapshots walk live QuickJS objects and emit one DevTools node per object. ArrayBuffer nodes use the buffer's byte length as `self_size`.
 
     return struct {
         const std = @import("std");
@@ -23,13 +23,22 @@ pub fn Module(comptime Host: type) type {
             state: *InspectorState,
             session_id: transport_mod.SessionId,
             request_id: i64,
-            snapshot: bool,
+            operation: enum { usage, snapshot, collect },
+            report_progress: bool = false,
 
             fn run(ctx: ?*anyopaque) void {
                 const job: *Job = @ptrCast(@alignCast(ctx.?));
                 defer job.state.allocator.destroy(job);
+                if (job.operation == .collect) {
+                    if (runtime_control.runGc(job.state.instance_id)) {
+                        json_writer.sendEmptyResult(job.state, job.session_id, job.request_id);
+                    } else {
+                        json_writer.sendError(job.state, job.session_id, job.request_id, -32000, "Runtime is no longer available");
+                    }
+                    return;
+                }
                 const usage = runtime_control.getMemoryUsage(job.state.instance_id) orelse runtime_control.MemoryUsage{};
-                if (job.snapshot) {
+                if (job.operation == .snapshot) {
                     sendSnapshot(job, usage);
                 } else {
                     if (comptime backend.isJscApiBackend(backend.active_backend)) {
@@ -49,27 +58,46 @@ pub fn Module(comptime Host: type) type {
         };
 
         pub fn scheduleUsage(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) void {
-            schedule(state, session_id, request_id, false);
+            schedule(state, session_id, request_id, .usage, false);
         }
 
-        pub fn scheduleSnapshot(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) void {
-            schedule(state, session_id, request_id, true);
+        pub fn scheduleSnapshot(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64, root: std.json.Value) void {
+            var report_progress = false;
+            if (root.object.get("params")) |params| {
+                if (params != .object) {
+                    json_writer.sendInvalidParams(state, session_id, request_id, "Snapshot params must be an object");
+                    return;
+                }
+                if (params.object.get("reportProgress")) |value| {
+                    if (value != .bool) {
+                        json_writer.sendInvalidParams(state, session_id, request_id, "reportProgress must be a boolean");
+                        return;
+                    }
+                    report_progress = value.bool;
+                }
+            }
+            schedule(state, session_id, request_id, .snapshot, report_progress);
         }
 
-        fn schedule(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64, snapshot: bool) void {
+        pub fn scheduleCollection(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) void {
+            schedule(state, session_id, request_id, .collect, false);
+        }
+
+        fn schedule(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64, operation: @FieldType(Job, "operation"), report_progress: bool) void {
             const job = state.allocator.create(Job) catch {
-                json_writer.sendEmptyResult(state, session_id, request_id);
+                json_writer.sendError(state, session_id, request_id, -32000, "Unable to schedule heap operation");
                 return;
             };
             job.* = .{
                 .state = state,
                 .session_id = session_id,
                 .request_id = request_id,
-                .snapshot = snapshot,
+                .operation = operation,
+                .report_progress = report_progress,
             };
             if (!state_mod.postInspectorTask(state, .{ .ctx = job, .run = Job.run, .cancel = Job.cancel })) {
                 state.allocator.destroy(job);
-                json_writer.sendEmptyResult(state, session_id, request_id);
+                json_writer.sendError(state, session_id, request_id, -32000, "Unable to schedule heap operation");
             }
         }
 
@@ -149,7 +177,9 @@ pub fn Module(comptime Host: type) type {
             const w = &aw.writer;
             const count = graph.objects.items.len + 1;
             const total_edges = graph.objects.items.len + graph.edges.items.len;
-            try w.writeAll("{\"snapshot\":{\"meta\":{\"node_fields\":[\"type\",\"name\",\"id\",\"self_size\",\"edge_count\",\"trace_node_id\",\"detachedness\"],\"node_types\":[[\"hidden\",\"array\",\"string\",\"object\",\"code\",\"closure\",\"regexp\",\"number\",\"native\",\"synthetic\",\"concatenated string\",\"sliced string\",\"symbol\",\"bigint\"],\"string\",\"number\",\"number\",\"number\",\"number\",\"number\"],\"edge_fields\":[\"type\",\"name_or_index\",\"to_node\"],\"edge_types\":[[\"context\",\"element\",\"property\",\"internal\",\"hidden\",\"shortcut\",\"weak\"],\"string_or_number\",\"node\"]},");
+            try w.writeAll("{\"snapshot\":{\"jsbaySnapshot\":");
+            try writeSnapshotMetadata(w, &graph);
+            try w.writeAll(",\"meta\":{\"node_fields\":[\"type\",\"name\",\"id\",\"self_size\",\"edge_count\",\"trace_node_id\",\"detachedness\"],\"node_types\":[[\"hidden\",\"array\",\"string\",\"object\",\"code\",\"closure\",\"regexp\",\"number\",\"native\",\"synthetic\",\"concatenated string\",\"sliced string\",\"symbol\",\"bigint\"],\"string\",\"number\",\"number\",\"number\",\"number\",\"number\"],\"edge_fields\":[\"type\",\"name_or_index\",\"to_node\"],\"edge_types\":[[\"context\",\"element\",\"property\",\"internal\",\"hidden\",\"shortcut\",\"weak\"],\"string_or_number\",\"node\"]},");
             try w.print("\"node_count\":{d},\"edge_count\":{d},\"trace_function_count\":0}},\"nodes\":[9,1,1,0,{d},0,0", .{ count, total_edges, graph.objects.items.len });
             var strings: std.ArrayList([]const u8) = .empty;
             defer {
@@ -179,13 +209,14 @@ pub fn Module(comptime Host: type) type {
                 try w.print("{d},{d},{d}", .{ edgeType(edge.kind), label, (edge.to + 1) * 7 });
                 emitted += 1;
             }
-            try w.writeAll("],\"strings\":[");
+            // The DevTools streaming loader expects the strings table to be the final array.
+            try w.writeAll("],\"trace_function_infos\":[],\"trace_tree\":[],\"samples\":[],\"locations\":[],\"strings\":[");
             for (strings.items, 0..) |s, i| {
                 if (i != 0) try w.writeByte(',');
                 try json_writer.writeJsonString(w, s);
             }
-            try w.writeAll("],\"trace_function_infos\":[],\"trace_tree\":[],\"samples\":[],\"locations\":[]}");
-            if (!sendChunk(job, aw.written())) return error.OutOfMemory;
+            try w.writeAll("]}");
+            if (!sendChunk(job, aw.written())) return error.SnapshotTransferFailed;
             try sendSnapshotResult(job, &graph);
         }
 
@@ -281,11 +312,16 @@ pub fn Module(comptime Host: type) type {
             };
         }
 
+        fn writeSnapshotMetadata(writer: anytype, graph: *const Graph) !void {
+            try writer.print("{{\"complete\":false,\"truncated\":{},\"unsupported\":false,\"omittedNodes\":{d},\"omittedEdgeLabels\":{d},\"edgeCoverage\":[\"properties\",\"elements\",\"prototype\",\"cycles\"],\"propertyNamePrecision\":\"{s}\",\"rootCoverage\":\"synthetic-root-all-nodes\",\"retainedSizeSupported\":false}}", .{ graph.truncated(), graph.omitted_nodes, graph.omitted_edge_labels, if (graph.omitted_edge_labels == 0) "complete" else "partial" });
+        }
+
         fn sendSnapshotResult(job: *Job, graph: *const Graph) !void {
             var aw: std.Io.Writer.Allocating = .init(job.state.allocator);
             defer aw.deinit();
-            const omitted_nodes = graph.omitted_nodes;
-            try aw.writer.print("{{\"id\":{d},\"result\":{{\"jsbaySnapshot\":{{\"complete\":false,\"truncated\":{},\"unsupported\":false,\"omittedNodes\":{d},\"omittedEdgeLabels\":{d},\"edgeCoverage\":[\"properties\",\"elements\",\"prototype\",\"cycles\"],\"propertyNamePrecision\":\"{s}\",\"rootCoverage\":\"synthetic-root-all-nodes\",\"retainedSizeSupported\":false}}}}}}", .{ job.request_id, graph.truncated(), omitted_nodes, graph.omitted_edge_labels, if (graph.omitted_edge_labels == 0) "complete" else "partial" });
+            try aw.writer.print("{{\"id\":{d},\"result\":{{\"jsbaySnapshot\":", .{job.request_id});
+            try writeSnapshotMetadata(&aw.writer, graph);
+            try aw.writer.writeAll("}}");
             json_writer.sendJson(job.state, job.session_id, aw.written());
         }
 
@@ -297,8 +333,9 @@ pub fn Module(comptime Host: type) type {
             cw.writeAll("{\"method\":\"HeapProfiler.addHeapSnapshotChunk\",\"params\":{\"chunk\":") catch return false;
             json_writer.writeJsonString(cw, payload) catch return false;
             cw.writeAll("}}") catch return false;
-            json_writer.sendJson(job.state, job.session_id, chunk.written());
-            return true;
+            // Allocate the chunk envelope before preparing DevTools' loader so an allocation failure cannot leave it waiting for data.
+            if (job.report_progress and !job.state.transport.sendText(job.session_id, "{\"method\":\"HeapProfiler.reportHeapSnapshotProgress\",\"params\":{\"done\":1,\"total\":1,\"finished\":true}}")) return false;
+            return job.state.transport.sendText(job.session_id, chunk.written());
         }
     };
 }

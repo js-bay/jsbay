@@ -260,7 +260,7 @@ fn copyTree(c: Context, source: []const u8, destination: []const u8, exclude_git
 }
 
 fn patchEngine(c: Context, args: []const []const u8, ng: bool) !void {
-    if (args.len != (if (ng) @as(usize, 10) else 12)) return error.Usage;
+    if (args.len != (if (ng) @as(usize, 11) else 13)) return error.Usage;
     if (!try c.exists(try c.fmt("{s}/{s}", .{ args[0], if (ng) "quickjs.h" else "quickjs.c" }))) return error.MissingUpstream;
     try copyTree(c, args[0], args[1], true);
     const cwd = try std.process.currentPathAlloc(c.init.io, c.allocator());

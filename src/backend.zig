@@ -54,6 +54,11 @@ pub fn isSpikeBackend(tag: BackendType) bool {
     return tag == .escargot or tag == .hermes;
 }
 
+/// Whether the backend can retain compiler-assigned source identities for Debugger.scriptParsed and Debugger.getScriptSource.
+pub fn supportsSourceJournal(tag: BackendType) bool {
+    return tag == .quickjs or tag == .quickjs_ng;
+}
+
 pub const ActiveEngine = Engine(active_backend);
 pub const ActiveEngineModule = EngineModule(active_backend);
 

@@ -6,6 +6,7 @@ const js_event_loop = @import("js_event_loop");
 const ActiveEngine = backend.ActiveEngine;
 
 const engine_thread = @import("engine_thread.zig");
+const execution_cpu = @import("execution_cpu.zig");
 
 /// Admission for stable host helpers that accept either an engine-owned or a standalone context. Engine-owned contexts keep their runtime alive until all retained values and scheduler scopes have been released.
 pub const ContextExecution = struct {
@@ -62,6 +63,7 @@ pub const Execution = struct {
     budget_armed: bool,
     scheduler_active: bool = true,
     budget_active: bool = true,
+    cpu_scope: execution_cpu.Scope,
 
     pub fn endScheduler(self: *Execution) void {
         if (!self.scheduler_active) return;
@@ -73,6 +75,7 @@ pub const Execution = struct {
         if (!self.budget_active) return;
         self.budget_active = false;
         if (self.budget_armed) @import("runtime_control.zig").endExecutionBudget(self.instance_id);
+        self.cpu_scope.end();
     }
 
     pub fn end(self: *Execution) void {
@@ -101,6 +104,7 @@ pub const Task = struct {
     budget_armed: bool,
     scheduler_active: bool = true,
     budget_active: bool = true,
+    cpu_scope: execution_cpu.Scope,
 
     pub fn endScheduler(self: *Task) bool {
         if (!self.scheduler_active) return false;
@@ -112,6 +116,7 @@ pub const Task = struct {
         if (!self.budget_active) return;
         self.budget_active = false;
         if (self.budget_armed) @import("runtime_control.zig").endExecutionBudget(self.instance_id);
+        self.cpu_scope.end();
     }
 
     pub fn end(self: *Task) bool {
@@ -125,7 +130,7 @@ pub fn beginExecution(instance_id: i32) ?Execution {
     if (engine_thread.ownerHasYielded(instance_id)) return null;
     if (!@import("runtime_control.zig").canEnterExecution(instance_id)) return null;
     const instance = instance_map.getInstance(instance_id) orelse return null;
-    return .{ .scheduler = instance.loop.scheduler.beginExecution(), .instance_id = instance_id, .budget_armed = @import("runtime_control.zig").beginExecutionBudget(instance_id) };
+    return .{ .scheduler = instance.loop.scheduler.beginExecution(), .instance_id = instance_id, .budget_armed = @import("runtime_control.zig").beginExecutionBudget(instance_id), .cpu_scope = if (instance.execution_cpu) |ledger| execution_cpu.begin(ledger) else .{} };
 }
 
 pub fn beginSyncWait(instance_id: i32) ?js_event_loop.Scheduler.SyncWait {
@@ -138,7 +143,7 @@ pub fn beginQueuedTask(instance_id: i32) ?Task {
     if (engine_thread.ownerHasYielded(instance_id)) return null;
     const instance = instance_map.getInstance(instance_id) orelse return null;
     const task = instance.loop.scheduler.beginQueuedTask() orelse return null;
-    return .{ .scheduler = task, .instance_id = instance_id, .budget_armed = @import("runtime_control.zig").beginExecutionBudget(instance_id) };
+    return .{ .scheduler = task, .instance_id = instance_id, .budget_armed = @import("runtime_control.zig").beginExecutionBudget(instance_id), .cpu_scope = if (instance.execution_cpu) |ledger| execution_cpu.begin(ledger) else .{} };
 }
 
 pub fn beginDebuggerControl(instance_id: i32) ?js_event_loop.Scheduler.DebuggerControl {
@@ -168,6 +173,8 @@ pub fn isSynchronouslyWaiting(instance_id: i32) bool {
 pub fn checkpoint(instance_id: i32, ctx: ActiveEngine.Context) void {
     if (engine_thread.ownerHasYielded(instance_id)) return;
     const instance = instance_map.getInstance(instance_id) orelse return;
+    var cpu_scope = if (instance.execution_cpu) |ledger| execution_cpu.begin(ledger) else execution_cpu.Scope{};
+    defer cpu_scope.end();
     var guard = instance.loop.scheduler.beginCheckpoint() orelse return;
     defer guard.end();
     if (!instance.loop.scheduler.beginBackendDrain()) return;
@@ -182,6 +189,8 @@ pub fn checkpoint(instance_id: i32, ctx: ActiveEngine.Context) void {
 /// Drain microtasks for mono or packed-alt instances (packed-alt must not use ActiveEngine.Context).
 pub fn checkpointInstance(instance_id: i32) void {
     const instance = instance_map.getInstance(instance_id) orelse return;
+    var cpu_scope = if (instance.execution_cpu) |ledger| execution_cpu.begin(ledger) else execution_cpu.Scope{};
+    defer cpu_scope.end();
     switch (instance.engine_handles) {
         .mono => |m| checkpoint(instance_id, m.ctx),
         .packed_alt => |a| {
