@@ -825,6 +825,50 @@ test "modules: destructured param property key does not shadow import" {
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__result__"));
 }
 
+test "modules: export async function declaration" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("m", "export async function read(){ return 42; }");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import { read } from 'm';
+        \\globalThis.__v__ = await read();
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__v__"));
+}
+
+test "modules: export default async function declaration" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("m", "export default async function read(){ return 7; }");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import read from 'm';
+        \\globalThis.__v__ = await read();
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__v__"));
+}
+
 test "modules: export binding named Object does not break export registration" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
@@ -972,6 +1016,32 @@ test "modules: diamond named re-export keeps a shared originating binding" {
     try testing.expect(res.err == null);
     try helpers.expectEvalEquals(id, "globalThis.__hasValue__", "true");
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__value__"));
+}
+
+test "modules: diamond renamed re-exports of distinct bindings stay ambiguous" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    // Same source module, different leaf bindings forwarded under one export name must omit that name (native ESM).
+    try ctx.modules.put("base", "export const a = 1; export const b = 2;");
+    try ctx.modules.put("left", "export { a as value } from 'base';");
+    try ctx.modules.put("right", "export { b as value } from 'base';");
+    try ctx.modules.put("hub", "export * from 'left'; export * from 'right';");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import * as ns from 'hub';
+        \\globalThis.__hasValue__ = Object.prototype.hasOwnProperty.call(ns, 'value');
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try helpers.expectEvalEquals(id, "globalThis.__hasValue__", "false");
 }
 
 test "modules: star re-export forwards renamed named re-export" {

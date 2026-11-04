@@ -272,8 +272,7 @@ fn weakBackendRelease(ctx: ActiveEngine.Context, cell: *WeakCell) void {
     }
 }
 
-/// One native retain (refcount dup or GC protect). Callers (Rooted) must not invoke this on every `root()`.
-/// Hermes uses `cell.identity` (weak object / durable primitive) so re-root works after the protect-map wrapper is released.
+/// One native retain (refcount dup or GC protect). Callers (Rooted) must not invoke this on every `root()`. Hermes uses `cell.identity` (weak object / durable primitive) so re-root works after the protect-map wrapper is released.
 fn rootBackendProtect(ctx: ActiveEngine.Context, cell: *RootCell) ?Local {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootProtect(ctx, cell.val),

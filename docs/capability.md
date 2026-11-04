@@ -1,8 +1,6 @@
 # Escargot / Hermes — capability vs QuickJS
 
-Backends selected with `-Dbackend=escargot` or `-Dbackend=hermes`.
-ABI is not frozen yet (full engine_thread suite / inspector / QJS native_handle class_id still missing; Escargot has rejection tracker; spike native_handle opaque+call+finalize+method this-binding; Hermes host ESM shim landed).
-Suite lists below are what `src/tests/all_tests.zig` imports for each backend; out-of-scope suites stay out of the aggregator. Production gap ranking: `docs/production-gaps.md`.
+Backends selected with `-Dbackend=escargot` or `-Dbackend=hermes`. ABI is not frozen yet (full engine_thread suite / inspector / QJS native_handle class_id still missing; Escargot has rejection tracker; spike native_handle opaque+call+finalize+method this-binding; Hermes host ESM shim landed). Suite lists below are what `src/tests/all_tests.zig` imports for each backend; out-of-scope suites stay out of the aggregator. Production gap ranking: `docs/production-gaps.md`.
 
 Shared tree: both engines live under `src/backend/{escargot,hermes}/`. Build one at a time via `-Dbackend=…` (not a multi-engine pack).
 

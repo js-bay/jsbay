@@ -2490,17 +2490,18 @@ static std::string exportLiveGetter(const std::string &exported, const std::stri
            "\",{enumerable:true,configurable:true,get:function(){return " + expr + ";}});";
 }
 
-// Named `export {…} from`: live getter plus leaf-binding origin so diamond star-reexports stay unambiguous.
+// Named `export {…} from`: live getter plus leaf origin `{m: moduleNs, b: bindingName}` so diamond star-reexports stay unambiguous only when both module identity and binding name match.
 static std::string exportNamedReexport(const std::string &exported, const std::string &ns,
                                        const std::string &imported) {
     std::string out = exportLiveGetter(exported, ns + "." + imported);
     out += std::string("if(!") + kWrapObject + ".prototype.hasOwnProperty.call(" + kWrapExports +
            ",\"__jsbay_star_origin\"))" + kWrapDefineProperty + "(" + kWrapExports +
            ",\"__jsbay_star_origin\",{value:" + kWrapObject + ".create(null),configurable:true});";
+    // Prefer a chained leaf origin; otherwise this named re-export is the leaf (module + imported binding).
     out += std::string(kWrapExports) + ".__jsbay_star_origin[\"" + exported + "\"]=(" + ns +
            ".__jsbay_star_origin&&" + kWrapObject + ".prototype.hasOwnProperty.call(" + ns +
            ".__jsbay_star_origin,\"" + imported + "\"))?" + ns + ".__jsbay_star_origin[\"" + imported +
-           "\"]:" + ns + ";";
+           "\"]:{m:" + ns + ",b:\"" + imported + "\"};";
     return out;
 }
 
@@ -2745,17 +2746,18 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
 
     // export default ...
     {
-        // Optional generator `*` must be recognized before the name so anonymous defaults keep `function*` (not `function __default_export*`).
-        static const std::regex re_fn(R"(export\s+default\s+function(\s*\*)?\s*([A-Za-z_$][\w$]*)?)");
+        // Optional `async` and generator `*` must be recognized before the name so anonymous defaults keep `async function*` (not `function __default_export*`).
+        static const std::regex re_fn(R"(export\s+default\s+(async\s+)?function(\s*\*)?\s*([A-Za-z_$][\w$]*)?)");
         // Do not treat `extends` as an anonymous default class name (`export default class extends Base {}`).
         static const std::regex re_class(R"(export\s+default\s+class(?:\s+(?!extends\b)([A-Za-z_$][\w$]*))?)");
         std::smatch m;
         std::string blanked = blankNonCode(body);
         if (std::regex_search(blanked, m, re_fn)) {
-            std::string star = m[1].matched ? body.substr(m.position(1), m.length(1)) : "";
-            std::string name = m[2].matched ? body.substr(m.position(2), m.length(2)) : "__default_export";
-            if (!m[2].matched) {
-                body.replace(m.position(), m.length(), "function" + star + " " + name);
+            std::string async_kw = m[1].matched ? body.substr(m.position(1), m.length(1)) : "";
+            std::string star = m[2].matched ? body.substr(m.position(2), m.length(2)) : "";
+            std::string name = m[3].matched ? body.substr(m.position(3), m.length(3)) : "__default_export";
+            if (!m[3].matched) {
+                body.replace(m.position(), m.length(), async_kw + "function" + star + " " + name);
             } else {
                 body.replace(m.position(), std::strlen("export default "), "");
             }
@@ -2780,9 +2782,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // export function name (including generators: preserve optional `*`)
+    // export [async] function name (including generators: preserve optional `async` and `*`)
     {
-        static const std::regex re(R"(export\s+function(\s*\*)?\s*([A-Za-z_$][\w$]*))");
+        static const std::regex re(R"(export\s+(async\s+)?function(\s*\*)?\s*([A-Za-z_$][\w$]*))");
         std::smatch m;
         std::string tmp = body;
         std::string blanked = blankNonCode(tmp);
@@ -2791,9 +2793,10 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         while (std::regex_search(blanked.cbegin() + last, blanked.cend(), m, re)) {
             size_t pos = last + m.position();
             body.append(tmp, last, pos - last);
-            std::string star = m[1].matched ? m[1].str() : "";
-            std::string name = m[2].str();
-            body += "function" + star + " " + name;
+            std::string async_kw = m[1].matched ? m[1].str() : "";
+            std::string star = m[2].matched ? m[2].str() : "";
+            std::string name = m[3].str();
+            body += async_kw + "function" + star + " " + name;
             epilogue.push_back(exportLiveGetter(name, name));
             last = pos + m.length();
         }
@@ -2912,7 +2915,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // Star re-exports: compare leaf origins for ambiguity, but read values from the immediate star source namespace so renamed named re-exports (`export {original as renamed}`) stay reachable under the export name. Omit ambiguous names unless an explicit export already resolved them; record leaf origins on this module for further star re-exports.
+    // Star re-exports: compare leaf origins `{m,b}` (module identity + binding name) for ambiguity, but read values from the immediate star source namespace so renamed named re-exports (`export {original as renamed}`) stay reachable under the export name. Omit ambiguous names unless an explicit export already resolved them; record leaf origins on this module for further star re-exports.
     if (!star_reexport_nss.empty()) {
         std::string star;
         star += std::string("var __jsbay_star_prov=") + kWrapObject + ".create(null);";
@@ -2922,9 +2925,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         for (const auto &ns : star_reexport_nss) {
             star += std::string(kWrapObject) + ".keys(" + ns + ").forEach(function(k){";
             star += "if(k===\"default\"||k===\"__jsbay_star_origin\")return;";
-            star += std::string("var __jsbay_origin=(") + ns + ".__jsbay_star_origin&&" + kWrapObject + ".prototype.hasOwnProperty.call(" + ns + ".__jsbay_star_origin,k))?" + ns + ".__jsbay_star_origin[k]:" + ns + ";";
+            star += std::string("var __jsbay_origin=(") + ns + ".__jsbay_star_origin&&" + kWrapObject + ".prototype.hasOwnProperty.call(" + ns + ".__jsbay_star_origin,k))?" + ns + ".__jsbay_star_origin[k]:{m:" + ns + ",b:k};";
             star += std::string("if(") + kWrapObject + ".prototype.hasOwnProperty.call(__jsbay_star_prov,k)){";
-            star += "if(__jsbay_star_prov[k]!==__jsbay_origin){__jsbay_star_prov[k]=null;__jsbay_star_ns[k]=null;}";
+            star += "if(__jsbay_star_prov[k]==null||__jsbay_star_prov[k].m!==__jsbay_origin.m||__jsbay_star_prov[k].b!==__jsbay_origin.b){__jsbay_star_prov[k]=null;__jsbay_star_ns[k]=null;}";
             star += "}else{__jsbay_star_prov[k]=__jsbay_origin;__jsbay_star_ns[k]=" + ns + ";}});";
         }
         star += std::string(kWrapObject) + ".keys(__jsbay_star_prov).forEach(function(k){";
