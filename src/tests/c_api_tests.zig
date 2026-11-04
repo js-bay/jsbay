@@ -966,8 +966,6 @@ test "typed constructors clear outputs and leave the engine usable after allocat
 
 // ---------------------------------------------------------------------------
 // Exception identity across the C ABI.
-//
-// Reference cases: ScriptX `ExceptionTest.Cross`.
 // ---------------------------------------------------------------------------
 
 fn expectEvalTrue(id: i32, source: []const u8) !void {

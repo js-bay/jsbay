@@ -95,6 +95,9 @@ struct EscargotContextOpaque {
     int32_t rejection_instance_id = 0;
     bool rejection_hook_on_vm = false;
     bool flushing_rejections = false;
+    // Pristine JSON.parse / JSON.stringify (C ABI must ignore script-replaced globalThis.JSON).
+    PersistentRefHolder<ValueRef> pristine_json_parse;
+    PersistentRefHolder<ValueRef> pristine_json_stringify;
 };
 
 
@@ -315,6 +318,20 @@ extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
         std::lock_guard<std::mutex> lock(g_ctx_map_mu);
         g_ctx_map[c->ctx.get()] = c;
     }
+    // Capture JSON builtins before user code can replace globalThis.JSON.
+    auto grab = Evaluator::execute(c->ctx.get(),
+        [](ExecutionStateRef *state, EscargotContextOpaque *opaque) -> ValueRef * {
+            auto *JSON = state->context()->globalObject()->get(
+                state, StringRef::createFromASCII("JSON"));
+            if (!JSON || !JSON->isObject()) return ValueRef::createUndefined();
+            auto *parse = JSON->asObject()->get(state, StringRef::createFromASCII("parse"));
+            auto *stringify = JSON->asObject()->get(state, StringRef::createFromASCII("stringify"));
+            if (parse) opaque->pristine_json_parse = PersistentRefHolder<ValueRef>(parse);
+            if (stringify) opaque->pristine_json_stringify = PersistentRefHolder<ValueRef>(stringify);
+            return ValueRef::createUndefined();
+        },
+        c);
+    (void)grab;
     return c;
 }
 
@@ -623,33 +640,25 @@ extern "C" char *escargot_value_to_utf8_n(EscargotContext *c, EscargotValue v, s
 }
 
 extern "C" char *escargot_json_stringify(EscargotContext *c, EscargotValue v) {
-    if (!c || !v) return nullptr;
+    if (!c || !v || !c->pristine_json_stringify.get()) return nullptr;
     auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, ValueRef *val) -> ValueRef * {
-            auto *JSON = state->context()->globalObject()->get(
-                state, StringRef::createFromASCII("JSON"));
-            auto *stringify = JSON->asObject()->get(
-                state, StringRef::createFromASCII("stringify"));
+        [](ExecutionStateRef *state, ValueRef *val, ValueRef *stringify) -> ValueRef * {
             ValueRef *args[] = {val};
-            return stringify->call(state, JSON, 1, args);
+            return stringify->call(state, ValueRef::createUndefined(), 1, args);
         },
-        asVal(v));
+        asVal(v), c->pristine_json_stringify.get());
     if (!er.isSuccessful() || !er.result || !er.result->isString()) return nullptr;
     return stringRefToUtf8(er.result->asString());
 }
 
 extern "C" EscargotValue escargot_json_parse(EscargotContext *c, const char *utf8, size_t len) {
-    if (!c) return nullptr;
+    if (!c || !c->pristine_json_parse.get()) return nullptr;
     auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, const char *u, size_t n) -> ValueRef * {
-            auto *JSON = state->context()->globalObject()->get(
-                state, StringRef::createFromASCII("JSON"));
-            auto *parse = JSON->asObject()->get(
-                state, StringRef::createFromASCII("parse"));
+        [](ExecutionStateRef *state, const char *u, size_t n, ValueRef *parse) -> ValueRef * {
             ValueRef *args[] = {StringRef::createFromUTF8(u ? u : "", n)};
-            return parse->call(state, JSON, 1, args);
+            return parse->call(state, ValueRef::createUndefined(), 1, args);
         },
-        utf8, len);
+        utf8, len, c->pristine_json_parse.get());
     if (!er.isSuccessful()) return nullptr;
     return retain(c, er.result);
 }
@@ -1662,34 +1671,26 @@ extern "C" EscargotOpResult escargot_get_property_result(EscargotContext *c, Esc
 
 extern "C" EscargotOpResult escargot_json_parse_result(EscargotContext *c, const char *utf8, size_t len) {
     EscargotOpResult out{nullptr, nullptr};
-    if (!c) return out;
+    if (!c || !c->pristine_json_parse.get()) return out;
     auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, const char *u, size_t n) -> ValueRef * {
-            auto *JSON = state->context()->globalObject()->get(
-                state, StringRef::createFromASCII("JSON"));
-            auto *parse = JSON->asObject()->get(
-                state, StringRef::createFromASCII("parse"));
+        [](ExecutionStateRef *state, const char *u, size_t n, ValueRef *parse) -> ValueRef * {
             ValueRef *args[] = {StringRef::createFromUTF8(u ? u : "", n)};
-            return parse->call(state, JSON, 1, args);
+            return parse->call(state, ValueRef::createUndefined(), 1, args);
         },
-        utf8, len);
+        utf8, len, c->pristine_json_parse.get());
     if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
     return opOk(c, er.result);
 }
 
 extern "C" EscargotOpResult escargot_json_stringify_result(EscargotContext *c, EscargotValue v) {
     EscargotOpResult out{nullptr, nullptr};
-    if (!c || !v) return out;
+    if (!c || !v || !c->pristine_json_stringify.get()) return out;
     auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, ValueRef *val) -> ValueRef * {
-            auto *JSON = state->context()->globalObject()->get(
-                state, StringRef::createFromASCII("JSON"));
-            auto *stringify = JSON->asObject()->get(
-                state, StringRef::createFromASCII("stringify"));
+        [](ExecutionStateRef *state, ValueRef *val, ValueRef *stringify) -> ValueRef * {
             ValueRef *args[] = {val};
-            return stringify->call(state, JSON, 1, args);
+            return stringify->call(state, ValueRef::createUndefined(), 1, args);
         },
-        asVal(v));
+        asVal(v), c->pristine_json_stringify.get());
     if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
     return opOk(c, er.result);
 }

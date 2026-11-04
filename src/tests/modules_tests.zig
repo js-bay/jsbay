@@ -452,6 +452,61 @@ test "modules: ambiguous star re-export is omitted from namespace" {
     try helpers.expectEvalEquals(id, "globalThis.__hasShared__", "false");
 }
 
+test "modules: function declaration shadows import for earlier references in the same scope" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Native ESM: a same-scope function declaration binds for the whole function body, including closures created before the declarator textually.
+    const src =
+        \\import { value } from 'dep';
+        \\export function read() {
+        \\  const before = () => value;
+        \\  function value() { return 2; }
+        \\  return before()();
+        \\}
+        \\globalThis.__result__ = read();
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 2), try helpers.evalInt(id, "globalThis.__result__"));
+}
+
+test "modules: diamond star re-export keeps a shared originating binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("base", "export const shared = 7;");
+    try ctx.modules.put("a", "export * from 'base';");
+    try ctx.modules.put("b", "export * from 'base';");
+    try ctx.modules.put("barrel", "export * from 'a'; export * from 'b';");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import * as ns from 'barrel';
+        \\globalThis.__shared__ = ns.shared;
+        \\globalThis.__hasShared__ = Object.prototype.hasOwnProperty.call(ns, 'shared');
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try helpers.expectEvalEquals(id, "globalThis.__hasShared__", "true");
+    try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__shared__"));
+}
+
 test "modules: circular imports do not deadlock" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);

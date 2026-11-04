@@ -411,6 +411,7 @@ static std::string rewriteIdents(const std::string &src,
                 std::string id = src.substr(i, j - i);
                 if (id == "function" || id == "class") {
                     i = j;
+                    // Nested function/class bodies are skipped here; declaration names for the enclosing scope are registered by collectLexicalBindingsInRange (which also skips nested blocks).
                     skipNestedFunctionOrClass(id);
                     continue;
                 }
@@ -513,6 +514,18 @@ static std::string rewriteIdents(const std::string &src,
                 std::string id = src.substr(i, j - i);
                 if (id == "function" || id == "class") {
                     i = j;
+                    // Register the declaration name for this enclosing scope before skipping nested params/body, so references that textually precede the declarator bind locally (TDZ / import shadowing), matching native ESM.
+                    size_t name_pos = i;
+                    while (name_pos < src.size() && std::isspace(static_cast<unsigned char>(src[name_pos]))) ++name_pos;
+                    if (id == "function" && name_pos < src.size() && src[name_pos] == '*') {
+                        ++name_pos;
+                        while (name_pos < src.size() && std::isspace(static_cast<unsigned char>(src[name_pos]))) ++name_pos;
+                    }
+                    if (name_pos < src.size() && isIdentStart(src[name_pos])) {
+                        size_t n = name_pos + 1;
+                        while (n < src.size() && isIdent(src[n])) ++n;
+                        into.insert(src.substr(name_pos, n - name_pos));
+                    }
                     skipNestedFunctionOrClass(id);
                     continue;
                 }
@@ -2191,22 +2204,27 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // Star re-exports: track provenance across deps; omit ambiguous names unless an explicit export already resolved them.
+    // Star re-exports: track originating binding across deps; omit ambiguous names unless an explicit export already resolved them.
+    // Intermediate namespace objects from a diamond (a and b both re-export the same base binding) must not mark the name ambiguous — compare leaf origins, and record origins on this module for further star re-exports.
     if (!star_reexport_nss.empty()) {
         std::string star;
         star += "var __jsbay_star_prov=Object.create(null);";
+        star += "if(!Object.prototype.hasOwnProperty.call(exports,\"__jsbay_star_origin\"))";
+        star += "Object.defineProperty(exports,\"__jsbay_star_origin\",{value:Object.create(null),configurable:true});";
         for (const auto &ns : star_reexport_nss) {
             star += "Object.keys(" + ns + ").forEach(function(k){";
-            star += "if(k===\"default\")return;";
+            star += "if(k===\"default\"||k===\"__jsbay_star_origin\")return;";
+            star += "var __jsbay_origin=(" + ns + ".__jsbay_star_origin&&Object.prototype.hasOwnProperty.call(" + ns + ".__jsbay_star_origin,k))?" + ns + ".__jsbay_star_origin[k]:" + ns + ";";
             star += "if(Object.prototype.hasOwnProperty.call(__jsbay_star_prov,k)){";
-            star += "if(__jsbay_star_prov[k]!==" + ns + ")__jsbay_star_prov[k]=null;";
-            star += "}else{__jsbay_star_prov[k]=" + ns + ";}});";
+            star += "if(__jsbay_star_prov[k]!==__jsbay_origin)__jsbay_star_prov[k]=null;";
+            star += "}else{__jsbay_star_prov[k]=__jsbay_origin;}});";
         }
         star += "Object.keys(__jsbay_star_prov).forEach(function(k){";
         star += "var __jsbay_src=__jsbay_star_prov[k];";
         star += "if(__jsbay_src==null)return;";
         star += "if(Object.prototype.hasOwnProperty.call(exports,k))return;";
         star += "Object.defineProperty(exports,k,{enumerable:true,configurable:true,get:function(){return __jsbay_src[k];}});";
+        star += "exports.__jsbay_star_origin[k]=__jsbay_src;";
         star += "});";
         post_epilogue.push_back(star);
     }

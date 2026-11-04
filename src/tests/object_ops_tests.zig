@@ -696,6 +696,80 @@ test "object ops: instance_of throws for non-callable constructors and hasInstan
     try testing.expect(!result and exception == 0);
 }
 
+test "object ops: instance_of with jsbay_value_undefined sentinel constructor TypeErrors" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var undef: u64 = 0;
+    try testing.expectEqual(ok, c_api.jsbay_value_undefined(f.id, &undef));
+    _ = try f.keep(undef);
+    var result = true;
+    var exception: u64 = 0;
+    const value = try f.eval("({})");
+    try testing.expectEqual(thrown, f.instanceOf(value, undef, &result, &exception));
+    try testing.expect(!result);
+    try f.expectThrownTypeError(exception);
+}
+
+test "object ops: instance_of with jsbay_value_undefined left operand still runs hasInstance" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var undef: u64 = 0;
+    try testing.expectEqual(ok, c_api.jsbay_value_undefined(f.id, &undef));
+    _ = try f.keep(undef);
+    const custom = try f.eval("({ [Symbol.hasInstance](v) { return v === undefined; } })");
+    try f.expectInstanceOf(undef, custom, true);
+    const reject = try f.eval("({ [Symbol.hasInstance](v) { return v === 1; } })");
+    try f.expectInstanceOf(undef, reject, false);
+}
+
+fn throwUndefinedCallback(instance_id: i32, _: ?*anyopaque, _: u64, _: usize, _: ?[*]const u64, out_value: *u64, out_exception: *u64) callconv(.c) c_int {
+    out_value.* = 0;
+    out_exception.* = 0;
+    // Owned undefined sentinel must survive the trampoline as JS undefined, not a string Error.
+    _ = c_api.jsbay_value_undefined(instance_id, out_exception);
+    return thrown;
+}
+
+test "object ops: native callback can throw the undefined sentinel" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var function: u64 = poison;
+    var exception: u64 = poison;
+    try testing.expectEqual(ok, c_api.jsbay_engine_bind(f.id, utf8("throwUndef"), throwUndefinedCallback, null, null, &function, &exception));
+    _ = try f.keep(function);
+    _ = try f.eval(
+        \\let caught = 'none';
+        \\try { throwUndef(); } catch (e) { caught = (e === undefined) ? 'undefined' : String(e); }
+        \\globalThis.__caught__ = caught;
+    );
+    try f.expectText(try f.eval("globalThis.__caught__"), "undefined");
+}
+
+test "object ops: to_json and new_json ignore a script that replaces JSON" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    const value = try f.eval(
+        \\JSON.stringify = function () { return 'HACKED'; };
+        \\JSON.parse = function () { return 'HACKED'; };
+        \\globalThis.JSON = { stringify() { return 'HACKED2'; }, parse() { return 'HACKED2'; } };
+        \\({ a: [1, 2], s: 'x' })
+    );
+    try f.expectJson(value, "{\"a\":[1,2],\"s\":\"x\"}");
+
+    const text = "{\"q\":[true,null,3]}";
+    var parsed: u64 = 0;
+    var exception: u64 = 0;
+    try testing.expectEqual(ok, c_api.jsbay_value_new_json(f.id, utf8(text), &parsed, &exception));
+    _ = try f.keep(parsed);
+    try testing.expectEqual(@as(u64, 0), exception);
+    _ = try f.eval("globalThis.__parsed = undefined");
+    // Publish via evaluate after setProperty would be heavier; reuse expectJson round-trip through get.
+    var bytes: c_api.Bytes = .{ .data = null, .len = 0 };
+    try testing.expectEqual(ok, c_api.jsbay_value_to_json(parsed, &bytes, &exception));
+    defer c_api.jsbay_free_bytes(bytes);
+    try testing.expectEqualStrings("{\"q\":[true,null,3]}", bytes.data.?[0..bytes.len]);
+}
+
 test "object ops: handles are released and operations reject released handles" {
     var f = try Fixture.init();
     defer f.deinit();

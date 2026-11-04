@@ -68,6 +68,9 @@ struct JsbayHermesContextOpaque {
     // Pristine Map.prototype / Set.prototype `size` getters (ignore own-property shadows / NaN).
     std::unique_ptr<jsi::Function> pristine_map_size_get;
     std::unique_ptr<jsi::Function> pristine_set_size_get;
+    // Pristine JSON.parse / JSON.stringify (C ABI must ignore script-replaced globalThis.JSON).
+    std::unique_ptr<jsi::Function> pristine_json_parse;
+    std::unique_ptr<jsi::Function> pristine_json_stringify;
     // Host WeakMap for stable JS object identity across distinct retained Value wrappers.
     std::unique_ptr<jsi::Object> identity_wm;
     uint64_t next_identity_id = 1;
@@ -133,8 +136,7 @@ static void hermesEvalSetErr(HermesEvalResult &out, const std::string &s) {
     out.err_len = out.err ? s.size() : 0;
 }
 
-// Prefer JSI ToString for numbers so 0.1 → "0.1" (not "%.17g" → "0.10000000000000001"),
-// including NaN / ±Infinity. Shared by display + UTF-8 export paths.
+// Prefer JSI ToString for numbers so 0.1 → "0.1" (not "%.17g" → "0.10000000000000001"), including NaN / ±Infinity. Shared by display + UTF-8 export paths.
 static std::string numberToJsString(FbHermesRuntime &rt, const jsi::Value &result) {
     try {
         return result.toString(rt).utf8(rt);
@@ -448,6 +450,16 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
     } catch (...) {
         c->pristine_map_size_get.reset();
         c->pristine_set_size_get.reset();
+    }
+    try {
+        auto JSON = c->rt->global().getPropertyAsObject(*c->rt, "JSON");
+        c->pristine_json_parse = std::make_unique<jsi::Function>(
+            JSON.getPropertyAsFunction(*c->rt, "parse"));
+        c->pristine_json_stringify = std::make_unique<jsi::Function>(
+            JSON.getPropertyAsFunction(*c->rt, "stringify"));
+    } catch (...) {
+        c->pristine_json_parse.reset();
+        c->pristine_json_stringify.reset();
     }
     return c;
 }
@@ -813,22 +825,18 @@ extern "C" char *hermes_value_to_utf8_n(JsbayHermesContext *c, HermesValue v, si
     } catch (...) { return nullptr; }
 }
 extern "C" char *hermes_json_stringify(JsbayHermesContext *c, HermesValue v) {
-    if (!c || !c->rt || !v) return nullptr;
+    if (!c || !c->rt || !v || !c->pristine_json_stringify) return nullptr;
     try {
-        auto JSON = c->rt->global().getPropertyAsObject(*c->rt, "JSON");
-        auto stringify = JSON.getPropertyAsFunction(*c->rt, "stringify");
-        jsi::Value jsoned = stringify.call(*c->rt, *asVal(v));
+        jsi::Value jsoned = c->pristine_json_stringify->call(*c->rt, *asVal(v));
         if (!jsoned.isString()) return nullptr;
         return dupCString(jsoned.getString(*c->rt).utf8(*c->rt));
     } catch (...) { return nullptr; }
 }
 extern "C" HermesValue hermes_json_parse(JsbayHermesContext *c, const char *utf8, size_t len) {
-    if (!c || !c->rt) return nullptr;
+    if (!c || !c->rt || !c->pristine_json_parse) return nullptr;
     try {
-        auto JSON = c->rt->global().getPropertyAsObject(*c->rt, "JSON");
-        auto parse = JSON.getPropertyAsFunction(*c->rt, "parse");
         auto s = jsi::String::createFromUtf8(*c->rt, std::string(utf8 ? utf8 : "", len));
-        return retainMove(c, parse.call(*c->rt, s));
+        return retainMove(c, c->pristine_json_parse->call(*c->rt, s));
     } catch (...) { return nullptr; }
 }
 
@@ -1684,7 +1692,8 @@ extern "C" void hermes_throw_value(JsbayHermesContext *c, HermesValue exception)
         // Caller transferred ownership of the handle; release the shell.
         hermes_free_value(c, exception);
     } else {
-        c->pending_throw = "Error";
+        // Null handle is the undefined sentinel (hermes_undefined); preserve JS undefined, do not invent an Error string.
+        c->pending_throw_value = std::make_unique<jsi::Value>(jsi::Value::undefined());
     }
 }
 
@@ -1833,12 +1842,10 @@ extern "C" HermesOpResult hermes_get_property_result(JsbayHermesContext *c, Herm
 
 extern "C" HermesOpResult hermes_json_parse_result(JsbayHermesContext *c, const char *utf8, size_t len) {
     HermesOpResult out{nullptr, nullptr};
-    if (!c || !c->rt) return out;
+    if (!c || !c->rt || !c->pristine_json_parse) return out;
     try {
-        auto JSON = c->rt->global().getPropertyAsObject(*c->rt, "JSON");
-        auto parse = JSON.getPropertyAsFunction(*c->rt, "parse");
         auto s = jsi::String::createFromUtf8(*c->rt, std::string(utf8 ? utf8 : "", len));
-        return hopOk(c, parse.call(*c->rt, s));
+        return hopOk(c, c->pristine_json_parse->call(*c->rt, s));
     } catch (const jsi::JSError &e) {
         return hopFail(c, jsi::Value(*c->rt, e.value()));
     } catch (...) {
@@ -1848,11 +1855,9 @@ extern "C" HermesOpResult hermes_json_parse_result(JsbayHermesContext *c, const 
 
 extern "C" HermesOpResult hermes_json_stringify_result(JsbayHermesContext *c, HermesValue v) {
     HermesOpResult out{nullptr, nullptr};
-    if (!c || !c->rt || !v) return out;
+    if (!c || !c->rt || !v || !c->pristine_json_stringify) return out;
     try {
-        auto JSON = c->rt->global().getPropertyAsObject(*c->rt, "JSON");
-        auto stringify = JSON.getPropertyAsFunction(*c->rt, "stringify");
-        return hopOk(c, stringify.call(*c->rt, *asVal(v)));
+        return hopOk(c, c->pristine_json_stringify->call(*c->rt, *asVal(v)));
     } catch (const jsi::JSError &e) {
         return hopFail(c, jsi::Value(*c->rt, e.value()));
     } catch (...) {
@@ -2116,14 +2121,17 @@ extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj
 }
 
 extern "C" HermesBoolOpResult hermes_instance_of(JsbayHermesContext *c, HermesValue value, HermesValue ctor) {
-    if (!c || !c->rt || !value || !ctor) return hboolOk(false);
+    // Only the context is required here: null HermesValue is the undefined sentinel and must still run instanceof (TypeError for undefined ctor; custom Symbol.hasInstance may observe an undefined left operand).
+    if (!c || !c->rt) return hboolOk(false);
     try {
         auto checker = c->rt->global()
             .getPropertyAsFunction(*c->rt, "Function")
             .callAsConstructor(*c->rt, "v", "c", "return v instanceof c;")
             .asObject(*c->rt)
             .asFunction(*c->rt);
-        jsi::Value r = checker.call(*c->rt, *asVal(value), *asVal(ctor));
+        jsi::Value left = value ? jsi::Value(*c->rt, *asVal(value)) : jsi::Value::undefined();
+        jsi::Value right = ctor ? jsi::Value(*c->rt, *asVal(ctor)) : jsi::Value::undefined();
+        jsi::Value r = checker.call(*c->rt, left, right);
         return hboolOk(r.isBool() && r.getBool());
     } catch (const jsi::JSError &e) {
         return hboolFail(c, jsi::Value(*c->rt, e.value()));
@@ -3062,8 +3070,7 @@ extern "C" HermesValue hermes_native_handle_create(JsbayHermesContext *c, void *
         state = std::make_shared<HermesNhState>(claim);
         claim->refs = 2;
         if (call_fn) {
-            // Closure retains HermesNhState independently of the JS-mutable __jsbay_nh holder,
-            // so deleting/overwriting that property cannot free the box while h is still callable.
+            // Closure retains HermesNhState independently of the JS-mutable __jsbay_nh holder, so deleting/overwriting that property cannot free the box while h is still callable.
             auto host = jsi::Function::createFromHostFunction(
                 *c->rt, jsi::PropNameID::forUtf8(*c->rt, "NativeHandle"), 0,
                 [state](jsi::Runtime &rt, const jsi::Value &thisVal, const jsi::Value *args, size_t count) -> jsi::Value {
