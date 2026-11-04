@@ -970,6 +970,7 @@ fn armSource(binding: *Binding) void {
 }
 
 fn armExecution(binding: *Binding) void {
+    if (comptime !@import("build_options").inspector) return;
     if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     if (binding.execution_armed.load(.seq_cst)) return;
     const rt = binding.runtime orelse return;
