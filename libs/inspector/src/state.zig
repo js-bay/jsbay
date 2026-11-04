@@ -201,6 +201,19 @@ pub fn Module(comptime Host: type) type {
 
         // Queue work that borrows `state`. Admission and queue insertion share the lifecycle lock so shutdown cannot remove a queue just before a new task recreates it. The task's completion callback clears the task marker before releasing the state lease.
         pub fn postInspectorTask(state: *InspectorState, task: dispatch.NativeTask) bool {
+            return postInspectorTaskWith(state, task, dispatch.postTask);
+        }
+
+        /// Queue an inspector operation only for a normal owner turn. Performance configuration changes its CPU measurement boundary, so it must not run while the debugger drains control work inside a paused script.
+        pub fn postInspectorBoundaryTask(state: *InspectorState, task: dispatch.NativeTask) bool {
+            return postInspectorTaskWith(state, task, dispatch.postBoundaryTask);
+        }
+
+        fn postInspectorTaskWith(
+            state: *InspectorState,
+            task: dispatch.NativeTask,
+            post: *const fn (i32, dispatch.NativeTask) bool,
+        ) bool {
             state.task_mutex.lock();
             defer state.task_mutex.unlock();
             if (state.closing) return false;
@@ -211,7 +224,7 @@ pub fn Module(comptime Host: type) type {
             leased.completion_ctx = state;
             leased.owner = state;
             leased.thread_id_slot = &state.engine_thread_id;
-            if (dispatch.postTask(state.instance_id, leased)) return true;
+            if (post(state.instance_id, leased)) return true;
             state.task_refs -= 1;
             state.inspector_task_refs -= 1;
             state.task_wake.broadcast();
@@ -522,7 +535,7 @@ pub fn Module(comptime Host: type) type {
             while (i < state.sessions.items.len) : (i += 1) {
                 if (state.sessions.items[i].id == session_id) {
                     _ = state.sessions.swapRemove(i);
-                    reconcileExecutionCpuMeasurementLocked(state);
+                    requestExecutionCpuMeasurementReconciliationLocked(state);
                     return true;
                 }
             }
@@ -546,7 +559,7 @@ pub fn Module(comptime Host: type) type {
                 if (state.sessions.items[i].id != session_id) continue;
                 const removed_debugger = state.sessions.items[i].debugger_enabled;
                 _ = state.sessions.swapRemove(i);
-                reconcileExecutionCpuMeasurementLocked(state);
+                requestExecutionCpuMeasurementReconciliationLocked(state);
                 var has_debugger = false;
                 for (state.sessions.items) |session| {
                     if (session.debugger_enabled) {
@@ -715,13 +728,13 @@ pub fn Module(comptime Host: type) type {
                 } else {
                     session.performance_enabled = false;
                 }
-                reconcileExecutionCpuMeasurementLocked(state);
+                reconcileExecutionCpuMeasurementOnOwnerLocked(state);
                 return .ok;
             }
             return .unknown_session;
         }
 
-        fn reconcileExecutionCpuMeasurementLocked(state: *InspectorState) void {
+        fn reconcileExecutionCpuMeasurementOnOwnerLocked(state: *InspectorState) void {
             var enabled = false;
             for (state.sessions.items) |session| {
                 if (session.performance_enabled) {
@@ -731,7 +744,22 @@ pub fn Module(comptime Host: type) type {
             }
             if (enabled == state.measurement_active) return;
             const ledger = state.execution_cpu_ledger orelse return;
-            if (enabled) ledger.enable() else ledger.disable();
+            if (enabled) ledger.enableOnOwner() else ledger.disableOnOwner();
+            state.measurement_active = enabled;
+        }
+
+        // Transport session removal cannot sample the owner's thread. Publish the logical state now and defer the physical decrement until the active CPU scope has ended.
+        fn requestExecutionCpuMeasurementReconciliationLocked(state: *InspectorState) void {
+            var enabled = false;
+            for (state.sessions.items) |session| {
+                if (session.performance_enabled) {
+                    enabled = true;
+                    break;
+                }
+            }
+            if (enabled == state.measurement_active) return;
+            const ledger = state.execution_cpu_ledger orelse return;
+            if (!enabled) ledger.requestDisableAtBoundary() else unreachable;
             state.measurement_active = enabled;
         }
 
@@ -739,7 +767,7 @@ pub fn Module(comptime Host: type) type {
             state.mutex.lock();
             const ledger = state.execution_cpu_ledger;
             if (state.measurement_active) {
-                (ledger orelse unreachable).disable();
+                (ledger orelse unreachable).requestDisableAtBoundary();
                 state.measurement_active = false;
             }
             state.execution_cpu_ledger = null;
@@ -1095,7 +1123,15 @@ pub fn Module(comptime Host: type) type {
                 try testing.expectEqual(@as(usize, 0), state.task_refs);
                 try testing.expect(!hasInspectorTasks(&state));
 
-                try testing.expect(postInspectorTask(&state, .{
+                dispatch.failNextQueueAllocationForTesting();
+                try testing.expect(!postInspectorBoundaryTask(&state, .{
+                    .ctx = &state,
+                    .run = lifecycle_test.heldTask,
+                }));
+                try testing.expectEqual(@as(usize, 0), state.task_refs);
+                try testing.expect(!hasInspectorTasks(&state));
+
+                try testing.expect(postInspectorBoundaryTask(&state, .{
                     .ctx = &state,
                     .run = lifecycle_test.heldTask,
                 }));
@@ -1139,6 +1175,8 @@ pub fn Module(comptime Host: type) type {
                 try testing.expect(removeSession(&state, 1));
                 try testing.expectEqual(@as(usize, 1), ledger.measurement_users.load(.acquire));
                 try testing.expect(removeSession(&state, 2));
+                try testing.expectEqual(@as(usize, 1), ledger.measurement_users.load(.acquire));
+                ledger.applyPendingDisablesOnOwner();
                 try testing.expectEqual(@as(usize, 0), ledger.measurement_users.load(.acquire));
             }
         } else struct {};

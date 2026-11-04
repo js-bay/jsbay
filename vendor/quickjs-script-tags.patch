@@ -11,7 +11,17 @@
  #if JSBAY_INSPECTOR
      JSJobHook *jsbay_qjs_job_hook;
      const char *jsbay_qjs_next_job_kind;
-@@ -724,13 +728,16 @@
+@@ -564,7 +568,7 @@
+     /* if NULL, eval is not supported */
+     JSValue (*eval_internal)(JSContext *ctx, JSValueConst this_obj,
+                              const char *input, size_t input_len,
+-                             const char *filename, int flags, int scope_idx);
++                             const char *filename, int flags, int scope_idx, char **jsbay_source_url);
+     const JSLocaleCallbacks *locale_callbacks;
+     void *user_opaque;
+ };
+@@ -727,6 +731,9 @@
+     JSValue *cpool; /* constant pool (self pointer) */
      int cpool_count;
      int closure_var_count;
 +#if JSBAY_INSPECTOR
@@ -20,15 +30,7 @@
      struct {
          /* debug info, move to separate structure to save memory? */
          JSAtom filename;
-         int source_len; 
-         int pc2line_len;
-         uint8_t *pc2line_buf;
-         char *source;
-     } debug;
- } JSFunctionBytecode;
- 
- typedef struct JSBoundFunction {
-@@ -1351,6 +1358,69 @@
+@@ -1351,9 +1358,72 @@
  static void js_async_function_resolve_finalizer(JSRuntime *rt, JSValue val);
  static void js_async_function_resolve_mark(JSRuntime *rt, JSValueConst val,
                                             JS_MarkFunc *mark_func);
@@ -97,7 +99,11 @@
 +
  static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
                                 const char *input, size_t input_len,
-                                const char *filename, int flags, int scope_idx);
+-                               const char *filename, int flags, int scope_idx);
++                               const char *filename, int flags, int scope_idx, char **jsbay_source_url);
+ static void js_free_module_def(JSRuntime *rt, JSModuleDef *m);
+ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
+                                JS_MarkFunc *mark_func);
 @@ -7916,6 +7986,7 @@
                  jsbay_qjs_copy_debug_string(frame->filename, sizeof(frame->filename),
                                         JS_AtomGetStr(ctx, buf, sizeof(buf), b->debug.filename));
@@ -117,11 +123,10 @@
      GetLineColCache get_line_col_cache;
  } JSParseState;
  
-@@ -23598,6 +23673,23 @@
-     return atom;
+@@ -23599,12 +23674,32 @@
  }
  
-+
+ 
 +#if JSBAY_INSPECTOR
 +static void jsbay_note_source_url(JSParseState *s, const uint8_t *begin, const uint8_t *end)
 +{
@@ -138,10 +143,10 @@
 +    s->jsbay_source_url_len = end - url;
 +}
 +#endif
- 
++
  static __exception int next_token(JSParseState *s)
  {
-@@ -23605,6 +23697,9 @@
+     const uint8_t *p;
      int c;
      BOOL ident_has_escape;
      JSAtom atom;
@@ -161,18 +166,25 @@
          skip_line_comment:
              for(;;) {
                  if (*p == '\0' && p >= s->buf_end)
-@@ -23700,6 +23798,10 @@
+@@ -23700,6 +23798,11 @@
                      p++;
                  }
              }
 +#if JSBAY_INSPECTOR
-+            if (s->ctx->rt->jsbay_script_tag_handler && comment_start)
++            if (comment_start)
 +                jsbay_note_source_url(s, comment_start, p);
++            comment_start = NULL;
 +#endif
              goto redo;
          } else if (p[1] == '=') {
              p += 2;
-@@ -38351,6 +38453,9 @@
+@@ -38346,11 +38449,14 @@
+ /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
+ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+                                  const char *input, size_t input_len,
+-                                 const char *filename, int flags, int scope_idx)
++                                 const char *filename, int flags, int scope_idx, char **jsbay_source_url_out)
+ {
      JSParseState s1, *s = &s1;
      int err, js_mode, eval_type;
      JSValue fun_obj, ret_val;
@@ -182,29 +194,106 @@
      JSStackFrame *sf;
      JSVarRef **var_refs;
      JSFunctionBytecode *b;
-@@ -38439,6 +38544,19 @@
+@@ -38439,6 +38545,29 @@
      fun_obj = js_create_function(ctx, fd);
      if (JS_IsException(fun_obj))
          goto fail1;
 +#if JSBAY_INSPECTOR
-+    if (ctx->rt->jsbay_script_tag_handler) {
-+        if (s->jsbay_source_url) {
-+            jsbay_source_url = js_malloc(ctx, s->jsbay_source_url_len + 1);
-+            if (jsbay_source_url) {
-+                memcpy(jsbay_source_url, s->jsbay_source_url, s->jsbay_source_url_len);
-+                jsbay_source_url[s->jsbay_source_url_len] = '\0';
-+            }
++    if (s->jsbay_source_url && (jsbay_source_url_out || ctx->rt->jsbay_script_tag_handler)) {
++        jsbay_source_url = js_malloc(ctx, s->jsbay_source_url_len + 1);
++        if (!jsbay_source_url) {
++            JS_FreeValue(ctx, fun_obj);
++            goto fail1;
 +        }
-+        JS_RebindScriptTag(ctx, fun_obj, jsbay_source_url ? jsbay_source_url : filename, input, input_len);
-+        js_free(ctx, jsbay_source_url);
++        memcpy(jsbay_source_url, s->jsbay_source_url, s->jsbay_source_url_len);
++        jsbay_source_url[s->jsbay_source_url_len] = '\0';
 +    }
++    if (jsbay_source_url_out) {
++        const char *effective_filename = jsbay_source_url ? jsbay_source_url : filename;
++        *jsbay_source_url_out = js_strdup(ctx, effective_filename);
++        if (!*jsbay_source_url_out) {
++            js_free(ctx, jsbay_source_url);
++            JS_FreeValue(ctx, fun_obj);
++            goto fail1;
++        }
++    }
++    if (ctx->rt->jsbay_script_tag_handler)
++        JS_RebindScriptTag(ctx, fun_obj, jsbay_source_url ? jsbay_source_url : filename, input, input_len);
++    js_free(ctx, jsbay_source_url);
 +#endif
      /* Could add a flag to avoid resolution if necessary */
      if (m) {
          m->func_obj = fun_obj;
+@@ -38462,7 +38591,7 @@
+ /* the indirection is needed to make 'eval' optional */
+ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+                                const char *input, size_t input_len,
+-                               const char *filename, int flags, int scope_idx)
++                               const char *filename, int flags, int scope_idx, char **jsbay_source_url)
+ {
+     BOOL backtrace_barrier = ((flags & JS_EVAL_FLAG_BACKTRACE_BARRIER) != 0);
+     int saved_js_mode = 0;
+@@ -38476,7 +38605,7 @@
+         ctx->rt->current_stack_frame->js_mode |= JS_MODE_BACKTRACE_BARRIER;
+     }
+     ret = ctx->eval_internal(ctx, this_obj, input, input_len, filename,
+-                             flags, scope_idx);
++                             flags, scope_idx, jsbay_source_url);
+     if (backtrace_barrier && ctx->rt->current_stack_frame)
+         ctx->rt->current_stack_frame->js_mode = saved_js_mode;
+     return ret;
+@@ -38494,7 +38623,7 @@
+     str = JS_ToCStringLen(ctx, &len, val);
+     if (!str)
+         return JS_EXCEPTION;
+-    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", flags, scope_idx);
++    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", flags, scope_idx, NULL);
+     JS_FreeCString(ctx, str);
+     return ret;
+ }
+@@ -38509,7 +38638,7 @@
+     assert(eval_type == JS_EVAL_TYPE_GLOBAL ||
+            eval_type == JS_EVAL_TYPE_MODULE);
+     ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename,
+-                          eval_flags, -1);
++                          eval_flags, -1, NULL);
+     return ret;
+ }
+ 
+@@ -38520,6 +38649,19 @@
+                        eval_flags);
+ }
+ 
++#if JSBAY_INSPECTOR
++JSValue jsbay_qjs_eval_with_source_url(JSContext *ctx, const char *input, size_t input_len,
++                             const char *filename, int eval_flags, char **jsbay_source_url)
++{
++    int eval_type = eval_flags & JS_EVAL_TYPE_MASK;
++    assert(eval_type == JS_EVAL_TYPE_GLOBAL || eval_type == JS_EVAL_TYPE_MODULE);
++    if (jsbay_source_url)
++        *jsbay_source_url = NULL;
++    return JS_EvalInternal(ctx, ctx->global_obj, input, input_len, filename,
++                           eval_flags, -1, jsbay_source_url);
++}
++#endif
++
+ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
+ {
+     if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1038,6 +1038,10 @@
+@@ -889,6 +889,10 @@
+ /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
+ JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
+                 const char *filename, int eval_flags);
++#if JSBAY_INSPECTOR
++JSValue jsbay_qjs_eval_with_source_url(JSContext *ctx, const char *input, size_t input_len,
++                             const char *filename, int eval_flags, char **jsbay_source_url);
++#endif
+ /* same as JS_Eval() but with an explicit 'this_obj' parameter */
+ JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,
+                     const char *input, size_t input_len,
+@@ -1038,6 +1042,10 @@
  typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
  int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv);
  #if JSBAY_INSPECTOR
@@ -215,7 +304,7 @@
  typedef int JSJobHook(JSContext *ctx, int phase, const char *kind);
  void JS_SetJobHook(JSRuntime *rt, JSJobHook *hook);
  void JS_InvalidatePendingJobHooks(JSRuntime *rt);
-@@ -1048,6 +1052,7 @@
+@@ -1048,6 +1056,7 @@
      char filename[512];
      int line;
      int column;

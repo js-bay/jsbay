@@ -13,6 +13,15 @@ pub const Result = struct {
     cache_hit: bool = false,
 };
 
+const source_url_cache_envelope = backend.active_backend == .quickjs and @import("build_options").inspector;
+const cache_envelope_magic = "JBSURL01";
+const cache_envelope_header_len = cache_envelope_magic.len + @sizeOf(u32);
+
+const CacheArtifact = struct {
+    bytecode: []const u8,
+    effective_url: []const u8,
+};
+
 pub fn evaluate(ctx: ActiveEngine.Context, source: []const u8, filename: []const u8, cache_dir: []const u8, version: []const u8) Result {
     const result = switch (backend.active_backend) {
         .quickjs, .quickjs_ng => evaluateQuickJs(ctx, source, filename, cache_dir, version),
@@ -36,34 +45,57 @@ fn evaluateQuickJs(ctx: ActiveEngine.Context, source: []const u8, filename: []co
     const gpa = std.heap.c_allocator;
     const path = cacheFile(source, filename, cache_dir, version);
     defer if (path) |owned| gpa.free(owned);
-    // A cache hit decodes bytecode with no serialized debugger identity. The caller still owns the exact source and filename, so bind them before the bytecode can execute; raw bytecode entry points without both stay unknown.
+    // Raw bytecode remains opaque. Classic QuickJS cache entries carry the compiler-selected identity in an outer envelope because runtime script tags are deliberately not serialized.
     const filename_z = gpa.dupeSentinel(u8, filename, 0) catch return .{ .out_of_memory = true };
     defer gpa.free(filename_z);
     if (path) |file| {
         if (cache.readBytes(file)) |bytes| {
             defer gpa.free(bytes);
-            const compiled = qjs.JS_ReadObject(ctx, bytes.ptr, bytes.len, 1);
-            if (!c.jsIsException(compiled)) {
-                if (comptime backend.supportsSourceJournal(backend.active_backend) and @import("build_options").inspector) {
-                    _ = qjs.JS_RebindScriptTag(ctx, compiled, filename_z.ptr, source.ptr, source.len);
+            const artifact: ?CacheArtifact = if (comptime source_url_cache_envelope) decodeCacheArtifact(bytes) else .{ .bytecode = bytes, .effective_url = filename };
+            if (artifact) |entry| {
+                const compiled = qjs.JS_ReadObject(ctx, entry.bytecode.ptr, entry.bytecode.len, 1);
+                if (!c.jsIsException(compiled)) {
+                    if (comptime backend.supportsSourceJournal(backend.active_backend) and @import("build_options").inspector) {
+                        if (comptime source_url_cache_envelope) {
+                            const effective_url_z = gpa.dupeSentinel(u8, entry.effective_url, 0) catch {
+                                c.jsbay_qjs_JS_FreeValue(ctx, compiled);
+                                return .{ .out_of_memory = true };
+                            };
+                            defer gpa.free(effective_url_z);
+                            _ = qjs.JS_RebindScriptTag(ctx, compiled, effective_url_z.ptr, source.ptr, source.len);
+                        } else {
+                            _ = qjs.JS_RebindScriptTag(ctx, compiled, filename_z.ptr, source.ptr, source.len);
+                        }
+                    }
+                    // JS_EvalFunction consumes compiled even when the script throws. A runtime exception is never a reason to execute source again.
+                    return quickJsResult(ctx, qjs.JS_EvalFunction(ctx, compiled), true);
                 }
-                // JS_EvalFunction consumes compiled even when the script throws. A runtime exception is never a reason to execute source again.
-                return quickJsResult(ctx, qjs.JS_EvalFunction(ctx, compiled), true);
+                c.jsbay_qjs_JS_FreeValue(ctx, qjs.JS_GetException(ctx));
+                cache.deleteFile(file);
+            } else {
+                cache.deleteFile(file);
             }
-            c.jsbay_qjs_JS_FreeValue(ctx, qjs.JS_GetException(ctx));
-            cache.deleteFile(file);
         }
     }
 
     const source_z = gpa.dupeSentinel(u8, source, 0) catch return .{ .out_of_memory = true };
     defer gpa.free(source_z);
     if (path) |file| {
-        const compiled = qjs.JS_Eval(ctx, source_z.ptr, source_z.len, filename_z.ptr, qjs.JS_EVAL_TYPE_GLOBAL | module.QJS_EVAL_FLAG_COMPILE_ONLY);
+        var source_url: [*c]u8 = null;
+        const compiled = if (comptime source_url_cache_envelope)
+            qjs.jsbay_qjs_eval_with_source_url(ctx, source_z.ptr, source_z.len, filename_z.ptr, qjs.JS_EVAL_TYPE_GLOBAL | module.QJS_EVAL_FLAG_COMPILE_ONLY, &source_url)
+        else
+            qjs.JS_Eval(ctx, source_z.ptr, source_z.len, filename_z.ptr, qjs.JS_EVAL_TYPE_GLOBAL | module.QJS_EVAL_FLAG_COMPILE_ONLY);
+        defer if (source_url != null) qjs.js_free(ctx, source_url);
         if (c.jsIsException(compiled)) return quickJsResult(ctx, compiled, false);
         var size: usize = 0;
         const bytes = qjs.JS_WriteObject(ctx, &size, compiled, 1);
         if (bytes != null) {
-            cache.writeBytes(file, bytes[0..size]);
+            if (comptime source_url_cache_envelope) {
+                if (source_url != null) writeCacheArtifact(file, std.mem.span(source_url), bytes[0..size]);
+            } else {
+                cache.writeBytes(file, bytes[0..size]);
+            }
             qjs.js_free(ctx, bytes);
         } else {
             // Serialization failure affects persistence only. The already compiled program is still executed exactly once.
@@ -73,6 +105,44 @@ fn evaluateQuickJs(ctx: ActiveEngine.Context, source: []const u8, filename: []co
     }
 
     return quickJsResult(ctx, qjs.JS_Eval(ctx, source_z.ptr, source_z.len, filename_z.ptr, qjs.JS_EVAL_TYPE_GLOBAL), false);
+}
+
+fn decodeCacheArtifact(bytes: []const u8) ?CacheArtifact {
+    if (bytes.len < cache_envelope_header_len + 1) return null;
+    if (!std.mem.eql(u8, bytes[0..cache_envelope_magic.len], cache_envelope_magic)) return null;
+    const url_len: usize = std.mem.readInt(u32, bytes[cache_envelope_magic.len..cache_envelope_header_len], .little);
+    if (url_len == 0 or url_len > bytes.len - cache_envelope_header_len) return null;
+    const url_end = cache_envelope_header_len + url_len;
+    if (url_end == bytes.len) return null;
+    const effective_url = bytes[cache_envelope_header_len..url_end];
+    if (std.mem.indexOfScalar(u8, effective_url, 0) != null) return null;
+    return .{ .effective_url = effective_url, .bytecode = bytes[url_end..] };
+}
+
+fn writeCacheArtifact(path: []const u8, effective_url: []const u8, bytecode: []const u8) void {
+    if (effective_url.len == 0 or effective_url.len > std.math.maxInt(u32) or bytecode.len == 0) return;
+    if (std.mem.indexOfScalar(u8, effective_url, 0) != null) return;
+    const total = std.math.add(usize, cache_envelope_header_len, effective_url.len) catch return;
+    const size = std.math.add(usize, total, bytecode.len) catch return;
+    const artifact = std.heap.c_allocator.alloc(u8, size) catch return;
+    defer std.heap.c_allocator.free(artifact);
+    @memcpy(artifact[0..cache_envelope_magic.len], cache_envelope_magic);
+    std.mem.writeInt(u32, artifact[cache_envelope_magic.len..cache_envelope_header_len], @intCast(effective_url.len), .little);
+    @memcpy(artifact[cache_envelope_header_len..total], effective_url);
+    @memcpy(artifact[total..], bytecode);
+    cache.writeBytes(path, artifact);
+}
+
+test "typed eval: source URL cache envelope rejects malformed metadata" {
+    const testing = std.testing;
+    try testing.expect(decodeCacheArtifact("raw-bytecode") == null);
+    try testing.expect(decodeCacheArtifact(cache_envelope_magic ++ "\x00\x00\x00\x00bytecode") == null);
+    try testing.expect(decodeCacheArtifact(cache_envelope_magic ++ "\x05\x00\x00\x00url") == null);
+    try testing.expect(decodeCacheArtifact(cache_envelope_magic ++ "\x03\x00\x00\x00a\x00bbytecode") == null);
+    try testing.expect(decodeCacheArtifact(cache_envelope_magic ++ "\x03\x00\x00\x00url") == null);
+    const valid = decodeCacheArtifact(cache_envelope_magic ++ "\x03\x00\x00\x00urlbytecode") orelse return error.ExpectedCacheArtifact;
+    try testing.expectEqualStrings("url", valid.effective_url);
+    try testing.expectEqualStrings("bytecode", valid.bytecode);
 }
 
 fn quickJsResult(ctx: ActiveEngine.Context, value: ActiveEngine.Value, hit: bool) Result {

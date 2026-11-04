@@ -46,6 +46,46 @@ pub fn Module(comptime Host: type) type {
             }
         };
 
+        const Configuration = union(enum) {
+            enable: ?TimeDomain,
+            disable,
+            set_time_domain: TimeDomain,
+        };
+
+        const ConfigurationTask = struct {
+            state: *InspectorState,
+            session_id: transport_mod.SessionId,
+            request_id: i64,
+            configuration: Configuration,
+
+            fn run(ctx: ?*anyopaque) void {
+                const task: *ConfigurationTask = @ptrCast(@alignCast(ctx.?));
+                defer task.state.allocator.destroy(task);
+                switch (task.configuration) {
+                    .enable => |domain| switch (state_mod.configureSessionPerformance(task.state, task.session_id, true, domain)) {
+                        .ok => json_writer.sendEmptyResult(task.state, task.session_id, task.request_id),
+                        .active_time_domain_conflict => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Cannot change time domain while Performance is enabled"),
+                        .unknown_session => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Inspector session is no longer active"),
+                    },
+                    .disable => switch (state_mod.configureSessionPerformance(task.state, task.session_id, false, null)) {
+                        .ok => json_writer.sendEmptyResult(task.state, task.session_id, task.request_id),
+                        .active_time_domain_conflict => unreachable,
+                        .unknown_session => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Inspector session is no longer active"),
+                    },
+                    .set_time_domain => |domain| switch (state_mod.setSessionPerformanceTimeDomain(task.state, task.session_id, domain)) {
+                        .ok => json_writer.sendEmptyResult(task.state, task.session_id, task.request_id),
+                        .enabled => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Cannot change time domain while Performance is enabled"),
+                        .unknown_session => json_writer.sendError(task.state, task.session_id, task.request_id, -32000, "Inspector session is no longer active"),
+                    },
+                }
+            }
+
+            fn cancel(ctx: ?*anyopaque) void {
+                const task: *ConfigurationTask = @ptrCast(@alignCast(ctx.?));
+                task.state.allocator.destroy(task);
+            }
+        };
+
         pub fn handle(
             state: *InspectorState,
             session_id: transport_mod.SessionId,
@@ -65,19 +105,11 @@ pub fn Module(comptime Host: type) type {
                         return;
                     }
                 }
-                switch (state_mod.configureSessionPerformance(state, session_id, true, time_domain)) {
-                    .ok => json_writer.sendEmptyResult(state, session_id, request_id),
-                    .active_time_domain_conflict => json_writer.sendError(state, session_id, request_id, -32000, "Cannot change time domain while Performance is enabled"),
-                    .unknown_session => json_writer.sendError(state, session_id, request_id, -32000, "Inspector session is no longer active"),
-                }
+                scheduleConfiguration(state, session_id, request_id, .{ .enable = time_domain });
                 return;
             }
             if (std.mem.eql(u8, method, "Performance.disable")) {
-                switch (state_mod.configureSessionPerformance(state, session_id, false, null)) {
-                    .ok => json_writer.sendEmptyResult(state, session_id, request_id),
-                    .active_time_domain_conflict => unreachable,
-                    .unknown_session => json_writer.sendError(state, session_id, request_id, -32000, "Inspector session is no longer active"),
-                }
+                scheduleConfiguration(state, session_id, request_id, .disable);
                 return;
             }
             if (std.mem.eql(u8, method, "Performance.setTimeDomain")) {
@@ -89,11 +121,7 @@ pub fn Module(comptime Host: type) type {
                     json_writer.sendError(state, session_id, request_id, -32000, "Performance threadTicks is unsupported by this runtime");
                     return;
                 }
-                switch (state_mod.setSessionPerformanceTimeDomain(state, session_id, time_domain)) {
-                    .ok => json_writer.sendEmptyResult(state, session_id, request_id),
-                    .enabled => json_writer.sendError(state, session_id, request_id, -32000, "Cannot change time domain while Performance is enabled"),
-                    .unknown_session => json_writer.sendError(state, session_id, request_id, -32000, "Inspector session is no longer active"),
-                }
+                scheduleConfiguration(state, session_id, request_id, .{ .set_time_domain = time_domain });
                 return;
             }
             if (std.mem.eql(u8, method, "Performance.getMetrics")) {
@@ -101,6 +129,18 @@ pub fn Module(comptime Host: type) type {
                 return;
             }
             json_writer.sendMethodNotFound(state, session_id, request_id, method);
+        }
+
+        fn scheduleConfiguration(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64, configuration: Configuration) void {
+            const task = state.allocator.create(ConfigurationTask) catch {
+                json_writer.sendError(state, session_id, request_id, -32000, "Unable to schedule Performance configuration");
+                return;
+            };
+            task.* = .{ .state = state, .session_id = session_id, .request_id = request_id, .configuration = configuration };
+            if (!state_mod.postInspectorBoundaryTask(state, .{ .ctx = task, .run = ConfigurationTask.run, .cancel = ConfigurationTask.cancel })) {
+                state.allocator.destroy(task);
+                json_writer.sendError(state, session_id, request_id, -32000, "Unable to schedule Performance configuration");
+            }
         }
 
         fn scheduleMetrics(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) void {

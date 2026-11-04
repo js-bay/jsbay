@@ -39,9 +39,7 @@ fn expectIncreased(before: u64, after: u64) !void {
 }
 
 fn burnHostCpu() void {
-    var value: u64 = 0;
-    for (0..4_000_000) |index| value +%= index;
-    std.mem.doNotOptimizeAway(&value);
+    thread_cpu.testing.consumeTick() catch @panic("CPU clock failed to advance during test work");
 }
 
 fn runBusy(instance_id: i32) !void {

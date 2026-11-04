@@ -196,6 +196,20 @@ const StateTestHost = struct {
                 _ = self.measurement_users.fetchSub(1, .acq_rel);
             }
 
+            pub fn requestDisableAtBoundary(self: *Ledger) void {
+                self.disable();
+            }
+
+            pub fn disableOnOwner(self: *Ledger) void {
+                self.disable();
+            }
+
+            pub fn enableOnOwner(self: *Ledger) void {
+                self.enable();
+            }
+
+            pub fn applyPendingDisablesOnOwner(_: *Ledger) void {}
+
             pub fn seconds(_: *const Ledger) ?f64 {
                 return null;
             }

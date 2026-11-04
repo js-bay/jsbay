@@ -83,6 +83,7 @@ const Binding = struct {
     alive: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
     pause: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     suppress: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    condition_source_suppression: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     skip_all_pauses: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     breakpoints_active: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
     break_requested: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -1161,6 +1162,8 @@ fn isBlackboxed(binding: *Binding, url: []const u8) bool {
 fn conditionPasses(binding: *Binding, expr: []const u8) bool {
     binding.suppress.store(1, .seq_cst);
     defer binding.suppress.store(0, .seq_cst);
+    _ = binding.condition_source_suppression.fetchAdd(1, .seq_cst);
+    defer _ = binding.condition_source_suppression.fetchSub(1, .seq_cst);
     const wrapped = std.fmt.allocPrint(std.heap.c_allocator, "!!({s})", .{expr}) catch return false;
     defer std.heap.c_allocator.free(wrapped);
     const result = evalDebugFrame(binding.instance_id, 0, wrapped);
@@ -1282,7 +1285,7 @@ fn scriptTagTrampoline(
     opaque_ptr: ?*anyopaque,
 ) callconv(.c) u64 {
     const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return 0));
-    if (!binding.source_collection_owned.load(.seq_cst) or filename == null or source == null) return 0;
+    if (!binding.source_collection_owned.load(.seq_cst) or binding.condition_source_suppression.load(.seq_cst) != 0 or filename == null or source == null) return 0;
     const filename_text = std.mem.span(filename);
     if (filename_text.len == 0) return 0;
     const text = source[0..source_len];

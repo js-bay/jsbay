@@ -209,6 +209,7 @@ test "debugger: classic stripped bytecode rebinds cached nested functions" {
     const source =
         \\function outer() { function inner() { return 42; } return inner(); }
         \\outer();
+        \\//# sourceURL=classic-stripped-cache-source.js
     ;
     const lease = @import("../runtime/engine_thread.zig").beginEval(id);
     defer engine.finishEvalEntry(id, lease);
@@ -223,8 +224,9 @@ test "debugger: classic stripped bytecode rebinds cached nested functions" {
         try testing.expectEqual(@as(f64, 42), backend.ActiveEngine.toFloat64(ctx, output).?);
     }
 
-    const script_id = debugger_mod.scriptIdForUrl(id, "classic-stripped-cache.js");
+    const script_id = debugger_mod.scriptIdForUrl(id, "classic-stripped-cache-source.js");
     try testing.expect(script_id != 0);
+    try testing.expectEqual(@as(u32, 0), debugger_mod.scriptIdForUrl(id, "classic-stripped-cache.js"));
     const script = debugger_mod.scriptById(id, script_id) orelse return error.MissingScript;
     defer debugger_mod.freeScriptInfo(script);
     try testing.expectEqualStrings(source, script.source);
@@ -630,6 +632,40 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
                 const owned = debugger_mod.scriptById(instance_id, newest.id) orelse return error.MissingNewestScript;
                 defer debugger_mod.freeScriptInfo(owned);
                 try testing.expectEqualStrings(newest.source, owned.source);
+            }
+        }.run);
+    }
+
+    test "debugger: conditional breakpoint checks do not evict the application script journal" {
+        if (comptime backend.active_backend != .quickjs_ng) return error.SkipZigTest;
+        const id = helpers.nextInstanceId();
+        try helpers.withEngine(id, .{}, struct {
+            fn run(instance_id: i32) !void {
+                try attachDebuggerForTest(instance_id);
+                const source =
+                    \\let total = 0;
+                    \\for (let i = 0; i < 300; i++) total += i;
+                    \\total;
+                ;
+                try testing.expect(debugger_mod.setBreakpointEx(instance_id, "condition-journal.js", 2, 0, false, "false") != 0);
+                const evaluated = engine.evalScript(instance_id, source, "condition-journal.js");
+                defer helpers.freeEvalResult(evaluated);
+                try testing.expect(evaluated.err == null);
+                try testing.expectEqualStrings("44850", evaluated.result orelse return error.MissingResult);
+
+                const script_id = debugger_mod.scriptIdForUrl(instance_id, "condition-journal.js");
+                try testing.expect(script_id != 0);
+                const late_id = debugger_mod.setBreakpointEx(instance_id, "condition-journal.js", 2, 0, false, "");
+                try testing.expect(late_id != 0);
+                const locations = debugger_mod.breakpointsOnScript(instance_id, script_id);
+                defer if (locations.len > 0) std.heap.c_allocator.free(locations);
+                for (locations) |location| {
+                    if (location.breakpoint_id == late_id) {
+                        try testing.expectEqual(@as(i32, 2), location.line);
+                        return;
+                    }
+                }
+                return error.MissingLateBreakpointLocation;
             }
         }.run);
     }

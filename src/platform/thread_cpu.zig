@@ -65,6 +65,26 @@ extern "c" fn mach_thread_self() std.c.thread_act_t;
 extern "c" fn mach_task_self() std.c.mach_port_t;
 extern "c" fn mach_port_deallocate(task: std.c.mach_port_t, name: std.c.mach_port_t) c_int;
 
+pub const testing = if (builtin.is_test) struct {
+    /// Consume CPU until the platform clock advances; fixed iteration counts cannot guarantee a measurable interval.
+    pub fn consumeTick() !void {
+        const start = currentThreadCpuNanoseconds() orelse {
+            if (isSupported()) return error.CpuClockUnavailable;
+            return;
+        };
+        const io = @import("io.zig");
+        const deadline = io.monotonicMilliseconds() + 5_000;
+        var work: u64 = 1;
+        while (true) {
+            for (0..10_000) |index| work = work *% 6364136223846793005 +% index;
+            std.mem.doNotOptimizeAway(&work);
+            const now = currentThreadCpuNanoseconds() orelse return error.CpuClockUnavailable;
+            if (now > start) return;
+            if (io.monotonicMilliseconds() >= deadline) return error.CpuClockDidNotAdvance;
+        }
+    }
+} else struct {};
+
 test "thread CPU clock is monotonic when supported" {
     const before = currentThreadCpuNanoseconds();
     var value: u64 = 0;

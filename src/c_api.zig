@@ -2887,6 +2887,16 @@ test "c_api: inspector startup preserves backend source collection policy" {
     defer jsbay_engine_destroy(id);
     if (comptime !@import("build_options").inspector or !backend.supportsSourceJournal(backend.active_backend)) return error.SkipZigTest;
     var port: u16 = 0;
+    if (comptime !@import("build_options").inspector_transport or @import("builtin").os.tag == .windows) {
+        try testing.expect(!jsbay_engine_inspector_start(id, 0, &port));
+        try testing.expectEqual(@as(u16, 0), port);
+        const result = engine.evalScript(id, "42", "inspector-without-http.js");
+        defer @import("tests/test_helpers.zig").freeEvalResult(result);
+        try testing.expect(result.err == null);
+        try testing.expectEqualStrings("42", result.result.?);
+        try testing.expectEqual(@as(u64, 0), debugger.scriptIdForUrl(id, "inspector-without-http.js"));
+        return;
+    }
     try testing.expect(jsbay_engine_inspector_start(id, 0, &port));
     defer jsbay_engine_inspector_stop(id);
     try testing.expect(port != 0);
@@ -2917,9 +2927,13 @@ test "c_api: evaluation and cache preserve inspector source contract" {
     defer jsbay_engine_destroy(id);
     const instance = instance_map.getInstance(id) orelse return error.MissingEngine;
     const inspector_enabled = @import("build_options").inspector;
+    var attached = false;
     if (comptime inspector_enabled) {
         if (comptime !backend.supportsSourceJournal(backend.active_backend)) return error.SkipZigTest;
-        try testing.expect(debugger.attach(id, @ptrCast(@constCast(instance.monoRuntime().?))));
+        if (comptime backend.active_backend != .quickjs) {
+            try testing.expect(debugger.attach(id, @ptrCast(@constCast(instance.monoRuntime().?))));
+            attached = true;
+        }
     } else {
         try testing.expect(!debugger.attach(id, @ptrCast(@constCast(instance.monoRuntime().?))));
     }
@@ -2927,8 +2941,10 @@ test "c_api: evaluation and cache preserve inspector source contract" {
     defer temp.cleanup();
     const directory = try temp.dir.realPathFileAlloc(testing.io, ".", testing.allocator);
     defer testing.allocator.free(directory);
-    const source = "globalThis.apiDebugRuns=(globalThis.apiDebugRuns||0)+1;apiDebugRuns";
-    const filename = "c-api-inspector-source.js";
+    const requested_filename = "c-api-inspector-source.js";
+    const source_url = "c-api-cache-source-url.js";
+    const source = "globalThis.apiDebugRuns=(globalThis.apiDebugRuns||0)+1;apiDebugRuns\n//# sourceURL=c-api-cache-source-url.js\n<!-- ignored\n--> ignored\n";
+    const effective_filename = if (comptime backend.active_backend == .quickjs) source_url else requested_filename;
     var hit = false;
     var options = EvalOptions{
         .struct_size = @sizeOf(EvalOptions),
@@ -2936,22 +2952,34 @@ test "c_api: evaluation and cache preserve inspector source contract" {
         .cache_version = .{ .data = "v1", .len = 2 },
         .out_cache_hit = &hit,
     };
-    try testing.expectEqual(@as(u32, 0), debugger.scriptIdForUrl(id, filename));
+    try testing.expectEqual(@as(u32, 0), debugger.scriptIdForUrl(id, effective_filename));
+    try testing.expectEqual(@as(u32, 0), debugger.scriptIdForUrl(id, requested_filename));
     for (0..3) |index| {
+        if (comptime inspector_enabled and backend.active_backend == .quickjs) {
+            if (index == 1) {
+                try testing.expect(debugger.attach(id, @ptrCast(@constCast(instance.monoRuntime().?))));
+                attached = true;
+            }
+        }
         var value: u64 = 0;
         var exception: u64 = 0;
         hit = false;
-        try testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, if (index < 2) &options else null, &value, &exception));
+        try testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = requested_filename.ptr, .len = requested_filename.len }, if (index < 2) &options else null, &value, &exception));
         defer _ = jsbay_value_release(value);
         try testing.expectEqual(@as(u64, 0), exception);
         try testing.expectEqual(@import("build_options").bytecode_cache and backend.active_backend != .jsc and index == 1, hit);
-        const script_id = debugger.scriptIdForUrl(id, filename);
+        const script_id = debugger.scriptIdForUrl(id, effective_filename);
         if (comptime inspector_enabled) {
+            if (!attached) {
+                try testing.expectEqual(@as(u32, 0), script_id);
+                continue;
+            }
             try testing.expect(script_id != 0);
             const script = debugger.scriptById(id, script_id) orelse return error.MissingDebuggerSource;
             defer debugger.freeScriptInfo(script);
             try testing.expectEqualStrings(source, script.source);
-            try testing.expectEqualStrings(filename, script.url);
+            try testing.expectEqualStrings(effective_filename, script.url);
+            if (comptime backend.active_backend == .quickjs) try testing.expectEqual(@as(u32, 0), debugger.scriptIdForUrl(id, requested_filename));
         } else {
             try testing.expectEqual(@as(u32, 0), script_id);
         }

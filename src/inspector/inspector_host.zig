@@ -15,6 +15,11 @@ pub const InspectorHost = struct {
             return root_dispatch.postTask(instance_id, control);
         }
 
+        /// Queue ordinary owner work which must not run from the paused debugger control drain.
+        pub fn postBoundaryTask(instance_id: i32, task: NativeTask) bool {
+            return root_dispatch.postTask(instance_id, task);
+        }
+
         pub const enterTaskOwnerFrame = root_dispatch.enterTaskOwnerFrame;
         pub const leaveTaskOwnerFrame = root_dispatch.leaveTaskOwnerFrame;
         pub const isRunningTaskForOwner = root_dispatch.isRunningTaskForOwner;

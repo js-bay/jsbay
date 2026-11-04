@@ -26,11 +26,12 @@ const Session = struct {
     reader: wire.FrameReader,
     got: std.ArrayList(u8) = .empty,
     c_api_owned: bool = false,
+    stream_open: bool = true,
 
     fn deinit(self: *Session) void {
         self.got.deinit(self.alloc);
         self.reader.deinit(self.alloc);
-        self.stream.close();
+        if (self.stream_open) self.stream.close();
         inspector.stop(self.handle);
         if (self.c_api_owned) {
             c_api.jsbay_engine_destroy(self.id);
@@ -72,6 +73,28 @@ const NativeStopHost = struct {
         return 0;
     }
 };
+
+const PerformanceBoundaryHost = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn call(_: c_int, user_data: ?*anyopaque, _: u32, _: ?[*]const host_value.HostValue, out: *host_value.HostValue) callconv(.c) c_int {
+        const self: *PerformanceBoundaryHost = @ptrCast(@alignCast(user_data.?));
+        self.entered.store(true, .seq_cst);
+        while (!self.release.load(.seq_cst)) std.Thread.yield() catch {};
+        host_value.clear(out);
+        return 0;
+    }
+};
+
+fn waitForAtomicTrue(value: *std.atomic.Value(bool)) bool {
+    var spins: usize = 0;
+    while (spins < 100_000) : (spins += 1) {
+        if (value.load(.seq_cst)) return true;
+        std.Thread.yield() catch {};
+    }
+    return false;
+}
 
 fn hostRejectionTracker(
     _: i32,
@@ -714,6 +737,38 @@ test "cdp alignment: classic compiler tags preserve sourceURL identities" {
     try testing.expect(std.mem.indexOf(u8, second_source, "__classicSecond") != null);
 }
 
+test "cdp alignment: classic HTML comments do not extend sourceURL directives" {
+    if (comptime backend.active_backend != .quickjs) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-classic-html-source-url");
+    defer session.deinit();
+    _ = try pumpResponse(&session, try send(&session, "Debugger.enable", "", 94), 94);
+
+    const opening = engine.evalScript(session.id, "//# sourceURL=classic-html-open-url.js\n<!-- ignored\n42", "classic-html-outer.js");
+    defer discardEval(opening);
+    const closing = engine.evalScript(session.id, "//# sourceURL=classic-html-close-url.js\n--> ignored\n42", "classic-html-outer.js");
+    defer discardEval(closing);
+    try testing.expect(opening.err == null and closing.err == null);
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"classic-html-open-url.js\"", 1));
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"classic-html-close-url.js\"", 1));
+    try testing.expect(std.mem.indexOf(u8, session.got.items, "classic-html-open-url.js\\n") == null);
+    try testing.expect(std.mem.indexOf(u8, session.got.items, "classic-html-close-url.js\\n") == null);
+
+    const opening_id = scriptIdForUrl(session.got.items, "\"url\":\"classic-html-open-url.js\"") orelse return error.TestUnexpectedResult;
+    const opening_params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{opening_id});
+    defer alloc.free(opening_params);
+    const opening_source = try pumpResponse(&session, try send(&session, "Debugger.getScriptSource", opening_params, 95), 95);
+    try testing.expect(std.mem.indexOf(u8, opening_source, "sourceURL=classic-html-open-url.js") != null);
+    try testing.expect(std.mem.indexOf(u8, opening_source, "<!-- ignored") != null);
+
+    const closing_id = scriptIdForUrl(session.got.items, "\"url\":\"classic-html-close-url.js\"") orelse return error.TestUnexpectedResult;
+    const closing_params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{closing_id});
+    defer alloc.free(closing_params);
+    const closing_source = try pumpResponse(&session, try send(&session, "Debugger.getScriptSource", closing_params, 96), 96);
+    try testing.expect(std.mem.indexOf(u8, closing_source, "sourceURL=classic-html-close-url.js") != null);
+    try testing.expect(std.mem.indexOf(u8, closing_source, "--> ignored") != null);
+}
+
 test "cdp alignment: Runtime.exceptionThrown reports direct uncaught eval but not caught eval" {
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-sync-exception");
@@ -1103,6 +1158,117 @@ test "cdp alignment: Performance reports backend-specific measurable metrics" {
         try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"JSHeapUsedSize\"") == null);
         try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"JSHeapTotalSize\"") == null);
     }
+}
+
+test "cdp regression: Performance configuration acknowledges only after an owner boundary" {
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-performance-owner-boundary");
+    defer session.deinit();
+
+    var host = PerformanceBoundaryHost{};
+    var thread: ?std.Thread = null;
+    defer {
+        host.release.store(true, .seq_cst);
+        if (thread) |value| value.join();
+    }
+    try testing.expect(engine_thread.hostInstall(session.id, "performanceBoundary", PerformanceBoundaryHost.call, @ptrCast(&host)));
+
+    var at = try send(&session, "Performance.enable", "", 1701);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, at, 1701), 1701));
+
+    var evaluation = EvalProbe{ .id = session.id, .source = "performanceBoundary()", .filename = "performance-boundary.js" };
+    thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&evaluation});
+    try testing.expect(waitForAtomicTrue(&host.entered));
+    at = try send(&session, "Performance.disable", "", 1702);
+    try testing.expect(!(try waitResponseNoTick(&session, at, 1702)));
+    host.release.store(true, .seq_cst);
+    thread.?.join();
+    thread = null;
+    try testing.expect(evaluation.ok);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, at, 1702), 1702));
+
+    host.entered.store(false, .seq_cst);
+    host.release.store(false, .seq_cst);
+    evaluation = .{ .id = session.id, .source = "performanceBoundary()", .filename = "performance-boundary.js" };
+    thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&evaluation});
+    try testing.expect(waitForAtomicTrue(&host.entered));
+    at = try send(&session, "Performance.enable", "", 1703);
+    try testing.expect(!(try waitResponseNoTick(&session, at, 1703)));
+    host.release.store(true, .seq_cst);
+    thread.?.join();
+    thread = null;
+    try testing.expect(evaluation.ok);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, at, 1703), 1703));
+}
+
+test "cdp regression: Performance configuration does not run from a paused debugger control drain" {
+    if (comptime backend.active_backend != .quickjs_ng) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-performance-paused-boundary");
+    defer session.deinit();
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, try send(&session, "Debugger.enable", "", 1711), 1711), 1711));
+
+    var evaluation = EvalProbe{ .id = session.id, .source = "debugger; globalThis.__performancePauseDone = true;", .filename = "performance-pause.js" };
+    var thread: ?std.Thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&evaluation});
+    defer {
+        if (thread) |value| {
+            _ = send(&session, "Debugger.resume", "", 1713) catch 0;
+            value.join();
+        }
+    }
+    const paused_from = session.got.items.len;
+    try testing.expect(try waitForFrame(&session, paused_from, "Debugger.paused", 80));
+
+    const enable_at = try send(&session, "Performance.enable", "", 1712);
+    try testing.expect(!(try waitResponseNoTick(&session, enable_at, 1712)));
+    const resume_at = try send(&session, "Debugger.resume", "", 1713);
+    try testing.expect(try waitResponseNoTick(&session, resume_at, 1713));
+    thread.?.join();
+    thread = null;
+    try testing.expect(evaluation.ok);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, enable_at, 1712), 1712));
+}
+
+test "cdp regression: a closed session cannot revive queued Performance measurement" {
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-performance-closed-queue");
+    defer session.deinit();
+    const state = inspector_state.stateByInstance(session.id) orelse return error.TestUnexpectedResult;
+    const ledger = state.execution_cpu_ledger orelse return error.TestUnexpectedResult;
+    const session_id = try onlySessionId(state);
+
+    var host = PerformanceBoundaryHost{};
+    var thread: ?std.Thread = null;
+    defer {
+        host.release.store(true, .seq_cst);
+        if (thread) |value| value.join();
+    }
+    try testing.expect(engine_thread.hostInstall(session.id, "performanceBoundary", PerformanceBoundaryHost.call, @ptrCast(&host)));
+    var evaluation = EvalProbe{ .id = session.id, .source = "performanceBoundary()", .filename = "performance-close-queue.js" };
+    thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&evaluation});
+    try testing.expect(waitForAtomicTrue(&host.entered));
+    _ = try send(&session, "Performance.enable", "", 1721);
+    const barrier_at = try send(&session, "Runtime.getIsolateId", "", 1722);
+    try testing.expect(try waitResponseNoTick(&session, barrier_at, 1722));
+    session.stream.close();
+    session.stream_open = false;
+    try waitForSessionRemoval(state, session_id);
+    try testing.expectEqual(@as(usize, 0), ledger.measurement_users.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), ledger.pending_measurement_disables.load(.acquire));
+
+    host.release.store(true, .seq_cst);
+    thread.?.join();
+    thread = null;
+    try testing.expect(evaluation.ok);
+    _ = dispatch.tickInstance(session.id);
+    try testing.expectEqual(@as(usize, 0), ledger.measurement_users.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), ledger.pending_measurement_disables.load(.acquire));
+
+    session.reader.deinit(alloc);
+    session.stream = try wire.connect(inspector.boundPort(session.handle));
+    session.stream_open = true;
+    try wire.doWsHandshake(alloc, session.stream, "cdp-performance-closed-queue");
+    session.reader = wire.FrameReader.init(session.stream);
 }
 
 test "cdp alignment: Performance rejects unsupported threadTicks at both protocol entry points" {
