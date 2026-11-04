@@ -1290,6 +1290,11 @@ static std::string rewriteIdents(const std::string &src,
                     if (isIdentStart(ch)) {
                         size_t n = i + 1;
                         while (n < src.size() && isIdent(src[n])) ++n;
+                        // for-of / for-in header boundary: leave `of`/`in` + iterable for the outer rewrite pass.
+                        if (depth == 0) {
+                            const std::string kw = src.substr(i, n - i);
+                            if (kw == "of" || kw == "in") break;
+                        }
                         out.append(src, i, n - i);
                         i = n;
                         continue;

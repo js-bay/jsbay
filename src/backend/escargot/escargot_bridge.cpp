@@ -1155,7 +1155,7 @@ extern "C" bool escargot_map_foreach(EscargotContext *c, EscargotValue map, void
         if (!cb(c, cb_ctx, key, val)) {
             if (key) escargot_free_value(c, key);
             if (val) escargot_free_value(c, val);
-            ok = false;
+            // Callback false = clean early exit; mapForEach promises true for exhaustion and early stop.
             break;
         }
         if (key) escargot_free_value(c, key);
@@ -1183,7 +1183,7 @@ extern "C" bool escargot_set_foreach(EscargotContext *c, EscargotValue set, void
         auto val = escargot_get_index(c, arr, i);
         if (!cb(c, cb_ctx, val)) {
             if (val) escargot_free_value(c, val);
-            ok = false;
+            // Callback false = clean early exit; setForEach promises true for exhaustion and early stop.
             break;
         }
         if (val) escargot_free_value(c, val);

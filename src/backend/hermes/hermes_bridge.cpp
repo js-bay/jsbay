@@ -677,8 +677,7 @@ extern "C" bool hermes_is_constructor(JsbayHermesContext *c, HermesValue v) {
         auto o = asVal(v)->getObject(rt);
         if (!o.isFunction(rt)) return false;
         // ES IsConstructor: Reflect.construct(fn, []) succeeds iff [[Construct]] exists.
-        // Probe via a cached helper so we never invoke the user constructor body with a
-        // wrong newTarget, and so JS TypeErrors stay in-engine (no host ABRT).
+        // Probe via a cached helper so we never invoke the user constructor body with a wrong newTarget, and so JS TypeErrors stay in-engine (no host ABRT).
         static const char *kHelper =
             "(function(f){try{Reflect.construct(function(){},[],f);return true;}"
             "catch(e){return false;}})";
