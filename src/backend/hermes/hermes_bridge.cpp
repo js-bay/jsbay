@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <errno.h>
 
 namespace jsi = facebook::jsi;
 using FbHermesRuntime = facebook::hermes::HermesRuntime;
@@ -1037,8 +1038,8 @@ extern "C" HermesValue hermes_get_index(JsbayHermesContext *c, HermesValue obj, 
         }
         return retainMove(c, o.getProperty(*c->rt, std::to_string(index).c_str()));
     } catch (...) {
-        try { return retainMove(c, jsi::Value::undefined()); }
-        catch (...) { return nullptr; }
+        // Throwing getter / failed indexed read → C null (failure), not JS undefined (hole).
+        return nullptr;
     }
 }
 extern "C" uint32_t hermes_get_length(JsbayHermesContext *c, HermesValue obj) {
@@ -1575,8 +1576,7 @@ extern "C" uint8_t *hermes_typed_array_data(JsbayHermesContext *c, HermesValue t
     try {
         auto o = asVal(ta)->getObject(*c->rt);
         if (!hermesBrandIsTypedArray(c, o)) return nullptr;
-        // JSI TypedArray::buffer/byteOffset/byteLength default to getProperty and fire
-        // exotic own getters. Use pristine %TypedArray%.prototype getters instead.
+        // JSI TypedArray::buffer/byteOffset/byteLength default to getProperty and fire exotic own getters. Use pristine %TypedArray%.prototype getters instead.
         auto bufVal = hermesTypedArrayProtoGet(c, o, "buffer");
         auto offVal = hermesTypedArrayProtoGet(c, o, "byteOffset");
         auto lenVal = hermesTypedArrayProtoGet(c, o, "byteLength");
@@ -1587,8 +1587,7 @@ extern "C" uint8_t *hermes_typed_array_data(JsbayHermesContext *c, HermesValue t
         if (byte_offset) *byte_offset = off;
         if (byte_length) *byte_length = blen;
         if (kind) {
-            // Use the captured pristine %TypedArray%.prototype[Symbol.toStringTag] getter so an
-            // instance own Symbol.toStringTag (or a replaced Object.prototype.toString) cannot spoof the element kind.
+            // Use the captured pristine %TypedArray%.prototype[Symbol.toStringTag] getter so an instance own Symbol.toStringTag (or a replaced Object.prototype.toString) cannot spoof the element kind.
             std::string name;
             try {
                 if (c->pristine_ta_to_string_tag_get) {
@@ -2902,7 +2901,18 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
     } else if (pid > 0) {
         if (err_fd >= 0) close(err_fd);
         int status = 0;
-        waitpid(pid, &status, 0);
+        // Retry waitpid on EINTR so a non-SA_RESTART signal cannot leave hermesc unreaped while we treat status 0 as success and read a still-incomplete output file.
+        pid_t waited;
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited != pid) {
+            unlink(js_path.c_str());
+            if (!err_path.empty()) unlink(err_path.c_str());
+            unlink(hbc_path);
+            out.err = dupCString("waitpid hermesc failed");
+            return out;
+        }
         rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     } else {
         if (err_fd >= 0) close(err_fd);
