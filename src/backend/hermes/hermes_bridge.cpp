@@ -71,6 +71,8 @@ struct JsbayHermesContextOpaque {
     // Pristine Map.prototype / Set.prototype `size` getters (ignore own-property shadows / NaN).
     std::unique_ptr<jsi::Function> pristine_map_size_get;
     std::unique_ptr<jsi::Function> pristine_set_size_get;
+    // Pristine Date.prototype.getTime (Date brand without Object.prototype.toString / toStringTag).
+    std::unique_ptr<jsi::Function> pristine_date_gettime;
     // Pristine JSON.parse / JSON.stringify (C ABI must ignore script-replaced globalThis.JSON).
     std::unique_ptr<jsi::Function> pristine_json_parse;
     std::unique_ptr<jsi::Function> pristine_json_stringify;
@@ -473,6 +475,19 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
     } catch (...) {
         c->pristine_map_size_get.reset();
         c->pristine_set_size_get.reset();
+    }
+    try {
+        const char *kGrabDateGetTime = R"JS(
+            (function () {
+              return Date.prototype.getTime;
+            })()
+        )JS";
+        auto gtVal = c->rt->evaluateJavaScript(std::make_shared<jsi::StringBuffer>(kGrabDateGetTime),
+                                               "<jsbay-date-gettime>");
+        c->pristine_date_gettime = std::make_unique<jsi::Function>(
+            gtVal.asObject(*c->rt).asFunction(*c->rt));
+    } catch (...) {
+        c->pristine_date_gettime.reset();
     }
     try {
         auto JSON = c->rt->global().getPropertyAsObject(*c->rt, "JSON");
@@ -1154,16 +1169,31 @@ extern "C" HermesValue hermes_symbol_for(JsbayHermesContext *c, const char *key,
     } catch (...) { return nullptr; }
 }
 
+// Pristine Date.prototype.getTime validates [[DateValue]] without Object.prototype.toString / toStringTag.
+static bool hermesBrandIsDate(JsbayHermesContext *c, const jsi::Object &o) {
+    if (!c || !c->rt || !c->pristine_date_gettime) return false;
+    try {
+        auto r = c->pristine_date_gettime->callWithThis(*c->rt, o);
+        return r.isNumber();
+    } catch (...) {
+        return false;
+    }
+}
+
 extern "C" bool hermes_is_date(JsbayHermesContext *c, HermesValue v) {
-    if (!c || !c->rt || !v) return false;
-    return instanceOfGlobal(*c->rt, *asVal(v), "Date");
+    if (!c || !c->rt || !v || !asVal(v)->isObject()) return false;
+    try {
+        return hermesBrandIsDate(c, asVal(v)->getObject(*c->rt));
+    } catch (...) {
+        return false;
+    }
 }
 extern "C" bool hermes_date_to_ms(JsbayHermesContext *c, HermesValue v, int64_t *out) {
-    if (!c || !c->rt || !v || !out) return false;
+    if (!c || !c->rt || !v || !out || !asVal(v)->isObject() || !c->pristine_date_gettime) return false;
     try {
         auto o = asVal(v)->getObject(*c->rt);
-        auto getTime = o.getPropertyAsFunction(*c->rt, "getTime");
-        auto r = getTime.callWithThis(*c->rt, o);
+        // Use the captured pristine getTime so own getTime / toStringTag cannot spoof or block conversion.
+        auto r = c->pristine_date_gettime->callWithThis(*c->rt, o);
         if (!r.isNumber()) return false;
         double d = r.getNumber();
         if (!std::isfinite(d)) return false;

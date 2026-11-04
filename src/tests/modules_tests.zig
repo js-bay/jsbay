@@ -204,6 +204,28 @@ test "modules: imported binding rewritten in ternary consequent" {
     try testing.expectEqual(@as(i64, 9), got);
 }
 
+test "modules: imported binding rewritten in compound ternary consequent" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Colon after a non-boundary operand must not be treated as a label (`1 + value : 0`).
+    const src = "import { value } from 'dep';\nexport function read(){ return true ? 1 + value : 0; }\nglobalThis.__result__ = read();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 43), got);
+}
+
 test "modules: named function import calls stay unbound" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
@@ -923,6 +945,33 @@ test "modules: diamond star re-export keeps a shared originating binding" {
     try testing.expect(res.err == null);
     try helpers.expectEvalEquals(id, "globalThis.__hasShared__", "true");
     try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__shared__"));
+}
+
+test "modules: diamond named re-export keeps a shared originating binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("base", "export const value = 42;");
+    try ctx.modules.put("left", "export { value } from 'base';");
+    try ctx.modules.put("right", "export { value } from 'base';");
+    try ctx.modules.put("hub", "export * from 'left'; export * from 'right';");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import * as ns from 'hub';
+        \\globalThis.__value__ = ns.value;
+        \\globalThis.__hasValue__ = Object.prototype.hasOwnProperty.call(ns, 'value');
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try helpers.expectEvalEquals(id, "globalThis.__hasValue__", "true");
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__value__"));
 }
 
 test "modules: circular imports do not deadlock" {

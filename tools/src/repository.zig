@@ -110,13 +110,9 @@ fn releaseVersion(c: Context, args: []const []const u8) !void {
 }
 
 const privacy_patterns =
-    // Public-tree hygiene only. Personal names, private product labels, lab
-    // device ids, and private network markers go in git `info/privacy-denylist`
-    // (or PRIVACY_EXTRA_FILE) so they are not embedded in this source file.
+    // Public-tree hygiene only. Personal names, private product labels, lab device ids, and private network markers go in git `info/privacy-denylist` (or PRIVACY_EXTRA_FILE) so they are not embedded in this source file.
     "(^|[^0-9.])100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.[0-9]+\\.[0-9]+\n/Use[r]s/[A-Za-z0-9._-]+\n/Volum[e]s/[A-Za-z0-9._-]+\n" ++
-    // Comparison / inspiration host-product names that are not first-party backends.
-    // First-party engine backends (including the Hermes -Dbackend= and its JSI bridge paths)
-    // are allowed; keep the mobile host-framework product name banned for casual attribution.
+    // Comparison / inspiration host-product names that are not first-party backends. First-party engine backends (including the Hermes -Dbackend= and its JSI bridge paths) are allowed; keep the mobile host-framework product name banned for casual attribution.
     "r[e]act[-_ ]?native\n";
 
 fn privacy(c: Context, args: []const []const u8) !void {
@@ -369,8 +365,7 @@ fn checkDocs(c: Context, args: []const []const u8) !void {
 
 fn checkTooling(c: Context, args: []const []const u8) !void {
     if (args.len != 0) return error.Usage;
-    // Git lists a submodule as one directory entry. Its upstream files are
-    // outside this repository's tooling policy, as are ignored build caches.
+    // Git lists a submodule as one directory entry. Its upstream files are outside this repository's tooling policy, as are ignored build caches.
     const files = try c.command(&.{ "git", "ls-files", "-co", "--exclude-standard", "-z" }, null);
     var paths = std.mem.splitScalar(u8, files, 0);
     var failed = false;

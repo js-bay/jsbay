@@ -1721,15 +1721,20 @@ static std::string rewriteIdents(const std::string &src,
                 while (lpk > 0 && std::isspace(static_cast<unsigned char>(out[lpk - 1]))) --lpk;
                 if (outEndsWithWord(lpk, "break") || outEndsWithWord(lpk, "continue")) label_operand = true;
             }
+            // Recognize labels only at statement boundaries so ternary/expression operands (`1 + value : 0`) stay rewritten.
             bool label_decl = false;
-            if (!after_dot && !after_question && !in_object_lit_for_key && !label_operand) {
+            if (!after_dot && !in_object_lit_for_key && !label_operand) {
                 size_t lk = j;
                 skipSpacesAndCommentsSrc(lk);
                 if (lk < src.size() && src[lk] == ':' && !(lk + 1 < src.size() && src[lk + 1] == ':')) {
                     size_t lpk = out.size();
                     while (lpk > 0 && std::isspace(static_cast<unsigned char>(out[lpk - 1]))) --lpk;
-                    // `case value:` is an expression, not a label declaration.
-                    if (!outEndsWithWord(lpk, "case")) label_decl = true;
+                    char p = lpk > 0 ? out[lpk - 1] : '\0';
+                    bool at_stmt_boundary = (p == '\0' || p == ';' || p == '{' || p == '}' || p == ')' || p == ':');
+                    if (!at_stmt_boundary && (outEndsWithWord(lpk, "else") || outEndsWithWord(lpk, "do")))
+                        at_stmt_boundary = true;
+                    // `case value:` is an expression operand, not a label declaration.
+                    if (at_stmt_boundary && !outEndsWithWord(lpk, "case")) label_decl = true;
                 }
             }
             auto it = repl.find(id);
@@ -2485,6 +2490,20 @@ static std::string exportLiveGetter(const std::string &exported, const std::stri
            "\",{enumerable:true,configurable:true,get:function(){return " + expr + ";}});";
 }
 
+// Named `export {…} from`: live getter plus leaf-binding origin so diamond star-reexports stay unambiguous.
+static std::string exportNamedReexport(const std::string &exported, const std::string &ns,
+                                       const std::string &imported) {
+    std::string out = exportLiveGetter(exported, ns + "." + imported);
+    out += std::string("if(!") + kWrapObject + ".prototype.hasOwnProperty.call(" + kWrapExports +
+           ",\"__jsbay_star_origin\"))" + kWrapDefineProperty + "(" + kWrapExports +
+           ",\"__jsbay_star_origin\",{value:" + kWrapObject + ".create(null),configurable:true});";
+    out += std::string(kWrapExports) + ".__jsbay_star_origin[\"" + exported + "\"]=(" + ns +
+           ".__jsbay_star_origin&&" + kWrapObject + ".prototype.hasOwnProperty.call(" + ns +
+           ".__jsbay_star_origin,\"" + imported + "\"))?" + ns + ".__jsbay_star_origin[\"" + imported +
+           "\"]:" + ns + ";";
+    return out;
+}
+
 // Very small ESM→CJS transform covering modules_tests fixtures.
 static std::string transformEsmToCjs(const std::string &src, const std::string &filename) {
     (void)filename;
@@ -2714,7 +2733,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                         } else {
                             imported = exported = part;
                         }
-                        repl += exportLiveGetter(exported, ns + "." + imported);
+                        repl += exportNamedReexport(exported, ns, imported);
                     }
                     if (comma == std::string::npos) break;
                     pos = comma + 1;
