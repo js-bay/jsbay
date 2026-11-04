@@ -1,7 +1,7 @@
 pub fn Module(comptime Host: type) type {
     // CDP `Performance` domain backed only by measurements this runtime can make.
     //
-    // `Timestamp` is a process-monotonic timeTicks value in seconds. QuickJS exposes heap accounting through `JS_ComputeMemoryUsage`; JSC's public C API does not, so a JSC response deliberately contains only Timestamp. We do not report duration metrics because there is no low-cost, cross-backend execution accounting source for them.
+    // `Timestamp` is a process-monotonic timeTicks value in seconds. `JSBayExecutionCPUTime` is execution CPU attributed to this engine instance while Performance measurement is enabled. QuickJS exposes heap accounting through `JS_ComputeMemoryUsage`; JSC's public C API does not, so JSC omits heap byte metrics.
 
     return struct {
         const std = @import("std");
@@ -28,7 +28,7 @@ pub fn Module(comptime Host: type) type {
                     return;
                 };
                 if (!session.enabled) {
-                    sendMetrics(job, null);
+                    sendDisabledMetrics(job);
                     return;
                 }
                 // Reject unsupported threadTicks in restored session state. Normal command handling rejects threadTicks before it is committed to a session.
@@ -37,7 +37,7 @@ pub fn Module(comptime Host: type) type {
                     return;
                 }
                 const usage = if (comptime backend.isQuickJsApiBackend(backend.active_backend)) runtime_control.getMemoryUsage(job.state.instance_id) else null;
-                sendMetrics(job, usage);
+                sendMetrics(job, usage, state_mod.executionCpuSeconds(job.state));
             }
 
             fn cancel(ctx: ?*anyopaque) void {
@@ -115,20 +115,27 @@ pub fn Module(comptime Host: type) type {
             }
         }
 
-        fn sendMetrics(job: *Job, usage: ?runtime_control.MemoryUsage) void {
+        fn sendMetrics(job: *Job, usage: ?runtime_control.MemoryUsage, execution_cpu_seconds: ?f64) void {
             var aw: std.Io.Writer.Allocating = .init(job.state.allocator);
             defer aw.deinit();
             const w = &aw.writer;
             w.print("{{\"id\":{d},\"result\":{{\"metrics\":[", .{job.request_id}) catch return;
             const now = monotonicMilliseconds();
+            w.print("{{\"name\":\"Timestamp\",\"value\":{d}.{d:0>3}}}", .{ now / 1000, now % 1000 }) catch return;
+            if (execution_cpu_seconds) |value| w.print(",{{\"name\":\"JSBayExecutionCPUTime\",\"value\":{e}}}", .{value}) catch return;
             if (usage) |memory| {
                 const used = if (memory.memory_used_size != 0) memory.memory_used_size else memory.malloc_size;
                 const total = @max(memory.malloc_size, used);
-                w.print("{{\"name\":\"Timestamp\",\"value\":{d}.{d:0>3}}},{{\"name\":\"JSHeapUsedSize\",\"value\":{d}}},{{\"name\":\"JSHeapTotalSize\",\"value\":{d}}}", .{ now / 1000, now % 1000, used, total }) catch return;
-            } else if (state_mod.sessionPerformance(job.state, job.session_id)) |session| {
-                if (session.enabled) w.print("{{\"name\":\"Timestamp\",\"value\":{d}.{d:0>3}}}", .{ now / 1000, now % 1000 }) catch return;
+                w.print(",{{\"name\":\"JSHeapUsedSize\",\"value\":{d}}},{{\"name\":\"JSHeapTotalSize\",\"value\":{d}}}", .{ used, total }) catch return;
             }
             w.writeAll("]}}") catch return;
+            json_writer.sendJson(job.state, job.session_id, aw.written());
+        }
+
+        fn sendDisabledMetrics(job: *Job) void {
+            var aw: std.Io.Writer.Allocating = .init(job.state.allocator);
+            defer aw.deinit();
+            aw.writer.print("{{\"id\":{d},\"result\":{{\"metrics\":[]}}}}", .{job.request_id}) catch return;
             json_writer.sendJson(job.state, job.session_id, aw.written());
         }
 

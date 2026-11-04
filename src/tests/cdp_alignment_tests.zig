@@ -136,6 +136,14 @@ fn pumpResponse(session: *Session, from: usize, id: i64) ![]const u8 {
     return error.TestUnexpectedResult;
 }
 
+fn metricValue(response: []const u8, name: []const u8) ?f64 {
+    var needle: [64]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&needle, "\"name\":\"{s}\",\"value\":", .{name}) catch return null;
+    const start = (std.mem.indexOf(u8, response, prefix) orelse return null) + prefix.len;
+    const end = std.mem.indexOfAnyPos(u8, response, start, ",}") orelse return null;
+    return std.fmt.parseFloat(f64, response[start..end]) catch null;
+}
+
 fn pumpFor(session: *Session, from: usize, needle: []const u8, spins: usize) !bool {
     var i: usize = 0;
     while (i < spins) : (i += 1) {
@@ -492,7 +500,7 @@ test "cdp alignment: last Debugger session disconnect cools native hooks when re
     defer discardEval(evaluated);
     try testing.expect(evaluated.err == null);
     try testing.expectEqual(@as(u64, 0), debugger_mod.handlerInstallThreadId(session.id));
-    try testing.expectEqual(@as(u32, 0), debugger_mod.scriptIdForUrl(session.id, "after-debugger-disconnect.js"));
+    try testing.expect(debugger_mod.scriptIdForUrl(session.id, "after-debugger-disconnect.js") != 0);
 }
 
 test "cdp alignment: async depth without Debugger.enable keeps an explicitly attached debugger armed" {
@@ -651,6 +659,61 @@ test "cdp alignment: Debugger.getPossibleBreakpoints keeps separate tables for s
     try testing.expect(std.mem.indexOf(u8, second_response, "\"lineNumber\":6") != null);
 }
 
+test "cdp alignment: classic compiler tags preserve sourceURL identities" {
+    if (comptime backend.active_backend != .quickjs) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-classic-source-identities");
+    defer session.deinit();
+    _ = try pumpResponse(&session, try send(&session, "Debugger.enable", "", 91), 91);
+
+    const first = engine.evalScript(session.id, "(0, eval)(\"globalThis.__classicFirst = function(){ return 'first'; };\\n//# sourceURL=classic-same-url.js\");", "classic-outer.js");
+    defer discardEval(first);
+    const second = engine.evalScript(session.id, "(0, eval)(\"globalThis.__classicSecond = function(){ return 'second'; };\\n//# sourceURL=classic-same-url.js\");", "classic-outer.js");
+    defer discardEval(second);
+    const anonymous = engine.evalScript(session.id, "(0, eval)(\"globalThis.__classicAnonymous = 1;\");", "classic-outer.js");
+    defer discardEval(anonymous);
+    const function = engine.evalScript(session.id, "globalThis.__classicFunction = new Function(\"return 'function';\\n//# sourceURL=classic-function-url.js\");", "classic-outer.js");
+    defer discardEval(function);
+    const literal = engine.evalScript(session.id, "globalThis.__classicLiteral = '//# sourceURL=not-a-script.js';", "classic-outer.js");
+    defer discardEval(literal);
+    const template = engine.evalScript(session.id, "globalThis.__classicTemplate = `\n//# sourceURL=not-a-script.js`;", "classic-outer.js");
+    defer discardEval(template);
+    const block = engine.evalScript(session.id, "/*\n//# sourceURL=not-a-script.js */ globalThis.__classicBlock = 1;", "classic-outer.js");
+    defer discardEval(block);
+    const regexp = engine.evalScript(session.id, "globalThis.__classicRegexp = /[//# sourceURL=spoof.js]/;", "classic-outer.js");
+    defer discardEval(regexp);
+    try testing.expect(first.err == null and second.err == null and anonymous.err == null and function.err == null and literal.err == null and template.err == null and block.err == null and regexp.err == null);
+
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"classic-same-url.js\"", 2));
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"classic-function-url.js\"", 1));
+    try testing.expect(std.mem.indexOf(u8, session.got.items, "not-a-script.js") == null);
+
+    var ids: [4]?[]const u8 = @splat(null);
+    try testing.expectEqual(@as(usize, 2), scriptIdsForUrl(session.got.items, "\"url\":\"classic-same-url.js\"", &ids));
+    const first_id = try alloc.dupe(u8, ids[0].?);
+    defer alloc.free(first_id);
+    const second_id = try alloc.dupe(u8, ids[1].?);
+    defer alloc.free(second_id);
+    const first_params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{first_id});
+    defer alloc.free(first_params);
+    const first_source = try pumpResponse(&session, try send(&session, "Debugger.getScriptSource", first_params, 92), 92);
+    try testing.expect(std.mem.indexOf(u8, first_source, "__classicFirst") != null);
+    const identical_source = "globalThis.__classicIdentical = (globalThis.__classicIdentical || 0) + 1;";
+    const identical_first = engine.evalScript(session.id, identical_source, "classic-identical-url.js");
+    defer discardEval(identical_first);
+    const identical_second = engine.evalScript(session.id, identical_source, "classic-identical-url.js");
+    defer discardEval(identical_second);
+    try testing.expect(identical_first.err == null and identical_second.err == null);
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"classic-identical-url.js\"", 2));
+    var identical_ids: [4]?[]const u8 = @splat(null);
+    try testing.expectEqual(@as(usize, 2), scriptIdsForUrl(session.got.items, "\"url\":\"classic-identical-url.js\"", &identical_ids));
+    try testing.expect(!std.mem.eql(u8, identical_ids[0].?, identical_ids[1].?));
+    const second_params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{second_id});
+    defer alloc.free(second_params);
+    const second_source = try pumpResponse(&session, try send(&session, "Debugger.getScriptSource", second_params, 93), 93);
+    try testing.expect(std.mem.indexOf(u8, second_source, "__classicSecond") != null);
+}
+
 test "cdp alignment: Runtime.exceptionThrown reports direct uncaught eval but not caught eval" {
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-sync-exception");
@@ -673,6 +736,48 @@ test "cdp alignment: Runtime.exceptionThrown reports direct uncaught eval but no
     defer discardEval(caught);
     try testing.expect(caught.err == null);
     try testing.expect(!try pumpFor(&session, caught_from, "cdp-caught-must-not-notify", 12));
+}
+
+test "cdp alignment: Runtime.evaluate returns exceptionDetails without exceptionThrown" {
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-alignment-evaluate-exception-response");
+    defer session.deinit();
+
+    const enable_at = try send(&session, "Runtime.enable", "", 52);
+    _ = try pumpResponse(&session, enable_at, 52);
+
+    inline for ([_]bool{ false, true }, 0..) |silent, offset| {
+        const from = session.got.items.len;
+        const params = if (silent)
+            "{\"expression\":\"throw new Error('cdp-evaluate-silent');\",\"silent\":true}"
+        else
+            "{\"expression\":\"throw new Error('cdp-evaluate-loud');\",\"silent\":false}";
+        const request_id: i64 = 53 + @as(i64, @intCast(offset));
+        const sent_at = try send(&session, "Runtime.evaluate", params, request_id);
+        const response = try pumpResponse(&session, sent_at, request_id);
+        try testing.expect(std.mem.indexOf(u8, response, "exceptionDetails") != null);
+        try testing.expect(!try pumpFor(&session, from, "Runtime.exceptionThrown", 20));
+    }
+}
+
+test "cdp alignment: Runtime.callFunctionOn compilation failure returns exceptionDetails without exceptionThrown" {
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-alignment-call-function-exception-response");
+    defer session.deinit();
+
+    const enable_at = try send(&session, "Runtime.enable", "", 55);
+    _ = try pumpResponse(&session, enable_at, 55);
+    const from = session.got.items.len;
+    const sent_at = try send(&session, "Runtime.callFunctionOn", "{\"functionDeclaration\":\"function( {\"}", 56);
+    const response = try pumpResponse(&session, sent_at, 56);
+    try testing.expect(std.mem.indexOf(u8, response, "exceptionDetails") != null);
+    try testing.expect(!try pumpFor(&session, from, "Runtime.exceptionThrown", 20));
+
+    const invoke_from = session.got.items.len;
+    const invoke_at = try send(&session, "Runtime.callFunctionOn", "{\"functionDeclaration\":\"function(){ throw new Error('cdp-call-throw'); }\"}", 57);
+    const invoke_response = try pumpResponse(&session, invoke_at, 57);
+    try testing.expect(std.mem.indexOf(u8, invoke_response, "exceptionDetails") != null);
+    try testing.expect(!try pumpFor(&session, invoke_from, "Runtime.exceptionThrown", 20));
 }
 
 test "cdp alignment: Runtime.exceptionThrown reports a public C ABI evaluate exception without coercing it" {
@@ -881,6 +986,50 @@ test "cdp alignment: Profiler.start does not override the configured sampling in
     try testing.expect(std.mem.indexOf(u8, response, "\"totalSamples\":1") != null);
 }
 
+test "cdp alignment: HeapProfiler collectGarbage reclaims an unreachable cycle in the native runtime" {
+    var session = try openSession(testing.allocator, "cdp-alignment-collect-garbage");
+    defer session.deinit();
+    const runtime_control = @import("../runtime/runtime_control.zig");
+    const allocated = engine.evalScript(session.id, "globalThis.heapCycle = { data: new Array(65536).fill(12345) }; heapCycle.self = heapCycle; void 0;", "heap-cycle.js");
+    defer if (allocated.result) |value| std.heap.c_allocator.free(value);
+    defer if (allocated.err) |err| if (allocated.err_is_heap) std.heap.c_allocator.free(err);
+    try testing.expect(allocated.err == null);
+    const retained = runtime_control.getMemoryUsage(session.id);
+    const released = engine.evalScript(session.id, "delete globalThis.heapCycle; void 0;", "heap-cycle.js");
+    defer if (released.result) |value| std.heap.c_allocator.free(value);
+    defer if (released.err) |err| if (released.err_is_heap) std.heap.c_allocator.free(err);
+    try testing.expect(released.err == null);
+    const at = try send(&session, "HeapProfiler.collectGarbage", "", 10);
+    const response = try pumpResponse(&session, at, 10);
+    try testing.expect(responseIsSuccess(response, 10));
+    if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+        const collected = runtime_control.getMemoryUsage(session.id).?;
+        try testing.expect(retained.?.memory_used_size > collected.memory_used_size + 512 * 1024);
+    }
+}
+
+test "cdp alignment: heap snapshot progress prepares the frontend loader before chunks" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    var session = try openSession(testing.allocator, "cdp-alignment-snapshot-progress");
+    defer session.deinit();
+    const at = try send(&session, "HeapProfiler.takeHeapSnapshot", "{\"reportProgress\":true}", 21);
+    const response = try pumpResponse(&session, at, 21);
+    try testing.expect(responseIsSuccess(response, 21));
+    const progress = std.mem.indexOf(u8, response, "HeapProfiler.reportHeapSnapshotProgress") orelse return error.MissingSnapshotProgress;
+    const chunk = std.mem.indexOf(u8, response, "HeapProfiler.addHeapSnapshotChunk") orelse return error.MissingSnapshotChunk;
+    try testing.expect(progress < chunk);
+    try testing.expect(std.mem.indexOf(u8, response[progress..chunk], "\"finished\":true") != null);
+    // The frontend streaming loader parses through the final array bracket as the strings table.
+    const strings = std.mem.indexOf(u8, response, "\\\"strings\\\":[") orelse return error.MissingSnapshotStrings;
+    const locations = std.mem.indexOf(u8, response, "\\\"locations\\\":[") orelse return error.MissingSnapshotLocations;
+    try testing.expect(locations < strings);
+    const quiet_at = try send(&session, "HeapProfiler.takeHeapSnapshot", "{\"reportProgress\":false}", 22);
+    const quiet = try pumpResponse(&session, quiet_at, 22);
+    try testing.expect(responseIsSuccess(quiet, 22));
+    try testing.expect(std.mem.indexOf(u8, quiet, "HeapProfiler.addHeapSnapshotChunk") != null);
+    try testing.expect(std.mem.indexOf(u8, quiet, "HeapProfiler.reportHeapSnapshotProgress") == null);
+}
+
 test "cdp alignment: Performance metrics have a live timestamp and real heap usage" {
     if (comptime backend.active_backend != .quickjs_ng) return;
     const alloc = testing.allocator;
@@ -904,6 +1053,7 @@ test "cdp alignment: Performance metrics have a live timestamp and real heap usa
     try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"JSHeapUsedSize\"") != null);
     try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"JSHeapTotalSize\"") != null);
     try testing.expect(std.mem.indexOf(u8, response, "\"value\":0") == null);
+    try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"ThreadTime\"") == null);
 
     at = try send(&session, "Performance.disable", "", 13);
     response = try pumpResponse(&session, at, 13);
@@ -929,6 +1079,22 @@ test "cdp alignment: Performance reports backend-specific measurable metrics" {
     response = try pumpResponse(&session, metrics_at, 16);
     try testing.expect(responseIsSuccess(response, 16));
     try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"Timestamp\"") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"ThreadTime\"") == null);
+
+    const first_work = engine.evalScript(session.id, "var cpuMetric = 0; for (var i = 0; i < 4000000; i++) cpuMetric += i; cpuMetric;", "performance-cpu-metric.js");
+    defer discardEval(first_work);
+    try testing.expect(first_work.err == null);
+    const first_at = try send(&session, "Performance.getMetrics", "", 161);
+    const first_cpu = metricValue(try pumpResponse(&session, first_at, 161), "JSBayExecutionCPUTime") orelse return error.ExpectedExecutionCpuMetric;
+
+    const second_work = engine.evalScript(session.id, "var cpuMetric2 = 0; for (var i = 0; i < 4000000; i++) cpuMetric2 += i; cpuMetric2;", "performance-cpu-metric.js");
+    defer discardEval(second_work);
+    try testing.expect(second_work.err == null);
+    const second_at = try send(&session, "Performance.getMetrics", "", 162);
+    response = try pumpResponse(&session, second_at, 162);
+    const second_cpu = metricValue(response, "JSBayExecutionCPUTime") orelse return error.ExpectedExecutionCpuMetric;
+    try testing.expect(second_cpu > first_cpu);
+    try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"ThreadTime\"") == null);
     if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
         try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"JSHeapUsedSize\"") != null);
         try testing.expect(std.mem.indexOf(u8, response, "\"name\":\"JSHeapTotalSize\"") != null);
@@ -1147,6 +1313,44 @@ test "cdp regression: i32 overflow breakpoint line is an invalid request" {
     try reviewInvalidBreakpointStartLine("2147483648", 891);
 }
 
+test "cdp regression: reconnect retains an old closure source identity" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-reconnect-old-closure");
+    defer session.deinit();
+    _ = try pumpResponse(&session, try send(&session, "Runtime.enable", "", 1281), 1281);
+    _ = try pumpResponse(&session, try send(&session, "Debugger.enable", "", 1282), 1282);
+    const filename = "reconnect-same-url.js";
+    const original_source = "globalThis.__reconnectOld = function(){ console.log('reconnect-old'); };";
+    const original = engine.evalScript(session.id, original_source, filename);
+    defer discardEval(original);
+    try testing.expect(original.err == null);
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"reconnect-same-url.js\"", 1));
+    const original_id = try alloc.dupe(u8, scriptIdForUrl(session.got.items, "\"url\":\"reconnect-same-url.js\"") orelse return error.TestUnexpectedResult);
+    defer alloc.free(original_id);
+    const disabled = try send(&session, "Debugger.disable", "", 1283);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, disabled, 1283), 1283));
+    const enabled = try send(&session, "Debugger.enable", "", 1284);
+    try testing.expect(responseIsSuccess(try pumpResponse(&session, enabled, 1284), 1284));
+    const replacement = engine.evalScript(session.id, "globalThis.__reconnectReplacement = 1;", filename);
+    defer discardEval(replacement);
+    try testing.expect(replacement.err == null);
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"reconnect-same-url.js\"", 2));
+    const from = session.got.items.len;
+    const invoke = engine.evalScript(session.id, "globalThis.__reconnectOld();", "reconnect-trigger.js");
+    defer discardEval(invoke);
+    try testing.expect(invoke.err == null);
+    try testing.expect(try pumpFor(&session, from, "reconnect-old", 40));
+    const event = session.got.items[from..];
+    const frame = try std.fmt.allocPrint(alloc, "\"scriptId\":\"{s}\"", .{original_id});
+    defer alloc.free(frame);
+    try testing.expect(std.mem.indexOf(u8, event, frame) != null);
+    const params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{original_id});
+    defer alloc.free(params);
+    const source = try pumpResponse(&session, try send(&session, "Debugger.getScriptSource", params, 1285), 1285);
+    try testing.expect(std.mem.indexOf(u8, source, "__reconnectOld") != null);
+}
+
 test "cdp governance: an old closure pause keeps its original same-url script identity" {
     if (comptime backend.active_backend != .quickjs_ng) return;
     const alloc = testing.allocator;
@@ -1292,19 +1496,19 @@ test "cdp governance: a cached C ABI closure keeps its script identity after a s
         try testing.expectEqual(@as(u64, 0), exception);
         try testing.expectEqual(run == 1, cache_hit);
     }
-    try testing.expect(try waitForScriptIds(&session, "\"url\":\"governance-cached-same-url.js\"", 1));
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"governance-cached-same-url.js\"", 2));
     var ids: [4]?[]const u8 = @splat(null);
-    try testing.expectEqual(@as(usize, 1), scriptIdsForUrl(session.got.items, "\"url\":\"governance-cached-same-url.js\"", &ids));
-    const cached_id = try alloc.dupe(u8, ids[0].?);
+    try testing.expectEqual(@as(usize, 2), scriptIdsForUrl(session.got.items, "\"url\":\"governance-cached-same-url.js\"", &ids));
+    const cached_id = try alloc.dupe(u8, ids[1].?);
     defer alloc.free(cached_id);
 
     const replacement = engine.evalScript(session.id, "globalThis.__governanceCachedReplacement = 3;", filename);
     defer discardEval(replacement);
     try testing.expect(replacement.err == null);
-    try testing.expect(try waitForScriptIds(&session, "\"url\":\"governance-cached-same-url.js\"", 2));
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"governance-cached-same-url.js\"", 3));
     ids = @splat(null);
-    try testing.expectEqual(@as(usize, 2), scriptIdsForUrl(session.got.items, "\"url\":\"governance-cached-same-url.js\"", &ids));
-    const replacement_id = try alloc.dupe(u8, ids[1].?);
+    try testing.expectEqual(@as(usize, 3), scriptIdsForUrl(session.got.items, "\"url\":\"governance-cached-same-url.js\"", &ids));
+    const replacement_id = try alloc.dupe(u8, ids[2].?);
     defer alloc.free(replacement_id);
 
     const source_params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{cached_id});
@@ -1316,11 +1520,12 @@ test "cdp governance: a cached C ABI closure keeps its script identity after a s
     const invoke_thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&invoke});
     const paused_from = session.got.items.len;
     const paused = try waitForFrame(&session, paused_from, "Debugger.paused", 80);
-    const paused_event = session.got.items[paused_from..];
+    try testing.expect(paused);
+    const paused_event = try alloc.dupe(u8, session.got.items[paused_from..]);
+    defer alloc.free(paused_event);
     const resume_at = try send(&session, "Debugger.resume", "", 1333);
     try testing.expect(try waitResponseNoTick(&session, resume_at, 1333));
     invoke_thread.join();
-    try testing.expect(paused);
     try testing.expect(invoke.ok);
 
     const cached_frame = try std.fmt.allocPrint(alloc, "\"scriptId\":\"{s}\"", .{cached_id});

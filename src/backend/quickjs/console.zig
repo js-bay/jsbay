@@ -127,6 +127,7 @@ fn publish(
                 .url = std.mem.span(@as([*:0]const u8, @ptrCast(&frame.filename))),
                 .line = if (frame.line > 0) frame.line - 1 else 0,
                 .column = if (frame.column > 0) frame.column - 1 else 0,
+                .script_tag = frame.script_tag,
             };
         }
         const arg_count: usize = if (argc > 0) @intCast(argc) else 0;

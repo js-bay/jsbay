@@ -182,7 +182,7 @@ test "native sync: inline, background, exception and timeout preserve owner resu
     var exception: u64 = 0;
     try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_bind_sync(id, .{ .data = "syncValue".ptr, .len = 9 }, &start, &probe, null, 80, &function, &exception));
     defer _ = c_api.jsbay_value_release(function);
-    try testing.expectEqual(@as(f64, 42), try evalNumber(id, "const wx={test:syncValue}; const x=wx.test(); Number(x)+1"));
+    try testing.expectEqual(@as(f64, 42), try evalNumber(id, "const jsbayHost={invoke:syncValue}; const x=jsbayHost.invoke(); Number(x)+1"));
     try testing.expectEqual(@as(c_int, 0), probe.completion_status.load(.seq_cst));
     try testing.expectEqual(@as(c_int, 5), probe.duplicate_status.load(.seq_cst));
 

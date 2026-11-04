@@ -1,6 +1,6 @@
-//! Contracts for the zero-debug collection path.
+//! Contracts for the Inspector source-collection and execution-debugging boundary.
 //!
-//! These assert externally meaningful debugger state after ordinary engine use, rather than timing a particular machine. The implementation must keep the collection machinery cold until a debugger session explicitly enables it.
+//! These assert externally meaningful debugger state after ordinary engine use, rather than timing a particular machine. Inspector startup collects compiler source while a Debugger session alone enables execution pauses.
 
 const std = @import("std");
 const testing = std.testing;
@@ -161,7 +161,7 @@ comptime {
 }
 
 const InspectorEnabledTests = if (@import("build_options").inspector) struct {
-    test "debug cold: NG started Inspector without a client still does not collect scripts or arm locations" {
+    test "debug cold: NG started Inspector collects sources without execution handlers" {
         if (comptime !backend.supportsDebugger(backend.active_backend)) return;
         if (comptime !@import("build_options").inspector) return;
 
@@ -169,15 +169,25 @@ const InspectorEnabledTests = if (@import("build_options").inspector) struct {
         try testing.expect(engine.create(id, .{}));
         defer engine.destroy(id);
         const handle = try inspector.start(id, .{});
-        defer inspector.stop(handle);
 
         const evaluated = engine.evalScript(id, "globalThis.coldServerContract = 1;", "cold-contract-no-client.js");
         defer helpers.freeEvalResult(evaluated);
         try testing.expect(evaluated.err == null);
 
-        // Listening is not equivalent to an attached DevTools debugger. Until a client enables Debugger, it must have neither a source history nor an active per-location interpreter callback.
-        try testing.expectEqual(@as(u32, 0), debugger_mod.scriptIdForUrl(id, "cold-contract-no-client.js"));
+        // Startup owns compiler collection, but execution callbacks remain cold until Debugger.enable.
+        try testing.expect(debugger_mod.scriptIdForUrl(id, "cold-contract-no-client.js") != 0);
         try testing.expectEqual(@as(u64, 0), debugger_mod.handlerInstallThreadId(id));
+
+        const debugger_statement = engine.evalScript(id, "debugger; globalThis.coldServerDebuggerStatement = 1;", "cold-contract-no-client-debugger.js");
+        defer helpers.freeEvalResult(debugger_statement);
+        try testing.expect(debugger_statement.err == null);
+        try testing.expectEqual(@as(u64, 0), debugger_mod.handlerInstallThreadId(id));
+
+        inspector.stop(handle);
+        const after_stop = engine.evalScript(id, "globalThis.coldServerAfterStop = 1;", "cold-contract-after-stop.js");
+        defer helpers.freeEvalResult(after_stop);
+        try testing.expect(after_stop.err == null);
+        try testing.expectEqual(@as(u32, 0), debugger_mod.scriptIdForUrl(id, "cold-contract-after-stop.js"));
     }
 
     test "debug cold: Inspector listener without Runtime.enable does not copy console stacks" {

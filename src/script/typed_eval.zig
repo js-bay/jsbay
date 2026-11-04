@@ -44,7 +44,7 @@ fn evaluateQuickJs(ctx: ActiveEngine.Context, source: []const u8, filename: []co
             defer gpa.free(bytes);
             const compiled = qjs.JS_ReadObject(ctx, bytes.ptr, bytes.len, 1);
             if (!c.jsIsException(compiled)) {
-                if (comptime backend.active_backend == .quickjs_ng and @import("build_options").inspector) {
+                if (comptime backend.supportsSourceJournal(backend.active_backend) and @import("build_options").inspector) {
                     _ = qjs.JS_RebindScriptTag(ctx, compiled, filename_z.ptr, source.ptr, source.len);
                 }
                 // JS_EvalFunction consumes compiled even when the script throws. A runtime exception is never a reason to execute source again.

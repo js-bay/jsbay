@@ -38,7 +38,7 @@ pub const JscInterruptState = extern struct {
     shutdown_phase: c_int = 0,
 };
 
-/// Trampoline for the execution-time-limit watchdog. The system JavaScriptCore build exercised here needs an explicit re-arm after a false return, despite the upstream header documenting that it should invoke the callback again.
+/// Trampoline for the execution-time-limit watchdog. Explicitly re-arm after a false return so the next interrupt check does not depend on framework-specific callback repetition.
 fn jscShouldTerminate(ctx: jsc.JSContextRef, context: ?*anyopaque) callconv(.c) bool {
     const state_ptr = context orelse return false;
     const state: *JscInterruptState = @ptrCast(@alignCast(state_ptr));
@@ -54,7 +54,7 @@ fn jscShouldTerminate(ctx: jsc.JSContextRef, context: ?*anyopaque) callconv(.c) 
     const budget_deadline = budget_ptr.load(.monotonic);
     const shutdown_deadline = shutdown_ptr.load(.monotonic);
     if ((deadline != 0 and now >= deadline) or (budget_deadline != 0 and now >= budget_deadline) or (shutdown_deadline != 0 and now >= shutdown_deadline)) return true;
-    // Keep the same interval as installation so an interrupt requested after this check can still stop the running script on affected system builds.
+    // Keep the installation interval so an interrupt requested after this check is observed by the next callback.
     const group = jsc.JSContextGetGroup(ctx);
     JSContextGroupSetExecutionTimeLimit(group, watchdog_period_seconds, jscShouldTerminate, context);
 

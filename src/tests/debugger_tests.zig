@@ -9,6 +9,7 @@ const engine = @import("../engine.zig");
 const instance_map = @import("../runtime/instance_map.zig");
 const io = @import("../platform/io.zig");
 const runtime_control = @import("../runtime/runtime_control.zig");
+const typed_eval = @import("../script/typed_eval.zig");
 const value = @import("../value/root.zig");
 const helpers = @import("test_helpers.zig");
 
@@ -49,7 +50,11 @@ fn reentrantScriptHook(instance_id: i32, info: debugger_mod.ScriptInfo) void {
     const state = active_reentrant_script_hook orelse return;
     if (instance_id != state.id) return;
     const call = state.calls.fetchAdd(1, .seq_cst);
-    if (call == 0) debugger_mod.noteScript(instance_id, "hook-reentrant-nested.js", "nested");
+    if (call == 0) {
+        const nested = engine.evalScript(instance_id, "2", "hook-reentrant-nested.js");
+        defer helpers.freeEvalResult(nested);
+        if (nested.err != null) state.valid.store(false, .seq_cst);
+    }
     // info is an owned publication copy and remains readable across the nested journal update above.
     if (info.url.len == 0 or info.source.len == 0) state.valid.store(false, .seq_cst);
     if (debugger_mod.scriptById(instance_id, info.id)) |copy| {
@@ -63,14 +68,7 @@ const ScriptJournalRace = struct {
     writer_done: std.atomic.Value(bool) = .init(false),
     reader_failed: std.atomic.Value(bool) = .init(false),
 
-    fn writer(self: *ScriptJournalRace) void {
-        for (0..1024) |index| {
-            var url: [48]u8 = undefined;
-            var source: [48]u8 = undefined;
-            const url_text = std.fmt.bufPrint(&url, "race-{d}.js", .{index}) catch continue;
-            const source_text = std.fmt.bufPrint(&source, "{d}", .{index}) catch continue;
-            debugger_mod.noteScript(self.id, url_text, source_text);
-        }
+    fn finish(self: *ScriptJournalRace) void {
         self.writer_done.store(true, .seq_cst);
     }
 
@@ -156,6 +154,80 @@ fn waitPaused(id: i32) bool {
 fn attachDebuggerForTest(id: i32) !void {
     const instance = instance_map.getInstance(id) orelse return error.MissingEngine;
     _ = debugger_mod.attach(id, @ptrCast(@constCast(instance.monoRuntime().?)));
+}
+
+test "debugger: classic stripped bytecode retains source identity for nested functions" {
+    if (comptime backend.active_backend != .quickjs or !@import("build_options").inspector) return error.SkipZigTest;
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+    try attachDebuggerForTest(id);
+    defer debugger_mod.detach(id);
+
+    const instance = instance_map.getInstance(id) orelse return error.MissingEngine;
+    const qjs = @import("../backend/quickjs/c_api.zig").qjs;
+    qjs.JS_SetStripInfo(instance.monoRuntime().?, qjs.JS_STRIP_DEBUG);
+    defer qjs.JS_SetStripInfo(instance.monoRuntime().?, 0);
+
+    const source =
+        \\function outer() { function inner() { return 42; } return inner(); }
+        \\outer();
+    ;
+    const result = engine.evalScript(id, source, "classic-stripped-source.js");
+    defer helpers.freeEvalResult(result);
+    try testing.expect(result.err == null);
+    try testing.expectEqualStrings("42", result.result.?);
+
+    const script_id = debugger_mod.scriptIdForUrl(id, "classic-stripped-source.js");
+    try testing.expect(script_id != 0);
+    const script = debugger_mod.scriptById(id, script_id) orelse return error.MissingScript;
+    defer debugger_mod.freeScriptInfo(script);
+    try testing.expectEqualStrings(source, script.source);
+}
+
+test "debugger: classic stripped bytecode rebinds cached nested functions" {
+    if (comptime backend.active_backend != .quickjs or !@import("build_options").inspector) return error.SkipZigTest;
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+    try attachDebuggerForTest(id);
+    defer debugger_mod.detach(id);
+
+    const instance = instance_map.getInstance(id) orelse return error.MissingEngine;
+    const qjs = @import("../backend/quickjs/c_api.zig").qjs;
+    qjs.JS_SetStripInfo(instance.monoRuntime().?, qjs.JS_STRIP_DEBUG);
+    defer qjs.JS_SetStripInfo(instance.monoRuntime().?, 0);
+
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.createDirPath(testing.io, "cache");
+    const directory = try temp.dir.realPathFileAlloc(testing.io, "cache", testing.allocator);
+    defer testing.allocator.free(directory);
+
+    const source =
+        \\function outer() { function inner() { return 42; } return inner(); }
+        \\outer();
+    ;
+    const lease = @import("../runtime/engine_thread.zig").beginEval(id);
+    defer engine.finishEvalEntry(id, lease);
+    try testing.expect(lease.allowed);
+    const ctx = engine.getContext(id) orelse return error.MissingContext;
+    for (0..2) |run| {
+        const result = typed_eval.evaluate(ctx, source, "classic-stripped-cache.js", directory, "v1");
+        try testing.expect(result.exception == null and !result.out_of_memory);
+        try testing.expectEqual(run == 1, result.cache_hit);
+        const output = result.value orelse return error.MissingResult;
+        defer backend.ActiveEngine.freeValue(ctx, output);
+        try testing.expectEqual(@as(f64, 42), backend.ActiveEngine.toFloat64(ctx, output).?);
+    }
+
+    const script_id = debugger_mod.scriptIdForUrl(id, "classic-stripped-cache.js");
+    try testing.expect(script_id != 0);
+    const script = debugger_mod.scriptById(id, script_id) orelse return error.MissingScript;
+    defer debugger_mod.freeScriptInfo(script);
+    try testing.expectEqualStrings(source, script.source);
 }
 
 const NativeFrameDebuggerToggle = struct {
@@ -514,7 +586,7 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
         }.run);
     }
 
-    test "debugger: script journal deduplicates exact sources and bounds dynamic sources" {
+    test "debugger: script journal keeps compiler identities and bounds dynamic sources" {
         if (comptime !backend.supportsDebugger(backend.active_backend)) return;
         const id = helpers.nextInstanceId();
         try helpers.withEngine(id, .{}, struct {
@@ -529,7 +601,7 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
                 }
                 const same = debugger_mod.snapshotScripts(instance_id);
                 defer debugger_mod.freeScriptSnapshot(same);
-                try testing.expectEqual(@as(usize, 1), same.len);
+                try testing.expectEqual(debugger_mod.max_retained_scripts, same.len);
                 const first_dynamic_id = same[0].id;
                 const held = debugger_mod.scriptById(instance_id, first_dynamic_id) orelse return error.MissingHeldScript;
                 defer debugger_mod.freeScriptInfo(held);
@@ -568,12 +640,18 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
         try helpers.withEngine(id, .{}, struct {
             fn run(instance_id: i32) !void {
                 try attachDebuggerForTest(instance_id);
-                debugger_mod.noteScript(instance_id, "old-source.js", "old");
+                const old = engine.evalScript(instance_id, "1", "old-source.js");
+                defer helpers.freeEvalResult(old);
+                try testing.expect(old.err == null);
                 const old_id = debugger_mod.scriptIdForUrl(instance_id, "old-source.js");
                 const oversized = try std.heap.c_allocator.alloc(u8, debugger_mod.max_retained_source_bytes + 1);
                 defer std.heap.c_allocator.free(oversized);
                 @memset(oversized, 'x');
-                debugger_mod.noteScript(instance_id, "oversized-source.js", oversized);
+                oversized[0] = '/';
+                oversized[1] = '/';
+                const newest = engine.evalScript(instance_id, oversized, "oversized-source.js");
+                defer helpers.freeEvalResult(newest);
+                try testing.expect(newest.err == null);
                 const scripts = debugger_mod.snapshotScripts(instance_id);
                 defer debugger_mod.freeScriptSnapshot(scripts);
                 try testing.expectEqual(@as(usize, 1), scripts.len);
@@ -592,9 +670,23 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
                 try attachDebuggerForTest(instance_id);
                 var race = ScriptJournalRace{ .id = instance_id };
                 const reader = try std.Thread.spawn(.{}, ScriptJournalRace.reader, .{&race});
-                const writer = try std.Thread.spawn(.{}, ScriptJournalRace.writer, .{&race});
-                writer.join();
+                var reader_joined = false;
+                defer if (!reader_joined) {
+                    race.finish();
+                    reader.join();
+                };
+                for (0..1024) |index| {
+                    const source = try std.fmt.allocPrint(std.heap.c_allocator, "{d}", .{index});
+                    defer std.heap.c_allocator.free(source);
+                    const filename = try std.fmt.allocPrint(std.heap.c_allocator, "race-{d}.js", .{index});
+                    defer std.heap.c_allocator.free(filename);
+                    const evaluated = engine.evalScript(instance_id, source, filename);
+                    defer helpers.freeEvalResult(evaluated);
+                    try testing.expect(evaluated.err == null);
+                }
+                race.finish();
                 reader.join();
+                reader_joined = true;
                 try testing.expect(!race.reader_failed.load(.seq_cst));
             }
         }.run);
@@ -613,7 +705,9 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
         try helpers.withEngine(id, .{}, struct {
             fn run(instance_id: i32) !void {
                 try attachDebuggerForTest(instance_id);
-                debugger_mod.noteScript(instance_id, "hook-reentrant.js", "outer");
+                const evaluated = engine.evalScript(instance_id, "1", "hook-reentrant.js");
+                defer helpers.freeEvalResult(evaluated);
+                try testing.expect(evaluated.err == null);
             }
         }.run);
         try testing.expectEqual(@as(usize, 2), state.calls.load(.seq_cst));

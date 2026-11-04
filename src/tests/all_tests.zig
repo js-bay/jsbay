@@ -15,6 +15,7 @@ comptime {
     _ = @import("shutdown_race_tests.zig");
     // Engine-thread completion, C ABI host callbacks, and pointer+length eval.
     _ = @import("engine_thread_tests.zig");
+    _ = @import("execution_cpu_runtime_tests.zig");
     _ = @import("internal_thread_safety_tests.zig");
     _ = @import("debugger_tests.zig");
     if (build_options.inspector_transport) {

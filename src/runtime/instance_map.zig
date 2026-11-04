@@ -81,6 +81,7 @@ pub const EngineInstance = struct {
     /// Changes on every successful publication, including when an id is reused. Asynchronous producers must capture this with `dispatch.captureInstanceToken` before starting work and use it when posting the result.
     generation: u64 = 0,
     resources: *@import("resource_limits.zig").Budget,
+    execution_cpu: ?*@import("execution_cpu.zig").Ledger = null,
     engine_handles: EngineHandles,
     loop: *event_loop.Driver,
     timers: timers.TimerRegistry,

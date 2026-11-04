@@ -265,7 +265,7 @@ test "reader-thread configuration is cold again after its session disconnects" {
     defer if (result.err) |value| if (result.err_is_heap) std.heap.c_allocator.free(value);
     try testing.expect(result.err == null);
     try testing.expectEqual(@as(u64, 0), debugger_mod.handlerInstallThreadId(session.id));
-    try testing.expectEqual(@as(u32, 0), debugger_mod.scriptIdForUrl(session.id, "debugger-reader-after-disconnect.js"));
+    try testing.expect(debugger_mod.scriptIdForUrl(session.id, "debugger-reader-after-disconnect.js") != 0);
 }
 
 test "exception mode beside first enable pauses after owner admission" {

@@ -54,7 +54,7 @@ pub fn Module(comptime Host: type) type {
             debugger_session_mutex.lock();
             defer debugger_session_mutex.unlock();
             if (state_mod.isClosing(state) or !state_mod.hasSession(state, session_id)) return .session_unavailable;
-            // Classic QuickJS and JSC have always acknowledged Debugger.enable while exposing no bytecode hooks. Preserve that protocol contract; only the NG hook backend needs a successful native attach before enabling.
+            // Compiler collection is owned by Inspector startup. Only execution debugging requires an owner-side attach before acknowledging enable.
             if (comptime backend.supportsDebugger(backend.active_backend)) {
                 if (!debugger_mod.attach(state.instance_id, runtime orelse return .attach_failed)) return .attach_failed;
             }
@@ -65,7 +65,7 @@ pub fn Module(comptime Host: type) type {
         }
 
         fn prepareDebuggerConfiguration(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) bool {
-            if (comptime backend.supportsDebugger(backend.active_backend)) {
+            if (comptime backend.supportsSourceJournal(backend.active_backend)) {
                 if (!debugger_mod.prepare(state.instance_id)) {
                     json_writer.sendError(state, session_id, request_id, -32000, "Unable to prepare debugger configuration");
                     return false;
@@ -92,6 +92,7 @@ pub fn Module(comptime Host: type) type {
             const has_debugger_session = state_mod.hasEnabledDebuggerSession(state);
             debugger_mod.setDebuggerStatements(state.instance_id, has_debugger_session);
             if (!has_debugger_session) {
+                debugger_mod.deactivateExecution(state.instance_id);
                 debugger_mod.resumeExecution(state.instance_id);
             }
             if (removal.removed) {
@@ -104,6 +105,7 @@ pub fn Module(comptime Host: type) type {
             debugger_session_mutex.lock();
             defer debugger_session_mutex.unlock();
             debugger_mod.setDebuggerStatements(state.instance_id, false);
+            debugger_mod.deactivateExecution(state.instance_id);
             debugger_mod.resumeExecution(state.instance_id);
             // Inspector finalization also clears the backend state directly. Marking this here makes an already-running owner tick cool a stopped listener even when a transport callback raced with shutdown.
             state.mutex.lock();
@@ -130,7 +132,9 @@ pub fn Module(comptime Host: type) type {
         fn reconcilePendingAsyncDepthForState(state: *InspectorState) void {
             const pending = state_mod.takePendingAsyncStackDepth(state) orelse return;
             // Re-read sessions on the owner. A late static task for an old state can only cool its own instance, and never detaches an active debugger.
-            if (pending.debugger_cooldown and !state_mod.hasEnabledDebuggerSession(state)) debugger_mod.coolDown(state.instance_id);
+            if (comptime backend.supportsDebugger(backend.active_backend)) {
+                if (pending.debugger_cooldown and !state_mod.hasEnabledDebuggerSession(state)) debugger_mod.coolDown(state.instance_id);
+            }
             const instance = instance_map.getInstance(state.instance_id) orelse return;
             setAsyncStackDepthOnOwner(state.instance_id, instance.monoRuntime().?, pending.depth);
         }
@@ -150,8 +154,9 @@ pub fn Module(comptime Host: type) type {
             root: std.json.Value,
         ) bool {
             debugger_mod.setHooks(onPause, onScript);
+            debugger_mod.setBreakLocationsHook(onBreakLocations);
             if (comptime !backend.supportsDebugger(backend.active_backend)) {
-                if (requiresDebuggerHooks(method)) {
+                if (requiresExecutionDebuggerHooks(method)) {
                     json_writer.sendError(state, session_id, request_id, -32000, "Debugger command is unavailable for this backend");
                     return true;
                 }
@@ -581,7 +586,9 @@ pub fn Module(comptime Host: type) type {
                 setDebuggerSession(task.state, task.session_id, false);
                 _ = state_mod.clearSessionAsyncStackDepth(task.state, task.session_id);
                 reconcilePendingAsyncDepthForState(task.state);
-                if (!state_mod.hasEnabledDebuggerSession(task.state)) debugger_mod.coolDown(task.state.instance_id);
+                if (comptime backend.supportsDebugger(backend.active_backend)) {
+                    if (!state_mod.hasEnabledDebuggerSession(task.state)) debugger_mod.coolDown(task.state.instance_id);
+                }
                 json_writer.sendEmptyResult(task.state, task.session_id, task.request_id);
             }
 
@@ -603,12 +610,11 @@ pub fn Module(comptime Host: type) type {
             }
         }
 
-        fn requiresDebuggerHooks(method: []const u8) bool {
+        fn requiresExecutionDebuggerHooks(method: []const u8) bool {
             const methods = [_][]const u8{
                 "Debugger.setBreakpointByUrl",
                 "Debugger.removeBreakpoint",
                 "Debugger.getPossibleBreakpoints",
-                "Debugger.getScriptSource",
                 "Debugger.resume",
                 "Debugger.stepInto",
                 "Debugger.stepOver",
@@ -772,6 +778,31 @@ pub fn Module(comptime Host: type) type {
                 );
             }
             const hits = debugger_mod.breakpointsOnScript(instance_id, info.id);
+            defer std.heap.c_allocator.free(hits);
+            for (sessions.items) |session_id| {
+                for (hits) |hit| {
+                    json_writer.sendBreakpointResolved(
+                        state,
+                        session_id,
+                        hit.breakpoint_id,
+                        hit.script_id,
+                        hit.line,
+                        hit.column,
+                    );
+                }
+            }
+        }
+
+        fn onBreakLocations(instance_id: i32, script_id: u32) void {
+            const state = state_mod.acquireStateLeaseByInstance(instance_id) orelse return;
+            defer state_mod.releaseStateLease(state);
+            var owner_frame: dispatch.TaskOwnerFrame = undefined;
+            dispatch.enterTaskOwnerFrame(&owner_frame, instance_id, state);
+            defer dispatch.leaveTaskOwnerFrame(&owner_frame);
+            var sessions: std.ArrayList(transport_mod.SessionId) = .empty;
+            defer sessions.deinit(state.allocator);
+            state_mod.snapshotDebuggerSessions(state, &sessions);
+            const hits = debugger_mod.breakpointsOnScript(instance_id, script_id);
             defer std.heap.c_allocator.free(hits);
             for (sessions.items) |session_id| {
                 for (hits) |hit| {

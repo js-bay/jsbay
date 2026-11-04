@@ -167,7 +167,12 @@ pub fn Module(comptime Host: type) type {
             }
             if (std.mem.eql(u8, method, "HeapProfiler.takeHeapSnapshot")) {
                 const heap = @import("heap.zig").Module(Host);
-                heap.scheduleSnapshot(state, session_id, id);
+                heap.scheduleSnapshot(state, session_id, id, req.parsed.value);
+                return;
+            }
+            if (std.mem.eql(u8, method, "HeapProfiler.collectGarbage")) {
+                const heap = @import("heap.zig").Module(Host);
+                heap.scheduleCollection(state, session_id, id);
                 return;
             }
             if (std.mem.startsWith(u8, method, "Performance.")) {
@@ -193,24 +198,21 @@ pub fn Module(comptime Host: type) type {
         }
 
         fn sendSchemaDomains(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) void {
+            const protocol_domains = @import("protocol-domains.zig");
             const domains = switch (backend.active_backend) {
-                .quickjs_ng => if (build_options.heap_snapshot)
-                    \\[{"name":"Runtime","version":"1.3"},{"name":"Debugger","version":"1.3"},{"name":"Profiler","version":"1.3"},{"name":"HeapProfiler","version":"1.3"},{"name":"Performance","version":"1.3"},{"name":"Schema","version":"1.3"}]
-                else
-                    \\[{"name":"Runtime","version":"1.3"},{"name":"Debugger","version":"1.3"},{"name":"Profiler","version":"1.3"},{"name":"Performance","version":"1.3"},{"name":"Schema","version":"1.3"}]
-                ,
-                .quickjs => if (build_options.heap_snapshot)
-                    \\[{"name":"Runtime","version":"1.3"},{"name":"Profiler","version":"1.3"},{"name":"HeapProfiler","version":"1.3"},{"name":"Performance","version":"1.3"},{"name":"Schema","version":"1.3"}]
-                else
-                    \\[{"name":"Runtime","version":"1.3"},{"name":"Profiler","version":"1.3"},{"name":"Performance","version":"1.3"},{"name":"Schema","version":"1.3"}]
-                ,
-                .jsc =>
-                \\[{"name":"Runtime","version":"1.3"},{"name":"Performance","version":"1.3"},{"name":"Schema","version":"1.3"}]
-                ,
+                .quickjs_ng => if (build_options.heap_snapshot) &protocol_domains.quickjs_ng else &protocol_domains.quickjs_ng_no_heap,
+                .quickjs => if (build_options.heap_snapshot) &protocol_domains.quickjs else &protocol_domains.quickjs_no_heap,
+                .jsc => &protocol_domains.jsc,
             };
-            var buffer: [512]u8 = undefined;
-            const response = std.fmt.bufPrint(&buffer, "{{\"id\":{d},\"result\":{{\"domains\":{s}}}}}", .{ request_id, domains }) catch return;
-            json_writer.sendJson(state, session_id, response);
+            var out: std.Io.Writer.Allocating = .init(state.allocator);
+            defer out.deinit();
+            out.writer.print("{{\"id\":{d},\"result\":{{\"domains\":[", .{request_id}) catch return;
+            for (domains, 0..) |domain, index| {
+                if (index != 0) out.writer.writeByte(',') catch return;
+                out.writer.print("{{\"name\":\"{s}\",\"version\":\"{s}\"}}", .{ domain.name, domain.version }) catch return;
+            }
+            out.writer.writeAll("]}}") catch return;
+            json_writer.sendJson(state, session_id, out.written());
         }
 
         fn isNoOpMethod(method: []const u8) bool {

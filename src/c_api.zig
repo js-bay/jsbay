@@ -337,6 +337,7 @@ test "c_api: forced packed_alt typed value (Linux primary-tag)" {
     };
     instance.* = .{
         .resources = resources,
+        .execution_cpu = null,
         .instance_id = id,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
         .loop = loop,
@@ -414,6 +415,7 @@ test "c_api: forced packed_alt set/call/construct/new_* (Linux primary-tag proof
     };
     instance.* = .{
         .resources = resources,
+        .execution_cpu = null,
         .instance_id = id,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
         .loop = loop,
@@ -589,6 +591,7 @@ test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/ne
     };
     instance.* = .{
         .resources = resources,
+        .execution_cpu = null,
         .instance_id = id,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
         .loop = loop,
@@ -766,6 +769,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
     };
     instance.* = .{
         .resources = resources,
+        .execution_cpu = null,
         .instance_id = id,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
         .loop = loop,
@@ -924,6 +928,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
     };
     instance2.* = .{
         .resources = resources2,
+        .execution_cpu = null,
         .instance_id = id2,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles2.runtime_addr, .ctx_addr = handles2.ctx_addr } },
         .loop = loop2,
@@ -2874,6 +2879,35 @@ pub export fn jsbay_engine_evaluate(instance_id_raw: c_int, source_arg: Utf8, fi
     maybeFireMemoryLimit(id, API_OUT_OF_MEMORY);
     return API_OUT_OF_MEMORY;
 }
+test "c_api: inspector startup preserves backend source collection policy" {
+    const testing = std.testing;
+    const debugger = @import("inspector/debugger.zig");
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try testing.expect(jsbay_engine_create(id, null, null));
+    defer jsbay_engine_destroy(id);
+    if (comptime !@import("build_options").inspector or !backend.supportsSourceJournal(backend.active_backend)) return error.SkipZigTest;
+    var port: u16 = 0;
+    try testing.expect(jsbay_engine_inspector_start(id, 0, &port));
+    defer jsbay_engine_inspector_stop(id);
+    try testing.expect(port != 0);
+    const source = "globalThis.inspectorStartSource = 1;";
+    const filename = "inspector-start-source.js";
+    var value: u64 = 0;
+    var exception: u64 = 0;
+    try testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception));
+    defer _ = jsbay_value_release(value);
+    try testing.expectEqual(@as(u64, 0), exception);
+    const script_id = debugger.scriptIdForUrl(id, filename);
+    if (comptime backend.supportsDebugger(backend.active_backend)) {
+        try testing.expect(script_id != 0);
+        try testing.expectEqual(@as(u64, 0), debugger.handlerInstallThreadId(id));
+    }
+    try testing.expect(script_id != 0);
+    const script = debugger.scriptById(id, script_id) orelse return error.MissingDebuggerSource;
+    defer debugger.freeScriptInfo(script);
+    try testing.expectEqualStrings(source, script.source);
+}
+
 test "c_api: evaluation and cache preserve inspector source contract" {
     const testing = std.testing;
     const debugger = @import("inspector/debugger.zig");
@@ -2884,7 +2918,7 @@ test "c_api: evaluation and cache preserve inspector source contract" {
     const instance = instance_map.getInstance(id) orelse return error.MissingEngine;
     const inspector_enabled = @import("build_options").inspector;
     if (comptime inspector_enabled) {
-        if (comptime !backend.supportsDebugger(backend.active_backend)) return error.SkipZigTest;
+        if (comptime !backend.supportsSourceJournal(backend.active_backend)) return error.SkipZigTest;
         try testing.expect(debugger.attach(id, @ptrCast(@constCast(instance.monoRuntime().?))));
     } else {
         try testing.expect(!debugger.attach(id, @ptrCast(@constCast(instance.monoRuntime().?))));
