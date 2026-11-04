@@ -98,8 +98,7 @@ test "runtime_control: memory limit is enforced by QuickJS and rejected by JSC" 
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
             if (backend.isJscApiBackend(backend.active_backend) or backend.isSpikeBackend(backend.active_backend)) {
-                // JSC/Escargot/Hermes: no runtime-enforced per-instance heap cap. Returning false
-                // prevents hosts from assuming an unenforced limit protects an untrusted script.
+                // JSC/Escargot/Hermes: no runtime-enforced per-instance heap cap. Returning false prevents hosts from assuming an unenforced limit protects an untrusted script.
                 try testing.expect(!rc.setMemoryLimit(id, 1));
                 return;
             }

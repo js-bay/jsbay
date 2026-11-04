@@ -1507,11 +1507,12 @@ extern "C" void escargot_throw_value(EscargotContext *c, EscargotValue exception
         escargot_free_value(c, c->pending_throw_value);
         c->pending_throw_value = nullptr;
     }
-    // Caller transferred ownership of the handle.
-    c->pending_throw_value = exception;
-    if (!exception) {
-        c->pending_throw = "Error";
-        c->pending_throw_set = true;
+    if (exception) {
+        // Caller transferred ownership of the handle.
+        c->pending_throw_value = exception;
+    } else {
+        // Null handle is the undefined sentinel (ActiveEngine.undefinedValue); preserve JS undefined, do not invent an Error string.
+        c->pending_throw_value = retain(c, ValueRef::createUndefined());
     }
 }
 

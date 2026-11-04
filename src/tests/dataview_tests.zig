@@ -332,8 +332,7 @@ test "dataview: detached and ordinary values leave the context usable" {
 
 test "dataview: length-tracking resizable buffer follows shrink and grow" {
     if (comptime backend.isJscApiBackend(backend.active_backend)) return;
-    // Spikes: Hermes has no ArrayBuffer.resize; Escargot resizes but Public ArrayBufferView
-    // zeros OOB length-tracking views (cannot match QuickJS dataViewInfo→null).
+    // Spikes: Hermes has no ArrayBuffer.resize; Escargot resizes but Public ArrayBufferView zeros OOB length-tracking views (cannot match QuickJS dataViewInfo→null).
     if (comptime backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
 
     reset();
