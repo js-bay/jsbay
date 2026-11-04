@@ -79,8 +79,10 @@ test "c_api: library_backend and capabilities match compile-time backend" {
     try std.testing.expectEqual(backend.libraryCapabilityFlags(), caps.flags);
 
     const F = CapabilityFlags;
-    // Interrupt/deadline exist for QJS/JSC; spike backends report bit-only / create-time limits.
-    if (!backend.isSpikeBackend(backend.active_backend)) {
+    // Interrupt/deadline exist for QJS/JSC mid-script cancel; Escargot/Hermes refuse requestInterrupt so the bit stays clear.
+    if (backend.isSpikeBackend(backend.active_backend)) {
+        try std.testing.expect((caps.flags & F.interrupt_deadline) == 0);
+    } else {
         try std.testing.expect((caps.flags & F.interrupt_deadline) != 0);
     }
     if (backend.isQuickJsApiBackend(backend.active_backend)) {

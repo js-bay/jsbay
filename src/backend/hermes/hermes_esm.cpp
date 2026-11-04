@@ -1941,6 +1941,25 @@ static bool skipStringTemplateOrComment(const std::string &src, size_t &i) {
     return false;
 }
 
+
+// Skip whitespace / line+block comments (not strings — string keys stay visible to the binding scanner).
+static void skipWsAndComments(const std::string &src, size_t &i) {
+    while (i < src.size()) {
+        if (std::isspace(static_cast<unsigned char>(src[i]))) { ++i; continue; }
+        if (src[i] == '/' && skipStringTemplateOrComment(src, i)) continue;
+        break;
+    }
+}
+
+// Skip whitespace / commas / comments between binding-pattern elements.
+static void skipPatternSeparators(const std::string &src, size_t &i) {
+    while (i < src.size()) {
+        if (std::isspace(static_cast<unsigned char>(src[i])) || src[i] == ',') { ++i; continue; }
+        if (src[i] == '/' && skipStringTemplateOrComment(src, i)) continue;
+        break;
+    }
+}
+
 // `i` at `[`; on success leaves `i` past matching `]`, sets expr_start/expr_end to the interior.
 static bool takeBalancedBracketExpr(const std::string &src, size_t &i, size_t &expr_start, size_t &expr_end) {
     if (i >= src.size() || src[i] != '[') return false;
@@ -1972,19 +1991,19 @@ static char prevSignificantChar(const std::string &src, size_t pos) {
     return 0;
 }
 
-// Collect bound names from a binding pattern (`ident`, `{a, b: c}`, `[x, ...y]`).
+// Collect bound names from a binding pattern (`ident`, `{a, b: c}`, `[x, ...y]`); skip comment trivia so comment identifiers are not treated as extra bindings.
 static void collectPatternBoundNames(const std::string &src, size_t &i, std::vector<std::string> &names) {
-    while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+    skipWsAndComments(src, i);
     if (i >= src.size()) return;
     if (src[i] == '{') {
         ++i;
         while (i < src.size()) {
-            while (i < src.size() && (std::isspace(static_cast<unsigned char>(src[i])) || src[i] == ',')) ++i;
+            skipPatternSeparators(src, i);
             if (i >= src.size()) return;
             if (src[i] == '}') { ++i; return; }
             if (src[i] == '.' && i + 2 < src.size() && src[i + 1] == '.' && src[i + 2] == '.') {
                 i += 3;
-                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                skipWsAndComments(src, i);
                 size_t j = i;
                 while (j < src.size() && isIdent(src[j])) ++j;
                 if (j > i) names.push_back(src.substr(i, j - i));
@@ -1997,26 +2016,17 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
                 size_t es = 0, ee = 0;
                 if (!takeBalancedBracketExpr(src, i, es, ee)) return;
                 (void)es; (void)ee;
-                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                skipWsAndComments(src, i);
                 if (i < src.size() && src[i] == ':') {
                     ++i;
                     collectPatternBoundNames(src, i, names);
-                    while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                    skipWsAndComments(src, i);
                     if (i < src.size() && src[i] == '=') {
                         ++i;
                         int depth = 0;
                         while (i < src.size()) {
+                            if (skipStringTemplateOrComment(src, i)) continue;
                             char ch = src[i];
-                            if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                            if (ch == '\'' || ch == '"' || ch == '`') {
-                                char q = ch; ++i;
-                                while (i < src.size()) {
-                                    if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                                    if (src[i] == q) { ++i; break; }
-                                    ++i;
-                                }
-                                continue;
-                            }
                             if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
                             if (ch == '}' || ch == ']' || ch == ')') {
                                 if (depth == 0) break;
@@ -2031,22 +2041,13 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
                 // Nested array pattern (not a computed key).
                 i = save;
                 collectPatternBoundNames(src, i, names);
-                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                skipWsAndComments(src, i);
                 if (i < src.size() && src[i] == '=') {
                     ++i;
                     int depth = 0;
                     while (i < src.size()) {
+                        if (skipStringTemplateOrComment(src, i)) continue;
                         char ch = src[i];
-                        if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                        if (ch == '\'' || ch == '"' || ch == '`') {
-                            char q = ch; ++i;
-                            while (i < src.size()) {
-                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                                if (src[i] == q) { ++i; break; }
-                                ++i;
-                            }
-                            continue;
-                        }
                         if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
                         if (ch == '}' || ch == ']' || ch == ')') {
                             if (depth == 0) break;
@@ -2060,22 +2061,13 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
             }
             if (src[i] == '{') {
                 collectPatternBoundNames(src, i, names);
-                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                skipWsAndComments(src, i);
                 if (i < src.size() && src[i] == '=') {
                     ++i;
                     int depth = 0;
                     while (i < src.size()) {
+                        if (skipStringTemplateOrComment(src, i)) continue;
                         char ch = src[i];
-                        if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                        if (ch == '\'' || ch == '"' || ch == '`') {
-                            char q = ch; ++i;
-                            while (i < src.size()) {
-                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                                if (src[i] == q) { ++i; break; }
-                                ++i;
-                            }
-                            continue;
-                        }
                         if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
                         if (ch == '}' || ch == ']' || ch == ')') {
                             if (depth == 0) break;
@@ -2092,27 +2084,18 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
             while (j < src.size() && isIdent(src[j])) ++j;
             std::string first = src.substr(i, j - i);
             i = j;
-            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            skipWsAndComments(src, i);
             if (i < src.size() && src[i] == ':') {
                 ++i;
                 collectPatternBoundNames(src, i, names);
                 // Renamed binding may carry a default (`{x: y = value}`); skip it like shorthand/computed-key branches so initializer idents are not collected as locals.
-                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                skipWsAndComments(src, i);
                 if (i < src.size() && src[i] == '=') {
                     ++i;
                     int depth = 0;
                     while (i < src.size()) {
+                        if (skipStringTemplateOrComment(src, i)) continue;
                         char ch = src[i];
-                        if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                        if (ch == '\'' || ch == '"' || ch == '`') {
-                            char q = ch; ++i;
-                            while (i < src.size()) {
-                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                                if (src[i] == q) { ++i; break; }
-                                ++i;
-                            }
-                            continue;
-                        }
                         if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
                         if (ch == '}' || ch == ']' || ch == ')') {
                             if (depth == 0) break;
@@ -2128,17 +2111,8 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
                     ++i;
                     int depth = 0;
                     while (i < src.size()) {
+                        if (skipStringTemplateOrComment(src, i)) continue;
                         char ch = src[i];
-                        if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                        if (ch == '\'' || ch == '"' || ch == '`') {
-                            char q = ch; ++i;
-                            while (i < src.size()) {
-                                if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                                if (src[i] == q) { ++i; break; }
-                                ++i;
-                            }
-                            continue;
-                        }
                         if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
                         if (ch == '}' || ch == ']' || ch == ')') {
                             if (depth == 0) break;
@@ -2155,12 +2129,12 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
     if (src[i] == '[') {
         ++i;
         while (i < src.size()) {
-            while (i < src.size() && (std::isspace(static_cast<unsigned char>(src[i])) || src[i] == ',')) ++i;
+            skipPatternSeparators(src, i);
             if (i >= src.size()) return;
             if (src[i] == ']') { ++i; return; }
             if (src[i] == '.' && i + 2 < src.size() && src[i + 1] == '.' && src[i + 2] == '.') {
                 i += 3;
-                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                skipWsAndComments(src, i);
                 size_t j = i;
                 while (j < src.size() && isIdent(src[j])) ++j;
                 if (j > i) names.push_back(src.substr(i, j - i));
@@ -2168,22 +2142,13 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
                 continue;
             }
             collectPatternBoundNames(src, i, names);
-            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            skipWsAndComments(src, i);
             if (i < src.size() && src[i] == '=') {
                 ++i;
                 int depth = 0;
                 while (i < src.size()) {
+                    if (skipStringTemplateOrComment(src, i)) continue;
                     char ch = src[i];
-                    if (ch == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                    if (ch == '\'' || ch == '"' || ch == '`') {
-                        char q = ch; ++i;
-                        while (i < src.size()) {
-                            if (src[i] == '\\' && i + 1 < src.size()) { i += 2; continue; }
-                            if (src[i] == q) { ++i; break; }
-                            ++i;
-                        }
-                        continue;
-                    }
                     if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
                     if (ch == '}' || ch == ']' || ch == ')') {
                         if (depth == 0) break;
@@ -2208,10 +2173,10 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
     std::vector<std::string> names;
     size_t i = start;
     while (i < src.size()) {
-        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        skipWsAndComments(src, i);
         if (i >= src.size() || src[i] == ';') break;
         collectPatternBoundNames(src, i, names);
-        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        skipWsAndComments(src, i);
         if (i < src.size() && src[i] == '=') {
             ++i;
             int depth = 0;
@@ -2251,7 +2216,7 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
                 ++i;
             }
         }
-        while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        skipWsAndComments(src, i);
         if (i < src.size() && src[i] == ',') { ++i; continue; }
         break;
     }

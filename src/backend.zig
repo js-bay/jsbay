@@ -141,9 +141,10 @@ pub const CapabilityFlags = struct {
 /// Derive capability flags from existing backend predicates / branches — not a parallel myth table.
 pub fn libraryCapabilityFlags() u32 {
     var flags: u32 = 0;
-    // Interrupt + execution deadline: QJS JS_SetInterruptHandler; JSC private time-limit path.
-    // Spike backends expose requestInterrupt with documented reliability limits.
-    flags |= CapabilityFlags.interrupt_deadline;
+    // Interrupt + execution deadline only when mid-script requestInterrupt is real (QJS interrupt handler / JSC time-limit). Escargot/Hermes refuse requestInterrupt — clear CAP_INTERRUPT_DEADLINE so capability discovery matches runtime_control.supportsMidScriptUserInterrupt.
+    if (!isSpikeBackend(active_backend)) {
+        flags |= CapabilityFlags.interrupt_deadline;
+    }
     if (isQuickJsApiBackend(active_backend)) {
         // setMemoryLimit returns false on JSC; QJS fills MemoryUsage, JSC zeros.
         flags |= CapabilityFlags.heap_stack_limit;

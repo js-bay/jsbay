@@ -53,8 +53,9 @@ struct JsbayHermesContextOpaque {
     // Promise state side-table for Deferreds we create (JS object identity, not Value* wrapper).
     std::mutex promise_mu;
     std::unordered_map<uint64_t, std::pair<int, jsi::Value *>> promise_state; // state, result retained ptr
-    // Captured at context_new before user code can replace page Object.keys / DataView.
+    // Captured at context_new before user code can replace page Object.keys / Object.defineProperty / DataView.
     std::unique_ptr<jsi::Function> pristine_object_keys;
+    std::unique_ptr<jsi::Function> pristine_object_define_property;
     std::unique_ptr<jsi::Object> pristine_dataview_proto;
     // Pristine DataView.prototype getters (captured once; ignore mutated prototype accessors).
     std::unique_ptr<jsi::Function> pristine_dv_buffer_get;
@@ -357,12 +358,14 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
     } catch (...) {
     }
     try {
-        auto keys = c->rt->global()
-            .getPropertyAsFunction(*c->rt, "Object")
-            .getPropertyAsFunction(*c->rt, "keys");
+        auto Object = c->rt->global().getPropertyAsFunction(*c->rt, "Object");
+        auto keys = Object.getPropertyAsFunction(*c->rt, "keys");
         c->pristine_object_keys = std::make_unique<jsi::Function>(std::move(keys));
+        auto defineProp = Object.getPropertyAsFunction(*c->rt, "defineProperty");
+        c->pristine_object_define_property = std::make_unique<jsi::Function>(std::move(defineProp));
     } catch (...) {
         c->pristine_object_keys.reset();
+        c->pristine_object_define_property.reset();
     }
     try {
         auto proto = c->rt->global()
@@ -1129,14 +1132,13 @@ extern "C" bool hermes_define_data_property(JsbayHermesContext *c, HermesValue o
     if (!c || !c->rt || !obj || !key || !asVal(obj)->isObject()) return false;
     try {
         auto &rt = *c->rt;
-        auto Object = rt.global().getPropertyAsFunction(rt, "Object");
-        auto defineProp = Object.getPropertyAsFunction(rt, "defineProperty");
+        if (!c->pristine_object_define_property) return false;
         jsi::Object desc(rt);
         desc.setProperty(rt, "value", val ? jsi::Value(rt, *asVal(val)) : jsi::Value::undefined());
         desc.setProperty(rt, "writable", writable);
         desc.setProperty(rt, "enumerable", true);
         desc.setProperty(rt, "configurable", true);
-        defineProp.call(rt, *asVal(obj), key, desc);
+        c->pristine_object_define_property->call(rt, *asVal(obj), key, desc);
         return true;
     } catch (...) { return false; }
 }
@@ -2166,14 +2168,11 @@ extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj
             ? asVal(obj)->getObject(rt)
             : rt.global().getPropertyAsFunction(rt, "Object").call(rt, *asVal(obj)).asObject(rt);
 
-        if (!c->pristine_object_keys) {
-            return hopFail(c, makeTypeError(rt, "Object.keys unavailable"));
+        if (!c->pristine_object_keys || !c->pristine_object_define_property) {
+            return hopFail(c, makeTypeError(rt, "Object.keys/defineProperty unavailable"));
         }
 
-        auto Object = rt.global().getPropertyAsFunction(rt, "Object");
-        auto defineProp = Object.getPropertyAsFunction(rt, "defineProperty");
-
-        // Enumerate without mutating Array.prototype — Proxy ownKeys traps must observe unmodified global state, and trap mutations must not be overwritten by restore.
+        // Enumerate without mutating Array.prototype — Proxy ownKeys traps must observe unmodified global state, and trap mutations must not be overwritten by restore. Rebuild via captured pristine defineProperty so page-replaced Object.defineProperty cannot punch holes in the result.
         jsi::Value keysVal = c->pristine_object_keys->call(rt, target);
         if (!keysVal.isObject()) return hopOk(c, jsi::Value(jsi::Array(rt, 0)));
         jsi::Array names = keysVal.getObject(rt).asArray(rt);
@@ -2187,7 +2186,7 @@ extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj
             desc.setProperty(rt, "writable", true);
             desc.setProperty(rt, "enumerable", true);
             desc.setProperty(rt, "configurable", true);
-            defineProp.call(rt, result, (double)i, desc);
+            c->pristine_object_define_property->call(rt, result, (double)i, desc);
         }
         result.setProperty(rt, "length", (double)n);
         return hopOk(c, jsi::Value(std::move(result)));
