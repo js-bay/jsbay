@@ -400,6 +400,28 @@ static void skipRegexLiteral(const std::string &src, size_t &i) {
     }
 }
 
+// Advance past leading whitespace and // or /* */ comments so anchored import collectors can see a declaration after a file header comment.
+static size_t skipLeadingTrivia(const std::string &src, size_t i = 0) {
+    while (i < src.size()) {
+        unsigned char c = static_cast<unsigned char>(src[i]);
+        if (std::isspace(c)) { ++i; continue; }
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') {
+            i += 2;
+            while (i < src.size() && src[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+            if (i + 1 < src.size()) i += 2;
+            else i = src.size();
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
 // Blank `/pattern/flags` interiors in-place (keep delimiters/flags length); used by blankNonCode.
 static void blankRegexLiteral(std::string &out, size_t &i) {
     ++i; // keep opening /
@@ -528,6 +550,7 @@ static std::string rewriteIdents(const std::string &src,
                 char ch = src[i];
                 if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') { skipLineComment(); continue; }
                 if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
+                if (ch == '/' && canStartRegexLiteral(src.substr(0, i))) { skipRegexLiteral(src, i); continue; }
                 if (ch == '\'' || ch == '"') { char q = ch; skipQuoted(q); continue; }
                 if (ch == '`') { skipTemplate(); continue; }
                 if (ch == open_ch) { ++d; ++i; continue; }
@@ -573,6 +596,7 @@ static std::string rewriteIdents(const std::string &src,
             char c = src[i];
             if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') { skipLineComment(); continue; }
             if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
+            if (c == '/' && canStartRegexLiteral(src.substr(0, i))) { skipRegexLiteral(src, i); continue; }
             if (c == '\'' || c == '"') { skipQuoted(c); continue; }
             if (c == '`') { skipTemplate(); continue; }
             // Arrow body `{...}` is its own function environment — do not harvest its `var` into the enclosing function.
@@ -681,6 +705,7 @@ static std::string rewriteIdents(const std::string &src,
                 char ch = src[i];
                 if (ch == '/' && i + 1 < src.size() && src[i + 1] == '/') { skipLineComment(); continue; }
                 if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
+                if (ch == '/' && canStartRegexLiteral(src.substr(0, i))) { skipRegexLiteral(src, i); continue; }
                 if (ch == '\'' || ch == '"') { char q = ch; skipQuoted(q); continue; }
                 if (ch == '`') { skipTemplate(); continue; }
                 if (ch == open_ch) { ++d; ++i; continue; }
@@ -711,6 +736,7 @@ static std::string rewriteIdents(const std::string &src,
             char c = src[i];
             if (c == '/' && i + 1 < src.size() && src[i + 1] == '/') { skipLineComment(); continue; }
             if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
+            if (c == '/' && canStartRegexLiteral(src.substr(0, i))) { skipRegexLiteral(src, i); continue; }
             if (c == '\'' || c == '"') { skipQuoted(c); continue; }
             if (c == '`') { skipTemplate(); continue; }
             // Nested block: its let/const belong to the child scope, not this one.
@@ -2515,6 +2541,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
 
     // Strip/collect import declarations (multi-form). Process repeatedly.
     auto eatImports = [&]() {
+        // Match on source after skipLeadingTrivia so `/* header */ import …` is consumed; keep leading trivia in `body`.
         static const std::regex import_side(R"(^\s*import\s+(['\"])([^'\"]+)\1\s*;?\s*)");
         static const std::regex import_default(
             R"(^\s*import\s+([A-Za-z_$][\w$]*)\s+from\s+(['\"])([^'\"]+)\2\s*;?\s*)");
@@ -2524,12 +2551,27 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             R"(^\s*import\s*\{([^}]*)\}\s*from\s+(['\"])([^'\"]+)\2\s*;?\s*)");
         static const std::regex import_def_named(
             R"(^\s*import\s+([A-Za-z_$][\w$]*)\s*,\s*\{([^}]*)\}\s*from\s+(['\"])([^'\"]+)\3\s*;?\s*)");
+        // Combined default + namespace: `import main, * as ns from 'dep'`.
+        static const std::regex import_def_ns(
+            R"(^\s*import\s+([A-Za-z_$][\w$]*)\s*,\s*\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+(['\"])([^'\"]+)\3\s*;?\s*)");
 
         bool changed = true;
         while (changed) {
             changed = false;
+            const size_t lead = skipLeadingTrivia(body);
+            const std::string rest = body.substr(lead);
+            auto consume_match = [&](const std::smatch &m) {
+                body = body.substr(0, lead) + rest.substr(m.length());
+                changed = true;
+            };
             std::smatch m;
-            if (std::regex_search(body, m, import_def_named) && m.position() == 0) {
+            if (std::regex_search(rest, m, import_def_ns) && m.position() == 0) {
+                imports.push_back({m[1].str(), "default", m[4].str()});
+                imports.push_back({m[2].str(), ".", m[4].str()});
+                consume_match(m);
+                continue;
+            }
+            if (std::regex_search(rest, m, import_def_named) && m.position() == 0) {
                 imports.push_back({m[1].str(), "default", m[4].str()});
                 std::string specs = m[2].str();
                 size_t pos = 0;
@@ -2546,11 +2588,10 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                     if (comma == std::string::npos) break;
                     pos = comma + 1;
                 }
-                body = body.substr(m.length());
-                changed = true;
+                consume_match(m);
                 continue;
             }
-            if (std::regex_search(body, m, import_named) && m.position() == 0) {
+            if (std::regex_search(rest, m, import_named) && m.position() == 0) {
                 std::string specs = m[1].str();
                 size_t pos = 0;
                 bool any_named = false;
@@ -2571,26 +2612,22 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 // `import {} from 'dep'` still evaluates the dependency (side effects / missing module).
                 if (!any_named)
                     imports.push_back({"", "", m[3].str()});
-                body = body.substr(m.length());
-                changed = true;
+                consume_match(m);
                 continue;
             }
-            if (std::regex_search(body, m, import_ns) && m.position() == 0) {
+            if (std::regex_search(rest, m, import_ns) && m.position() == 0) {
                 imports.push_back({m[1].str(), ".", m[3].str()});
-                body = body.substr(m.length());
-                changed = true;
+                consume_match(m);
                 continue;
             }
-            if (std::regex_search(body, m, import_default) && m.position() == 0) {
+            if (std::regex_search(rest, m, import_default) && m.position() == 0) {
                 imports.push_back({m[1].str(), "default", m[3].str()});
-                body = body.substr(m.length());
-                changed = true;
+                consume_match(m);
                 continue;
             }
-            if (std::regex_search(body, m, import_side) && m.position() == 0) {
+            if (std::regex_search(rest, m, import_side) && m.position() == 0) {
                 imports.push_back({"", "", m[2].str()}); // side-effect
-                body = body.substr(m.length());
-                changed = true;
+                consume_match(m);
                 continue;
             }
             // Also allow imports after newlines or same-line statements (`;`): search next top-level import on blankNonCode so commented-out `import` is ignored; mutate live body at those offsets.
@@ -2604,7 +2641,9 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                         std::string tail = body.substr(start);
                         std::smatch im;
                         size_t decl_len = 0;
-                        if (std::regex_search(tail, im, import_def_named) && im.position() == 0)
+                        if (std::regex_search(tail, im, import_def_ns) && im.position() == 0)
+                            decl_len = im.length();
+                        else if (std::regex_search(tail, im, import_def_named) && im.position() == 0)
                             decl_len = im.length();
                         else if (std::regex_search(tail, im, import_named) && im.position() == 0)
                             decl_len = im.length();
@@ -2638,6 +2677,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             }
         }
     };
+
     // Record ordinary-import and re-export dependency sites in source order before eatImports rotates mid-file imports.
     struct StaticDepOcc {
         size_t pos = 0;
@@ -2649,6 +2689,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         std::string blanked = blankNonCode(body);
         static const std::regex re_export_named(R"(export\s*\{[^}]*\}\s*from\s*(['"])([^'"]+)\1)");
         static const std::regex re_export_star(R"(export\s*\*\s*(?:as\s+[A-Za-z_$][\w$]*\s+)?from\s*(['"])([^'"]+)\1)");
+        static const std::regex re_imp_def_ns(
+            R"(import\s+[A-Za-z_$][\w$]*\s*,\s*\*\s+as\s+[A-Za-z_$][\w$]*\s+from\s*(['"])([^'"]+)\1)");
         static const std::regex re_imp_def_named(
             R"(import\s+[A-Za-z_$][\w$]*\s*,\s*\{[^}]*\}\s*from\s*(['"])([^'"]+)\1)");
         static const std::regex re_imp_named(R"(import\s*\{[^}]*\}\s*from\s*(['"])([^'"]+)\1)");
@@ -2665,6 +2707,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         };
         collect_re(re_export_named, true, 2);
         collect_re(re_export_star, true, 2);
+        collect_re(re_imp_def_ns, false, 2);
         collect_re(re_imp_def_named, false, 2);
         collect_re(re_imp_named, false, 2);
         collect_re(re_imp_ns, false, 2);
@@ -2701,7 +2744,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         static const std::regex re_named(R"(export\s*\{([^}]*)\}\s*from\s*(['"])([^'"]+)\2\s*;?)");
         // Optional `as name` covers `export * as ns from 'dep'` (namespace re-export); bare `export * from` stays a star re-export.
         static const std::regex re_star(R"(export\s*\*\s*(?:as\s+([A-Za-z_$][\w$]*)\s+)?from\s*(['"])([^'"]+)\2\s*;?)");
-        static int reexport_ns = 0;
+        int reexport_ns = 0; // per-transform only; not process-wide (Hermes instances can transform concurrently)
         for (;;) {
             std::string blanked = blankNonCode(body);
             std::smatch m_named, m_star;
