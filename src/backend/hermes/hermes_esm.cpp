@@ -330,7 +330,7 @@ static std::string rewriteIdents(const std::string &src,
         pushScope();
         fn_scope_stack.push_back(scopes.size() - 1);
     };
-    // Scan a matched `{...}` body (or top-level range) for `var` bindings, skipping nested function/class bodies so their vars stay local to those scopes.
+    // Scan a matched `{...}` body (or top-level range) for `var` bindings, skipping nested function environments (function/class, arrow bodies, and object/class methods) so their vars stay local to those scopes.
     auto collectVarBindingsInRange = [&](size_t from, size_t to, std::unordered_set<std::string> &into) {
         size_t i = from;
         auto skipLineComment = [&]() {
@@ -386,19 +386,34 @@ static std::string rewriteIdents(const std::string &src,
                 ++i;
             }
         };
-        auto skipNestedFunctionOrClass = [&](const std::string &kw) {
+        auto skipWs = [&]() {
             while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+        };
+        auto skipNestedFunctionOrClass = [&](const std::string &kw) {
+            skipWs();
             if (kw == "function" && i < src.size() && src[i] == '*') {
                 ++i;
-                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                skipWs();
             }
             if (i < src.size() && isIdentStart(src[i])) {
                 while (i < src.size() && isIdent(src[i])) ++i;
-                while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+                skipWs();
             }
             if (i < src.size() && src[i] == '(') skipBalanced('(', ')');
-            while (i < src.size() && std::isspace(static_cast<unsigned char>(src[i]))) ++i;
+            skipWs();
             if (i < src.size() && src[i] == '{') skipBalanced('{', '}');
+        };
+        // After a name (or get/set/async name), skip `(params) { body }` so object/class method vars stay nested.
+        auto skipMethodLikeIfPresent = [&]() -> bool {
+            skipWs();
+            if (i >= src.size() || src[i] != '(') return false;
+            skipBalanced('(', ')');
+            skipWs();
+            if (i < src.size() && src[i] == '{') {
+                skipBalanced('{', '}');
+                return true;
+            }
+            return false;
         };
         while (i < to && i < src.size()) {
             char c = src[i];
@@ -406,6 +421,25 @@ static std::string rewriteIdents(const std::string &src,
             if (c == '/' && i + 1 < src.size() && src[i + 1] == '*') { skipBlockComment(); continue; }
             if (c == '\'' || c == '"') { skipQuoted(c); continue; }
             if (c == '`') { skipTemplate(); continue; }
+            // Arrow body `{...}` is its own function environment — do not harvest its `var` into the enclosing function.
+            if (c == '=' && i + 1 < src.size() && src[i + 1] == '>') {
+                i += 2;
+                skipWs();
+                if (i < src.size() && src[i] == '{') skipBalanced('{', '}');
+                continue;
+            }
+            // Generator method `*name(){...}` inside object/class literals.
+            if (c == '*' && (i == from || !isIdent(src[i - 1]))) {
+                size_t save = i;
+                ++i;
+                skipWs();
+                if (i < src.size() && isIdentStart(src[i])) {
+                    while (i < src.size() && isIdent(src[i])) ++i;
+                    if (skipMethodLikeIfPresent()) continue;
+                }
+                i = save + 1;
+                continue;
+            }
             if (isIdentStart(c) && (i == from || !isIdent(src[i - 1]))) {
                 size_t j = i + 1;
                 while (j < src.size() && isIdent(src[j])) ++j;
@@ -422,7 +456,27 @@ static std::string rewriteIdents(const std::string &src,
                     i = j;
                     continue;
                 }
+                // Control-flow `(...){...}` keeps `var` in the enclosing function — do not skip those bodies.
+                if (id == "if" || id == "while" || id == "for" || id == "switch" || id == "catch" || id == "with") {
+                    i = j;
+                    continue;
+                }
                 i = j;
+                // `get`/`set`/`async` method: skip optional name then `(params){body}`.
+                if (id == "get" || id == "set" || id == "async") {
+                    skipWs();
+                    if (i < src.size() && src[i] == '*') {
+                        ++i;
+                        skipWs();
+                    }
+                    if (i < src.size() && isIdentStart(src[i])) {
+                        while (i < src.size() && isIdent(src[i])) ++i;
+                    }
+                    if (skipMethodLikeIfPresent()) continue;
+                    continue;
+                }
+                // Ordinary object/class method `name(params){body}` — nested function environment.
+                if (skipMethodLikeIfPresent()) continue;
                 continue;
             }
             ++i;

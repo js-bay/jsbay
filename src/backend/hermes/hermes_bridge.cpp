@@ -2092,8 +2092,7 @@ extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj
         auto Object = rt.global().getPropertyAsFunction(rt, "Object");
         auto defineProp = Object.getPropertyAsFunction(rt, "defineProperty");
 
-        // Enumerate without mutating Array.prototype — Proxy ownKeys traps must observe
-        // unmodified global state, and trap mutations must not be overwritten by restore.
+        // Enumerate without mutating Array.prototype — Proxy ownKeys traps must observe unmodified global state, and trap mutations must not be overwritten by restore.
         jsi::Value keysVal = c->pristine_object_keys->call(rt, target);
         if (!keysVal.isObject()) return hopOk(c, jsi::Value(jsi::Array(rt, 0)));
         jsi::Array names = keysVal.getObject(rt).asArray(rt);

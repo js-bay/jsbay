@@ -313,6 +313,50 @@ test "modules: object method param shadows imported binding" {
     try testing.expectEqual(@as(i64, 2), got);
 }
 
+test "modules: arrow body var does not steal imported binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Nested arrow `var` must not register on the enclosing function, or `return value` stops resolving to the import.
+    const src = "import { value } from 'dep';\nexport function read() { const f = () => { var value = 2; }; return value; }\nglobalThis.__result__ = read();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 42), got);
+}
+
+test "modules: object method body var does not steal imported binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Object-method `var` is a nested function environment; enclosing `return value` must keep the import.
+    const src = "import { value } from 'dep';\nexport function read() { const o = { m() { var value = 2; } }; return value; }\nglobalThis.__result__ = read();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 42), got);
+}
+
 test "modules: class method param shadows imported binding" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
