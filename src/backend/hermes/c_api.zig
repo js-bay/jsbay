@@ -192,7 +192,7 @@ pub fn cStringToOwned(ptr: ?[*:0]u8) ?[]u8 {
 }
 
 pub extern fn hermes_is_error(ctx: ?*Context, v: Value) bool;
-pub extern fn hermes_new_error(ctx: ?*Context, kind: c_int, message: [*:0]const u8) Value;
+pub extern fn hermes_new_error(ctx: ?*Context, kind: c_int, message: [*]const u8, message_len: usize) Value;
 
 pub const HostValueC = extern struct {
     tag: u32,

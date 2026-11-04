@@ -1,5 +1,4 @@
-//! Escargot ES module loader — PlatformRef onLoadModule → ModuleLoaderVTable.
-//! Escargot is ES-facing: ESM yes; CJS/require intentionally unsupported (docs/capability.md).
+//! Escargot ES module loader — PlatformRef onLoadModule → ModuleLoaderVTable. Escargot is ES-facing: ESM yes; CJS/require intentionally unsupported (docs/capability.md).
 
 const std = @import("std");
 const types = @import("../../types.zig");

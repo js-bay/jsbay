@@ -148,11 +148,7 @@ pub fn newError(
                 .aggregate_error => 8,
                 .generic, .internal_error, .unknown => 0,
             };
-            var buf: [1024]u8 = undefined;
-            if (message.len >= buf.len) return null;
-            @memcpy(buf[0..message.len], message);
-            buf[message.len] = 0;
-            return c_api.escargot_new_error(ctx, kind_i, @ptrCast(&buf));
+            return c_api.escargot_new_error(ctx, kind_i, message.ptr, message.len);
         },
         .hermes => {
             const c_api = @import("../backend/hermes/c_api.zig");
@@ -166,11 +162,7 @@ pub fn newError(
                 .aggregate_error => 8,
                 .generic, .internal_error, .unknown => 0,
             };
-            var buf: [1024]u8 = undefined;
-            if (message.len >= buf.len) return null;
-            @memcpy(buf[0..message.len], message);
-            buf[message.len] = 0;
-            return c_api.hermes_new_error(ctx, kind_i, @ptrCast(&buf));
+            return c_api.hermes_new_error(ctx, kind_i, message.ptr, message.len);
         },
     }
 }

@@ -179,7 +179,7 @@ bool hermes_has_property_atom(JsbayHermesContext *ctx, HermesValue obj, HermesAt
 /* Errors */
 bool hermes_is_error(JsbayHermesContext *ctx, HermesValue v);
 /* kind: 0=Error 1=TypeError 2=RangeError 3=ReferenceError 4=SyntaxError 5=URIError 6=EvalError 8=AggregateError */
-HermesValue hermes_new_error(JsbayHermesContext *ctx, int kind, const char *message);
+HermesValue hermes_new_error(JsbayHermesContext *ctx, int kind, const char *message, size_t message_len);
 
 
 /* ---- Op results ---- */

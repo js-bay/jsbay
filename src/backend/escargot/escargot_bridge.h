@@ -185,7 +185,7 @@ void escargot_throw(EscargotContext *ctx, const char *message);
 /* ---- Errors ---- */
 bool escargot_is_error(EscargotValue v);
 /* kind: 0=Error 1=TypeError 2=RangeError 3=SyntaxError 4=ReferenceError 5=URIError 6=EvalError */
-EscargotValue escargot_new_error(EscargotContext *ctx, int kind, const char *message);
+EscargotValue escargot_new_error(EscargotContext *ctx, int kind, const char *message, size_t message_len);
 
 /* ---- Op results (value + optional retained exception) ---- */
 typedef struct {

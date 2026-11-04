@@ -1,5 +1,4 @@
-//! console.{log,debug,info,warn,error} for the Hermes backend.
-//! Joins args (objects via JSON.stringify, else ToString) and delivers to log_handler + console_tap.
+//! console.{log,debug,info,warn,error} for the Hermes backend. Joins args (objects via JSON.stringify, else ToString) and delivers to log_handler + console_tap.
 
 const std = @import("std");
 const types = @import("../../types.zig");

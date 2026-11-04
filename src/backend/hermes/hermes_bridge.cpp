@@ -1855,7 +1855,7 @@ extern "C" bool hermes_is_error(JsbayHermesContext *c, HermesValue v) {
     if (!c || !c->rt || !v) return false;
     return instanceOfGlobal(*c->rt, *asVal(v), "Error");
 }
-extern "C" HermesValue hermes_new_error(JsbayHermesContext *c, int kind, const char *message) {
+extern "C" HermesValue hermes_new_error(JsbayHermesContext *c, int kind, const char *message, size_t message_len) {
     if (!c || !c->rt) return nullptr;
     const char *ctor = "Error";
     switch (kind) {
@@ -1869,13 +1869,15 @@ extern "C" HermesValue hermes_new_error(JsbayHermesContext *c, int kind, const c
     default: break;
     }
     try {
+        // Length-aware: preserve embedded NUL in the message bytes (C-string ctor would truncate).
+        auto msg = jsi::String::createFromUtf8(*c->rt, std::string(message ? message : "", message_len));
         auto Ctor = c->rt->global().getPropertyAsFunction(*c->rt, ctor);
         if (kind == 8) {
             // AggregateError(errors, message)
             auto arr = c->rt->global().getPropertyAsFunction(*c->rt, "Array").callAsConstructor(*c->rt);
-            return retainMove(c, Ctor.callAsConstructor(*c->rt, arr, message ? message : ""));
+            return retainMove(c, Ctor.callAsConstructor(*c->rt, arr, msg));
         }
-        return retainMove(c, Ctor.callAsConstructor(*c->rt, message ? message : ""));
+        return retainMove(c, Ctor.callAsConstructor(*c->rt, msg));
     } catch (...) { return nullptr; }
 }
 

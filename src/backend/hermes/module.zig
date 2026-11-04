@@ -1,5 +1,4 @@
-//! Hermes ES module loader — host-side ESM→CJS shim via C bridge (see hermes_esm.cpp).
-//! Hermes pin disables native module codegen; this mirrors Escargot's ModuleLoaderVTable surface.
+//! Hermes ES module loader — host-side ESM→CJS shim via C bridge (see hermes_esm.cpp). Hermes pin disables native module codegen; this mirrors Escargot's ModuleLoaderVTable surface.
 
 const std = @import("std");
 const types = @import("../../types.zig");

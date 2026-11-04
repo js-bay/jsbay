@@ -1584,12 +1584,14 @@ extern "C" bool escargot_is_error(EscargotValue v) {
     return v && asVal(v)->isErrorObject();
 }
 
-extern "C" EscargotValue escargot_new_error(EscargotContext *c, int kind, const char *message) {
+extern "C" EscargotValue escargot_new_error(EscargotContext *c, int kind, const char *message, size_t message_len) {
     if (!c) return nullptr;
     const char *msg = message ? message : "";
+    size_t len = message ? message_len : 0;
     auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, int k, const char *m) -> ValueRef * {
-            auto *s = StringRef::createFromUTF8(m, std::strlen(m));
+        [](ExecutionStateRef *state, int k, const char *m, size_t n) -> ValueRef * {
+            // Length-aware: preserve embedded NUL in the message bytes (strlen would truncate).
+            auto *s = StringRef::createFromUTF8(m, n);
             // Zig JsErrorKind: 0=generic 1=type 2=range 3=reference 4=syntax 5=uri 6=eval 7=internal 8=aggregate
             ErrorObjectRef::Code code = ErrorObjectRef::Code::None;
             switch (k) {
@@ -1606,7 +1608,7 @@ extern "C" EscargotValue escargot_new_error(EscargotContext *c, int kind, const 
             err->updateStackTraceData(state);
             return err;
         },
-        kind, msg);
+        kind, msg, len);
     if (!er.isSuccessful()) return nullptr;
     return retain(c, er.result);
 }

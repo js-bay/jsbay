@@ -806,17 +806,13 @@ fn escargotCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_va
 
 fn hermesNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const c = @import("../backend/hermes/c_api.zig");
-    const msg_z = std.heap.c_allocator.dupeSentinel(u8, message, 0) catch return .{ .out_of_memory = true };
-    defer std.heap.c_allocator.free(msg_z);
-    const v = c.hermes_new_error(ctx, 0, msg_z.ptr);
+    const v = c.hermes_new_error(ctx, 0, message.ptr, message.len);
     return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
 }
 
 fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const c = @import("../backend/escargot/c_api.zig");
-    const msg_z = std.heap.c_allocator.dupeSentinel(u8, message, 0) catch return .{ .out_of_memory = true };
-    defer std.heap.c_allocator.free(msg_z);
-    const v = c.escargot_new_error(ctx, 0, msg_z.ptr);
+    const v = c.escargot_new_error(ctx, 0, message.ptr, message.len);
     return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
 }
 

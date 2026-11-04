@@ -1770,7 +1770,30 @@ static std::string rewriteIdents(const std::string &src,
                 bool after_shorthand_intro = false;
                 if (in_object_lit && !out.empty()) {
                     size_t pk = out.size();
-                    while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+                    // Backward skip of spaces + // and /* */ trivia so `({/*c*/ value})` still sees `{`/`,` (mirrors skipSpacesAndCommentsSrc).
+                    while (pk > 0) {
+                        if (std::isspace(static_cast<unsigned char>(out[pk - 1]))) { --pk; continue; }
+                        if (pk >= 2 && out[pk - 2] == '*' && out[pk - 1] == '/') {
+                            size_t q = pk - 2;
+                            bool found = false;
+                            while (q > 0) {
+                                if (out[q - 1] == '/' && out[q] == '*') { pk = q - 1; found = true; break; }
+                                --q;
+                            }
+                            if (!found) break;
+                            continue;
+                        }
+                        // Line comment: if this line contains `//`, drop from that `//` through pk.
+                        size_t line_start = pk;
+                        while (line_start > 0 && out[line_start - 1] != '\n') --line_start;
+                        size_t slash = std::string::npos;
+                        for (size_t t = line_start; t + 1 < pk; ++t) {
+                            if (out[t] == '/' && out[t + 1] == '/') { slash = t; break; }
+                            if (out[t] == '/' && out[t + 1] == '*') break;
+                        }
+                        if (slash != std::string::npos) { pk = slash; continue; }
+                        break;
+                    }
                     if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ',')) after_shorthand_intro = true;
                 }
                 bool ahead_shorthand_end = (k < src.size() && (src[k] == ',' || src[k] == '}'));
@@ -2510,10 +2533,10 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
 }
 
 
-// ESM namespace export: getter-only live forwarding. Local updates stay visible; importer writes fail (no namespace setter).
+// ESM namespace export: getter-only live forwarding, non-configurable once published. Local updates stay visible; importer writes fail (no namespace setter; defineProperty overwrite rejected).
 static std::string exportLiveGetter(const std::string &exported, const std::string &expr) {
     return std::string(kWrapDefineProperty) + "(" + kWrapExports + ",\"" + exported +
-           "\",{enumerable:true,configurable:true,get:function(){return " + expr + ";}});";
+           "\",{enumerable:true,configurable:false,get:function(){return " + expr + ";}});";
 }
 
 // Named `export {…} from`: live getter plus leaf origin `{m: moduleNs, b: bindingName}` so diamond star-reexports stay unambiguous only when both module identity and binding name match.
@@ -3013,7 +3036,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         star += "var __jsbay_lookup=__jsbay_star_ns[k];";
         star += "if(__jsbay_src==null)return;";
         star += std::string("if(") + kWrapObject + ".prototype.hasOwnProperty.call(" + kWrapExports + ",k))return;";
-        star += std::string(kWrapDefineProperty) + "(" + kWrapExports + ",k,{enumerable:true,configurable:true,get:function(){return __jsbay_lookup[k];}});";
+        star += std::string(kWrapDefineProperty) + "(" + kWrapExports + ",k,{enumerable:true,configurable:false,get:function(){return __jsbay_lookup[k];}});";
         star += std::string(kWrapExports) + ".__jsbay_star_origin[k]=__jsbay_src;";
         star += "});";
         post_epilogue.push_back(star);

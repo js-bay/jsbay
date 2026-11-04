@@ -1,5 +1,4 @@
-//! Escargot NativeHandle — opaque pointer + optional call + finalize (ExtraData + pending_finals).
-//! Not full QJS class_id / CallbackStore parity; methods via make_function; finalize teardown-forced.
+//! Escargot NativeHandle — opaque pointer + optional call + finalize (ExtraData + pending_finals). Not full QJS class_id / CallbackStore parity; methods via make_function; finalize teardown-forced.
 const std = @import("std");
 const lifecycle = @import("lifecycle.zig");
 const c_api = @import("c_api.zig");

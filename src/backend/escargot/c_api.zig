@@ -129,7 +129,7 @@ pub extern fn escargot_get_property_atom(ctx: ?*Context, obj: Value, atom: ?*any
 pub extern fn escargot_set_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque, val: Value) bool;
 pub extern fn escargot_has_property_atom(ctx: ?*Context, obj: Value, atom: ?*anyopaque) bool;
 pub extern fn escargot_is_error(v: Value) bool;
-pub extern fn escargot_new_error(ctx: ?*Context, kind: c_int, message: [*:0]const u8) Value;
+pub extern fn escargot_new_error(ctx: ?*Context, kind: c_int, message: [*]const u8, message_len: usize) Value;
 
 pub const OpResult = extern struct {
     value: Value,
