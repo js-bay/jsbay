@@ -70,6 +70,10 @@ static constexpr const char *kWrapModule = "__jsbay_module";
 static constexpr const char *kWrapFilename = "__jsbay_filename";
 static constexpr const char *kWrapDirname = "__jsbay_dirname";
 static constexpr const char *kWrapImportMeta = "__jsbay_import_meta";
+// Pristine intrinsic Object passed as a factory param so module-local `Object` cannot break generated export registration / star-reexport helpers (body `var Object = Object` would hit TDZ).
+static constexpr const char *kWrapObject = "__jsbay_Object";
+// Derived inside the factory from kWrapObject so export helpers call a non-shadowable defineProperty.
+static constexpr const char *kWrapDefineProperty = "__jsbay_defineProperty";
 
 static bool canStartRegexLiteral(const std::string &preceding);
 static void blankRegexLiteral(std::string &out, size_t &i);
@@ -1608,14 +1612,13 @@ static std::string rewriteIdents(const std::string &src,
                 }
             }
 
-            // ParamList / destructuring bindings under ParamList: do not rewrite; register binding.
+            // ParamList / destructuring pattern under ParamList: do not rewrite. Bound names were already registered by collectParamListBoundNames when the ParamList opened — do not treat property keys (`{value: x}`) as additional bindings.
             //
-            // Default-initializer expressions (after `=` until `,`/`)`) may reference imports — allow rewrite.
+            // Default-initializer expressions (after `=` until `,`/`)`) may reference imports — allow rewrite. Computed keys are rewritten via the Cont::ObjectLit `[` handler before this path.
             if (underParamList()) {
                 char p = prevSignificant();
                 if (p != '.' && p != '?') {
                     if (!in_param_default) {
-                        addBindings({id});
                         out += id;
                         i = j;
                         continue;
@@ -2387,7 +2390,7 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src) {
 
 // ESM namespace export: getter-only live forwarding. Local updates stay visible; importer writes fail (no namespace setter).
 static std::string exportLiveGetter(const std::string &exported, const std::string &expr) {
-    return std::string("Object.defineProperty(") + kWrapExports + ",\"" + exported +
+    return std::string(kWrapDefineProperty) + "(" + kWrapExports + ",\"" + exported +
            "\",{enumerable:true,configurable:true,get:function(){return " + expr + ";}});";
 }
 
@@ -2479,8 +2482,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 changed = true;
                 continue;
             }
-            // Also allow imports after newlines mid-file: search next import at line start on blankNonCode so commented-out `import` is ignored; mutate live body at those offsets.
-            static const std::regex any_import(R"((^|\n)(\s*import\s))");
+            // Also allow imports after newlines or same-line statements (`;`): search next top-level import on blankNonCode so commented-out `import` is ignored; mutate live body at those offsets.
+            static const std::regex any_import(R"((^|[\n;])(\s*import\s))");
             {
                 std::string blanked = blankNonCode(body);
                 if (std::regex_search(blanked, m, any_import)) {
@@ -2785,22 +2788,22 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     // Star re-exports: track originating binding across deps; omit ambiguous names unless an explicit export already resolved them. Intermediate namespace objects from a diamond (a and b both re-export the same base binding) must not mark the name ambiguous — compare leaf origins, and record origins on this module for further star re-exports.
     if (!star_reexport_nss.empty()) {
         std::string star;
-        star += "var __jsbay_star_prov=Object.create(null);";
-        star += std::string("if(!Object.prototype.hasOwnProperty.call(") + kWrapExports + ",\"__jsbay_star_origin\"))";
-        star += std::string("Object.defineProperty(") + kWrapExports + ",\"__jsbay_star_origin\",{value:Object.create(null),configurable:true});";
+        star += std::string("var __jsbay_star_prov=") + kWrapObject + ".create(null);";
+        star += std::string("if(!") + kWrapObject + ".prototype.hasOwnProperty.call(" + kWrapExports + ",\"__jsbay_star_origin\"))";
+        star += std::string(kWrapDefineProperty) + "(" + kWrapExports + ",\"__jsbay_star_origin\",{value:" + kWrapObject + ".create(null),configurable:true});";
         for (const auto &ns : star_reexport_nss) {
-            star += "Object.keys(" + ns + ").forEach(function(k){";
+            star += std::string(kWrapObject) + ".keys(" + ns + ").forEach(function(k){";
             star += "if(k===\"default\"||k===\"__jsbay_star_origin\")return;";
-            star += "var __jsbay_origin=(" + ns + ".__jsbay_star_origin&&Object.prototype.hasOwnProperty.call(" + ns + ".__jsbay_star_origin,k))?" + ns + ".__jsbay_star_origin[k]:" + ns + ";";
-            star += "if(Object.prototype.hasOwnProperty.call(__jsbay_star_prov,k)){";
+            star += std::string("var __jsbay_origin=(") + ns + ".__jsbay_star_origin&&" + kWrapObject + ".prototype.hasOwnProperty.call(" + ns + ".__jsbay_star_origin,k))?" + ns + ".__jsbay_star_origin[k]:" + ns + ";";
+            star += std::string("if(") + kWrapObject + ".prototype.hasOwnProperty.call(__jsbay_star_prov,k)){";
             star += "if(__jsbay_star_prov[k]!==__jsbay_origin)__jsbay_star_prov[k]=null;";
             star += "}else{__jsbay_star_prov[k]=__jsbay_origin;}});";
         }
-        star += "Object.keys(__jsbay_star_prov).forEach(function(k){";
+        star += std::string(kWrapObject) + ".keys(__jsbay_star_prov).forEach(function(k){";
         star += "var __jsbay_src=__jsbay_star_prov[k];";
         star += "if(__jsbay_src==null)return;";
-        star += std::string("if(Object.prototype.hasOwnProperty.call(") + kWrapExports + ",k))return;";
-        star += std::string("Object.defineProperty(") + kWrapExports + ",k,{enumerable:true,configurable:true,get:function(){return __jsbay_src[k];}});";
+        star += std::string("if(") + kWrapObject + ".prototype.hasOwnProperty.call(" + kWrapExports + ",k))return;";
+        star += std::string(kWrapDefineProperty) + "(" + kWrapExports + ",k,{enumerable:true,configurable:true,get:function(){return __jsbay_src[k];}});";
         star += std::string(kWrapExports) + ".__jsbay_star_origin[k]=__jsbay_src;";
         star += "});";
         post_epilogue.push_back(star);
@@ -2808,9 +2811,12 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
 
     body = rewriteIdents(body, ident_repl);
 
+    // Pass pristine Object as a factory param (not a body `var`) so a module-local `const Object` TDZ cannot break capture.
     std::string out = std::string("(async function(") + kWrapExports + "," + kWrapRequire + "," +
-        kWrapModule + "," + kWrapFilename + "," + kWrapDirname + "," + kWrapImportMeta +
+        kWrapModule + "," + kWrapFilename + "," + kWrapDirname + "," + kWrapImportMeta + "," +
+        kWrapObject +
         "){\n\"use strict\";\n";
+    out += std::string("var ") + kWrapDefineProperty + "=" + kWrapObject + ".defineProperty.bind(" + kWrapObject + ");\n";
     for (auto &p : prelude) out += p + "\n";
     out += body;
     out += "\n";
@@ -2962,7 +2968,8 @@ static jsi::Object loadAndEvalModule(JsbayHermesContext *c, HermesModLoader *loa
             moduleObj,
             jsi::String::createFromUtf8(rt, id),
             jsi::String::createFromUtf8(rt, ""),
-            importMeta);
+            importMeta,
+            rt.global().getProperty(rt, "Object"));
         result = awaitThenable(c, rt, std::move(result));
         if (result.isObject()) {
             rec->exports = result.getObject(rt);
@@ -3074,7 +3081,8 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
         jsi::Value result = fn.call(rt, rec->exports, requireFn, moduleObj,
                 jsi::String::createFromUtf8(rt, fname),
                 jsi::String::createFromUtf8(rt, ""),
-                importMeta);
+                importMeta,
+                rt.global().getProperty(rt, "Object"));
         result = awaitThenable(c, rt, std::move(result));
         if (result.isObject()) {
             rec->exports = result.getObject(rt);

@@ -544,8 +544,7 @@ test "modules: later param shadows import in earlier default (TDZ)" {
     try testing.expect(engine.create(id, .{ .module_loader = &loader }));
     defer engine.destroy(id);
 
-    // All parameter bindings are in scope for every default initializer; `value` here is the later formal, not the import.
-    // A correct rewrite leaves `value` unbound until its parameter init (TDZ ReferenceError on engines that enforce it). Rewriting to the import would yield 42 instead.
+    // All parameter bindings are in scope for every default initializer; `value` here is the later formal, not the import. A correct rewrite leaves `value` unbound until its parameter init (TDZ ReferenceError on engines that enforce it). Rewriting to the import would yield 42 instead.
     const src =
         \\import { value } from 'dep';
         \\export function read(){ return ((a = value, value = 2) => a)(); }
@@ -780,6 +779,72 @@ test "modules: exported CJS-param-named bindings are visible to importers" {
     try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__exports__"));
 }
 
+test "modules: destructured param property key does not shadow import" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // `{value: x}` binds `x` only; the property key must not register `value` as a local that blocks the import rewrite.
+    const src =
+        \\import { value } from 'dep';
+        \\export function read({ value: x }) { return value; }
+        \\globalThis.__result__ = read({ value: 1 });
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__result__"));
+}
+
+test "modules: export binding named Object does not break export registration" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Generated export helpers must use a captured pristine Object.defineProperty, not a module-local `Object`.
+    const src =
+        \\export const Object = 42;
+        \\globalThis.__object__ = Object;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__object__"));
+}
+
+test "modules: static import after same-line statement is extracted" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Top-level import after another statement on the same physical line must still be hoisted out of the generated wrapper body.
+    const src = "const local = 1; import { value } from 'dep'; export const answer = local + value;\nglobalThis.__result__ = answer;";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 43), try helpers.evalInt(id, "globalThis.__result__"));
+}
+
 test "modules: regex literal after braced if-statement is not rewritten as import" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
@@ -864,8 +929,7 @@ test "modules: circular imports do not deadlock" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
-    // Classic A↔B cycle. Escargot leaves the reverse *named* import of a function in TDZ even after evaluation, so bPlusA must not call aFn — the unused import still establishes the cycle; aPlusB proves the forward cross-call.
-    // Calls run after evalModule (top-level calls during linking hit TDZ).
+    // Classic A↔B cycle. Escargot leaves the reverse *named* import of a function in TDZ even after evaluation, so bPlusA must not call aFn — the unused import still establishes the cycle; aPlusB proves the forward cross-call. Calls run after evalModule (top-level calls during linking hit TDZ).
     try ctx.modules.put("a",
         \\import { bFn } from 'b';
         \\export function aFn() { return 1; }

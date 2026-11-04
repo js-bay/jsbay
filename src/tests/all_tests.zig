@@ -1,9 +1,6 @@
 //! Aggregator — imported from root.zig so that `zig build test` picks up all test files in src/tests/.
-//! Spike backends (escargot/hermes) share the suite source; out-of-scope suites are not imported
-//! (see docs/capability.md). In-scope: eval, value/object, Promise, buffers (basic), timers,
-//! host_object, Escargot ESM, Hermes .hbc. Out: engine_thread / thick C ABI, inspector,
-//! deep event-loop contracts, heap/interrupt, Escargot disk bytecode cache, advanced buffer
-//! transfer/copy, resource/OOM/stack limits.
+//!
+//! Spike backends (escargot/hermes) share the suite source; out-of-scope suites are not imported (see docs/capability.md). In-scope: eval, value/object, Promise, buffers (basic), timers, host_object, Escargot ESM, Hermes .hbc. Out: engine_thread / thick C ABI, inspector, deep event-loop contracts, heap/interrupt, Escargot disk bytecode cache, advanced buffer transfer/copy, resource/OOM/stack limits.
 
 const backend = @import("../backend.zig");
 const build_options = @import("build_options");
@@ -22,8 +19,7 @@ comptime {
     _ = @import("value_tests.zig");
     _ = @import("string_roundtrip_tests.zig");
     _ = @import("engine_tests.zig");
-    // engine_thread: spike smoke already covers start/id/stop/post/wait; import full suite and
-    // Skip only cases that need interrupt/heap/bind-sync not yet green on Escargot/Hermes.
+    // engine_thread: spike smoke already covers start/id/stop/post/wait; import full suite and Skip only cases that need interrupt/heap/bind-sync not yet green on Escargot/Hermes.
     _ = @import("engine_thread_tests.zig");
     if (!spike) {
         _ = @import("self_driven_loop_tests.zig");
@@ -95,8 +91,7 @@ comptime {
     if (!spike) {
         _ = @import("runtime_control_tests.zig");
     }
-    // buffers_tests: basic + finalizer in spike scope; advanced cases Skip inside the suite.
-    // Transfer: Escargot native; Hermes polyfill (detachArrayBuffer + copy). Tight-cap case still QJS-only Skip inside.
+    // buffers_tests: basic + finalizer in spike scope; advanced cases Skip inside the suite. Transfer: Escargot native; Hermes polyfill (detachArrayBuffer + copy). Tight-cap case still QJS-only Skip inside.
     _ = @import("buffers_tests.zig");
     _ = @import("buffers_transfer_tests.zig");
     _ = @import("cjs_tests.zig");
