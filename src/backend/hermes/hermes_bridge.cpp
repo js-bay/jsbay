@@ -670,24 +670,34 @@ extern "C" bool hermes_is_function(JsbayHermesContext *c, HermesValue v) {
     catch (...) { return false; }
 }
 
-extern "C" bool hermes_is_constructor(JsbayHermesContext *c, HermesValue v) {
-    if (!c || !c->rt || !v || !asVal(v)->isObject()) return false;
+// ES IsConstructor without reading candidate.prototype (Hermes Construct / GetPrototypeFromConstructor always does; Proxy get traps must not run).
+static bool hermesIsConstructor(jsi::Runtime &rt, const jsi::Value &v) {
+    if (!v.isObject() || !v.getObject(rt).isFunction(rt)) return false;
+    auto fn = v.getObject(rt);
     try {
-        auto &rt = *c->rt;
-        auto o = asVal(v)->getObject(rt);
-        if (!o.isFunction(rt)) return false;
-        // ES IsConstructor: Reflect.construct(fn, []) succeeds iff [[Construct]] exists.
-        // Probe via a cached helper so we never invoke the user constructor body with a wrong newTarget, and so JS TypeErrors stay in-engine (no host ABRT).
+        // Reflect.construct(dummy, [], newTarget) checks IsConstructor(newTarget) then reads newTarget.prototype; wrap the candidate and satisfy prototype via getOwnPropertyDescriptor (skips Proxy get traps; keeps class non-configurable prototype invariants).
         static const char *kHelper =
-            "(function(f){try{Reflect.construct(function(){},[],f);return true;}"
+            "(function(f){try{Reflect.construct(function(){},[],new Proxy(f,{get:function(t,p,r){"
+            "if(p!=='prototype')return Reflect.get(t,p,r);"
+            "var d=Object.getOwnPropertyDescriptor(t,'prototype');"
+            "return d&&'value'in d?d.value:null;}}));return true;}"
             "catch(e){return false;}})";
         auto helper = rt.global()
                           .getPropertyAsFunction(rt, "eval")
                           .call(rt, kHelper)
                           .asObject(rt)
                           .asFunction(rt);
-        auto out = helper.call(rt, o);
+        auto out = helper.call(rt, fn);
         return out.isBool() && out.getBool();
+    } catch (...) {
+        return false;
+    }
+}
+
+extern "C" bool hermes_is_constructor(JsbayHermesContext *c, HermesValue v) {
+    if (!c || !c->rt || !v || !asVal(v)->isObject()) return false;
+    try {
+        return hermesIsConstructor(*c->rt, *asVal(v));
     } catch (...) {
         return false;
     }
@@ -1989,24 +1999,6 @@ extern "C" HermesOpResult hermes_call_result(JsbayHermesContext *c, HermesValue 
         return hopFail(c, makeTypeError(*c->rt, e.what()));
     } catch (...) {
         return hopFail(c, makeTypeError(*c->rt, "call failed"));
-    }
-}
-
-
-
-static bool hermesIsConstructor(jsi::Runtime &rt, const jsi::Value &v) {
-    if (!v.isObject() || !v.getObject(rt).isFunction(rt)) return false;
-    auto fn = v.getObject(rt);
-    try {
-        auto Reflect = rt.global().getPropertyAsObject(rt, "Reflect");
-        auto constructFn = Reflect.getPropertyAsFunction(rt, "construct");
-        auto Object = rt.global().getPropertyAsFunction(rt, "Object");
-        jsi::Array empty(rt, 0);
-        // Reflect.construct(Object, [], newTarget) throws if newTarget is not a constructor, without invoking newTarget or reading its properties (Proxy construct trap safe).
-        constructFn.call(rt, Object, empty, fn);
-        return true;
-    } catch (...) {
-        return false;
     }
 }
 

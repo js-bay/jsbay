@@ -52,6 +52,29 @@ test "isConstructor: class and function(){} are constructors" {
     }.run);
 }
 
+test "isConstructor: constructible Proxy with throwing prototype get remains a constructor" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            const ctx = engine.getContext(id) orelse return error.NoContext;
+            // Constructible Proxy: get trap throws on prototype, construct trap returns {}. IsConstructor must not read prototype.
+            try helpers.evalOk(id,
+                \\globalThis.__proxyCtor = new Proxy(function () {}, {
+                \\  get(t, p, r) { if (p === 'prototype') throw new Error('proto'); return Reflect.get(t, p, r); },
+                \\  construct() { return {}; }
+                \\});
+                \\globalThis.__arrow = (_ => _);
+            );
+            const proxy = try loadGlobal(id, "__proxyCtor");
+            defer ActiveEngine.freeValue(ctx, proxy);
+            try testing.expect(value.isConstructor(id, proxy));
+
+            const arrow = try loadGlobal(id, "__arrow");
+            defer ActiveEngine.freeValue(ctx, arrow);
+            try testing.expect(!value.isConstructor(id, arrow));
+        }
+    }.run);
+}
+
 test "isConstructor: Math, Reflect, object, generator, async, and arrows are not" {
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
