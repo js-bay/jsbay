@@ -74,6 +74,10 @@ struct JsbayHermesContextOpaque {
     std::unique_ptr<jsi::Function> pristine_json_stringify;
     // Host WeakMap for stable JS object identity across distinct retained Value wrappers.
     std::unique_ptr<jsi::Object> identity_wm;
+    // Pristine WeakMap.prototype has/get/set — ignore script replacements of the mutable prototype.
+    std::unique_ptr<jsi::Function> pristine_wm_has;
+    std::unique_ptr<jsi::Function> pristine_wm_get;
+    std::unique_ptr<jsi::Function> pristine_wm_set;
     uint64_t next_identity_id = 1;
     // Host Promise rejection tracker (Escargot-style queue + flush after microtasks)
     HermesRejectionTrackerFn rejection_fn = nullptr;
@@ -391,8 +395,26 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
     try {
         auto WM = c->rt->global().getPropertyAsFunction(*c->rt, "WeakMap");
         c->identity_wm = std::make_unique<jsi::Object>(WM.callAsConstructor(*c->rt).asObject(*c->rt));
+        // Capture pristine WeakMap.prototype methods before user code can replace them.
+        const char *kGrabWm = R"JS(
+            (function () {
+              var P = WeakMap.prototype;
+              return [P.has, P.get, P.set];
+            })()
+        )JS";
+        auto arrVal = c->rt->evaluateJavaScript(std::make_shared<jsi::StringBuffer>(kGrabWm), "<jsbay-wm-methods>");
+        auto arr = arrVal.asObject(*c->rt).asArray(*c->rt);
+        c->pristine_wm_has = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 0).asObject(*c->rt).asFunction(*c->rt));
+        c->pristine_wm_get = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 1).asObject(*c->rt).asFunction(*c->rt));
+        c->pristine_wm_set = std::make_unique<jsi::Function>(
+            arr.getValueAtIndex(*c->rt, 2).asObject(*c->rt).asFunction(*c->rt));
     } catch (...) {
         c->identity_wm.reset();
+        c->pristine_wm_has.reset();
+        c->pristine_wm_get.reset();
+        c->pristine_wm_set.reset();
     }
     try {
         // Evaluate once so we grab real accessor .get functions off %TypedArray%.prototype.
@@ -1486,8 +1508,7 @@ extern "C" bool hermes_is_data_view(JsbayHermesContext *c, HermesValue v) {
 extern "C" HermesValue hermes_new_array_buffer_copy(JsbayHermesContext *c, const uint8_t *bytes, size_t len) {
     if (!c || !c->rt) return nullptr;
     try {
-        // Allocate through a trusted MutableBuffer — never the replaceable global ArrayBuffer ctor
-        // (JS can shrink the returned buffer and OOB our memcpy).
+        // Allocate through a trusted MutableBuffer — never the replaceable global ArrayBuffer ctor (JS can shrink the returned buffer and OOB our memcpy).
         auto buf = std::make_shared<VectorBuffer>(bytes, len);
         if (buf->size() != len) return nullptr;
         return retainMove(c, jsi::Value(jsi::ArrayBuffer(*c->rt, std::move(buf))));
@@ -1903,22 +1924,20 @@ extern "C" HermesOpResult hermes_json_stringify_result(JsbayHermesContext *c, He
 }
 
 extern "C" uint64_t hermes_object_identity(JsbayHermesContext *c, HermesValue v) {
-    if (!c || !c->rt || !v || !asVal(v)->isObject() || !c->identity_wm) return 0;
+    if (!c || !c->rt || !v || !asVal(v)->isObject() || !c->identity_wm
+        || !c->pristine_wm_has || !c->pristine_wm_get || !c->pristine_wm_set) return 0;
     try {
         auto &rt = *c->rt;
         auto o = asVal(v)->getObject(rt);
         auto &wm = *c->identity_wm;
-        // WeakMap methods require the map as `this`; Function::call does not bind receiver.
-        auto has = wm.getPropertyAsFunction(rt, "has");
-        if (has.callWithThis(rt, wm, o).getBool()) {
-            auto get = wm.getPropertyAsFunction(rt, "get");
-            auto idVal = get.callWithThis(rt, wm, o);
+        // Use pristine WeakMap.prototype methods captured at context creation; Function::call does not bind receiver.
+        if (c->pristine_wm_has->callWithThis(rt, wm, o).getBool()) {
+            auto idVal = c->pristine_wm_get->callWithThis(rt, wm, o);
             return idVal.isNumber() ? (uint64_t)idVal.getNumber() : 0;
         }
         uint64_t id = c->next_identity_id++;
         if (id == 0) id = c->next_identity_id++;
-        auto set = wm.getPropertyAsFunction(rt, "set");
-        set.callWithThis(rt, wm, o, (double)id);
+        c->pristine_wm_set->callWithThis(rt, wm, o, (double)id);
         return id;
     } catch (...) {
         return 0;
