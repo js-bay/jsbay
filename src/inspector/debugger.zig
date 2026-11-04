@@ -71,6 +71,14 @@ const SourceLocation = struct {
     column: i32,
 };
 
+const blackbox_cache_capacity: usize = 64;
+
+const BlackboxCacheEntry = struct {
+    url: []u8,
+    revision: u64,
+    matches: bool,
+};
+
 const Binding = struct {
     instance_id: i32,
     runtime: ?*anyopaque,
@@ -121,6 +129,8 @@ const Binding = struct {
     skip_seen_same: bool = false,
     skip_saw_deeper: bool = false,
     blackbox: std.ArrayList([]u8) = .empty,
+    blackbox_revision: u64 = 0,
+    blackbox_cache: std.ArrayList(BlackboxCacheEntry) = .empty,
 };
 
 pub const DebugFrame = struct {
@@ -400,6 +410,10 @@ pub fn setBreakpointEx(
 
 pub fn setBlackboxPatterns(instance_id: i32, patterns: []const []const u8) void {
     const binding = lookup(instance_id) orelse return;
+    replaceBlackboxPatterns(binding, patterns);
+}
+
+fn replaceBlackboxPatterns(binding: *Binding, patterns: []const []const u8) void {
     binding.mutex.lock();
     defer binding.mutex.unlock();
     for (binding.blackbox.items) |pat| std.heap.c_allocator.free(pat);
@@ -410,6 +424,8 @@ pub fn setBlackboxPatterns(instance_id: i32, patterns: []const []const u8) void 
             std.heap.c_allocator.free(copy);
         };
     }
+    binding.blackbox_revision +%= 1;
+    clearBlackboxCacheLocked(binding);
 }
 
 pub fn removeBreakpoint(instance_id: i32, id: u32) bool {
@@ -1002,6 +1018,8 @@ fn destroyBinding(binding: *Binding) void {
     binding.breakpoints.deinit(std.heap.c_allocator);
     for (binding.blackbox.items) |pat| std.heap.c_allocator.free(pat);
     binding.blackbox.deinit(std.heap.c_allocator);
+    clearBlackboxCacheLocked(binding);
+    binding.blackbox_cache.deinit(std.heap.c_allocator);
     for (binding.scripts.items) |script| {
         freeScript(script);
     }
@@ -1070,6 +1088,76 @@ test "debugger: script info clone releases every partial allocation on OOM" {
     }.run, .{script});
 }
 
+test "debugger: blackbox cache invalidates and evicts without changing matches" {
+    const binding = try std.heap.c_allocator.create(Binding);
+    defer destroyBinding(binding);
+    binding.* = .{ .instance_id = -1, .runtime = null };
+
+    const first = [_][]const u8{"blocked\\.js"};
+    replaceBlackboxPatterns(binding, &first);
+    try std.testing.expect(isBlackboxed(binding, "blocked.js"));
+    try std.testing.expectEqual(@as(usize, 1), binding.blackbox_cache.items.len);
+    try std.testing.expect(isBlackboxed(binding, "blocked.js"));
+    try std.testing.expectEqual(@as(usize, 1), binding.blackbox_cache.items.len);
+
+    const second = [_][]const u8{"other\\.js"};
+    replaceBlackboxPatterns(binding, &second);
+    try std.testing.expect(!isBlackboxed(binding, "blocked.js"));
+    try std.testing.expect(isBlackboxed(binding, "other.js"));
+
+    var number: usize = 0;
+    while (number < blackbox_cache_capacity + 1) : (number += 1) {
+        var name: [32]u8 = undefined;
+        const url = try std.fmt.bufPrint(&name, "item-{d}.js", .{number});
+        try std.testing.expect(!isBlackboxed(binding, url));
+    }
+    try std.testing.expectEqual(blackbox_cache_capacity, binding.blackbox_cache.items.len);
+    try std.testing.expect(isBlackboxed(binding, "other.js"));
+}
+
+test "debugger: blackbox cache keeps no entries for empty patterns" {
+    const binding = try std.heap.c_allocator.create(Binding);
+    defer destroyBinding(binding);
+    binding.* = .{ .instance_id = -4, .runtime = null };
+
+    var number: usize = 0;
+    while (number < blackbox_cache_capacity + 1) : (number += 1) {
+        var name: [32]u8 = undefined;
+        const url = try std.fmt.bufPrint(&name, "empty-{d}.js", .{number});
+        try std.testing.expect(!isBlackboxed(binding, url));
+    }
+    try std.testing.expectEqual(@as(usize, 0), binding.blackbox_cache.items.len);
+}
+
+test "debugger: blackbox cache does not publish an obsolete revision" {
+    const binding = try std.heap.c_allocator.create(Binding);
+    defer destroyBinding(binding);
+    binding.* = .{ .instance_id = -2, .runtime = null };
+
+    const first = [_][]const u8{"old\\.js"};
+    replaceBlackboxPatterns(binding, &first);
+    binding.mutex.lock();
+    const old_revision = binding.blackbox_revision;
+    binding.mutex.unlock();
+
+    const second = [_][]const u8{"new\\.js"};
+    replaceBlackboxPatterns(binding, &second);
+    binding.mutex.lock();
+    defer binding.mutex.unlock();
+    try std.testing.expect(!publishBlackboxResultLocked(binding, "old.js", old_revision, true));
+    try std.testing.expectEqual(@as(usize, 0), binding.blackbox_cache.items.len);
+}
+
+test "debugger: blackbox cache snapshot releases partial OOM allocations" {
+    const patterns = [_][]const u8{ "first\\.js", "second\\.js", "third\\.js" };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, input: []const []const u8) !void {
+            var copies = try cloneBlackboxPatterns(allocator, input);
+            defer freeBlackboxPatternCopies(allocator, &copies);
+        }
+    }.run, .{patterns[0..]});
+}
+
 fn shouldPause(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) ?PauseReason {
     return breakpointHit(binding, url, line, column, depth, script_tag);
 }
@@ -1129,21 +1217,86 @@ fn urlPatternMatch(bp: Breakpoint, url: []const u8) bool {
 }
 
 fn isBlackboxed(binding: *Binding, url: []const u8) bool {
-    binding.mutex.lock();
+    while (true) {
+        binding.mutex.lock();
+        if (binding.blackbox.items.len == 0) {
+            binding.mutex.unlock();
+            return false;
+        }
+        if (lookupBlackboxCacheLocked(binding, url)) |matches| {
+            binding.mutex.unlock();
+            return matches;
+        }
+        const revision = binding.blackbox_revision;
+        var copies = cloneBlackboxPatterns(std.heap.c_allocator, binding.blackbox.items) catch {
+            const matches = matchesBlackboxPatterns(binding.blackbox.items, url);
+            binding.mutex.unlock();
+            return matches;
+        };
+        binding.mutex.unlock();
+
+        const matches = matchesBlackboxPatterns(copies.items, url);
+        binding.mutex.lock();
+        const published = publishBlackboxResultLocked(binding, url, revision, matches);
+        binding.mutex.unlock();
+        freeBlackboxPatternCopies(std.heap.c_allocator, &copies);
+        if (published) return matches;
+    }
+}
+
+fn cloneBlackboxPatterns(allocator: std.mem.Allocator, patterns: anytype) !std.ArrayList([]u8) {
     var copies: std.ArrayList([]u8) = .empty;
-    for (binding.blackbox.items) |pat| {
-        const copy = std.heap.c_allocator.dupe(u8, pat) catch continue;
-        copies.append(std.heap.c_allocator, copy) catch std.heap.c_allocator.free(copy);
+    errdefer freeBlackboxPatternCopies(allocator, &copies);
+    for (patterns) |pat| {
+        const copy = try allocator.dupe(u8, pat);
+        copies.append(allocator, copy) catch |err| {
+            allocator.free(copy);
+            return err;
+        };
     }
-    binding.mutex.unlock();
-    defer {
-        for (copies.items) |pat| std.heap.c_allocator.free(pat);
-        copies.deinit(std.heap.c_allocator);
-    }
-    for (copies.items) |pat| {
+    return copies;
+}
+
+fn freeBlackboxPatternCopies(allocator: std.mem.Allocator, copies: *std.ArrayList([]u8)) void {
+    for (copies.items) |pat| allocator.free(pat);
+    copies.deinit(allocator);
+}
+
+fn matchesBlackboxPatterns(patterns: []const []u8, url: []const u8) bool {
+    for (patterns) |pat| {
         if (regexSearch(pat, url)) return true;
     }
     return false;
+}
+
+fn lookupBlackboxCacheLocked(binding: *Binding, url: []const u8) ?bool {
+    for (binding.blackbox_cache.items) |entry| {
+        if (entry.revision == binding.blackbox_revision and std.mem.eql(u8, entry.url, url)) return entry.matches;
+    }
+    return null;
+}
+
+fn clearBlackboxCacheLocked(binding: *Binding) void {
+    for (binding.blackbox_cache.items) |entry| std.heap.c_allocator.free(entry.url);
+    binding.blackbox_cache.clearRetainingCapacity();
+}
+
+fn publishBlackboxResultLocked(binding: *Binding, url: []const u8, revision: u64, matches: bool) bool {
+    if (revision != binding.blackbox_revision) return false;
+    const copy = std.heap.c_allocator.dupe(u8, url) catch return true;
+    if (binding.blackbox_cache.items.len == blackbox_cache_capacity) {
+        const evicted = binding.blackbox_cache.orderedRemove(0);
+        std.heap.c_allocator.free(evicted.url);
+    }
+    binding.blackbox_cache.append(std.heap.c_allocator, .{
+        .url = copy,
+        .revision = binding.blackbox_revision,
+        .matches = matches,
+    }) catch {
+        std.heap.c_allocator.free(copy);
+        return true;
+    };
+    return true;
 }
 
 fn conditionPasses(binding: *Binding, expr: []const u8) bool {
