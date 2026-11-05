@@ -66,6 +66,8 @@ pub extern fn hermes_set_property(ctx: ?*Context, obj: Value, key: [*:0]const u8
 pub extern fn hermes_has_property(ctx: ?*Context, obj: Value, key: [*:0]const u8) bool;
 pub extern fn hermes_call(ctx: ?*Context, fn_val: Value, this_val: Value, args: ?[*]const Value, argc: usize, out_err: *?[*:0]u8) Value;
 pub extern fn hermes_process_pending_jobs(ctx: ?*Context) void;
+pub const ShouldStopPendingJobDrainFn = *const fn (instance_id: c_int) callconv(.c) bool;
+pub extern fn hermes_set_should_stop_pending_job_drain(fn_ptr: ?ShouldStopPendingJobDrainFn) void;
 
 pub const ValueResultC = extern struct {
     value: Value,

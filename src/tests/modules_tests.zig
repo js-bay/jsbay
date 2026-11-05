@@ -1893,6 +1893,54 @@ test "modules: ESM factory uses captured Object when global Object is replaced" 
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__v__"));
 }
 
+
+test "modules: ESM factory uses captured defineProperty when Object.defineProperty is replaced" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const answer = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Poison only Object.defineProperty; the constructor object remains but its method slot is replaced.
+    _ = engine.evalScript(id, "Object.defineProperty = function(){};", "patch-defineProperty.js");
+    const res = engine.evalModule(id, "import {answer} from 'dep'; globalThis.__v__ = answer;", "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__v__"));
+}
+
+test "modules: user export named __jsbay_star_origin does not break star re-export" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    // Hermes-only: star provenance must not live on the export namespace under a reserved string key.
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const x = 7;");
+    try ctx.modules.put("mid", "export const __jsbay_star_origin = 1; export * from 'dep';");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\import * as ns from 'mid';
+        \\globalThis.__x__ = ns.x;
+        \\globalThis.__origin_export__ = ns.__jsbay_star_origin;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 7), try helpers.evalInt(id, "globalThis.__x__"));
+    try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__origin_export__"));
+}
+
 test "modules: local export-list is visible to cyclic importer" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     // Hermes-only: ESM→CJS transform must hoist local `export {f}` like `export function f` for cyclic importers.

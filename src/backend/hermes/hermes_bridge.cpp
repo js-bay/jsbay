@@ -1010,14 +1010,42 @@ extern "C" HermesValue hermes_call(JsbayHermesContext *c, HermesValue fn, Hermes
     }
 }
 
-extern "C" void hermes_process_pending_jobs(JsbayHermesContext *c) {
+// Function pointer (registered from Zig) so Hermes microtask drains honor stop/interrupt/budget between batches. The bridge is a shared library, so a Zig `export` would be an unresolved .so symbol at rebuild time.
+static HermesShouldStopPendingJobDrainFn g_should_stop_pending_job_drain = nullptr;
+
+extern "C" void hermes_set_should_stop_pending_job_drain(HermesShouldStopPendingJobDrainFn fn) {
+    g_should_stop_pending_job_drain = fn;
+}
+
+static int32_t hermesInstanceIdFromOpaque(JsbayHermesContext *c) {
+    if (!c || !c->opaque) return 0;
+    return static_cast<int32_t>(reinterpret_cast<uintptr_t>(c->opaque) & 0xffffffffu);
+}
+
+static bool shouldStopPendingJobDrain(JsbayHermesContext *c) {
+    if (!g_should_stop_pending_job_drain) return false;
+    const int32_t id = hermesInstanceIdFromOpaque(c);
+    if (id == 0) return false;
+    return g_should_stop_pending_job_drain(id);
+}
+
+// Drain microtasks in bounded batches with a stop/deadline check between them so self-replenishing Promise chains cannot pin the engine thread past the effective execution limit.
+static void drainMicrotasksChecked(JsbayHermesContext *c) {
     if (!c || !c->rt) return;
+    // Batch size 1 mirrors Escargot's per-job stop check; Hermes drainMicrotasks honors maxMicrotasksHint.
+    constexpr int kBatch = 1;
     try {
-        // drainMicrotasks returns true when the queue is empty.
-        while (!c->rt->drainMicrotasks(-1)) {
+        while (true) {
+            if (shouldStopPendingJobDrain(c)) break;
+            if (c->rt->drainMicrotasks(kBatch)) break;
         }
     } catch (...) {
     }
+}
+
+extern "C" void hermes_process_pending_jobs(JsbayHermesContext *c) {
+    if (!c || !c->rt) return;
+    drainMicrotasksChecked(c);
     hermes_flush_pending_rejections(c);
 }
 
@@ -1122,11 +1150,10 @@ extern "C" HermesValue hermes_get_index(JsbayHermesContext *c, HermesValue obj, 
         auto o = asVal(obj)->getObject(*c->rt);
         if (o.isArray(*c->rt)) {
             auto arr = o.getArray(*c->rt);
-            // Out-of-range / hole → JS undefined (not C null), matching arrayGet contract.
-            if (index >= arr.size(*c->rt)) {
-                return retainMove(c, jsi::Value::undefined());
+            // In-range (including holes): array exotic [[Get]] via getValueAtIndex. Out-of-range is not proof of absence — inherited numeric props and own "4294967295" need ordinary indexed lookup.
+            if (index < arr.size(*c->rt)) {
+                return retainMove(c, arr.getValueAtIndex(*c->rt, index));
             }
-            return retainMove(c, arr.getValueAtIndex(*c->rt, index));
         }
         return retainMove(c, o.getProperty(*c->rt, std::to_string(index).c_str()));
     } catch (...) {
@@ -3393,6 +3420,19 @@ facebook::jsi::Value hermes_context_pristine_object(JsbayHermesContext *c) {
     if (c->pristine_object) return facebook::jsi::Value(*c->rt, *c->pristine_object);
     return c->rt->global().getProperty(*c->rt, "Object");
 }
+facebook::jsi::Value hermes_context_pristine_define_property(JsbayHermesContext *c) {
+    if (!c || !c->rt) return facebook::jsi::Value::undefined();
+    if (c->pristine_object_define_property)
+        return facebook::jsi::Value(*c->rt, *c->pristine_object_define_property);
+    // Fallback only when capture failed at context create; still prefer Object.defineProperty on the pristine ctor when available.
+    try {
+        auto obj = hermes_context_pristine_object(c);
+        if (obj.isObject())
+            return obj.getObject(*c->rt).getProperty(*c->rt, "defineProperty");
+    } catch (...) {
+    }
+    return facebook::jsi::Value::undefined();
+}
 static void hermes_flush_pending_rejections(JsbayHermesContext *c) {
     if (!c || !c->rejection_fn) return;
     auto pending = std::move(c->pending_rejections);
@@ -3410,7 +3450,7 @@ static void hermes_flush_pending_rejections(JsbayHermesContext *c) {
 
 void hermes_context_drain_microtasks(JsbayHermesContext *c) {
     if (!c || !c->rt) return;
-    try { c->rt->drainMicrotasks(); } catch (...) {}
+    drainMicrotasksChecked(c);
     hermes_flush_pending_rejections(c);
 }
 

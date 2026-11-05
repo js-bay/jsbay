@@ -1,0 +1,71 @@
+diff --git a/API/hermes/hermes.cpp b/API/hermes/hermes.cpp
+index 3e68d3a4f..51744e242 100644
+--- a/API/hermes/hermes.cpp
++++ b/API/hermes/hermes.cpp
+@@ -1722,12 +1722,11 @@ void HermesRuntimeImpl::queueMicrotask(const jsi::Function &callback) {
+ 
+ bool HermesRuntimeImpl::drainMicrotasks(int maxMicrotasksHint) {
+   if (runtime_.hasMicrotaskQueue()) {
+-    checkStatus(runtime_.drainJobs());
++    // Honor maxMicrotasksHint so hosts can check execution deadlines between batches (self-replenishing Promise chains).
++    checkStatus(runtime_.drainJobs(maxMicrotasksHint));
+   }
+-  // \c drainJobs is currently an unbounded execution, hence no exceptions
+-  // implies drained until TODO(T89426441): \c maxMicrotasksHint is supported
+   runtime_.clearKeptObjects();
+-  return true;
++  return !runtime_.hasPendingJobs();
+ }
+ 
+ jsi::Object HermesRuntimeImpl::global() {
+diff --git a/include/hermes/VM/Runtime.h b/include/hermes/VM/Runtime.h
+index 5f473284e..1a7eddb4c 100644
+--- a/include/hermes/VM/Runtime.h
++++ b/include/hermes/VM/Runtime.h
+@@ -413,7 +413,16 @@ class HERMES_EMPTY_BASES Runtime : public PointerBase,
+   /// by returning a rejected Promise. However, the capability of propagating
+   /// exception per job is required by `queueMicrotask` to properly "report the
+   /// exception" (https://html.spec.whatwg.org/C#microtask-queuing).
+-  ExecutionStatus drainJobs();
++  ///
++  /// \param maxJobs when >= 0, stop after that many jobs even if the queue is
++  /// not empty so hosts can check deadlines between batches. -1 drains until
++  /// empty or an exception (historical unbounded behavior).
++  ExecutionStatus drainJobs(int maxJobs = -1);
++
++  /// \return whether any Promise / microtask jobs remain queued.
++  bool hasPendingJobs() const {
++    return !jobQueue_.empty();
++  }
+ 
+   // ES2021 9.12 "When the abstract operation AddToKeptObjects is called with a
+   // target object reference, it adds the target to a list that will point
+diff --git a/lib/VM/Runtime.cpp b/lib/VM/Runtime.cpp
+index dfba5712c..318e809d1 100644
+--- a/lib/VM/Runtime.cpp
++++ b/lib/VM/Runtime.cpp
+@@ -1857,11 +1857,15 @@ void Runtime::freezeBuiltins() {
+   builtinsFrozen_ = true;
+ }
+ 
+-ExecutionStatus Runtime::drainJobs() {
++ExecutionStatus Runtime::drainJobs(int maxJobs) {
+   GCScope gcScope{*this};
+   MutableHandle<Callable> job{*this};
+   // Note that new jobs can be enqueued during the draining.
++  int drained = 0;
+   while (!jobQueue_.empty()) {
++    if (maxJobs >= 0 && drained >= maxJobs) {
++      break;
++    }
+     GCScopeMarkerRAII marker{gcScope};
+ 
+     job = jobQueue_.front();
+@@ -1876,6 +1880,7 @@ ExecutionStatus Runtime::drainJobs() {
+     if (LLVM_UNLIKELY(callRes == ExecutionStatus::EXCEPTION)) {
+       return ExecutionStatus::EXCEPTION;
+     }
++    ++drained;
+   }
+   return ExecutionStatus::RETURNED;
+ }

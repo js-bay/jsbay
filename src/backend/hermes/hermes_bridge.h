@@ -84,6 +84,9 @@ HermesValue hermes_call(JsbayHermesContext *ctx, HermesValue fn, HermesValue thi
                         const HermesValue *args, size_t argc, char **out_err);
 
 void hermes_process_pending_jobs(JsbayHermesContext *ctx);
+/* Optional: Zig registers this so microtask drains honor stop/interrupt/budget between batches (Hermes bridge is a .so; cannot rely on unresolved Zig exports). */
+typedef bool (*HermesShouldStopPendingJobDrainFn)(int32_t instance_id);
+void hermes_set_should_stop_pending_job_drain(HermesShouldStopPendingJobDrainFn fn);
 
 
 /* ---- Value-returning eval (typed_eval) ---- */
@@ -314,5 +317,7 @@ void hermes_context_drain_microtasks(JsbayHermesContext *c);
 void hermes_context_pump_host_tasks(JsbayHermesContext *c);
 /* Captured Object constructor for ESM factories (ignore page-replaced globalThis.Object). */
 facebook::jsi::Value hermes_context_pristine_object(JsbayHermesContext *c);
+/* Captured Object.defineProperty for ESM factories (ignore page-replaced Object.defineProperty on the mutable ctor). */
+facebook::jsi::Value hermes_context_pristine_define_property(JsbayHermesContext *c);
 #endif
 

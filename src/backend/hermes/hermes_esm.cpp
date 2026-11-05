@@ -35,6 +35,8 @@ struct HermesModLoader {
     HermesModFreeResolvedFn free_resolved = nullptr;
     std::unordered_map<std::string, std::shared_ptr<HermesModuleRecord>> cache;
     std::string current_referrer;
+    // Star/named re-export leaf provenance keyed by export-namespace object — kept off the namespace so a user export named __jsbay_star_origin cannot collide.
+    std::unique_ptr<jsi::Object> star_origin_wm;
 };
 
 // We store loader on context via a side map keyed by context pointer (avoid reshaping opaque).
@@ -73,8 +75,10 @@ static constexpr const char *kPreferredWrapDirname = "__jsbay_dirname";
 static constexpr const char *kPreferredWrapImportMeta = "__jsbay_import_meta";
 // Preferred pristine Object factory-param name so module-local `Object` cannot break generated export registration / star-reexport helpers (body `var Object = Object` would hit TDZ).
 static constexpr const char *kPreferredWrapObject = "__jsbay_Object";
-// Preferred name for defineProperty derived inside the factory from the Object param.
+// Preferred name for the captured pristine Object.defineProperty factory param (not read from the mutable constructor).
 static constexpr const char *kPreferredWrapDefineProperty = "__jsbay_defineProperty";
+// Preferred name for the loader WeakMap that holds star/named re-export leaf provenance off the export namespace.
+static constexpr const char *kPreferredWrapStarOrigins = "__jsbay_star_origins";
 
 struct EsmWrapNames {
     std::string exports;
@@ -85,6 +89,7 @@ struct EsmWrapNames {
     std::string import_meta;
     std::string object;
     std::string define_property;
+    std::string star_origins;
 };
 
 
@@ -2816,17 +2821,16 @@ static std::string exportLiveGetter(const EsmWrapNames &wrap, const std::string 
            "\",{enumerable:true,configurable:false,get:function(){return " + expr + ";}});";
 }
 
-// Named `export {…} from`: live getter plus leaf origin `{m: moduleNs, b: bindingName}` so diamond star-reexports stay unambiguous only when both module identity and binding name match.
+// Named `export {…} from`: live getter plus leaf origin `{m: moduleNs, b: bindingName}` so diamond star-reexports stay unambiguous only when both module identity and binding name match. Provenance lives in the loader WeakMap (wrap.star_origins), not on the export namespace.
 static std::string exportNamedReexport(const EsmWrapNames &wrap, const std::string &exported, const std::string &ns,
                                        const std::string &imported) {
     std::string out = exportLiveGetter(wrap, exported, ns + "." + imported);
-    out += std::string("if(!") + wrap.object + ".prototype.hasOwnProperty.call(" + wrap.exports +
-           ",\"__jsbay_star_origin\"))" + wrap.define_property + "(" + wrap.exports +
-           ",\"__jsbay_star_origin\",{value:" + wrap.object + ".create(null),configurable:true});";
+    out += "var __jsbay_so=" + wrap.star_origins + ".get(" + wrap.exports + ");";
+    out += "if(__jsbay_so==null){" + wrap.star_origins + ".set(" + wrap.exports + ",(__jsbay_so=" + wrap.object + ".create(null)));}";
+    out += "var __jsbay_ns_so=" + wrap.star_origins + ".get(" + ns + ");";
     // Prefer a chained leaf origin; otherwise this named re-export is the leaf (module + imported binding).
-    out += wrap.exports + ".__jsbay_star_origin[\"" + exported + "\"]=(" + ns +
-           ".__jsbay_star_origin&&" + wrap.object + ".prototype.hasOwnProperty.call(" + ns +
-           ".__jsbay_star_origin,\"" + imported + "\"))?" + ns + ".__jsbay_star_origin[\"" + imported +
+    out += "__jsbay_so[\"" + exported + "\"]=(__jsbay_ns_so&&" + wrap.object +
+           ".prototype.hasOwnProperty.call(__jsbay_ns_so,\"" + imported + "\"))?__jsbay_ns_so[\"" + imported +
            "\"]:{m:" + ns + ",b:\"" + imported + "\"};";
     return out;
 }
@@ -2846,6 +2850,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     wrap.import_meta = allocFreshIdentExact(used_idents, kPreferredWrapImportMeta);
     wrap.object = allocFreshIdentExact(used_idents, kPreferredWrapObject);
     wrap.define_property = allocFreshIdentExact(used_idents, kPreferredWrapDefineProperty);
+    wrap.star_origins = allocFreshIdentExact(used_idents, kPreferredWrapStarOrigins);
     std::string body = rewriteImportMetaAndDynamic(src, wrap);
     std::vector<ImportBinding> imports;
     std::vector<std::string> prelude;
@@ -3304,19 +3309,20 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // Star re-exports: compare leaf origins `{m,b}` (module identity + binding name) for ambiguity, but read values from the immediate star source namespace so renamed named re-exports (`export {original as renamed}`) stay reachable under the export name. Omit ambiguous names unless an explicit export already resolved them; record leaf origins on this module for further star re-exports.
+    // Star re-exports: compare leaf origins `{m,b}` (module identity + binding name) for ambiguity, but read values from the immediate star source namespace so renamed named re-exports (`export {original as renamed}`) stay reachable under the export name. Omit ambiguous names unless an explicit export already resolved them; record leaf origins in the loader WeakMap (not on the export namespace) for further star re-exports.
     if (!star_reexport_nss.empty()) {
         std::string star_prov = allocFreshIdentExact(used_idents, "__jsbay_star_prov");
         std::string star_ns_map = allocFreshIdentExact(used_idents, "__jsbay_star_ns");
         std::string star;
         star += "var " + star_prov + "=" + wrap.object + ".create(null);";
         star += "var " + star_ns_map + "=" + wrap.object + ".create(null);";
-        star += std::string("if(!") + wrap.object + ".prototype.hasOwnProperty.call(" + wrap.exports + ",\"__jsbay_star_origin\"))";
-        star += std::string(wrap.define_property) + "(" + wrap.exports + ",\"__jsbay_star_origin\",{value:" + wrap.object + ".create(null),configurable:true});";
+        star += "var __jsbay_ex_so=" + wrap.star_origins + ".get(" + wrap.exports + ");";
+        star += "if(__jsbay_ex_so==null){" + wrap.star_origins + ".set(" + wrap.exports + ",(__jsbay_ex_so=" + wrap.object + ".create(null)));}";
         for (const auto &ns : star_reexport_nss) {
             star += std::string(wrap.object) + ".keys(" + ns + ").forEach(function(k){";
-            star += "if(k===\"default\"||k===\"__jsbay_star_origin\")return;";
-            star += std::string("var __jsbay_origin=(") + ns + ".__jsbay_star_origin&&" + wrap.object + ".prototype.hasOwnProperty.call(" + ns + ".__jsbay_star_origin,k))?" + ns + ".__jsbay_star_origin[k]:{m:" + ns + ",b:k};";
+            star += "if(k===\"default\")return;";
+            star += "var __jsbay_ns_so=" + wrap.star_origins + ".get(" + ns + ");";
+            star += std::string("var __jsbay_origin=(__jsbay_ns_so&&") + wrap.object + ".prototype.hasOwnProperty.call(__jsbay_ns_so,k))?__jsbay_ns_so[k]:{m:" + ns + ",b:k};";
             star += std::string("if(") + wrap.object + ".prototype.hasOwnProperty.call(" + star_prov + ",k)){";
             star += "if(" + star_prov + "[k]==null||" + star_prov + "[k].m!==__jsbay_origin.m||" + star_prov + "[k].b!==__jsbay_origin.b){" + star_prov + "[k]=null;" + star_ns_map + "[k]=null;}";
             star += "}else{" + star_prov + "[k]=__jsbay_origin;" + star_ns_map + "[k]=" + ns + ";}});";
@@ -3327,19 +3333,18 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         star += "if(__jsbay_src==null)return;";
         star += std::string("if(") + wrap.object + ".prototype.hasOwnProperty.call(" + wrap.exports + ",k))return;";
         star += std::string(wrap.define_property) + "(" + wrap.exports + ",k,{enumerable:true,configurable:false,get:function(){return __jsbay_lookup[k];}});";
-        star += std::string(wrap.exports) + ".__jsbay_star_origin[k]=__jsbay_src;";
+        star += "__jsbay_ex_so[k]=__jsbay_src;";
         star += "});";
         post_epilogue.push_back(star);
     }
 
     body = rewriteIdents(body, ident_repl);
 
-    // Pass pristine Object as a factory param (not a body `var`) so a module-local `const Object` TDZ cannot break capture.
+    // Pass pristine Object, captured defineProperty, and the loader star-origin WeakMap as factory params (not body `var`s) so module-local bindings / page-poisoned Object.defineProperty cannot break export publish or collide with provenance storage.
     std::string out = std::string("(async function(") + wrap.exports + "," + wrap.require + "," +
         wrap.module + "," + wrap.filename + "," + wrap.dirname + "," + wrap.import_meta + "," +
-        wrap.object +
+        wrap.object + "," + wrap.define_property + "," + wrap.star_origins +
         "){\n\"use strict\";\n";
-    out += std::string("var ") + wrap.define_property + "=" + wrap.object + ".defineProperty.bind(" + wrap.object + ");\n";
     for (auto &e : hoisted_exports) out += e + "\n";
     for (auto &p : prelude) out += p + "\n";
     out += body;
@@ -3355,6 +3360,15 @@ extern "C" char *hermes_esm_transform_source(const char *src, size_t src_len, co
     if (!src) return nullptr;
     std::string out = transformEsmToCjs(std::string(src, src_len), filename ? filename : "<transform>");
     return dupCStringLocal(out);
+}
+
+
+static jsi::Object ensureStarOriginWm(FbHermesRuntime &rt, HermesModLoader *loader) {
+    if (!loader->star_origin_wm) {
+        auto WM = rt.global().getPropertyAsFunction(rt, "WeakMap");
+        loader->star_origin_wm = std::make_unique<jsi::Object>(WM.callAsConstructor(rt).getObject(rt));
+    }
+    return jsi::Value(rt, *loader->star_origin_wm).asObject(rt);
 }
 
 static std::string resolveId(HermesModLoader *loader, const std::string &referrer, const std::string &specifier) {
@@ -3489,6 +3503,8 @@ static jsi::Object loadAndEvalModule(JsbayHermesContext *c, HermesModLoader *loa
         importMeta.setProperty(rt, "url", jsi::String::createFromUtf8(rt, id));
         auto requireFn = makeRequire(c, loader, rt, id);
         jsi::Value pristineObject = hermes_context_pristine_object(c);
+        jsi::Value pristineDefineProperty = hermes_context_pristine_define_property(c);
+        jsi::Object starOrigins = ensureStarOriginWm(rt, loader);
         jsi::Value result = fn.call(
             rt,
             rec->exports,
@@ -3497,7 +3513,9 @@ static jsi::Object loadAndEvalModule(JsbayHermesContext *c, HermesModLoader *loa
             jsi::String::createFromUtf8(rt, id),
             jsi::String::createFromUtf8(rt, ""),
             importMeta,
-            pristineObject);
+            pristineObject,
+            pristineDefineProperty,
+            starOrigins);
         result = awaitThenable(c, rt, std::move(result));
         if (result.isObject()) {
             rec->exports = result.getObject(rt);
@@ -3535,6 +3553,7 @@ extern "C" void hermes_install_module_loader(JsbayHermesContext *ctx, void *user
     if (it != g_mod_loaders.end()) {
         // Drop cached jsi::Objects while the Runtime is still alive.
         it->second->cache.clear();
+        it->second->star_origin_wm.reset();
         g_mod_loaders.erase(it);
     }
     auto loader = std::make_unique<HermesModLoader>();
@@ -3551,6 +3570,7 @@ extern "C" void hermes_uninstall_module_loader(JsbayHermesContext *ctx) {
     auto it = g_mod_loaders.find(ctx);
     if (it == g_mod_loaders.end()) return;
     it->second->cache.clear();
+    it->second->star_origin_wm.reset();
     g_mod_loaders.erase(it);
 }
 
@@ -3607,11 +3627,15 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
         importMeta.setProperty(rt, "url", jsi::String::createFromUtf8(rt, fname));
         auto requireFn = makeRequire(c, use, rt, fname);
         jsi::Value pristineObject = hermes_context_pristine_object(c);
+        jsi::Value pristineDefineProperty = hermes_context_pristine_define_property(c);
+        jsi::Object starOrigins = ensureStarOriginWm(rt, use);
         jsi::Value result = fn.call(rt, rec->exports, requireFn, moduleObj,
                 jsi::String::createFromUtf8(rt, fname),
                 jsi::String::createFromUtf8(rt, ""),
                 importMeta,
-                pristineObject);
+                pristineObject,
+                pristineDefineProperty,
+                starOrigins);
         result = awaitThenable(c, rt, std::move(result));
         if (result.isObject()) {
             rec->exports = result.getObject(rt);

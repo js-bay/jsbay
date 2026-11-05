@@ -19,6 +19,21 @@ if [[ ! -d "$ICU/lib" ]]; then
 fi
 
 mkdir -p "$BUILD" "$PREFIX"
+# Bounded drainMicrotasks(maxMicrotasksHint) so hosts can honor execution deadlines between batches.
+PATCH="$ROOT/vendor/hermes-drain-microtasks-hint.patch"
+if [[ -f "$PATCH" ]]; then
+  # Apply once; ignore "already applied" (exit 1 with --forward), fail on rejects.
+  set +e
+  out=$(patch -d "$SRC" -p1 --forward --batch < "$PATCH" 2>&1)
+  rc=$?
+  set -e
+  printf '%s
+' "$out"
+  if [[ $rc -ne 0 && "$out" != *"previously applied"* && "$out" != *"Ignoring previously applied"* && "$out" != *"Reversed (or previously applied)"* ]]; then
+    echo "ERROR: failed to apply $PATCH to $SRC (rc=$rc)" >&2
+    exit 1
+  fi
+fi
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" \
