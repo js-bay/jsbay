@@ -1810,10 +1810,13 @@ extern "C" EscargotOpResult escargot_own_keys(EscargotContext *c, EscargotValue 
 }
 
 extern "C" EscargotBoolOpResult escargot_instance_of(EscargotContext *c, EscargotValue value, EscargotValue ctor) {
-    if (!c || !value || !ctor) return boolOk(false);
+    // Only the context is required: null EscargotValue is the undefined sentinel and must still run instanceof (TypeError for undefined ctor; custom Symbol.hasInstance may observe an undefined left operand).
+    if (!c) return boolOk(false);
     auto er = Evaluator::execute(c->ctx.get(),
         [](ExecutionStateRef *state, ValueRef *v, ValueRef *ctorV) -> ValueRef * {
-            return ValueRef::create(v->instanceOf(state, ctorV));
+            ValueRef *left = v ? v : ValueRef::createUndefined();
+            ValueRef *right = ctorV ? ctorV : ValueRef::createUndefined();
+            return ValueRef::create(left->instanceOf(state, right));
         },
         asVal(value), asVal(ctor));
     if (!er.isSuccessful()) return boolFail(c, retainedErrorOrNull(c, er));

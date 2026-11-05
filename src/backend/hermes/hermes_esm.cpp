@@ -2780,8 +2780,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 consume_match(m);
                 continue;
             }
-            // Also allow imports after newlines or same-line statements (`;`): search next top-level import on blankNonCode so commented-out `import` is ignored; mutate live body at those offsets.
-            static const std::regex any_import(R"((^|[\n;])(\s*import\s))");
+            // Also allow imports after newlines, same-line statements (`;`), or a closed declaration block (`}`): search next top-level import on blankNonCode so commented-out `import` is ignored; mutate live body at those offsets.
+            static const std::regex any_import(R"((^|[\n;}])(\s*import\s))");
             {
                 std::string blanked = blankNonCode(body);
                 if (std::regex_search(blanked, m, any_import)) {

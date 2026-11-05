@@ -933,6 +933,26 @@ test "modules: static import after same-line statement is extracted" {
     try testing.expectEqual(@as(i64, 43), try helpers.evalInt(id, "globalThis.__result__"));
 }
 
+test "modules: static import after same-line block declaration is extracted" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Top-level import after a same-line closed function/class declaration must still be collected (no required `;`/newline before `import`).
+    const src = "export function read(){return value;} import {value} from 'dep';\nglobalThis.__result__ = read();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__result__"));
+}
+
 test "modules: regex literal after braced if-statement is not rewritten as import" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);

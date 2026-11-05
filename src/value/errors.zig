@@ -268,8 +268,7 @@ pub fn throwError(instance_id: i32, kind: JsErrorKind, message: []const u8) bool
             return true;
         },
         .escargot, .hermes => {
-            // pending_throw is message-only (Escargot trampoline → TypeError;
-            // Hermes → `throw new Error(...)`). `kind` is honored on QJS/JSC arms only.
+            // pending_throw is message-only (Escargot trampoline → TypeError; Hermes → `throw new Error(...)`). `kind` is honored on QJS/JSC arms only.
             var buf: [1024]u8 = undefined;
             if (message.len >= buf.len) return false;
             @memcpy(buf[0..message.len], message);
