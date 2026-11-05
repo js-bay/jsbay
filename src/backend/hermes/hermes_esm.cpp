@@ -2180,6 +2180,32 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
                 }
                 continue;
             }
+            if (src[i] == '\'' || src[i] == '"' || src[i] == '`') {
+                // Quoted property key `"key": binding` — consume the key as one token; collect only the binding after `:` (do not treat the key text as a binding).
+                if (!skipStringTemplateOrComment(src, i)) return;
+                skipWsAndComments(src, i);
+                if (i < src.size() && src[i] == ':') {
+                    ++i;
+                    collectPatternBoundNames(src, i, names);
+                    skipWsAndComments(src, i);
+                    if (i < src.size() && src[i] == '=') {
+                        ++i;
+                        int depth = 0;
+                        while (i < src.size()) {
+                            if (skipStringTemplateOrComment(src, i)) continue;
+                            char ch = src[i];
+                            if (ch == '{' || ch == '[' || ch == '(') { ++depth; ++i; continue; }
+                            if (ch == '}' || ch == ']' || ch == ')') {
+                                if (depth == 0) break;
+                                --depth; ++i; continue;
+                            }
+                            if (depth == 0 && (ch == ',' || ch == '}')) break;
+                            ++i;
+                        }
+                    }
+                }
+                continue;
+            }
             if (!isIdentStart(src[i])) { ++i; continue; }
             size_t j = i + 1;
             while (j < src.size() && isIdent(src[j])) ++j;

@@ -847,6 +847,24 @@ test "modules: destructured param property key does not shadow import" {
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__result__"));
 }
 
+
+test "modules: export quoted destructure key does not redefine binding" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    try withEmptyLoaderEngine(struct {
+        fn run(id: i32, ctx: *TestLoaderCtx) !void {
+            // Quoted key `"value"` is not a binding; only the binding after `:` is exported once (native ESM exports 42).
+            try ctx.modules.put("m", "export const {\"value\": value} = {value: 42};");
+            const res = engine.evalModule(id,
+                \\import { value } from 'm';
+                \\globalThis.__qv = value;
+            , "<entry>");
+            defer helpers.freeEvalResult(res);
+            try testing.expect(res.err == null);
+            try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__qv"));
+        }
+    }.run);
+}
+
 test "modules: export async function declaration" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
@@ -1534,6 +1552,27 @@ test "modules: top-level await completes and later code in the module runs" {
         }
     }.run);
 }
+
+test "modules: top-level await settles setTimeout(0) promise" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    // Hermes-only: sync TLA host-progress pump must arm+dispatch timers; other backends settle TLA via their own event-loop drain.
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
+    try withEmptyLoaderEngine(struct {
+        fn run(id: i32, ctx: *TestLoaderCtx) !void {
+            _ = ctx;
+            // Host timer must arm+dispatch during sync TLA pump (not only drain an empty ready queue).
+            const res = engine.evalModule(id,
+                \\globalThis.__tla_timer = 'before';
+                \\await new Promise(function (resolve) { setTimeout(resolve, 0); });
+                \\globalThis.__tla_timer = 'done';
+            , "<entry>");
+            defer helpers.freeEvalResult(res);
+            try testing.expect(res.err == null);
+            try helpers.expectEvalEquals(id, "globalThis.__tla_timer", "done");
+        }
+    }.run);
+}
+
 
 // How a failed dependency is reported differs by backend (an eval error on JSC, a rejected module promise on the QuickJS family), so only what must hold everywhere is asserted: the importer's body does not run, the failing body ran once, and the engine stays usable.
 test "modules: a dependency that throws keeps its importer from running" {

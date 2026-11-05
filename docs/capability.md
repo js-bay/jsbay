@@ -1,6 +1,6 @@
 # Escargot / Hermes — capability vs QuickJS
 
-Backends selected with `-Dbackend=escargot` or `-Dbackend=hermes`. ABI is not frozen yet (full engine_thread suite / inspector / QJS native_handle class_id still missing; Escargot has rejection tracker; spike native_handle opaque+call+finalize+method this-binding; Hermes host ESM shim landed). Suite lists below are what `src/tests/all_tests.zig` imports for each backend; out-of-scope suites stay out of the aggregator. Production gap ranking: `docs/production-gaps.md`.
+Backends selected with `-Dbackend=escargot` or `-Dbackend=hermes`. ABI is not frozen yet (full engine_thread suite / inspector / QJS native_handle class_id still missing; Escargot has rejection tracker; spike native_handle opaque+call+finalize+method this-binding; Hermes host ESM shim). Suite lists below are what `src/tests/all_tests.zig` imports for each backend; out-of-scope suites stay out of the aggregator. Production gap ranking: `docs/production-gaps.md`.
 
 Shared tree: both engines live under `src/backend/{escargot,hermes}/`. Build one at a time via `-Dbackend=…` (not a multi-engine pack).
 
@@ -160,7 +160,7 @@ Supported threading configuration: `ENABLE_THREADING`, `ENABLE_TLS_ACCESS_BY_PTH
 - **Escargot mid-script interrupt — permanent**: no hook in `EscargotPublic.h` (this pin)
 - **`setMemoryLimit` — permanent false** both backends; Hermes **create-time** max heap via Zig `EngineConfig.max_heap_size` or `-Dhermes-max-heap=N` (bytes; 0=default 3GiB). **`jsbay_engine_create_with_options`** exposes create-time `max_heap_size` (Hermes); plain `create` leaves 0. `set_memory_limit` still false on spike.
 - **User `requestInterrupt`**: spike returns **false** (`supportsMidScriptUserInterrupt()==false`); Hermes mid-script remains stop/destroy only. `runtime_control_tests` not imported on spike.
-- **`getMemoryUsage` soft stats landed** (Escargot `Memory::heapSize`/`totalSize`; Hermes `instrumentation().getHeapInfo`)
+- **`getMemoryUsage` soft stats** (Escargot `Memory::heapSize`/`totalSize`; Hermes `instrumentation().getHeapInfo`)
 - Hermes stop/destroy: soft `watchTimeLimit` + `softRearmHermesStopAfterHost` + idle drain
 - Escargot ET+host: **same-thread only**; `skipEscargotEtHost` — diminishing returns vs per-ET Context
 - Escargot DestroyDefer (2): bdwgc ABRT — not cheap

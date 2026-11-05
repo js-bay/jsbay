@@ -137,8 +137,8 @@ fn hostProgressPump(ud: ?*anyopaque) callconv(.c) void {
         sched.execution_depth = saved_depth;
         sched.checkpoint_active = saved_checkpoint;
     }
-    const now: u64 = @intCast(@import("../../platform/io.zig").monotonicMilliseconds());
-    timers_mod.fireDue(id, now);
+    // Normal turn path: prepare/beginTick arms pending timers, dispatch moves due ones onto ready, then the turn fires them. fireDue alone only drains ready/firing and leaves newly scheduled timers pending.
+    @import("../../engine.zig").runEventLoopOnce(id);
 }
 
 pub fn registerTimers(ctx: Context) void {
