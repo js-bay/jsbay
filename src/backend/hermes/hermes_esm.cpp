@@ -1,6 +1,4 @@
-// Hermes spike ESM ModuleLoader — host-side transform (Hermes pin disables native CJS/ESM codegen).
-//
-// Transforms a subset of import/export into a CommonJS-like wrapper evaluated via JSI.
+// Hermes spike ESM ModuleLoader — host-side transform (Hermes pin disables native CJS/ESM codegen). Transforms a subset of import/export into a CommonJS-like wrapper evaluated via JSI.
 #include "hermes_bridge.h"
 
 #include <hermes/hermes.h>
@@ -56,11 +54,14 @@ static void hermesEvalSetErrLocal(HermesEvalResult &out, const std::string &s) {
     out.err_len = out.err ? s.size() : 0;
 }
 
+// Identifier bytes: ASCII ID_Start/ID_Continue plus UTF-8 lead/continuation so UnicodeIDStart names (e.g. π) are collected as one binding rather than rejected as non-idents.
 static bool isIdentStart(char c) {
-    return std::isalpha(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+    unsigned char uc = static_cast<unsigned char>(c);
+    return std::isalpha(uc) || c == '_' || c == '$' || uc >= 0x80;
 }
 static bool isIdent(char c) {
-    return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+    unsigned char uc = static_cast<unsigned char>(c);
+    return std::isalnum(uc) || c == '_' || c == '$' || uc >= 0x80;
 }
 
 // Preferred CJS wrapper parameter names. transformEsmToCjs allocates collision-free instances against module source idents so a user binding like `export const __jsbay_exports = 1` does not clash with factory params (params share the module body scope).
@@ -130,9 +131,7 @@ static std::string blankNonCode(const std::string &src) {
 }
 
 
-// True when `/` after `preceding` can start a RegExp literal (vs division).
-//
-// Practical heuristic: regex-ok after operators / expression-intro keywords / punctuators and at start-of-input; division after identifiers, numbers, `)`, `]`, string/template closes.
+// True when `/` after `preceding` can start a RegExp literal (vs division). Practical heuristic: regex-ok after operators / expression-intro keywords / punctuators and at start-of-input; division after identifiers, numbers, `)`, `]`, string/template closes.
 static bool canStartRegexLiteral(const std::string &preceding) {
     size_t pk = preceding.size();
     while (pk > 0 && std::isspace(static_cast<unsigned char>(preceding[pk - 1]))) --pk;
@@ -469,16 +468,13 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
 static std::vector<std::string> collectDeclaratorBoundNames(const std::string &src, size_t start);
 static std::vector<std::string> collectParamListBoundNames(const std::string &src, size_t open_paren);
 static bool takeBalancedBracketExpr(const std::string &src, size_t &i, size_t &expr_start, size_t &expr_end);
+static bool skipStringTemplateOrComment(const std::string &src, size_t &i);
 static char prevSignificantChar(const std::string &src, size_t pos);
 static size_t skipTriviaBackward(const std::string &src, size_t pos);
 static char prevSignificantSkippingComments(const std::string &src, size_t pos);
 static void collectAsAliasSpecs(const std::string &specs, std::vector<std::pair<std::string, std::string>> &out);
 
-// Skip strings/comments/regex roughly; return rewritten source with identifier replacements.
-//
-// Template literal text is preserved, but `${...}` interpolations are rewritten recursively.
-//
-// Regex literals are copied verbatim so identifiers inside the pattern/flags are not rewritten.
+// Skip strings/comments/regex roughly; return rewritten source with identifier replacements. Template literal text is preserved, but `${...}` interpolations are rewritten recursively. Regex literals are copied verbatim so identifiers inside the pattern/flags are not rewritten.
 static std::string rewriteIdents(const std::string &src,
                                  const std::unordered_map<std::string, std::string> &repl,
                                  std::vector<std::unordered_set<std::string>> scopes) {
@@ -1532,9 +1528,7 @@ static std::string rewriteIdents(const std::string &src,
                 continue;
             }
 
-            // const / let / var — register declarator bindings; rewrite only initializer expressions.
-            //
-            // `var` is function-scoped (or module-scoped): keep it active for the enclosing function, not the current block.
+            // const / let / var — register declarator bindings; rewrite only initializer expressions. `var` is function-scoped (or module-scoped): keep it active for the enclosing function, not the current block.
             if ((id == "const" || id == "let" || id == "var") && (i == 0 || !isIdent(src[i - 1]))) {
                 out += id;
                 i = j;
@@ -1699,9 +1693,7 @@ static std::string rewriteIdents(const std::string &src,
                 }
             }
 
-            // ParamList / destructuring pattern under ParamList: do not rewrite. Bound names were already registered by collectParamListBoundNames when the ParamList opened — do not treat property keys (`{value: x}`) as additional bindings.
-            //
-            // Default-initializer expressions (after `=` until `,`/`)`) may reference imports — allow rewrite. Computed keys are rewritten via the Cont::ObjectLit `[` handler before this path.
+            // ParamList / destructuring pattern under ParamList: do not rewrite. Bound names were already registered by collectParamListBoundNames when the ParamList opened — do not treat property keys (`{value: x}`) as additional bindings. Default-initializer expressions (after `=` until `,`/`)`) may reference imports — allow rewrite. Computed keys are rewritten via the Cont::ObjectLit `[` handler before this path.
             if (underParamList()) {
                 char p = prevSignificant();
                 if (p != '.' && p != '?') {
@@ -1778,8 +1770,30 @@ static std::string rewriteIdents(const std::string &src,
                     if (at_stmt_boundary && !outEndsWithWord(lpk, "case")) label_decl = true;
                 }
             }
+            // Accessor modifiers (`get`/`set` before a property key then `(`) are keywords, not value references — leave them even when an import binds the same name.
+            bool accessor_modifier = false;
+            if ((id == "get" || id == "set") && !after_dot && !after_question &&
+                (in_object_lit_for_key || in_class_body_for_key) && k < src.size()) {
+                size_t ak = k;
+                bool saw_key = false;
+                if (isIdentStart(src[ak])) {
+                    ++ak;
+                    while (ak < src.size() && isIdent(src[ak])) ++ak;
+                    saw_key = true;
+                } else if (src[ak] == '\'' || src[ak] == '"' || src[ak] == '`') {
+                    size_t t = ak;
+                    if (skipStringTemplateOrComment(src, t)) { ak = t; saw_key = true; }
+                } else if (src[ak] == '[') {
+                    size_t es = 0, ee = 0;
+                    if (takeBalancedBracketExpr(src, ak, es, ee)) saw_key = true;
+                }
+                if (saw_key) {
+                    skipSpacesAndCommentsSrc(ak);
+                    if (ak < src.size() && src[ak] == '(') accessor_modifier = true;
+                }
+            }
             auto it = repl.find(id);
-            if (!after_dot && !object_key && !method_key && !label_decl && !label_operand && it != repl.end() && !isShadowed(id)) {
+            if (!after_dot && !object_key && !method_key && !label_decl && !label_operand && !accessor_modifier && it != repl.end() && !isShadowed(id)) {
                 // Shorthand only for ObjectLit property context — not arrays, args, or blocks.
                 bool in_object_lit = !cont.empty() && cont.back() == Cont::ObjectLit;
                 bool after_shorthand_intro = false;
@@ -2280,7 +2294,17 @@ static void collectPatternBoundNames(const std::string &src, size_t &i, std::vec
                 i = j;
                 continue;
             }
+            size_t before_elem = i;
             collectPatternBoundNames(src, i, names);
+            // If the recursive call collected nothing and left `i` unchanged (non-ident start), advance one UTF-8 codepoint/byte so the element loop cannot spin forever.
+            if (i == before_elem && i < src.size()) {
+                unsigned char b = static_cast<unsigned char>(src[i]);
+                if (b < 0x80) ++i;
+                else if ((b & 0xE0) == 0xC0) i = std::min(i + 2, src.size());
+                else if ((b & 0xF0) == 0xE0) i = std::min(i + 3, src.size());
+                else if ((b & 0xF8) == 0xF0) i = std::min(i + 4, src.size());
+                else ++i;
+            }
             skipWsAndComments(src, i);
             if (i < src.size() && src[i] == '=') {
                 ++i;
@@ -2926,11 +2950,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     }
     eatImports();
 
-    // Re-export dependency loads go into the static prelude (native ESM: all static deps before module body).
-    //
-    // Process named and star re-exports left-to-right so prelude require order matches source order.
-    //
-    // Each entry is (module, require-line); merged with ordinary imports by static_dep_occs source order below.
+    // Re-export dependency loads go into the static prelude (native ESM: all static deps before module body). Process named and star re-exports left-to-right so prelude require order matches source order. Each entry is (module, require-line); merged with ordinary imports by static_dep_occs source order below.
     std::vector<std::pair<std::string, std::string>> reexport_prelude;
     std::vector<std::string> star_reexport_nss;
     std::vector<std::string> post_epilogue;
@@ -3126,9 +3146,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         }
     }
 
-    // Build require prelude + live import bindings.
-    //
-    // Ordinary imports and re-export dependencies share one source-ordered static dependency prelude (native ESM init order).
+    // Build require prelude + live import bindings. Ordinary imports and re-export dependencies share one source-ordered static dependency prelude (native ESM init order).
     std::unordered_map<std::string, std::string> ident_repl;
     for (auto &ib : imports) {
         if (ib.module.empty() || ib.local.empty()) continue; // side-effect only

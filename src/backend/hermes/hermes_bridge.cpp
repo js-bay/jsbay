@@ -80,6 +80,8 @@ struct JsbayHermesContextOpaque {
     std::unique_ptr<jsi::Function> pristine_json_stringify;
     // Unary ToNumber helper `(function(x){return +x;})` — call with the value; never stash args in a mutable global slot.
     std::unique_ptr<jsi::Function> pristine_to_number;
+    // Pristine `instanceof` checker `(v, c) => v instanceof c` captured before scripts can replace globalThis.Function.
+    std::unique_ptr<jsi::Function> pristine_instanceof_checker;
     // Host WeakMap for stable JS object identity across distinct retained Value wrappers.
     std::unique_ptr<jsi::Object> identity_wm;
     // Pristine WeakMap.prototype has/get/set — ignore script replacements of the mutable prototype.
@@ -518,6 +520,16 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
             to_number_fn.getObject(*c->rt).getFunction(*c->rt));
     } catch (...) {
         c->pristine_to_number.reset();
+    }
+    try {
+        auto checker = c->rt->global()
+            .getPropertyAsFunction(*c->rt, "Function")
+            .callAsConstructor(*c->rt, "v", "c", "return v instanceof c;")
+            .asObject(*c->rt)
+            .asFunction(*c->rt);
+        c->pristine_instanceof_checker = std::make_unique<jsi::Function>(std::move(checker));
+    } catch (...) {
+        c->pristine_instanceof_checker.reset();
     }
     return c;
 }
@@ -2223,15 +2235,11 @@ extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj
 extern "C" HermesBoolOpResult hermes_instance_of(JsbayHermesContext *c, HermesValue value, HermesValue ctor) {
     // Only the context is required here: null HermesValue is the undefined sentinel and must still run instanceof (TypeError for undefined ctor; custom Symbol.hasInstance may observe an undefined left operand).
     if (!c || !c->rt) return hboolOk(false);
+    if (!c->pristine_instanceof_checker) return hboolOk(false);
     try {
-        auto checker = c->rt->global()
-            .getPropertyAsFunction(*c->rt, "Function")
-            .callAsConstructor(*c->rt, "v", "c", "return v instanceof c;")
-            .asObject(*c->rt)
-            .asFunction(*c->rt);
         jsi::Value left = value ? jsi::Value(*c->rt, *asVal(value)) : jsi::Value::undefined();
         jsi::Value right = ctor ? jsi::Value(*c->rt, *asVal(ctor)) : jsi::Value::undefined();
-        jsi::Value r = checker.call(*c->rt, left, right);
+        jsi::Value r = c->pristine_instanceof_checker->call(*c->rt, left, right);
         return hboolOk(r.isBool() && r.getBool());
     } catch (const jsi::JSError &e) {
         return hboolFail(c, jsi::Value(*c->rt, e.value()));
@@ -2930,38 +2938,33 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
         }
         base = clean.empty() ? "script.js" : clean;
     }
-    std::string js_path = std::string("/tmp/jsbay-hbc-XXXXXX-") + base;
-    // mkstemps needs the template to end with the suffix after XXXXXX. Use a fixed suffix ".js" template then rename to include basename.
-    char js_tmpl[] = "/tmp/jsbay-hbc-XXXXXX.js";
-    char hbc_path[] = "/tmp/jsbay-hbc-XXXXXX.hbc";
-    int js_fd = mkstemps(js_tmpl, 3);
+    // Private mode-0700 directory avoids shared-/tmp TOCTOU on hermesc -out= (no pre-unlinked public name).
+    char dir_tmpl[] = "/tmp/jsbay-hbc-XXXXXX";
+    if (!mkdtemp(dir_tmpl)) {
+        out.err = dupCString("mkdtemp failed");
+        return out;
+    }
+    std::string dir = dir_tmpl;
+    std::string js_path = dir + "/" + base;
+    std::string hbc_path = dir + "/out.hbc";
+    std::string err_path = dir + "/hermesc.err";
+    auto cleanupDir = [&]() {
+        unlink(js_path.c_str());
+        unlink(hbc_path.c_str());
+        unlink(err_path.c_str());
+        rmdir(dir.c_str());
+    };
+
+    int js_fd = open(js_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (js_fd < 0) {
-        out.err = dupCString("mkstemps js failed");
+        cleanupDir();
+        out.err = dupCString("open js temp failed");
         return out;
     }
-    int hbc_fd = mkstemps(hbc_path, 4);
-    if (hbc_fd < 0) {
-        close(js_fd);
-        unlink(js_tmpl);
-        out.err = dupCString("mkstemps hbc failed");
-        return out;
-    }
-    close(hbc_fd);
-    unlink(hbc_path);
-
-    // Rename js temp to end with caller basename for debug info.
-    js_path = std::string(js_tmpl);
-    {
-        std::string renamed = std::string(js_tmpl);
-        // replace trailing .js with -basename (keep unique XXXXXX prefix)
-        if (renamed.size() > 3) renamed = renamed.substr(0, renamed.size() - 3) + "-" + base;
-        if (rename(js_tmpl, renamed.c_str()) == 0) js_path = renamed;
-    }
-
     ssize_t wrote = write(js_fd, src, src_len);
     close(js_fd);
     if (wrote < 0 || (size_t)wrote != src_len) {
-        unlink(js_path.c_str());
+        cleanupDir();
         out.err = dupCString("write source failed");
         return out;
     }
@@ -2969,9 +2972,7 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
     std::string hermesc = findHermesc();
     // -g1 embeds location info (incl. source path basename) for stack traces. Use fork/exec (not system()) so filenames with shell metacharacters are safe.
     std::string out_arg = std::string("-out=") + hbc_path;
-    char err_tmpl[] = "/tmp/jsbay-hermesc-XXXXXX.err";
-    int err_fd = mkstemps(err_tmpl, 4);
-    std::string err_path = (err_fd >= 0) ? std::string(err_tmpl) : std::string();
+    int err_fd = open(err_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     pid_t pid = fork();
     int rc = -1;
     if (pid == 0) {
@@ -2992,47 +2993,55 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
             waited = waitpid(pid, &status, 0);
         } while (waited < 0 && errno == EINTR);
         if (waited != pid) {
-            unlink(js_path.c_str());
-            if (!err_path.empty()) unlink(err_path.c_str());
-            unlink(hbc_path);
+            cleanupDir();
             out.err = dupCString("waitpid hermesc failed");
             return out;
         }
         rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     } else {
         if (err_fd >= 0) close(err_fd);
-        if (!err_path.empty()) unlink(err_path.c_str());
-        unlink(js_path.c_str());
+        cleanupDir();
         out.err = dupCString("fork hermesc failed");
         return out;
     }
-    unlink(js_path.c_str());
     if (rc != 0) {
         std::string err = "hermesc failed";
-        if (!err_path.empty()) {
-            std::ifstream ef(err_path);
-            if (ef) {
-                std::ostringstream ss;
-                ss << ef.rdbuf();
-                std::string body = ss.str();
-                if (!body.empty()) err = body;
-            }
-            unlink(err_path.c_str());
+        std::ifstream ef(err_path);
+        if (ef) {
+            std::ostringstream ss;
+            ss << ef.rdbuf();
+            std::string body = ss.str();
+            if (!body.empty()) err = body;
         }
+        cleanupDir();
         out.err = dupCString(err);
-        unlink(hbc_path);
         return out;
     }
-    if (!err_path.empty()) unlink(err_path.c_str());
-    std::ifstream in(hbc_path, std::ios::binary);
-    if (!in) {
+    // Prefer O_NOFOLLOW so a replaced symlink/FIFO inside the private dir cannot redirect the read.
+    int hbc_fd = open(hbc_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (hbc_fd < 0) {
+        cleanupDir();
         out.err = dupCString("failed to read hermesc output");
-        unlink(hbc_path);
         return out;
     }
-    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    in.close();
-    unlink(hbc_path);
+    std::vector<uint8_t> bytes;
+    {
+        uint8_t buf[8192];
+        for (;;) {
+            ssize_t n = read(hbc_fd, buf, sizeof(buf));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                close(hbc_fd);
+                cleanupDir();
+                out.err = dupCString("failed to read hermesc output");
+                return out;
+            }
+            if (n == 0) break;
+            bytes.insert(bytes.end(), buf, buf + n);
+        }
+    }
+    close(hbc_fd);
+    cleanupDir();
     if (bytes.empty()) {
         out.err = dupCString("empty hermesc output");
         return out;

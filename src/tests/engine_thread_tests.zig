@@ -533,8 +533,7 @@ fn runOnWorker(job: *RunJob) !void {
 // ---------------------------------------------------------------------------
 
 fn skipSpikeUnlessGreen() !void {
-    // No-op placeholder (Hermes green). Escargot: after-stop / nested / filename peeled;
-    // destroy-defer / unstarted use skipEscargotDestroyDefer (bdwgc ABRT).
+    // No-op for backends that already pass these engine-thread cases; Escargot destroy-defer / unstarted still use skipEscargotDestroyDefer (bdwgc ABRT).
     _ = {};
 }
 
