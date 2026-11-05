@@ -29,11 +29,26 @@ pub fn runGc(rt: Runtime) void {
     c_api.escargot_runtime_gc(rt);
 }
 
+fn shouldStopPendingJobDrain(instance_id: i32) bool {
+    const runtime_control = @import("../../runtime/runtime_control.zig");
+    if (runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) return true;
+    // Include the per-entry execution budget and shutdown grace, not only the absolute manual deadline; short Promise microtasks may finish without an opcode interrupt check, so without this an expired budget never ends the drain.
+    return if (runtime_control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
+}
+
+/// C bridge job drains call this between `executePendingJob` so stop/budget can finish joining the engine thread.
+export fn jsbay_escargot_should_stop_pending_job_drain(instance_id: c_int) callconv(.c) bool {
+    return shouldStopPendingJobDrain(@intCast(instance_id));
+}
+
 pub fn processPendingJobs(ctx: Context) void {
     // Match QuickJS/JSC: Deferred.settleWith can call this while an outer script/native callback is still on the stack; gate so Promise reactions wait for the outer checkpoint.
     if (ctx == null) return;
     if (!@import("../../runtime/scheduler_gate.zig").allows(@ptrCast(ctx))) return;
     defer @import("../../runtime/scheduler_gate.zig").finished(@ptrCast(ctx));
+    const opaque_ptr = c_api.escargot_context_get_opaque(ctx);
+    const instance_id: i32 = if (opaque_ptr) |p| @bitCast(@as(u32, @truncate(@intFromPtr(p)))) else 0;
+    if (instance_id != 0 and shouldStopPendingJobDrain(instance_id)) return;
     c_api.escargot_process_pending_jobs(ctx);
 }
 

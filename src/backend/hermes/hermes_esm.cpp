@@ -3217,10 +3217,11 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 const std::string &exported = pr.second;
                 auto origin = import_local_origin.find(local);
                 if (origin != import_local_origin.end())
-                    // Carry the imported binding's leaf provenance through local export lists (import-then-export diamond).
+                    // Carry the imported binding's leaf provenance through local export lists (import-then-export diamond). Re-exports need the dependency namespace from the prelude, so they stay at the export statement.
                     repl += exportNamedReexport(wrap, exported, origin->second.first, origin->second.second);
                 else
-                    repl += exportLiveGetter(wrap, exported, local);
+                    // Local `export {f}` must publish before the dependency prelude so cyclic importers observe the binding like `export function f()`.
+                    hoisted_exports.push_back(exportLiveGetter(wrap, exported, local));
             }
             body.replace(m.position(), m.length(), prefix + repl);
         }
@@ -3274,6 +3275,32 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
         for (const auto &p : reexport_prelude) {
             size_t n = seen[p.first]++;
             if (n >= reexport_emit_idx[p.first]) prelude.push_back(p.second);
+        }
+    }
+
+    // Reject missing named/default imports during linking (after requires, before the importer body) instead of rewriting them into silent undefined property reads.
+    {
+        std::unordered_set<std::string> validated;
+        auto js_str = [](const std::string &s) {
+            std::string out = "\"";
+            for (unsigned char ch : s) {
+                if (ch == '\\' || ch == '"') out.push_back('\\');
+                out.push_back(static_cast<char>(ch));
+            }
+            out.push_back('"');
+            return out;
+        };
+        for (const auto &ib : imports) {
+            if (ib.module.empty() || ib.local.empty() || ib.imported == ".") continue;
+            const std::string key = ib.module + "\x1f" + ib.imported;
+            if (!validated.insert(key).second) continue;
+            auto ns_it = mod_to_ns.find(ib.module);
+            if (ns_it == mod_to_ns.end()) continue;
+            const std::string &ns = ns_it->second;
+            const std::string msg = "The requested module '" + ib.module + "' does not provide an export named '" + ib.imported + "'";
+            prelude.push_back(
+                "if(!" + std::string(wrap.object) + ".prototype.hasOwnProperty.call(" + ns + "," + js_str(ib.imported) + "))"
+                "throw new SyntaxError(" + js_str(msg) + ");");
         }
     }
 

@@ -201,28 +201,37 @@ pub fn deinit(instance_id: i32) bool {
 
 fn hermesTriggerTimeout(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    const inst = instance_map.getInstance(instance_id) orelse return;
+    // Control-plane lease: refuse teardown_pending and keep destroyRuntime waiting so asyncTriggerTimeout cannot touch a freed Hermes runtime.
+    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    defer lease.end();
+    const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
-    her.c_api_mod.hermes_runtime_async_trigger_timeout(inst.monoRuntime().?);
+    her.c_api_mod.hermes_runtime_async_trigger_timeout(rt);
 }
 
 fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    const inst = instance_map.getInstance(instance_id) orelse return;
+    // Lease across watch/unwatch so clear_interrupt cannot race destroyRuntime freeing the Hermes runtime while the map entry still exists.
+    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    defer lease.end();
+    const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
     if (millis == 0) {
-        her.c_api_mod.hermes_runtime_unwatch_time_limit(inst.monoRuntime().?);
+        her.c_api_mod.hermes_runtime_unwatch_time_limit(rt);
         return;
     }
     const capped: u32 = if (millis > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(millis);
-    her.c_api_mod.hermes_runtime_watch_time_limit(inst.monoRuntime().?, capped);
+    her.c_api_mod.hermes_runtime_watch_time_limit(rt, capped);
 }
 
 fn hermesDrainAsyncTimeout(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    const inst = instance_map.getInstance(instance_id) orelse return;
+    // Same lease as watch/trigger: drain touches native Hermes timeout state that destroyRuntime frees.
+    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    defer lease.end();
+    const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
-    her.c_api_mod.hermes_runtime_drain_async_timeout(inst.monoRuntime().?);
+    her.c_api_mod.hermes_runtime_drain_async_timeout(rt);
 }
 
 /// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from requestStopInterrupt (destroy/stop) therefore kills finite work after a host callback (`hostDestroy(); 42`). Call from the host trampoline on the way back into JS: clear sticky bits on every eval-active instance on this thread (nested destroy can arm outer frames too), then arm a short watch so loops still abort soon.

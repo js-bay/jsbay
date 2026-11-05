@@ -1892,3 +1892,50 @@ test "modules: ESM factory uses captured Object when global Object is replaced" 
     try testing.expect(res.err == null);
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__v__"));
 }
+
+test "modules: local export-list is visible to cyclic importer" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    // Hermes-only: ESM→CJS transform must hoist local `export {f}` like `export function f` for cyclic importers.
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    // `export {f}` must hoist like `export function f` so B can call f while A is still evaluating.
+    try ctx.modules.put("a", "import 'b'; function f(){ return 42; } export { f };");
+    try ctx.modules.put("b", "import { f } from 'a'; globalThis.__cyclic_f__ = f();");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const res = engine.evalModule(id, "import 'a';", "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__cyclic_f__"));
+}
+
+test "modules: missing named import is rejected before importer body" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    // Hermes-only: transform must SyntaxError missing named imports during link, before the importer body runs.
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const present = 1;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const res = engine.evalModule(id, "import { missing } from 'dep'; globalThis.__ran__ = 1;", "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err != null);
+    const err = res.err.?;
+    try testing.expect(std.mem.indexOf(u8, err, "missing") != null);
+    // Importer body must not run after a failed named-import link.
+    try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__ran__ === 1 ? 1 : 0"));
+}
+
+

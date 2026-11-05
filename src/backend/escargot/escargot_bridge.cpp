@@ -736,12 +736,33 @@ extern "C" EscargotValue escargot_call(EscargotContext *c, EscargotValue fn, Esc
     return retain(c, er.result);
 }
 
-extern "C" void escargot_process_pending_jobs(EscargotContext *c) {
+// Zig exports this so Escargot job drains honor stop/interrupt/budget the same way QuickJS does between jobs.
+extern "C" bool jsbay_escargot_should_stop_pending_job_drain(int32_t instance_id);
+
+static int32_t escargotInstanceIdFromOpaque(EscargotContextOpaque *c) {
+    if (!c || !c->opaque) return 0;
+    return static_cast<int32_t>(reinterpret_cast<uintptr_t>(c->opaque) & 0xffffffffu);
+}
+
+static bool shouldStopPendingJobDrain(EscargotContextOpaque *c) {
+    const int32_t id = escargotInstanceIdFromOpaque(c);
+    if (id == 0) return false;
+    return jsbay_escargot_should_stop_pending_job_drain(id);
+}
+
+// Drain microtasks with a stop/deadline check between jobs so self-replenishing Promise chains cannot pin the engine thread past threadStop.
+static void drainPendingJobsChecked(EscargotContextOpaque *c) {
     if (!c || !c->rt || !c->rt->vm.get()) return;
     auto *vm = c->rt->vm.get();
     while (vm->hasPendingJob()) {
+        if (shouldStopPendingJobDrain(c)) break;
         (void)vm->executePendingJob();
     }
+}
+
+extern "C" void escargot_process_pending_jobs(EscargotContext *c) {
+    if (!c) return;
+    drainPendingJobsChecked(c);
     flushPendingRejections(c);
 }
 
@@ -2418,9 +2439,7 @@ static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *
             return script->execute(state);
         },
         parsed.script.get());
-    while (c->rt && c->rt->vm.get() && c->rt->vm.get()->hasPendingJob()) {
-        c->rt->vm.get()->executePendingJob();
-    }
+    drainPendingJobsChecked(c);
     if (!er.isSuccessful()) {
         std::string __em;
         if (auto *__sr = er.resultOrErrorToString(c->ctx.get())) __em = __sr->toStdUTF8String();
@@ -2469,9 +2488,7 @@ extern "C" EscargotEvalResult escargot_import_module(EscargotContext *c, const c
                 return script->execute(state);
             },
             cached);
-        while (c->rt && c->rt->vm.get() && c->rt->vm.get()->hasPendingJob()) {
-            c->rt->vm.get()->executePendingJob();
-        }
+        drainPendingJobsChecked(c);
         if (!er.isSuccessful()) {
             std::string __em;
             if (auto *__sr = er.resultOrErrorToString(c->ctx.get())) __em = __sr->toStdUTF8String();
