@@ -94,7 +94,9 @@ const Binding = struct {
     condition_source_suppression: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     skip_all_pauses: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     breakpoints_active: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
+    breakpoint_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     break_requested: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    stepping_or_skip_pending: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     exception_mode: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     // One exception pause per throw. Follow-up JS_Throw calls from the same exception are ignored until the next source line.
     exception_hold: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -165,6 +167,50 @@ test "debugger hook storage uses atomic publication slots" {
     try std.testing.expect(@TypeOf(pause_hook) == std.atomic.Value(?PauseHook));
     try std.testing.expect(@TypeOf(script_hook) == std.atomic.Value(?ScriptHook));
     try std.testing.expect(@TypeOf(break_locations_hook) == std.atomic.Value(?BreakLocationsHook));
+}
+
+test "debugger: an idle enabled binding has no location work" {
+    var binding: Binding = .{ .instance_id = -1, .runtime = null };
+    try std.testing.expect(!hasPendingLocationWork(&binding));
+    binding.breakpoint_count.store(1, .seq_cst);
+    try std.testing.expect(hasPendingLocationWork(&binding));
+    binding.breakpoints_active.store(0, .seq_cst);
+    try std.testing.expect(!hasPendingLocationWork(&binding));
+    binding.stepping_or_skip_pending.store(1, .seq_cst);
+    try std.testing.expect(hasPendingLocationWork(&binding));
+    binding.stepping_or_skip_pending.store(0, .seq_cst);
+    binding.break_requested.store(1, .seq_cst);
+    try std.testing.expect(hasPendingLocationWork(&binding));
+}
+
+fn hasPendingLocationWork(binding: *const Binding) bool {
+    if (binding.break_requested.load(.seq_cst) != 0) return true;
+    if (binding.stepping_or_skip_pending.load(.seq_cst) != 0) return true;
+    return binding.breakpoints_active.load(.seq_cst) != 0 and binding.breakpoint_count.load(.seq_cst) != 0;
+}
+
+fn locationWorkPredicate(opaque_ptr: ?*anyopaque) callconv(.c) c_int {
+    const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return 0));
+    if (binding.alive.load(.seq_cst) == 0) return 0;
+    if (binding.skip_all_pauses.load(.seq_cst) != 0) return 0;
+    if (binding.exception_hold.load(.seq_cst) != 0) return 1;
+    // Exception pauses depend on source transitions to suppress repeated throw notifications.
+    if (binding.exception_mode.load(.seq_cst) != @backingInt(ExceptionPause.none)) return 1;
+    return @intFromBool(hasPendingLocationWork(binding));
+}
+
+fn exceptionWorkPredicate(opaque_ptr: ?*anyopaque) callconv(.c) c_int {
+    const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return 0));
+    if (binding.alive.load(.seq_cst) == 0) return 0;
+    if (binding.skip_all_pauses.load(.seq_cst) != 0) return 0;
+    if (binding.suppress.load(.seq_cst) != 0) return 0;
+    if (binding.exception_hold.load(.seq_cst) != 0) return 0;
+    return @intFromBool(binding.exception_mode.load(.seq_cst) != @backingInt(ExceptionPause.none));
+}
+
+fn refreshSteppingOrSkipPendingLocked(binding: *Binding) void {
+    const pending = binding.mode != .run or binding.skip_line >= 0;
+    binding.stepping_or_skip_pending.store(if (pending) 1 else 0, .seq_cst);
 }
 
 fn bindings() *std.AutoHashMap(i32, *Binding) {
@@ -404,6 +450,7 @@ pub fn setBreakpointEx(
         std.heap.c_allocator.free(cond);
         return 0;
     };
+    _ = binding.breakpoint_count.fetchAdd(1, .seq_cst);
     binding.mutex.unlock();
     return id;
 }
@@ -437,6 +484,7 @@ pub fn removeBreakpoint(instance_id: i32, id: u32) bool {
         std.heap.c_allocator.free(bp.url);
         if (bp.condition.len > 0) std.heap.c_allocator.free(bp.condition);
         _ = binding.breakpoints.swapRemove(i);
+        _ = binding.breakpoint_count.fetchSub(1, .seq_cst);
         return true;
     }
     return false;
@@ -875,6 +923,7 @@ fn continueWith(instance_id: i32, mode: StepMode) void {
     binding.skip_depth = binding.paused_depth;
     binding.skip_seen_same = false;
     binding.skip_saw_deeper = false;
+    refreshSteppingOrSkipPendingLocked(binding);
     binding.mutex.unlock();
     binding.pause.store(0, .seq_cst);
 }
@@ -895,6 +944,7 @@ fn finishStepOut(binding: *Binding, url: []const u8, line: i32, column: i32, dep
     binding.skip_saw_deeper = false;
     binding.mode = .step_over;
     binding.paused_depth = depth;
+    refreshSteppingOrSkipPendingLocked(binding);
     return true;
 }
 
@@ -912,6 +962,7 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth
             binding.skip_column = -1;
             binding.skip_url_len = 0;
             binding.skip_script_tag = 0;
+            refreshSteppingOrSkipPendingLocked(binding);
             return true;
         }
         if (!binding.skip_seen_same) {
@@ -922,6 +973,7 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth
         binding.skip_column = -1;
         binding.skip_url_len = 0;
         binding.skip_script_tag = 0;
+        refreshSteppingOrSkipPendingLocked(binding);
         return false;
     }
     if (depth > binding.skip_depth) {
@@ -932,6 +984,7 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth
     binding.skip_column = -1;
     binding.skip_url_len = 0;
     binding.skip_script_tag = 0;
+    refreshSteppingOrSkipPendingLocked(binding);
     return false;
 }
 
@@ -980,6 +1033,8 @@ fn armExecution(binding: *Binding) void {
     if (comptime backend.active_backend == .quickjs_ng) {
         qjs.JS_SetLocationHandler(@ptrCast(rt), @ptrCast(&locationTrampoline), binding);
         qjs.JS_SetExceptionHandler(@ptrCast(rt), @ptrCast(&exceptionTrampoline), binding);
+        qjs.jsbay_qjs_set_location_work_predicate(@ptrCast(rt), @ptrCast(&locationWorkPredicate));
+        qjs.jsbay_qjs_set_exception_work_predicate(@ptrCast(rt), @ptrCast(&exceptionWorkPredicate));
         qjs.JS_SetDebuggerHandler(@ptrCast(rt), @ptrCast(&debuggerTrampoline), binding);
     }
     binding.handler_install_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
@@ -993,6 +1048,8 @@ fn disarmExecution(binding: *Binding) void {
     const rt = binding.runtime orelse return;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
     if (comptime backend.active_backend == .quickjs_ng) {
+        qjs.jsbay_qjs_set_location_work_predicate(@ptrCast(rt), null);
+        qjs.jsbay_qjs_set_exception_work_predicate(@ptrCast(rt), null);
         qjs.JS_SetLocationHandler(@ptrCast(rt), null, null);
         qjs.JS_SetExceptionHandler(@ptrCast(rt), null, null);
         qjs.JS_SetDebuggerHandler(@ptrCast(rt), null, null);
@@ -1503,6 +1560,7 @@ fn locationTrampoline(
     binding.exception_hold.store(0, .seq_cst);
     if (binding.suppress.load(.seq_cst) != 0) return;
     if (binding.alive.load(.seq_cst) == 0) return;
+    if (!hasPendingLocationWork(binding)) return;
     const url = if (filename == null) "" else std.mem.span(filename);
     const hook_column: i32 = if (column > 0) column - 1 else 0;
     const explicit_pause = binding.break_requested.load(.seq_cst) != 0;
@@ -1578,6 +1636,7 @@ fn enterPause(
 ) void {
     binding.mutex.lock();
     binding.mode = .run;
+    refreshSteppingOrSkipPendingLocked(binding);
     binding.paused_depth = depth;
     binding.paused_reason = reason;
     binding.paused_script_tag = script_tag;

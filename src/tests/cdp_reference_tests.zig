@@ -413,6 +413,50 @@ test "cdp: removeBreakpoint lets the script finish" {
     try testing.expectEqualStrings("2", box.result);
 }
 
+test "cdp: idle debugger remains live across pause and breakpoint changes" {
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-idle-debugger-control");
+    defer session.deinit();
+    try enableDebugger(&session);
+
+    // This pause is queued while the enabled debugger has no breakpoints or step state.
+    try waitCommand(&session, try session.command("Debugger.pause", ""));
+    var first = EvalBox{ .id = session.id, .script = "var first = 1;\nfirst\n", .filename = "idle-control.js" };
+    defer first.deinit();
+    _ = try pauseOn(&session, &first);
+    try resumeSession(&session);
+    try testing.expectEqualStrings("1", first.result);
+
+    try setBreakpoint(&session, "idle-control.js", 1);
+    try waitCommand(&session, try session.command("Debugger.removeBreakpoint", "{\"breakpointId\":\"1\"}"));
+    var removed = EvalBox{ .id = session.id, .script = "var removed = 2;\nremoved\n", .filename = "idle-control.js" };
+    defer removed.deinit();
+    const removed_mark = session.got.items.len;
+    try session.spawn(&removed);
+    try session.expect(!try session.waitFrom(removed_mark, "Debugger.paused", 20));
+    session.joinEval();
+    try testing.expectEqualStrings("2", removed.result);
+
+    try setBreakpoint(&session, "idle-control.js", 1);
+    var stepped = EvalBox{ .id = session.id, .script = "var stepped = 3;\nstepped = 4;\nstepped\n", .filename = "idle-control.js" };
+    defer stepped.deinit();
+    _ = try pauseOn(&session, &stepped);
+    const step_mark = session.got.items.len;
+    _ = try session.command("Debugger.stepOver", "");
+    try session.expect(try session.waitFrom(step_mark, "Debugger.paused", 80));
+    try resumeSession(&session);
+    try testing.expectEqualStrings("4", stepped.result);
+
+    try waitCommand(&session, try session.command("Debugger.removeBreakpoint", "{\"breakpointId\":\"2\"}"));
+    try waitCommand(&session, try session.command("Debugger.pause", ""));
+    var second = EvalBox{ .id = session.id, .script = "var second = 5;\nsecond\n", .filename = "idle-control.js" };
+    defer second.deinit();
+    _ = try pauseOn(&session, &second);
+    try resumeSession(&session);
+    try testing.expectEqualStrings("5", second.result);
+}
+
 test "cdp: removing one breakpoint at a line leaves the other" {
     // Multiple breakpoints at the same location; removing one leaves the others active.
     if (comptime !backend.supportsDebugger(backend.active_backend)) return;
@@ -636,6 +680,37 @@ test "cdp: setPauseOnExceptions distinguishes none, uncaught, and all" {
     try testing.expect(std.mem.indexOf(u8, session.got.items[all_at..], "\"url\":\"all.js\"") != null);
     try resumeSession(&session);
     try testing.expectEqualStrings("4", both.result);
+}
+
+test "cdp: all-exceptions clears the hold before a second throw" {
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-exception-hold");
+    defer session.deinit();
+    try enableDebugger(&session);
+    try waitCommand(&session, try session.command("Debugger.setPauseOnExceptions", "{\"state\":\"all\"}"));
+
+    var box = EvalBox{
+        .id = session.id,
+        .script = "try { throw 1; } catch (e) {}\ntry { throw 2; } catch (e) { 5 }\n5\n",
+        .filename = "exception-hold.js",
+    };
+    defer box.deinit();
+    const first_at = try pauseOn(&session, &box);
+    const first = session.got.items[first_at..];
+    try testing.expect(std.mem.indexOf(u8, first, "\"reason\":\"exception\"") != null);
+    try testing.expect(std.mem.indexOf(u8, first, "\"url\":\"exception-hold.js\"") != null);
+    try testing.expect(intAfter(first, "\"lineNumber\":") == 0);
+
+    const second_at = session.got.items.len;
+    _ = try session.command("Debugger.resume", "");
+    try session.expect(try session.waitFrom(second_at, "Debugger.paused", 80));
+    const second = session.got.items[second_at..];
+    try testing.expect(std.mem.indexOf(u8, second, "\"reason\":\"exception\"") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "\"url\":\"exception-hold.js\"") != null);
+    try testing.expect(intAfter(second, "\"lineNumber\":") == 1);
+    try resumeSession(&session);
+    try testing.expectEqualStrings("5", box.result);
 }
 
 const closure_script =

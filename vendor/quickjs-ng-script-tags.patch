@@ -150,13 +150,15 @@
          m->func_obj = fun_obj;
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1217,16 +1217,21 @@
+@@ -1217,16 +1217,23 @@
     borrowed until the callback returns. depth is the number of JS frames.
     The callback may block; it must not free the runtime. */
  typedef void JSLocationHandler(JSContext *ctx, const char *filename,
 -                               int line, int column, int depth, void *opaque);
 +                               int line, int column, int depth, uint64_t script_tag, void *opaque);
  JS_EXTERN void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque);
++typedef int jsbay_qjs_debugger_work_predicate_t(void *opaque);
++JS_EXTERN void jsbay_qjs_set_location_work_predicate(JSRuntime *rt, jsbay_qjs_debugger_work_predicate_t *predicate);
  /* Evaluator-side bytecode positions. complete is non-zero on the final
     callback; truncated reports the fixed collection budget was exceeded. */
  typedef void JSBreakLocationHandler(JSContext *ctx, const char *filename,
