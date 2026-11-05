@@ -21,7 +21,7 @@ const types = @import("../types.zig");
 const backend = @import("../backend.zig");
 
 fn hermesModulesUnsupported() bool {
-    // Hermes host-side ESM shim landed (hermes_esm.cpp). Keep helper for easy re-gate.
+    // Hermes runs these module-loader tests; return true only when this backend must skip the suite.
     return false;
 }
 
@@ -530,6 +530,28 @@ test "modules: class method key after preceding method is not rewritten" {
 
     const got = try helpers.evalInt(id, "globalThis.__result__");
     try testing.expectEqual(@as(i64, 2), got);
+}
+
+test "modules: object method key after comment trivia is not rewritten" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // A block comment before an object method key must not turn the key into an import rewrite (`{/*c*/ value(){…}}`).
+    const src = "import { value } from 'dep';\nexport function read(){ return {/*c*/ value(){ return 7; }}.value(); }\nglobalThis.__result__ = read();";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 7), got);
 }
 
 test "modules: compound param default rewrites imported binding" {

@@ -458,6 +458,7 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
 static std::vector<std::string> collectParamListBoundNames(const std::string &src, size_t open_paren);
 static bool takeBalancedBracketExpr(const std::string &src, size_t &i, size_t &expr_start, size_t &expr_end);
 static char prevSignificantChar(const std::string &src, size_t pos);
+static size_t skipTriviaBackward(const std::string &src, size_t pos);
 static char prevSignificantSkippingComments(const std::string &src, size_t pos);
 static void collectAsAliasSpecs(const std::string &specs, std::vector<std::pair<std::string, std::string>> &out);
 
@@ -1720,8 +1721,8 @@ static std::string rewriteIdents(const std::string &src,
             bool in_class_body_for_key = !cont.empty() && cont.back() == Cont::ClassBody;
             if (!after_dot && !after_question && (in_object_lit_for_key || in_class_body_for_key) &&
                 k < src.size() && src[k] == '(') {
-                size_t pk = out.size();
-                while (pk > 0 && std::isspace(static_cast<unsigned char>(out[pk - 1]))) --pk;
+                // Skip // /* */ trivia so `{/*c*/ value(){…}}` still sees `{`/`,` as the method-key boundary.
+                size_t pk = skipTriviaBackward(out, out.size());
                 // Class ASI: a preceding method's `}` is a valid boundary for the next method key (no semicolon required).
                 if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ',' || out[pk - 1] == '*' ||
                                (in_class_body_for_key && (out[pk - 1] == ';' || out[pk - 1] == '}')))) {
@@ -1953,8 +1954,8 @@ static void skipWsAndComments(const std::string &src, size_t &i) {
     }
 }
 
-// Significant char before `pos`, skipping spaces and // /* */ trivia (so `obj./*c*/id` still sees `.`).
-static char prevSignificantSkippingComments(const std::string &src, size_t pos) {
+// Position after dropping trailing spaces and // /* */ trivia before `pos` (so `{/*c*/ id` / `obj./*c*/id` still see `{` / `.`).
+static size_t skipTriviaBackward(const std::string &src, size_t pos) {
     size_t pk = pos;
     while (pk > 0) {
         if (std::isspace(static_cast<unsigned char>(src[pk - 1]))) { --pk; continue; }
@@ -1979,6 +1980,11 @@ static char prevSignificantSkippingComments(const std::string &src, size_t pos) 
         if (slash != std::string::npos) { pk = slash; continue; }
         break;
     }
+    return pk;
+}
+
+static char prevSignificantSkippingComments(const std::string &src, size_t pos) {
+    size_t pk = skipTriviaBackward(src, pos);
     return pk > 0 ? src[pk - 1] : 0;
 }
 
