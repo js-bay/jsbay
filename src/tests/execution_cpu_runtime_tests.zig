@@ -137,7 +137,8 @@ test "execution CPU runtime: a disabled nested engine suppresses its enabled cal
     const disabled_delta = total(caller) - before_disabled;
     try testing.expectEqual(@as(u64, 0), total(nested));
     try testing.expect(nested.seconds() == null);
-    if (thread_cpu.isSupported()) try testing.expect(disabled_delta <= direct_cost * 8 + std.time.ns_per_ms);
+    // direct_cost (eval "0") can be near zero on coarse clocks; CI host-call overhead then exceeds 1ms.
+    if (thread_cpu.isSupported()) try testing.expect(disabled_delta <= direct_cost * 8 + 10 * std.time.ns_per_ms);
 
     nested.enable();
     defer nested.disable();
@@ -149,7 +150,7 @@ test "execution CPU runtime: a disabled nested engine suppresses its enabled cal
     try testing.expect(enabled.err == null);
     try testing.expect(probe.completed);
     try expectIncreased(before_enabled_nested, total(nested));
-    if (thread_cpu.isSupported()) try testing.expect(total(caller) - before_enabled_caller <= direct_cost * 8 + std.time.ns_per_ms);
+    if (thread_cpu.isSupported()) try testing.expect(total(caller) - before_enabled_caller <= direct_cost * 8 + 10 * std.time.ns_per_ms);
 }
 
 const ReenteredCallerProbe = struct {
@@ -340,7 +341,7 @@ test "execution CPU runtime: yielding inside a disabled nested engine keeps its 
         };
     }
     try testing.expectEqual(@as(u64, 0), total(middle));
-    if (thread_cpu.isSupported()) try testing.expect(total(owner) - before <= control_delta * 8 + std.time.ns_per_ms);
+    if (thread_cpu.isSupported()) try testing.expect(total(owner) - before <= control_delta * 8 + 10 * std.time.ns_per_ms);
     try testing.expect(total(child) > 0 or !thread_cpu.isSupported());
 }
 
