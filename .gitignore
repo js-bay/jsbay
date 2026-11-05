@@ -4,34 +4,51 @@
 zig-out/
 build-apple/
 build-android/
-build/
 .agent-extracts/
 .hvigor/
-.gradle/
-.cxx/
-.build/
-oh_modules/
 .DS_Store
-*.log
-*.pid
 /WORKLOG.md
+/inspector-demo.log
+/inspector-demo.pid
 /sdk/harmony/BuildProfile.ets
 __pycache__/
+sdk/**/.gradle/
+sdk/**/.cxx/
+sdk/**/build/
+sdk/apple/.build/
+sdk/harmony/oh_modules/
 
 # Local package cache used by zig fetch / path deps
 zig-pkg/
 
 # .NET SDK consumer build artifacts
-**/bin/
-**/obj/
+/sdk/dotnet/**/bin/
+/sdk/dotnet/**/obj/
+/tests/dotnet-sdk/**/bin/
+/tests/dotnet-sdk/**/obj/
+/bench/interop/csharp/bin/
+/bench/interop/csharp/obj/
 
-# Local SDK / signing (never commit machine paths or cert material)
-**/local.properties
-**/*.p12
-**/*.cer
-**/*.p7b
+# Spike engine install / build trees (built locally; not committed)
+# Match both real dirs and local symlinks (no trailing slash).
+vendor/escargot-install
+vendor/hermes-install
+vendor/hermes-build
+vendor/icu-prefix
 
-# Device / simulator hilog dumps and local capture dirs (regenerate locally)
-**/hilog-*-excerpt.txt
-*-hilog/
-artifacts/
+# Local scratch / gate run logs
+/*.txt
+/bridge-build.txt
+
+# Escargot / Hermes sources are git submodules (vendor/escargot, vendor/hermes).
+# Do not ignore those paths.
+
+# Android / ICU cross-build trees (box-local; huge)
+vendor/escargot-android-build-x86_64/
+vendor/escargot-android-install-x86_64/
+vendor/hermes-android-build-x86_64/
+vendor/hermes-android-install-x86_64/
+vendor/icu-android-build-x86_64/
+vendor/icu-android-prefix-x86_64/
+vendor/icu-host-build-for-android/
+vendor/icu-src/

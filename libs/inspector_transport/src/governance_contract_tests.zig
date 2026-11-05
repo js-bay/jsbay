@@ -468,8 +468,8 @@ test "transport: a broadcast snapshot allocation failure releases every retained
     }
     _ = opened.wait(peers.len);
 
-    // The first snapshot append allocates its backing storage. The ninth append grows it. Let that first allocation succeed and fail the next allocation, which is the snapshot growth on this allocator.
-    failing.fail_index = failing.alloc_index + 1;
+    // broadcastText allocates the exact lease snapshot before retaining. Fail that allocation so OOM cannot observe any broadcast lease.
+    failing.fail_index = failing.alloc_index;
     t.broadcastText("oom-broadcast-token");
     try testing.expect(failing.has_induced_failure);
     // FailingAllocator keeps failing every alloc at fail_index; re-arm so deinit/close can free.

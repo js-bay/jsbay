@@ -133,6 +133,46 @@ See the full notice in `vendor/quickjs-ng/libunicode-table.h`. Classic QuickJS b
 
 SVG marks under `assets/brand-icons/` (inlined into `assets/banner.svg`) require the attributions in [assets/brand-icons/ATTRIBUTION.md](assets/brand-icons/ATTRIBUTION.md), including the CC BY 3.0 Android robot attribution. Trademarks remain with their owners; inclusion is for platform identification only.
 
+## Samsung Escargot
+
+Source: <https://github.com/Samsung/escargot>
+
+Used only when building with `-Dbackend=escargot` (experimental spike). Escargot is primarily LGPL-2.1; some bundled components use other licenses (see `LICENSE.*` in the Escargot tree). JS Bay does not link Escargot in the default QuickJS-NG build. Before publishing an Escargot-linked artifact, ship the LICENSE / NOTICE files from the Escargot revision you vendor and meet LGPL obligations for that linkage.
+
+## Meta Hermes
+
+Source: <https://github.com/facebook/hermes>
+
+Used only when building with `-Dbackend=hermes` (experimental spike). Hermes is MIT-licensed; see `vendor/hermes` for NOTICE and third-party licenses.
+
+```text
+MIT License
+
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## ICU (International Components for Unicode)
+
+Hermes builds typically link ICU (`icuuc` / `icui18n` / `icudata`). ICU is Unicode License (Unicode-3.0) / ICU License. Ship the ICU license file from your ICU prefix when distributing a Hermes-linked artifact. See <https://unicode-org.github.io/icu/userguide/>.
+
 ## Distribution scope
 
-Shipped desktop libraries, Apple XCFrameworks, Android AARs, and Harmony HARs include JS Bay code plus the third-party material listed in this file (QuickJS / QuickJS-NG and their Unicode tables when that backend is selected, and Inspector CDP JSON when Inspector is built in). The Android JNI adapter and Apple / Harmony SDK adapters are JS Bay source: they use platform SDK headers and link platform libraries, and they do not add further third-party source beyond what this file already covers. If a future release adds another third-party dependency to a shipped artifact, add its notices here before publishing.
+Shipped desktop libraries, Apple XCFrameworks, Android AARs, and Harmony HARs include JS Bay code plus the third-party material listed in this file (QuickJS / QuickJS-NG and their Unicode tables when that backend is selected, Inspector CDP JSON when Inspector is built in, and Escargot / Hermes / ICU notices when those backends are selected). The Android JNI adapter and Apple / Harmony SDK adapters are JS Bay source: they use platform SDK headers and link platform libraries, and they do not add further third-party source beyond what this file already covers. If a future release adds another third-party dependency to a shipped artifact, add its notices here before publishing.

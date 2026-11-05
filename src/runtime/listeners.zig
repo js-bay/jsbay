@@ -149,6 +149,7 @@ pub const NamedListenerRegistry = struct {
                 }
             },
             .jsc => {},
+            .escargot, .hermes => {},
         }
     }
 };

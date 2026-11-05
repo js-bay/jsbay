@@ -27,7 +27,7 @@ fn logHandler(_: i32, level: types.LogLevel, msg: [*:0]const u8, _: ?*anyopaque)
 }
 
 pub fn main() !void {
-    if (backend.active_backend != .jsc) {
+    if (!backend.isJscApiBackend(backend.active_backend)) {
         std.debug.print(
             "jsc-safari-demo requires -Dbackend=jsc (current: {s}). " ++
                 "Use `zig build safari-demo -Dbackend=jsc` on macOS/iOS.\n",

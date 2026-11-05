@@ -52,14 +52,14 @@ Building with `-Dheap-snapshot=false` keeps the public symbols but `takeHeapSnap
 
 Authority for what a running build advertises is `Schema.getDomains` and the support manifest [`libs/inspector/src/protocol-support.json`](../libs/inspector/src/protocol-support.json). Advertised commands can still support only a subset of optional parameters.
 
-| Area | `quickjs` | `quickjs_ng` | `jsc` |
-| --- | --- | --- | --- |
-| CDP `Debugger` | Non-execution subset (enable/disable/source retrieval/async stack; no breakpoints or pauses) | Partial execution support (enable/pause/breakpoints/step family in the manifest) | Not CDP Debugger; use [Safari Web Inspector](#safari-web-inspector) |
-| CDP `Runtime` / `Profiler` / `Performance` | Partial | Partial | Partial Runtime + Performance; no Profiler and no heap snapshots |
-| CDP `HeapProfiler` | `collectGarbage`, bounded `takeHeapSnapshot`, chunk and optional progress events | Same | `collectGarbage` only |
-| Safari Web Inspector | No | No | Supported JSC builds only |
+| Area | `quickjs` | `quickjs_ng` | `jsc` | `escargot` / `hermes` (spike) |
+| --- | --- | --- | --- | --- |
+| CDP `Debugger` | Non-execution subset (enable/disable/source retrieval/async stack; no breakpoints or pauses) | Partial execution support (enable/pause/breakpoints/step family in the manifest) | Not CDP Debugger; use [Safari Web Inspector](#safari-web-inspector) | Not advertised (inspector out of spike scope) |
+| CDP `Runtime` / `Profiler` / `Performance` | Partial | Partial | Partial Runtime + Performance; no Profiler and no heap snapshots | `Runtime` + `Performance` + `Schema` only |
+| CDP `HeapProfiler` | `collectGarbage`, bounded `takeHeapSnapshot`, chunk and optional progress events | Same | `collectGarbage` only | Not advertised |
+| Safari Web Inspector | No | No | Supported JSC builds only | No |
 
-Production hosts that fix `-Dbackend=quickjs` can retrieve source identity through the limited CDP Debugger subset, but source breakpoints and `debugger;` pause over CDP require `quickjs_ng`. Prefer `quickjs_ng` when execution debugging is required, or use the Safari path on JSC.
+Production hosts that fix `-Dbackend=quickjs` can retrieve source identity through the limited CDP Debugger subset, but source breakpoints and `debugger;` pause over CDP require `quickjs_ng`. Prefer `quickjs_ng` when execution debugging is required, or use the Safari path on JSC. Escargot/Hermes spike builds keep a minimal Schema surface and do not claim CDP Debugger or HeapProfiler readiness.
 
 ## Build options
 

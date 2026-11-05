@@ -71,5 +71,13 @@ pub fn create(instance_id: i32, user_data: ?*anyopaque, callbacks: Callbacks) ?A
             _ = jsc_mod.jsc.JSValueProtect(@ptrCast(ctx), v);
             return v;
         },
+        .escargot => {
+            const esc = @import("../backend/escargot/host_object.zig");
+            return esc.create(ctx, instance_id, user_data, callbacks.get, callbacks.set, callbacks.get_property_names, callbacks.finalize);
+        },
+        .hermes => {
+            const her = @import("../backend/hermes/host_object.zig");
+            return her.create(ctx, instance_id, user_data, callbacks.get, callbacks.set, callbacks.get_property_names, callbacks.finalize);
+        },
     }
 }

@@ -9,7 +9,7 @@ const io = @import("../platform/io.zig");
 const helpers = @import("test_helpers.zig");
 
 test "JSC queueMicrotask: returns undefined and rejects non-functions synchronously" {
-    if (comptime backend.active_backend != .jsc) return error.SkipZigTest;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
@@ -29,7 +29,7 @@ test "JSC queueMicrotask: returns undefined and rejects non-functions synchronou
 }
 
 test "JSC queueMicrotask: reports throws and continues the checkpoint in order" {
-    if (comptime backend.active_backend != .jsc) return error.SkipZigTest;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {

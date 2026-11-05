@@ -123,6 +123,7 @@ pub const DataViewPayload = struct {
     pub fn getUint8(self: DataViewPayload, off: usize) ?u8 {
         if (!self.inRange(off, 1)) return null;
         const b = self.viewBytes();
+        if (off >= b.len) return null;
         return b[off];
     }
 
@@ -141,6 +142,7 @@ pub const DataViewPayload = struct {
     pub fn getInt32(self: DataViewPayload, off: usize, little_endian: bool) ?i32 {
         if (!self.inRange(off, 4)) return null;
         const b = self.viewBytes();
+        if (off + 4 > b.len) return null;
         return std.mem.readInt(i32, b[off..][0..4], endianness(little_endian));
     }
 
@@ -281,6 +283,22 @@ pub fn kindFromBackend(code: c_int) ?TypedArrayKind {
             if (code == jsc_mod.JSC_TA_BIG_INT64) return .big_int64;
             if (code == jsc_mod.JSC_TA_BIG_UINT64) return .big_uint64;
             return null;
+        },
+        .escargot, .hermes => {
+            // Bridge kind codes: 0=Int8 1=Uint8 2=Uint8C 3=Int16 4=Uint16 5=Int32 6=Uint32 7=Float32 8=Float64 9=BigInt64 10=BigUint64
+            return switch (code) {
+                0 => .int8,
+                1, 2 => .uint8,
+                3 => .int16,
+                4 => .uint16,
+                5 => .int32,
+                6 => .uint32,
+                7 => .float32,
+                8 => .float64,
+                9 => .big_int64,
+                10 => .big_uint64,
+                else => null,
+            };
         },
     };
 }

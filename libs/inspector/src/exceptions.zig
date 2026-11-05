@@ -78,8 +78,10 @@ pub fn Module(comptime Host: type) type {
             const ctx = engine.getContext(state.instance_id) orelse return error.InstanceUnavailable;
             const is_object = if (comptime backend.isQuickJsApiBackend(backend.active_backend))
                 backend.ActiveEngineModule.c_api.jsbay_qjs_JS_IsObject(value) != 0
+            else if (comptime backend.isJscApiBackend(backend.active_backend))
+                backend.ActiveEngineModule.jsc.JSValueIsObject(@ptrCast(ctx), value)
             else
-                backend.ActiveEngineModule.jsc.JSValueIsObject(@ptrCast(ctx), value);
+                ActiveEngine.isObjectVal(ctx, value);
             if (is_object) {
                 const object_pending = state.exception_object_ids.items.len - state.exception_object_ids_head;
                 if (object_pending == rejection_limit) {

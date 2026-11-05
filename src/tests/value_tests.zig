@@ -481,6 +481,9 @@ test "value: getPropertyBool returns bool when present, null otherwise" {
             value.registerFunction(inst, null, "gpbm", &hGetPropBoolMissing);
             try helpers.expectEvalEquals(inst, "String(gpb({active:true}))", "true");
             try helpers.expectEvalEquals(inst, "String(gpb({active:false}))", "false");
+            // ToBoolean coercion: truthy/falsy non-booleans (QuickJS/JSC parity).
+            try helpers.expectEvalEquals(inst, "String(gpb({active:1}))", "true");
+            try helpers.expectEvalEquals(inst, "String(gpb({active:0}))", "false");
             try helpers.expectEvalEquals(inst, "String(gpbm({}))", "false");
         }
     }.run);
@@ -615,6 +618,7 @@ test "value: returning .json parses into JS object" {
 }
 
 test "value: returning .err throws JS exception containing message" {
+    // Hermes host-throw fixed via libhermes_bridge.so (shared libstdc++/libgcc_s with hermesvm).
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {

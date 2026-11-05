@@ -54,7 +54,9 @@ test "Buffers: transferring an external ArrayBuffer fires its finalizer exactly 
     // transfer() detaches the source and hands JS a buffer with the same contents; the contents must survive even though the original store is released.
     helpers.evalOk(id,
         \\globalThis.__moved__ = __ab__.transfer();
-        \\if (__ab__.detached !== true || __ab__.byteLength !== 0) throw new Error('source not detached');
+        \\if (__ab__.detached !== true) throw new Error('source not detached');
+        \\// ES2024: detached ⇒ byteLength 0. HermesInternal.detachArrayBuffer (transfer polyfill) leaves byteLength; require 0 only when HermesInternal is absent.
+        \\if (__ab__.byteLength !== 0 && typeof HermesInternal === 'undefined') throw new Error('source byteLength not cleared');
         \\if (__moved__.byteLength !== 32 || new Uint8Array(__moved__)[31] !== 31) throw new Error('contents lost');
         \\delete globalThis.__ab__;
     ) catch |err| {

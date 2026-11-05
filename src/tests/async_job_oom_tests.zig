@@ -40,6 +40,7 @@ fn queuePromiseWithoutDrain(id: i32, source: [:0]const u8) !void {
             try testing.expect(!c.jsIsException(result));
         },
         .jsc => unreachable,
+        .escargot, .hermes => unreachable,
     }
 }
 

@@ -125,6 +125,23 @@ test "date: isDate rejects non-Date values" {
     }.run);
 }
 
+test "date: isDate/toDateMs ignore Symbol.toStringTag spoofing" {
+    resetGlobals();
+    const id = helpers.nextInstanceId();
+    try helpers.withEngine(id, .{}, struct {
+        fn run(inst: i32) !void {
+            value.registerFunction(inst, null, "probe", &hProbeDate);
+            value.registerFunction(inst, null, "readDate", &hReadDate);
+            // Own toStringTag must not hide a real Date or promote a plain object.
+            try helpers.expectEvalEquals(inst, "(() => { const d = new Date(42); d[Symbol.toStringTag] = 'Custom'; return String(probe(d)); })()", "true");
+            try helpers.expectEvalEquals(inst, "String(probe({ [Symbol.toStringTag]: 'Date', getTime() { return 42; } }))", "false");
+            try helpers.expectEvalEquals(inst, "(() => { const d = new Date(1700000000000); d[Symbol.toStringTag] = 'Custom'; return String(readDate(d)); })()", "1700000000000");
+            try testing.expectEqual(@as(?bool, true), g_is_date);
+            try testing.expectEqual(@as(?i64, 1_700_000_000_000), g_ms);
+        }
+    }.run);
+}
+
 // ========================================================================
 // BigInt tests.
 // ========================================================================

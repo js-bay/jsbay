@@ -6,7 +6,7 @@ pub const backend = @import("backend.zig");
 pub const dispatch = @import("runtime/dispatch.zig");
 pub const engine = @import("engine.zig");
 pub const inspector = @import("inspector/root.zig");
-pub const jsc_remote_inspector = if (backend.active_backend == .jsc)
+pub const jsc_remote_inspector = if (backend.isJscApiBackend(backend.active_backend))
     @import("backend/jsc/remote_inspector.zig")
 else
     struct {};

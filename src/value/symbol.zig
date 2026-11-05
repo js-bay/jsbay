@@ -1,6 +1,6 @@
 //! Host-side Symbol and Symbol.for.
 //!
-//! `newSymbol` matches `Symbol(desc)`: two calls never strict-equal. `forKey` matches `Symbol.for(key)` and therefore equals a symbol the script created with the same key. The caller owns the returned value (`freeValue`). Null means the engine is gone or the backend failed.
+//! `newSymbol` matches `Symbol(desc)` (including `Symbol("")` when `desc` is empty — never `Symbol()` with an omitted description): two calls never strict-equal. `forKey` matches `Symbol.for(key)` and therefore equals a symbol the script created with the same key. The caller owns the returned value (`freeValue`). Null means the engine is gone or the backend failed.
 
 const backend = @import("../backend.zig");
 const engine = @import("../engine.zig");
@@ -40,6 +40,10 @@ fn make(instance_id: i32, text: []const u8, is_global: bool) ?ActiveEngine.Value
             const sym = raw orelse return null;
             _ = jsc_mod.jsc.JSValueProtect(@ptrCast(ctx), sym);
             return sym;
+        },
+        .escargot, .hermes => {
+            if (is_global) return ActiveEngine.symbolFor(ctx, text);
+            return ActiveEngine.newSymbol(ctx, text);
         },
     }
 }

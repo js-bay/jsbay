@@ -26,6 +26,7 @@ pub fn evaluate(ctx: ActiveEngine.Context, source: []const u8, filename: []const
     const result = switch (backend.active_backend) {
         .quickjs, .quickjs_ng => evaluateQuickJs(ctx, source, filename, cache_dir, version),
         .jsc => evaluateJsc(ctx, source, filename),
+        .escargot, .hermes => evaluateSpike(ctx, source, filename),
     };
     if (result.exception) |exception| @import("../inspector/root.zig").exceptions.reportValue(ActiveEngine.instanceIdFromCtx(ctx), ctx, exception, filename);
     return result;
@@ -164,6 +165,39 @@ fn cacheFile(source: []const u8, filename: []const u8, cache_dir: []const u8, ve
     return cache.cachePath(gpa, cache_dir, version, source_hash, name_hash);
 }
 
+fn evaluateSpike(ctx: ActiveEngine.Context, source: []const u8, filename: []const u8) Result {
+    defer {
+        if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
+    }
+    // Prefer value-returning eval when the active backend exposes it (Escargot / Hermes).
+    if (comptime @hasDecl(ActiveEngine, "evalValue")) {
+        const er = ActiveEngine.evalValue(ctx, source, filename);
+        // Bridge may report err_text without a retained exception value (non-JSError paths). Synthesize a string exception so public evaluate is not misclassified as OOM.
+        if (er.exception != null) {
+            if (er.err_text) |e| std.heap.c_allocator.free(e);
+            return .{ .exception = er.exception };
+        }
+        if (er.err_text) |e| {
+            defer std.heap.c_allocator.free(e);
+            const synthesized = ActiveEngine.newStringVal(ctx, e) orelse return .{ .out_of_memory = true };
+            return .{ .exception = synthesized };
+        }
+        return .{ .value = er.value };
+    }
+    // String eval fallback: keep live exceptions by allocating the message before freeing the heap err.
+    const er = ActiveEngine.eval(ctx, source, filename);
+    if (er.result) |r| std.heap.c_allocator.free(@constCast(r));
+    if (er.err) |e| {
+        const synthesized = ActiveEngine.newStringVal(ctx, e) orelse {
+            if (er.err_is_heap) std.heap.c_allocator.free(@constCast(e));
+            return .{ .out_of_memory = true };
+        };
+        if (er.err_is_heap) std.heap.c_allocator.free(@constCast(e));
+        return .{ .exception = synthesized };
+    }
+    return .{};
+}
+
 fn evaluateJsc(ctx: ActiveEngine.Context, source: []const u8, filename: []const u8) Result {
     const module = @import("../backend/jsc.zig");
     const jsc = module.jsc;
@@ -195,6 +229,7 @@ fn jscString(input: []const u8) @import("../backend/jsc.zig").jsc.JSStringRef {
 }
 
 test "typed eval: keeps live functions and raw exceptions" {
+    // Spike backends use evaluateSpike (value-returning eval via native bridge).
     const engine = @import("../engine.zig");
     const id = @import("../tests/test_helpers.zig").nextInstanceId();
     try std.testing.expect(engine.create(id, .{}));
@@ -218,6 +253,7 @@ test "typed eval: keeps live functions and raw exceptions" {
 }
 
 test "typed eval: cache preserves live exports and never repeats side effects" {
+    // Spike backends use evaluateSpike (value-returning eval via native bridge).
     const testing = std.testing;
     const engine = @import("../engine.zig");
     const id = @import("../tests/test_helpers.zig").nextInstanceId();
@@ -238,7 +274,7 @@ test "typed eval: cache preserves live exports and never repeats side effects" {
     for (0..2) |index| {
         const result = evaluate(ctx, source, "exports.js", directory, "v1");
         try testing.expect(result.exception == null and !result.out_of_memory);
-        try testing.expectEqual(persistent_cache and backend.active_backend != .jsc and index == 1, result.cache_hit);
+        try testing.expectEqual(persistent_cache and !backend.isJscApiBackend(backend.active_backend) and !backend.isSpikeBackend(backend.active_backend) and index == 1, result.cache_hit);
         const value = result.value orelse return error.ExpectedExports;
         defer ActiveEngine.freeValue(ctx, value);
         const number = ActiveEngine.getPropertyVal(ctx, value, "n") orelse return error.ExpectedCount;
@@ -272,7 +308,7 @@ test "typed eval: cache preserves live exports and never repeats side effects" {
     for (0..2) |index| {
         const result = evaluate(ctx, throwing, "throw-once.js", directory, "v1");
         try testing.expect(result.value == null and !result.out_of_memory);
-        try testing.expectEqual(backend.active_backend != .jsc and index == 1, result.cache_hit);
+        try testing.expectEqual(!backend.isJscApiBackend(backend.active_backend) and !backend.isSpikeBackend(backend.active_backend) and index == 1, result.cache_hit);
         const exception = result.exception orelse return error.ExpectedException;
         defer ActiveEngine.freeValue(ctx, exception);
         try testing.expectEqual(@as(f64, @floatFromInt(index + 1)), ActiveEngine.toFloat64(ctx, exception).?);

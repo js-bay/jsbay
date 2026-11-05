@@ -356,6 +356,7 @@ test "errors: newError then inspectError round-trips the kind" {
             switch (backend.active_backend) {
                 .quickjs, .quickjs_ng => try testing.expectEqual(errors.JsErrorKind.internal_error, info.kind),
                 .jsc => try testing.expectEqual(errors.JsErrorKind.generic, info.kind),
+                .escargot, .hermes => try testing.expectEqual(errors.JsErrorKind.generic, info.kind),
             }
         }
     }.run);

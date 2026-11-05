@@ -37,6 +37,27 @@ test "Atom: newAtom + atomToString roundtrip" {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Embedded NUL in atom names must round-trip (Hermes/Escargot length-aware decode).
+// ---------------------------------------------------------------------------
+
+test "Atom: embedded NUL roundtrips through atomToString" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            const name = "a\x00b";
+            const atom = atoms.newAtom(id, name) orelse return error.NewAtomFailed;
+            defer atoms.freeAtom(id, atom);
+
+            const decoded = atoms.atomToString(testing.allocator, id, atom) orelse
+                return error.DecodeFailed;
+            defer testing.allocator.free(decoded);
+
+            try testing.expectEqualStrings(name, decoded);
+            try testing.expectEqual(@as(usize, 3), decoded.len);
+        }
+    }.run);
+}
+
+// ---------------------------------------------------------------------------
 // 2. Two atoms interned from the same name decode to the same string.
 //
 // On QuickJS, JS_NewAtom collapses to the same JSAtom slot (so repr is identical). On JSC, each call may hand back a fresh JSStringRef, so we assert only the decoded-string equivalence.

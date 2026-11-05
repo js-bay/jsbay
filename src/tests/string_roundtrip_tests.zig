@@ -17,6 +17,7 @@ fn expectRoundTrip(ctx: ActiveEngine.Context, input: []const u8) !void {
 }
 
 test "string roundtrip preserves embedded NUL, ASCII, and non-ASCII" {
+    // Length-aware hermes_value_to_utf8_n preserves embedded NUL.
     try helpers.withBareContext(struct {
         fn run(ctx: ActiveEngine.Context, _: ActiveEngine.Runtime) !void {
             try expectRoundTrip(ctx, "a\x00b");

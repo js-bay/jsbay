@@ -1,5 +1,6 @@
 //! Memory-limit headroom sweep.
 //!
+//! Reference cases: quickjs-ng api-test.c `backtrace_oom_callsite_array`, `backtrace_oom_current_exception`, and `large_allocation_accounting`.
 //!
 //! The runtime cap is tightened to `usage + k` for growing k. At every step each host API under test must return a status allowed by the C ABI matrix (OK, EXCEPTION or OUT_OF_MEMORY), leave failed outputs zeroed, leak no objects, and the same engine must still evaluate correctly once the cap is lifted. Whether a given step succeeds is deliberately not asserted: the cut-over point differs per backend.
 
@@ -250,7 +251,7 @@ test "oom sweep: host APIs stay valid and the engine recovers at every memory he
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer c_api.jsbay_engine_destroy(id);
 
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) {
         // JSC has no heap cap; the rejection itself is the contract (see runtime_control_tests).
         try testing.expect(!rc.setMemoryLimit(id, 1));
         try testing.expect(!c_api.jsbay_engine_set_memory_limit(id, 1));

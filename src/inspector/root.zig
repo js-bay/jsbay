@@ -82,6 +82,8 @@ pub fn protocolJson() []const u8 {
         .quickjs_ng => .quickjs_ng,
         .quickjs => .quickjs,
         .jsc => .jsc,
+        .escargot => .escargot,
+        .hermes => .hermes,
     };
     return inspector_package.protocolJson(active, @import("build_options").heap_snapshot);
 }

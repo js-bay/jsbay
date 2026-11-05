@@ -1,4 +1,4 @@
-//! Weak-callback / finalize registration — N-API `napi_wrap` + finalize equivalent, or the V8 weak-persistent-with-finalizer pattern.
+//! Weak-callback / finalize registration for host-owned resources tied to a JS object lifetime.
 //!
 //! Use this when native code needs to release a resource at the same moment a JavaScript object becomes unreachable. Common cases:
 //!   - clean up native state tied to a host object
@@ -7,7 +7,7 @@
 //!
 //! ### How it works
 //!
-//! `attachFinalizer` installs a holder object on the target as a writable property under a unique `__$jsbay_qjs_Finalizer${n}$__` key. The holder is a backend-private object whose GC finalizer hands control back to the user's callback (QuickJS: a `native_handle`-class holder; JSC: a dedicated `JSClassRef` holder whose `finalize` entrypoint is our trampoline). Because nothing else references the holder, it becomes unreachable exactly when the target does — which triggers the backend finalizer and, in turn, the user callback.
+//! `attachFinalizer` installs a holder object on the target as a writable property under a unique `__$jsbay_qjs_Finalizer${n}$__` key. The holder is a backend-private object whose GC finalizer hands control back to the user's callback. Because nothing else references the holder, it becomes unreachable exactly when the target does — which triggers the backend finalizer and, in turn, the user callback.
 //!
 //! Multiple finalizers can be attached to the same object; each gets its own holder + callback and all will fire when the object is collected. Firing order across holders on the same target is unspecified.
 //!
@@ -15,7 +15,7 @@
 //!
 //! - `target` must be a JS object (plain object, array, function, typed array, NativeHandle, External, ...). Primitives (numbers, strings, booleans, null, undefined) are not supported — the function returns `false` without side effects.
 //! - The finalizer runs during GC or engine destroy. It MUST NOT execute JavaScript or re-enter the engine context — just release native resources and return.
-//! - `attachDestroyingFinalizer` is the same synchronous native callback with Duktape's second argument: `destroying` is true only while `engine.destroy` is tearing the runtime down (`FINALIZER_NORESCUE`), and false for an ordinary collection.
+//! - `attachDestroyingFinalizer` is the same synchronous native callback with a `destroying` flag: true only while `engine.destroy` is tearing the runtime down, and false for an ordinary collection.
 //! - `attachDeferredFinalizer` only enqueues from the GC callback. The user function runs on the next `processPendingJobs` or `runEventLoopOnce`, on that thread, when `inFinalizer` is false, so it may eval.
 //! - When `engine.destroy` tears down the runtime, any un-fired finalizers fire as part of runtime teardown, so `user_data` boxes are reclaimed.
 //! - A registration that has already run is not run again at destroy.
@@ -45,7 +45,7 @@ pub const FinalizerCallback = *const fn (user_data: ?*anyopaque) callconv(.c) vo
 
 /// Register a callback to fire when `target` becomes GC-unreachable.
 ///
-/// `target` must be a JS object. Returns false if `target` is a primitive, the engine instance has been destroyed, or the backend refused to install the holder (e.g. a frozen target on QuickJS).
+/// `target` must be a JS object. Returns false if `target` is a primitive, the engine instance has been destroyed, or the backend refused to install the holder (for example a non-extensible target).
 ///
 /// Multiple finalizers can be attached to the same object; each gets its own callback and `user_data`. Firing order across finalizers on the same target is unspecified.
 ///
@@ -65,6 +65,14 @@ pub fn attachFinalizer(
         .jsc => {
             const jsc_mod = @import("../backend/jsc.zig");
             return jsc_mod.jscWeakAttachFinalizer(@ptrCast(ctx), target, user_data, on_finalize);
+        },
+        .escargot => {
+            const c = @import("../backend/escargot/c_api.zig");
+            return c.escargot_weak_attach_finalizer(ctx, target, user_data, @ptrCast(on_finalize));
+        },
+        .hermes => {
+            const c = @import("../backend/hermes/c_api.zig");
+            return c.hermes_weak_attach_finalizer(ctx, target, user_data, @ptrCast(on_finalize));
         },
     }
 }
@@ -121,6 +129,14 @@ fn attachDispatch(instance_id: i32, target: ActiveEngine.Value, dispatch: Dispat
         .jsc => blk: {
             const jsc_mod = @import("../backend/jsc.zig");
             break :blk jsc_mod.jscWeakAttachFinalizer(@ptrCast(ctx), target, @ptrCast(box), dispatchFinalizer);
+        },
+        .escargot => blk: {
+            const c = @import("../backend/escargot/c_api.zig");
+            break :blk c.escargot_weak_attach_finalizer(ctx, target, @ptrCast(box), dispatchFinalizer);
+        },
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            break :blk c.hermes_weak_attach_finalizer(ctx, target, @ptrCast(box), dispatchFinalizer);
         },
     };
     if (!installed) std.heap.c_allocator.destroy(box);

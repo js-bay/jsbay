@@ -1,13 +1,13 @@
 //! Reference lifecycle — Local / Global(T) / Weak(T) / Scope / StackFrameScope.
 //!
-//! Hold JS values across scope boundaries with `Global(T)`; temporary in-scope values are the backend-native `Local` (aka `ActiveEngine.Value`).
+//! Users who need to hold a JS `Value` across scope boundaries (e.g. store a callback in a Zig data structure) should reach for `Global(T)`; temporary in-scope values are the backend-native `Local` (aka `ActiveEngine.Value`).
 //!
 //! ## Lifetime summary
 //!
-//! - `Local` — backend Value. No retain; lifetime is whatever the backend rules say (e.g. QuickJS refcount held by caller, JSC GC root).
+//! - `Local` — backend Value. No retain; lifetime follows the active backend's ownership rules (refcount or GC root).
 //! - `Global(T)` — retained across scopes. `init` duplicates the value; the retained value is released on `reset` (or when the owning engine is destroyed, see `engine.destroy` → bookkeeping walk).
 //! - `Weak(T)` — **true weak** reference on JS objects. `get()` returns null once the target has been garbage collected. See "Weak semantics" below.
-//! - `Rooted` — refcounted GC root. `root` calls the backend protect only on the 0→1 edge; `unroot` releases only when the count returns to 0. `Global` is unchanged and still protects exactly once.
+//! - `Rooted` — refcounted GC root. `root` calls the backend protect only on the 0→1 edge; `unroot` releases only when the count returns to 0. On Hermes the protect-map wrapper is separate from a reusable weak identity so re-rooting a still-live object works after unroot. `Global` is unchanged and still protects exactly once.
 //! - `Scope` — threadlocal stack that `currentInstanceId()` reads. Not yet required before every API call; exists so consumers can query the active engine id without passing it everywhere.
 //! - `StackFrameScope` — thin wrapper around `dupValue` for values that need to escape a frame.
 //!
@@ -15,13 +15,13 @@
 //!
 //! `Weak(T)` is a true weak reference when the target value is a JS **object** (including arrays, functions, plain objects, typed arrays). `.get()` returns null after the underlying object has been garbage collected.
 //!
-//! - **QuickJS**: implemented via *Option C* — a finalizer watcher object (`WeakWatcher` class, registered once per runtime) is attached to the target as a hidden property (`__$jsbay_qjs_Weak$__`). Because the target strongly references the watcher (not the other way around), the watcher becomes unreachable exactly when the target does; its finalizer then clears a shared `WatcherData` struct. The Zig-side `Weak.get()` reads that struct to decide whether the target is still live.
+//! - **Refcount backends**: a finalizer watcher object (`WeakWatcher` class, registered once per runtime) is attached to the target as a hidden property (`__$jsbay_qjs_Weak$__`). Because the target strongly references the watcher (not the other way around), the watcher becomes unreachable exactly when the target does; its finalizer then clears a shared `WatcherData` struct. The Zig-side `Weak.get()` reads that struct to decide whether the target is still live.
 //!
-//! - **JSC**: implemented via `JSWeakCreate` / `JSWeakGetObject` — the JavaScriptCore private-but-ABI-stable weak-reference API. Symbols live in `JavaScriptCore.framework` but are not declared in the public headers; they are declared manually in `backend/jsc/weak.zig`.
+//! - **GC backends with weak handles**: implemented via the backend weak-reference API declared in `backend/jsc/weak.zig` (`JSWeakCreate` / `JSWeakGetObject`).
 //!
 //! ### Primitives policy
 //!
-//! Non-object values (numbers, booleans, strings, null, undefined) are not subject to garbage collection in the same way — numbers/booleans are inlined in the tagged value, strings are refcounted (QJS) or interned (JSC). For these, `Weak.init` stores a retained copy and behaves like a tiny `Global` that never spontaneously clears. Callers that want strict "null after GC" semantics should wrap primitives in an object first.
+//! Non-object values (numbers, booleans, strings, null, undefined) are not subject to garbage collection in the same way — numbers/booleans are inlined in the tagged value; strings are refcounted or interned depending on the backend. For these, `Weak.init` stores a retained copy and behaves like a tiny `Global` that never spontaneously clears. Callers that want strict "null after GC" semantics should wrap primitives in an object first.
 //!
 //! ## Implementation note: heap-allocated handle
 //!
@@ -93,7 +93,7 @@ pub const StackFrameScope = struct {
         _ = self;
     }
 
-    /// Promote a value out of the frame. Duplicates the refcount (QuickJS) or calls JSValueProtect (JSC). The caller then owns the returned value and must free it via `ActiveEngine.freeValue`.
+    /// Promote a value out of the frame via the backend retain path. The caller then owns the returned value and must free it via `ActiveEngine.freeValue`.
     pub fn returnValue(self: *StackFrameScope, v: Local) Local {
         const ctx = ctxForInstance(self.instance_id) orelse return v;
         return ActiveEngine.dupValue(ctx, v);
@@ -132,15 +132,15 @@ const WeakKind = enum {
 
 /// Shared between a `Weak` cell and the backend-specific watcher.
 ///
-/// For QuickJS, the watcher JS object holds a pointer to this via its opaque slot; on finalize it sets `target_collected = true`. Because either side can outlive the other, we reference-count the struct:
+/// On refcount backends, the watcher JS object holds a pointer to this via its opaque slot; on finalize it sets `target_collected = true`. Because either side can outlive the other, we reference-count the struct:
 ///   - `+1` for the WeakCell while it holds a pointer
 ///   - `+1` for the watcher while its finalizer has not fired yet.
 ///
-/// For JSC, this struct just records the `JSWeakRef` in an opaque slot.
+/// On weak-handle backends, this struct records the weak ref in an opaque slot.
 pub const WatcherData = struct {
-    /// True once the backend's finalizer/weak-ref reports the target has been garbage collected. For JSC this is implicit (set by polling `JSWeakGetObject == NULL`) so we don't actually flip this bit on JSC; see `getLive`.
+    /// True once the backend's finalizer/weak-ref reports the target has been garbage collected. On weak-handle backends this may be implicit (polled null); see `getLive`.
     target_collected: bool = false,
-    /// Platform-opaque handle. On JSC this is the `JSWeakRef`; on QJS it's unused (the watcher JS object owns the lifetime).
+    /// Platform-opaque handle. On weak-handle backends this is the weak ref; on refcount backends it's unused (the watcher JS object owns the lifetime).
     native_handle: ?*anyopaque = null,
     ref_count: u32 = 1,
 
@@ -230,7 +230,7 @@ fn unregisterEntry(instance_id: i32, entry: *instance_map.RefEntry) void {
 // reference.zig owns the WatcherData lifetime; each backend provides a thin attach/get/release adapter declared as `jsbay_qjsWeakAttach`, `jsbay_qjsWeakGetLive`, `jsbay_qjsWeakRelease` (append-only additions at the end of each backend file).
 // ----------------------------------------------------------------------
 
-/// Called by a backend finalizer when it detects that the target of a Weak has been collected. Must be `callconv(.c)` so we can hand it to QuickJS as a class finalizer. Flips `target_collected` and releases the backend's reference on the `WatcherData`; safe to invoke even after the owning `Weak` was `reset()` (the WatcherData is refcounted).
+/// Called by a backend finalizer when it detects that the target of a Weak has been collected. Must be `callconv(.c)` for class-finalizer trampolines. Flips `target_collected` and releases the backend's reference on the `WatcherData`; safe to invoke even after the owning `Weak` was `reset()` (the WatcherData is refcounted).
 pub fn weakFinalizerCallback(opaque_ptr: ?*anyopaque) callconv(.c) void {
     const wd_ptr = opaque_ptr orelse return;
     const wd: *WatcherData = @ptrCast(@alignCast(wd_ptr));
@@ -242,14 +242,16 @@ fn weakBackendIsObject(ctx: ActiveEngine.Context, v: Local) bool {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.Backend.jsIsObject(v),
         .jsc => @import("../backend/jsc.zig").JscBackend.isObjectVal(ctx, v),
+        .escargot, .hermes => ActiveEngine.isObjectVal(ctx, v),
     };
 }
 
-/// Attempt to install a backend-specific watcher on `v`. On success, populates `cell.watcher` and returns true. On failure (e.g. target frozen on QuickJS, or JSC alloc failure), returns false and the caller should fall back to strong retention.
+/// Attempt to install a backend-specific watcher on `v`. On success, populates `cell.watcher` and returns true. On failure (non-extensible target, or alloc failure), returns false and the caller should fall back to strong retention.
 fn weakBackendAttach(ctx: ActiveEngine.Context, cell: *WeakCell, v: Local) bool {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.jsbay_qjsWeakAttach(ctx, cell, v),
         .jsc => @import("../backend/jsc.zig").jsbay_qjsWeakAttach(ctx, cell, v),
+        .escargot, .hermes => false,
     };
 }
 
@@ -258,6 +260,7 @@ fn weakBackendGetLive(ctx: ActiveEngine.Context, cell: *WeakCell) ?Local {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.jsbay_qjsWeakGetLive(ctx, cell),
         .jsc => @import("../backend/jsc.zig").jsbay_qjsWeakGetLive(ctx, cell),
+        .escargot, .hermes => null,
     };
 }
 
@@ -265,14 +268,22 @@ fn weakBackendRelease(ctx: ActiveEngine.Context, cell: *WeakCell) void {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.jsbay_qjsWeakRelease(ctx, cell),
         .jsc => @import("../backend/jsc.zig").jsbay_qjsWeakRelease(ctx, cell),
+        .escargot, .hermes => {},
     }
 }
 
-/// One native retain. QuickJS dups the refcount; JSC calls `JSValueProtect` once. Callers (Rooted) must not invoke this on every `root()`.
-fn rootBackendProtect(ctx: ActiveEngine.Context, v: Local) Local {
+/// One native retain (refcount dup or GC protect). Callers (Rooted) must not invoke this on every `root()`. Hermes uses `cell.identity` (weak object / durable primitive) so re-root works after the protect-map wrapper is released.
+fn rootBackendProtect(ctx: ActiveEngine.Context, cell: *RootCell) ?Local {
     return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootProtect(ctx, v),
-        .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootProtect(ctx, v),
+        .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootProtect(ctx, cell.val),
+        .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootProtect(ctx, cell.val),
+        .escargot => ActiveEngine.dupValue(ctx, cell.val),
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            const id = cell.identity orelse break :blk null;
+            const v = c.hermes_root_protect(ctx, @ptrCast(id));
+            break :blk if (v == null) null else v;
+        },
     };
 }
 
@@ -281,6 +292,25 @@ fn rootBackendUnprotect(ctx: ActiveEngine.Context, v: Local) void {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootUnprotect(ctx, v),
         .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootUnprotect(ctx, v),
+        .escargot, .hermes => ActiveEngine.freeValue(ctx, v),
+    }
+}
+
+fn rootBackendIdentityCreate(ctx: ActiveEngine.Context, v: Local) ?*anyopaque {
+    return switch (backend.active_backend) {
+        .hermes => blk: {
+            const c = @import("../backend/hermes/c_api.zig");
+            break :blk @ptrCast(c.hermes_root_identity_create(ctx, v));
+        },
+        else => null,
+    };
+}
+
+fn rootBackendIdentityFree(ctx: ?ActiveEngine.Context, identity: ?*anyopaque) void {
+    const id = identity orelse return;
+    if (comptime backend.active_backend == .hermes) {
+        const c = @import("../backend/hermes/c_api.zig");
+        c.hermes_root_identity_free(ctx, @ptrCast(id));
     }
 }
 
@@ -288,7 +318,7 @@ fn rootBackendUnprotect(ctx: ActiveEngine.Context, v: Local) void {
 // Global(T)
 // ----------------------------------------------------------------------
 
-/// Retained reference to a JS value, safe to hold across scope boundaries. `T` is a phantom marker (e.g. Value vs Function) for clarity at the type site; the Zig implementation does not currently distinguish on T at runtime.
+/// Retained reference to a JS value, safe to hold across scope boundaries. `T` is a phantom type marker (e.g. Global(Value), Global(Function)); the Zig implementation does not currently distinguish on T at runtime; consumers may still use it for clarity at the type site.
 ///
 /// Ownership: a Global is a unique handle to the underlying heap cell. Copying the struct aliases the cell; deinit'ing one copy leaves any other copies with a dangling pointer. Pass Globals by pointer, or move them (do not use the source after assignment).
 pub fn Global(comptime T: type) type {
@@ -384,7 +414,7 @@ pub fn Weak(comptime T: type) type {
                     .val = v,
                 };
                 if (!weakBackendAttach(ctx, cell, v)) {
-                    // Fallback: the backend couldn't install a weak watcher (e.g. frozen target on QuickJS). Degrade to strong retention so the Weak is still usable.
+                    // Fallback: the backend couldn't install a weak watcher (e.g. non-extensible target). Degrade to strong retention so the Weak is still usable.
                     cell.kind = .primitive;
                     cell.val = ActiveEngine.dupValue(ctx, v);
                 }
@@ -450,10 +480,14 @@ pub fn Weak(comptime T: type) type {
 // ----------------------------------------------------------------------
 
 /// Heap cell for `Rooted`. The native retain is a single protect/dup held only while `root_count > 0`. Extra `root` calls bump the counter and do not call the backend again.
+///
+/// On Hermes, `identity` holds a reusable weak object reference (or durable primitive copy) separate from the protect-map wrapper in `val`. Unroot releases only the wrapper so a later `root` can protect the still-live object again.
 const RootCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
     val: ActiveEngine.Value,
+    /// Hermes-only durable identity (`HermesRootIdentity`). Null on other backends.
+    identity: ?*anyopaque = null,
     root_count: u32 = 0,
     /// True while the single native protect/dup from `rootBackendProtect` is outstanding.
     protected: bool = false,
@@ -462,12 +496,16 @@ const RootCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *RootCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
+        const ctx = ctxForInstance(cell.instance_id);
         if (cell.protected) {
-            if (ctxForInstance(cell.instance_id)) |ctx| {
-                rootBackendUnprotect(ctx, cell.val);
+            if (ctx) |c| {
+                rootBackendUnprotect(c, cell.val);
             }
             cell.protected = false;
-            cell.val = ActiveEngine.nullValue();
+        }
+        if (cell.identity) |id| {
+            rootBackendIdentityFree(ctx, id);
+            cell.identity = null;
         }
         cell.root_count = 0;
         cell.released = true;
@@ -477,6 +515,8 @@ const RootCell = struct {
 /// Refcounted root of one JS value.
 ///
 /// `root` twice then `unroot` once leaves the value protected. A further `unroot` that brings the count to 0 drops the native retain, after which a GC may collect the object. `unroot` at 0 is a no-op. This does not change `Global`, which still protects exactly once in `init`.
+///
+/// Hermes keeps a weak identity across unroot so re-rooting a still-live object creates a fresh protect-map wrapper; other backends reuse the durable value handle itself.
 ///
 /// The cell is registered with engine bookkeeping so `engine.destroy` releases a leftover protect before the runtime is freed.
 pub const Rooted = struct {
@@ -488,14 +528,21 @@ pub const Rooted = struct {
         const ctx = ctxForInstance(instance_id) orelse {
             return Rooted{ .instance_id = instance_id, .cell = null };
         };
-        _ = ctx;
         const cell = std.heap.c_allocator.create(RootCell) catch {
             return Rooted{ .instance_id = instance_id, .cell = null };
         };
+        const identity = rootBackendIdentityCreate(ctx, v);
+        if (comptime backend.active_backend == .hermes) {
+            if (identity == null) {
+                std.heap.c_allocator.destroy(cell);
+                return Rooted{ .instance_id = instance_id, .cell = null };
+            }
+        }
         cell.* = .{
             .entry = .{ .reset_fn = RootCell.releaseValue },
             .instance_id = instance_id,
             .val = v,
+            .identity = identity,
         };
         registerEntry(instance_id, &cell.entry);
         return Rooted{ .instance_id = instance_id, .cell = cell };
@@ -512,7 +559,8 @@ pub const Rooted = struct {
         if (cell.released) return;
         if (cell.root_count == 0) {
             const ctx = ctxForInstance(self.instance_id) orelse return;
-            cell.val = rootBackendProtect(ctx, cell.val);
+            const protected_val = rootBackendProtect(ctx, cell) orelse return;
+            cell.val = protected_val;
             cell.protected = true;
         }
         cell.root_count += 1;
@@ -528,9 +576,10 @@ pub const Rooted = struct {
                 rootBackendUnprotect(ctx, cell.val);
             }
             cell.protected = false;
-            // Keep cell.val so a later root() on a still-live object can re-protect it.
-            // (Clearing to nullValue here made isEmpty false after re-root while protecting
-            // only the sentinel — see "Rooted: re-root after count returns to zero".)
+            // Hermes: drop the freed wrapper address; re-root rebuilds from `identity`.
+            if (comptime backend.active_backend == .hermes) {
+                cell.val = ActiveEngine.undefinedValue();
+            }
         }
     }
 

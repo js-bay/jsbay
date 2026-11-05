@@ -18,6 +18,8 @@ const runtime_control = @import("../runtime/runtime_control.zig");
 const native_handle = switch (backend.active_backend) {
     .quickjs, .quickjs_ng => @import("../value/native_handle.zig"),
     .jsc => @import("../backend/jsc/native_handle.zig"),
+    .escargot => @import("../backend/escargot/native_handle.zig"),
+    .hermes => @import("../backend/hermes/native_handle.zig"),
 };
 
 const ActiveEngine = backend.ActiveEngine;
@@ -104,6 +106,7 @@ test "weakcb: finalizer fires for NativeHandle instance on teardown" {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => native_handle.init(instance.monoRuntime().?),
         .jsc => native_handle.init(),
+        .escargot, .hermes => native_handle.init(),
     }
 
     {

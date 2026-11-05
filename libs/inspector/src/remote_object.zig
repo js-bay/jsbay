@@ -282,7 +282,10 @@ pub fn Module(comptime Host: type) type {
                 const qjs = backend.ActiveEngineModule.c_api.qjs;
                 return value.tag == qjs.JS_TAG_SYMBOL;
             }
-            return backend.ActiveEngineModule.jsc.JSValueIsSymbol(@ptrCast(ctx), value);
+            if (comptime backend.isJscApiBackend(backend.active_backend)) {
+                return backend.ActiveEngineModule.jsc.JSValueIsSymbol(@ptrCast(ctx), value);
+            }
+            return ActiveEngine.isSymbol(ctx, value);
         }
 
         fn writeBigIntText(writer: anytype, digits: []const u8) !void {

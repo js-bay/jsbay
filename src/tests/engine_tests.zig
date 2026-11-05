@@ -346,6 +346,7 @@ test "engine: stopEventLoop before run and before destroy is safe" {
 }
 
 test "engine: runEventLoopOnce drains Promise microtasks" {
+    // Hermes: hermes_process_pending_jobs drains via jsi::Runtime::drainMicrotasks.
     const id = helpers.nextInstanceId();
     try testing.expect(engine.create(id, .{}));
     defer engine.destroy(id);
@@ -479,6 +480,8 @@ test "engine: log handler receives console.log output" {
 // ===================================================================
 
 test "engine: bounded stack aborts deep recursion with a JS exception" {
+    // Spikes: max_stack_size not wired to Escargot/Hermes Public/JSI APIs.
+    if (comptime backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{ .max_stack_size = 1 * 1024 * 1024 }, struct {
         fn run(eid: i32) !void {

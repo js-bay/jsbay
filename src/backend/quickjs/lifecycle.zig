@@ -243,7 +243,9 @@ threadlocal var job_drain_depth: u32 = 0;
 fn shouldStopPendingJobDrain(instance_id: i32) bool {
     const runtime_control = @import("../../runtime/runtime_control.zig");
     if (runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) return true;
-    return if (runtime_control.remainingExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
+    // Include the per-entry execution budget and shutdown grace, not only the absolute manual deadline.
+    // Short Promise microtasks may finish without an opcode interrupt check; without this, an expired budget never ends the drain.
+    return if (runtime_control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
 }
 
 pub fn processPendingJobsImpl(ctx: ?*qjs.JSContext) void {

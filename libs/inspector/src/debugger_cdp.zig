@@ -508,6 +508,7 @@ pub fn Module(comptime Host: type) type {
                     const ctx = Host.engine.getContext(instance_id) orelse return;
                     Host.jsc_async_hooks.setDepth(ctx, instance_id, depth);
                 },
+                .escargot, .hermes => {},
             }
         }
 

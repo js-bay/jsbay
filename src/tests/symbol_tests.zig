@@ -48,3 +48,19 @@ test "symbol: forKey matches Symbol.for" {
     ActiveEngine.setPropertyStr(ctx, global, "s", ActiveEngine.dupValue(ctx, s));
     try helpers.evalOk(id, "if (s !== Symbol.for('shared')) throw new Error('registry'); if (s.description !== 'shared') throw new Error(String(s.description));");
 }
+
+test "symbol: newSymbol with empty description is Symbol(\"\")" {
+    const id = helpers.nextInstanceId();
+    if (!engine.create(id, .{})) return error.EngineCreateFailed;
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id).?;
+    const s = symbol.newSymbol(id, "") orelse return error.SymbolFailed;
+    defer ActiveEngine.freeValue(ctx, s);
+
+    const global = ActiveEngine.getGlobalObject(ctx);
+    defer ActiveEngine.freeValue(ctx, global);
+    ActiveEngine.setPropertyStr(ctx, global, "s", ActiveEngine.dupValue(ctx, s));
+    // Host newSymbol("") must match Symbol("") (.description === ""), not Symbol() (.description === undefined).
+    try helpers.evalOk(id, "if (s.description !== '') throw new Error(String(s.description)); if (s.description === undefined) throw new Error('omitted');");
+}

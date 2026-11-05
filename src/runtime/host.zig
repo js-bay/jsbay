@@ -51,6 +51,7 @@ fn withTestContext(comptime test_fn: fn (ActiveEngine.Context, ActiveEngine.Runt
 }
 
 test "host: global handler emits json payload" {
+    // Dispatch emitGlobal works on native Escargot/Hermes facades.
     try withTestContext(struct {
         fn run(ctx: ActiveEngine.Context, _: ActiveEngine.Runtime) !void {
             const eval_result = ActiveEngine.eval(

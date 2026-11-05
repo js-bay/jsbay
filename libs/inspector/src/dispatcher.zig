@@ -203,6 +203,12 @@ pub fn Module(comptime Host: type) type {
                 .quickjs_ng => if (build_options.heap_snapshot) &protocol_domains.quickjs_ng else &protocol_domains.quickjs_ng_no_heap,
                 .quickjs => if (build_options.heap_snapshot) &protocol_domains.quickjs else &protocol_domains.quickjs_no_heap,
                 .jsc => &protocol_domains.jsc,
+                // Spike backends: minimal Schema surface (inspector is out of spike scope).
+                .escargot, .hermes => &[_]protocol_domains.Domain{
+                    .{ .name = "Runtime" },
+                    .{ .name = "Performance" },
+                    .{ .name = "Schema" },
+                },
             };
             var out: std.Io.Writer.Allocating = .init(state.allocator);
             defer out.deinit();

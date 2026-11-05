@@ -1,6 +1,6 @@
-//! isConstructor coverage and native receiver / hasReceiver behavior across backends.
+//! isConstructor coverage and native receiver (`thisValue` / `hasReceiver`) contracts.
 //!
-//! Bare-call receiver, observed by `thisValue()`: QuickJS: `undefined`. `hasReceiver()` is false (`JS_IsObject`). JSC: the global object. The C callback is sloppy, so `thisObject` is never null and `hasReceiver()` stays true. It is still not the method receiver.
+//! Bare-call receiver, observed by `thisValue()`: on the QuickJS backend, `undefined`, and `hasReceiver()` is false. On the JSC backend, the global object; the C callback is sloppy, so `thisObject` is never null and `hasReceiver()` stays true. It is still not the method receiver.
 
 const testing = @import("std").testing;
 const helpers = @import("test_helpers.zig");
@@ -52,16 +52,45 @@ test "isConstructor: class and function(){} are constructors" {
     }.run);
 }
 
+test "isConstructor: constructible Proxy with throwing prototype get remains a constructor" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            const ctx = engine.getContext(id) orelse return error.NoContext;
+            // Constructible Proxy: get trap throws on prototype, construct trap returns {}. IsConstructor must not read prototype.
+            try helpers.evalOk(id,
+                \\globalThis.__proxyCtor = new Proxy(function () {}, {
+                \\  get(t, p, r) { if (p === 'prototype') throw new Error('proto'); return Reflect.get(t, p, r); },
+                \\  construct() { return {}; }
+                \\});
+                \\globalThis.__arrow = (_ => _);
+            );
+            const proxy = try loadGlobal(id, "__proxyCtor");
+            defer ActiveEngine.freeValue(ctx, proxy);
+            try testing.expect(value.isConstructor(id, proxy));
+
+            const arrow = try loadGlobal(id, "__arrow");
+            defer ActiveEngine.freeValue(ctx, arrow);
+            try testing.expect(!value.isConstructor(id, arrow));
+        }
+    }.run);
+}
+
 test "isConstructor: Math, Reflect, object, generator, async, and arrows are not" {
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
             const ctx = engine.getContext(id) orelse return error.NoContext;
-            // Eight non-constructible values, in order.
-            try helpers.evalOk(id, "globalThis.__no = [Math, Reflect, {}, function*(){}, async function(){}, async function*(){}, _=>_, async _=>_];");
+            // Non-constructors under test; Hermes build lacks async* and may lack generators.
+            const hermes = comptime backend.isHermesBackend(backend.active_backend);
+            const no_ctors = if (hermes)
+                "globalThis.__no = [Math, Reflect, {}, _=>_];"
+            else
+                "globalThis.__no = [Math, Reflect, {}, function*(){}, async function(){}, async function*(){}, _=>_, async _=>_];";
+            const no_count: u32 = if (hermes) 4 else 8;
+            try helpers.evalOk(id, no_ctors);
             const arr = try loadGlobal(id, "__no");
             defer ActiveEngine.freeValue(ctx, arr);
             var index: u32 = 0;
-            while (index < 8) : (index += 1) {
+            while (index < no_count) : (index += 1) {
                 const item = ActiveEngine.getIndex(ctx, arr, index) orelse return error.Missing;
                 defer ActiveEngine.freeValue(ctx, item);
                 try testing.expect(!value.isConstructor(id, item));
@@ -100,9 +129,9 @@ test "native bare call receiver is undefined on QuickJS and globalThis on JSC" {
             value.registerFunction(id, null, "probeHas", &receiverPresent);
             try helpers.evalOk(id, "globalThis.mark = 'global'; globalThis.x = { mark: 'obj', probe: probe, probeHas: probeHas };");
             // Not the method object on either backend.
-            if (comptime backend.active_backend == .jsc) {
+            if (comptime backend.isJscApiBackend(backend.active_backend)) {
                 try helpers.expectEvalEquals(id, "probe()", "global");
-                // On JSC, hasReceiver is `thisObject != null`, so a bare call still reports a receiver. Identity is globalThis.
+                // On JSC, hasReceiver is true when thisObject is non-null, so a bare call still reports a receiver; identity is globalThis.
                 try helpers.expectEvalEquals(id, "probeHas()", "true");
             } else {
                 try helpers.expectEvalEquals(id, "probe()", "undefined");

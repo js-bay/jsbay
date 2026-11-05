@@ -95,7 +95,7 @@ fn pumpConsoleToken(session: *Session, from: usize, token: []const u8) ![]const 
 }
 
 test "JSC async stack: an application then wrapper creates one Promise parent" {
-    if (comptime backend.active_backend != .jsc) return;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "jsc-async-wrapper-parent");
     defer session.deinit();
@@ -135,7 +135,7 @@ test "JSC async stack: an application then wrapper creates one Promise parent" {
 }
 
 test "JSC async stack: a closure then wrapper creates one Promise parent" {
-    if (comptime backend.active_backend != .jsc) return;
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "jsc-async-closure-wrapper-parent");
     defer session.deinit();

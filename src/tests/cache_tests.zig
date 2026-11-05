@@ -45,7 +45,7 @@ test "cache: build fingerprint creates a distinct artifact namespace" {
 }
 
 test "cache: changed build fingerprint does not read an old artifact" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const abs = try makeCacheDir(testing.allocator);
     defer cleanCacheDir(testing.allocator, abs);
@@ -186,7 +186,7 @@ fn freeCached(gpa: std.mem.Allocator, res: cache.CachedEvalResult) void {
 }
 
 test "cache: cold write persists one artifact; warm run hits and matches" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const abs = try makeCacheDir(testing.allocator);
     defer cleanCacheDir(testing.allocator, abs);
@@ -214,7 +214,7 @@ test "cache: cold write persists one artifact; warm run hits and matches" {
 }
 
 test "cache: runtime exception from cached run is surfaced and cache kept" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const abs = try makeCacheDir(testing.allocator);
     defer cleanCacheDir(testing.allocator, abs);
@@ -245,7 +245,7 @@ test "cache: runtime exception from cached run is surfaced and cache kept" {
 }
 
 test "cache: corrupt artifact is deleted and rebuilt once" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const abs = try makeCacheDir(testing.allocator);
     defer cleanCacheDir(testing.allocator, abs);
@@ -278,7 +278,7 @@ test "cache: corrupt artifact is deleted and rebuilt once" {
 }
 
 test "cache: unsafe version falls back to plain eval, never writes outside dir" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const abs = try makeCacheDir(testing.allocator);
     defer cleanCacheDir(testing.allocator, abs);
@@ -298,7 +298,7 @@ test "cache: unsafe version falls back to plain eval, never writes outside dir" 
 }
 
 test "cache: zero-byte artifact is rebuilt instead of repeated errors" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const abs = try makeCacheDir(testing.allocator);
     defer cleanCacheDir(testing.allocator, abs);
@@ -341,7 +341,7 @@ test "cache: zero-byte artifact is rebuilt instead of repeated errors" {
 }
 
 test "cache: repeated fresh writes leave valid artifacts, no stray temp names" {
-    if (backend.active_backend == .jsc) return error.SkipZigTest;
+    if (backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
 
     const abs = try makeCacheDir(testing.allocator);
     defer cleanCacheDir(testing.allocator, abs);
