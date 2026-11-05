@@ -349,6 +349,7 @@ test "timers: setTimeout with non-function throws TypeError at registration" {
     try helpers.evalErr(id, "setTimeout(42, 0);");
     try helpers.evalErr(id, "setTimeout(null, 0);");
     // Callback-validation failures must be TypeError (QuickJS/Escargot parity), not a plain Error.
+    //
     // Separate script evals share one realm — avoid `let ok` redeclaration across evalOk calls.
     try helpers.evalOk(id,
         \\try { setTimeout(null, 0); globalThis.__timerTypeErr__ = false; }
