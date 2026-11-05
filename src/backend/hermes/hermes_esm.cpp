@@ -1802,20 +1802,25 @@ static std::string rewriteIdents(const std::string &src,
                     if (at_stmt_boundary && !outEndsWithWord(lpk, "case")) label_decl = true;
                 }
             }
-            // Accessor modifiers (`get`/`set` before a property key then `(`) are keywords, not value references — leave them even when an import binds the same name.
+            // Accessor / async method modifiers (`get`/`set`/`async` before a property key then `(`) are keywords, not value references — leave them even when an import binds the same name. Computed keys and method bodies still rewrite import references as usual.
             bool accessor_modifier = false;
-            if ((id == "get" || id == "set") && !after_dot && !after_question &&
+            if ((id == "get" || id == "set" || id == "async") && !after_dot && !after_question &&
                 (in_object_lit_for_key || in_class_body_for_key) && k < src.size()) {
                 size_t ak = k;
+                // `async *name()` / `async *[expr]()`: optional generator star after the modifier.
+                if (id == "async" && src[ak] == '*') {
+                    ++ak;
+                    skipSpacesAndCommentsSrc(ak);
+                }
                 bool saw_key = false;
-                if (isIdentStart(src[ak])) {
+                if (ak < src.size() && isIdentStart(src[ak])) {
                     ++ak;
                     while (ak < src.size() && isIdent(src[ak])) ++ak;
                     saw_key = true;
-                } else if (src[ak] == '\'' || src[ak] == '"' || src[ak] == '`') {
+                } else if (ak < src.size() && (src[ak] == '\'' || src[ak] == '"' || src[ak] == '`')) {
                     size_t t = ak;
                     if (skipStringTemplateOrComment(src, t)) { ak = t; saw_key = true; }
-                } else if (src[ak] == '[') {
+                } else if (ak < src.size() && src[ak] == '[') {
                     size_t es = 0, ee = 0;
                     if (takeBalancedBracketExpr(src, ak, es, ee)) saw_key = true;
                 }
@@ -2613,40 +2618,58 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src, const Esm
             return true;
         }
 
-        // dynamic import( ... )
+        // dynamic import( ... ): quoted literals and expression specifiers (Hermes has no native dynamic import).
         if (k >= src.size() || src[k] != '(') return false;
-        size_t arg = k + 1;
-        while (arg < src.size() && std::isspace(static_cast<unsigned char>(src[arg]))) ++arg;
-        if (arg >= src.size() || (src[arg] != '\'' && src[arg] != '"')) return false;
-        char q = src[arg++];
-        size_t spec_start = arg;
-        while (arg < src.size()) {
-            if (src[arg] == '\\' && arg + 1 < src.size()) {
-                arg += 2;
-                continue;
+        size_t end = scanBalancedCallEnd(k);
+        if (end == std::string::npos) return false;
+        size_t args_lo = k + 1;
+        size_t args_hi = end - 1; // index of closing ')'
+        // Top-level comma marks unsupported import attributes (depth 1 inside the outer call).
+        auto topLevelComma = [&](size_t lo, size_t hi) -> size_t {
+            int depth = 1;
+            size_t p = lo;
+            while (p < hi) {
+                char ch = src[p];
+                if (ch == '\\' && p + 1 < hi) { p += 2; continue; }
+                if (ch == '\'' || ch == '"' || ch == '`') {
+                    char qq = ch; ++p;
+                    while (p < hi) {
+                        if (src[p] == '\\' && p + 1 < hi) { p += 2; continue; }
+                        if (src[p] == qq) { ++p; break; }
+                        if (qq == '`' && src[p] == '$' && p + 1 < hi && src[p + 1] == '{') {
+                            p += 2; int nested = 1;
+                            while (p < hi && nested > 0) {
+                                if (src[p] == '{') ++nested;
+                                else if (src[p] == '}') --nested;
+                                ++p;
+                            }
+                            continue;
+                        }
+                        ++p;
+                    }
+                    continue;
+                }
+                if (ch == '(' || ch == '{' || ch == '[') { ++depth; ++p; continue; }
+                if (ch == ')' || ch == '}' || ch == ']') { --depth; ++p; continue; }
+                if (ch == ',' && depth == 1) return p;
+                ++p;
             }
-            if (src[arg] == q) break;
-            ++arg;
-        }
-        if (arg >= src.size()) return false;
-        std::string spec = src.substr(spec_start, arg - spec_start);
-        ++arg; // closing quote
-        while (arg < src.size() && std::isspace(static_cast<unsigned char>(src[arg]))) ++arg;
-
-        if (arg < src.size() && src[arg] == ',') {
-            size_t end = scanBalancedCallEnd(k);
-            if (end == std::string::npos) return false;
+            return std::string::npos;
+        };
+        if (topLevelComma(args_lo, args_hi) != std::string::npos) {
             out += "Promise.reject(new Error(\"import attributes not supported\"))";
             i = end;
             return true;
         }
-        if (arg >= src.size() || src[arg] != ')') return false;
-        out += std::string("Promise.resolve().then(function(){ return ") + wrap.require + "(";
-        out.push_back(q);
-        out += spec;
-        out.push_back(q);
-        out += "); })";
-        i = arg + 1;
+        size_t es = args_lo, ee = args_hi;
+        while (es < ee && std::isspace(static_cast<unsigned char>(src[es]))) ++es;
+        while (ee > es && std::isspace(static_cast<unsigned char>(src[ee - 1]))) --ee;
+        if (es >= ee) return false;
+        // Recurse so nested import.meta / import() inside the specifier expression are rewritten too.
+        std::string expr = rewriteImportMetaAndDynamic(src.substr(es, ee - es), wrap);
+        // Evaluate the specifier inside the then-callback so load failures reject the promise (matching literal import("dep") rewriting).
+        out += std::string("Promise.resolve().then(function(){ return ") + wrap.require + "(" + expr + "); })";
+        i = end;
         return true;
     };
 

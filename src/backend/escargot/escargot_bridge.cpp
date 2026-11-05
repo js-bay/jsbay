@@ -785,8 +785,22 @@ extern "C" EscargotValueResult escargot_eval_value(EscargotContext *c, const cha
     auto fname = StringRef::createFromUTF8(filename ? filename : "", filename_len);
     auto parsed = c->ctx.get()->scriptParser()->initializeScript(source, fname, false);
     if (!parsed.isSuccessful()) {
+        // Keep diagnostic text in err; also retain a real Error object so hosts can inspect name/message (typed_eval synthesizes a string when value is null).
         out.err = stringRefToUtf8(parsed.parseErrorMessage);
         if (!out.err) out.err = dupCString("parse error");
+        auto code = parsed.parseErrorCode;
+        if (code == ErrorObjectRef::Code::None) code = ErrorObjectRef::Code::SyntaxError;
+        StringRef *msg = parsed.parseErrorMessage ? parsed.parseErrorMessage : StringRef::emptyString();
+        auto er_parse = Evaluator::execute(c->ctx.get(),
+            [](ExecutionStateRef *state, ErrorObjectRef::Code ec, StringRef *m) -> ValueRef * {
+                auto *err = ErrorObjectRef::create(state, ec, m);
+                err->updateStackTraceData(state);
+                return err;
+            },
+            code, msg);
+        if (er_parse.isSuccessful() && er_parse.result) {
+            out.value = retain(c, er_parse.result);
+        }
         return out;
     }
     auto er = Evaluator::execute(c->ctx.get(),
