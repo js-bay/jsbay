@@ -532,6 +532,29 @@ test "modules: class method key after preceding method is not rewritten" {
     try testing.expectEqual(@as(i64, 2), got);
 }
 
+
+test "modules: class field key is not rewritten to import" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const value = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Non-computed class field keys are names; only the initializer may reference the import.
+    const src = "import {value} from 'dep';\nexport const C = class { value = 7; };\nglobalThis.__result__ = new C().value;";
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const got = try helpers.evalInt(id, "globalThis.__result__");
+    try testing.expectEqual(@as(i64, 7), got);
+}
+
 test "modules: object method key after comment trivia is not rewritten" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
@@ -1198,6 +1221,34 @@ test "modules: semicolon-free export const respects ASI between declarations" {
     const src =
         \\export const a = 1
         \\export const b = 2, c = 3;
+        \\globalThis.__a__ = a;
+        \\globalThis.__b__ = b;
+        \\globalThis.__c__ = c;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__a__"));
+    try testing.expectEqual(@as(i64, 2), try helpers.evalInt(id, "globalThis.__b__"));
+    try testing.expectEqual(@as(i64, 3), try helpers.evalInt(id, "globalThis.__c__"));
+}
+
+
+test "modules: ASI across block comment with LineTerminator between export consts" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // LineTerminator inside `/*…*/` still ends the first declarator list for ASI; `c` belongs to the second declaration.
+    const src =
+        \\export const a=1/*
+        \\*/export const b=2,c=3;
         \\globalThis.__a__ = a;
         \\globalThis.__b__ = b;
         \\globalThis.__c__ = c;

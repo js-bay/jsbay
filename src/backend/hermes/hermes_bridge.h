@@ -268,6 +268,8 @@ HermesEvalResult hermes_run_bytecode(JsbayHermesContext *ctx, const uint8_t *byt
 /* decode_failed: 1 if bytes are not valid HBC / empty; 0 if JS threw after decode. */
 HermesEvalResult hermes_run_bytecode_ex(JsbayHermesContext *ctx, const uint8_t *bytes, size_t len,
                                         int *out_decode_failed);
+HermesValueResult hermes_run_bytecode_value(JsbayHermesContext *ctx, const uint8_t *bytes, size_t len,
+                                            int *out_decode_failed);
 
 /* NativeHandle: opaque + optional call + finalize */
 typedef void (*HermesNhFinalize)(void *handle_data);

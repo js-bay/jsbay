@@ -21,7 +21,8 @@ pub fn compile(ctx: ActiveEngine.Context, source: []const u8, filename: []const 
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => compileQuickJs(ctx, source, filename),
         .jsc => .{ .unsupported = true },
-        .escargot, .hermes => .{ .unsupported = true },
+        .escargot => .{ .unsupported = true },
+        .hermes => compileHermes(ctx, source, filename),
     };
 }
 
@@ -30,7 +31,8 @@ pub fn run(ctx: ActiveEngine.Context, bytes: []const u8) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => runQuickJs(ctx, bytes),
         .jsc => .{ .unsupported = true },
-        .escargot, .hermes => .{ .unsupported = true },
+        .escargot => .{ .unsupported = true },
+        .hermes => runHermes(ctx, bytes),
     };
 }
 
@@ -175,4 +177,37 @@ test "typed bytecode: compile and run preserve live values and throw values" {
     const syntax = compile(ctx, "function {", "syntax.js");
     const syntax_exception = syntax.exception orelse return error.ExpectedSyntaxException;
     defer ActiveEngine.freeValue(ctx, syntax_exception);
+}
+
+fn compileHermes(ctx: ActiveEngine.Context, source: []const u8, filename: []const u8) Result {
+    const hermes = @import("../backend/hermes.zig");
+    const out = hermes.hermesCompileBytecode(source, filename);
+    if (out.err) |e| {
+        defer if (out.err_is_heap) std.heap.c_allocator.free(@constCast(e));
+        // Compile failures are reported as string exceptions on the public ABI.
+        const synthesized = ActiveEngine.newStringVal(ctx, e) orelse return .{ .out_of_memory = true };
+        return .{ .exception = synthesized };
+    }
+    const raw = out.bytes orelse return .{ .out_of_memory = true };
+    // hermesCompileBytecode returns a malloc buffer; copy into c_allocator so freeBytes matches.
+    const owned = std.heap.c_allocator.alloc(u8, raw.len) catch {
+        std.c.free(raw.ptr);
+        return .{ .out_of_memory = true };
+    };
+    @memcpy(owned, raw);
+    std.c.free(raw.ptr);
+    return .{ .bytes = owned };
+}
+
+fn runHermes(ctx: ActiveEngine.Context, bytes: []const u8) Result {
+    if (bytes.len == 0) return .{ .invalid_argument = true };
+    const hermes = @import("../backend/hermes.zig");
+    const out = hermes.hermesRunBytecodeValue(ctx, bytes);
+    if (out.err_text) |e| {
+        defer std.heap.c_allocator.free(e);
+        if (out.exception) |ex| return .{ .exception = ex };
+        const synthesized = ActiveEngine.newStringVal(ctx, e) orelse return .{ .out_of_memory = true };
+        return .{ .exception = synthesized };
+    }
+    return .{ .value = out.value orelse return .{ .out_of_memory = true } };
 }

@@ -57,6 +57,10 @@ struct JsbayHermesContextOpaque {
     std::unique_ptr<jsi::Function> pristine_object_keys;
     std::unique_ptr<jsi::Function> pristine_object_create;
     std::unique_ptr<jsi::Function> pristine_object_define_property;
+    // Pristine Object constructor for ToObject boxing of primitive receivers (ignore page-replaced globalThis.Object).
+    std::unique_ptr<jsi::Function> pristine_object;
+    // Pristine Reflect.deleteProperty for jsbay_value_delete (ignore page-replaced Reflect).
+    std::unique_ptr<jsi::Function> pristine_reflect_delete_property;
     std::unique_ptr<jsi::Object> pristine_dataview_proto;
     // Pristine DataView.prototype getters (captured once; ignore mutated prototype accessors).
     std::unique_ptr<jsi::Function> pristine_dv_buffer_get;
@@ -370,10 +374,20 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
         c->pristine_object_create = std::make_unique<jsi::Function>(std::move(create));
         auto defineProp = Object.getPropertyAsFunction(*c->rt, "defineProperty");
         c->pristine_object_define_property = std::make_unique<jsi::Function>(std::move(defineProp));
+        // Move last: Function is move-only; keep the pristine ctor for ToObject boxing of primitives.
+        c->pristine_object = std::make_unique<jsi::Function>(std::move(Object));
     } catch (...) {
+        c->pristine_object.reset();
         c->pristine_object_keys.reset();
         c->pristine_object_create.reset();
         c->pristine_object_define_property.reset();
+    }
+    try {
+        auto Reflect = c->rt->global().getPropertyAsObject(*c->rt, "Reflect");
+        auto del = Reflect.getPropertyAsFunction(*c->rt, "deleteProperty");
+        c->pristine_reflect_delete_property = std::make_unique<jsi::Function>(std::move(del));
+    } catch (...) {
+        c->pristine_reflect_delete_property.reset();
     }
     try {
         auto proto = c->rt->global()
@@ -938,7 +952,9 @@ extern "C" HermesValue hermes_get_property(JsbayHermesContext *c, HermesValue ob
         if (asVal(obj)->isNull() || asVal(obj)->isUndefined()) return nullptr;
         jsi::Object target = asVal(obj)->isObject()
             ? asVal(obj)->getObject(*c->rt)
-            : c->rt->global().getPropertyAsFunction(*c->rt, "Object").call(*c->rt, *asVal(obj)).asObject(*c->rt);
+            : (c->pristine_object
+                   ? c->pristine_object->call(*c->rt, *asVal(obj)).asObject(*c->rt)
+                   : c->rt->global().getPropertyAsFunction(*c->rt, "Object").call(*c->rt, *asVal(obj)).asObject(*c->rt));
         return retainMove(c, target.getProperty(*c->rt, key));
     } catch (...) { return nullptr; }
 }
@@ -1967,9 +1983,12 @@ extern "C" HermesOpResult hermes_get_property_result(JsbayHermesContext *c, Herm
         return hopFail(c, makeTypeError(*c->rt, "Cannot convert undefined or null to object"));
     }
     try {
+        if (!asVal(obj)->isObject() && !c->pristine_object) {
+            return hopFail(c, makeTypeError(*c->rt, "Object unavailable"));
+        }
         jsi::Object target = asVal(obj)->isObject()
             ? asVal(obj)->getObject(*c->rt)
-            : c->rt->global().getPropertyAsFunction(*c->rt, "Object").call(*c->rt, *asVal(obj)).asObject(*c->rt);
+            : c->pristine_object->call(*c->rt, *asVal(obj)).asObject(*c->rt);
         return hopOk(c, target.getProperty(*c->rt, key));
     } catch (const jsi::JSError &e) {
         return hopFail(c, jsi::Value(*c->rt, e.value()));
@@ -2176,13 +2195,17 @@ extern "C" HermesBoolOpResult hermes_delete_property(JsbayHermesContext *c, Herm
         return hboolFail(c, makeTypeError(*c->rt, "Cannot convert undefined or null to object"));
     }
     try {
+        if (!asVal(obj)->isObject() && !c->pristine_object) {
+            return hboolFail(c, makeTypeError(*c->rt, "Object unavailable"));
+        }
         jsi::Object target = asVal(obj)->isObject()
             ? asVal(obj)->getObject(*c->rt)
-            : c->rt->global().getPropertyAsFunction(*c->rt, "Object").call(*c->rt, *asVal(obj)).asObject(*c->rt);
-        // Reflect.deleteProperty — non-strict boolean result, trap exceptions.
-        auto Reflect = c->rt->global().getPropertyAsObject(*c->rt, "Reflect");
-        auto del = Reflect.getPropertyAsFunction(*c->rt, "deleteProperty");
-        jsi::Value ok = del.call(*c->rt, target, key);
+            : c->pristine_object->call(*c->rt, *asVal(obj)).asObject(*c->rt);
+        // Pristine Reflect.deleteProperty — non-strict boolean result; ignore page-replaced Reflect.
+        if (!c->pristine_reflect_delete_property) {
+            return hboolFail(c, makeTypeError(*c->rt, "Reflect.deleteProperty unavailable"));
+        }
+        jsi::Value ok = c->pristine_reflect_delete_property->call(*c->rt, target, key);
         return hboolOk(ok.isBool() && ok.getBool());
     } catch (const jsi::JSError &e) {
         return hboolFail(c, jsi::Value(*c->rt, e.value()));
@@ -2200,9 +2223,12 @@ extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj
     }
     try {
         auto &rt = *c->rt;
+        if (!asVal(obj)->isObject() && !c->pristine_object) {
+            return hopFail(c, makeTypeError(rt, "Object unavailable"));
+        }
         jsi::Object target = asVal(obj)->isObject()
             ? asVal(obj)->getObject(rt)
-            : rt.global().getPropertyAsFunction(rt, "Object").call(rt, *asVal(obj)).asObject(rt);
+            : c->pristine_object->call(rt, *asVal(obj)).asObject(rt);
 
         if (!c->pristine_object_keys || !c->pristine_object_define_property) {
             return hopFail(c, makeTypeError(rt, "Object.keys/defineProperty unavailable"));
@@ -3119,6 +3145,61 @@ extern "C" HermesEvalResult hermes_run_bytecode_ex(JsbayHermesContext *c, const 
     } catch (...) {
         if (out_decode_failed) *out_decode_failed = 1;
         hermesEvalSetErr(out, "unknown bytecode error");
+    }
+    return out;
+}
+
+
+// Value-returning bytecode run for the public C ABI (mirrors hermes_eval_value).
+extern "C" HermesValueResult hermes_run_bytecode_value(JsbayHermesContext *c, const uint8_t *bytes, size_t len,
+                                                       int *out_decode_failed) {
+    HermesValueResult out{nullptr, nullptr};
+    if (out_decode_failed) *out_decode_failed = 0;
+    if (!c || !c->rt) {
+        out.err = dupCString("no context");
+        if (out_decode_failed) *out_decode_failed = 1;
+        return out;
+    }
+    if (!bytes || len == 0) {
+        out.err = dupCString("bytecode buffer is empty");
+        if (out_decode_failed) *out_decode_failed = 1;
+        return out;
+    }
+    // Validate HBC header before execution. Script exceptions must never set decode_failed.
+    if (len < 8) {
+        out.err = dupCString("bytecode buffer too short for HBC header");
+        if (out_decode_failed) *out_decode_failed = 1;
+        return out;
+    }
+    {
+        uint64_t magic = 0;
+        std::memcpy(&magic, bytes, sizeof(magic));
+        constexpr uint64_t kHbcMagic = 0x1F1903C103BC1FC6ull;
+        constexpr uint64_t kHbcMagic2 = 0x1F1903C103BC1FC7ull;
+        if (magic != kHbcMagic && magic != kHbcMagic2) {
+            out.err = dupCString("invalid HBC magic");
+            if (out_decode_failed) *out_decode_failed = 1;
+            return out;
+        }
+    }
+    try {
+        auto buf = std::make_shared<HbcBuffer>(bytes, len);
+        jsi::Value result = c->rt->evaluateJavaScript(std::move(buf), "<bytecode>");
+        out.value = retainMove(c, std::move(result));
+    } catch (const jsi::JSError &e) {
+        if (out_decode_failed) *out_decode_failed = 0;
+        try {
+            out.value = retainMove(c, jsi::Value(*c->rt, e.value()));
+        } catch (...) {
+            out.value = nullptr;
+        }
+        out.err = dupCString(formatJSError(e));
+    } catch (const std::exception &e) {
+        if (out_decode_failed) *out_decode_failed = 1;
+        out.err = dupCString(e.what());
+    } catch (...) {
+        if (out_decode_failed) *out_decode_failed = 1;
+        out.err = dupCString("unknown bytecode error");
     }
     return out;
 }

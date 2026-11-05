@@ -422,10 +422,7 @@ pub const Transport = struct {
     }
 
     pub fn broadcastText(self: *Transport, message: []const u8) void {
-        // Allocate the lease snapshot before retaining anything. An append-while-retaining
-        // loop can fail mid-growth after some sessions were already retained; pairing those
-        // releases with a growable ArrayList is easy to get wrong under concurrent allocator
-        // pressure. Exact alloc-or-fail keeps OOM from observing any broadcast lease.
+        // Allocate the lease snapshot before retaining anything. An append-while-retaining loop can fail mid-growth after some sessions were already retained; pairing those releases with a growable ArrayList is easy to get wrong under concurrent allocator pressure. Exact alloc-or-fail keeps OOM from observing any broadcast lease.
         self.sessions_mu.lock();
         const n = self.sessions.items.len;
         const snapshot = self.allocator.alloc(*Session, n) catch {

@@ -1747,6 +1747,38 @@ static std::string rewriteIdents(const std::string &src,
                         method_key = true;
                 }
             }
+            // Non-computed class field keys (`value=7`, `value;`, `static value=7`) are names, not references — only initializers after `=` rewrite imports.
+            bool class_field_key = false;
+            if (!method_key && !after_dot && !after_question && in_class_body_for_key) {
+                size_t pk = skipTriviaBackward(out, out.size());
+                bool at_field_boundary = false;
+                if (pk > 0 && (out[pk - 1] == '{' || out[pk - 1] == ';' || out[pk - 1] == '}' || out[pk - 1] == '*')) {
+                    at_field_boundary = true;
+                } else if (pk > 0 && (std::isalnum(static_cast<unsigned char>(out[pk - 1])) ||
+                                      out[pk - 1] == '_' || out[pk - 1] == '$')) {
+                    size_t start = pk;
+                    while (start > 0) {
+                        char ch = out[start - 1];
+                        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '$')
+                            --start;
+                        else
+                            break;
+                    }
+                    std::string prev_word = out.substr(start, pk - start);
+                    if (prev_word == "static")
+                        at_field_boundary = true;
+                }
+                if (at_field_boundary) {
+                    if (k >= src.size()) {
+                        class_field_key = true;
+                    } else {
+                        char nk = src[k];
+                        // Field: `name=`, `name;`, `name}`, or ASI LineTerminator before the next member. Methods use `(`.
+                        if (nk == '=' || nk == ';' || nk == '}') class_field_key = true;
+                        else if (nk == '\n' || nk == '\r') class_field_key = true;
+                    }
+                }
+            }
             // Labels live in a separate namespace from values: do not rewrite label declarations or `break`/`continue` label operands.
             bool label_operand = false;
             {
@@ -1793,7 +1825,7 @@ static std::string rewriteIdents(const std::string &src,
                 }
             }
             auto it = repl.find(id);
-            if (!after_dot && !object_key && !method_key && !label_decl && !label_operand && !accessor_modifier && it != repl.end() && !isShadowed(id)) {
+            if (!after_dot && !object_key && !method_key && !class_field_key && !label_decl && !label_operand && !accessor_modifier && it != repl.end() && !isShadowed(id)) {
                 // Shorthand only for ObjectLit property context — not arrays, args, or blocks.
                 bool in_object_lit = !cont.empty() && cont.back() == Cont::ObjectLit;
                 bool after_shorthand_intro = false;
@@ -2351,9 +2383,24 @@ static std::vector<std::string> collectDeclaratorBoundNames(const std::string &s
                     continue;
                 }
                 if (ch == '/' && i + 1 < src.size() && src[i + 1] == '*') {
+                    // Preserve LineTerminator visibility for ASI: `a=1/*\n*/export…` must end the declarator.
+                    const size_t comment_start = i;
                     i += 2;
-                    while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) ++i;
+                    bool saw_lt = false;
+                    while (i + 1 < src.size() && !(src[i] == '*' && src[i + 1] == '/')) {
+                        if (src[i] == '\n' || src[i] == '\r') saw_lt = true;
+                        ++i;
+                    }
                     if (i + 1 < src.size()) i += 2;
+                    if (saw_lt && depth == 0) {
+                        char prev = prevSignificantSkippingComments(src, comment_start);
+                        bool ended = tokenCanEndAssignmentExpr(prev) || atPostfixIncDecBefore(src, comment_start);
+                        if (ended) {
+                            size_t la = i;
+                            skipWsAndComments(src, la);
+                            if (!canContinueExprAfterLineBreak(src, la)) break;
+                        }
+                    }
                     continue;
                 }
                 if (ch == '/' && canStartRegexLiteral(src.substr(0, i))) {

@@ -20,7 +20,14 @@ const HermesEvalResult = extern struct {
 extern fn hermes_compile_bytecode(src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) HermesCompileResult;
 extern fn hermes_compile_result_free(r: HermesCompileResult) void;
 extern fn hermes_run_bytecode_ex(ctx: ?*anyopaque, bytes: [*]const u8, len: usize, out_decode_failed: *c_int) HermesEvalResult;
+extern fn hermes_run_bytecode_value(ctx: ?*anyopaque, bytes: [*]const u8, len: usize, out_decode_failed: *c_int) HermesValueResultC;
+extern fn hermes_value_result_free_err(r: HermesValueResultC) void;
 extern fn free(ptr: ?*anyopaque) void;
+
+const HermesValueResultC = extern struct {
+    value: ?*anyopaque,
+    err: ?[*:0]u8,
+};
 
 fn dupeAndFree(src_opt: ?[*:0]u8) ?[]const u8 {
     const src = src_opt orelse return null;
@@ -78,4 +85,33 @@ pub fn hermesRunBytecode(ctx: Context, bytes: []const u8) types.EvalResult {
         return .{ .result = null, .err = err, .err_is_heap = duped != null, .decode_failed = decode_failed != 0 };
     }
     return .{ .result = dupeAndFreeLen(r.result, r.result_len), .err = null, .decode_failed = false };
+}
+
+pub const ValueRunOut = struct {
+    value: ?*anyopaque = null,
+    exception: ?*anyopaque = null,
+    err_text: ?[]u8 = null,
+    decode_failed: bool = false,
+    out_of_memory: bool = false,
+};
+
+/// Run .hbc and return a retained live Value (or exception Value). Caller owns value/exception/err_text.
+pub fn hermesRunBytecodeValue(ctx: Context, bytes: []const u8) ValueRunOut {
+    var decode_failed: c_int = 0;
+    const ptr: [*]const u8 = if (bytes.len > 0) bytes.ptr else @as([*]const u8, @ptrFromInt(1));
+    const r = hermes_run_bytecode_value(ctx, ptr, bytes.len, &decode_failed);
+    if (r.err) |e| {
+        const span = std.mem.span(e);
+        const err_text = std.heap.c_allocator.dupe(u8, span) catch {
+            hermes_value_result_free_err(r);
+            if (r.value) |v| {
+                // Drop retained exception if we cannot surface the message; typed layer synthesizes OOM.
+                _ = v;
+            }
+            return .{ .out_of_memory = true, .decode_failed = decode_failed != 0 };
+        };
+        hermes_value_result_free_err(r);
+        return .{ .value = null, .exception = r.value, .err_text = err_text, .decode_failed = decode_failed != 0 };
+    }
+    return .{ .value = r.value, .exception = null, .err_text = null, .decode_failed = false };
 }

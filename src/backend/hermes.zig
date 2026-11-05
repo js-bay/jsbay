@@ -56,8 +56,7 @@ pub const HermesBackend = struct {
     }
     pub const setPropertyStr = value_mod.setPropertyStr;
     pub fn makeFunction(ctx: Context, name: anytype, callback: anytype) Value {
-        // JSC-shaped API used by registry: name is []const u8 or [*:0]const u8; callback is *const fn...
-        // Hermes registry uses hermes_make_function directly via HermesWrapper.
+        // JSC-shaped API used by registry: name is []const u8 or [*:0]const u8; callback is *const fn... Hermes registry uses hermes_make_function directly via HermesWrapper.
         _ = ctx;
         _ = name;
         _ = callback;
@@ -253,6 +252,7 @@ pub const HermesBackend = struct {
 const bytecode_mod = @import("hermes/bytecode.zig");
 pub const hermesCompileBytecode = bytecode_mod.hermesCompileBytecode;
 pub const hermesRunBytecode = bytecode_mod.hermesRunBytecode;
+pub const hermesRunBytecodeValue = bytecode_mod.hermesRunBytecodeValue;
 
 const module_mod = @import("hermes/module.zig");
 pub const installModuleLoader = module_mod.installModuleLoader;

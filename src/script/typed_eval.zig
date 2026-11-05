@@ -169,19 +169,31 @@ fn evaluateSpike(ctx: ActiveEngine.Context, source: []const u8, filename: []cons
     defer {
         if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
     }
-    // Prefer value-returning eval when the active backend exposes it (Escargot).
+    // Prefer value-returning eval when the active backend exposes it (Escargot / Hermes).
     if (comptime @hasDecl(ActiveEngine, "evalValue")) {
         const er = ActiveEngine.evalValue(ctx, source, filename);
-        if (er.err_text) |e| std.heap.c_allocator.free(e);
-        if (er.exception != null) return .{ .exception = er.exception };
+        // Bridge may report err_text without a retained exception value (non-JSError paths). Synthesize a string exception so public evaluate is not misclassified as OOM.
+        if (er.exception != null) {
+            if (er.err_text) |e| std.heap.c_allocator.free(e);
+            return .{ .exception = er.exception };
+        }
+        if (er.err_text) |e| {
+            defer std.heap.c_allocator.free(e);
+            const synthesized = ActiveEngine.newStringVal(ctx, e) orelse return .{ .out_of_memory = true };
+            return .{ .exception = synthesized };
+        }
         return .{ .value = er.value };
     }
-    // Hermes fallback until evalValue is wired: string eval loses live values.
+    // String eval fallback: keep live exceptions by allocating the message before freeing the heap err.
     const er = ActiveEngine.eval(ctx, source, filename);
     if (er.result) |r| std.heap.c_allocator.free(@constCast(r));
     if (er.err) |e| {
+        const synthesized = ActiveEngine.newStringVal(ctx, e) orelse {
+            if (er.err_is_heap) std.heap.c_allocator.free(@constCast(e));
+            return .{ .out_of_memory = true };
+        };
         if (er.err_is_heap) std.heap.c_allocator.free(@constCast(e));
-        return .{ .exception = ActiveEngine.newString(ctx, e) };
+        return .{ .exception = synthesized };
     }
     return .{};
 }

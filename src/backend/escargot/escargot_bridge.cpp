@@ -84,8 +84,8 @@ struct EscargotContextOpaque {
     std::vector<std::pair<std::string, PersistentRefHolder<ScriptRef>>> module_cache;
 
     // Host promise-rejection tracker (VMInstanceRef::registerPromiseRejectCallback).
-    //
-    // Queue unhandled rejects; flush after microtask drain (process_pending_jobs).
+//
+// Queue unhandled rejects; flush after microtask drain (process_pending_jobs).
     struct PendingRejection {
         ValueRef *promise = nullptr; // retained via protect map
         ValueRef *reason = nullptr;
@@ -626,14 +626,17 @@ extern "C" bool escargot_to_float64(EscargotContext *c, EscargotValue v, double 
 }
 
 extern "C" char *escargot_value_to_utf8(EscargotContext *c, EscargotValue v) {
-    if (!c || !v) return nullptr;
-    return stringRefToUtf8(asVal(v)->toStringWithoutException(c->ctx.get()));
+    if (!c) return nullptr;
+    // Null handle is the undefined sentinel; ToString → "undefined".
+    ValueRef *val = v ? asVal(v) : ValueRef::createUndefined();
+    return stringRefToUtf8(val->toStringWithoutException(c->ctx.get()));
 }
 /* Length-aware UTF-8 (preserves embedded NUL). Caller frees; *out_len is byte length excluding terminator. */
 extern "C" char *escargot_value_to_utf8_n(EscargotContext *c, EscargotValue v, size_t *out_len) {
     if (out_len) *out_len = 0;
-    if (!c || !v) return nullptr;
-    StringRef *s = asVal(v)->toStringWithoutException(c->ctx.get());
+    if (!c) return nullptr;
+    ValueRef *val = v ? asVal(v) : ValueRef::createUndefined();
+    StringRef *s = val->toStringWithoutException(c->ctx.get());
     if (!s) return nullptr;
     std::string utf8 = s->toStdUTF8String();
     if (out_len) *out_len = utf8.size();
@@ -1642,12 +1645,14 @@ static ValueRef *retainedErrorOrNull(EscargotContextOpaque *c, const Evaluator::
 
 extern "C" EscargotOpResult escargot_value_to_string_result(EscargotContext *c, EscargotValue v) {
     EscargotOpResult out{nullptr, nullptr};
-    if (!c || !v) return out;
+    if (!c) return out;
+    // Null handle is the undefined sentinel (ActiveEngine.undefinedValue); ToString → "undefined".
+    ValueRef *val = v ? asVal(v) : ValueRef::createUndefined();
     auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, ValueRef *val) -> ValueRef * {
-            return val->toString(state);
+        [](ExecutionStateRef *state, ValueRef *x) -> ValueRef * {
+            return x->toString(state);
         },
-        asVal(v));
+        val);
     if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
     return opOk(c, er.result);
 }
