@@ -1104,10 +1104,10 @@ test "modules: diamond import-then-export keeps a shared originating binding" {
     var ctx = TestLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
     // Branches import a named binding then re-export it locally.
-    // Hermes tracks leaf origin across import-then-export so star-merge keeps the shared binding.
-    // bellard QuickJS similarly keeps it. ECMA-262 ResolveExport for LocalExportEntries returns
-    // {module: exporter, bindingName: local} without following import provenance, so quickjs_ng
-    // (and other strict engines) treat the diamond as ambiguous and omit the name.
+    //
+    // Hermes, bellard QuickJS, and JSC track leaf origin across import-then-export so star-merge keeps the shared binding.
+    //
+    // ECMA-262 ResolveExport for LocalExportEntries returns {module: exporter, bindingName: local} without following import provenance, so quickjs_ng treats the diamond as ambiguous and omits the name.
     try ctx.modules.put("base", "export const value = 42;");
     try ctx.modules.put("left", "import { value } from 'base'; export { value };");
     try ctx.modules.put("right", "import { value } from 'base'; export { value };");
@@ -1129,8 +1129,8 @@ test "modules: diamond import-then-export keeps a shared originating binding" {
     try testing.expect(res.err == null);
 
     const keeps_shared_binding = comptime switch (backend.active_backend) {
-        // Hermes leaf-origin WeakMap; bellard QuickJS follows import provenance for star ambiguity.
-        .hermes, .quickjs => true,
+        // Hermes leaf-origin WeakMap; bellard QuickJS and JSC follow import provenance for star ambiguity.
+        .hermes, .quickjs, .jsc => true,
         // Spec-shaped LocalExportEntries identity: exporter module, so the diamond is ambiguous.
         else => false,
     };
@@ -1862,8 +1862,13 @@ test "modules: dynamic import specifier evaluates in original context" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
     var ctx = TestLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
-    try ctx.modules.put("first", "export const value = 1;");
-    try ctx.modules.put("second", "export const value = 2;");
+    // Relative form so JSC accepts a runtime-computed specifier (bare names fail its built-in check before the loader runs). Register both keys: QuickJS keeps "./first"; JSC resolves URL-relative to "first".
+    const first_src = "export const value = 1;";
+    const second_src = "export const value = 2;";
+    try ctx.modules.put("./first", first_src);
+    try ctx.modules.put("first", first_src);
+    try ctx.modules.put("./second", second_src);
+    try ctx.modules.put("second", second_src);
 
     const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
 
@@ -1872,10 +1877,12 @@ test "modules: dynamic import specifier evaluates in original context" {
     defer engine.destroy(id);
 
     // Specifier must be captured when import() runs, not when the deferred require runs.
+    //
+    // Use "./…" rather than a bare name: JSC has no public resolve hook, so only relative/absolute runtime specifiers reach the module loader.
     const src =
-        \\let name = 'first';
+        \\let name = './first';
         \\const p = import(name);
-        \\name = 'second';
+        \\name = './second';
         \\const mod = await p;
         \\globalThis.__v__ = mod.value;
     ;

@@ -10,8 +10,8 @@ JS Bay is a Zig package and typed C ABI for embedding QuickJS-NG, QuickJS, or Ja
 
 | Engine | Upstream | Pin |
 |--------|----------|-----|
-| QuickJS-NG (default) | [quickjs-ng/quickjs](https://github.com/quickjs-ng/quickjs) | [v0.17.0](https://github.com/quickjs-ng/quickjs/releases/tag/v0.17.0) · [`6d46d07`](https://github.com/quickjs-ng/quickjs/tree/6d46d07d04041b40f4f49eaa7fdebe44c314c699) |
-| QuickJS | [bellard/quickjs](https://github.com/bellard/quickjs) | [`e2dc3ebb`](https://github.com/bellard/quickjs/tree/e2dc3ebbd874385fbcd48243acad5c8e98c4d451) |
+| QuickJS-NG | [quickjs-ng/quickjs](https://github.com/quickjs-ng/quickjs) | [v0.17.0](https://github.com/quickjs-ng/quickjs/releases/tag/v0.17.0) · [`6d46d07`](https://github.com/quickjs-ng/quickjs/tree/6d46d07d04041b40f4f49eaa7fdebe44c314c699) |
+| QuickJS (default) | [bellard/quickjs](https://github.com/bellard/quickjs) | [`e2dc3ebb`](https://github.com/bellard/quickjs/tree/e2dc3ebbd874385fbcd48243acad5c8e98c4d451) |
 | JavaScriptCore | [WebKit / JavaScriptCore](https://developer.apple.com/documentation/javascriptcore) | System framework on Apple targets (`-Dbackend=jsc`) |
 
 Experimental spikes (not a stable ABI; see [docs/capability.md](docs/capability.md)):
@@ -33,7 +33,7 @@ zig build -Dbackend=quickjs_ng
 zig build test
 ```
 
-Supported backend tags are `quickjs_ng`, `quickjs`, and `jsc`. JavaScriptCore requires an Apple target. Experimental Escargot / Hermes spikes also live as submodules (`vendor/escargot`, `vendor/hermes`); see below.
+Unconfigured `zig build` defaults to QuickJS. The quick start above selects QuickJS-NG explicitly. Supported backend tags are `quickjs_ng`, `quickjs`, and `jsc`. JavaScriptCore requires an Apple target. Experimental Escargot / Hermes spikes also live as submodules (`vendor/escargot`, `vendor/hermes`); see below.
 
 The public C header is [`include/jsbay.h`](include/jsbay.h). Create and use each engine on one owner thread, release every owned `jsbay_value_t`, and destroy the engine on that same thread. `jsbay_engine_request_interrupt` and `jsbay_engine_stop_loop` are the ordinary cross-thread controls.
 
@@ -76,10 +76,7 @@ Start with the [documentation index](docs/readme.md). The most commonly needed g
 
 ## Experimental backends
 
-`-Dbackend=escargot` and `-Dbackend=hermes` are experimental spikes, not a
-stable ABI. Sources are git submodules (`vendor/escargot`, `vendor/hermes`);
-install prefixes stay local and gitignored. Capability tables, pinned SHAs, and
-build notes: [docs/capability.md](docs/capability.md). Default remains QuickJS-NG.
+`-Dbackend=escargot` and `-Dbackend=hermes` are experimental spikes, not a stable ABI. Sources are git submodules (`vendor/escargot`, `vendor/hermes`); install prefixes stay local and gitignored. Capability tables, pinned SHAs, and build notes: [docs/capability.md](docs/capability.md). Unconfigured builds default to QuickJS (`backend_opt orelse .quickjs`); use `-Dbackend=quickjs_ng` for the QuickJS-NG quick start above.
 
 ## License
 
