@@ -1,6 +1,6 @@
 //! Exception extraction + JSON / toString helpers.
 //!
-//! `getAndFormatException` drains the pending exception from `ctx`, building a "<message>\n<stack>" report in a c_allocator-owned slice. `jsonStringify` and `valueToString` produce c_allocator-owned UTF-8 representations of arbitrary JSValues — both ALWAYS free their internal cstr/JSValue dups so callers never need to touch QuickJS refcounts here.
+//! `getAndFormatException` drains the pending exception from `ctx`, building a message and stack report without repeating a matching stack header in a c_allocator-owned slice. `jsonStringify` and `valueToString` produce c_allocator-owned UTF-8 representations of arbitrary JSValues — both ALWAYS free their internal cstr/JSValue dups so callers never need to touch QuickJS refcounts here.
 
 const std = @import("std");
 const c = @import("c_api.zig");
@@ -32,8 +32,18 @@ pub fn formatExceptionValue(ctx: ?*qjs.JSContext, exc: qjs.JSValue) ?[]const u8 
 
     const stack = qjs.JS_GetPropertyStr(ctx, exc, "stack");
     if (!c.jsIsUndefined(stack) and !c.jsIsNull(stack)) {
-        buf.append(std.heap.c_allocator, '\n') catch {};
-        _ = appendCStringLen(ctx, &buf, stack);
+        var stack_text: std.ArrayList(u8) = .empty;
+        defer stack_text.deinit(std.heap.c_allocator);
+        if (appendCStringLen(ctx, &stack_text, stack)) {
+            const has_header = buf.items.len > 0 and std.mem.startsWith(u8, stack_text.items, buf.items) and
+                (stack_text.items.len == buf.items.len or stack_text.items[buf.items.len] == '\n' or stack_text.items[buf.items.len] == '\r');
+            if (has_header) {
+                buf.appendSlice(std.heap.c_allocator, stack_text.items[buf.items.len..]) catch {};
+            } else {
+                buf.append(std.heap.c_allocator, '\n') catch {};
+                buf.appendSlice(std.heap.c_allocator, stack_text.items) catch {};
+            }
+        }
     }
     c.jsbay_qjs_JS_FreeValue(ctx, stack);
 

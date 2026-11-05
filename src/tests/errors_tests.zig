@@ -361,3 +361,61 @@ test "errors: newError then inspectError round-trips the kind" {
         }
     }.run);
 }
+
+test "errors: QuickJS stack header keeps intrinsic names and ignores prototype getters" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            try helpers.expectEvalEquals(id,
+                \\(() => {
+                \\  const original = Object.getOwnPropertyDescriptor(Error.prototype, 'name');
+                \\  let reads = 0;
+                \\  Object.defineProperty(Error.prototype, 'name', { configurable: true, get() { reads++; return 'UnexpectedName'; } });
+                \\  const plain = new Error('stack-header-marker');
+                \\  Object.defineProperty(Error.prototype, 'name', original);
+                \\  const typed = new TypeError('typed-stack-header-marker');
+                \\  class DerivedTypeError extends TypeError {}
+                \\  const derived = new DerivedTypeError('derived-stack-header-marker');
+                \\  const oneHeader = (stack, header) => stack.startsWith(header + '\n') && stack.indexOf(header) === stack.lastIndexOf(header);
+                \\  const valid = reads === 0
+                \\    && oneHeader(plain.stack, 'Error: stack-header-marker')
+                \\    && oneHeader(typed.stack, 'TypeError: typed-stack-header-marker')
+                \\    && oneHeader(derived.stack, 'TypeError: derived-stack-header-marker')
+                \\    && plain.stack.includes('at <anonymous>')
+                \\    && typed.stack.includes('at <anonymous>');
+                \\  return valid ? true : JSON.stringify({ reads, plain: plain.stack, typed: typed.stack, derived: derived.stack });
+                \\})()
+            , "true");
+        }
+    }.run);
+}
+
+test "errors: stack headers preserve embedded null bytes" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            try helpers.expectEvalEquals(id,
+                \\(() => {
+                \\  const error = new Error('A\x00B');
+                \\  return error.stack.startsWith('Error: A\x00B\n') && error.stack.includes('at <anonymous>');
+                \\})()
+            , "true");
+        }
+    }.run);
+}
+
+test "errors: formatted exception does not repeat a generated stack header" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            const result = engine.evalScript(id, "throw new Error('formatted-header-marker')", "error-header.js");
+            defer helpers.freeEvalResult(result);
+            const text = result.err orelse return error.ExpectedException;
+            try testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Error: formatted-header-marker"));
+            try testing.expect(std.mem.indexOf(u8, text, "error-header.js") != null);
+            const custom = engine.evalScript(id, "const error = new Error('custom-header-marker'); error.stack = 'custom stack'; throw error", "custom-stack.js");
+            defer helpers.freeEvalResult(custom);
+            try testing.expectEqualStrings("Error: custom-header-marker\ncustom stack", custom.err orelse return error.ExpectedException);
+        }
+    }.run);
+}
