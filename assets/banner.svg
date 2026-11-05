@@ -93,21 +93,21 @@
 </rect>
 
 <!-- stable backends -->
-<g transform="translate(86.0,270)">
+<g transform="translate(134.0,270)">
     <rect width="148" height="46" rx="10" fill="#000000" stroke="#5eead4" stroke-opacity="0.85"/>
     <circle cx="18" cy="23" r="4.5" fill="#5eead4" fill-opacity="0.7">
       <animate attributeName="fill-opacity" values="0.55;0.55;1;0.55;0.55" keyTimes="0;0.08;0.13;0.18;1" dur="6s" repeatCount="indefinite"/>
     </circle>
     <text class="sans" x="30" y="29" font-size="15" font-weight="600" fill="#f8fafc">QuickJS</text>
   </g>
-<g transform="translate(246.0,270)">
+<g transform="translate(294.0,270)">
     <rect width="168" height="46" rx="10" fill="#000000" stroke="#7dd3fc" stroke-opacity="0.85"/>
     <circle cx="18" cy="23" r="4.5" fill="#7dd3fc" fill-opacity="0.7">
       <animate attributeName="fill-opacity" values="0.55;0.55;1;0.55;0.55" keyTimes="0;0.22;0.27;0.32;1" dur="6s" repeatCount="indefinite"/>
     </circle>
     <text class="sans" x="30" y="29" font-size="15" font-weight="600" fill="#f8fafc">QuickJS-NG</text>
   </g>
-<g transform="translate(426.0,270)">
+<g transform="translate(474.0,270)">
     <rect width="200" height="46" rx="10" fill="#000000" stroke="#a5b4fc" stroke-opacity="0.85"/>
     <!-- WebKit/JSC mark (assets/brand-icons/webkit-mark.svg) -->
     <g transform="translate(10,9) scale(0.875)">
@@ -125,14 +125,14 @@
     <text class="sans" x="48" y="29" font-size="15" font-weight="600" fill="#f8fafc">JavaScriptCore</text>
   </g>
 <!-- Escargot + Hermes backends -->
-<g transform="translate(642.0,270)">
+<g transform="translate(686.0,270)">
     <rect width="168" height="46" rx="10" fill="#000000" stroke="#fbbf24" stroke-opacity="0.85"/>
     <circle cx="18" cy="23" r="4.5" fill="#fbbf24" fill-opacity="0.45">
       <animate attributeName="fill-opacity" values="0.35;0.35;0.75;0.35;0.35" keyTimes="0;0.50;0.55;0.60;1" dur="6s" repeatCount="indefinite"/>
     </circle>
     <text class="sans" x="30" y="29" font-size="15" font-weight="600" fill="#f8fafc">Escargot</text>
   </g>
-<g transform="translate(826.0,270)">
+<g transform="translate(866.0,270)">
     <rect width="200" height="46" rx="10" fill="#000000" stroke="#2bb673" stroke-opacity="0.85"/>
     <!-- Meta Hermes mark (assets/brand-icons/hermes-mark.svg) -->
     <g transform="translate(10,10) scale(0.06886)">

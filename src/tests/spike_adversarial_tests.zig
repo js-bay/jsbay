@@ -750,4 +750,3 @@ test "adversarial: Escargot relative import fails cleanly" {
         }
     }.run);
 }
-

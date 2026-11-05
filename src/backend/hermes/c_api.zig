@@ -241,4 +241,3 @@ pub extern fn hermes_set_host_progress(
     fn_ptr: ?HostProgressFn,
     userdata: ?*anyopaque,
 ) void;
-

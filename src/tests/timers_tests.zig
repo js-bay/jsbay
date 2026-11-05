@@ -349,16 +349,16 @@ test "timers: setTimeout with non-function throws TypeError at registration" {
     try helpers.evalErr(id, "setTimeout(42, 0);");
     try helpers.evalErr(id, "setTimeout(null, 0);");
     // Callback-validation failures must be TypeError (QuickJS/Escargot parity), not a plain Error.
+    //
+    // Separate script evals share one realm — avoid `let ok` redeclaration across evalOk calls.
     try helpers.evalOk(id,
-        \\let ok = false;
-        \\try { setTimeout(null, 0); } catch (e) { ok = e instanceof TypeError; }
-        \\globalThis.__timerTypeErr__ = ok;
+        \\try { setTimeout(null, 0); globalThis.__timerTypeErr__ = false; }
+        \\catch (e) { globalThis.__timerTypeErr__ = e instanceof TypeError; }
     );
     try helpers.expectEvalEquals(id, "globalThis.__timerTypeErr__", "true");
     try helpers.evalOk(id,
-        \\let ok = false;
-        \\try { setInterval(42, 0); } catch (e) { ok = e instanceof TypeError; }
-        \\globalThis.__intervalTypeErr__ = ok;
+        \\try { setInterval(42, 0); globalThis.__intervalTypeErr__ = false; }
+        \\catch (e) { globalThis.__intervalTypeErr__ = e instanceof TypeError; }
     );
     try helpers.expectEvalEquals(id, "globalThis.__intervalTypeErr__", "true");
 }
