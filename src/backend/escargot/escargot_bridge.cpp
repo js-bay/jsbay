@@ -83,9 +83,7 @@ struct EscargotContextOpaque {
     // path -> cached ScriptRef (client must cache per Escargot Platform contract)
     std::vector<std::pair<std::string, PersistentRefHolder<ScriptRef>>> module_cache;
 
-    // Host promise-rejection tracker (VMInstanceRef::registerPromiseRejectCallback).
-//
-// Queue unhandled rejects; flush after microtask drain (process_pending_jobs).
+    // Host promise-rejection tracker (VMInstanceRef::registerPromiseRejectCallback). Queue unhandled rejects; flush after microtask drain (process_pending_jobs).
     struct PendingRejection {
         ValueRef *promise = nullptr; // retained via protect map
         ValueRef *reason = nullptr;
@@ -561,9 +559,7 @@ static int32_t escargotToInt32Number(double d) {
     return static_cast<int32_t>(mod);
 }
 
-// ECMAScript ToNumber into *out. On failure sets pending throw and returns false.
-//
-// Prefer ToNumber semantics (unary +) over Number(...): BigInt must TypeError like QuickJS/JSC.
+// ECMAScript ToNumber into *out. On failure sets pending throw and returns false. Prefer ToNumber semantics (unary +) over Number(...): BigInt must TypeError like QuickJS/JSC.
 static bool escargotToNumber(EscargotContext *c, EscargotValue v, double *out) {
     if (!out) return false;
     if (!v) {

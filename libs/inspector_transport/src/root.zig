@@ -18,9 +18,7 @@ const zev = @import("zev");
 // A callback can request destruction of its transport. Its own socket worker must unwind before the transport can be released.
 threadlocal var callback_transport: ?*Transport = null;
 
-// -- Raw POSIX socket layer -------------------------------------------------
-//
-// This accept loop uses fcntl to poll a nonblocking listener so shutdown can be observed without closing a descriptor used by another thread. Use the matching libc calls directly because the std.Io network API treats EAGAIN from this configuration as a programmer error.
+// -- Raw POSIX socket layer ------------------------------------------------- This accept loop uses fcntl to poll a nonblocking listener so shutdown can be observed without closing a descriptor used by another thread. Use the matching libc calls directly because the std.Io network API treats EAGAIN from this configuration as a programmer error.
 const RawSocket = struct {
     handle: std.posix.fd_t,
 
