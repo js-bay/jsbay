@@ -6,6 +6,23 @@
 
 JS Bay is a Zig package and typed C ABI for embedding QuickJS-NG, QuickJS, or JavaScriptCore. Select the backend at build time; the C API and platform SDKs keep the same instance, value, timer, and callback model.
 
+### Supported engines
+
+| Engine | Upstream | Pin |
+|--------|----------|-----|
+| QuickJS-NG (default) | [quickjs-ng/quickjs](https://github.com/quickjs-ng/quickjs) | [v0.17.0](https://github.com/quickjs-ng/quickjs/releases/tag/v0.17.0) · [`6d46d07`](https://github.com/quickjs-ng/quickjs/tree/6d46d07d04041b40f4f49eaa7fdebe44c314c699) |
+| QuickJS | [bellard/quickjs](https://github.com/bellard/quickjs) | [`e2dc3ebb`](https://github.com/bellard/quickjs/tree/e2dc3ebbd874385fbcd48243acad5c8e98c4d451) |
+| JavaScriptCore | [WebKit / JavaScriptCore](https://developer.apple.com/documentation/javascriptcore) | System framework on Apple targets (`-Dbackend=jsc`) |
+
+Experimental spikes (not a stable ABI; see [docs/capability.md](docs/capability.md)):
+
+| Engine | Upstream | Pin |
+|--------|----------|-----|
+| Escargot | [Samsung/escargot](https://github.com/Samsung/escargot) | [`ffd9b77a`](https://github.com/Samsung/escargot/tree/ffd9b77ac17598c161d760d7bbe15bfca9179f02) |
+| Hermes | [facebook/hermes](https://github.com/facebook/hermes) | [`9a51f48d`](https://github.com/facebook/hermes/tree/9a51f48dcbccf0eddd0b67c687d17b3ab4cede58) |
+
+Pins match the `vendor/*` git submodules and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Quick start
 
 Use Zig 0.17 and clone vendor submodules:
