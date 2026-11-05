@@ -205,7 +205,10 @@ pub const RejectionTracker = *const fn (
     userdata: ?*anyopaque,
 ) callconv(.c) void;
 
-/// Register `tracker` for `instance_id`. Pass `null` to unregister. Returns false on JSC. Hermes installs HermesInternal.enablePromiseRejectionTracker (plus module-shim reports). Escargot uses `registerPromiseRejectCallback`.
+pub const ErrorObserver = @import("../types.zig").ErrorObserver;
+pub const ErrorObserverRegistration = enum { applied, out_of_memory, unsupported };
+
+/// Register `tracker` for `instance_id`. Pass `null` to unregister. Returns false on JSC: the public C API has no rejection-tracker hook, and this function does not invent one.
 pub fn setRejectionTracker(instance_id: i32, tracker: ?RejectionTracker, userdata: ?*anyopaque) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
@@ -227,6 +230,17 @@ pub fn setRejectionTracker(instance_id: i32, tracker: ?RejectionTracker, userdat
             const c = @import("../backend/hermes/c_api.zig");
             return c.hermes_set_rejection_tracker(ctx, instance_id, tracker, userdata);
         },
+    }
+}
+
+/// Register a typed asynchronous-error observer. JSC has no public rejection tracker, so it cannot provide this contract.
+pub fn setErrorObserver(instance_id: i32, observer: ?ErrorObserver, userdata: ?*anyopaque) ErrorObserverRegistration {
+    switch (backend.active_backend) {
+        .quickjs, .quickjs_ng => {
+            const ctx = ctxFor(instance_id) orelse return .unsupported;
+            return if (backend.ActiveEngineModule.exception.setErrorObserver(ctx, instance_id, observer, userdata)) .applied else .out_of_memory;
+        },
+        .jsc => return .unsupported,
     }
 }
 

@@ -117,6 +117,7 @@ pub const c_api = struct {
     pub const jsbay_engine_get_memory_usage = c_api_impl.jsbay_engine_get_memory_usage;
     pub const jsbay_engine_run_gc = c_api_impl.jsbay_engine_run_gc;
     pub const jsbay_engine_set_event_handler = c_api_impl.jsbay_engine_set_event_handler;
+    pub const jsbay_engine_set_error_observer = c_api_impl.jsbay_engine_set_error_observer;
     pub const jsbay_library_backend = c_api_impl.jsbay_library_backend;
     pub const jsbay_library_capabilities = c_api_impl.jsbay_library_capabilities;
     pub const jsbay_available_backends = c_api_impl.jsbay_available_backends;

@@ -112,6 +112,8 @@ comptime {
         _ = @import("engine_thread_guard_tests.zig");
         _ = @import("finalizer_contract_tests.zig");
     }
+    _ = @import("nested_rejection_legacy_tests.zig");
+    _ = @import("nested_rejection_tests.zig");
     _ = @import("host_object_tests.zig");
     _ = @import("promise_chain_tests.zig");
     // Core value contracts: spike-safe subset (callable/array/property/symbol).

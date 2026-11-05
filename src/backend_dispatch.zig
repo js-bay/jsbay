@@ -206,6 +206,25 @@ pub fn timerCallNoArgs(tag: Backend, ctx_addr: usize, callback_bytes: []const u8
     return null;
 }
 
+/// Timer callbacks use the asynchronous exception path so typed observers receive the original thrown value before diagnostics format it.
+pub fn timerCallNoArgsObserved(tag: Backend, ctx_addr: usize, callback_bytes: []const u8, instance_id: i32) ?[]const u8 {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+        if (cand == tag) {
+            if (comptime multi_pack.isPacked(cand) or cand == backend.active_backend) {
+                const E = backend.Engine(cand);
+                if (callback_bytes.len != @sizeOf(E.Value)) return null;
+                const ctx = restorePtr(E.Context, ctx_addr);
+                if (comptime backend.isQuickJsApiBackend(cand)) {
+                    return E.callFunctionNoArgsObserved(ctx, loadValue(E, callback_bytes), instance_id);
+                }
+                return E.callFunctionNoArgs(ctx, loadValue(E, callback_bytes));
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
 pub fn destroyPacked(tag: Backend, handles: Handles) void {
     inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
         if (cand == tag) {

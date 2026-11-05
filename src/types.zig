@@ -41,6 +41,25 @@ pub const EngineEvent = extern struct {
 /// Best-effort host telemetry callback. Must not call engine/Value APIs.
 pub const EngineEventHandler = *const fn (*const EngineEvent, ?*anyopaque) callconv(.c) void;
 
+/// Asynchronous error kinds delivered through `ErrorObserver`.
+pub const ErrorKind = enum(c_int) {
+    async_uncaught = 0,
+    unhandled_rejection = 1,
+    rejection_handled = 2,
+};
+
+/// Callback-local asynchronous error payload. `promise` is zero for uncaught errors. Both handles are borrowed for the callback duration and may be retained through the Value API.
+pub const ErrorEvent = extern struct {
+    struct_size: u32,
+    kind: ErrorKind,
+    instance_id: c_int,
+    promise: u64,
+    value: u64,
+};
+
+/// Owner-thread asynchronous error observer. The callback may retain or release Value handles, but must not run JavaScript or destroy the engine.
+pub const ErrorObserver = *const fn (*const ErrorEvent, ?*anyopaque) callconv(.c) void;
+
 /// Configuration for creating an engine instance.
 pub const EngineConfig = struct {
     /// Native timer and asynchronous callback budgets; zero disables that resource.
