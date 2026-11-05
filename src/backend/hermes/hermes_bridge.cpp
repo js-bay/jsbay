@@ -3387,6 +3387,12 @@ extern "C" bool hermes_native_handle_is(JsbayHermesContext *c, HermesValue v) {
 facebook::hermes::HermesRuntime *hermes_context_rt(JsbayHermesContext *c) {
     return c ? c->rt : nullptr;
 }
+
+facebook::jsi::Value hermes_context_pristine_object(JsbayHermesContext *c) {
+    if (!c || !c->rt) return facebook::jsi::Value::undefined();
+    if (c->pristine_object) return facebook::jsi::Value(*c->rt, *c->pristine_object);
+    return c->rt->global().getProperty(*c->rt, "Object");
+}
 static void hermes_flush_pending_rejections(JsbayHermesContext *c) {
     if (!c || !c->rejection_fn) return;
     auto pending = std::move(c->pending_rejections);

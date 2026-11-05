@@ -1796,3 +1796,99 @@ test "modules: a JSON module import attribute either works or fails readably" {
         }
     }.run);
 }
+
+
+test "modules: circular lexical export visible during cycle" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    // A reads get() from B while still evaluating; B reads A's lexical `x` mid-init. Native ESM yields y=42.
+    try ctx.modules.put("a",
+        \\import {get} from 'b';
+        \\export const x = 42;
+        \\export const y = get();
+    );
+    try ctx.modules.put("b",
+        \\import {x} from 'a';
+        \\export function get(){ return x; }
+    );
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const res = engine.evalModule(id, "import {y} from 'a'; globalThis.__y__ = y;", "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__y__"));
+}
+
+test "modules: object method named import is not rewritten as dynamic import" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const src =
+        \\export const o = { import(name){ return name; } };
+        \\globalThis.__v__ = o.import('ok');
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try helpers.expectEvalEquals(id, "globalThis.__v__", "ok");
+}
+
+test "modules: dynamic import specifier evaluates in original context" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("first", "export const value = 1;");
+    try ctx.modules.put("second", "export const value = 2;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Specifier must be captured when import() runs, not when the deferred require runs.
+    const src =
+        \\let name = 'first';
+        \\const p = import(name);
+        \\name = 'second';
+        \\const mod = await p;
+        \\globalThis.__v__ = mod.value;
+    ;
+    const res = engine.evalModule(id, src, "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__v__"));
+}
+
+test "modules: ESM factory uses captured Object when global Object is replaced" {
+    if (hermesModulesUnsupported()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    try ctx.modules.put("dep", "export const answer = 42;");
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    // Replace page Object before loading a module that registers exports via Object.defineProperty.
+    _ = engine.evalScript(id, "globalThis.Object = function(){};", "patch-object.js");
+    const res = engine.evalModule(id, "import {answer} from 'dep'; globalThis.__v__ = answer;", "<entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__v__"));
+}

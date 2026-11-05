@@ -308,8 +308,11 @@ void hermes_set_host_progress(JsbayHermesContext *ctx, HermesHostProgressFn fn, 
 }
 
 namespace facebook { namespace hermes { class HermesRuntime; } }
+#include <jsi/jsi.h>
 facebook::hermes::HermesRuntime *hermes_context_rt(JsbayHermesContext *c);
 void hermes_context_drain_microtasks(JsbayHermesContext *c);
 void hermes_context_pump_host_tasks(JsbayHermesContext *c);
+/* Captured Object constructor for ESM factories (ignore page-replaced globalThis.Object). */
+facebook::jsi::Value hermes_context_pristine_object(JsbayHermesContext *c);
 #endif
 

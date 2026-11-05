@@ -2622,6 +2622,12 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src, const Esm
         if (k >= src.size() || src[k] != '(') return false;
         size_t end = scanBalancedCallEnd(k);
         if (end == std::string::npos) return false;
+        // Object/class MethodDefinition named `import`: `import(name){...}` — leave the key intact (dot exclusion only covers member calls).
+        {
+            size_t look = end;
+            skipWsAndComments(src, look);
+            if (look < src.size() && src[look] == '{') return false;
+        }
         size_t args_lo = k + 1;
         size_t args_hi = end - 1; // index of closing ')'
         // Top-level comma marks unsupported import attributes (depth 1 inside the outer call).
@@ -2667,8 +2673,8 @@ static std::string rewriteImportMetaAndDynamic(const std::string &src, const Esm
         if (es >= ee) return false;
         // Recurse so nested import.meta / import() inside the specifier expression are rewritten too.
         std::string expr = rewriteImportMetaAndDynamic(src.substr(es, ee - es), wrap);
-        // Evaluate the specifier inside the then-callback so load failures reject the promise (matching literal import("dep") rewriting).
-        out += std::string("Promise.resolve().then(function(){ return ") + wrap.require + "(" + expr + "); })";
+        // Evaluate the specifier in the original context (timing, `this`, await), then defer only the load so require failures still reject the promise.
+        out += std::string("Promise.resolve(") + expr + ").then(function(s){ return " + wrap.require + "(s); })";
         i = end;
         return true;
     };
@@ -2844,7 +2850,7 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
     std::vector<ImportBinding> imports;
     std::vector<std::string> prelude;
     std::vector<std::string> epilogue;
-    // Function-declaration export getters (incl. default function) publish before the dependency prelude so cyclic importers see hoisted bindings during evaluation, matching native ESM instantiation order.
+    // Export getters (functions, lexical const/let/var, classes) publish before the dependency prelude so cyclic importers see live bindings during evaluation; TDZ on the lexical bindings matches native ESM instantiation order.
     std::vector<std::string> hoisted_exports;
 
     // Strip/collect import declarations (multi-form). Process repeatedly.
@@ -3100,7 +3106,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 size_t cut = (rel == std::string::npos) ? m.length(0) : rel;
                 body.replace(m.position(), cut, "");
             }
-            epilogue.push_back(exportLiveGetter(wrap, "default", name));
+            // Publish before dependency prelude so cyclic importers observe the binding (TDZ until class evaluates).
+            hoisted_exports.push_back(exportLiveGetter(wrap, "default", name));
         } else {
             static const std::regex re_def(R"(export\s+default\s+)");
             blanked = blankNonCode(body);
@@ -3108,7 +3115,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
                 // Store the expression in an internal binding and expose a read-only live export (native ESM semantics).
                 std::string def_bind = allocFreshIdentExact(used_idents, "__jsbay_default");
                 body.replace(m.position(), m.length(), "var " + def_bind + " = ");
-                epilogue.push_back(exportLiveGetter(wrap, "default", def_bind));
+                // Publish before dependency prelude; var starts undefined until the default expression runs.
+                hoisted_exports.push_back(exportLiveGetter(wrap, "default", def_bind));
             }
         }
     }
@@ -3126,7 +3134,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             body.append(tmp, last, pos - last);
             std::string name = m[1].str();
             body += "class " + name;
-            epilogue.push_back(exportLiveGetter(wrap, name, name));
+            // Publish before dependency prelude so cyclic importers observe the binding (TDZ until class evaluates).
+            hoisted_exports.push_back(exportLiveGetter(wrap, name, name));
             last = pos + m.length();
         }
         body.append(tmp, last, std::string::npos);
@@ -3166,7 +3175,8 @@ static std::string transformEsmToCjs(const std::string &src, const std::string &
             body.replace(m.position(), m.length(), kind + " ");
             for (const auto &name : names) {
                 if (name.empty()) continue;
-                epilogue.push_back(exportLiveGetter(wrap, name, name));
+                // Lexical export getters before dependency/body evaluation: circular importers see live bindings; TDZ enforces initialization.
+                hoisted_exports.push_back(exportLiveGetter(wrap, name, name));
             }
         }
     }
@@ -3451,6 +3461,7 @@ static jsi::Object loadAndEvalModule(JsbayHermesContext *c, HermesModLoader *loa
         jsi::Object importMeta(rt);
         importMeta.setProperty(rt, "url", jsi::String::createFromUtf8(rt, id));
         auto requireFn = makeRequire(c, loader, rt, id);
+        jsi::Value pristineObject = hermes_context_pristine_object(c);
         jsi::Value result = fn.call(
             rt,
             rec->exports,
@@ -3459,7 +3470,7 @@ static jsi::Object loadAndEvalModule(JsbayHermesContext *c, HermesModLoader *loa
             jsi::String::createFromUtf8(rt, id),
             jsi::String::createFromUtf8(rt, ""),
             importMeta,
-            rt.global().getProperty(rt, "Object"));
+            pristineObject);
         result = awaitThenable(c, rt, std::move(result));
         if (result.isObject()) {
             rec->exports = result.getObject(rt);
@@ -3568,11 +3579,12 @@ extern "C" HermesEvalResult hermes_eval_module(JsbayHermesContext *c, const char
         jsi::Object importMeta(rt);
         importMeta.setProperty(rt, "url", jsi::String::createFromUtf8(rt, fname));
         auto requireFn = makeRequire(c, use, rt, fname);
+        jsi::Value pristineObject = hermes_context_pristine_object(c);
         jsi::Value result = fn.call(rt, rec->exports, requireFn, moduleObj,
                 jsi::String::createFromUtf8(rt, fname),
                 jsi::String::createFromUtf8(rt, ""),
                 importMeta,
-                rt.global().getProperty(rt, "Object"));
+                pristineObject);
         result = awaitThenable(c, rt, std::move(result));
         if (result.isObject()) {
             rec->exports = result.getObject(rt);
