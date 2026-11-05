@@ -2,7 +2,7 @@
 //!
 //! Content fidelity is checked through `JSON.stringify(Array.from(val))`.
 //!
-//! Reference cases: napi-rs `map-set.spec.ts`; ScriptX `Basic_test.cc` Map/Set tests.
+//! Reference cases: napi-rs `map-set.spec.ts` and host-binding Map/Set tests.
 
 const std = @import("std");
 const testing = std.testing;

@@ -247,8 +247,8 @@ test "native: register with non-existent parent name" {
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
-            value.registerFunction(inst, "wx", "fn", &retConstNum);
-            try helpers.expectEvalEquals(inst, "wx.fn()", "42");
+            value.registerFunction(inst, "host", "fn", &retConstNum);
+            try helpers.expectEvalEquals(inst, "host.fn()", "42");
         }
     }.run);
 }
@@ -258,10 +258,10 @@ test "native: register with existing parent preserves existing props" {
     const id = helpers.nextInstanceId();
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
-            try helpers.evalOk(inst, "globalThis.wx = { existing: 1 };");
-            value.registerFunction(inst, "wx", "fn", &retConstNum);
-            try helpers.expectEvalEquals(inst, "wx.existing", "1");
-            try helpers.expectEvalEquals(inst, "wx.fn()", "42");
+            try helpers.evalOk(inst, "globalThis.host = { existing: 1 };");
+            value.registerFunction(inst, "host", "fn", &retConstNum);
+            try helpers.expectEvalEquals(inst, "host.existing", "1");
+            try helpers.expectEvalEquals(inst, "host.fn()", "42");
         }
     }.run);
 }
