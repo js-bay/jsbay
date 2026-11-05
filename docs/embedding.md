@@ -61,7 +61,7 @@ The C and SDK contract, including ownership and status semantics, is in [api-con
 
 These backends are **not** production-default. Hard rules:
 
-- **Escargot engine_thread × host**: Context is **thread-affine**. `hostInstall` is refused while the engine thread is running; `threadStart` is refused if hosts are already installed. Crossing that boundary historically SEGV'd (AtomicString/GC) — the refuse path is intentional, not a temporary Skip.
+- **Escargot engine_thread × host**: Context is **thread-affine**. `hostInstall` is refused while the engine thread is running; `threadStart` is refused if hosts are already installed. The refuse path is the supported constraint, not a temporary Skip.
 - **`jsbay_engine_request_interrupt`**: returns **false** on Escargot/Hermes (no mid-script user interrupt). Hermes stop/destroy still cancels via lifecycle interrupt.
 - **`jsbay_engine_set_memory_limit`**: always **false** on spike. Hermes create-time heap: `jsbay_engine_create_with_options` / Zig `EngineConfig.max_heap_size` / `-Dhermes-max-heap`.
 - Rebuild prefixes: `scripts/rebuild-icu-prefix.sh`, `scripts/rebuild-hermes-install.sh`, `scripts/rebuild-escargot-install.sh`. See [capability.md](capability.md).

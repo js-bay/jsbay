@@ -55,6 +55,7 @@ struct JsbayHermesContextOpaque {
     std::unordered_map<uint64_t, std::pair<int, jsi::Value *>> promise_state; // state, result retained ptr
     // Captured at context_new before user code can replace page Object.keys / Object.defineProperty / DataView.
     std::unique_ptr<jsi::Function> pristine_object_keys;
+    std::unique_ptr<jsi::Function> pristine_object_create;
     std::unique_ptr<jsi::Function> pristine_object_define_property;
     std::unique_ptr<jsi::Object> pristine_dataview_proto;
     // Pristine DataView.prototype getters (captured once; ignore mutated prototype accessors).
@@ -363,10 +364,13 @@ extern "C" JsbayHermesContext *hermes_context_new(JsbayHermesRuntime *rt) {
         auto Object = c->rt->global().getPropertyAsFunction(*c->rt, "Object");
         auto keys = Object.getPropertyAsFunction(*c->rt, "keys");
         c->pristine_object_keys = std::make_unique<jsi::Function>(std::move(keys));
+        auto create = Object.getPropertyAsFunction(*c->rt, "create");
+        c->pristine_object_create = std::make_unique<jsi::Function>(std::move(create));
         auto defineProp = Object.getPropertyAsFunction(*c->rt, "defineProperty");
         c->pristine_object_define_property = std::make_unique<jsi::Function>(std::move(defineProp));
     } catch (...) {
         c->pristine_object_keys.reset();
+        c->pristine_object_create.reset();
         c->pristine_object_define_property.reset();
     }
     try {
@@ -1140,17 +1144,24 @@ extern "C" bool hermes_set_length(JsbayHermesContext *c, HermesValue obj, uint32
     } catch (...) { return false; }
 }
 
+
+// Build a data-property descriptor with a null prototype so Object.prototype accessors cannot intercept field writes or later reads by defineProperty.
+static jsi::Object makeNullProtoDataDesc(jsi::Runtime &rt, jsi::Function &object_create, jsi::Value value, bool writable, bool enumerable, bool configurable) {
+    jsi::Object desc = object_create.call(rt, jsi::Value::null()).asObject(rt);
+    desc.setProperty(rt, "value", std::move(value));
+    desc.setProperty(rt, "writable", writable);
+    desc.setProperty(rt, "enumerable", enumerable);
+    desc.setProperty(rt, "configurable", configurable);
+    return desc;
+}
+
 extern "C" bool hermes_define_data_property(JsbayHermesContext *c, HermesValue obj, const char *key,
                                            HermesValue val, bool writable) {
     if (!c || !c->rt || !obj || !key || !asVal(obj)->isObject()) return false;
     try {
         auto &rt = *c->rt;
-        if (!c->pristine_object_define_property) return false;
-        jsi::Object desc(rt);
-        desc.setProperty(rt, "value", val ? jsi::Value(rt, *asVal(val)) : jsi::Value::undefined());
-        desc.setProperty(rt, "writable", writable);
-        desc.setProperty(rt, "enumerable", true);
-        desc.setProperty(rt, "configurable", true);
+        if (!c->pristine_object_define_property || !c->pristine_object_create) return false;
+        jsi::Object desc = makeNullProtoDataDesc(rt, *c->pristine_object_create, val ? jsi::Value(rt, *asVal(val)) : jsi::Value::undefined(), writable, true, true);
         c->pristine_object_define_property->call(rt, *asVal(obj), key, desc);
         return true;
     } catch (...) { return false; }
@@ -2191,14 +2202,13 @@ extern "C" HermesOpResult hermes_own_keys(JsbayHermesContext *c, HermesValue obj
         jsi::Array names = keysVal.getObject(rt).asArray(rt);
         size_t n = names.size(rt);
 
-        // Rebuild via CreateDataProperty so the returned array never runs Array.prototype setters.
+        // Rebuild via CreateDataProperty so the returned array never runs Array.prototype setters. Null-prototype descriptors keep Object.prototype accessors from intercepting value/writable/enumerable/configurable.
+        if (!c->pristine_object_create) {
+            return hopFail(c, makeTypeError(rt, "Object.create unavailable"));
+        }
         jsi::Array result = jsi::Array(rt, 0);
         for (size_t i = 0; i < n; i++) {
-            jsi::Object desc(rt);
-            desc.setProperty(rt, "value", names.getValueAtIndex(rt, i));
-            desc.setProperty(rt, "writable", true);
-            desc.setProperty(rt, "enumerable", true);
-            desc.setProperty(rt, "configurable", true);
+            jsi::Object desc = makeNullProtoDataDesc(rt, *c->pristine_object_create, names.getValueAtIndex(rt, i), true, true, true);
             c->pristine_object_define_property->call(rt, result, (double)i, desc);
         }
         result.setProperty(rt, "length", (double)n);
@@ -2576,14 +2586,9 @@ extern "C" bool hermes_weak_attach_finalizer(JsbayHermesContext *c, HermesValue 
         char keybuf[64];
         std::snprintf(keybuf, sizeof(keybuf), "__$jsbay_hermes_Finalizer%llu$__",
                       (unsigned long long)seq.fetch_add(1));
-        auto Object = c->rt->global().getPropertyAsObject(*c->rt, "Object");
-        auto defProp = Object.getPropertyAsFunction(*c->rt, "defineProperty");
-        jsi::Object desc(*c->rt);
-        desc.setProperty(*c->rt, "value", holder);
-        desc.setProperty(*c->rt, "writable", true);
-        desc.setProperty(*c->rt, "enumerable", false);
-        desc.setProperty(*c->rt, "configurable", true);
-        defProp.call(*c->rt, *asVal(target),
+        if (!c->pristine_object_define_property || !c->pristine_object_create) return false;
+        jsi::Object desc = makeNullProtoDataDesc(*c->rt, *c->pristine_object_create, jsi::Value(*c->rt, holder), true, false, true);
+        c->pristine_object_define_property->call(*c->rt, *asVal(target),
                      jsi::String::createFromUtf8(*c->rt, keybuf), desc);
         return true;
     } catch (...) {

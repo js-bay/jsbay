@@ -89,8 +89,7 @@ Scope: eval, value/object, Promise, buffers, timers, host_object, `.hbc` bytecod
 | `vendor/escargot` | https://github.com/Samsung/escargot.git | `ffd9b77ac17598c161d760d7bbe15bfca9179f02` |
 | `vendor/hermes` | https://github.com/facebook/hermes.git | `9a51f48dcbccf0eddd0b67c687d17b3ab4cede58` |
 
-These match the revisions the C bridges / install prefixes were built against.
-Install / build trees stay **local** (gitignored): `vendor/escargot-install`, `vendor/hermes-install`, `vendor/hermes-build`, `vendor/icu-prefix`.
+These match the revisions the C bridges / install prefixes were built against. Install / build trees stay **local** (gitignored): `vendor/escargot-install`, `vendor/hermes-install`, `vendor/hermes-build`, `vendor/icu-prefix`.
 
 ```bash
 # sources (QuickJS + Escargot + Hermes)

@@ -4,7 +4,6 @@ const testing = std.testing;
 const backend = @import("../backend.zig");
 const helpers = @import("test_helpers.zig");
 const engine = @import("../engine.zig");
-const ActiveEngine = backend.ActiveEngine;
 const engine_thread = @import("../runtime/engine_thread.zig");
 const c_api = @import("../c_api.zig");
 const runtime_control = @import("../runtime/runtime_control.zig");
@@ -60,116 +59,105 @@ test "spike smoke: two instances are isolated" {
     }.run);
 }
 
-const native_handle = switch (backend.active_backend) {
-    .escargot => @import("../backend/escargot/native_handle.zig"),
-    .hermes => @import("../backend/hermes/native_handle.zig"),
-    else => @import("../backend/escargot/native_handle.zig"), // unused when skipped
-};
-
-var g_nh_fin_count: u32 = 0;
-fn nhFin(ptr: ?*anyopaque) void {
+var g_bind_fin_count: u32 = 0;
+fn bindFin(ptr: ?*anyopaque) callconv(.c) void {
     _ = ptr;
-    g_nh_fin_count += 1;
+    g_bind_fin_count += 1;
 }
 
-fn nhCall(ctx: native_handle.Context, this: native_handle.Value, args: []const native_handle.Value) native_handle.Value {
-    _ = this;
-    _ = args;
-    // return 42
-    return switch (backend.active_backend) {
-        .escargot => @import("../backend/escargot/c_api.zig").escargot_new_int32(42),
-        .hermes => @import("../backend/hermes/c_api.zig").hermes_new_int32(ctx, 42),
-        else => null,
-    };
+fn bindReturn42(instance_id: i32, _: ?*anyopaque, _: u64, _: usize, _: ?[*]const u64, out_value: *u64, out_exception: *u64) callconv(.c) c_int {
+    out_exception.* = 0;
+    return c_api.jsbay_value_new_number(instance_id, 42, out_value);
 }
 
-test "spike smoke: native_handle opaque + finalize on teardown" {
-    if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
-    g_nh_fin_count = 0;
-    const id = helpers.nextInstanceId();
-    if (!engine.create(id, .{})) return error.EngineCreateFailed;
-
-    {
-        const ctx = engine.getContext(id) orelse {
-            engine.destroy(id);
-            return error.NoContext;
-        };
-        native_handle.init();
-        var marker: u32 = 0x4E48;
-        const h = native_handle.create(ctx, .{
-            .ptr = @ptrCast(&marker),
-            .finalize_fn = nhFin,
-        });
-        try testing.expect(h != null);
-        const opaque_ptr = native_handle.getOpaque(ctx, h);
-        try testing.expect(opaque_ptr != null);
-        try testing.expect(opaque_ptr.?.ptr == @as(?*anyopaque, @ptrCast(&marker)));
-        const plain = ActiveEngine.newObject(ctx);
-        defer ActiveEngine.freeValue(ctx, plain);
-        try testing.expect(native_handle.getOpaque(ctx, plain) == null);
-
-        const global = ActiveEngine.getGlobalObject(ctx);
-        defer ActiveEngine.freeValue(ctx, global);
-        ActiveEngine.setPropertyStr(ctx, global, "__nh", h);
-    }
-
-    engine.destroy(id);
-    try testing.expect(g_nh_fin_count >= 1);
-}
-
-test "spike smoke: native_handle callable returns 42" {
-    if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
-    const id = helpers.nextInstanceId();
-    try helpers.withEngine(id, .{}, struct {
-        fn run(inst: i32) !void {
-            const ctx = engine.getContext(inst) orelse return error.NoContext;
-            native_handle.init();
-            const h = native_handle.create(ctx, .{ .call_fn = nhCall });
-            try testing.expect(h != null);
-            const global = ActiveEngine.getGlobalObject(ctx);
-            defer ActiveEngine.freeValue(ctx, global);
-            ActiveEngine.setPropertyStr(ctx, global, "nh", h);
-            try helpers.expectEvalEquals(inst, "nh()", "42");
-            try helpers.expectEvalEquals(inst, "typeof nh", "function");
-        }
-    }.run);
-}
-
-fn nhMethodInc(ctx: native_handle.Context, this: native_handle.Value, args: []const native_handle.Value) native_handle.Value {
-    _ = args;
-    const data = native_handle.getOpaque(ctx, this) orelse return null;
-    const counter: *i32 = @ptrCast(@alignCast(data.ptr orelse return null));
+fn bindIncCounter(instance_id: i32, data: ?*anyopaque, _: u64, _: usize, _: ?[*]const u64, out_value: *u64, out_exception: *u64) callconv(.c) c_int {
+    out_exception.* = 0;
+    const counter: *i32 = @ptrCast(@alignCast(data orelse {
+        out_value.* = 0;
+        return 2;
+    }));
     counter.* += 1;
-    return switch (backend.active_backend) {
-        .escargot => @import("../backend/escargot/c_api.zig").escargot_new_int32(counter.*),
-        .hermes => @import("../backend/hermes/c_api.zig").hermes_new_int32(ctx, counter.*),
-        else => null,
-    };
+    return c_api.jsbay_value_new_number(instance_id, @floatFromInt(counter.*), out_value);
 }
 
-test "spike smoke: native_handle method this-binding (detached)" {
+test "spike smoke: public bind finalize on teardown" {
+    if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
+    g_bind_fin_count = 0;
+    const id = helpers.nextInstanceId();
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    var function: u64 = 0;
+    var exception: u64 = 0;
+    const name = "spikeBindFin";
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_bind(
+        id,
+        .{ .data = name.ptr, .len = name.len },
+        bindReturn42,
+        null,
+        bindFin,
+        &function,
+        &exception,
+    ));
+    if (function != 0) _ = c_api.jsbay_value_release(function);
+    if (exception != 0) _ = c_api.jsbay_value_release(exception);
+    c_api.jsbay_engine_destroy(id);
+    try testing.expect(g_bind_fin_count >= 1);
+}
+
+test "spike smoke: public bind callable returns 42" {
     if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
     const id = helpers.nextInstanceId();
-    try helpers.withEngine(id, .{}, struct {
-        fn run(inst: i32) !void {
-            const ctx = engine.getContext(inst) orelse return error.NoContext;
-            native_handle.init();
-            var counter: i32 = 0;
-            const h = native_handle.createWithMethods(ctx, .{ .ptr = @ptrCast(&counter) }, &.{
-                .{ .name = "inc", .method = nhMethodInc },
-            });
-            try testing.expect(h != null);
-            const global = ActiveEngine.getGlobalObject(ctx);
-            defer ActiveEngine.freeValue(ctx, global);
-            ActiveEngine.setPropertyStr(ctx, global, "nh", h);
-            try helpers.expectEvalEquals(inst, "typeof nh", "object");
-            try helpers.expectEvalEquals(inst, "typeof nh.inc", "function");
-            try helpers.expectEvalEquals(inst, "nh.inc()", "1");
-            // Detached method must still bind to the NativeHandle (MethodBox).
-            try helpers.expectEvalEquals(inst, "const f = nh.inc; f()", "2");
-            try testing.expectEqual(@as(i32, 2), counter);
-        }
-    }.run);
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+    var function: u64 = 0;
+    var exception: u64 = 0;
+    const name = "nh";
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_bind(
+        id,
+        .{ .data = name.ptr, .len = name.len },
+        bindReturn42,
+        null,
+        null,
+        &function,
+        &exception,
+    ));
+    defer if (function != 0) {
+        _ = c_api.jsbay_value_release(function);
+    };
+    defer if (exception != 0) {
+        _ = c_api.jsbay_value_release(exception);
+    };
+    try helpers.expectEvalEquals(id, "nh()", "42");
+    try helpers.expectEvalEquals(id, "typeof nh", "function");
+}
+
+test "spike smoke: public bind mutates userdata counter" {
+    if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
+    const id = helpers.nextInstanceId();
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+    var counter: i32 = 0;
+    var function: u64 = 0;
+    var exception: u64 = 0;
+    const name = "inc";
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_bind(
+        id,
+        .{ .data = name.ptr, .len = name.len },
+        bindIncCounter,
+        @ptrCast(&counter),
+        null,
+        &function,
+        &exception,
+    ));
+    defer if (function != 0) {
+        _ = c_api.jsbay_value_release(function);
+    };
+    defer if (exception != 0) {
+        _ = c_api.jsbay_value_release(exception);
+    };
+    try helpers.expectEvalEquals(id, "typeof inc", "function");
+    try helpers.expectEvalEquals(id, "inc()", "1");
+    try helpers.expectEvalEquals(id, "inc()", "2");
+    try testing.expectEqual(@as(i32, 2), counter);
 }
 
 test "spike smoke: engine_thread start / id / stop" {
