@@ -520,8 +520,8 @@ pub fn build(b: *std.Build) void {
     const debug_eval_contract_step = b.step("test-ng-debug-eval", "Run QuickJS-NG debugger expression cache contract");
     if (backend == .quickjs_ng and packed_backends.len == 1 and inspector_enabled and inspector_transport_enabled) {
         // Instrument a private source copy for this contract; installed libraries use the unmodified patched tree.
-        const instrument = b.addSystemCommand(&.{"python3"});
-        instrument.addFileArg(b.path("tests/instrument_debug_eval.py"));
+        const instrument = b.addRunArtifact(tool);
+        instrument.addArg("instrument-debug-eval");
         instrument.addDirectoryArg(qjs_root.?);
         const instrumented_root = instrument.addOutputDirectoryArg("debug-eval-source");
         const contract_module = b.createModule(.{

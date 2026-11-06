@@ -8,6 +8,7 @@ pub const test_tool_path = if (@import("builtin").is_test) @import("tool_options
 const Exit = error{ Usage, InvalidInput, PolicyFailure, ExternalFailure };
 
 test {
+    _ = repository;
     _ = @import("contracts.zig");
     _ = @import("package_contracts.zig");
     _ = @import("apple_archive.zig");
