@@ -517,6 +517,17 @@ pub fn build(b: *std.Build) void {
         dispatch_contract_step.dependOn(&unsupported.step);
     }
 
+    const debug_eval_contract_step = b.step("test-ng-debug-eval", "Run QuickJS-NG debugger expression cache contract");
+    if (backend == .quickjs_ng) {
+        const run_debug_eval_contract = b.addSystemCommand(&.{"sh"});
+        run_debug_eval_contract.addFileArg(b.path("tests/quickjs_ng_debug_eval_contract.sh"));
+        run_debug_eval_contract.addDirectoryArg(qjs_root.?);
+        debug_eval_contract_step.dependOn(&run_debug_eval_contract.step);
+    } else {
+        const unsupported = b.addSystemCommand(&.{ "sh", "-c", "printf '%s\\n' 'test-ng-debug-eval requires -Dbackend=quickjs_ng' >&2; exit 1" });
+        debug_eval_contract_step.dependOn(&unsupported.step);
+    }
+
     // An instrumented test-only archive keeps rejection observation out of the distributed ABI while evaluating cases through the normal C API.
     const conformance_module = b.createModule(.{
         .root_source_file = b.path("src/test262_host.zig"),
@@ -755,6 +766,7 @@ fn preparePatchedQuickJsNg(b: *std.Build, tool: *std.Build.Step.Compile) std.Bui
     run.addFileArg(b.path("vendor/quickjs-ng-inspector-off.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-location-precision.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-error-stack-header.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-debug-eval-cache.patch"));
     return out;
 }
 
@@ -1026,6 +1038,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-ng-inspector-off.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-location-precision.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-error-stack-header.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-debug-eval-cache.patch"));
             hash.update(@embedFile("src/backend/quickjs_ng/qjs_wrapper_ng.c"));
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
         },

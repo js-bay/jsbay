@@ -1,0 +1,63 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -637,6 +637,9 @@
+     JSValue array_proto_values;
+     JSValue throw_type_error;
+     JSValue eval_obj;
++#if JSBAY_INSPECTOR
++    JSValue debugger_eval_helper;
++#endif
+ 
+     JSValue global_obj; /* global object */
+     JSValue global_var_obj; /* contains the global let/const definitions */
+@@ -2746,11 +2749,15 @@
+         return JS_EXCEPTION;
+     }
+     JS_FreeValue(ctx, closure);
+-    helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, "<debugger>", JS_EVAL_TYPE_GLOBAL);
+-    if (JS_IsException(helper)) {
+-        JS_FreeValue(ctx, local);
+-        return helper;
+-    }
++    if (JS_IsUndefined(ctx->debugger_eval_helper)) {
++        helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, "<debugger>", JS_EVAL_TYPE_GLOBAL);
++        if (JS_IsException(helper)) {
++            JS_FreeValue(ctx, local);
++            return helper;
++        }
++        ctx->debugger_eval_helper = helper;
++    }
++    helper = JS_DupValue(ctx, ctx->debugger_eval_helper);
+     expression = JS_NewStringLen(ctx, expr, len);
+     if (JS_IsException(expression)) {
+         JS_FreeValue(ctx, helper);
+@@ -3212,6 +3219,9 @@
+     ctx->error_back_trace = JS_UNDEFINED;
+     ctx->error_prepare_stack = JS_UNDEFINED;
+     ctx->error_stack_trace_limit = js_int32(10);
++#if JSBAY_INSPECTOR
++    ctx->debugger_eval_helper = JS_UNDEFINED;
++#endif
+     init_list_head(&ctx->loaded_modules);
+     // TODO(bnoordhuis) use getrandom() etc.
+     ctx->random_state = js__gettimeofday_us();
+@@ -3333,6 +3343,9 @@
+ 
+     JS_MarkValue(rt, ctx->throw_type_error, mark_func);
+     JS_MarkValue(rt, ctx->eval_obj, mark_func);
++#if JSBAY_INSPECTOR
++    JS_MarkValue(rt, ctx->debugger_eval_helper, mark_func);
++#endif
+ 
+     JS_MarkValue(rt, ctx->array_proto_values, mark_func);
+     for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
+@@ -3415,6 +3428,9 @@
+ 
+     JS_FreeValue(ctx, ctx->throw_type_error);
+     JS_FreeValue(ctx, ctx->eval_obj);
++#if JSBAY_INSPECTOR
++    JS_FreeValue(ctx, ctx->debugger_eval_helper);
++#endif
+ 
+     JS_FreeValue(ctx, ctx->array_proto_values);
+     for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {

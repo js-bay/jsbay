@@ -180,6 +180,14 @@ jobs:
         if: matrix.backend == 'quickjs_ng'
         run: zig build test-ng-dispatch -Dbackend=quickjs_ng --summary all
 
+      - name: QuickJS-NG debugger expression cache contract
+        if: matrix.backend == 'quickjs_ng'
+        run: zig build test-ng-debug-eval -Dbackend=quickjs_ng --summary all
+
+      - name: Debugger execution benchmark contract
+        if: matrix.backend == 'quickjs_ng'
+        run: bash tests/debugger_benchmark_contract.sh
+
       - name: Pinned Test262 subset
         run: bash tests/test262/run.sh --backend ${{ matrix.backend }} --output artifacts/test262-${{ matrix.backend }}.json
 
