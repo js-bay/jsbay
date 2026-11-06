@@ -31,6 +31,7 @@ Shared native format config is `sdk/.clang-format`; Kotlin and C# editor rules l
 | Apple | swift-format 6.3.0 from Xcode 26.5 | Swift language mode 5, ObjC compile diagnostics, Clang analyzer, warnings as errors; macOS 11 compile target |
 | Harmony | Huawei Code Linter 1.0.0, API 12 ETS 5.0.0.71 parser/fixer | Official Code Linter style and semantic rules, with per-file probes that verify actual scan coverage |
 | C# | dotnet format from .NET SDK 8.0.426 | Roslyn .NET 8 recommended rules; SDK and consumers enable the test branch; warnings as errors |
+| Node.js | Shared native formatter for `sdk/node/src` | C++ compilation, TypeScript declaration consumer when `TSC` is set, and Node.js runtime consumers |
 | C/C++/ObjC | clang-format 20.1.8 | Compiler diagnostics run via the matching platform build |
 
 Quality scripts use Bash. Downloads and report handling use `curl`, `unzip`, `shasum`, `jq`, and similar commands; they do not depend on Python. Kotlin/Java tools download into a user cache and verify a fixed SHA-256. clang-format uses a binary archive pinned by URL and SHA-256 in a lockfile, and `unzip` extracts only the executable; the lockfile is `scripts/quality/native-tools.lock.json`. Set `JSBAY_QUALITY_CACHE` to choose the cache directory. A `CLANG_FORMAT` path override must still pass the version check. CI pins pawl to 0.8.2.
@@ -48,6 +49,8 @@ C#: install the SDK named in the root `global.json`, or set `DOTNET` to its bina
 ## Build, run, and tool self-tests
 
 Beyond source checks, the existing external consumers in CI must still pass: Android strict JNI, pre/post-R8 consumers and AAR; Apple Swift/ObjC dual-backend consumers. Android `tests/android-sdk/run-r8-host.sh <libjsbay.a>` actually runs the shrunk JVM classes and checks JNI-dependent names; that does not replace Android ART on-device runs.
+
+Node.js consumers run through `bash tests/node-sdk/run_native_consumer.sh`; they are separate from the `make check` dimensions. The helper builds an addon, exercises ordinary and asynchronous calls, runs independent lifecycle and fault-injection consumers, and checks declarations when `TSC` names a TypeScript compiler script. Shared `native-format` includes the Node.js C++ source. See the [SDK README](node/README.md) for archive and header configuration and [testing guide](../docs/testing.md#native-promise-and-nodejs-consumers) for coverage and production-build differences.
 
 Harmony `tests/harmony-sdk/build_har.sh` feeds conformance, recursive-callback, and Worker samples to a real ArkTS compiler, then cleans the test sources and rebuilds the shipping HAR. The default fixture keeps compatible API 12 and target API 20. To exercise a real SDK 12, set `HARMONY_TARGET_SDK_VERSION='5.0.0(12)'` explicitly; the script only changes an out-of-tree temporary fixture. Each configuration needs a matching `DEVECO_SDK_HOME`, `HVIGORW`, `OHPM`, and OpenHarmony `JSBAY_LIBRARY`. A higher SDK's compatibility mode is not proof that a lower SDK compiles cleanly.
 

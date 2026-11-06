@@ -5,6 +5,8 @@ Public declarations are in [the installed header](../include/jsbay.h). These gui
 - [Embedding](embedding.md): select a backend and use Zig, C, or an SDK.
 - [Public API contract](api-contract.md): ownership, status, callbacks, and lifecycle.
 - [Runtime limits](runtime-limits.md) and [synchronous native calls](native-sync.md).
+- [Native asynchronous calls](native-async.md): return a Promise and complete it from a host thread.
+- [Node.js SDK](../sdk/node/README.md): build, value conversion, asynchronous evaluation, and host callbacks.
 - [Inspector](inspector.md): CDP setup, compatibility, and Safari inspection.
 - [Architecture](architecture.md): package boundaries and source placement.
 - [Testing](testing.md), [QuickJS upgrades](quickjs-upgrade.md), and [performance](performance.md).

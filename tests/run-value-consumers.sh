@@ -20,7 +20,7 @@ for consumer in value_contract_consumer value_edge_consumer jsc_bind_contract_co
         "${LIBS[@]}" -o "$OUTPUT/$consumer"
     "$OUTPUT/$consumer"
 done
-for consumer in c_consumer bytecode_consumer; do
+for consumer in c_consumer bytecode_consumer async_promise_consumer; do
     printf 'CONSUMER=%s
 ' "$consumer"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I"$ROOT/include" "$ROOT/tests/$consumer.c" "$ARCHIVE" \

@@ -72,7 +72,7 @@ jobs:
           sudo apt-get install --yes ripgrep
 
       - name: Check host tool dependencies
-        run: command -v git zig ruby tar zip unzip rg
+        run: command -v git zig ruby tar zip unzip rg cmake
 
       - name: Privacy — candidate source paths
         run: |
@@ -164,7 +164,7 @@ jobs:
           global-json-file: global.json
 
       - name: Check host tool dependencies
-        run: command -v git zig
+        run: command -v git zig cmake
 
       - name: Engine tests
         run: zig build test-engine -Dbackend=${{ matrix.backend }} --summary all
@@ -193,13 +193,20 @@ jobs:
           zig build -Dbackend=${{ matrix.backend }} -Dlibrary-only=true -Doptimize=ReleaseFast --prefix artifacts/typed-consumers --summary all
           bash tests/run-value-consumers.sh artifacts/typed-consumers/lib/libjsbay.a artifacts/typed-consumers
 
+      - name: Node.js SDK consumers
+        run: |
+          set -euo pipefail
+          node_root="$(dirname "$(dirname "$(command -v node)")")"
+          test -f "$node_root/include/node/node_api.h"
+          npm install --ignore-scripts --no-audit --no-fund --prefix "$RUNNER_TEMP/jsbay-typescript" typescript@5.6.3
+          NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers/lib/libjsbay.a" TSC="$RUNNER_TEMP/jsbay-typescript/node_modules/typescript/lib/tsc.js" bash tests/node-sdk/run_native_consumer.sh
+
       - name: Harmony N-API host consumers
         if: matrix.backend == 'quickjs_ng'
         run: |
           set -euo pipefail
           node_root="$(dirname "$(dirname "$(command -v node)")")"
           test -f "$node_root/include/node/node_api.h"
-          npm install --ignore-scripts --no-audit --no-fund --prefix "$RUNNER_TEMP/jsbay-typescript" typescript@5.6.3
           NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers/lib/libjsbay.a" TSC="$RUNNER_TEMP/jsbay-typescript/node_modules/typescript/lib/tsc.js" tests/harmony-sdk/run_facade_consumer.sh
           NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers/lib/libjsbay.a" bash tests/harmony-sdk/run-lifecycle-suite.sh
 
@@ -305,7 +312,7 @@ jobs:
         run: command -v rg || brew install ripgrep
 
       - name: Check host tool dependencies
-        run: command -v git zig ruby tar zip unzip rg
+        run: command -v git zig ruby tar zip unzip rg cmake
 
       - name: Test repository tools
         run: zig build test-tools --summary all
@@ -351,6 +358,13 @@ jobs:
           zig build -Dbackend=quickjs_ng -Dlibrary-only=true -Doptimize=ReleaseFast --prefix artifacts/typed-consumers-qjsng --summary all
           bash tests/run-value-consumers.sh artifacts/typed-consumers-qjsng/lib/libjsbay.a artifacts/typed-consumers-qjsng
 
+      - name: Node.js SDK consumers (quickjs_ng)
+        run: |
+          set -euo pipefail
+          node_root="$(dirname "$(dirname "$(command -v node)")")"
+          test -f "$node_root/include/node/node_api.h"
+          NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers-qjsng/lib/libjsbay.a" bash tests/node-sdk/run_native_consumer.sh
+
       - name: Swift and Objective-C SDK consumers (quickjs_ng)
         run: bash tests/apple-sdk/run.sh artifacts/typed-consumers-qjsng/lib/libjsbay.a artifacts/apple-sdk-qjsng quickjs_ng macosx
 
@@ -378,6 +392,13 @@ jobs:
           set -euo pipefail
           zig build -Dbackend=jsc -Dlibrary-only=true -Doptimize=ReleaseFast --prefix artifacts/typed-consumers-jsc --summary all
           bash tests/run-value-consumers.sh artifacts/typed-consumers-jsc/lib/libjsbay.a artifacts/typed-consumers-jsc
+
+      - name: Node.js SDK consumers (jsc)
+        run: |
+          set -euo pipefail
+          node_root="$(dirname "$(dirname "$(command -v node)")")"
+          test -f "$node_root/include/node/node_api.h"
+          NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers-jsc/lib/libjsbay.a" bash tests/node-sdk/run_native_consumer.sh
 
       - name: Swift and Objective-C SDK consumers (jsc)
         run: bash tests/apple-sdk/run.sh artifacts/typed-consumers-jsc/lib/libjsbay.a artifacts/apple-sdk-jsc jsc macosx

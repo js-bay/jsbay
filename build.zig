@@ -384,7 +384,7 @@ pub fn build(b: *std.Build) void {
 
     // Install C header
     b.installFile("include/jsbay.h", "include/jsbay.h");
-    for ([_][]const u8{ "jsbay_bytecode.h", "jsbay_sync.h", "module.modulemap" }) |header| {
+    for ([_][]const u8{ "jsbay_bytecode.h", "jsbay_sync.h", "jsbay_async.h", "module.modulemap" }) |header| {
         b.installFile(b.fmt("include/{s}", .{header}), b.fmt("include/{s}", .{header}));
     }
 

@@ -51,8 +51,8 @@ jsbay_status_t status = jsbay_engine_evaluate(
     (jsbay_utf8_t){source, sizeof(source) - 1},
     (jsbay_utf8_t){filename, sizeof(filename) - 1},
     NULL, &value, &exception);
-if (status == JS_BAY_OK) jsbay_value_release(value);
-if (status == JS_BAY_EXCEPTION) jsbay_value_release(exception);
+if (status == JSBAY_OK) jsbay_value_release(value);
+if (status == JSBAY_EXCEPTION) jsbay_value_release(exception);
 jsbay_engine_destroy(1);
 ```
 
@@ -60,14 +60,17 @@ The JavaScript event loop owns its monotonic clock, timers, waiting, and wakeups
 
 ## SDKs and integration
 
-The Android, Apple, .NET, and Harmony SDKs wrap the same typed C ABI. Installation and platform build details are in their SDK directories.
+The Android, Apple, .NET, Harmony, and Node.js SDKs wrap the same typed C ABI. Installation and platform build details are in their SDK directories.
 
 - [Android](sdk/android)
 - [Apple](sdk/apple)
 - [.NET](sdk/dotnet)
 - [Harmony](sdk/harmony)
+- [Node.js](sdk/node)
 
-Read [the API contract](docs/api-contract.md) before implementing a binding or callback. It defines value ownership, errors, thread affinity, callbacks, cache behavior, and the optional synchronous-native extension. [Embedding](docs/embedding.md) gives the lifecycle checklist.
+Native operations that finish later can return a Promise through [`include/jsbay_async.h`](include/jsbay_async.h). The host submits copied result data from its completion thread, and the engine settles the Promise on its owner thread. See [native asynchronous calls](docs/native-async.md). The [Node.js SDK](sdk/node) provides `evaluateAsync` and `bindAsync` with direct value conversion and automatic event-loop attachment.
+
+Read [the API contract](docs/api-contract.md) before implementing a binding or callback. It defines value ownership, errors, thread affinity, callbacks, cache behavior, and the asynchronous and synchronous native extensions. [Embedding](docs/embedding.md) gives the lifecycle checklist.
 
 ## Documentation
 
