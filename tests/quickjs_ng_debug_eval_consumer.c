@@ -1,116 +1,218 @@
-/* Exercise the per-context debugger expression helper cache. */
-#include "quickjs.h"
-#include <assert.h>
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200112L
+#endif
+
+#include "jsbay.h"
+
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 
-#ifndef JSBAY_TEST_INCLUDE_QUICKJS_C
-#error "quickjs_ng_debug_eval_consumer.c needs quickjs.c in this test translation unit"
-#endif
+#define TEXT(value) ((jsbay_utf8_t){(const uint8_t *)(value), sizeof(value) - 1u})
+/* Match the native engine owner stack so Debug inspector calls retain their stack budget. */
+#define OWNER_STACK_BYTES (128u * 1024u * 1024u)
 
-#include "quickjs.c"
+enum command { COMMAND_NONE, COMMAND_RUN, COMMAND_GC, COMMAND_RESET, COMMAND_QUIT };
 
-static const char helper_source[] =
-    "(function(__jsbayScope,__jsbayExpression){"
-    "return (function(){with(__jsbayScope){return eval(__jsbayExpression);}}).call(this);"
-    "})";
+struct state {
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    enum command command;
+    int ready;
+    int complete;
+    int failed;
+    int engine_started;
+    int generation;
+    int instance_id;
+    uint16_t port;
+};
 
-static unsigned helper_compiles;
+static int start_engine(struct state *state) {
+    jsbay_value_t value = 0;
+    jsbay_value_t exception = 0;
+    char source[512];
+    const int realm = ++state->generation * 100;
+    const int length = snprintf(
+        source, sizeof(source),
+        "globalThis.contractRealm = %d;\nglobalThis.contractSequence = 0;\nglobalThis.invoke = "
+        "function invoke() {\n  const sequence = ++globalThis.contractSequence;\n  const "
+        "outerClosure = sequence * 10;\n  const receiver = { value: sequence * 100 };\n  return "
+        "(function frame() {\n    const local = sequence;\n    return local + outerClosure + "
+        "this.value + globalThis.contractRealm;\n  }).call(receiver);\n};\n",
+        realm);
+    if (length < 0 || (size_t)length >= sizeof(source))
+        return 0;
+    if (!jsbay_engine_create(state->instance_id, NULL, NULL))
+        return 0;
+    if (!jsbay_engine_inspector_start(state->instance_id, 0, &state->port))
+        goto failed;
+    if (jsbay_engine_evaluate(state->instance_id,
+                              (jsbay_utf8_t){(const uint8_t *)source, (size_t)length},
+                              TEXT("debug-eval-contract.js"), NULL, &value, &exception) != JSBAY_OK)
+        goto failed;
+    jsbay_value_release(value);
+    state->engine_started = 1;
+    return 1;
+failed:
+    if (value)
+        jsbay_value_release(value);
+    if (exception)
+        jsbay_value_release(exception);
+    jsbay_engine_inspector_stop(state->instance_id);
+    jsbay_engine_destroy(state->instance_id);
+    return 0;
+}
 
-static uint64_t script_tag(JSContext *ctx, const char *filename, const char *source,
-                           size_t source_len, void *opaque) {
-    (void)ctx;
-    (void)opaque;
-    if (strcmp(filename, "<debugger>") == 0 && source_len == sizeof(helper_source) - 1 &&
-        memcmp(source, helper_source, source_len) == 0)
-        helper_compiles++;
+static void stop_engine(struct state *state) {
+    if (!state->engine_started)
+        return;
+    jsbay_engine_inspector_stop(state->instance_id);
+    jsbay_engine_destroy(state->instance_id);
+    state->engine_started = 0;
+}
+
+static int run_frame(struct state *state) {
+    jsbay_value_t value = 0;
+    jsbay_value_t exception = 0;
+    double result = 0;
+    const jsbay_status_t status =
+        jsbay_engine_evaluate(state->instance_id, TEXT("globalThis.invoke()"),
+                              TEXT("debug-eval-contract-run.js"), NULL, &value, &exception);
+    const int ok = status == JSBAY_OK && jsbay_value_to_number(value, &result) == JSBAY_OK;
+    if (value)
+        jsbay_value_release(value);
+    if (exception)
+        jsbay_value_release(exception);
+    if (!ok)
+        return 0;
+    printf("RESULT %.0f\n", result);
+    fflush(stdout);
     return 1;
 }
 
-static void expect_int(JSContext *ctx, JSValue value, int expected, const char *label) {
-    int actual = 0;
-    if (JS_IsException(value)) {
-        JSValue exception = JS_GetException(ctx);
-        const char *text = JS_ToCString(ctx, exception);
-        fprintf(stderr, "%s: %s\n", label, text ? text : "exception");
-        JS_FreeCString(ctx, text);
-        JS_FreeValue(ctx, exception);
-        assert(0);
+static void signal_ready(struct state *state) {
+    pthread_mutex_lock(&state->mutex);
+    state->ready = 1;
+    state->complete = 1;
+    pthread_cond_broadcast(&state->changed);
+    pthread_mutex_unlock(&state->mutex);
+    printf("READY %u\n", (unsigned)state->port);
+    fflush(stdout);
+}
+
+static void signal_complete(struct state *state, int failed) {
+    pthread_mutex_lock(&state->mutex);
+    if (failed)
+        state->failed = 1;
+    state->complete = 1;
+    pthread_cond_broadcast(&state->changed);
+    pthread_mutex_unlock(&state->mutex);
+}
+
+static void *owner_main(void *opaque) {
+    struct state *state = opaque;
+    if (!start_engine(state)) {
+        pthread_mutex_lock(&state->mutex);
+        state->failed = 1;
+        state->ready = 1;
+        pthread_cond_broadcast(&state->changed);
+        pthread_mutex_unlock(&state->mutex);
+        return NULL;
     }
-    assert(JS_ToInt32(ctx, &actual, value) == 0);
-    if (actual != expected)
-        fprintf(stderr, "%s: expected %d, got %d\n", label, expected, actual);
-    assert(actual == expected);
-    JS_FreeValue(ctx, value);
-}
-
-static JSValue probe(JSContext *ctx, JSValueConst this_value, int argc, JSValueConst *argv) {
-    int expected_realm = 0;
-    int expected_local = 0;
-    JSValue value;
-    (void)this_value;
-
-    assert(argc == 2);
-    assert(JS_ToInt32(ctx, &expected_realm, argv[0]) == 0);
-    assert(JS_ToInt32(ctx, &expected_local, argv[1]) == 0);
-
-    value = JS_EvalInDebugFrame(ctx, 1, "local + realmValue", sizeof("local + realmValue") - 1);
-    expect_int(ctx, value, expected_realm, "realm");
-
-    value = JS_EvalInDebugFrame(ctx, 1, "(", 1);
-    assert(JS_IsException(value));
-    JS_FreeValue(ctx, value);
-    value = JS_GetException(ctx);
-    assert(!JS_IsException(value));
-    JS_FreeValue(ctx, value);
-
-    value = JS_EvalInDebugFrame(ctx, 1, "local", sizeof("local") - 1);
-    expect_int(ctx, value, expected_local, "local");
-    return JS_NewInt32(ctx, 0);
-}
-
-static void install_probe(JSContext *ctx) {
-    JSValue global = JS_GetGlobalObject(ctx);
-    assert(JS_SetPropertyStr(ctx, global, "__probe", JS_NewCFunction(ctx, probe, "__probe", 1)) >=
-           0);
-    JS_FreeValue(ctx, global);
-}
-
-static void invoke(JSContext *ctx, int realm_value, int local) {
-    char source[192];
-    const int written = snprintf(source, sizeof(source),
-                                 "globalThis.realmValue = %d; function invoke() { let local = %d; "
-                                 "return __probe(%d, %d); } invoke();",
-                                 realm_value, local, local + realm_value, local);
-    JSValue result;
-    assert(written > 0 && (size_t)written < sizeof(source));
-    result = JS_Eval(ctx, source, (size_t)written, "debug-eval-consumer.js", JS_EVAL_TYPE_GLOBAL);
-    expect_int(ctx, result, 0, "invoke");
+    signal_ready(state);
+    for (;;) {
+        if (jsbay_engine_run_loop(state->instance_id) != JSBAY_OK) {
+            signal_complete(state, 1);
+            break;
+        }
+        pthread_mutex_lock(&state->mutex);
+        const enum command command = state->command;
+        state->command = COMMAND_NONE;
+        pthread_mutex_unlock(&state->mutex);
+        if (command == COMMAND_QUIT)
+            break;
+        int failed = 0;
+        if (command == COMMAND_RUN) {
+            failed = !run_frame(state);
+        } else if (command == COMMAND_GC) {
+            if (!jsbay_engine_run_gc(state->instance_id))
+                failed = 1;
+            else {
+                puts("GC");
+                fflush(stdout);
+            }
+        } else if (command == COMMAND_RESET) {
+            stop_engine(state);
+            if (!start_engine(state)) {
+                signal_complete(state, 1);
+                break;
+            }
+            signal_ready(state);
+            continue;
+        }
+        signal_complete(state, failed);
+        if (failed)
+            break;
+    }
+    stop_engine(state);
+    return NULL;
 }
 
 int main(void) {
-    JSRuntime *rt = JS_NewRuntime();
-    JSContext *first = JS_NewContext(rt);
-    JSContext *second = JS_NewContext(rt);
-    assert(rt && first && second);
-    JS_SetScriptTagHandler(rt, script_tag, NULL);
-    install_probe(first);
-    install_probe(second);
-
-    invoke(first, 1, 40);
-    assert(helper_compiles == 1);
-    JS_RunGC(rt);
-    invoke(first, 1, 50);
-    assert(helper_compiles == 1);
-
-    invoke(second, 2, 60);
-    assert(helper_compiles == 2);
-
-    JS_SetScriptTagHandler(rt, NULL, NULL);
-    JS_FreeContext(first);
-    JS_FreeContext(second);
-    JS_RunGC(rt);
-    JS_FreeRuntime(rt);
-    puts("PASS: debugger eval helper cache is per context and survives GC");
-    return 0;
+    struct state state;
+    pthread_t owner;
+    pthread_attr_t attributes;
+    char line[32];
+    memset(&state, 0, sizeof(state));
+    state.instance_id = 744002;
+    pthread_mutex_init(&state.mutex, NULL);
+    pthread_cond_init(&state.changed, NULL);
+    if (pthread_attr_init(&attributes) != 0)
+        return 2;
+    if (pthread_attr_setstacksize(&attributes, OWNER_STACK_BYTES) != 0)
+        return 2;
+    if (pthread_create(&owner, &attributes, owner_main, &state) != 0)
+        return 2;
+    pthread_attr_destroy(&attributes);
+    pthread_mutex_lock(&state.mutex);
+    while (!state.ready)
+        pthread_cond_wait(&state.changed, &state.mutex);
+    const int initial_failed = state.failed;
+    pthread_mutex_unlock(&state.mutex);
+    if (initial_failed) {
+        pthread_join(owner, NULL);
+        return 2;
+    }
+    while (fgets(line, sizeof(line), stdin)) {
+        const enum command command = strcmp(line, "RUN\n") == 0     ? COMMAND_RUN
+                                     : strcmp(line, "GC\n") == 0    ? COMMAND_GC
+                                     : strcmp(line, "RESET\n") == 0 ? COMMAND_RESET
+                                     : strcmp(line, "QUIT\n") == 0  ? COMMAND_QUIT
+                                                                    : COMMAND_NONE;
+        if (command == COMMAND_NONE)
+            continue;
+        pthread_mutex_lock(&state.mutex);
+        state.command = command;
+        state.complete = 0;
+        pthread_mutex_unlock(&state.mutex);
+        if (!jsbay_engine_stop_loop(state.instance_id))
+            break;
+        if (command == COMMAND_QUIT)
+            break;
+        pthread_mutex_lock(&state.mutex);
+        while (!state.complete && !state.failed)
+            pthread_cond_wait(&state.changed, &state.mutex);
+        const int failed = state.failed;
+        pthread_mutex_unlock(&state.mutex);
+        if (failed)
+            break;
+    }
+    pthread_mutex_lock(&state.mutex);
+    state.command = COMMAND_QUIT;
+    pthread_mutex_unlock(&state.mutex);
+    jsbay_engine_stop_loop(state.instance_id);
+    pthread_join(owner, NULL);
+    pthread_cond_destroy(&state.changed);
+    pthread_mutex_destroy(&state.mutex);
+    return state.failed ? 2 : 0;
 }

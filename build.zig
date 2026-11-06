@@ -518,13 +518,43 @@ pub fn build(b: *std.Build) void {
     }
 
     const debug_eval_contract_step = b.step("test-ng-debug-eval", "Run QuickJS-NG debugger expression cache contract");
-    if (backend == .quickjs_ng) {
-        const run_debug_eval_contract = b.addSystemCommand(&.{"sh"});
-        run_debug_eval_contract.addFileArg(b.path("tests/quickjs_ng_debug_eval_contract.sh"));
-        run_debug_eval_contract.addDirectoryArg(qjs_root.?);
+    if (backend == .quickjs_ng and packed_backends.len == 1 and inspector_enabled and inspector_transport_enabled) {
+        // Instrument a private source copy for this contract; installed libraries use the unmodified patched tree.
+        const instrument = b.addSystemCommand(&.{"python3"});
+        instrument.addFileArg(b.path("tests/instrument_debug_eval.py"));
+        instrument.addDirectoryArg(qjs_root.?);
+        const instrumented_root = instrument.addOutputDirectoryArg("debug-eval-source");
+        const contract_module = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = .debug,
+            .link_libc = true,
+            .pic = true,
+        });
+        contract_module.addOptions("build_options", build_options);
+        contract_module.addImport("qjs", qjs_mod.?);
+        contract_module.addImport("zev", zev);
+        contract_module.addImport("js_event_loop", js_event_loop);
+        contract_module.addImport("inspector", inspector);
+        contract_module.addImport("inspector_transport", inspector_transport);
+        contract_module.addImport("bytecode_cache", bytecode_cache);
+        addPlatformCompatSources(b, contract_module);
+        addBackendSources(b, contract_module, packed_backends, false, os, instrumented_root, true, heap_snapshot, false, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
+        contract_module.linkSystemLibrary("m", .{});
+        const contract_library = b.addLibrary(.{ .name = "jsbay_debug_eval_contract", .root_module = contract_module, .linkage = .static });
+        const consumer_module = b.createModule(.{ .target = target, .optimize = .debug, .link_libc = true });
+        consumer_module.addIncludePath(b.path("include"));
+        consumer_module.linkSystemLibrary("pthread", .{});
+        consumer_module.addCSourceFile(.{ .file = b.path("tests/quickjs_ng_debug_eval_consumer.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        consumer_module.linkLibrary(contract_library);
+        const consumer = b.addExecutable(.{ .name = "debug-eval-consumer", .root_module = consumer_module });
+        const run_debug_eval_contract = b.addSystemCommand(&.{"node"});
+        run_debug_eval_contract.addFileArg(b.path("tests/quickjs_ng_debug_eval_driver.mjs"));
+        run_debug_eval_contract.addArg("--bin");
+        run_debug_eval_contract.addArtifactArg(consumer);
         debug_eval_contract_step.dependOn(&run_debug_eval_contract.step);
     } else {
-        const unsupported = b.addSystemCommand(&.{ "sh", "-c", "printf '%s\\n' 'test-ng-debug-eval requires -Dbackend=quickjs_ng' >&2; exit 1" });
+        const unsupported = b.addSystemCommand(&.{ "sh", "-c", "printf '%s\\n' 'test-ng-debug-eval requires a single QuickJS-NG backend with inspector transport enabled' >&2; exit 1" });
         debug_eval_contract_step.dependOn(&unsupported.step);
     }
 
