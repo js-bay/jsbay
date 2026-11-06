@@ -202,7 +202,7 @@ fn copyErrorObserver(instance_id: i32) ?ErrorObserver {
 fn dispatchError(_: ?*qjs.JSContext, instance_id: i32, kind: @import("../../types.zig").ErrorKind, promise: qjs.JSValue, value: qjs.JSValue) bool {
     const control = @import("../../runtime/runtime_control.zig");
     if (control.isInterruptRequested(instance_id) or control.isStopRequested(instance_id)) return false;
-    if (control.remainingExecutionLimitMillis(instance_id)) |remaining| if (remaining == 0) return false;
+    if (control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| if (remaining == 0) return false;
     const target = copyErrorObserver(instance_id) orelse return true;
     const api_value = @import("../../abi/api_value.zig");
     const promise_handle = if (kind == .async_uncaught) 0 else api_value.putBorrowed(instance_id, promise) orelse return true;
@@ -218,7 +218,7 @@ fn dispatchError(_: ?*qjs.JSContext, instance_id: i32, kind: @import("../../type
 pub fn reportAsyncUncaught(ctx: ?*qjs.JSContext, instance_id: i32, value: qjs.JSValue) void {
     const control = @import("../../runtime/runtime_control.zig");
     if (control.isInterruptRequested(instance_id) or control.isStopRequested(instance_id)) return;
-    if (control.remainingExecutionLimitMillis(instance_id)) |remaining| if (remaining == 0) return;
+    if (control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| if (remaining == 0) return;
     _ = dispatchError(ctx, instance_id, .async_uncaught, value, value);
 }
 
@@ -284,12 +284,43 @@ fn freeQueue(ctx: ?*qjs.JSContext, queue: *std.ArrayList(Pending)) void {
         freePending(ctx, item);
     }
     queue.deinit(std.heap.c_allocator);
+    queue.* = .empty;
+}
+
+test "deferred rejection restore OOM leaves caller cleanup safe" {
+    if (comptime !@import("../../backend.zig").isQuickJsApiBackend(@import("../../backend.zig").active_backend)) return error.SkipZigTest;
+    const testing = std.testing;
+    const runtime = qjs.JS_NewRuntime() orelse return error.OutOfMemory;
+    defer qjs.JS_FreeRuntime(runtime);
+    const ctx = qjs.JS_NewContext(runtime) orelse return error.OutOfMemory;
+    defer qjs.JS_FreeContext(ctx);
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var queued: std.ArrayList(Pending) = .empty;
+    try queued.append(std.heap.c_allocator, .{ .promise = c.JS_UNDEFINED, .reason = c.JS_UNDEFINED });
+    defer queued.deinit(std.heap.c_allocator);
+
+    rejection_lock.lock();
+    const original = pending_by_instance;
+    pending_by_instance = std.AutoHashMap(i32, std.ArrayList(Pending)).init(failing.allocator());
+    rejection_lock.unlock();
+    defer {
+        rejection_lock.lock();
+        var injected = pending_by_instance.?;
+        pending_by_instance = original;
+        rejection_lock.unlock();
+        injected.deinit();
+    }
+
+    restorePendingTail(ctx, -1, &queued, 0);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), queued.items.len);
+    try testing.expectEqual(@as(usize, 0), queued.capacity);
 }
 
 fn shouldDeferPendingRejections(instance_id: i32) bool {
     const control = @import("../../runtime/runtime_control.zig");
     if (control.isInterruptRequested(instance_id) or control.isStopRequested(instance_id)) return true;
-    return if (control.remainingExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
+    return if (control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
 }
 
 fn restorePendingTail(ctx: ?*qjs.JSContext, instance_id: i32, queue: *std.ArrayList(Pending), start: usize) void {

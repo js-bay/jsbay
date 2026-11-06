@@ -233,6 +233,57 @@ test "error observer: synchronous evaluation and interrupted timer stay quiet" {
     try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
 }
 
+test "error observer: execution budget cancellation stays quiet for timers and microtasks" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    inline for (.{ "setTimeout", "queueMicrotask" }) |schedule| {
+        const id = helpers.nextInstanceId();
+        try testing.expect(c_api.jsbay_engine_create(id, null, null));
+        defer c_api.jsbay_engine_destroy(id);
+        var log = EventCount{};
+        try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_set_error_observer(id, EventCount.handler, &log));
+        try helpers.evalOk(id, "globalThis.__budget_started = false; globalThis.__budget_finished = false;");
+        try testing.expect(c_api.jsbay_engine_set_execution_budget(id, 10));
+        const source: []const u8 = schedule ++ "(function () { globalThis.__budget_started = true; const end = Date.now() + 100; while (Date.now() < end) {} globalThis.__budget_finished = true; }, 0);";
+        var value: u64 = 0;
+        var exception: u64 = 0;
+        defer {
+            if (value != 0) _ = c_api.jsbay_value_release(value);
+            if (exception != 0) _ = c_api.jsbay_value_release(exception);
+        }
+        const filename: []const u8 = "budget-error-observer.js";
+        const status = c_api.jsbay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception);
+        try testing.expect(status == 0 or status == 1);
+        if (comptime std.mem.eql(u8, schedule, "setTimeout")) engine.runEventLoopOnce(id);
+        try testing.expect(c_api.jsbay_engine_set_execution_budget(id, 0));
+        try helpers.expectEvalEquals(id, "__budget_started + ',' + __budget_finished", "true,false");
+        try testing.expectEqual(@as(u32, 0), log.count);
+        try helpers.evalOk(id, "queueMicrotask(function () { throw { marker: 121 }; });");
+        try testing.expectEqual(@as(u32, 1), log.count);
+    }
+}
+
+test "error observer: budget-interrupted rejections stay pending until a recovery catch" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    const id = helpers.nextInstanceId();
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+    var log = EventCount{};
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_set_error_observer(id, EventCount.handler, &log));
+    try helpers.evalOk(id,
+        \\setTimeout(function () {
+        \\  globalThis.__budget_promise = Promise.reject({ marker: 122 });
+        \\  queueMicrotask(function () { const end = Date.now() + 100; while (Date.now() < end) {} });
+        \\}, 0);
+    );
+    try testing.expect(c_api.jsbay_engine_set_execution_budget(id, 10));
+    engine.runEventLoopOnce(id);
+    try testing.expectEqual(@as(u32, 0), log.count);
+    try testing.expect(c_api.jsbay_engine_set_execution_budget(id, 0));
+    try helpers.evalOk(id, "__budget_promise.catch(function () { globalThis.__budget_caught = true; });");
+    try helpers.expectEvalEquals(id, "__budget_caught", "true");
+    try testing.expectEqual(@as(u32, 0), log.count);
+}
+
 test "error observer: interrupted rejection drain stays quiet until its catch runs" {
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
