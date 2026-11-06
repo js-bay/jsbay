@@ -2,7 +2,7 @@
 //!
 //! This self-contained binary prints an ops/sec table. Both backends share the same source; the active backend is selected at build time via `-Dbackend=quickjs_ng|quickjs|jsc`.
 //!
-//! Reference cases: ScriptX `PressureTest`.
+//! Reference cases: host-binding pressure tests.
 //!
 //! Workloads (see `workloads` array below):
 //!   1. eval_throughput            — hot-loop `1+1`

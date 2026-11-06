@@ -309,7 +309,7 @@ pub fn Module(comptime Host: type) type {
             object_group: ?[]const u8,
             preview: bool,
         ) !void {
-            try writeRemoteObjectOwned(state, ctx, writer, value, object_group, preview, false);
+            try writeRemoteObjectOwned(state, ctx, writer, value, object_group, preview, false, null, null);
         }
 
         // Console-only serializer. Its object group is private to console history.
@@ -320,8 +320,21 @@ pub fn Module(comptime Host: type) type {
             value: ActiveEngine.Value,
             object_group: ?[]const u8,
             preview: bool,
+            object_ids: *std.ArrayList(u64),
         ) !void {
-            try writeRemoteObjectOwned(state, ctx, writer, value, object_group, preview, true);
+            try writeRemoteObjectOwned(state, ctx, writer, value, object_group, preview, true, object_ids, null);
+        }
+
+        /// Serialize a descendant of a console object. It is visible only to the session that expanded its parent.
+        pub fn writeConsoleChildRemoteObjectEx(
+            state: *InspectorState,
+            ctx: ActiveEngine.Context,
+            writer: anytype,
+            value: ActiveEngine.Value,
+            session_id: transport_mod.SessionId,
+            preview: bool,
+        ) !void {
+            try writeRemoteObjectOwned(state, ctx, writer, value, null, preview, false, null, session_id);
         }
 
         fn writeRemoteObjectOwned(
@@ -332,6 +345,8 @@ pub fn Module(comptime Host: type) type {
             object_group: ?[]const u8,
             preview: bool,
             console_owner: bool,
+            console_ids: ?*std.ArrayList(u64),
+            console_session: ?transport_mod.SessionId,
         ) !void {
             if (ActiveEngine.isUndefined(ctx, value)) {
                 try writer.writeAll("{\"type\":\"undefined\"}");
@@ -418,7 +433,12 @@ pub fn Module(comptime Host: type) type {
                 break :blk "Object";
             };
 
-            const oid = (if (console_owner) state.object_table.retainConsole(ctx, value, object_group) else state.object_table.retain(ctx, value, object_group)) orelse {
+            const oid = (if (console_owner)
+                state.object_table.retainConsole(ctx, value, object_group)
+            else if (console_session) |session_id|
+                state_mod.retainConsoleChildForLiveSession(state, ctx, session_id, value)
+            else
+                state.object_table.retain(ctx, value, object_group)) orelse {
                 try writer.writeAll("{\"type\":\"object\",\"className\":");
                 try writeJsonString(writer, class_name);
                 try writer.writeAll(",\"description\":");
@@ -427,6 +447,12 @@ pub fn Module(comptime Host: type) type {
                 try writer.writeAll("}");
                 return;
             };
+            if (console_ids) |ids| {
+                ids.append(state.allocator, oid) catch |err| {
+                    state.object_table.releaseConsoleCache(ctx, &.{oid});
+                    return err;
+                };
+            }
 
             try writer.writeAll("{\"type\":");
             if (is_fn) {

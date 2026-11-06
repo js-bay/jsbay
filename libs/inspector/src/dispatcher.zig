@@ -43,6 +43,7 @@ pub fn Module(comptime Host: type) type {
                     // The debugger owns session removal because it must turn the vanished session's async-depth request into an owner task. Await cleanup may still inspect its pending records afterwards.
                     debugger_cdp.sessionClosed(state, event.session_id);
                     await_promise.closeSession(state, event.session_id);
+                    console_cdp.releaseClosedSession(state, event.session_id);
                 },
                 .message => if (!state_mod.isClosing(state)) handleMessage(state, event.session_id, event.payload),
             }

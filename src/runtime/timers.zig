@@ -424,7 +424,7 @@ fn fireOne(instance_id: i32, data: *TimerData, now_ms: u64, queued: *@import("js
             const label: []const u8 = if (data.is_interval) "setInterval" else "setTimeout";
             const entered = if (data.async_trace) |parent| async_stack.enter(instance_id, label, parent) else false;
             defer if (entered) async_stack.leave(instance_id);
-            if (dispatch.timerCallNoArgs(data.backend_tag, data.ctx_addr, dup_buf[0..dup_len])) |message| {
+            if (dispatch.timerCallNoArgsObserved(data.backend_tag, data.ctx_addr, dup_buf[0..dup_len], instance_id)) |message| {
                 defer std.heap.c_allocator.free(message);
                 @import("../inspector/root.zig").exceptions.reportUncaught(instance_id, message, "");
             }

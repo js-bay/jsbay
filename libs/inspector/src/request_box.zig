@@ -37,6 +37,7 @@ pub fn Module(comptime Host: type) type {
             run_fn: RunFn,
             expression: []u8 = &.{},
             object_group: []u8 = &.{},
+            call_object_group_supplied: bool = false,
             return_by_value: bool = false,
             /// Runtime.evaluate/callFunctionOn may defer their response until a returned Promise settles. Runtime.awaitPromise sets this on its direct request.
             await_promise: bool = false,
@@ -88,6 +89,7 @@ pub fn Module(comptime Host: type) type {
                 return;
             };
 
+            box.state.object_table.drainClosedConsoleSessions(js_ctx);
             box.run_fn(box, js_ctx);
         }
     };

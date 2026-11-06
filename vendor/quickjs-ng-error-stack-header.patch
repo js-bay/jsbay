@@ -1,0 +1,66 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8183,7 +8183,54 @@
+ /* only taken into account if filename is provided */
+ #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
+ #define JS_BACKTRACE_FLAG_FILTER_FUNC      (1 << 2)
++
++static void jsbay_append_error_stack_header(JSContext *ctx, DynBuf *dbuf,
++                                      JSValueConst error_obj)
++{
++    static const char * const native_error_names[JS_NATIVE_ERROR_COUNT] = {
++        "EvalError", "RangeError", "ReferenceError", "SyntaxError",
++        "TypeError", "URIError", "InternalError", "AggregateError",
++        "SuppressedError",
++    };
++    JSObject *error;
++    JSObject *proto;
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    const char *name = "Error";
++    const char *message = NULL;
++    size_t message_len = 0;
++    int i;
++    int matched = 0;
++
++    if (!JS_IsObject(error_obj))
++        return;
++    error = JS_VALUE_GET_OBJ(error_obj);
++    proto = error->shape->proto;
++    while (proto && !matched) {
++        for (i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
++            if (proto == JS_VALUE_GET_OBJ(ctx->native_error_proto[i])) {
++                name = native_error_names[i];
++                matched = 1;
++                break;
++            }
++        }
++        proto = proto->shape->proto;
++    }
++    prs = find_own_property(&pr, error, JS_ATOM_message);
++    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
++        JS_IsString(pr->u.value)) {
++        message = JS_ToCStringLen(ctx, &message_len, pr->u.value);
++    }
++    if (message && message_len != 0) {
++        dbuf_printf(dbuf, "%s: ", name);
++        dbuf_put(dbuf, (const uint8_t *)message, message_len);
++        dbuf_putc(dbuf, '\n');
++    } else {
++        dbuf_printf(dbuf, "%s\n", name);
++    }
++    JS_FreeCString(ctx, message);
++}
+ 
+ /* if filename != NULL, an additional level is added with the filename
+    and line number information (used for parse error). */
+ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+@@ -8247,6 +8287,7 @@
+             js_new_callsite_data2(ctx, &csd[i++], filename, line_num, col_num);
+     } else {
+         js_dbuf_init(ctx, &dbuf);
++        jsbay_append_error_stack_header(ctx, &dbuf, error_obj);
+         if (stack_trace_limit == 0)
+             goto done;
+         if (filename) {

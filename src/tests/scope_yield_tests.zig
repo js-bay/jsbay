@@ -1,6 +1,6 @@
 //! Temporarily yield the engine so another thread can eval.
 //!
-//! ScriptX `ExitEngineScope` drops the owning thread's claim; a second thread enters, then the owner takes the claim back. Before `threadStart` there is no engine thread, so release / reacquire do nothing.
+//! Releasing the engine scope drops the owning thread's claim; a second thread enters, then the owner takes the claim back. Before `threadStart` there is no engine thread, so release and reacquire do nothing.
 
 const std = @import("std");
 const testing = std.testing;

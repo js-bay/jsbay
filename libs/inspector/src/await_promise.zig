@@ -26,9 +26,10 @@ pub fn Module(comptime Host: type) type {
             value: backend.ActiveEngine.Value,
             return_by_value: bool,
             object_group: ?[]const u8,
+            console_origin: bool,
         ) bool {
             if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
-                return @import("await_promise_qjs.zig").Module(Host).attach(state, session_id, request_id, ctx, value, return_by_value, object_group);
+                return @import("await_promise_qjs.zig").Module(Host).attach(state, session_id, request_id, ctx, value, return_by_value, object_group, console_origin);
             }
             json_writer.sendError(state, session_id, request_id, -32601, "Runtime.awaitPromise is unsupported by this backend");
             return false;

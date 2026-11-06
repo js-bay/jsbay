@@ -24,7 +24,13 @@ pub fn Module(comptime Host: type) type {
         const sendObjectNotFound = json_writer.sendObjectNotFound;
         const writeRemoteObject = remote_object.writeRemoteObject;
         const writeRemoteObjectEx = remote_object.writeRemoteObjectEx;
+        const writeConsoleChildRemoteObjectEx = remote_object.writeConsoleChildRemoteObjectEx;
         const parseObjectId = remote_object.parseObjectId;
+
+        fn writeRemoteObjectForParent(state: *InspectorState, ctx: ActiveEngine.Context, w: anytype, value: ActiveEngine.Value, session_id: transport_mod.SessionId, console_origin: bool, preview: bool) !void {
+            if (console_origin) return writeConsoleChildRemoteObjectEx(state, ctx, w, value, session_id, preview);
+            return writeRemoteObjectEx(state, ctx, w, value, null, preview);
+        }
 
         // Create a clean realm in the same runtime and retain its reflection methods. Values from a realm in the same QuickJS runtime / JSC context group can be called against the inspected context, while staying outside page control.
         pub fn captureRuntimeIntrinsicsFromFreshRealm(runtime: ActiveEngine.Runtime, state: *InspectorState) bool {
@@ -160,10 +166,13 @@ pub fn Module(comptime Host: type) type {
 
         fn runGetPropertiesOwnEnumerable(box: *RequestBox, ctx: ActiveEngine.Context) void {
             const state = box.state;
-            const target = state.object_table.get(box.object_id) orelse {
+            const target = state.object_table.getForSession(box.session_id, box.object_id) orelse {
                 sendObjectNotFound(state, box.session_id, box.request_id);
                 return;
             };
+            const target_owned = ActiveEngine.dupValue(ctx, target);
+            defer ActiveEngine.freeValue(ctx, target_owned);
+            const console_origin = state.object_table.isConsole(box.object_id);
 
             // Fetch Object.keys(target) via callFunction so both backends share OwnEnumerableStringProperties semantics.
             const object_ctor = state.runtime_object_ctor orelse {
@@ -210,7 +219,7 @@ pub fn Module(comptime Host: type) type {
                 w.writeAll(",\"value\":") catch return;
                 if (prop_val_opt) |pv| {
                     defer ActiveEngine.freeValue(ctx, pv);
-                    writeRemoteObject(state, ctx, w, pv, null) catch return;
+                    writeRemoteObjectForParent(state, ctx, w, pv, box.session_id, console_origin, false) catch return;
                 } else {
                     w.writeAll("{\"type\":\"undefined\"}") catch return;
                 }
@@ -329,6 +338,8 @@ pub fn Module(comptime Host: type) type {
             names: ActiveEngine.Value,
             is_own: bool,
             query: PropertyQuery,
+            session_id: transport_mod.SessionId,
+            console_origin: bool,
         ) !void {
             const len = ActiveEngine.getLength(ctx, names) orelse 0;
             var i: u32 = 0;
@@ -399,7 +410,7 @@ pub fn Module(comptime Host: type) type {
                     if (owns_get) {
                         try w.writeAll(",\"get\":");
                         if (get_v) |g| {
-                            try writeRemoteObjectEx(state, ctx, w, g, null, query.preview);
+                            try writeRemoteObjectForParent(state, ctx, w, g, session_id, console_origin, query.preview);
                         } else {
                             try w.writeAll("{\"type\":\"undefined\"}");
                         }
@@ -407,7 +418,7 @@ pub fn Module(comptime Host: type) type {
                     if (owns_set) {
                         try w.writeAll(",\"set\":");
                         if (set_v) |s| {
-                            try writeRemoteObjectEx(state, ctx, w, s, null, query.preview);
+                            try writeRemoteObjectForParent(state, ctx, w, s, session_id, console_origin, query.preview);
                         } else {
                             try w.writeAll("{\"type\":\"undefined\"}");
                         }
@@ -418,7 +429,7 @@ pub fn Module(comptime Host: type) type {
                     const writable = descriptorBool(ctx, desc, "writable", false);
                     try w.writeAll(",\"value\":");
                     if (value_v) |pv| {
-                        try writeRemoteObjectEx(state, ctx, w, pv, null, query.preview);
+                        try writeRemoteObjectForParent(state, ctx, w, pv, session_id, console_origin, query.preview);
                     } else {
                         try w.writeAll("{\"type\":\"undefined\"}");
                     }
@@ -445,6 +456,8 @@ pub fn Module(comptime Host: type) type {
             object_ctor: ActiveEngine.Value,
             target: ActiveEngine.Value,
             preview: bool,
+            session_id: transport_mod.SessionId,
+            console_origin: bool,
         ) !void {
             const args = [_]ActiveEngine.Value{target};
             const proto = callObject(ctx, proto_fn, object_ctor, &args) orelse return;
@@ -462,7 +475,7 @@ pub fn Module(comptime Host: type) type {
             wrote.* = true;
             // Chrome's default getProperties reply always includes this synthetic descriptor, including when ownProperties is true. It is not the Object.prototype.__proto__ accessor and it is not invoked.
             try w.writeAll("{\"name\":\"__proto__\",\"value\":");
-            try writeRemoteObjectEx(state, ctx, w, proto, null, preview);
+            try writeRemoteObjectForParent(state, ctx, w, proto, session_id, console_origin, preview);
             try w.writeAll(",\"writable\":");
             try w.writeAll(if (writable) "true" else "false");
             try w.writeAll(",\"enumerable\":false,\"configurable\":true,\"isOwn\":true}");
@@ -475,6 +488,8 @@ pub fn Module(comptime Host: type) type {
             w: anytype,
             target: ActiveEngine.Value,
             preview: bool,
+            session_id: transport_mod.SessionId,
+            console_origin: bool,
         ) !void {
             if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
             const qjs = Host.backend.ActiveEngineModule.c_api.qjs;
@@ -493,7 +508,7 @@ pub fn Module(comptime Host: type) type {
                     const result = qjs.JS_PromiseResult(ctx, target);
                     defer qjs.JS_FreeValue(ctx, result);
                     try w.writeAll(",{\"name\":\"[[PromiseResult]]\",\"value\":");
-                    try writeRemoteObjectEx(state, ctx, w, result, null, preview);
+                    try writeRemoteObjectForParent(state, ctx, w, result, session_id, console_origin, preview);
                     try w.writeAll("}");
                 }
             }
@@ -501,10 +516,13 @@ pub fn Module(comptime Host: type) type {
 
         fn runGetPropertiesWithDescriptors(box: *RequestBox, ctx: ActiveEngine.Context) void {
             const state = box.state;
-            const target = state.object_table.get(box.object_id) orelse {
+            const target = state.object_table.getForSession(box.session_id, box.object_id) orelse {
                 sendObjectNotFound(state, box.session_id, box.request_id);
                 return;
             };
+            const target_owned = ActiveEngine.dupValue(ctx, target);
+            defer ActiveEngine.freeValue(ctx, target_owned);
+            const console_origin = state.object_table.isConsole(box.object_id);
 
             const object_ctor = state.runtime_object_ctor orelse {
                 sendInvalidParams(state, box.session_id, box.request_id, "no Object constructor");
@@ -580,6 +598,8 @@ pub fn Module(comptime Host: type) type {
                         .preview = box.generate_preview,
                         .non_indexed = box.non_indexed_properties_only,
                     },
+                    box.session_id,
+                    console_origin,
                 ) catch return;
 
                 if (box.own_properties) break;
@@ -594,10 +614,10 @@ pub fn Module(comptime Host: type) type {
                 current = next;
             }
 
-            writeProtoDescriptor(state, ctx, w, &wrote_one, proto_fn, object_ctor, target, box.generate_preview) catch return;
+            writeProtoDescriptor(state, ctx, w, &wrote_one, proto_fn, object_ctor, target, box.generate_preview, box.session_id, console_origin) catch return;
 
             w.writeAll("],\"internalProperties\":[") catch return;
-            writeInternalProperties(state, ctx, w, target, box.generate_preview) catch return;
+            writeInternalProperties(state, ctx, w, target, box.generate_preview, box.session_id, console_origin) catch return;
             w.writeAll("]}}") catch return;
             sendJson(state, box.session_id, aw.written());
         }
@@ -652,7 +672,11 @@ pub fn Module(comptime Host: type) type {
         }
 
         fn runReleaseObject(box: *RequestBox, ctx: ActiveEngine.Context) void {
-            _ = box.state.object_table.release(ctx, box.object_id);
+            if (box.state.object_table.isConsole(box.object_id)) {
+                _ = box.state.object_table.releaseConsoleLease(ctx, box.session_id, box.object_id);
+            } else {
+                _ = box.state.object_table.release(ctx, box.object_id);
+            }
             sendEmptyResult(box.state, box.session_id, box.request_id);
         }
 
@@ -704,6 +728,9 @@ pub fn Module(comptime Host: type) type {
         }
 
         fn runReleaseObjectGroup(box: *RequestBox, ctx: ActiveEngine.Context) void {
+            if (std.mem.eql(u8, box.group_name, "console")) {
+                box.state.object_table.releaseConsoleSession(ctx, box.session_id);
+            }
             _ = box.state.object_table.releaseGroup(ctx, box.group_name);
             sendEmptyResult(box.state, box.session_id, box.request_id);
         }

@@ -22,6 +22,7 @@ const stack_budget = @import("../../platform/stack_budget.zig");
 /// `anchor_sp`/`anchor_thread` remember the HIGHEST native frame address the limit was anchored at, per thread. The stack grows down, so a later entry that is deeper (lower address) must NOT re-anchor: doing so would set `stack_top` to that deeper pointer and hand the in-progress recursion a fresh full budget, letting it overflow the native stack instead of raising `RangeError`. This holds even for JS entry points that are not wrapped here (getters, `toString`/`toJSON`, other hosts' raw `JS_Eval`): the anchor can only ever move up.
 const ExecState = struct {
     depth: u32 = 0,
+    job_drain_depth: u32 = 0,
     owner: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     anchor_thread: ?std.Thread.Id = null,
     anchor_sp: usize = 0,
@@ -237,9 +238,6 @@ pub fn debugStackAnchorSp(ctx: ?*qjs.JSContext) usize {
     return st.anchor_sp;
 }
 
-/// Nesting depth of processPendingJobsImpl on this thread. Unhandled rejections flush only when the outermost drain finishes, so a .catch queued as a sibling microtask still cancels the report.
-threadlocal var job_drain_depth: u32 = 0;
-
 fn shouldStopPendingJobDrain(instance_id: i32) bool {
     const runtime_control = @import("../../runtime/runtime_control.zig");
     if (runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id)) return true;
@@ -257,10 +255,11 @@ pub fn processPendingJobsImpl(ctx: ?*qjs.JSContext) void {
     if (!enterJs(ctx)) return;
     defer leaveJs(ctx);
     syncStackTopForJs(ctx);
-    job_drain_depth += 1;
+    const st = execState(qjs.JS_GetRuntime(ctx)) orelse return;
+    st.job_drain_depth += 1;
     defer {
-        job_drain_depth -= 1;
-        if (job_drain_depth == 0) exception.flushPendingRejections(ctx);
+        st.job_drain_depth -= 1;
+        if (st.job_drain_depth == 0) exception.flushPendingRejections(ctx);
     }
     const rt = qjs.JS_GetRuntime(ctx);
     var ctx1: ?*qjs.JSContext = null;
@@ -271,10 +270,13 @@ pub fn processPendingJobsImpl(ctx: ?*qjs.JSContext) void {
         if (status < 0 and ctx1 != null) {
             const opaque_id = qjs.JS_GetContextOpaque(ctx1);
             const failed_instance_id: i32 = @bitCast(@as(u32, @truncate(@intFromPtr(opaque_id))));
-            if (exception.getAndFormatException(ctx1)) |message| {
+            const exc = qjs.JS_GetException(ctx1);
+            exception.reportAsyncUncaught(ctx1, failed_instance_id, exc);
+            if (exception.formatExceptionValue(ctx1, exc)) |message| {
                 defer std.heap.c_allocator.free(message);
                 @import("../../inspector/root.zig").exceptions.reportUncaught(failed_instance_id, message, "");
             }
+            c.jsbay_qjs_JS_FreeValue(ctx1, exc);
             if (shouldStopPendingJobDrain(failed_instance_id)) break;
             continue;
         }
@@ -512,6 +514,26 @@ pub const QuickJsBackend = struct {
         c.jsbay_qjs_JS_FreeValue(ctx, global);
         if (c.jsIsException(result)) {
             const err_msg = exception.getAndFormatException(ctx);
+            c.jsbay_qjs_JS_FreeValue(ctx, result);
+            return err_msg;
+        }
+        c.jsbay_qjs_JS_FreeValue(ctx, result);
+        return null;
+    }
+
+    /// Invoke an asynchronous callback and expose its original exception to the typed observer before formatting it for existing diagnostics.
+    pub fn callFunctionNoArgsObserved(ctx: Context, func: Value, instance_id: i32) ?[]const u8 {
+        if (!enterJs(ctx)) return null;
+        defer leaveJs(ctx);
+        const global = qjs.JS_GetGlobalObject(ctx);
+        syncStackTopForJs(ctx);
+        const result = qjs.JS_Call(ctx, func, global, 0, null);
+        c.jsbay_qjs_JS_FreeValue(ctx, global);
+        if (c.jsIsException(result)) {
+            const exc = qjs.JS_GetException(ctx);
+            exception.reportAsyncUncaught(ctx, instance_id, exc);
+            const err_msg = exception.formatExceptionValue(ctx, exc);
+            c.jsbay_qjs_JS_FreeValue(ctx, exc);
             c.jsbay_qjs_JS_FreeValue(ctx, result);
             return err_msg;
         }

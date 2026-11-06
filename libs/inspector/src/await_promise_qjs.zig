@@ -29,6 +29,7 @@ pub fn Module(comptime Host: type) type {
             request_id: i64,
             return_by_value: bool,
             object_group: []u8 = &.{},
+            console_origin: bool,
         };
 
         var pending_mutex: sync.Mutex = .{};
@@ -163,11 +164,11 @@ pub fn Module(comptime Host: type) type {
 
         fn runRequest(box: *request_box.RequestBox, ctx: ActiveEngine.Context) void {
             if (!state_mod.hasSession(box.state, box.session_id)) return;
-            const promise = box.state.object_table.get(box.object_id) orelse {
+            const promise = box.state.object_table.getForSession(box.session_id, box.object_id) orelse {
                 json_writer.sendObjectNotFound(box.state, box.session_id, box.request_id);
                 return;
             };
-            _ = attach(box.state, box.session_id, box.request_id, ctx, promise, box.return_by_value, if (box.object_group.len == 0) null else box.object_group);
+            _ = attach(box.state, box.session_id, box.request_id, ctx, promise, box.return_by_value, if (box.object_group.len == 0) null else box.object_group, box.state.object_table.isConsole(box.object_id));
         }
 
         pub fn attach(
@@ -178,6 +179,7 @@ pub fn Module(comptime Host: type) type {
             promise: ActiveEngine.Value,
             return_by_value: bool,
             object_group: ?[]const u8,
+            console_origin: bool,
         ) bool {
             if (c.jsbay_qjs_JS_IsPromise(ctx, promise) == 0) {
                 json_writer.sendInvalidParams(state, session_id, request_id, "promiseObjectId must identify a Promise");
@@ -193,6 +195,7 @@ pub fn Module(comptime Host: type) type {
                 .session_id = session_id,
                 .request_id = request_id,
                 .return_by_value = return_by_value,
+                .console_origin = console_origin,
                 .object_group = if (object_group) |group| std.heap.c_allocator.dupe(u8, group) catch {
                     std.heap.c_allocator.destroy(item);
                     json_writer.sendError(state, session_id, request_id, -32000, "Unable to allocate Runtime.awaitPromise group");
@@ -305,7 +308,11 @@ pub fn Module(comptime Host: type) type {
                     return;
                 };
             } else {
-                remote_object.writeRemoteObject(item.state, ctx, w, value, group) catch return;
+                if (item.console_origin) {
+                    remote_object.writeConsoleChildRemoteObjectEx(item.state, ctx, w, value, item.session_id, false) catch return;
+                } else {
+                    remote_object.writeRemoteObject(item.state, ctx, w, value, group) catch return;
+                }
             }
             w.writeAll("}}") catch return;
             json_writer.sendJson(item.state, item.session_id, aw.written());

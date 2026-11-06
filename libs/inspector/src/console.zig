@@ -34,6 +34,7 @@ pub fn Module(comptime Host: type) type {
 
             var group_buf: [48]u8 = undefined;
             const js_ctx = currentConsoleContext(instance_id);
+            if (js_ctx) |value| state.object_table.drainClosedConsoleSessions(value);
             const group = if (js_ctx != null) blk: {
                 const id = nextConsoleGroupId() orelse break :blk null;
                 break :blk std.fmt.bufPrint(&group_buf, "__jsbay_console_{d}", .{id}) catch null;
@@ -41,24 +42,22 @@ pub fn Module(comptime Host: type) type {
 
             var aw: std.Io.Writer.Allocating = .init(state.allocator);
             defer aw.deinit();
-            writeConsoleEvent(state, &aw.writer, instance_id, level, msg_slice, group) catch {
-                if (js_ctx) |value| {
-                    if (group) |name| _ = state.object_table.releaseConsoleGroup(value, name);
-                }
+            var object_ids: std.ArrayList(u64) = .empty;
+            defer object_ids.deinit(state.allocator);
+            writeConsoleEvent(state, &aw.writer, instance_id, level, msg_slice, group, &object_ids) catch {
+                if (js_ctx) |value| state.object_table.releaseConsoleCache(value, object_ids.items);
                 return;
             };
 
             var ids: std.ArrayList(transport_mod.SessionId) = .empty;
             defer ids.deinit(state.allocator);
-            state_mod.bufferConsoleEvent(state, aw.written(), js_ctx, group, &ids) catch {
-                if (js_ctx) |value| {
-                    if (group) |name| _ = state.object_table.releaseConsoleGroup(value, name);
-                }
+            state_mod.bufferConsoleEvent(state, aw.written(), js_ctx, object_ids.items, &ids) catch {
+                if (js_ctx) |value| state.object_table.releaseConsoleCache(value, object_ids.items);
                 return;
             };
 
             for (ids.items) |sid| {
-                _ = state.transport.sendText(sid, aw.written());
+                if (!state.transport.sendText(sid, aw.written())) state.transport.closeSession(sid);
             }
         }
 
@@ -99,8 +98,12 @@ pub fn Module(comptime Host: type) type {
         pub fn enableRuntimeAndReplayConsole(state: *InspectorState, session_id: transport_mod.SessionId) void {
             const buffered = state_mod.enableRuntimeAndCopyConsole(state, session_id);
             defer state_mod.freeBufferedConsole(state, buffered);
+            if (buffered.failed) {
+                state.transport.closeSession(session_id);
+                return;
+            }
             for (buffered.entries) |entry| {
-                _ = state.transport.sendText(session_id, entry);
+                if (!state.transport.sendText(session_id, entry)) state.transport.closeSession(session_id);
             }
         }
 
@@ -127,6 +130,17 @@ pub fn Module(comptime Host: type) type {
             json_writer.sendEmptyResult(box.state, box.session_id, box.request_id);
         }
 
+        pub fn releaseClosedSession(state: *InspectorState, session_id: transport_mod.SessionId) void {
+            state.object_table.markConsoleSessionClosed(session_id);
+            const box = state.allocator.create(request_box.RequestBox) catch return;
+            box.* = .{ .state = state, .session_id = session_id, .request_id = 0, .run_fn = runReleaseClosedSession };
+            if (!request_box.postJsRequest(state, box)) request_box.freeRequestBox(state.allocator, box);
+        }
+
+        fn runReleaseClosedSession(box: *request_box.RequestBox, ctx: backend.ActiveEngine.Context) void {
+            box.state.object_table.drainClosedConsoleSessions(ctx);
+        }
+
         fn cdpType(level: types.LogLevel) []const u8 {
             const console_tap = Host.console_tap;
             if (console_tap.currentArgView()) |view| {
@@ -147,11 +161,12 @@ pub fn Module(comptime Host: type) type {
             level: types.LogLevel,
             message: []const u8,
             object_group: ?[]const u8,
+            object_ids: *std.ArrayList(u64),
         ) !void {
             try w.writeAll("{\"method\":\"Runtime.consoleAPICalled\",\"params\":{\"type\":");
             try json_writer.writeJsonString(w, cdpType(level));
             try w.writeAll(",\"args\":[");
-            try writeArgList(state, w, message, object_group);
+            try writeArgList(state, w, message, object_group, object_ids);
             try w.print("],\"executionContextId\":{d},\"timestamp\":", .{state_mod.default_execution_context_id});
             try w.print("{d}", .{io.milliTimestamp()});
             try w.writeAll(",\"stackTrace\":{\"callFrames\":[");
@@ -187,7 +202,7 @@ pub fn Module(comptime Host: type) type {
             try w.writeByte('}');
         }
 
-        fn writeArgList(state: *InspectorState, w: anytype, message: []const u8, object_group: ?[]const u8) !void {
+        fn writeArgList(state: *InspectorState, w: anytype, message: []const u8, object_group: ?[]const u8, object_ids: *std.ArrayList(u64)) !void {
             if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) {
                 try writeSingleStringArg(w, message);
                 return;
@@ -217,7 +232,7 @@ pub fn Module(comptime Host: type) type {
                 const argv: [*]const backend.ActiveEngine.Value = @ptrCast(@alignCast(argv_ptr));
                 for (0..view.argc) |i| {
                     if (i != 0) try w.writeByte(',');
-                    try remote_object.writeConsoleRemoteObjectEx(state, ctx, w, argv[i], object_group, true);
+                    try remote_object.writeConsoleRemoteObjectEx(state, ctx, w, argv[i], object_group, true, object_ids);
                 }
             }
         }

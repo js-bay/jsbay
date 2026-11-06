@@ -1748,6 +1748,32 @@ pub export fn jsbay_engine_set_event_handler(
     return engine_events.setHandler(id, handler, user_data);
 }
 
+/// Owner-thread typed asynchronous-error observer registration.
+pub export fn jsbay_engine_set_error_observer(
+    instance_id: c_int,
+    observer: ?types.ErrorObserver,
+    user_data: ?*anyopaque,
+) c_int {
+    const id: i32 = @intCast(instance_id);
+    if (host_wake.isNotifying()) return API_INVALID_ARGUMENT;
+    if (@import("runtime/instance_map.zig").isTeardownPending(id) or !api_value.hasOwner(id)) return API_INSTANCE_NOT_FOUND;
+    if (!api_value.isOwner(id)) return API_WRONG_THREAD;
+    const lease = engine_thread.beginEval(id);
+    if (!lease.allowed) {
+        return if (@import("runtime/instance_map.zig").isTeardownPending(id) or !api_value.hasOwner(id)) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
+    }
+    defer engine.finishEvalEntry(id, lease);
+    if (packedTagOf(id) != null) return API_UNSUPPORTED;
+    if (@import("runtime/instance_map.zig").getInstance(id)) |inst| {
+        if (inst.loop.lastError() != null) return API_LOOP_FAILED;
+    } else return API_INSTANCE_NOT_FOUND;
+    return switch (@import("runtime/promise.zig").setErrorObserver(id, observer, user_data)) {
+        .applied => API_OK,
+        .out_of_memory => API_OUT_OF_MEMORY,
+        .unsupported => API_UNSUPPORTED,
+    };
+}
+
 fn maybeFireInterrupted(id: i32) void {
     if (runtime_control.isInterruptRequested(id)) {
         engine_events.fireInterrupted(id, 0, "interrupt requested");

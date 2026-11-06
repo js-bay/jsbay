@@ -71,6 +71,14 @@ const SourceLocation = struct {
     column: i32,
 };
 
+const blackbox_cache_capacity: usize = 64;
+
+const BlackboxCacheEntry = struct {
+    url: []u8,
+    revision: u64,
+    matches: bool,
+};
+
 const Binding = struct {
     instance_id: i32,
     runtime: ?*anyopaque,
@@ -86,7 +94,9 @@ const Binding = struct {
     condition_source_suppression: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     skip_all_pauses: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     breakpoints_active: std.atomic.Value(u8) = std.atomic.Value(u8).init(1),
+    breakpoint_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     break_requested: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    stepping_or_skip_pending: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     exception_mode: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     // One exception pause per throw. Follow-up JS_Throw calls from the same exception are ignored until the next source line.
     exception_hold: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
@@ -121,6 +131,8 @@ const Binding = struct {
     skip_seen_same: bool = false,
     skip_saw_deeper: bool = false,
     blackbox: std.ArrayList([]u8) = .empty,
+    blackbox_revision: u64 = 0,
+    blackbox_cache: std.ArrayList(BlackboxCacheEntry) = .empty,
 };
 
 pub const DebugFrame = struct {
@@ -155,6 +167,60 @@ test "debugger hook storage uses atomic publication slots" {
     try std.testing.expect(@TypeOf(pause_hook) == std.atomic.Value(?PauseHook));
     try std.testing.expect(@TypeOf(script_hook) == std.atomic.Value(?ScriptHook));
     try std.testing.expect(@TypeOf(break_locations_hook) == std.atomic.Value(?BreakLocationsHook));
+}
+
+test "debugger: an idle enabled binding has no location work" {
+    var binding: Binding = .{ .instance_id = -1, .runtime = null };
+    try std.testing.expect(!hasPendingLocationWork(&binding));
+    binding.breakpoint_count.store(1, .seq_cst);
+    try std.testing.expect(hasPendingLocationWork(&binding));
+    binding.breakpoints_active.store(0, .seq_cst);
+    try std.testing.expect(!hasPendingLocationWork(&binding));
+    binding.stepping_or_skip_pending.store(1, .seq_cst);
+    try std.testing.expect(hasPendingLocationWork(&binding));
+    binding.stepping_or_skip_pending.store(0, .seq_cst);
+    binding.break_requested.store(1, .seq_cst);
+    try std.testing.expect(hasPendingLocationWork(&binding));
+}
+
+fn hasPendingLocationWork(binding: *const Binding) bool {
+    if (binding.break_requested.load(.seq_cst) != 0) return true;
+    if (binding.stepping_or_skip_pending.load(.seq_cst) != 0) return true;
+    return binding.breakpoints_active.load(.seq_cst) != 0 and binding.breakpoint_count.load(.seq_cst) != 0;
+}
+
+fn locationWorkPredicate(opaque_ptr: ?*anyopaque) callconv(.c) c_int {
+    const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return 0));
+    if (binding.alive.load(.seq_cst) == 0) return 0;
+    if (binding.skip_all_pauses.load(.seq_cst) != 0) return 0;
+    if (binding.suppress.load(.seq_cst) != 0) return 0;
+    if (binding.exception_hold.load(.seq_cst) != 0) return 1;
+    // Exception pauses depend on source transitions to suppress repeated throw notifications.
+    if (binding.exception_mode.load(.seq_cst) != @backingInt(ExceptionPause.none)) return 1;
+    return @intFromBool(hasPendingLocationWork(binding));
+}
+
+test "debugger: suppressed evaluation preserves the pending exception pause" {
+    var binding: Binding = .{ .instance_id = -1, .runtime = null };
+    binding.exception_hold.store(1, .seq_cst);
+    binding.suppress.store(1, .seq_cst);
+    try std.testing.expectEqual(@as(c_int, 0), locationWorkPredicate(&binding));
+    locationTrampoline(null, null, 1, 1, 0, 0, &binding);
+    try std.testing.expectEqual(@as(u8, 1), binding.exception_hold.load(.seq_cst));
+}
+
+fn exceptionWorkPredicate(opaque_ptr: ?*anyopaque) callconv(.c) c_int {
+    const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return 0));
+    if (binding.alive.load(.seq_cst) == 0) return 0;
+    if (binding.skip_all_pauses.load(.seq_cst) != 0) return 0;
+    if (binding.suppress.load(.seq_cst) != 0) return 0;
+    if (binding.exception_hold.load(.seq_cst) != 0) return 0;
+    return @intFromBool(binding.exception_mode.load(.seq_cst) != @backingInt(ExceptionPause.none));
+}
+
+fn refreshSteppingOrSkipPendingLocked(binding: *Binding) void {
+    const pending = binding.mode != .run or binding.skip_line >= 0;
+    binding.stepping_or_skip_pending.store(if (pending) 1 else 0, .seq_cst);
 }
 
 fn bindings() *std.AutoHashMap(i32, *Binding) {
@@ -394,12 +460,17 @@ pub fn setBreakpointEx(
         std.heap.c_allocator.free(cond);
         return 0;
     };
+    _ = binding.breakpoint_count.fetchAdd(1, .seq_cst);
     binding.mutex.unlock();
     return id;
 }
 
 pub fn setBlackboxPatterns(instance_id: i32, patterns: []const []const u8) void {
     const binding = lookup(instance_id) orelse return;
+    replaceBlackboxPatterns(binding, patterns);
+}
+
+fn replaceBlackboxPatterns(binding: *Binding, patterns: []const []const u8) void {
     binding.mutex.lock();
     defer binding.mutex.unlock();
     for (binding.blackbox.items) |pat| std.heap.c_allocator.free(pat);
@@ -410,6 +481,8 @@ pub fn setBlackboxPatterns(instance_id: i32, patterns: []const []const u8) void 
             std.heap.c_allocator.free(copy);
         };
     }
+    binding.blackbox_revision +%= 1;
+    clearBlackboxCacheLocked(binding);
 }
 
 pub fn removeBreakpoint(instance_id: i32, id: u32) bool {
@@ -421,6 +494,7 @@ pub fn removeBreakpoint(instance_id: i32, id: u32) bool {
         std.heap.c_allocator.free(bp.url);
         if (bp.condition.len > 0) std.heap.c_allocator.free(bp.condition);
         _ = binding.breakpoints.swapRemove(i);
+        _ = binding.breakpoint_count.fetchSub(1, .seq_cst);
         return true;
     }
     return false;
@@ -859,6 +933,7 @@ fn continueWith(instance_id: i32, mode: StepMode) void {
     binding.skip_depth = binding.paused_depth;
     binding.skip_seen_same = false;
     binding.skip_saw_deeper = false;
+    refreshSteppingOrSkipPendingLocked(binding);
     binding.mutex.unlock();
     binding.pause.store(0, .seq_cst);
 }
@@ -879,6 +954,7 @@ fn finishStepOut(binding: *Binding, url: []const u8, line: i32, column: i32, dep
     binding.skip_saw_deeper = false;
     binding.mode = .step_over;
     binding.paused_depth = depth;
+    refreshSteppingOrSkipPendingLocked(binding);
     return true;
 }
 
@@ -896,6 +972,7 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth
             binding.skip_column = -1;
             binding.skip_url_len = 0;
             binding.skip_script_tag = 0;
+            refreshSteppingOrSkipPendingLocked(binding);
             return true;
         }
         if (!binding.skip_seen_same) {
@@ -906,6 +983,7 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth
         binding.skip_column = -1;
         binding.skip_url_len = 0;
         binding.skip_script_tag = 0;
+        refreshSteppingOrSkipPendingLocked(binding);
         return false;
     }
     if (depth > binding.skip_depth) {
@@ -916,6 +994,7 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth
     binding.skip_column = -1;
     binding.skip_url_len = 0;
     binding.skip_script_tag = 0;
+    refreshSteppingOrSkipPendingLocked(binding);
     return false;
 }
 
@@ -964,6 +1043,8 @@ fn armExecution(binding: *Binding) void {
     if (comptime backend.active_backend == .quickjs_ng) {
         qjs.JS_SetLocationHandler(@ptrCast(rt), @ptrCast(&locationTrampoline), binding);
         qjs.JS_SetExceptionHandler(@ptrCast(rt), @ptrCast(&exceptionTrampoline), binding);
+        qjs.jsbay_qjs_set_location_work_predicate(@ptrCast(rt), @ptrCast(&locationWorkPredicate));
+        qjs.jsbay_qjs_set_exception_work_predicate(@ptrCast(rt), @ptrCast(&exceptionWorkPredicate));
         qjs.JS_SetDebuggerHandler(@ptrCast(rt), @ptrCast(&debuggerTrampoline), binding);
     }
     binding.handler_install_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
@@ -977,6 +1058,8 @@ fn disarmExecution(binding: *Binding) void {
     const rt = binding.runtime orelse return;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
     if (comptime backend.active_backend == .quickjs_ng) {
+        qjs.jsbay_qjs_set_location_work_predicate(@ptrCast(rt), null);
+        qjs.jsbay_qjs_set_exception_work_predicate(@ptrCast(rt), null);
         qjs.JS_SetLocationHandler(@ptrCast(rt), null, null);
         qjs.JS_SetExceptionHandler(@ptrCast(rt), null, null);
         qjs.JS_SetDebuggerHandler(@ptrCast(rt), null, null);
@@ -1002,6 +1085,8 @@ fn destroyBinding(binding: *Binding) void {
     binding.breakpoints.deinit(std.heap.c_allocator);
     for (binding.blackbox.items) |pat| std.heap.c_allocator.free(pat);
     binding.blackbox.deinit(std.heap.c_allocator);
+    clearBlackboxCacheLocked(binding);
+    binding.blackbox_cache.deinit(std.heap.c_allocator);
     for (binding.scripts.items) |script| {
         freeScript(script);
     }
@@ -1070,6 +1155,76 @@ test "debugger: script info clone releases every partial allocation on OOM" {
     }.run, .{script});
 }
 
+test "debugger: blackbox cache invalidates and evicts without changing matches" {
+    const binding = try std.heap.c_allocator.create(Binding);
+    defer destroyBinding(binding);
+    binding.* = .{ .instance_id = -1, .runtime = null };
+
+    const first = [_][]const u8{"blocked\\.js"};
+    replaceBlackboxPatterns(binding, &first);
+    try std.testing.expect(isBlackboxed(binding, "blocked.js"));
+    try std.testing.expectEqual(@as(usize, 1), binding.blackbox_cache.items.len);
+    try std.testing.expect(isBlackboxed(binding, "blocked.js"));
+    try std.testing.expectEqual(@as(usize, 1), binding.blackbox_cache.items.len);
+
+    const second = [_][]const u8{"other\\.js"};
+    replaceBlackboxPatterns(binding, &second);
+    try std.testing.expect(!isBlackboxed(binding, "blocked.js"));
+    try std.testing.expect(isBlackboxed(binding, "other.js"));
+
+    var number: usize = 0;
+    while (number < blackbox_cache_capacity + 1) : (number += 1) {
+        var name: [32]u8 = undefined;
+        const url = try std.fmt.bufPrint(&name, "item-{d}.js", .{number});
+        try std.testing.expect(!isBlackboxed(binding, url));
+    }
+    try std.testing.expectEqual(blackbox_cache_capacity, binding.blackbox_cache.items.len);
+    try std.testing.expect(isBlackboxed(binding, "other.js"));
+}
+
+test "debugger: blackbox cache keeps no entries for empty patterns" {
+    const binding = try std.heap.c_allocator.create(Binding);
+    defer destroyBinding(binding);
+    binding.* = .{ .instance_id = -4, .runtime = null };
+
+    var number: usize = 0;
+    while (number < blackbox_cache_capacity + 1) : (number += 1) {
+        var name: [32]u8 = undefined;
+        const url = try std.fmt.bufPrint(&name, "empty-{d}.js", .{number});
+        try std.testing.expect(!isBlackboxed(binding, url));
+    }
+    try std.testing.expectEqual(@as(usize, 0), binding.blackbox_cache.items.len);
+}
+
+test "debugger: blackbox cache does not publish an obsolete revision" {
+    const binding = try std.heap.c_allocator.create(Binding);
+    defer destroyBinding(binding);
+    binding.* = .{ .instance_id = -2, .runtime = null };
+
+    const first = [_][]const u8{"old\\.js"};
+    replaceBlackboxPatterns(binding, &first);
+    binding.mutex.lock();
+    const old_revision = binding.blackbox_revision;
+    binding.mutex.unlock();
+
+    const second = [_][]const u8{"new\\.js"};
+    replaceBlackboxPatterns(binding, &second);
+    binding.mutex.lock();
+    defer binding.mutex.unlock();
+    try std.testing.expect(!publishBlackboxResultLocked(binding, "old.js", old_revision, true));
+    try std.testing.expectEqual(@as(usize, 0), binding.blackbox_cache.items.len);
+}
+
+test "debugger: blackbox cache snapshot releases partial OOM allocations" {
+    const patterns = [_][]const u8{ "first\\.js", "second\\.js", "third\\.js" };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, input: []const []const u8) !void {
+            var copies = try cloneBlackboxPatterns(allocator, input);
+            defer freeBlackboxPatternCopies(allocator, &copies);
+        }
+    }.run, .{patterns[0..]});
+}
+
 fn shouldPause(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) ?PauseReason {
     return breakpointHit(binding, url, line, column, depth, script_tag);
 }
@@ -1129,21 +1284,86 @@ fn urlPatternMatch(bp: Breakpoint, url: []const u8) bool {
 }
 
 fn isBlackboxed(binding: *Binding, url: []const u8) bool {
-    binding.mutex.lock();
+    while (true) {
+        binding.mutex.lock();
+        if (binding.blackbox.items.len == 0) {
+            binding.mutex.unlock();
+            return false;
+        }
+        if (lookupBlackboxCacheLocked(binding, url)) |matches| {
+            binding.mutex.unlock();
+            return matches;
+        }
+        const revision = binding.blackbox_revision;
+        var copies = cloneBlackboxPatterns(std.heap.c_allocator, binding.blackbox.items) catch {
+            const matches = matchesBlackboxPatterns(binding.blackbox.items, url);
+            binding.mutex.unlock();
+            return matches;
+        };
+        binding.mutex.unlock();
+
+        const matches = matchesBlackboxPatterns(copies.items, url);
+        binding.mutex.lock();
+        const published = publishBlackboxResultLocked(binding, url, revision, matches);
+        binding.mutex.unlock();
+        freeBlackboxPatternCopies(std.heap.c_allocator, &copies);
+        if (published) return matches;
+    }
+}
+
+fn cloneBlackboxPatterns(allocator: std.mem.Allocator, patterns: anytype) !std.ArrayList([]u8) {
     var copies: std.ArrayList([]u8) = .empty;
-    for (binding.blackbox.items) |pat| {
-        const copy = std.heap.c_allocator.dupe(u8, pat) catch continue;
-        copies.append(std.heap.c_allocator, copy) catch std.heap.c_allocator.free(copy);
+    errdefer freeBlackboxPatternCopies(allocator, &copies);
+    for (patterns) |pat| {
+        const copy = try allocator.dupe(u8, pat);
+        copies.append(allocator, copy) catch |err| {
+            allocator.free(copy);
+            return err;
+        };
     }
-    binding.mutex.unlock();
-    defer {
-        for (copies.items) |pat| std.heap.c_allocator.free(pat);
-        copies.deinit(std.heap.c_allocator);
-    }
-    for (copies.items) |pat| {
+    return copies;
+}
+
+fn freeBlackboxPatternCopies(allocator: std.mem.Allocator, copies: *std.ArrayList([]u8)) void {
+    for (copies.items) |pat| allocator.free(pat);
+    copies.deinit(allocator);
+}
+
+fn matchesBlackboxPatterns(patterns: []const []u8, url: []const u8) bool {
+    for (patterns) |pat| {
         if (regexSearch(pat, url)) return true;
     }
     return false;
+}
+
+fn lookupBlackboxCacheLocked(binding: *Binding, url: []const u8) ?bool {
+    for (binding.blackbox_cache.items) |entry| {
+        if (entry.revision == binding.blackbox_revision and std.mem.eql(u8, entry.url, url)) return entry.matches;
+    }
+    return null;
+}
+
+fn clearBlackboxCacheLocked(binding: *Binding) void {
+    for (binding.blackbox_cache.items) |entry| std.heap.c_allocator.free(entry.url);
+    binding.blackbox_cache.clearRetainingCapacity();
+}
+
+fn publishBlackboxResultLocked(binding: *Binding, url: []const u8, revision: u64, matches: bool) bool {
+    if (revision != binding.blackbox_revision) return false;
+    const copy = std.heap.c_allocator.dupe(u8, url) catch return true;
+    if (binding.blackbox_cache.items.len == blackbox_cache_capacity) {
+        const evicted = binding.blackbox_cache.orderedRemove(0);
+        std.heap.c_allocator.free(evicted.url);
+    }
+    binding.blackbox_cache.append(std.heap.c_allocator, .{
+        .url = copy,
+        .revision = binding.blackbox_revision,
+        .matches = matches,
+    }) catch {
+        std.heap.c_allocator.free(copy);
+        return true;
+    };
+    return true;
 }
 
 fn conditionPasses(binding: *Binding, expr: []const u8) bool {
@@ -1347,9 +1567,10 @@ fn locationTrampoline(
 ) callconv(.c) void {
     const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return));
     if (binding.skip_all_pauses.load(.seq_cst) != 0) return;
-    binding.exception_hold.store(0, .seq_cst);
     if (binding.suppress.load(.seq_cst) != 0) return;
+    binding.exception_hold.store(0, .seq_cst);
     if (binding.alive.load(.seq_cst) == 0) return;
+    if (!hasPendingLocationWork(binding)) return;
     const url = if (filename == null) "" else std.mem.span(filename);
     const hook_column: i32 = if (column > 0) column - 1 else 0;
     const explicit_pause = binding.break_requested.load(.seq_cst) != 0;
@@ -1425,6 +1646,7 @@ fn enterPause(
 ) void {
     binding.mutex.lock();
     binding.mode = .run;
+    refreshSteppingOrSkipPendingLocked(binding);
     binding.paused_depth = depth;
     binding.paused_reason = reason;
     binding.paused_script_tag = script_tag;

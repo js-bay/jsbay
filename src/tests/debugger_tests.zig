@@ -126,12 +126,14 @@ const EvalBox = struct {
     script: []const u8,
     filename: []const u8,
     status_ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     result: []const u8 = "",
 };
 
 fn evalOnThread(box: *EvalBox) void {
     const res = engine.evalScript(box.id, box.script, box.filename);
     box.status_ok.store(res.err == null, .seq_cst);
+    box.finished.store(true, .seq_cst);
     if (res.result) |text| {
         box.result = std.heap.c_allocator.dupe(u8, text) catch "";
     }
@@ -553,6 +555,40 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
         }.run);
     }
 
+    test "debugger: stepping after idle execution works on repeated function calls" {
+        if (comptime !backend.supportsDebugger(backend.active_backend)) return;
+        const id = helpers.nextInstanceId();
+        try helpers.withEngine(id, .{}, struct {
+            fn run(instance_id: i32) !void {
+                try attachDebuggerForTest(instance_id);
+                debugger_mod.setDebuggerStatements(instance_id, true);
+                var box = EvalBox{
+                    .id = instance_id,
+                    .script = "function repeated() { debugger;\n globalThis.repeatedCount = (globalThis.repeatedCount || 0) + 1;\n}\nrepeated(); repeated(); globalThis.repeatedCount;",
+                    .filename = "repeated-step.js",
+                };
+                const thread = try std.Thread.spawn(.{}, evalOnThread, .{&box});
+                var joined = false;
+                defer if (!joined) {
+                    debugger_mod.setSkipAllPauses(instance_id, true);
+                    debugger_mod.resumeExecution(instance_id);
+                    thread.join();
+                };
+                for (0..2) |_| {
+                    try testing.expect(waitPaused(instance_id));
+                    try testing.expectEqual(@as(i32, 1), debugger_mod.pausedLine(instance_id));
+                    debugger_mod.stepOver(instance_id);
+                    try testing.expect(waitPaused(instance_id));
+                    try testing.expectEqual(@as(i32, 2), debugger_mod.pausedLine(instance_id));
+                    debugger_mod.resumeExecution(instance_id);
+                }
+                thread.join();
+                joined = true;
+                try testing.expectEqualStrings("2", box.result);
+            }
+        }.run);
+    }
+
     test "debugger: step over stops on the next line" {
         if (comptime !backend.supportsDebugger(backend.active_backend)) return;
         const id = helpers.nextInstanceId();
@@ -798,6 +834,40 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
                 caught_thread.join();
                 caught_joined = true;
                 try testing.expect(caught_box.status_ok.load(.seq_cst));
+            }
+        }.run);
+    }
+
+    test "debugger: constructing Error does not pause as an exception" {
+        if (comptime !backend.supportsDebugger(backend.active_backend)) return;
+        const id = helpers.nextInstanceId();
+        try helpers.withEngine(id, .{}, struct {
+            fn run(instance_id: i32) !void {
+                try attachDebuggerForTest(instance_id);
+                debugger_mod.setExceptionPause(instance_id, .all);
+                var box = EvalBox{
+                    .id = instance_id,
+                    .script = "new Error('constructed only');",
+                    .filename = "constructed-error.js",
+                };
+                const thread = try std.Thread.spawn(.{}, evalOnThread, .{&box});
+                var joined = false;
+                defer if (!joined) {
+                    debugger_mod.resumeExecution(instance_id);
+                    thread.join();
+                };
+                var turns: u32 = 0;
+                while (turns < 100 and !box.finished.load(.seq_cst)) : (turns += 1) {
+                    if (debugger_mod.isPaused(instance_id)) {
+                        debugger_mod.resumeExecution(instance_id);
+                        return error.ConstructedErrorPaused;
+                    }
+                    io.sleepMs(1);
+                }
+                try testing.expect(box.finished.load(.seq_cst));
+                thread.join();
+                joined = true;
+                try testing.expect(box.status_ok.load(.seq_cst));
             }
         }.run);
     }

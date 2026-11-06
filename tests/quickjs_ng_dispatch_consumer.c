@@ -22,6 +22,10 @@ static int nested_calls;
 static int in_nested;
 static int expecting_cold_outer_frame;
 static uint64_t cold_probe;
+static unsigned quiet_location_calls;
+static unsigned exception_calls;
+static int location_work_enabled;
+static int exception_work_enabled;
 
 static void eval_nested(JSContext *ctx) {
     const char *source = "1 + 2";
@@ -46,6 +50,73 @@ static void location(JSContext *ctx, const char *filename, int line, int column,
         eval_nested(ctx);
         in_nested = 0;
     }
+}
+
+static void quiet_location(JSContext *ctx, const char *filename, int line, int column,
+                           int depth, uint64_t script_tag, void *opaque) {
+    (void)ctx;
+    (void)filename;
+    (void)line;
+    (void)column;
+    (void)depth;
+    (void)script_tag;
+    (void)opaque;
+    quiet_location_calls++;
+}
+
+static void on_exception(JSContext *ctx, int caught, void *opaque) {
+    (void)ctx;
+    (void)caught;
+    (void)opaque;
+    exception_calls++;
+}
+
+static int location_work(void *opaque) {
+    (void)opaque;
+    return location_work_enabled;
+}
+
+static int exception_work(void *opaque) {
+    (void)opaque;
+    return exception_work_enabled;
+}
+
+static void assert_idle_hooks_skip_expensive_dispatch(JSContext *ctx) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSValue result;
+
+    JS_SetLocationHandler(rt, quiet_location, NULL);
+    jsbay_qjs_set_location_work_predicate(rt, location_work);
+    location_work_enabled = 0;
+    result = JS_Eval(ctx, "var idle = 1; idle + 1", 22, "idle.js", JS_EVAL_TYPE_GLOBAL);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    assert(quiet_location_calls == 0);
+
+    JS_RequestLocationCallback(rt);
+    result = JS_Eval(ctx, "idle + 2", 8, "idle.js", JS_EVAL_TYPE_GLOBAL);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    assert(quiet_location_calls > 0);
+
+    JS_SetExceptionHandler(rt, on_exception, NULL);
+    jsbay_qjs_set_exception_work_predicate(rt, exception_work);
+    exception_work_enabled = 0;
+    result = JS_Eval(ctx, "try { throw 1; } catch (e) {}", 29, "idle.js", JS_EVAL_TYPE_GLOBAL);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    assert(exception_calls == 0);
+
+    exception_work_enabled = 1;
+    result = JS_Eval(ctx, "try { throw 2; } catch (e) {}", 29, "idle.js", JS_EVAL_TYPE_GLOBAL);
+    assert(!JS_IsException(result));
+    JS_FreeValue(ctx, result);
+    assert(exception_calls > 0);
+
+    JS_SetExceptionHandler(rt, NULL, NULL);
+    jsbay_qjs_set_exception_work_predicate(rt, NULL);
+    jsbay_qjs_set_location_work_predicate(rt, NULL);
+    JS_SetLocationHandler(rt, NULL, NULL);
 }
 
 static JSValue turn_on(JSContext *ctx, JSValueConst this_value, int argc, JSValueConst *argv) {
@@ -129,6 +200,7 @@ int main(void) {
     assert(expecting_cold_outer_frame);
     assert(JS_GetLocationDispatchProbe(rt) == cold_probe);
     assert_hot_invalid_opcode_uses_cold_error_path(ctx);
+    assert_idle_hooks_skip_expensive_dispatch(ctx);
     JS_FreeValue(ctx, result);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);

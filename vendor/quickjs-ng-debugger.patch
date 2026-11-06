@@ -676,7 +676,7 @@ index b5e5576..b5344d7 100644
  /* atom support */
  #define JS_ATOM_NULL 0
  
-@@ -1186,6 +1192,38 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
+@@ -1186,6 +1192,39 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
  /* return != 0 if the JS code needs to be interrupted */
  typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
  JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
@@ -693,6 +693,7 @@ index b5e5576..b5344d7 100644
 +/* caught != 0 when some live frame has an active try. The callback may block. */
 +typedef void JSExceptionHandler(JSContext *ctx, int caught, void *opaque);
 +JS_EXTERN void JS_SetExceptionHandler(JSRuntime *rt, JSExceptionHandler *cb, void *opaque);
++JS_EXTERN void jsbay_qjs_set_exception_work_predicate(JSRuntime *rt, jsbay_qjs_debugger_work_predicate_t *predicate);
 +
 +/* Called when a debugger statement runs. The callback may block. */
 +typedef void JSDebuggerHandler(JSContext *ctx, void *opaque);

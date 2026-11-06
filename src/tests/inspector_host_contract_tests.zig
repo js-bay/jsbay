@@ -24,6 +24,18 @@ test "public and console groups with the same name release independently" {
     try inspector.object_table.TestCases.publicAndConsoleGroupsWithSameNameReleaseIndependently();
 }
 
+test "closed console sessions reject late child objects" {
+    try inspector.state.TestCases.closedSessionRejectsLateConsoleChildren();
+}
+
+test "console replay lease failures close only the failed session" {
+    try inspector.state.TestCases.replayLeaseFailureClosesOnlyFailedSession();
+}
+
+test "closed console sessions remain isolated when close allocation fails" {
+    try inspector.object_table.TestCases.closedConsoleSessionRemainsIsolatedWhenCloseCannotAllocate();
+}
+
 test "Debugger.enable cannot reopen the gate after Inspector closing begins" {
     try inspector.debugger_cdp.TestCases.debuggerEnableCannotReopenGateAfterClosingBegins();
 }

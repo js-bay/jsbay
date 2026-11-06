@@ -266,6 +266,22 @@ typedef void (*jsbay_engine_event_handler_t)(const jsbay_engine_event_t *event, 
 /* Owner-thread registration. Pass NULL handler to clear. Returns false if missing/wrong thread. */
 bool jsbay_engine_set_event_handler(int instance_id, jsbay_engine_event_handler_t handler, void *user_data);
 
+typedef enum {
+    JSBAY_ERROR_ASYNC_UNCAUGHT = 0,
+    JSBAY_ERROR_UNHANDLED_REJECTION = 1,
+    JSBAY_ERROR_REJECTION_HANDLED = 2,
+} jsbay_error_kind_t;
+typedef struct {
+    uint32_t struct_size;
+    jsbay_error_kind_t kind;
+    int instance_id;
+    jsbay_value_t promise;
+    jsbay_value_t value;
+} jsbay_error_event_t;
+typedef void (*jsbay_error_observer_t)(const jsbay_error_event_t *event, void *user_data);
+/* Owner-thread registration. Pass NULL handler to clear. Event handles are borrowed until the callback returns; retain them for later use and release only owned copies. The callback must not execute JavaScript or destroy the engine. Backends without typed error observation return JSBAY_UNSUPPORTED. */
+jsbay_status_t jsbay_engine_set_error_observer(int instance_id, jsbay_error_observer_t handler, void *user_data);
+
 /* The synchronous owner-thread script execution entry point. source and filename are UTF-8 bytes. options may be NULL; otherwise struct_size must be sizeof(*options), and cache_dir/cache_version must both be empty or both non-empty. A cache failure evaluates source once. */
 jsbay_status_t jsbay_engine_evaluate(int instance_id, jsbay_utf8_t source,
                                        jsbay_utf8_t filename,

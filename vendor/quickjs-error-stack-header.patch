@@ -1,0 +1,103 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7642,9 +7642,56 @@
+ 
+ #define JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL (1 << 0)
+ 
++static void jsbay_append_error_stack_header(JSContext *ctx, DynBuf *dbuf,
++                                      JSValueConst error_obj)
++{
++    static const char * const native_error_names[JS_NATIVE_ERROR_COUNT] = {
++        "EvalError", "RangeError", "ReferenceError", "SyntaxError",
++        "TypeError", "URIError", "InternalError", "AggregateError",
++        "SuppressedError",
++    };
++    JSObject *error;
++    JSObject *proto;
++    JSProperty *pr;
++    JSShapeProperty *prs;
++    const char *name = "Error";
++    const char *message = NULL;
++    size_t message_len = 0;
++    int i;
++    int matched = 0;
++
++    if (!JS_IsObject(error_obj))
++        return;
++    error = JS_VALUE_GET_OBJ(error_obj);
++    proto = error->shape->proto;
++    while (proto && !matched) {
++        for (i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
++            if (proto == JS_VALUE_GET_OBJ(ctx->native_error_proto[i])) {
++                name = native_error_names[i];
++                matched = 1;
++                break;
++            }
++        }
++        proto = proto->shape->proto;
++    }
++    prs = find_own_property(&pr, error, JS_ATOM_message);
++    if (prs && (prs->flags & JS_PROP_TMASK) == JS_PROP_NORMAL &&
++        JS_IsString(pr->u.value)) {
++        message = JS_ToCStringLen(ctx, &message_len, pr->u.value);
++    }
++    if (message && message_len != 0) {
++        dbuf_printf(dbuf, "%s: ", name);
++        dbuf_put(dbuf, (const uint8_t *)message, message_len);
++        dbuf_putc(dbuf, '\n');
++    } else {
++        dbuf_printf(dbuf, "%s\n", name);
++    }
++    JS_FreeCString(ctx, message);
++}
++
+ /* if filename != NULL, an additional level is added with the filename
+    and line number information (used for parse error). */
+-static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
++static void jsbay_build_backtrace_body(JSContext *ctx, JSValueConst error_obj,
+                             const char *filename, int line_num, int col_num,
+                             int backtrace_flags)
+ {
+@@ -7659,6 +7706,7 @@
+         return; /* protection in the out of memory case */
+     
+     js_dbuf_init(ctx, &dbuf);
++    jsbay_append_error_stack_header(ctx, &dbuf, error_obj);
+     if (filename) {
+         dbuf_printf(&dbuf, "    at %s", filename);
+         if (line_num != -1)
+@@ -7719,10 +7767,21 @@
+     if (dbuf_error(&dbuf))
+         str = JS_NULL;
+     else
+-        str = JS_NewString(ctx, (char *)dbuf.buf);
++        str = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size - 1);
+     dbuf_free(&dbuf);
+     JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, str,
+                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
++}
++
++/* Stack formatting can allocate and replace the pending exception. */
++static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
++                            const char *filename, int line_num, int col_num,
++                            int backtrace_flags)
++{
++    JSValue retained = JS_DupValue(ctx, error_obj);
++    jsbay_build_backtrace_body(ctx, retained, filename, line_num, col_num,
++                              backtrace_flags);
++    JS_FreeValue(ctx, retained);
+ }
+ 
+ /* Note: it is important that no exception is returned by this function */
+--- a/tests/test_builtin.js
++++ b/tests/test_builtin.js
+@@ -549,7 +549,8 @@
+     level |= 0;
+     expected_pos = ":" + line_num + ":" + col_num;
+     tab = e.stack.split("\n");
+-    line = tab[level];
++    assert(tab[0], expected_error.name + ": " + e.message, "Error stack header");
++    line = tab[level + 1];
+     if (line.slice(-1) == ')')
+         line = line.slice(0, -1);
+     if (line.indexOf(expected_pos) < 0) {
