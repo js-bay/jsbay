@@ -63,6 +63,31 @@ leave that option off.
 
 The root test command includes independent package suites. Use the package directory to run one package alone. The `tests/` directory lists consumer, SDK, and command-driver entry points.
 
+## Native Promise and Node.js consumers
+
+The native Promise contract tests run inside the engine suite. Run the supported backends separately, and use an Apple host for JSC:
+
+```sh
+zig build test-engine -Dbackend=quickjs_ng -Dtest-filter='async promise:' --summary all
+zig build test-engine -Dbackend=quickjs -Dtest-filter='async promise:' --summary all
+zig build test-engine -Dbackend=jsc -Dtest-filter='async promise:' --summary all
+zig build test-engine -Dbackends=quickjs_ng,jsc -Dtest-filter='async boundary:' --summary all
+```
+
+The Promise tests exercise cross-thread completion, original rejection values, binary and JSON payloads, duplicate calls, admission failures and retry, generation cancellation, shutdown deadlines, reentrant destruction, and instance-ID reuse. The boundary tests verify invalid output pointers and `JSBAY_UNSUPPORTED` for non-primary packed instances. A single-backend build skips the packed-instance case; the dual-pack command exercises it. `tests/run-value-consumers.sh` also compiles and runs `tests/async_promise_consumer.c` against a real archive.
+
+Run the Node.js SDK consumers with a compatible host archive:
+
+```sh
+JSBAY_LIBRARY="$PWD/zig-out/node-core/lib/libjsbay.a" NODE_INCLUDE="$NODE_INCLUDE" TSC="$TSC" bash tests/node-sdk/run_native_consumer.sh
+```
+
+The helper builds both its fault-injection addon and the production CMake addon. It runs ordinary, lifecycle, Promise, and package consumers against both; fault and conversion-fault consumers run only against the former, and the production consumer checks that test hooks are absent.
+
+The [SDK build guide](../sdk/node/README.md) shows how to create the archive and set `NODE_INCLUDE`. Without `JSBAY_LIBRARY`, the helper builds QuickJS-NG itself. Without `TSC`, it runs the native consumers but does not check TypeScript declarations. The helper runs the basic consumer, an independently authored lifecycle and value-conversion consumer, and a fault-injection consumer. These cover actual timer callbacks, idle exit, garbage collection, Worker shutdown, late host completions, hostile thenables, failed callback registration, wrapper allocation, and guest-catchable host exceptions.
+
+The helper compiles `JSBAY_NODE_TESTING` to expose fault controls and native resource counts. Normal CMake builds omit those controls, so run the basic and independent consumers against production artifacts; the fault consumer requires the test build. An injected failure tests cleanup at a chosen boundary and is not evidence that every system-memory-exhaustion path was exercised. The Linux engine CI jobs configure Node.js and TypeScript consumer checks for both QuickJS backends. The macOS job runs Node SDK consumers for QuickJS-NG and JSC without the TypeScript check. Workflow configuration alone does not prove that a run passed.
+
 ## Test262 subset
 
 `tests/test262/run.sh` builds an isolated C-ABI host and runs the fixed subset in [`tests/test262/manifest.json`](../tests/test262/manifest.json). It is a regression suite, not a full Test262 conformance claim.

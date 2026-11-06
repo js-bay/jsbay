@@ -156,6 +156,10 @@ comptime {
     // bind_sync / syncTrampoline ride on spikeInstall — import on spike too.
     _ = @import("native_sync_tests.zig");
     if (!spike) {
+        _ = @import("async_promise_tests.zig");
+        _ = @import("async_api_boundary_tests.zig");
+        _ = @import("async_generation_failure_tests.zig");
+        _ = @import("async_budget_tests.zig");
         _ = @import("primjs_patch_semantics_tests.zig");
         _ = @import("async_bridge_tests.zig");
         _ = @import("resource_limit_tests.zig");

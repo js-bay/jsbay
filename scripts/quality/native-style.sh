@@ -83,7 +83,7 @@ if [ "$#" -gt 0 ]; then
     files=("$@")
 else
     cd "$ROOT"
-    find sdk/android/jsbay/src/main/cpp sdk/apple/Sources/JsBayObjC sdk/harmony/src/main/cpp \
+    find sdk/android/jsbay/src/main/cpp sdk/apple/Sources/JsBayObjC sdk/harmony/src/main/cpp sdk/node/src \
         tests/apple-sdk tests/harmony-sdk/node_napi \
         -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.h' -o -name '*.m' \) -print0 > "$WORK/files"
     while IFS= read -r -d '' source; do files+=("$source"); done < "$WORK/files"
