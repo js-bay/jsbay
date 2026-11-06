@@ -243,9 +243,10 @@
      rt->current_exception = obj;
 -    if (JSBAY_INSPECTOR && rt->exception_handler && !rt->in_exception_hook &&
 +#if JSBAY_INSPECTOR
-+    if (rt->exception_handler && !rt->in_exception_hook &&
++    if (rt->exception_handler && !rt->in_exception_hook && !rt->in_build_stack_trace &&
 +        (!rt->exception_work_predicate || rt->exception_work_predicate(rt->exception_opaque)) &&
-         !JS_IsUncatchableError(obj)) {
+-        !JS_IsUncatchableError(obj)) {
++        !JS_IsUncatchableError(obj) && !JS_IsUninitialized(obj)) {
          JSStackFrame *sf;
          int caught = 0;
 @@ -8498,6 +8582,7 @@

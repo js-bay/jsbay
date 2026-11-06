@@ -170,6 +170,8 @@ pub fn Module(comptime Host: type) type {
                 sendObjectNotFound(state, box.session_id, box.request_id);
                 return;
             };
+            const target_owned = ActiveEngine.dupValue(ctx, target);
+            defer ActiveEngine.freeValue(ctx, target_owned);
             const console_origin = state.object_table.isConsole(box.object_id);
 
             // Fetch Object.keys(target) via callFunction so both backends share OwnEnumerableStringProperties semantics.
@@ -518,6 +520,8 @@ pub fn Module(comptime Host: type) type {
                 sendObjectNotFound(state, box.session_id, box.request_id);
                 return;
             };
+            const target_owned = ActiveEngine.dupValue(ctx, target);
+            defer ActiveEngine.freeValue(ctx, target_owned);
             const console_origin = state.object_table.isConsole(box.object_id);
 
             const object_ctor = state.runtime_object_ctor orelse {

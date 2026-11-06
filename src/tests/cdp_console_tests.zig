@@ -540,12 +540,7 @@ test "cdp: console descendants remain session-owned through properties and callF
     const root_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\"}}", .{root_id});
     defer alloc.free(root_params);
 
-    const props_id = try session.conn.command("Runtime.getProperties", root_params);
-    const props_marker = try idMarker(alloc, props_id);
-    defer alloc.free(props_marker);
-    _ = dispatch.tickInstance(session.id);
-    try session.conn.expect(try session.conn.wait(props_marker, 40));
-    const props = responseForMarker(session.conn.got.items, props_marker) orelse return error.TestUnexpectedResult;
+    const props = try commandResponse(&session, "Runtime.getProperties", root_params);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, props, .{});
     defer parsed.deinit();
     const child_id = parsed.value.object.get("result").?.object.get("result").?.array.items[0].object.get("value").?.object.get("objectId").?.string;
@@ -554,36 +549,17 @@ test "cdp: console descendants remain session-owned through properties and callF
 
     const call_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\",\"functionDeclaration\":\"function() {{ return this; }}\"}}", .{root_id});
     defer alloc.free(call_params);
-    const call_id = try session.conn.command("Runtime.callFunctionOn", call_params);
-    const call_marker = try idMarker(alloc, call_id);
-    defer alloc.free(call_marker);
-    _ = dispatch.tickInstance(session.id);
-    try session.conn.expect(try session.conn.wait(call_marker, 40));
-    const call_reply = responseForMarker(session.conn.got.items, call_marker) orelse return error.TestUnexpectedResult;
+    const call_reply = try commandResponse(&session, "Runtime.callFunctionOn", call_params);
     var call_parsed = try std.json.parseFromSlice(std.json.Value, alloc, call_reply, .{});
     defer call_parsed.deinit();
     const call_id_value = call_parsed.value.object.get("result").?.object.get("result").?.object.get("objectId").?.string;
     const call_object_params = try std.fmt.allocPrint(alloc, "{{\"objectId\":\"{s}\"}}", .{call_id_value});
     defer alloc.free(call_object_params);
 
-    const clear_id = try session.conn.command("Runtime.discardConsoleEntries", "");
-    const clear_marker = try idMarker(alloc, clear_id);
-    defer alloc.free(clear_marker);
-    _ = dispatch.tickInstance(session.id);
-    try session.conn.expect(try session.conn.wait(clear_marker, 40));
-    const child_props_id = try session.conn.command("Runtime.getProperties", child_params);
-    const child_marker = try idMarker(alloc, child_props_id);
-    defer alloc.free(child_marker);
-    _ = dispatch.tickInstance(session.id);
-    try session.conn.expect(try session.conn.wait(child_marker, 40));
-    const child_reply = responseForMarker(session.conn.got.items, child_marker) orelse return error.TestUnexpectedResult;
+    _ = try commandResponse(&session, "Runtime.discardConsoleEntries", "");
+    const child_reply = try commandResponse(&session, "Runtime.getProperties", child_params);
     try testing.expect(std.mem.indexOf(u8, child_reply, "Could not find object with given id") != null);
-    const call_props_id = try session.conn.command("Runtime.getProperties", call_object_params);
-    const call_props_marker = try idMarker(alloc, call_props_id);
-    defer alloc.free(call_props_marker);
-    _ = dispatch.tickInstance(session.id);
-    try session.conn.expect(try session.conn.wait(call_props_marker, 40));
-    const call_props_reply = responseForMarker(session.conn.got.items, call_props_marker) orelse return error.TestUnexpectedResult;
+    const call_props_reply = try commandResponse(&session, "Runtime.getProperties", call_object_params);
     try testing.expect(std.mem.indexOf(u8, call_props_reply, "Could not find object with given id") != null);
 }
 

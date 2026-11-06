@@ -416,6 +416,14 @@ test "errors: formatted exception does not repeat a generated stack header" {
             const custom = engine.evalScript(id, "const error = new Error('custom-header-marker'); error.stack = 'custom stack'; throw error", "custom-stack.js");
             defer helpers.freeEvalResult(custom);
             try testing.expectEqualStrings("Error: custom-header-marker\ncustom stack", custom.err orelse return error.ExpectedException);
+            const custom_header = engine.evalScript(id, "(() => { const error = new Error('custom-native-header'); error.stack = 'TypeError: custom-native-header\\n    at custom'; throw error; })()", "custom-native-stack.js");
+            defer helpers.freeEvalResult(custom_header);
+            try testing.expectEqualStrings("Error: custom-native-header\nTypeError: custom-native-header\n    at custom", custom_header.err orelse return error.ExpectedException);
+            const renamed = engine.evalScript(id, "(() => { const error = new Error('renamed-header-marker'); error.name = 'RenamedError'; throw error; })()", "renamed-error.js");
+            defer helpers.freeEvalResult(renamed);
+            const renamed_text = renamed.err orelse return error.ExpectedException;
+            try testing.expectEqual(@as(usize, 1), std.mem.count(u8, renamed_text, "RenamedError: renamed-header-marker"));
+            try testing.expectEqual(@as(usize, 0), std.mem.count(u8, renamed_text, "\nError: renamed-header-marker"));
         }
     }.run);
 }

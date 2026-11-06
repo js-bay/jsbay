@@ -373,12 +373,16 @@ pub fn Module(comptime Host: type) type {
 
             // Resolve `this` binding — either the retained target, or globalThis.
             var this_val: ActiveEngine.Value = undefined;
+            var owned_this: ?ActiveEngine.Value = null;
+            defer if (owned_this) |value| ActiveEngine.freeValue(ctx, value);
             var console_origin = false;
             if (box.call_has_this) {
-                this_val = state.object_table.getForSession(box.session_id, box.call_this_id) orelse {
+                const stored = state.object_table.getForSession(box.session_id, box.call_this_id) orelse {
                     sendObjectNotFound(state, box.session_id, box.request_id);
                     return;
                 };
+                this_val = ActiveEngine.dupValue(ctx, stored);
+                owned_this = this_val;
                 console_origin = state.object_table.isConsole(box.call_this_id);
             } else {
                 this_val = global;

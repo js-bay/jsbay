@@ -193,10 +193,20 @@ fn locationWorkPredicate(opaque_ptr: ?*anyopaque) callconv(.c) c_int {
     const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return 0));
     if (binding.alive.load(.seq_cst) == 0) return 0;
     if (binding.skip_all_pauses.load(.seq_cst) != 0) return 0;
+    if (binding.suppress.load(.seq_cst) != 0) return 0;
     if (binding.exception_hold.load(.seq_cst) != 0) return 1;
     // Exception pauses depend on source transitions to suppress repeated throw notifications.
     if (binding.exception_mode.load(.seq_cst) != @backingInt(ExceptionPause.none)) return 1;
     return @intFromBool(hasPendingLocationWork(binding));
+}
+
+test "debugger: suppressed evaluation preserves the pending exception pause" {
+    var binding: Binding = .{ .instance_id = -1, .runtime = null };
+    binding.exception_hold.store(1, .seq_cst);
+    binding.suppress.store(1, .seq_cst);
+    try std.testing.expectEqual(@as(c_int, 0), locationWorkPredicate(&binding));
+    locationTrampoline(null, null, 1, 1, 0, 0, &binding);
+    try std.testing.expectEqual(@as(u8, 1), binding.exception_hold.load(.seq_cst));
 }
 
 fn exceptionWorkPredicate(opaque_ptr: ?*anyopaque) callconv(.c) c_int {
@@ -1557,8 +1567,8 @@ fn locationTrampoline(
 ) callconv(.c) void {
     const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return));
     if (binding.skip_all_pauses.load(.seq_cst) != 0) return;
-    binding.exception_hold.store(0, .seq_cst);
     if (binding.suppress.load(.seq_cst) != 0) return;
+    binding.exception_hold.store(0, .seq_cst);
     if (binding.alive.load(.seq_cst) == 0) return;
     if (!hasPendingLocationWork(binding)) return;
     const url = if (filename == null) "" else std.mem.span(filename);

@@ -14,6 +14,25 @@ fn appendCStringLen(ctx: ?*qjs.JSContext, buf: *std.ArrayList(u8), val: qjs.JSVa
     return true;
 }
 
+fn matchingStackHeaderLength(stack: []const u8, description: []const u8) ?usize {
+    if (std.mem.startsWith(u8, stack, description) and (stack.len == description.len or stack[description.len] == '\n' or stack[description.len] == '\r')) return description.len;
+    const newline = std.mem.indexOfScalar(u8, stack, '\n') orelse return null;
+    if (!std.mem.startsWith(u8, stack[newline + 1 ..], "    at ")) return null;
+    const header = std.mem.trimEnd(u8, stack[0..newline], "\r");
+    const header_name_end = std.mem.indexOfScalar(u8, header, ':') orelse header.len;
+    const description_name_end = std.mem.indexOfScalar(u8, description, ':') orelse description.len;
+    const native_names = .{ "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "InternalError", "AggregateError", "SuppressedError" };
+    inline for (native_names) |name| {
+        if (std.mem.eql(u8, description[0..description_name_end], name)) return null;
+    }
+    if (!std.mem.eql(u8, header[header_name_end..], description[description_name_end..])) return null;
+    // Generated stacks capture the native name before application code can rename the error.
+    inline for (native_names) |name| {
+        if (std.mem.eql(u8, header[0..header_name_end], name)) return newline;
+    }
+    return null;
+}
+
 pub fn getAndFormatException(ctx: ?*qjs.JSContext) ?[]const u8 {
     const exc = qjs.JS_GetException(ctx);
     defer c.jsbay_qjs_JS_FreeValue(ctx, exc);
@@ -35,10 +54,8 @@ pub fn formatExceptionValue(ctx: ?*qjs.JSContext, exc: qjs.JSValue) ?[]const u8 
         var stack_text: std.ArrayList(u8) = .empty;
         defer stack_text.deinit(std.heap.c_allocator);
         if (appendCStringLen(ctx, &stack_text, stack)) {
-            const has_header = buf.items.len > 0 and std.mem.startsWith(u8, stack_text.items, buf.items) and
-                (stack_text.items.len == buf.items.len or stack_text.items[buf.items.len] == '\n' or stack_text.items[buf.items.len] == '\r');
-            if (has_header) {
-                buf.appendSlice(std.heap.c_allocator, stack_text.items[buf.items.len..]) catch {};
+            if (matchingStackHeaderLength(stack_text.items, buf.items)) |header_length| {
+                buf.appendSlice(std.heap.c_allocator, stack_text.items[header_length..]) catch {};
             } else {
                 buf.append(std.heap.c_allocator, '\n') catch {};
                 buf.appendSlice(std.heap.c_allocator, stack_text.items) catch {};
