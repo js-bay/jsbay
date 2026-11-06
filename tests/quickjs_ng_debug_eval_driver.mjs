@@ -95,14 +95,15 @@ async function cdp(port) {
       for (const waiter of pauseWaiters.splice(0)) waiter();
       return;
     }
+    if (!Number.isSafeInteger(message.id) || message.id <= 0) return;
     const waiter = pending.get(message.id);
-    if (waiter) { pending.delete(message.id); waiter(message); }
+    if (waiter) { pending.delete(message.id); waiter.resolve(message); }
   };
   const command = (method, params = {}) => new Promise((resolve, reject) => {
     const id = ++sequence;
     const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${method} timed out`)); }, 10000);
     timer.unref();
-    pending.set(id, message => { clearTimeout(timer); if (message.error) reject(new Error(`${method}: ${message.error.message}`)); else resolve(message.result); });
+    pending.set(id, { resolve: message => { clearTimeout(timer); if (message.error) reject(new Error(`${method}: ${message.error.message}`)); else resolve(message.result); } });
     socket.send(JSON.stringify({ id, method, params }));
   });
   const paused = async () => {
