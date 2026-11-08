@@ -2,5 +2,6 @@ module JsBay {
     header "jsbay.h"
     header "jsbay_bytecode.h"
     header "jsbay_sync.h"
+    header "jsbay_async.h"
     export *
 }

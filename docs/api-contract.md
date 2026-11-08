@@ -1,6 +1,6 @@
 # Public API contract
 
-This document defines the shared behavior of `include/jsbay.h` and the Android, Apple, .NET, and Harmony bindings. Function declarations are authoritative for names and fields; this document defines ownership, thread affinity, errors, and backend-independent meaning.
+This document defines the shared behavior of the public C headers and the Android, Apple, .NET, Harmony, and Node.js bindings. Function declarations are authoritative for names and fields; this document defines ownership, thread affinity, errors, and backend-independent meaning.
 
 ## Instances and threads
 
@@ -40,7 +40,9 @@ Callback `this` and argument values are borrowed for the duration of the callbac
 
 For C callbacks, `JSBAY_OK` requires an owned result and no exception; `JSBAY_EXCEPTION` requires an owned exception and no result; other statuses require both outputs to be zero. Return JavaScript `undefined` through an explicit value handle, not zero. Invalid output combinations do not transfer ownership: the engine must not guess which handles it can release.
 
-SDK callbacks add a scope around this C contract. Borrowed argument wrappers expire at callback exit. Newly created owned values are also closed at scope exit unless explicitly retained for use outside the callback. The SDK retains a separate reference when transferring a return value or exception to the engine, so returning an argument is supported. Keeping a wrapper in an application variable does not extend its lifetime; retain it explicitly to escape the scope.
+Handle-based SDK callbacks add a scope around this C contract. Borrowed argument wrappers expire at callback exit. Newly created owned values are also closed at scope exit unless explicitly retained for use outside the callback. The SDK retains a separate reference when transferring a return value or exception to the engine, so returning an argument is supported. Keeping a wrapper in an application variable does not extend its lifetime; retain it explicitly to escape the scope.
+
+The Node.js SDK copies supported values between Node.js and the engine. Its JavaScript callers do not own C handles and do not call retain or release. Copies preserve supported property values and binary bytes, but not object identity across runtimes. Its [SDK guide](../sdk/node/README.md) defines supported types, accessor handling, Promise behavior, and closure of pending evaluations.
 
 A successful native binding transfers its `user_data` to the engine until actual instance teardown, after active JavaScript and native callbacks have unwound. Rebinding the same name or collecting the JavaScript function does not run its finalizer early. The finalizer runs once on the owner thread; a failed bind does not transfer ownership or call it. Finalizers may release host resources but must not call engine or value APIs. Destroy the engine while the language runtime owning those resources is still alive.
 
@@ -83,6 +85,29 @@ Persistent bytecode cache is optional and only active when both cache directory 
 Execution and memory limits are controls, not a process sandbox. Per-instance native admission budgets are set with `jsbay_engine_create_with_limits` / `jsbay_engine_set_resource_limits` and inspected with `jsbay_engine_get_resource_usage` and `jsbay_resource_global_usage`; process-wide caps remain shared and nonblocking within an admission class, with a 25% foreground headroom. See [runtime-limits.md](runtime-limits.md), [host-isolation.md](host-isolation.md), and [backend selection](embedding.md#backend-selection).
 
 Owner-thread observability: `jsbay_engine_get_memory_usage`, `jsbay_engine_run_gc`, and `jsbay_engine_set_event_handler` (telemetry kinds for log / interrupt / memory limit / loop failed). The create-time `jsbay_log_handler_t` remains the console sink. Event handlers must not call engine or value APIs.
+
+## Native Promise extension
+
+`include/jsbay_async.h` exposes native Promise creation and settlement. Call `jsbay_promise_create` on the owner thread to obtain an owned Promise value and an opaque request ID. All three output pointers are required. Releasing the public Promise handle does not cancel the request; the engine retains the resolving functions until settlement or destruction. A request reserves one pending-call slot. Primary backend instances use their native Promise implementation; non-primary instances in a packed library return `JSBAY_UNSUPPORTED`.
+
+| Function | Calling thread | Result ownership |
+| --- | --- | --- |
+| `jsbay_promise_create` | Engine owner | Caller owns the Promise handle; request ID is a data-only token |
+| `jsbay_promise_settle` | Engine owner | Settlement value is borrowed and remains caller-owned |
+| `jsbay_async_complete` | Any thread | Copies result bytes; success admits one owner-thread task |
+| `jsbay_async_cancel` | Any thread | Admits one owner-thread rejection task |
+
+`jsbay_promise_settle` runs on the owner thread and borrows a value from the same instance. It resolves for `JSBAY_OK` and rejects for `JSBAY_EXCEPTION`, retaining the original JavaScript value and normal Promise adoption behavior. The caller still owns its value handle. A value from another instance is invalid and does not consume the request.
+
+`jsbay_async_complete` and `jsbay_async_cancel` may run on any thread. Completion reserves a native-task slot and payload bytes before copying data, then queues settlement to the captured engine generation. A successful return means the task was accepted, not that JavaScript has observed its result. Hosts must attach a platform loop or run the engine's owner loop to deliver it. Failed admission leaves the request available for retry. Once a completion or cancellation is accepted, later attempts return `JSBAY_STALE_VALUE`. Destruction and terminal generation cancellation may discard accepted tasks without entering JavaScript; old request IDs cannot deliver results to a replacement instance.
+
+While another completion is still acquiring admission, competing calls return retryable `JSBAY_OUT_OF_MEMORY`, as with other unavailable admission resources. They return `JSBAY_STALE_VALUE` only after acceptance or terminal cancellation. A value from another instance is rejected before claiming the request. Result construction can fail after queue acceptance; each request retains an Error at creation so that failure can reject without allocating a replacement reason. Owned exceptions from failed result or cancellation construction are released on the owner thread.
+
+String completion requires UTF-8 and resolves to a string. Byte completion resolves to an ArrayBuffer and accepts arbitrary bytes. For rejection, either kind requires UTF-8 and creates an Error with that message. JSON explicitly parses a UTF-8 payload for either outcome, preserving arbitrary rejection values; malformed JSON rejects with the parse error. Undefined requires an empty payload and is valid only for successful completion. Cancellation queues rejection with an Error and follows the same admission and duplicate rules. It does not stop external host work; the host remains responsible for its own operation's cancellation and resources.
+
+Terminal generation cancellation prevents JavaScript delivery but does not run JavaScript-value cleanup on the cancelling thread. Requests with no queued delivery retain their bounded pending-call reservations until engine destruction. The host must destroy a cancelled engine to finish releasing its retained requests and other engine resources.
+
+For a runnable C example and payload selection, see [native asynchronous calls](native-async.md). These C functions are available to embedders; the existing Android, Apple, .NET, and Harmony wrappers do not gain new language-level methods merely by including the header. The Node.js SDK exposes asynchronous host calls through `bindAsync`.
 
 ## Synchronous native extension
 

@@ -155,7 +155,7 @@ fn checkCAbi(args: []const []const u8) !u8 {
     // named `cc` ahead on PATH, which breaks these host syntax-only probes.
     const cc: []const u8 = if (builtin.os.tag == .windows) "cc" else "/usr/bin/cc";
     const cxx: []const u8 = if (builtin.os.tag == .windows) "c++" else "/usr/bin/c++";
-    const consumers = [_][]const u8{ "tests/c_consumer.c", "tests/bytecode_consumer.c", "tests/native_sync_consumer.c", "tests/host_wake_consumer.c" };
+    const consumers = [_][]const u8{ "tests/c_consumer.c", "tests/bytecode_consumer.c", "tests/native_sync_consumer.c", "tests/async_promise_consumer.c", "tests/host_wake_consumer.c" };
     for (consumers) |consumer| {
         try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
         try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
@@ -243,7 +243,7 @@ fn writeAndroidExportsMap(args: []const []const u8) !u8 {
 }
 
 pub fn headerSymbols(allocator: std.mem.Allocator) !std.StringHashMap(void) {
-    const names = [_][]const u8{ "jsbay.h", "jsbay_bytecode.h", "jsbay_sync.h" };
+    const names = [_][]const u8{ "jsbay.h", "jsbay_bytecode.h", "jsbay_sync.h", "jsbay_async.h" };
     var result = std.StringHashMap(void).init(allocator);
     errdefer result.deinit();
     var threaded = std.Io.Threaded.init(allocator, .{});
