@@ -48,6 +48,7 @@
         "vendor/quickjs-ng-inspector-off.patch",
         "vendor/quickjs-ng-location-precision.patch",
         "vendor/quickjs-ng-error-stack-header.patch",
+        "vendor/quickjs-ng-debug-eval-cache.patch",
         "vendor/quickjs-script-tags.patch",
     },
 }

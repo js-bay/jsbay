@@ -25,6 +25,10 @@ Each measured runner evaluates code, calls a host callback, converts JSON text, 
 
 For engine-internal investigation, use `zig build bench -Dbackend=quickjs_ng -Doptimize=ReleaseFast`. It does not include C ABI or SDK conversion costs. To compare inspector build configurations, use `bash bench/measure-diagnostics.sh OUTPUT_DIRECTORY quickjs_ng`; it preserves commands, artifacts, and exit codes in `OUTPUT_DIRECTORY`.
 
+To measure debugger execution states with the QuickJS-NG backend, use `bash bench/measure-debugger.sh NEW_OUTPUT_DIRECTORY quickjs_ng` on a POSIX host with Node.js 24 or newer, Zig, and a C compiler. The output directory must not exist. The contract test also requires `jq`. The command takes five samples per state, starts the same inspector listener, and compiles the same script for every state. `cold` has no CDP client, `enabled` sends `Debugger.enable`, `unmatched` installs one resolved but unexecuted breakpoint, and `conditional` installs an executed breakpoint whose condition increments a global counter then returns `false`. `report.json` contains raw samples, medians, source and artifact fingerprints, compiler metadata, and condition-hit evidence; command logs are stored in `work/*.log`. It measures a precompiled function call on the engine owner thread; it does not time `Runtime.evaluate`.
+
+Inspector and CDP runtime state are independent from Zig optimization mode. ReleaseFast builds support breakpoints. Zig `std.debug.assert` can provide optimization assumptions in unsafe modes; it is separate from C `NDEBUG` behavior.
+
 Compare records produced on the same host with the same backend, optimization mode, runner, and payload. Time for a full operation cannot identify the cost of one internal step. Profile first, then validate a change through the same public operation.
 
 ## Bytecode cache policy
