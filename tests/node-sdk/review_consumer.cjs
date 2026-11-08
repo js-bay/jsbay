@@ -231,6 +231,23 @@ function constructorFailure() {
   }
 }
 
+async function conversionClosesEngine() {
+  for (const rejected of [false, true]) {
+    for (const nested of [false, true]) {
+      const engine = Engine.create()
+      let calls = 0
+      try {
+        engine.bind('closeIt', () => { calls++; engine.close() })
+        const value = "new Proxy({}, { ownKeys() { closeIt(); return []; } })"
+        const result = nested ? `{ value: ${value} }` : value
+        const source = rejected ? `Promise.reject(${result})` : `Promise.resolve(${result})`
+        await assert.rejects(withTimeout(engine.evaluateAsync(source), 'close during result conversion'), /JsBay engine closed/)
+        assert.equal(calls, 1, 'result conversion must reach the host close callback')
+      } finally { engine.close() }
+    }
+  }
+}
+
 function workerFinalizer() {
   return new Promise((resolve, reject) => {
     const worker = new Worker(`
@@ -306,6 +323,7 @@ async function main() {
   const selected = process.argv[2]
   const tests = { 'timer-microtask': timerMicrotask, 'nested-thenable': nestedThenable, 'guest-then-getter': guestThenGetter, 'explicit-undefined': explicitUndefined, 'error-properties': errorProperties, 'cleanup-pending': cleanupPending, 'sparse-array': () => childCase('sparse-array-child'), 'sparse-array-child': sparseArray, 'completion-reasons': completionReasons, 'shared-handler-error': sharedHandlerError, 'timer-close-observer': () => childCase('timer-close-observer-child'), 'timer-close-observer-child': timerCloseObserver, 'synchronous-throw-completions': synchronousThrowCompletions, 'conversion-rejects': () => childCase('conversion-rejects-child'), 'conversion-rejects-child': conversionRejects, 'conversion-observer-rejects': () => childCase('conversion-observer-rejects-child'), 'conversion-observer-rejects-child': conversionObserverRejects, 'sync-host-throw': syncHostThrow, 'argument-budget': () => childCase('argument-budget-child'), 'argument-budget-child': argumentBudget, 'call-host-failure': callHostFailure, 'constructor-failure': constructorFailure, 'worker-finalizer': workerFinalizer, 'worker-pending-natural-exit': workerPendingNaturalExit, 'pending-engine-gc': () => childCase('pending-engine-gc-child'), 'pending-engine-gc-child': pendingEngineGc }
   if (!selected) throw new Error('select one review case')
+  tests['conversion-closes-engine'] = conversionClosesEngine
   assert.ok(tests[selected], `unknown review case: ${selected}`)
   await tests[selected]()
   console.log(`node SDK review case passed: ${selected}`)

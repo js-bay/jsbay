@@ -1309,6 +1309,16 @@ static jsbay_status_t observe(Engine *engine, bool rejected, size_t argc, const 
                                   *exception);
         rejected = true;
     }
+    if (engine->closed) {
+        napi_value message = nullptr, error = nullptr;
+        if (napi_create_string_utf8(engine->env, "JsBay engine closed", NAPI_AUTO_LENGTH,
+                                    &message) == napi_ok &&
+            napi_create_error(engine->env, nullptr, message, &error) == napi_ok)
+            value = error;
+        else
+            value = conversionFailure(engine, JSBAY_INVALID_ARGUMENT, 0);
+        rejected = true;
+    }
     if (rejected)
         napi_reject_deferred(engine->env, deferred, value);
     else

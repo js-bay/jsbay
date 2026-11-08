@@ -233,8 +233,7 @@ fn unclaim(request: *Request) void {
 
 const TakeResult = enum { missing, active, cancelled };
 
-/// Remove one queued request while atomically observing terminal cancellation.
-/// JS must only run after this returns and the mutex has been released.
+/// Remove one queued request while atomically observing terminal cancellation. JS must only run after this returns and the mutex has been released.
 fn take(request: *Request) TakeResult {
     mutex.lock();
     defer mutex.unlock();

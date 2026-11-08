@@ -36,7 +36,7 @@ mv -f "$temporary_addon" "$addon"
 JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
 JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
 JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/fault_consumer.cjs"
-for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
+for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
   JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
 done
 for review_case in cleanup-pending completion-reasons shared-handler-error synchronous-throw-completions call-host-failure; do
@@ -73,7 +73,7 @@ cmake_addon="$cmake_output/jsbay_node.node"
 test -s "$cmake_addon"
 JSBAY_NODE_ADDON="$cmake_addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
 JSBAY_NODE_ADDON="$cmake_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
-for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
+for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
   JSBAY_NODE_ADDON="$cmake_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
 done
 JSBAY_NODE_ADDON="$cmake_addon" JSBAY_NODE_PACKAGE_ROOT="$package_root/package.mjs" "$node_bin" "$root/tests/node-sdk/package_consumer.mjs"
