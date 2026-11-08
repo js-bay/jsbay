@@ -106,10 +106,11 @@ async function main() {
     try {
       let reads = 0
       for (const field of ['message', 'name', 'stack']) {
+        engine.bind('errorField', () => field)
         engine.bind('value', () => { const error = new Error('value'); Object.defineProperty(error, field, { get() { reads++; return 'getter' } }); return error })
         assert.throws(() => engine.evaluate('value()'))
         assert.equal(reads, 0, `Error ${field} accessor must not execute while copying`)
-        assert.throws(() => engine.evaluate(`(()=>{ const error = new Error('value'); Object.defineProperty(error, ${JSON.stringify(field)}, { get() { globalThis.guestGetterCalls++; return 'getter' } }); return error })()`))
+        assert.throws(() => engine.evaluate("(()=>{ const error = new Error('value'); Object.defineProperty(error, errorField(), { get() { globalThis.guestGetterCalls++; return 'getter' } }); return error })()"))
         assert.equal(engine.evaluate('globalThis.guestGetterCalls || 0'), 0)
       }
       assert.equal(engine.evaluate('42'), 42)
