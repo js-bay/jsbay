@@ -34,8 +34,7 @@ fn installPromise(id: i32, promise: u64, name: []const u8) !void {
 }
 
 fn advance(id: i32) void {
-    // Completion is deliberately queued. A host without an attached loop drives the
-    // next owner turn explicitly; do not make background completion run JavaScript.
+    // Completion is deliberately queued. A host without an attached loop drives the next owner turn explicitly; do not make background completion run JavaScript.
     _ = c_api.test_only.advance(id, 0);
 }
 
