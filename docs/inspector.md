@@ -24,24 +24,24 @@ JS Bay implements a subset of CDP for an embedded JavaScript engine. It has no D
 - Runtime evaluation, function calls, console events, and object inspection support limited parameters. CDP object handles retain engine values until released or the session closes; property behavior differs by backend.
 - QuickJS and QuickJS-NG can wait for Promises while the host keeps driving its event loop. Closing Inspector cancels its waits, not application Promises. JSC does not advertise this capability.
 - Exception events cover observable evaluation and asynchronous boundaries, not a complete engine-wide trace. Locations and stacks can be incomplete.
-- QuickJS-NG advertises a partial execution CDP `Debugger` domain. Classic QuickJS advertises only `Debugger.enable`, `Debugger.disable`, `Debugger.getScriptSource`, and `Debugger.setAsyncCallStackDepth`, with `Debugger.scriptParsed`; it does not advertise breakpoints, pause control, stepping, or paused-frame evaluation. JSC uses Safari Web Inspector, not CDP Debugger. See [Backend domain matrix](#backend-domain-matrix). Raw bytecode without source identity cannot provide reliable attribution.
-- QuickJS-family CPU profiles are interrupt samples from a bounded window. Heap snapshots are a custom bounded graph—see [HeapProfiler](#heapprofiler-not-chrome-memory) below; do not treat them as Chrome Memory.
+- Non-JSC backends expose CDP execution debugging through native location hooks or a native protocol agent. JSC uses Safari Web Inspector. See [Backend domain matrix](#backend-domain-matrix) for the supported domains. Raw bytecode without source identity cannot provide reliable attribution.
+- QuickJS-family CPU profiles are interrupt samples from a bounded window. Heap snapshots are a custom bounded graph—see [HeapProfiler](#quickjs-family-heapprofiler) below; do not treat them as Chrome Memory.
 - `Performance.getMetrics` is pull-only. `Timestamp` is monotonic seconds and QuickJS-family heap accounting is not process RSS. After `Performance.enable`, builds with supported thread CPU accounting also report `JSBayExecutionCPUTime`, which measures JavaScript execution attributed to that engine instance; do not treat it as process CPU time. Configuration changes are acknowledged after an ordinary owner turn applies them, so changes requested during a debugger pause wait for execution to resume. Session closure stops measurement at the next owner execution boundary.
 
 Queues and retained diagnostic state are bounded. Slow or disconnected clients can lose queued events. A successful transport send only means the transport accepted a message. These limits protect the owner thread; they do not bound arbitrary host callbacks.
 
-## HeapProfiler (not Chrome Memory)
+## QuickJS-family HeapProfiler
 
 **Hosts must not treat HeapProfiler output as a complete Chrome DevTools Memory / `.heapsnapshot`.**
 
-The advertised surface is:
+QuickJS-family builds advertise:
 
 - commands `HeapProfiler.collectGarbage` and `HeapProfiler.takeHeapSnapshot`
 - events `HeapProfiler.addHeapSnapshotChunk` and, when `reportProgress` is true, `HeapProfiler.reportHeapSnapshotProgress`
 
 `HeapProfiler.collectGarbage` requests an owner-thread collection pass and returns an empty result. `HeapProfiler.takeHeapSnapshot` returns a custom `jsbaySnapshot` object. The same metadata is embedded in the raw snapshot as `snapshot.jsbaySnapshot`; clients that persist chunks should retain it with the raw graph. Before assuming completeness, read at least `complete`, `truncated`, `retainedSizeSupported`, and `omittedNodes` (related fields such as `omittedEdgeLabels`, `edgeCoverage`, and `propertyNamePrecision` further describe what was dropped). Retained-size measurement is not supported. Chunks carry a bounded partial reference graph, not a full heap dump.
 
-Not implemented (expect method-not-found / not advertised):
+Not implemented on QuickJS-family builds (expect method-not-found / not advertised):
 
 - `HeapProfiler.getObjectByHeapObjectId`
 - heap sampling (`startSampling`, `stopSampling`, `getSamplingProfile`, and related commands)
@@ -52,14 +52,32 @@ Building with `-Dheap-snapshot=false` keeps the public symbols but `takeHeapSnap
 
 Authority for what a running build advertises is `Schema.getDomains` and the support manifest [`libs/inspector/src/protocol-support.json`](../libs/inspector/src/protocol-support.json). Advertised commands can still support only a subset of optional parameters.
 
-| Area | `quickjs` | `quickjs_ng` | `jsc` | `escargot` / `hermes` (spike) |
-| --- | --- | --- | --- | --- |
-| CDP `Debugger` | Non-execution subset (enable/disable/source retrieval/async stack; no breakpoints or pauses) | Partial execution support (enable/pause/breakpoints/step family in the manifest) | Not CDP Debugger; use [Safari Web Inspector](#safari-web-inspector) | Not advertised (inspector out of spike scope) |
-| CDP `Runtime` / `Profiler` / `Performance` | Partial | Partial | Partial Runtime + Performance; no Profiler and no heap snapshots | `Runtime` + `Performance` + `Schema` only |
-| CDP `HeapProfiler` | `collectGarbage`, bounded `takeHeapSnapshot`, chunk and optional progress events | Same | `collectGarbage` only | Not advertised |
-| Safari Web Inspector | No | No | Supported JSC builds only | No |
+| Area | `quickjs` | `quickjs_ng` | `jsc` | `escargot` | `hermes` |
+| --- | --- | --- | --- | --- | --- |
+| CDP `Debugger` | Partial execution support: source breakpoints, pause/resume, stepping, and frame evaluation | Same | Use [Safari Web Inspector](#safari-web-inspector) | Native location hooks; frame evaluation and stepping | Native CDP agent; frame evaluation and stepping |
+| CDP `Runtime` / `Profiler` / `Performance` | Partial | Partial | Runtime + Performance | Runtime + Performance | Native Runtime + Profiler; shared Performance |
+| CDP `HeapProfiler` | Collection and bounded snapshots | Collection and bounded snapshots | Collection | Collection | Native heap commands in the manifest |
+| Safari Web Inspector | No | No | Supported JSC builds only | No | No |
 
-Production hosts that fix `-Dbackend=quickjs` can retrieve source identity through the limited CDP Debugger subset, but source breakpoints and `debugger;` pause over CDP require `quickjs_ng`. Prefer `quickjs_ng` when execution debugging is required, or use the Safari path on JSC. Escargot/Hermes spike builds keep a minimal Schema surface and do not claim CDP Debugger or HeapProfiler readiness.
+`/json/protocol` and `Schema.getDomains` describe each backend's exact advertised surface. Escargot provides line breakpoints and top-frame evaluation; it does not advertise exception-pause or async-stack configuration. Hermes owns its Runtime and Debugger object handles, so frame evaluation and property inspection use the same native session. Hermes heap sampling and snapshots use its native agent rather than the QuickJS-family graph format. Backend availability and SDK packaging remain platform-specific.
+
+QuickJS-family engines and Escargot step by executable source line. Within one frame, step over and step into skip remaining locations on the same line; step into still enters called functions. Explicit breakpoints and debugger statements override stepping, and Debugger.pause can interrupt a line-granular step loop. Step out stops at the first shallower native JavaScript location, including a caller's return expression. This may pause on the call line before an assignment completes, whereas V8 may advance to the next statement. A call's before/after locations can have identical coordinates; variable values and callee effects distinguish them. Async resumption does not synthesize caller frames. Step out from a native callback finishes the native call before stopping at its first shallower JavaScript location.
+
+QuickJS-family engines do not decode source locations while no breakpoint or stepping work is active. If the first breakpoint is added while a call is already running, returning from that call can pause once at the caller's call location even though execution has already entered the callee.
+
+QuickJS-family paused-frame evaluation uses snapshots of local and closure bindings. Assignments to these bindings do not update the suspended frame, and `arguments` belongs to the evaluation function. If the program deletes the global `eval` binding or replaces it with an accessor, paused evaluation can fail or invoke that accessor while resolving the helper call.
+
+Hermes journals source entries by native script id while debugging is enabled. Each entry is limited to 64 KiB, and the journal retains at most 128 entries and 4 MiB of source. `Debugger.getScriptSource` returns an explicit error for entries that exceed these bounds, unavailable bytecode sources, and dynamic scripts without an unambiguous source entry. Recompiling the same URL preserves each retained script id's own source.
+
+Run `zig build test-cdp -Dbackend=<backend>` to exercise discovery, a source breakpoint, paused-frame evaluation, stepping, resume, and reconnect against a real Inspector process. Escargot and Hermes builds also require their native install prefixes and C++ dependencies. JSC source debugging follows the Safari path.
+
+Rebuild native prefixes with `scripts/rebuild-escargot-install.sh` or `scripts/rebuild-hermes-install.sh` after changing their bridge sources, debugger patches, or build configuration. The scripts write a source digest into the install prefix; Zig rejects a missing or stale digest before linking. The scripts patch `ESCARGOT_SRC` or `HERMES_SRC` in place, so use a separate source copy when the pinned submodule must remain untouched.
+
+## Mobile SDK access
+
+Android, Apple, and Harmony SDKs expose owner-thread Inspector start and stop methods. Their listeners bind to app-local loopback. Android devices use `adb forward tcp:<host-port> tcp:<device-port>`; an iOS Simulator listener is reachable through the host's loopback interface. Physical iOS and Harmony devices require a forwarding transport to the returned app-local port.
+
+Keep the engine on a dedicated owner thread or Worker so a debugger pause does not block the host that delivers control messages. See the [Android](../sdk/android/README.md#cdp-debugging), [Apple](../sdk/apple/README.md#cdp-debugging), and [Harmony](../sdk/harmony/README.md#cdp-debugging) SDK instructions. The same `tests/inspector/e2e.cjs --debugger-flow` contract runs against a forwarded mobile endpoint.
 
 ## Build options
 
@@ -69,7 +87,21 @@ Production hosts that fix `-Dbackend=quickjs` can retrieve source identity throu
 
 On supported JSC builds, call `jsc_remote_inspector.startAndEnable` after creating the instance and before scripts that need initial breakpoints run. The supplied name appears in Safari's Develop menu. The public `jsc_remote_inspector` namespace is empty on other backends, so shared Zig code must guard this call with a compile-time backend condition.
 
+The `jsc-safari-demo` example owns its context on the main thread and keeps that thread's Apple `CFRunLoop` active for Web Inspector commands. It attaches the engine's automatic driver to that run loop rather than blocking it in `engine.runEventLoop`, uses deadline-driven callbacks for JavaScript tasks, and stops both loops before releasing the engine. A separate context owner thread is not covered by this example's debugger test.
+
+Build the simulator example with `zig build safari-demo-build -Dbackend=jsc -Dtarget=aarch64-ios.14.0-simulator "-Dapple-sysroot=$(xcrun --sdk iphonesimulator --show-sdk-path)"`. With a simulator already booted, run `JSBAY_IOS_SIM_UDID=<booted-simulator> bash tests/apple-sdk/run-jsc-inspector-sim.sh zig-out/bin/jsc-safari-demo`. This checks the real Web Inspector protocol, including breakpoints, paused-frame evaluation, stepping, reconnection, and normal shutdown. It does not automate the Safari graphical interface.
+
+The regression requires normal context teardown as well as successful debugger commands. A native JavaScriptCore shutdown crash fails the check; debugger command success alone does not establish runtime compatibility.
+
 This path depends on platform JavaScriptCore symbols. It does not turn JSC into the CDP source debugger and it is not enabled by the CDP build option.
+
+### iOS 26.5 system JavaScriptCore teardown limitation
+
+The iOS 26.5 Simulator runtime (23F77) has a known limitation when a system JavaScriptCore context has accepted a remote Inspector frontend. Discovering an inspectable context without a frontend can release cleanly. After one frontend connection and a normal detach, releasing the context or VM can terminate with `SIGTRAP` while destroying `Inspector::JSGlobalObjectInspectorController`; the minimal repro does not need Runtime or Debugger commands.
+
+Setting the public inspectable flag to false to let the platform close the frontend, or retaining another context in the group and collecting garbage, did not avoid the trap. The exact internal cause has not been proven. This project uses only the system JavaScriptCore framework and does not work around the limitation by bundling a replacement runtime, retaining a VM indefinitely, or disabling runtime safety checks.
+
+Safari's graphical Inspector was not attached in the simulator test: Safari listed the running simulator under Develop but reported no inspectable applications. Physical iOS 26.5 has not been tested. Treat successful Inspector protocol commands on this runtime as incomplete until normal teardown has also been verified.
 
 ## Lifetime
 

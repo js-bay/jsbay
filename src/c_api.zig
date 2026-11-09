@@ -100,9 +100,9 @@ test "c_api: library_backend and capabilities match compile-time backend" {
         try std.testing.expect((caps.flags & F.heap_usage_snapshot) == 0);
         try std.testing.expect((caps.flags & F.explicit_bytecode) == 0);
         try std.testing.expect((caps.flags & F.persistent_bytecode_cache) == 0);
-        try std.testing.expect((caps.flags & F.safari_web_inspector) != 0);
+        try std.testing.expectEqual(backend.active_backend == .jsc, (caps.flags & F.safari_web_inspector) != 0);
     }
-    if (backend.supportsDebugger(backend.active_backend) and @import("build_options").inspector) {
+    if (backend.active_backend != .jsc and @import("build_options").inspector) {
         try std.testing.expect((caps.flags & F.cdp_source_debugger) != 0);
     } else {
         try std.testing.expect((caps.flags & F.cdp_source_debugger) == 0);
@@ -2981,7 +2981,7 @@ test "c_api: evaluation and cache preserve inspector source contract" {
     const requested_filename = "c-api-inspector-source.js";
     const source_url = "c-api-cache-source-url.js";
     const source = "globalThis.apiDebugRuns=(globalThis.apiDebugRuns||0)+1;apiDebugRuns\n//# sourceURL=c-api-cache-source-url.js\n<!-- ignored\n--> ignored\n";
-    const effective_filename = if (comptime backend.active_backend == .quickjs) source_url else requested_filename;
+    const effective_filename = source_url;
     var hit = false;
     var options = EvalOptions{
         .struct_size = @sizeOf(EvalOptions),
@@ -3004,7 +3004,7 @@ test "c_api: evaluation and cache preserve inspector source contract" {
         try testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = requested_filename.ptr, .len = requested_filename.len }, if (index < 2) &options else null, &value, &exception));
         defer _ = jsbay_value_release(value);
         try testing.expectEqual(@as(u64, 0), exception);
-        try testing.expectEqual(@import("build_options").bytecode_cache and backend.active_backend != .jsc and index == 1, hit);
+        try testing.expectEqual(@import("build_options").bytecode_cache and backend.isQuickJsApiBackend(backend.active_backend) and index == 1, hit);
         const script_id = debugger.scriptIdForUrl(id, effective_filename);
         if (comptime inspector_enabled) {
             if (!attached) {
@@ -3016,7 +3016,7 @@ test "c_api: evaluation and cache preserve inspector source contract" {
             defer debugger.freeScriptInfo(script);
             try testing.expectEqualStrings(source, script.source);
             try testing.expectEqualStrings(effective_filename, script.url);
-            if (comptime backend.active_backend == .quickjs) try testing.expectEqual(@as(u32, 0), debugger.scriptIdForUrl(id, requested_filename));
+            try testing.expectEqual(@as(u32, 0), debugger.scriptIdForUrl(id, requested_filename));
         } else {
             try testing.expectEqual(@as(u32, 0), script_id);
         }

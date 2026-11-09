@@ -13,6 +13,15 @@ if [[ ! -f "$SRC/CMakeLists.txt" ]]; then
   exit 1
 fi
 
+PATCH="$ROOT/vendor/escargot-debugger.patch"
+if [[ -f "$PATCH" ]]; then
+  if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
+    echo "Escargot debugger patch already applied"
+  else
+    patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+  fi
+fi
+
 mkdir -p "$BUILD" "$PREFIX/lib" "$PREFIX/include"
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
@@ -22,6 +31,8 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DESCARGOT_TLS_ACCESS_BY_ADDRESS=OFF \
   -DESCARGOT_FORCE_TLS_DIALECT_GNU2=ON \
   -DESCARGOT_LIBICU_SUPPORT=OFF \
+  -DESCARGOT_DEBUGGER=ON \
+  -DESCARGOT_CODE_CACHE=OFF \
   -DESCARGOT_ENABLE_SHELL=ON
 ninja -C "$BUILD" -j"$JOBS"
 
@@ -43,21 +54,21 @@ for lib in libescargot.a libgc-lib.a liblibbf.a liblibsimdutf.a libruntime-icu-b
     if [[ -n "$found" ]]; then cp -f "$found" "$PREFIX/lib/$lib"; else echo "WARN: missing $lib"; fi
   fi
 done
-# Headers: use existing install tree if present; else copy from src api + generated.
-if [[ ! -f "$PREFIX/include/EscargotPublic.h" ]]; then
-  if [[ -f "$SRC/src/api/EscargotPublic.h" ]]; then
-    cp -f "$SRC/src/api/EscargotPublic.h" "$PREFIX/include/"
-    # related public headers
-    find "$SRC/src/api" -maxdepth 1 -name '*.h' -exec cp -f {} "$PREFIX/include/" \;
-  fi
+# Headers must be refreshed after applying a debugger API patch.
+if [[ -f "$SRC/src/api/EscargotPublic.h" ]]; then
+  cp -f "$SRC/src/api/EscargotPublic.h" "$PREFIX/include/"
+  # related public headers
+  find "$SRC/src/api" -maxdepth 1 -name '*.h' -exec cp -f {} "$PREFIX/include/" \;
 fi
 
 # Bridge .o (static into Zig link). Needs g++ with local-exec TLS (GNU2).
 : "${CXX:=g++}"
-"$CXX" -c -std=c++17 -O0 -g -fPIC \
+"$CXX" -c -std=c++17 -O0 -g -fPIC -DESCARGOT_DEBUGGER \
   -I "$ROOT/src/backend/escargot" -I "$PREFIX/include" \
   -o "$PREFIX/lib/escargot_bridge.o" \
   "$ROOT/src/backend/escargot/escargot_bridge.cpp"
+
+bash "$ROOT/scripts/native-prefix-stamp.sh" escargot write "$PREFIX"
 
 echo "Escargot install ready: $PREFIX"
 echo "Zig: export JSBAY_LIBSTDCXX=/path/to/libstdc++.a"

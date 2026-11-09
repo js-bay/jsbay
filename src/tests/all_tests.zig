@@ -1,6 +1,6 @@
 //! Aggregator — imported from root.zig so that `zig build test` picks up all test files in src/tests/.
 //!
-//! Spike backends (escargot/hermes) share the suite source; out-of-scope suites are not imported (see docs/capability.md). In-scope: eval, value/object, Promise, buffers (basic), timers, host_object, Escargot ESM, Hermes .hbc. Out: engine_thread / thick C ABI, inspector, deep event-loop contracts, heap/interrupt, Escargot disk bytecode cache, advanced buffer transfer/copy, resource/OOM/stack limits.
+//! Spike backends (escargot/hermes) share the suite source; out-of-scope suites are not imported (see docs/capability.md). In-scope: eval, value/object, Promise, buffers (basic), timers, host_object, Escargot ESM, Hermes .hbc. The owner-thread CDP regressions also cover bytecode-debugger backends. The separate `test-cdp` step validates discovery, source retrieval, execution debugging, and reconnection for non-JSC backends. Out of this unit aggregator: inspector, deep event-loop contracts, heap/interrupt, Escargot disk bytecode cache, advanced buffer transfer/copy, resource/OOM/stack limits.
 
 const backend = @import("../backend.zig");
 const build_options = @import("build_options");
@@ -14,6 +14,10 @@ comptime {
     }
     _ = @import("../runtime/submission.zig");
     _ = @import("public_module_tests.zig");
+    _ = @import("native_cdp_lifecycle_tests.zig");
+    if (build_options.inspector and build_options.inspector_transport and backend.supportsDebugger(backend.active_backend)) {
+        _ = @import("step_control_tests.zig");
+    }
     _ = @import("../script/typed_eval.zig");
     _ = @import("test_helpers.zig");
     _ = @import("value_tests.zig");
@@ -135,6 +139,7 @@ comptime {
     if (!spike and build_options.inspector_transport) {
         _ = @import("inspector_tests.zig");
         if (build_options.inspector) {
+            _ = @import("debug_receiver_tests.zig");
             _ = @import("cdp_reference_tests.zig");
             _ = @import("cdp_properties_tests.zig");
             _ = @import("cdp_console_tests.zig");

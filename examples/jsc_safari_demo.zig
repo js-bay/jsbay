@@ -16,6 +16,18 @@ const SignalStop = @import("signal_stop.zig").SignalStop;
 const types = zjs.types;
 const backend = zjs.backend;
 
+const AppleRunLoop = opaque {};
+const LoopTask = *const fn (?*anyopaque) callconv(.c) void;
+
+extern fn jsbay_apple_run_loop_create() ?*AppleRunLoop;
+extern fn jsbay_apple_run_loop_destroy(loop: *AppleRunLoop) void;
+extern fn jsbay_apple_run_loop_schedule(loop: ?*anyopaque, delay_ms: u64, task: LoopTask, task_data: ?*anyopaque) callconv(.c) bool;
+extern fn jsbay_apple_run_loop_cancel(loop: ?*anyopaque) callconv(.c) void;
+extern fn jsbay_apple_run_loop_run(loop: *AppleRunLoop) bool;
+extern fn jsbay_apple_run_loop_stop(loop: *AppleRunLoop) void;
+
+var apple_run_loop: ?*AppleRunLoop = null;
+
 fn logHandler(_: i32, level: types.LogLevel, msg: [*:0]const u8, _: ?*anyopaque) callconv(.c) void {
     const tag = switch (level) {
         .debug => "log",
@@ -26,7 +38,13 @@ fn logHandler(_: i32, level: types.LogLevel, msg: [*:0]const u8, _: ?*anyopaque)
     std.debug.print("[js {s}] {s}\n", .{ tag, std.mem.span(msg) });
 }
 
+fn stopDemo(instance_id: i32) void {
+    engine.stopEventLoop(instance_id);
+    if (apple_run_loop) |loop| jsbay_apple_run_loop_stop(loop);
+}
+
 pub fn main() !void {
+    std.debug.print("STARTED {d}\n", .{std.c.getpid()});
     if (!backend.isJscApiBackend(backend.active_backend)) {
         std.debug.print(
             "jsc-safari-demo requires -Dbackend=jsc (current: {s}). " ++
@@ -44,17 +62,28 @@ pub fn main() !void {
         std.debug.print("engine.create failed\n", .{});
         std.process.exit(1);
     }
-    defer engine.destroy(id);
-    var signal_stop: SignalStop = .{};
-    try signal_stop.start(id, engine.stopEventLoop);
-    defer signal_stop.deinit();
+    errdefer engine.destroy(id);
 
     const target_name = "js-bay-demo";
     if (!zjs.jsc_remote_inspector.startAndEnable(id, target_name)) {
         std.debug.print("jsc_remote_inspector.startAndEnable failed\n", .{});
         std.process.exit(1);
     }
-    defer _ = zjs.jsc_remote_inspector.disable(id);
+    errdefer _ = zjs.jsc_remote_inspector.disable(id);
+
+    const loop = jsbay_apple_run_loop_create() orelse return error.AppleRunLoopCreateFailed;
+    errdefer jsbay_apple_run_loop_destroy(loop);
+    try engine.attachLoop(id, .{
+        .context = loop,
+        .schedule = jsbay_apple_run_loop_schedule,
+        .cancel = jsbay_apple_run_loop_cancel,
+    });
+    errdefer engine.detachLoop(id);
+    apple_run_loop = loop;
+    errdefer apple_run_loop = null;
+    var signal_stop: SignalStop = .{};
+    try signal_stop.start(id, stopDemo);
+    errdefer signal_stop.deinit();
 
     std.debug.print(
         \\JSC remote inspector enabled as "{s}".
@@ -74,7 +103,15 @@ pub fn main() !void {
     }
     if (prime_result.result) |r| std.heap.c_allocator.free(@constCast(r));
 
-    engine.runEventLoop(id);
+    std.debug.print("READY {d}\n", .{std.c.getpid()});
+    if (!jsbay_apple_run_loop_run(loop)) return error.AppleRunLoopFailed;
 
+    apple_run_loop = null;
+    engine.detachLoop(id);
+    jsbay_apple_run_loop_destroy(loop);
+    _ = zjs.jsc_remote_inspector.disable(id);
+    engine.destroy(id);
+    signal_stop.deinit();
     std.debug.print("\nshutting down...\n", .{});
+    std.debug.print("CLEAN_EXIT\n", .{});
 }

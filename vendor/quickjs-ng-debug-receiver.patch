@@ -1,0 +1,364 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -486,6 +486,9 @@
+     /* Number of OP_catch offsets still live on this frame's stack. */
+ #if JSBAY_INSPECTOR
+     int catch_count;
++    /* Borrowed from the active call or its async state. */
++    JSValue jsbay_debug_this;
++    bool jsbay_debug_this_valid;
+ #endif
+ } JSStackFrame;
+ 
+@@ -908,6 +911,9 @@
+     uint8_t super_allowed : 1;
+     uint8_t arguments_allowed : 1;
+     uint8_t backtrace_barrier : 1; /* stop backtrace on this function */
++#if JSBAY_INSPECTOR
++    uint8_t jsbay_debug_eval_helper : 1;
++#endif
+     /* XXX: 5 bits available */
+     uint8_t *byte_code_buf; /* (self pointer) */
+     int byte_code_len;
+@@ -2668,10 +2674,12 @@
+ 
+ static JSValue js_debug_local_variables(JSContext *ctx, JSStackFrame *sf)
+ {
+-    JSValue result = JS_NewObject(ctx);
++    JSValue result = JS_NewObjectProto(ctx, JS_NULL);
+     JSObject *f;
+     JSFunctionBytecode *b;
+     uint32_t i;
++    bool has_this = false;
++    bool this_tdz = false;
+ 
+     if (!sf || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
+         return result;
+@@ -2683,15 +2691,60 @@
+         return result;
+     for (i = 0; i < (uint32_t)(b->arg_count + b->var_count); i++) {
+         JSValue value = i < b->arg_count ? sf->arg_buf[i] : sf->var_buf[i - b->arg_count];
+-        if (!JS_IsUninitialized(value))
++        if (b->vardefs[i].var_name == JS_ATOM_this && JS_IsUninitialized(value)) {
++            this_tdz = true;
++        } else if (!JS_IsUninitialized(value)) {
++            if (b->vardefs[i].var_name == JS_ATOM_this)
++                has_this = true;
+             JS_SetProperty(ctx, result, b->vardefs[i].var_name, JS_DupValue(ctx, value));
++        }
++    }
++    if (!has_this && f->u.func.var_refs) {
++        for (i = 0; i < (uint32_t)b->closure_var_count; i++) {
++            JSVarRef *var_ref = f->u.func.var_refs[i];
++            if (b->closure_var[i].var_name == JS_ATOM_this && var_ref && var_ref->pvalue) {
++                if (JS_IsUninitialized(*var_ref->pvalue)) {
++                    this_tdz = true;
++                    break;
++                }
++                if (JS_DefinePropertyValue(ctx, result, JS_ATOM_this, js_dup(*var_ref->pvalue), JS_PROP_C_W_E) < 0) {
++                    JS_FreeValue(ctx, result);
++                    return JS_EXCEPTION;
++                }
++                has_this = true;
++                break;
++            }
++        }
++    }
++    if (!has_this && !this_tdz && sf->jsbay_debug_this_valid) {
++        JSValue value;
++        uint32_t tag = JS_VALUE_GET_TAG(sf->jsbay_debug_this);
++        if (!b->is_strict_mode) {
++            if (likely(tag == JS_TAG_OBJECT)) {
++                value = js_dup(sf->jsbay_debug_this);
++            } else if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
++                value = js_dup(ctx->global_obj);
++            } else {
++                value = JS_ToObject(ctx, sf->jsbay_debug_this);
++            }
++        } else {
++            value = js_dup(sf->jsbay_debug_this);
++        }
++        if (JS_IsException(value) || JS_DefinePropertyValue(ctx, result, JS_ATOM_this, value, JS_PROP_C_W_E) < 0) {
++            JS_FreeValue(ctx, result);
++            return JS_EXCEPTION;
++        }
++    }
++    if (this_tdz && JS_DefinePropertyValue(ctx, result, JS_ATOM_this, JS_UNINITIALIZED, JS_PROP_C_W_E) < 0) {
++        JS_FreeValue(ctx, result);
++        return JS_EXCEPTION;
+     }
+     return result;
+ }
+ 
+ static JSValue js_debug_closure_variables(JSContext *ctx, JSStackFrame *sf)
+ {
+-    JSValue result = JS_NewObject(ctx);
++    JSValue result = JS_NewObjectProto(ctx, JS_NULL);
+     JSObject *f;
+     JSFunctionBytecode *b;
+     uint32_t i;
+@@ -2726,48 +2779,148 @@
+     return js_debug_local_variables(ctx, sf);
+ }
+ 
++static JSFunctionBytecode *jsbay_script_tag_child(JSValue value)
++{
++    if (JS_VALUE_GET_TAG(value) == JS_TAG_FUNCTION_BYTECODE)
++        return JS_VALUE_GET_PTR(value);
++    if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT && js_class_has_bytecode(JS_VALUE_GET_OBJ(value)->class_id))
++        return JS_VALUE_GET_OBJ(value)->u.func.function_bytecode;
++    return NULL;
++}
++
++static void jsbay_mark_debug_eval_helper(JSValue value)
++{
++    JSFunctionBytecode *bytecode = jsbay_script_tag_child(value);
++    int index;
++    if (!bytecode || bytecode->jsbay_debug_eval_helper)
++        return;
++    bytecode->jsbay_debug_eval_helper = 1;
++    for (index = 0; index < bytecode->cpool_count; index++)
++        jsbay_mark_debug_eval_helper(bytecode->cpool[index]);
++}
++
++static char *jsbay_debug_eval_source(JSContext *ctx, const char *expr, size_t len, bool strict, bool tdz)
++{
++    static const char hex[] = "0123456789abcdef";
++    const char *prefix = tdz ? "(function(){with(arguments[0]){return class extends null{constructor(){return {value:eval(\"" : strict ? "(function(){with(arguments[0]){return function(){'use strict';return eval(\"" : "(function(){with(arguments[0]){return function(){return eval(\"";
++    const char *suffix = tdz ? "\")};}}}})" : "\")};}})";
++    char *out, *p;
++    size_t index, cap;
++
++    if (len > (SIZE_MAX - 256) / 6)
++        return NULL;
++    cap = len * 6 + 256;
++    out = js_malloc(ctx, cap);
++    if (!out)
++        return NULL;
++    p = out;
++    memcpy(p, prefix, strlen(prefix));
++    p += strlen(prefix);
++    for (index = 0; index < len; index++) {
++        unsigned char c = (unsigned char)expr[index];
++        if (c == '\\' || c == '\"') {
++            *p++ = '\\';
++            *p++ = c;
++        } else if (c < 0x20) {
++            memcpy(p, "\\u00", 4);
++            p += 4;
++            *p++ = hex[c >> 4];
++            *p++ = hex[c & 15];
++        } else if (c == 0xe2 && index + 2 < len && (unsigned char)expr[index + 1] == 0x80 && ((unsigned char)expr[index + 2] == 0xa8 || (unsigned char)expr[index + 2] == 0xa9)) {
++            memcpy(p, (unsigned char)expr[index + 2] == 0xa8 ? "\\u2028" : "\\u2029", 6);
++            p += 6;
++            index += 2;
++        } else {
++            *p++ = c;
++        }
++    }
++    memcpy(p, suffix, strlen(suffix));
++    p += strlen(suffix);
++    *p = '\0';
++    return out;
++}
++
+ JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, size_t len)
+ {
+-    static const char helper_source[] =
+-        "(function(__jsbayScope,__jsbayExpression){"
+-        "return (function(){with(__jsbayScope){return eval(__jsbayExpression);}}).call(this);"
+-        "})";
+-    JSValue local = js_debug_local_variables(ctx, js_debug_frame(ctx, frame_index));
+-    JSValue closure = js_debug_closure_variables(ctx, js_debug_frame(ctx, frame_index));
+-    JSValue helper;
+-    JSValue expression;
+-    JSValue args[2];
++    JSStackFrame *sf = js_debug_frame(ctx, frame_index);
++    JSObject *function = sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(sf->cur_func) : NULL;
++    JSFunctionBytecode *bytecode = function && js_class_has_bytecode(function->class_id) ? function->u.func.function_bytecode : NULL;
++    JSValue local = js_debug_local_variables(ctx, sf);
++    JSValue closure = js_debug_closure_variables(ctx, sf);
++    JSValue helper, runner;
+     JSValue global;
+     JSValue result;
+-
++    int has_this;
++    bool this_tdz;
++    JSValue this_value;
++    char *source;
++    JSScriptTagHandler *saved_source_handler;
++
++    if (JS_IsException(local) || JS_IsException(closure)) {
++        JS_FreeValue(ctx, local);
++        JS_FreeValue(ctx, closure);
++        return JS_EXCEPTION;
++    }
+     if (JS_SetPrototype(ctx, local, closure) < 0) {
+         JS_FreeValue(ctx, closure);
+         JS_FreeValue(ctx, local);
+         return JS_EXCEPTION;
+     }
+     JS_FreeValue(ctx, closure);
+-    helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, "<debugger>", JS_EVAL_TYPE_GLOBAL);
++    this_tdz = false;
++    if (JS_HasProperty(ctx, local, JS_ATOM_this) > 0) {
++        this_value = JS_GetProperty(ctx, local, JS_ATOM_this);
++        if (JS_IsException(this_value)) { JS_FreeValue(ctx, local); return this_value; }
++        this_tdz = JS_IsUninitialized(this_value);
++        JS_FreeValue(ctx, this_value);
++    }
++    source = jsbay_debug_eval_source(ctx, expr, len, bytecode && bytecode->is_strict_mode, this_tdz);
++    if (!source) {
++        JS_FreeValue(ctx, local);
++        return JS_ThrowOutOfMemory(ctx);
++    }
++    saved_source_handler = ctx->rt->script_tag_handler;
++    ctx->rt->script_tag_handler = NULL;
++    helper = JS_Eval(ctx, source, strlen(source), "<debugger>", JS_EVAL_TYPE_GLOBAL);
++    ctx->rt->script_tag_handler = saved_source_handler;
++    js_free(ctx, source);
+     if (JS_IsException(helper)) {
+         JS_FreeValue(ctx, local);
+         return helper;
+     }
+-    expression = JS_NewStringLen(ctx, expr, len);
+-    if (JS_IsException(expression)) {
++    jsbay_mark_debug_eval_helper(helper);
++    has_this = JS_HasProperty(ctx, local, JS_ATOM_this);
++    if (has_this < 0) {
+         JS_FreeValue(ctx, helper);
+         JS_FreeValue(ctx, local);
+-        return expression;
+-    }
+-    args[0] = local;
+-    args[1] = expression;
+-    /* `this` is a real binding in the frame. `with` does not change it. */
++        return JS_EXCEPTION;
++    }
+     global = JS_GetPropertyStr(ctx, local, "this");
+-    if (JS_IsException(global) || JS_IsUndefined(global) || JS_IsUninitialized(global)) {
++    if (JS_IsException(global)) {
++        JS_FreeValue(ctx, helper);
++        JS_FreeValue(ctx, local);
++        return JS_EXCEPTION;
++    }
++    if ((!has_this || JS_IsUninitialized(global)) && !(bytecode && bytecode->is_strict_mode)) {
+         JS_FreeValue(ctx, global);
+         global = JS_GetGlobalObject(ctx);
+     }
+-    result = JS_Call(ctx, helper, global, 2, args);
++    runner = JS_Call(ctx, helper, JS_UNDEFINED, 1, &local);
++    if (JS_IsException(runner))
++        result = runner;
++    else if (this_tdz) {
++        JSValue boxed = JS_CallConstructor(ctx, runner, 0, NULL);
++        if (JS_IsException(boxed))
++            result = boxed;
++        else {
++            result = JS_GetPropertyStr(ctx, boxed, "value");
++            JS_FreeValue(ctx, boxed);
++        }
++    }
++    else
++        result = JS_Call(ctx, runner, global, 0, NULL);
++    JS_FreeValue(ctx, runner);
+     JS_FreeValue(ctx, global);
+-    JS_FreeValue(ctx, expression);
+     JS_FreeValue(ctx, helper);
+     JS_FreeValue(ctx, local);
+     return result;
+@@ -19023,6 +19176,10 @@
+             sp = sf->cur_sp;
+             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
+             pc = sf->cur_pc;
++#if JSBAY_INSPECTOR
++            sf->jsbay_debug_this = s->this_val;
++            sf->jsbay_debug_this_valid = true;
++#endif
+             sf->prev_frame = rt->current_stack_frame;
+             rt->current_stack_frame = sf;
+             if (s->throw_flag)
+@@ -19062,6 +19219,8 @@
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+ #if JSBAY_INSPECTOR
+     sf->catch_count = 0;
++    sf->jsbay_debug_this = unsafe_unconst(this_obj);
++    sf->jsbay_debug_this_valid = true;
+ #endif
+     arg_buf = (JSValue *)argv;
+     sf->arg_count = argc;
+@@ -19688,7 +19847,11 @@
+                 pc += 4;
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++#if JSBAY_INSPECTOR
++                if (b->jsbay_debug_eval_helper || js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
++#else
+                 if (js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
++#endif
+                     if (call_argc >= 1)
+                         obj = call_argv[0];
+                     else
+@@ -22167,6 +22330,10 @@
+         return -1;
+     sf->cur_func = js_dup(func_obj);
+     s->this_val = js_dup(this_obj);
++#if JSBAY_INSPECTOR
++    sf->jsbay_debug_this = s->this_val;
++    sf->jsbay_debug_this_valid = true;
++#endif
+     s->argc = argc;
+     sf->arg_count = arg_buf_len;
+     sf->var_buf = sf->arg_buf + arg_buf_len;
+@@ -34917,6 +35084,39 @@
+     }
+ }
+ 
++#if JSBAY_INSPECTOR
++static int jsbay_capture_arrow_this(JSContext *ctx, JSFunctionDef *s)
++{
++    JSFunctionDef *fd;
++    int var_idx;
++
++    for (fd = s->parent; fd; fd = fd->parent) {
++        if (fd->has_this_binding) {
++            var_idx = resolve_pseudo_var(ctx, fd, JS_ATOM_this);
++            if (var_idx < 0)
++                return -1;
++            capture_var(fd, &fd->vars[var_idx]);
++            return get_closure_var(ctx, s, fd, JS_CLOSURE_LOCAL, var_idx,
++                                   JS_ATOM_this, false, fd->vars[var_idx].is_lexical,
++                                   JS_VAR_NORMAL) < 0 ? -1 : 0;
++        }
++        if (fd->is_eval) {
++            var_idx = find_closure_var(ctx, fd, JS_ATOM_this);
++            if (var_idx >= 0) {
++                JSClosureVar *cv = &fd->closure_var[var_idx];
++                JSClosureTypeEnum closure_type = cv->closure_type == JS_CLOSURE_GLOBAL ||
++                    cv->closure_type == JS_CLOSURE_GLOBAL_DECL ||
++                    cv->closure_type == JS_CLOSURE_GLOBAL_REF ? JS_CLOSURE_GLOBAL_REF : JS_CLOSURE_REF;
++                return get_closure_var(ctx, s, fd, closure_type, var_idx,
++                                       cv->var_name, cv->is_const, cv->is_lexical,
++                                       cv->var_kind) < 0 ? -1 : 0;
++            }
++        }
++    }
++    return 0;
++}
++#endif
++
+ /* return the position of the next opcode */
+ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+                              JSAtom var_name, int scope_level, int op,
+@@ -38584,6 +38784,10 @@
+         fd->super_call_allowed = fd->parent->super_call_allowed;
+         fd->super_allowed = fd->parent->super_allowed;
+         fd->arguments_allowed = fd->parent->arguments_allowed;
++#if JSBAY_INSPECTOR
++        if (jsbay_capture_arrow_this(ctx, fd))
++            goto fail;
++#endif
+     } else if (func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT) {
+         fd->new_target_allowed = true; // although new.target === undefined
+         fd->super_call_allowed = false;

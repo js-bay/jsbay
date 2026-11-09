@@ -49,6 +49,7 @@ fn consoleImpl(ctx: ?*c_api.Context, args: ?[*]const Value, argc: usize, level: 
 
     console_log.deliver(id, level, c_msg.ptr);
     console_tap.fire(id, level, c_msg.ptr);
+    c_api.hermes_inspector_console(c, args, argc, @backingInt(level));
     return value_mod.undefinedValue();
 }
 

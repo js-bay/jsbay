@@ -90,7 +90,13 @@ jobs:
           "$(go env GOPATH)/bin/actionlint" -color=false
 
       - name: Test repository tools
-        run: zig build test-tools --summary all
+        run: |
+          set -euo pipefail
+          zig build test-tools --summary all
+          bash tests/native_prefix_stamp_test.sh
+
+      - name: Check generated CDP protocols
+        run: node scripts/generate-cdp-protocol.mjs --fetch --check
 
       - name: Check Zig formatting
         run: |
@@ -232,26 +238,23 @@ jobs:
           done
 
       - name: Build inspector demo
-        if: matrix.backend == 'quickjs_ng'
         # `zig build inspector-demo` runs the demo (runnable step). Install artifacts only so CI does not hang on a long-lived server process.
-        run: zig build -Dbackend=quickjs_ng --summary all
+        run: zig build -Dbackend=${{ matrix.backend }} --summary all
 
       - name: Build idle wake consumer
-        if: matrix.backend == 'quickjs_ng'
         run: |
           set -euo pipefail
           link_flags=(-lm -pthread -fsanitize=undefined)
           cc -std=c11 -Wall -Wextra -Werror -Iinclude tests/host_wake_consumer.c zig-out/lib/libjsbay.a "${link_flags[@]}" -o zig-out/bin/host-wake-consumer
 
       - name: Inspector e2e, idle wake and signal shutdown
-        if: matrix.backend == 'quickjs_ng'
-        run: node tests/inspector/ci_driver.cjs ./zig-out/bin/inspector-demo-quickjs_ng ./zig-out/bin/host-wake-consumer
+        run: node tests/inspector/ci_driver.cjs ./zig-out/bin/inspector-demo-${{ matrix.backend }} ./zig-out/bin/host-wake-consumer
 
       - name: Upload inspector demo log on failure
-        if: failure() && matrix.backend == 'quickjs_ng'
+        if: failure()
         uses: actions/upload-artifact@v6
         with:
-          name: inspector-demo-log-ubuntu-24.04
+          name: inspector-demo-log-ubuntu-24.04-${{ matrix.backend }}
           path: inspector-demo.log
           if-no-files-found: ignore
 

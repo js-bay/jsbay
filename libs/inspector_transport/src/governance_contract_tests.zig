@@ -317,6 +317,81 @@ const TransportFreeObserver = struct {
     }
 };
 
+/// FailingAllocator counters are shared by detached socket workers.
+const LockedFailingAllocator = struct {
+    failing: testing.FailingAllocator,
+    mutex: zev.Mutex = .{},
+
+    fn init(inner: std.mem.Allocator, config: testing.FailingAllocator.Config) LockedFailingAllocator {
+        return .{ .failing = testing.FailingAllocator.init(inner, config) };
+    }
+
+    fn deinit(self: *LockedFailingAllocator) void {
+        self.mutex.deinit();
+    }
+
+    fn allocator(self: *LockedFailingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *LockedFailingAllocator = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.failing.allocator().rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *LockedFailingAllocator = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.failing.allocator().rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *LockedFailingAllocator = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.failing.allocator().rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *LockedFailingAllocator = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.failing.allocator().rawFree(memory, alignment, ret_addr);
+    }
+
+    fn failNextAllocation(self: *LockedFailingAllocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.failing.fail_index = self.failing.alloc_index;
+    }
+
+    fn allowAllocations(self: *LockedFailingAllocator) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.failing.fail_index = std.math.maxInt(usize);
+    }
+
+    fn expectInducedFailure(self: *LockedFailingAllocator) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try testing.expect(self.failing.has_induced_failure);
+    }
+
+    fn expectFullyFreed(self: *LockedFailingAllocator) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try testing.expectEqual(self.failing.allocated_bytes, self.failing.freed_bytes);
+    }
+};
+
 test "transport: a message handler can close its own transport without waiting for itself" {
     var observer = TransportFreeObserver.init(testing.allocator);
     defer observer.deinit();
@@ -451,7 +526,8 @@ test "transport: a slow session filling its budget does not block a second sessi
 }
 
 test "transport: a broadcast snapshot allocation failure releases every retained session" {
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var failing = LockedFailingAllocator.init(testing.allocator, .{});
+    defer failing.deinit();
     var opened = Opened{};
     defer opened.changed.deinit();
     defer opened.mutex.deinit();
@@ -469,16 +545,16 @@ test "transport: a broadcast snapshot allocation failure releases every retained
     _ = opened.wait(peers.len);
 
     // broadcastText allocates the exact lease snapshot before retaining. Fail that allocation so OOM cannot observe any broadcast lease.
-    failing.fail_index = failing.alloc_index;
+    failing.failNextAllocation();
     t.broadcastText("oom-broadcast-token");
-    try testing.expect(failing.has_induced_failure);
+    try failing.expectInducedFailure();
     // FailingAllocator keeps failing every alloc at fail_index; re-arm so deinit/close can free.
-    failing.fail_index = std.math.maxInt(usize);
+    failing.allowAllocations();
     std.debug.print("GOVERNANCE_BROADCAST_RESIZE_FAILED peers={d}\n", .{peers.len});
     t.deinit();
     deinitialized = true;
     for (peers) |peer| peer.close();
-    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try failing.expectFullyFreed();
 }
 
 test "transport: the session cap rejects the next handshake and recovers after disconnect" {
@@ -516,7 +592,8 @@ test "transport: the session cap rejects the next handshake and recovers after d
 }
 
 test "transport: repeated concurrent sends and disconnects reclaim every worker allocation" {
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var failing = LockedFailingAllocator.init(testing.allocator, .{});
+    defer failing.deinit();
     for (0..4) |round| {
         var opened = Opened{};
         defer opened.changed.deinit();
@@ -545,12 +622,13 @@ test "transport: repeated concurrent sends and disconnects reclaim every worker 
         t.deinit();
         deinitialized = true;
         std.debug.print("GOVERNANCE_CONCURRENT_CLOSE_RECLAIMED round={d}\n", .{round});
-        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        try failing.expectFullyFreed();
     }
 }
 
 test "transport: deinit returns only after live workers release sockets and allocations" {
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var failing = LockedFailingAllocator.init(testing.allocator, .{});
+    defer failing.deinit();
     var opened = Opened{};
     defer opened.changed.deinit();
     defer opened.mutex.deinit();
@@ -571,7 +649,7 @@ test "transport: deinit returns only after live workers release sockets and allo
     deinitialized = true;
     peer.close();
     peer_closed = true;
-    try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try failing.expectFullyFreed();
 
     const rebound = try transport.Transport.init(failing.allocator(), bound_port);
     defer rebound.deinit();

@@ -1,0 +1,58 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6963,6 +6963,9 @@
+     rt->current_stack_frame = sf;
+     // TODO(bnoordhuis) switch realms like js_call_c_function does
+     sf->is_strict_mode = false;
++#if JSBAY_INSPECTOR
++    sf->catch_count = 0;
++#endif
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+     sf->cur_func = unsafe_unconst(func_obj);
+     sf->arg_count = argc;
+@@ -7089,6 +7092,9 @@
+     rt->current_stack_frame = sf;
+     // TODO(bnoordhuis) switch realms like js_call_c_function does
+     sf->is_strict_mode = false;
++#if JSBAY_INSPECTOR
++    sf->catch_count = 0;
++#endif
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+     sf->cur_func = unsafe_unconst(func_obj);
+     sf->arg_count = argc;
+@@ -18720,6 +18726,9 @@
+     ctx = p->u.cfunc.realm; /* change the current realm */
+ 
+     sf->is_strict_mode = false;
++#if JSBAY_INSPECTOR
++    sf->catch_count = 0;
++#endif
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
+     sf->cur_func = unsafe_unconst(func_obj);
+     sf->arg_count = argc;
+@@ -19317,6 +19326,11 @@
+             BREAK;
+ 
+         CASE(OP_drop):
++#if JSBAY_INSPECTOR
++            if (JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_CATCH_OFFSET &&
++                JS_VALUE_GET_INT(sp[-1]) != 0 && sf->catch_count > 0)
++                sf->catch_count--;
++#endif
+             JS_FreeValue(ctx, sp[-1]);
+             sp--;
+             BREAK;
+@@ -20309,11 +20323,11 @@
+                     JS_FreeValue(ctx, ret_val);
+                     goto exception;
+                 }
+-                sp[-1] = ret_val;
+ #if JSBAY_INSPECTOR
+-                if (sf->catch_count > 0)
++                if (JS_VALUE_GET_INT(sp[-1]) != 0 && sf->catch_count > 0)
+                     sf->catch_count--;
+ #endif
++                sp[-1] = ret_val;
+             }
+             BREAK;
+ 

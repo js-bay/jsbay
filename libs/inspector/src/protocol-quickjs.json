@@ -1610,6 +1610,119 @@
           ]
         },
         {
+          "name": "evaluateOnCallFrame",
+          "description": "Evaluates expression on a given call frame.",
+          "parameters": [
+            {
+              "name": "callFrameId",
+              "description": "Call frame identifier to evaluate on.",
+              "$ref": "CallFrameId"
+            },
+            {
+              "name": "expression",
+              "description": "Expression to evaluate.",
+              "type": "string"
+            },
+            {
+              "name": "objectGroup",
+              "description": "String object group name to put result into (allows rapid releasing resulting object handles\nusing `releaseObjectGroup`).",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "includeCommandLineAPI",
+              "description": "Specifies whether command line API should be available to the evaluated expression, defaults\nto false.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "silent",
+              "description": "In silent mode exceptions thrown during evaluation are not reported and do not pause\nexecution. Overrides `setPauseOnException` state.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "returnByValue",
+              "description": "Whether the result is expected to be a JSON object that should be sent by value.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "generatePreview",
+              "description": "Whether preview should be generated for the result.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "throwOnSideEffect",
+              "description": "Whether to throw an exception if side effect cannot be ruled out during evaluation.",
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "timeout",
+              "description": "Terminate execution after timing out (number of milliseconds).",
+              "experimental": true,
+              "optional": true,
+              "$ref": "Runtime.TimeDelta"
+            },
+            {
+              "name": "scopeNumber",
+              "description": "Specifies the scope number to evaluate the expression in (default: 0, innermost scope).",
+              "experimental": true,
+              "optional": true,
+              "type": "integer"
+            }
+          ],
+          "returns": [
+            {
+              "name": "result",
+              "description": "Object wrapper for the evaluation result.",
+              "$ref": "Runtime.RemoteObject"
+            },
+            {
+              "name": "exceptionDetails",
+              "description": "Exception details.",
+              "optional": true,
+              "$ref": "Runtime.ExceptionDetails"
+            }
+          ]
+        },
+        {
+          "name": "getPossibleBreakpoints",
+          "description": "Returns possible locations for breakpoint. scriptId in start and end range locations should be\nthe same.",
+          "parameters": [
+            {
+              "name": "start",
+              "description": "Start of range to search possible breakpoint locations in.",
+              "$ref": "Location"
+            },
+            {
+              "name": "end",
+              "description": "End of range to search possible breakpoint locations in (excluding). When not specified, end\nof scripts is used as end of range.",
+              "optional": true,
+              "$ref": "Location"
+            },
+            {
+              "name": "restrictToFunction",
+              "description": "Only consider locations which are in the same (non-nested) function as start.",
+              "optional": true,
+              "type": "boolean"
+            }
+          ],
+          "returns": [
+            {
+              "name": "locations",
+              "description": "List of the possible breakpoint locations.",
+              "type": "array",
+              "items": {
+                "$ref": "BreakLocation"
+              }
+            }
+          ]
+        },
+        {
           "name": "getScriptSource",
           "description": "Returns source for the script with given id.",
           "parameters": [
@@ -1634,6 +1747,32 @@
           ]
         },
         {
+          "name": "pause",
+          "description": "Stops on the next JavaScript statement."
+        },
+        {
+          "name": "removeBreakpoint",
+          "description": "Removes JavaScript breakpoint.",
+          "parameters": [
+            {
+              "name": "breakpointId",
+              "$ref": "BreakpointId"
+            }
+          ]
+        },
+        {
+          "name": "resume",
+          "description": "Resumes JavaScript execution.",
+          "parameters": [
+            {
+              "name": "terminateOnResume",
+              "description": "Set to true to terminate execution upon resuming execution. In contrast\nto Runtime.terminateExecution, this will allows to execute further\nJavaScript (i.e. via evaluation) until execution of the paused code\nis actually resumed, at which point termination is triggered.\nIf execution is currently not paused, this parameter has no effect.",
+              "optional": true,
+              "type": "boolean"
+            }
+          ]
+        },
+        {
           "name": "setAsyncCallStackDepth",
           "description": "Enables or disables async call stacks tracking.",
           "parameters": [
@@ -1643,9 +1782,269 @@
               "type": "integer"
             }
           ]
+        },
+        {
+          "name": "setBlackboxPatterns",
+          "description": "Replace previous blackbox patterns with passed ones. Forces backend to skip stepping/pausing in\nscripts with url matching one of the patterns. VM will try to leave blackboxed script by\nperforming 'step in' several times, finally resorting to 'step out' if unsuccessful.",
+          "experimental": true,
+          "parameters": [
+            {
+              "name": "patterns",
+              "description": "Array of regexps that will be used to check script url for blackbox state.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "skipAnonymous",
+              "description": "If true, also ignore scripts with no source url.",
+              "optional": true,
+              "type": "boolean"
+            }
+          ]
+        },
+        {
+          "name": "setBreakpointByUrl",
+          "description": "Sets JavaScript breakpoint at given location specified either by URL or URL regex. Once this\ncommand is issued, all existing parsed scripts will have breakpoints resolved and returned in\n`locations` property. Further matching script parsing will result in subsequent\n`breakpointResolved` events issued. This logical breakpoint will survive page reloads.",
+          "parameters": [
+            {
+              "name": "lineNumber",
+              "description": "Line number to set breakpoint at.",
+              "type": "integer"
+            },
+            {
+              "name": "url",
+              "description": "URL of the resources to set breakpoint on.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "urlRegex",
+              "description": "Regex pattern for the URLs of the resources to set breakpoints on. Either `url` or\n`urlRegex` must be specified.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "scriptHash",
+              "description": "Script hash of the resources to set breakpoint on.",
+              "optional": true,
+              "type": "string"
+            },
+            {
+              "name": "columnNumber",
+              "description": "Offset in the line to set breakpoint at.",
+              "optional": true,
+              "type": "integer"
+            },
+            {
+              "name": "condition",
+              "description": "Expression to use as a breakpoint condition. When specified, debugger will only stop on the\nbreakpoint if this expression evaluates to true.",
+              "optional": true,
+              "type": "string"
+            }
+          ],
+          "returns": [
+            {
+              "name": "breakpointId",
+              "description": "Id of the created breakpoint for further reference.",
+              "$ref": "BreakpointId"
+            },
+            {
+              "name": "locations",
+              "description": "List of the locations this breakpoint resolved into upon addition.",
+              "type": "array",
+              "items": {
+                "$ref": "Location"
+              }
+            }
+          ]
+        },
+        {
+          "name": "setBreakpointsActive",
+          "description": "Activates / deactivates all breakpoints on the page.",
+          "parameters": [
+            {
+              "name": "active",
+              "description": "New value for breakpoints active state.",
+              "type": "boolean"
+            }
+          ]
+        },
+        {
+          "name": "setPauseOnExceptions",
+          "description": "Defines pause on exceptions state. Can be set to stop on all exceptions, uncaught exceptions,\nor caught exceptions, no exceptions. Initial pause on exceptions state is `none`.",
+          "parameters": [
+            {
+              "name": "state",
+              "description": "Pause on exceptions mode.",
+              "type": "string",
+              "enum": [
+                "none",
+                "caught",
+                "uncaught",
+                "all"
+              ]
+            }
+          ]
+        },
+        {
+          "name": "setSkipAllPauses",
+          "description": "Makes page not interrupt on any pauses (breakpoint, exception, dom exception etc).",
+          "parameters": [
+            {
+              "name": "skip",
+              "description": "New value for skip pauses state.",
+              "type": "boolean"
+            }
+          ]
+        },
+        {
+          "name": "stepInto",
+          "description": "Steps into the function call.",
+          "parameters": [
+            {
+              "name": "breakOnAsyncCall",
+              "description": "Debugger will pause on the execution of the first async task which was scheduled\nbefore next pause.",
+              "experimental": true,
+              "optional": true,
+              "type": "boolean"
+            },
+            {
+              "name": "skipList",
+              "description": "The skipList specifies location ranges that should be skipped on step into.",
+              "experimental": true,
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "LocationRange"
+              }
+            }
+          ]
+        },
+        {
+          "name": "stepOut",
+          "description": "Steps out of the function call."
+        },
+        {
+          "name": "stepOver",
+          "description": "Steps over the statement.",
+          "parameters": [
+            {
+              "name": "skipList",
+              "description": "The skipList specifies location ranges that should be skipped on step over.",
+              "experimental": true,
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "LocationRange"
+              }
+            },
+            {
+              "name": "enterRanges",
+              "description": "Functions whose source range lies within one of the enterRanges are\nentered as if by stepInto, even when they are called (directly or\nindirectly) from a call that is stepped over.",
+              "experimental": true,
+              "optional": true,
+              "type": "array",
+              "items": {
+                "$ref": "LocationRange"
+              }
+            }
+          ]
         }
       ],
       "events": [
+        {
+          "name": "breakpointResolved",
+          "description": "Fired when breakpoint is resolved to an actual script and location.\nDeprecated in favor of `resolvedBreakpoints` in the `scriptParsed` event.",
+          "deprecated": true,
+          "parameters": [
+            {
+              "name": "breakpointId",
+              "description": "Breakpoint unique identifier.",
+              "$ref": "BreakpointId"
+            },
+            {
+              "name": "location",
+              "description": "Actual breakpoint location.",
+              "$ref": "Location"
+            }
+          ]
+        },
+        {
+          "name": "paused",
+          "description": "Fired when the virtual machine stopped on breakpoint or exception or any other stop criteria.",
+          "parameters": [
+            {
+              "name": "callFrames",
+              "description": "Call stack the virtual machine stopped on.",
+              "type": "array",
+              "items": {
+                "$ref": "CallFrame"
+              }
+            },
+            {
+              "name": "reason",
+              "description": "Pause reason.",
+              "type": "string",
+              "enum": [
+                "ambiguous",
+                "assert",
+                "CSPViolation",
+                "debugCommand",
+                "DOM",
+                "EventListener",
+                "exception",
+                "instrumentation",
+                "OOM",
+                "other",
+                "promiseRejection",
+                "XHR",
+                "step"
+              ]
+            },
+            {
+              "name": "data",
+              "description": "Object containing break-specific auxiliary properties.",
+              "optional": true,
+              "type": "object"
+            },
+            {
+              "name": "hitBreakpoints",
+              "description": "Hit breakpoints IDs",
+              "optional": true,
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "asyncStackTrace",
+              "description": "Async stack trace, if any.",
+              "optional": true,
+              "$ref": "Runtime.StackTrace"
+            },
+            {
+              "name": "asyncStackTraceId",
+              "description": "Async stack trace, if any.",
+              "experimental": true,
+              "optional": true,
+              "$ref": "Runtime.StackTraceId"
+            },
+            {
+              "name": "asyncCallStackTraceId",
+              "description": "Never present, will be removed.",
+              "experimental": true,
+              "deprecated": true,
+              "optional": true,
+              "$ref": "Runtime.StackTraceId"
+            }
+          ]
+        },
+        {
+          "name": "resumed",
+          "description": "Fired when the virtual machine resumed execution."
+        },
         {
           "name": "scriptParsed",
           "description": "Fired when virtual machine parses script. This event is also fired for all known and uncollected\nscripts upon enabling debugger.",

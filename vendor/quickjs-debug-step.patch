@@ -1,0 +1,313 @@
+diff --git a/quickjs.c b/quickjs.c
+index a64fe34..dab4e60 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -377,7 +377,12 @@ struct JSRuntime {
+     int location_last_line;
+     int location_last_column;
+     void *location_last_func;
++    uint64_t location_last_token;
++    uint64_t location_next_token;
++    int location_last_depth;
+     int location_force_notify;
++    int jsbay_location_callback_active;
++    int jsbay_location_repeat;
+     JSExceptionHandler *exception_handler;
+     void *exception_opaque;
+     jsbay_qjs_debugger_work_predicate_t *exception_work_predicate;
+@@ -452,6 +457,12 @@ typedef struct JSStackFrame {
+     /* Borrowed from the active call or its async state. */
+     JSValue jsbay_debug_this;
+     BOOL jsbay_debug_this_valid;
++    uint64_t jsbay_debug_token;
++    const uint8_t *jsbay_debug_entry_pc;
++    void *jsbay_debug_last_func;
++    int jsbay_debug_last_line;
++    int jsbay_debug_last_column;
++    BOOL jsbay_debug_resume_suppressed;
+ #endif
+     int catch_count;
+ } JSStackFrame;
+@@ -2393,6 +2404,8 @@ void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque)
+     rt->location_last_line = -1;
+     rt->location_last_column = -1;
+     rt->location_last_func = NULL;
++    rt->location_last_token = 0;
++    rt->location_last_depth = -1;
+ }
+ 
+ void JS_SetBreakLocationHandler(JSRuntime *rt, JSBreakLocationHandler *cb, void *opaque)
+@@ -2559,10 +2572,13 @@ static void jsbay_collect_break_locations(JSContext *ctx, JSFunctionBytecode *by
+ 
+ 
+ 
+-static void js_notify_location(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *pc)
++static void js_notify_location_internal(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *pc, int post_call)
+ {
+     JSRuntime *rt = ctx->rt;
+     int line, column, depth = 0, force;
++    uint64_t token;
++    int repeated = 0;
++    int saved_active, saved_repeat;
+     JSStackFrame *frame;
+     JSStackFrame *current_frame;
+     const uint8_t *saved_pc;
+@@ -2570,21 +2586,62 @@ static void js_notify_location(JSContext *ctx, JSFunctionBytecode *b, const uint
+     if (!rt->location_handler || (rt->location_work_predicate && !rt->location_work_predicate(rt->location_opaque))) return;
+     line = find_line_num(ctx, b, (int)(pc - b->byte_code_buf), &column);
+     if (line <= 0) return;
++    current_frame = rt->current_stack_frame;
++    token = current_frame ? current_frame->jsbay_debug_token : 0;
++    for (frame = current_frame; frame; frame = frame->prev_frame) depth++;
++    if (current_frame) {
++        int same_source = current_frame->jsbay_debug_last_func == b &&
++            current_frame->jsbay_debug_last_line == line &&
++            current_frame->jsbay_debug_last_column == column;
++        repeated = same_source && current_frame->jsbay_debug_entry_pc &&
++            (post_call || pc > current_frame->jsbay_debug_entry_pc);
++        if (!same_source || !repeated)
++            current_frame->jsbay_debug_entry_pc = pc;
++    }
+     force = __atomic_exchange_n(&rt->location_force_notify, 0, __ATOMIC_SEQ_CST);
+-    if (!force && line == rt->location_last_line && column == rt->location_last_column && rt->location_last_func == b) return;
++    if (current_frame && current_frame->jsbay_debug_resume_suppressed) {
++        int same_location = current_frame->jsbay_debug_last_func == b && current_frame->jsbay_debug_last_line == line && current_frame->jsbay_debug_last_column == column;
++        current_frame->jsbay_debug_resume_suppressed = FALSE;
++        if (!force && same_location) {
++            rt->location_last_line = line;
++            rt->location_last_column = column;
++            rt->location_last_func = b;
++            rt->location_last_token = token;
++            rt->location_last_depth = depth;
++            return;
++        }
++    }
++    if (current_frame) {
++        current_frame->jsbay_debug_last_func = b;
++        current_frame->jsbay_debug_last_line = line;
++        current_frame->jsbay_debug_last_column = column;
++    }
++    if (!force && repeated && line == rt->location_last_line && column == rt->location_last_column && rt->location_last_func == b && rt->location_last_token == token && rt->location_last_depth == depth) return;
+     rt->location_last_line = line;
+     rt->location_last_column = column;
+     rt->location_last_func = b;
++    rt->location_last_token = token;
++    rt->location_last_depth = depth;
++
+     if (b->debug.filename != JS_ATOM_NULL) filename = JS_AtomToCString(ctx, b->debug.filename);
+-    current_frame = rt->current_stack_frame;
+     saved_pc = current_frame ? current_frame->cur_pc : NULL;
+     if (current_frame) current_frame->cur_pc = pc + 1;
+-    for (frame = rt->current_stack_frame; frame; frame = frame->prev_frame) depth++;
++    saved_active = rt->jsbay_location_callback_active;
++    saved_repeat = rt->jsbay_location_repeat;
++    rt->jsbay_location_callback_active = 1;
++    rt->jsbay_location_repeat = repeated;
+     rt->location_handler(ctx, filename ? filename : "", line, column, depth, b->jsbay_script_tag, rt->location_opaque);
++    rt->jsbay_location_repeat = saved_repeat;
++    rt->jsbay_location_callback_active = saved_active;
+     if (current_frame) current_frame->cur_pc = saved_pc;
+     if (filename) JS_FreeCString(ctx, filename);
+ }
+ 
++static void js_notify_location(JSContext *ctx, JSFunctionBytecode *b, const uint8_t *pc)
++{
++    js_notify_location_internal(ctx, b, pc, 0);
++}
++
+ static JSStackFrame *js_debug_frame(JSContext *ctx, int index)
+ {
+     JSStackFrame *frame = ctx->rt->current_stack_frame;
+@@ -8392,6 +8449,43 @@ int JS_CopyDebugStack(JSContext *ctx, JSDebugFrameInfo *out, int max)
+ }
+ #endif
+ 
++int JS_GetDebugStackDepth(JSContext *ctx)
++{
++    JSStackFrame *frame;
++    int depth = 0;
++    if (!ctx)
++        return 0;
++    for (frame = ctx->rt->current_stack_frame; frame; frame = frame->prev_frame)
++        depth++;
++    return depth;
++}
++
++int JS_IsDebugLocationRepeat(JSContext *ctx)
++{
++#if JSBAY_INSPECTOR
++    return ctx && ctx->rt->jsbay_location_callback_active && ctx->rt->jsbay_location_repeat;
++#else
++    (void)ctx;
++    return 0;
++#endif
++}
++
++uint64_t JS_GetDebugFrameToken(JSContext *ctx)
++{
++#if JSBAY_INSPECTOR
++    JSStackFrame *frame;
++    if (ctx) {
++        for (frame = ctx->rt->current_stack_frame; frame; frame = frame->prev_frame) {
++            if (frame->jsbay_debug_token)
++                return frame->jsbay_debug_token;
++        }
++    }
++#else
++    (void)ctx;
++#endif
++    return 0;
++}
++
+ /* return a string property without executing arbitrary JS code (used
+    when dumping the stack trace or in debug print). */
+ static const char *get_prop_string(JSContext *ctx, JSValueConst obj, JSAtom prop)
+@@ -18741,6 +18835,10 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
+     ctx = p->u.cfunc.realm; /* change the current realm */
+     sf->js_mode = 0;
+     sf->catch_count = 0;
++#if JSBAY_INSPECTOR
++    sf->jsbay_debug_token = 0;
++    sf->jsbay_debug_resume_suppressed = FALSE;
++#endif
+     sf->cur_func = (JSValue)func_obj;
+     sf->arg_count = argc;
+     arg_buf = argv;
+@@ -19011,6 +19109,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+     sf->js_mode = b->js_mode;
+     sf->catch_count = 0;
+ #if JSBAY_INSPECTOR
++    sf->jsbay_debug_token = ++rt->location_next_token;
++    sf->jsbay_debug_resume_suppressed = FALSE;
++    sf->jsbay_debug_entry_pc = NULL;
++    sf->jsbay_debug_last_func = NULL;
++    sf->jsbay_debug_last_line = -1;
++    sf->jsbay_debug_last_column = -1;
+     sf->jsbay_debug_this = (JSValue)this_obj;
+     sf->jsbay_debug_this_valid = TRUE;
+ #endif
+@@ -19369,8 +19473,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                           JS_UNDEFINED, call_argc, call_argv, 0);
+                 if (unlikely(JS_IsException(ret_val)))
+                     goto exception;
+-                if (opcode == OP_tail_call)
++                if (opcode == OP_tail_call) {
++#if JSBAY_INSPECTOR
++                    if (rt->location_handler && (!rt->location_work_predicate || rt->location_work_predicate(rt->location_opaque)))
++                        js_notify_location_internal(ctx, b, pc - 3, 1);
++#endif
+                     goto done;
++                }
+                 for(i = -1; i < call_argc; i++)
+                     JS_FreeValue(ctx, call_argv[i]);
+                 sp -= call_argc + 1;
+@@ -19405,8 +19514,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+                                           JS_UNDEFINED, call_argc, call_argv, 0);
+                 if (unlikely(JS_IsException(ret_val)))
+                     goto exception;
+-                if (opcode == OP_tail_call_method)
++                if (opcode == OP_tail_call_method) {
++#if JSBAY_INSPECTOR
++                    if (rt->location_handler && (!rt->location_work_predicate || rt->location_work_predicate(rt->location_opaque)))
++                        js_notify_location_internal(ctx, b, pc - 3, 1);
++#endif
+                     goto done;
++                }
+                 for(i = -2; i < call_argc; i++)
+                     JS_FreeValue(ctx, call_argv[i]);
+                 sp -= call_argc + 2;
+@@ -22006,6 +22120,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+        generator function. */
+     if (b->func_kind != JS_FUNC_NORMAL) {
+     done_generator:
++#if JSBAY_INSPECTOR
++        if ((opcode == OP_await || opcode == OP_yield ||
++             opcode == OP_yield_star || opcode == OP_async_yield_star) &&
++            !JS_IsException(ret_val)) {
++            sf->jsbay_debug_resume_suppressed = rt->location_handler &&
++                (!rt->location_work_predicate || rt->location_work_predicate(rt->location_opaque));
++        }
++#endif
+         sf->cur_pc = pc;
+         sf->cur_sp = sp;
+     } else {
+@@ -22226,6 +22348,14 @@ static JSAsyncFunctionState *async_func_init(JSContext *ctx,
+     sf = &s->frame;
+     sf->js_mode = b->js_mode | JS_MODE_ASYNC;
+     sf->catch_count = 0;
++#if JSBAY_INSPECTOR
++    sf->jsbay_debug_token = ++ctx->rt->location_next_token;
++    sf->jsbay_debug_resume_suppressed = FALSE;
++    sf->jsbay_debug_entry_pc = NULL;
++    sf->jsbay_debug_last_func = NULL;
++    sf->jsbay_debug_last_line = -1;
++    sf->jsbay_debug_last_column = -1;
++#endif
+     sf->cur_pc = b->byte_code_buf;
+     sf->arg_buf = (JSValue *)(s + 1);
+     sf->cur_func = JS_DupValue(ctx, func_obj);
+@@ -30264,6 +30394,10 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
+     JSContext *ctx = s->ctx;
+     JSFunctionDef *fd = s->cur_func;
+     JSAtom var_name;
++#if JSBAY_INSPECTOR
++    const uint8_t *debug_loop_head = s->token.ptr;
++    const uint8_t *debug_loop_operator;
++#endif
+     BOOL has_initializer, is_for_of, has_destructuring;
+     int tok, tok1, opcode, scope, block_scope_level;
+     int label_next, label_expr, label_cont, label_body, label_break;
+@@ -30295,6 +30429,9 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
+ 
+     pos_next = s->cur_func->byte_code.size;
+     emit_label(s, label_next);
++#if JSBAY_INSPECTOR
++    emit_source_pos(s, debug_loop_head);
++#endif
+ 
+     tok = s->token.val;
+     switch (is_let(s, DECL_MASK_OTHER)) {
+@@ -30414,6 +30551,9 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
+     }
+     JS_FreeAtom(ctx, var_name);
+ 
++#if JSBAY_INSPECTOR
++    debug_loop_operator = s->token.ptr;
++#endif
+     if (token_is_pseudo_keyword(s, JS_ATOM_of)) {
+         is_for_of = TRUE;
+         if (has_initializer)
+@@ -30435,6 +30575,9 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
+     }
+     if (next_token(s))
+         return -1;
++#if JSBAY_INSPECTOR
++    emit_source_pos(s, s->token.ptr);
++#endif
+     if (is_for_of) {
+         if (js_parse_assign_expr(s))
+             return -1;
+@@ -30506,6 +30649,9 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
+     close_scopes(s, s->cur_func->scope_level, block_scope_level);
+ 
+     emit_label(s, label_cont);
++#if JSBAY_INSPECTOR
++    emit_source_pos(s, debug_loop_operator);
++#endif
+     if (is_for_of) {
+         if (is_async) {
+             /* stack: iter_obj next catch_offset */
+diff --git a/quickjs.h b/quickjs.h
+index 798e994..00822a3 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1010,6 +1010,9 @@ void jsbay_qjs_set_exception_work_predicate(JSRuntime *rt, jsbay_qjs_debugger_wo
+ JSValue JS_CopyDebugScope(JSContext *ctx, int frame_index, int scope);
+ JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, size_t len);
+ #endif
++int JS_GetDebugStackDepth(JSContext *ctx);
++uint64_t JS_GetDebugFrameToken(JSContext *ctx);
++int JS_IsDebugLocationRepeat(JSContext *ctx);
+ /* if can_block is TRUE, Atomics.wait() can be used */
+ void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
+ /* select which debug info is stripped from the compiled code */

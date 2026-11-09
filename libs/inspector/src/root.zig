@@ -14,7 +14,8 @@ pub fn protocolJson(comptime backend: ProtocolBackend, comptime heap_snapshot: b
         .quickjs_ng => if (heap_snapshot) @embedFile("protocol-quickjs-ng.json") else @embedFile("protocol-quickjs-ng-no-heap.json"),
         .quickjs => if (heap_snapshot) @embedFile("protocol-quickjs.json") else @embedFile("protocol-quickjs-no-heap.json"),
         .jsc => @embedFile("protocol-jsc.json"),
-        .escargot, .hermes => @embedFile("protocol-jsc.json"),
+        .escargot => @embedFile("protocol-escargot.json"),
+        .hermes => @embedFile("protocol-hermes.json"),
     };
 }
 

@@ -46,7 +46,7 @@ pub fn isPointerValueBackend(tag: BackendType) bool {
 
 /// Whether this engine exposes the bytecode debugger hooks used by debugger.zig.
 pub fn supportsDebugger(tag: BackendType) bool {
-    return tag == .quickjs_ng;
+    return isQuickJsApiBackend(tag) or tag == .escargot;
 }
 
 /// Spike engines: gate advanced features until the native facade is complete.
@@ -56,7 +56,7 @@ pub fn isSpikeBackend(tag: BackendType) bool {
 
 /// Whether the backend can retain compiler-assigned source identities for Debugger.scriptParsed and Debugger.getScriptSource.
 pub fn supportsSourceJournal(tag: BackendType) bool {
-    return tag == .quickjs or tag == .quickjs_ng;
+    return isQuickJsApiBackend(tag) or tag == .escargot;
 }
 
 pub const ActiveEngine = Engine(active_backend);
@@ -156,7 +156,7 @@ pub fn libraryCapabilityFlags() u32 {
             flags |= CapabilityFlags.persistent_bytecode_cache;
         }
     }
-    if (supportsDebugger(active_backend) and build_options.inspector) {
+    if ((supportsDebugger(active_backend) or isHermesBackend(active_backend)) and build_options.inspector) {
         flags |= CapabilityFlags.cdp_source_debugger;
     }
     if (active_backend == .jsc) {

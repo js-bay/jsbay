@@ -30,6 +30,23 @@ pub const jsc = [_]Domain{
     .{ .name = "Schema" },
 };
 
+pub const escargot = [_]Domain{
+    .{ .name = "Runtime" },
+    .{ .name = "Debugger" },
+    .{ .name = "HeapProfiler" },
+    .{ .name = "Performance" },
+    .{ .name = "Schema" },
+};
+
+pub const hermes = [_]Domain{
+    .{ .name = "Runtime" },
+    .{ .name = "Debugger" },
+    .{ .name = "Profiler" },
+    .{ .name = "HeapProfiler" },
+    .{ .name = "Performance" },
+    .{ .name = "Schema" },
+};
+
 pub const quickjs_ng_no_heap = [_]Domain{
     .{ .name = "Runtime" },
     .{ .name = "Debugger" },

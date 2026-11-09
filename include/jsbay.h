@@ -55,7 +55,7 @@ enum {
     JSBAY_CAP_INTERRUPT_DEADLINE = 1u << 2,         /* request_interrupt + execution time limit */
     JSBAY_CAP_EXPLICIT_BYTECODE = 1u << 3,          /* compile_bytecode / run_bytecode (not UNSUPPORTED) */
     JSBAY_CAP_PERSISTENT_BYTECODE_CACHE = 1u << 4, /* evaluate/CJS cache path (not source-only fallback) */
-    JSBAY_CAP_CDP_SOURCE_DEBUGGER = 1u << 5,       /* supportsDebugger (quickjs_ng) */
+    JSBAY_CAP_CDP_SOURCE_DEBUGGER = 1u << 5,       /* Non-JSC CDP execution debugging when enabled */
     JSBAY_CAP_SAFARI_WEB_INSPECTOR = 1u << 6,      /* JSC remote inspector */
 };
 typedef struct {

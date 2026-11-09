@@ -45,6 +45,7 @@ pub fn Module(comptime Host: type) type {
         const await_promise = @import("await_promise.zig").Module(Host);
         const dispatcher = @import("dispatcher.zig").Module(Host);
         const debugger_cdp = @import("debugger_cdp.zig").Module(Host);
+        const native_cdp = @import("native_cdp.zig").Module(Host);
         const object_table = @import("object_table.zig").Module(Host);
         const profiler = @import("profiler.zig").Module(Host);
         const runtime_objects = @import("runtime_objects.zig").Module(Host);
@@ -178,6 +179,9 @@ pub fn Module(comptime Host: type) type {
             });
             errdefer console_tap.clear(instance_id);
 
+            if (!native_cdp.start(state)) return StartError.OutOfMemory;
+            errdefer native_cdp.stop(state);
+
             // Once start is entered, an implementation may have retained the callback even if it reports an error. This errdefer is later than every state cleanup, hence runs first and drains any task leases produced by its final session_closed callback.
             transport_started = true;
             errdefer rollbackStart(state);
@@ -214,6 +218,7 @@ pub fn Module(comptime Host: type) type {
         }
 
         fn releaseInspector(state: *InspectorState) void {
+            native_cdp.closeSessions(state);
             debugger_cdp.stopInstance(state);
             await_promise.cancelState(state);
             console_tap.dropInstance(state.instance_id);
@@ -246,6 +251,7 @@ pub fn Module(comptime Host: type) type {
         /// A transport is permitted to synchronously report its final close while `deinit` runs. Reject task creation first, then release any leases that callback created before the start errdefers unlink and destroy the state.
         fn rollbackStart(state: *InspectorState) void {
             state_mod.beginClosing(state);
+            native_cdp.closeSessions(state);
             state.transport.deinit();
             debugger_cdp.stopInstance(state);
             await_promise.cancelState(state);
@@ -267,6 +273,7 @@ pub fn Module(comptime Host: type) type {
                 return;
             }
             defer engine_thread.endEval(lease);
+            native_cdp.stop(state);
             // Finalization runs on the JS owner after all session/reader work has drained, so disarming here cannot race a new state with the same id.
             debugger_cdp.stopInstance(state);
             Host.debugger.stopCollector(state.instance_id);

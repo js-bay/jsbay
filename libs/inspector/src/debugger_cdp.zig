@@ -386,6 +386,10 @@ pub fn Module(comptime Host: type) type {
                 return true;
             }
             if (std.mem.eql(u8, method, "Debugger.setAsyncCallStackDepth")) {
+                if (comptime backend.isEscargotBackend(backend.active_backend)) {
+                    json_writer.sendMethodNotFound(state, session_id, request_id, method);
+                    return true;
+                }
                 const params = objectParams(root);
                 const raw = if (params) |p| intField(p, "maxDepth") orelse 0 else 0;
                 const depth: u32 = if (raw <= 0) 0 else @intCast(@min(raw, 8));
@@ -415,6 +419,10 @@ pub fn Module(comptime Host: type) type {
                 return true;
             }
             if (std.mem.eql(u8, method, "Debugger.setPauseOnExceptions")) {
+                if (comptime backend.isEscargotBackend(backend.active_backend)) {
+                    json_writer.sendMethodNotFound(state, session_id, request_id, method);
+                    return true;
+                }
                 const params = objectParams(root) orelse {
                     json_writer.sendInvalidParams(state, session_id, request_id, "params");
                     return true;
@@ -820,7 +828,7 @@ pub fn Module(comptime Host: type) type {
         }
 
         fn runEvalOnCallFrame(box: *request_box.RequestBox, ctx: ActiveEngine.Context) void {
-            if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) {
+            if (comptime !backend.supportsDebugger(backend.active_backend)) {
                 json_writer.sendInvalidParams(box.state, box.session_id, box.request_id, "paused");
                 return;
             }
@@ -828,10 +836,8 @@ pub fn Module(comptime Host: type) type {
                 json_writer.sendInvalidParams(box.state, box.session_id, box.request_id, "paused");
                 return;
             }
-            const qjs = Host.backend.ActiveEngineModule.c_api.qjs;
-            const value = qjs.JS_EvalInDebugFrame(ctx, box.frame_index, box.expression.ptr, box.expression.len);
-            if (value.tag == Host.backend.ActiveEngineModule.qjs.JS_TAG_EXCEPTION) {
-                const thrown = qjs.JS_GetException(ctx);
+            const result = debugger_mod.evalDebugFrameValue(box.state.instance_id, box.frame_index, box.expression);
+            if (result.exception) |thrown| {
                 const text = ActiveEngine.valueToString(ctx, thrown) orelse "exception";
                 const owned = text;
                 remote_object.sendEvalException(box.state, box.session_id, box.request_id, owned);
@@ -839,6 +845,10 @@ pub fn Module(comptime Host: type) type {
                 ActiveEngine.freeValue(ctx, thrown);
                 return;
             }
+            const value = result.value orelse {
+                remote_object.sendEvalException(box.state, box.session_id, box.request_id, "Frame evaluation is unavailable");
+                return;
+            };
             var aw: std.Io.Writer.Allocating = .init(box.state.allocator);
             defer aw.deinit();
             const w = &aw.writer;

@@ -36,6 +36,7 @@ struct JsbayHermesContextOpaque {
     JsbayHermesRuntimeOpaque *owner = nullptr;
     FbHermesRuntime *rt = nullptr;
     void *opaque = nullptr;
+    JsbayHermesInspector *inspector = nullptr;
     std::mutex protect_mu;
     std::unordered_map<jsi::Value *, std::pair<int, std::unique_ptr<jsi::Value>>> protect;
     std::string pending_throw;
@@ -600,6 +601,18 @@ extern "C" void *hermes_context_get_opaque(JsbayHermesContext *ctx) {
     return ctx ? ctx->opaque : nullptr;
 }
 
+extern "C" void hermes_context_set_inspector(JsbayHermesContext *ctx, JsbayHermesInspector *inspector) {
+    if (ctx) ctx->inspector = inspector;
+}
+
+extern "C" JsbayHermesInspector *hermes_context_get_inspector(JsbayHermesContext *ctx) {
+    return ctx ? ctx->inspector : nullptr;
+}
+// Kept private to the CDP bridge translation unit; callers must use the Inspector handle.
+extern "C" FbHermesRuntime *hermes_context_runtime_for_inspector(JsbayHermesContext *ctx) {
+    return ctx ? ctx->rt : nullptr;
+}
+
 
 static std::string formatJSError(const jsi::JSError &e) {
     // Message alone omits sourceURL; stack is "Error: msg\n    at ... (file:line:col)".
@@ -619,18 +632,23 @@ extern "C" HermesEvalResult hermes_eval(JsbayHermesContext *c, const char *src, 
         std::string code(src ? src : "", src_len);
         std::string url(filename ? filename : "", filename_len);
         if (url.empty()) url = "<eval>";
+        hermes_inspector_source_begin(c, code.data(), code.size());
         jsi::Value result = c->rt->evaluateJavaScript(
             std::make_shared<jsi::StringBuffer>(std::move(code)), url);
+        hermes_inspector_source_end(c);
         if (result.isUndefined() || result.isNull()) {
             // Match Escargot/jsbay: nullish completion yields null result, no err.
             return out;
         }
         hermesEvalSetResult(out, valueToDisplayString(*c->rt, result));
     } catch (const jsi::JSError &e) {
+        hermes_inspector_source_end(c);
         hermesEvalSetErr(out, formatJSError(e));
     } catch (const std::exception &e) {
+        hermes_inspector_source_end(c);
         hermesEvalSetErr(out, e.what());
     } catch (...) {
+        hermes_inspector_source_end(c);
         hermesEvalSetErr(out, "unknown JS error");
     }
     return out;
@@ -1123,10 +1141,13 @@ extern "C" HermesValueResult hermes_eval_value(JsbayHermesContext *c, const char
         std::string code(src ? src : "", src_len);
         std::string url(filename ? filename : "", filename_len);
         if (url.empty()) url = "<eval>";
+        hermes_inspector_source_begin(c, code.data(), code.size());
         jsi::Value result = c->rt->evaluateJavaScript(
             std::make_shared<jsi::StringBuffer>(std::move(code)), url);
+        hermes_inspector_source_end(c);
         out.value = retainMove(c, std::move(result));
     } catch (const jsi::JSError &e) {
+        hermes_inspector_source_end(c);
         try {
             out.value = retainMove(c, jsi::Value(*c->rt, e.value()));
         } catch (...) {
@@ -1134,8 +1155,10 @@ extern "C" HermesValueResult hermes_eval_value(JsbayHermesContext *c, const char
         }
         out.err = dupCString(formatJSError(e));
     } catch (const std::exception &e) {
+        hermes_inspector_source_end(c);
         out.err = dupCString(e.what());
     } catch (...) {
+        hermes_inspector_source_end(c);
         out.err = dupCString("unknown JS error");
     }
     return out;

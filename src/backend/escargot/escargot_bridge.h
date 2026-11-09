@@ -36,6 +36,40 @@ void escargot_context_free(EscargotContext *ctx);
 void escargot_context_set_opaque(EscargotContext *ctx, void *opaque);
 void *escargot_context_get_opaque(EscargotContext *ctx);
 
+/* ---- Debugger (requires an Escargot build with ESCARGOT_DEBUGGER=ON) ---- */
+typedef uint64_t (*EscargotDebugSourceFn)(EscargotContext *ctx, const char *filename,
+                                          const char *source, size_t source_len, void *user);
+typedef void (*EscargotDebugBreakLocationsFn)(EscargotContext *ctx, const char *filename,
+                                              int line, int column, uint64_t script_tag,
+                                              int complete, int truncated, void *user);
+typedef void (*EscargotDebugLocationFn)(EscargotContext *ctx, const char *filename,
+                                        int line, int column, int depth, uint64_t script_tag,
+                                        void *user);
+typedef bool (*EscargotDebuggerStatementFn)(EscargotContext *ctx, void *user);
+bool escargot_debugger_attach(EscargotContext *ctx, EscargotDebugSourceFn source_cb,
+                              EscargotDebugBreakLocationsFn break_locations_cb,
+                              EscargotDebugLocationFn location_cb,
+                              EscargotDebuggerStatementFn debugger_cb, void *user);
+void escargot_debugger_set_execution(EscargotContext *ctx, bool enabled);
+void escargot_debugger_detach(EscargotContext *ctx);
+typedef struct {
+    char name[256];
+    char filename[512];
+    int line;
+    int column;
+    uint64_t script_tag;
+} EscargotDebugFrame;
+int escargot_debugger_copy_stack(EscargotContext *ctx, EscargotDebugFrame *out, int max);
+int escargot_debugger_depth(EscargotContext *ctx);
+uint64_t escargot_debugger_frame_token(EscargotContext *ctx);
+bool escargot_debugger_location_is_repeat(EscargotContext *ctx);
+bool escargot_debugger_location_is_breakpoint_target(EscargotContext *ctx);
+EscargotValue escargot_debugger_scope(EscargotContext *ctx, int frame, int scope_index);
+EscargotValue escargot_debugger_this(EscargotContext *ctx, int frame);
+EscargotValue escargot_debugger_eval_frame(EscargotContext *ctx, int frame,
+                                           const char *expr, size_t expr_len,
+                                           EscargotValue *out_exception);
+
 EscargotEvalResult escargot_eval(EscargotContext *ctx, const char *src, size_t src_len,
                                  const char *filename, size_t filename_len);
 void escargot_eval_result_free(EscargotEvalResult r);

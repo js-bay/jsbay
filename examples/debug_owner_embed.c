@@ -16,8 +16,8 @@
  *   zig build debug-owner-embed -Dbackend=quickjs_ng -- --port 9229
  *   zig build debug-owner-embed-test -Dbackend=quickjs_ng
  *
- * Prefer -Dbackend=quickjs_ng when Sources / breakpoints matter; plain
- * quickjs advertises no Debugger domain. --port 0 binds an ephemeral port.
+ * Both QuickJS-family backends expose Sources and execution debugging.
+ * --port 0 binds an ephemeral port.
  */
 
 #ifndef _POSIX_C_SOURCE

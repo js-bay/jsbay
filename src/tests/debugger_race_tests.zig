@@ -138,7 +138,7 @@ fn reconnect(session: *Session, target_id: []const u8) !void {
 }
 
 test "cold debugger configuration never arms handlers on the reader thread" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "debugger-reader-reader-rearm");
     defer session.deinit();
@@ -161,7 +161,7 @@ test "cold debugger configuration never arms handlers on the reader thread" {
 }
 
 test "queued enable cannot attach after its session closes" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "debugger-queued-queued-enable-close");
     defer session.deinit();
@@ -204,7 +204,7 @@ test "queued enable cannot attach after its session closes" {
 }
 
 test "breakpoint queued beside first enable survives owner admission" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "debugger-batch-first-enable-batch");
     defer session.deinit();
@@ -238,7 +238,7 @@ test "breakpoint queued beside first enable survives owner admission" {
 }
 
 test "reader-thread configuration is cold again after its session disconnects" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "debugger-reader-disconnect-cold");
     defer session.deinit();
@@ -269,7 +269,7 @@ test "reader-thread configuration is cold again after its session disconnects" {
 }
 
 test "exception mode beside first enable pauses after owner admission" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "debugger-batch-exception-batch");
     defer session.deinit();
@@ -316,7 +316,7 @@ test "exception mode beside first enable pauses after owner admission" {
 }
 
 test "debugger session survives async depth and reconnect without native hooks" {
-    if (comptime backend.active_backend == .quickjs_ng) return;
+    if (comptime backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "debugger-cross-backend-debugger-session");
     defer session.deinit();
@@ -346,7 +346,7 @@ test "debugger session survives async depth and reconnect without native hooks" 
 }
 
 test "a second debugger session does not discard another session's pending pause" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var first = try openSession(alloc, "pending-pause-owner");
     defer first.deinit();
@@ -396,7 +396,7 @@ test "a second debugger session does not discard another session's pending pause
 }
 
 test "a queued disable cannot override a later enable on non-native backends" {
-    if (comptime backend.active_backend == .quickjs_ng) return;
+    if (comptime backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "queued-disable-generation");
     defer session.deinit();

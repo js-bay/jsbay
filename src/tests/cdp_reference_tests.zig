@@ -215,6 +215,48 @@ fn idMarker(alloc: std.mem.Allocator, id: i64) ![]u8 {
     return std.fmt.allocPrint(alloc, "\"id\":{d},", .{id});
 }
 
+fn stepProtocolMessage(session: *Session, start: usize, id: ?i64, method: ?[]const u8) !std.json.Parsed(std.json.Value) {
+    var lines = std.mem.splitScalar(u8, session.got.items[start..], '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, session.alloc, line, .{ .allocate = .alloc_always }) catch continue;
+        if (parsed.value == .object) {
+            const matches = if (id) |wanted| blk: {
+                const actual = parsed.value.object.get("id") orelse break :blk false;
+                break :blk actual == .integer and actual.integer == wanted;
+            } else blk: {
+                const actual = parsed.value.object.get("method") orelse break :blk false;
+                break :blk actual == .string and std.mem.eql(u8, actual.string, method.?);
+            };
+            if (matches) return parsed;
+        }
+        parsed.deinit();
+    }
+    return error.MissingProtocolMessage;
+}
+
+fn stepTopFrame(message: std.json.Value) !std.json.Value {
+    const params = message.object.get("params") orelse return error.MissingParams;
+    const frames = params.object.get("callFrames") orelse return error.MissingFrames;
+    if (frames != .array or frames.array.items.len == 0) return error.MissingFrames;
+    return frames.array.items[0];
+}
+
+fn expectPausedFlag(session: *Session, expression: []const u8) !void {
+    const params = try std.fmt.allocPrint(session.alloc, "{{\"callFrameId\":\"0\",\"expression\":{f}}}", .{std.json.fmt(expression, .{})});
+    defer session.alloc.free(params);
+    const mark = session.got.items.len;
+    const id = try session.command("Debugger.evaluateOnCallFrame", params);
+    try session.expect(try session.waitResponseId(mark, id, 40));
+    const reply = try stepProtocolMessage(session, mark, id, null);
+    defer reply.deinit();
+    const result = reply.value.object.get("result") orelse return error.MissingResult;
+    const remote = result.object.get("result") orelse return error.MissingResult;
+    const flag = remote.object.get("value") orelse return error.MissingValue;
+    if (flag != .bool or !flag.bool) std.debug.print("paused flag: {f}\n", .{std.json.fmt(reply.value, .{})});
+    try testing.expect(flag == .bool and flag.bool);
+}
+
 fn waitCommand(session: *Session, id: i64) !void {
     const marker = try idMarker(session.alloc, id);
     defer session.alloc.free(marker);
@@ -539,7 +581,7 @@ test "cdp: a breakpoint on the last line hits" {
 
 const step_script =
     \\function inner() {
-    \\  var x = 1;
+    \\  var x = (globalThis.__stepIntoEntered = true, 1);
     \\  return x;
     \\}
     \\function outer() {
@@ -573,8 +615,8 @@ test "cdp: stepOver stays in the caller" {
     try testing.expectEqualStrings("1", box.result);
 }
 
-test "cdp: stepInto enters the callee and stepOut returns" {
-    // V8 debugger/step-into.js and debugger/step-into-out.js.
+test "cdp: stepOut returns to the first native caller location" {
+    // Native locations can stop inside the caller's assignment after the callee has returned.
     if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-step-into");
@@ -584,20 +626,46 @@ test "cdp: stepInto enters the callee and stepOut returns" {
     var box = EvalBox{ .id = session.id, .script = step_script, .filename = "into.js" };
     defer box.deinit();
     _ = try pauseOn(&session, &box);
+    const breakpoint_id = quoteAfter(session.got.items, "\"breakpointId\":") orelse return error.MissingBreakpoint;
+    const remove_params = try std.fmt.allocPrint(alloc, "{{\"breakpointId\":{f}}}", .{std.json.fmt(breakpoint_id, .{})});
+    defer alloc.free(remove_params);
+    const remove_at = session.got.items.len;
+    const removed = try session.command("Debugger.removeBreakpoint", remove_params);
+    try session.expect(try session.waitResponseId(remove_at, removed, 40));
+    const remove_reply = try stepProtocolMessage(&session, remove_at, removed, null);
+    defer remove_reply.deinit();
+    try testing.expect(remove_reply.value.object.get("error") == null);
+    try expectPausedFlag(&session, "typeof globalThis.__stepIntoEntered === 'undefined'");
+
     const into_at = session.got.items.len;
     _ = try session.command("Debugger.stepInto", "");
     try session.expect(try session.waitFrom(into_at, "Debugger.paused", 80));
-    const into_line = intAfter(session.got.items[into_at..], "\"lineNumber\":");
-    try testing.expect(std.mem.indexOf(u8, session.got.items[into_at..], "\"functionName\":\"inner\"") != null);
-    // QuickJS reports the function header as well as the first statement.
+    const into = try stepProtocolMessage(&session, into_at, null, "Debugger.paused");
+    defer into.deinit();
+    const inner = try stepTopFrame(into.value);
+    try testing.expectEqualStrings("inner", inner.object.get("functionName").?.string);
+    const into_line = inner.object.get("location").?.object.get("lineNumber").?.integer;
     try testing.expect(into_line == 0 or into_line == 1);
 
     const out_at = session.got.items.len;
     _ = try session.command("Debugger.stepOut", "");
     try session.expect(try session.waitFrom(out_at, "Debugger.paused", 80));
-    const out_line = intAfter(session.got.items[out_at..], "\"lineNumber\":");
-    try testing.expect(std.mem.indexOf(u8, session.got.items[out_at..], "\"functionName\":\"outer\"") != null);
-    try testing.expect(out_line == 6);
+    const out = try stepProtocolMessage(&session, out_at, null, "Debugger.paused");
+    defer out.deinit();
+    const caller = try stepTopFrame(out.value);
+    try testing.expectEqualStrings("outer", caller.object.get("functionName").?.string);
+    try testing.expectEqual(@as(i64, 5), caller.object.get("location").?.object.get("lineNumber").?.integer);
+    try expectPausedFlag(&session, "globalThis.__stepIntoEntered === true && typeof y === 'undefined'");
+
+    const over_at = session.got.items.len;
+    _ = try session.command("Debugger.stepOver", "");
+    try session.expect(try session.waitFrom(over_at, "Debugger.paused", 80));
+    const over = try stepProtocolMessage(&session, over_at, null, "Debugger.paused");
+    defer over.deinit();
+    const completed = try stepTopFrame(over.value);
+    try testing.expectEqualStrings("outer", completed.object.get("functionName").?.string);
+    try testing.expectEqual(@as(i64, 6), completed.object.get("location").?.object.get("lineNumber").?.integer);
+    try expectPausedFlag(&session, "y === 1");
     try resumeSession(&session);
     try testing.expectEqualStrings("1", box.result);
 }
@@ -765,6 +833,34 @@ test "cdp: evaluateOnCallFrame reads a local and its closure" {
     try testing.expect(std.mem.indexOf(u8, session.got.items, "\"value\":7") != null);
     try resumeSession(&session);
     try testing.expectEqualStrings("8", box.result);
+}
+
+test "cdp: evaluateOnCallFrame keeps frame locals named scope and expression" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-frame-helper-bindings");
+    defer session.deinit();
+    try enableDebugger(&session);
+    try setBreakpoint(&session, "frame-helper-bindings.js", 1);
+    var box = EvalBox{
+        .id = session.id,
+        .script = "function f(scope, expression) {\n  return scope + expression;\n}\nf(31, 32)\n",
+        .filename = "frame-helper-bindings.js",
+    };
+    defer box.deinit();
+    _ = try pauseOn(&session, &box);
+    const scope_id = try session.command("Debugger.evaluateOnCallFrame", "{\"callFrameId\":\"0\",\"expression\":\"scope\"}");
+    const expression_id = try session.command("Debugger.evaluateOnCallFrame", "{\"callFrameId\":\"0\",\"expression\":\"expression\"}");
+    const scope_marker = try idMarker(alloc, scope_id);
+    defer alloc.free(scope_marker);
+    const expression_marker = try idMarker(alloc, expression_id);
+    defer alloc.free(expression_marker);
+    try session.expect(try session.wait(scope_marker, 40));
+    try session.expect(try session.wait(expression_marker, 40));
+    try testing.expect(std.mem.indexOf(u8, session.got.items, "\"value\":31") != null);
+    try testing.expect(std.mem.indexOf(u8, session.got.items, "\"value\":32") != null);
+    try resumeSession(&session);
+    try testing.expectEqualStrings("63", box.result);
 }
 
 const method_script =

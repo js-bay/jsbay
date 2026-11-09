@@ -1,0 +1,31 @@
+--- a/API/hermes/cdp/CDPAgent.cpp
++++ b/API/hermes/cdp/CDPAgent.cpp
+@@ -206,6 +206,8 @@
+ 
+   RuntimeTaskRunner runtimeTaskRunner_;
+   std::shared_ptr<DomainAgents> domainAgents_;
++  std::shared_ptr<std::atomic_bool> commandActive_ =
++      std::make_shared<std::atomic_bool>(true);
+ };
+ 
+ CDPAgentImpl::CDPAgentImpl(
+@@ -230,6 +232,7 @@
+               std::move(destroyedDomainAgentsImpl))) {}
+ 
+ CDPAgentImpl::~CDPAgentImpl() {
++  commandActive_->store(false, std::memory_order_release);
+   // Call DomainAgents::dispose on the runtime thread, only keeping a copy of
+   // the domainAgents shared pointer (as opposed to the usual shared "this"),
+   // so the remainder of the CDP Agent is free to be released.
+@@ -276,7 +279,11 @@
+   // Call DomainAgents::handleCommand on the runtime thread.
+   TaskQueues queues = messageTaskQueues(command->method);
+   RuntimeTask task = [weakDomainAgentsImpl = domainAgents_->getImplWeakPtr(),
++                      commandActive = commandActive_,
+                       command = std::move(command)](HermesRuntime &) mutable {
++    if (!commandActive->load(std::memory_order_acquire)) {
++      return;
++    }
+     if (auto strongDomainAgents = weakDomainAgentsImpl.lock()) {
+       strongDomainAgents->handleCommand(std::move(command));
+     }

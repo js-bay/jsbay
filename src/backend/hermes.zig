@@ -2,7 +2,7 @@
 const std = @import("std");
 const lifecycle = @import("hermes/lifecycle.zig");
 const value_mod = @import("hermes/value.zig");
-const c_api = @import("hermes/c_api.zig");
+pub const c_api = @import("hermes/c_api.zig");
 const console_mod = @import("hermes/console.zig");
 const timers_mod = @import("hermes/timers.zig");
 

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 using namespace Escargot;
@@ -99,6 +100,24 @@ struct EscargotContextOpaque {
     // Pristine JSON.parse / JSON.stringify (C ABI must ignore script-replaced globalThis.JSON).
     PersistentRefHolder<ValueRef> pristine_json_parse;
     PersistentRefHolder<ValueRef> pristine_json_stringify;
+#ifdef ESCARGOT_DEBUGGER
+    EscargotDebugSourceFn debug_source_cb = nullptr;
+    EscargotDebugBreakLocationsFn debug_break_locations_cb = nullptr;
+    EscargotDebugLocationFn debug_location_cb = nullptr;
+    EscargotDebuggerStatementFn debug_statement_cb = nullptr;
+    void *debug_user = nullptr;
+    bool debug_execution_enabled = false;
+    DebuggerOperationsRef::BreakpointOperations *debug_operations = nullptr;
+    int debug_depth = 0;
+    bool debug_location_repeat = false;
+    bool debug_location_breakpoint_target = false;
+    struct DebugCode {
+        uint64_t tag;
+        std::string filename;
+        std::vector<std::pair<uint32_t, uint32_t>> first_breakpoints;
+    };
+    std::unordered_map<void *, DebugCode> debug_codes;
+#endif
 };
 
 
@@ -111,6 +130,117 @@ static EscargotContextOpaque *lookupCtx(ContextRef *cref) {
     auto it = g_ctx_map.find(cref);
     return it == g_ctx_map.end() ? nullptr : it->second;
 }
+
+#ifdef ESCARGOT_DEBUGGER
+class BridgeDebuggerClient final : public DebuggerOperationsRef::DebuggerClient {
+public:
+    explicit BridgeDebuggerClient(EscargotContextOpaque *context)
+        : context_(context) {}
+
+    void parseCompleted(StringRef *source, StringRef *src_name,
+                        std::vector<DebuggerOperationsRef::BreakpointLocationsInfo *> &locations) override {
+        if (!context_ || !context_->debug_source_cb) return;
+        const std::string filename = src_name ? src_name->toStdUTF8String() : std::string();
+        const std::string text = source ? source->toStdUTF8String() : std::string();
+        const uint64_t tag = context_->debug_source_cb(context_, filename.c_str(), text.data(), text.size(), context_->debug_user);
+        for (auto *info : locations) {
+            if (!info || !info->weakCodeRef) continue;
+            auto &code = context_->debug_codes[info->weakCodeRef];
+            code.tag = tag;
+            code.filename = filename;
+            code.first_breakpoints.clear();
+            for (const auto &location : info->breakpointLocations) {
+                if (code.first_breakpoints.empty() || code.first_breakpoints.back().first != location.line) {
+                    code.first_breakpoints.emplace_back(location.line, location.offset);
+                }
+            }
+            if (context_->debug_break_locations_cb) {
+                for (const auto &location : info->breakpointLocations) {
+                    context_->debug_break_locations_cb(context_, filename.c_str(), static_cast<int>(location.line), 0, tag, 0, 0, context_->debug_user);
+                }
+            }
+        }
+        if (context_->debug_break_locations_cb) {
+            context_->debug_break_locations_cb(context_, filename.c_str(), 0, 0, tag, 1, 0, context_->debug_user);
+        }
+    }
+
+    void parseError(StringRef *, StringRef *, StringRef *) override {}
+
+    void codeReleased(DebuggerOperationsRef::WeakCodeRef *code) override {
+        if (context_) context_->debug_codes.erase(code);
+    }
+
+    DebuggerOperationsRef::ResumeBreakpointOperation stopAtBreakpoint(DebuggerOperationsRef::BreakpointOperations &operations) override {
+        if (!context_) return DebuggerOperationsRef::Continue;
+        auto found = context_->debug_codes.find(operations.weakCodeRef());
+        const uint64_t tag = found == context_->debug_codes.end() ? 0 : found->second.tag;
+        const std::string filename = found == context_->debug_codes.end() ? std::string() : found->second.filename;
+        DebuggerOperationsRef::DebuggerStackTraceDataVector stack;
+        operations.getStackTrace(stack);
+        int line = 0;
+        int column = 0;
+        int depth = 0;
+        if (!stack.empty()) {
+            line = static_cast<int>(stack.front().line);
+            // Escargot records `depth` from the current frame outward; shared stepping counts active frames from the root, so use the stack cardinality for the current location instead.
+            depth = static_cast<int>(stack.size());
+        }
+        struct DebugOperationsScope {
+            EscargotContextOpaque *context;
+            DebuggerOperationsRef::BreakpointOperations *operations;
+            int depth;
+            bool repeat;
+            bool breakpoint_target;
+
+            DebugOperationsScope(EscargotContextOpaque *context, DebuggerOperationsRef::BreakpointOperations *current_operations, int current_depth)
+                : context(context), operations(context->debug_operations), depth(context->debug_depth), repeat(context->debug_location_repeat), breakpoint_target(context->debug_location_breakpoint_target) {
+                context->debug_operations = current_operations;
+                context->debug_depth = current_depth;
+                context->debug_location_repeat = false;
+                context->debug_location_breakpoint_target = false;
+            }
+
+            ~DebugOperationsScope() {
+                context->debug_operations = operations;
+                context->debug_depth = depth;
+                context->debug_location_repeat = repeat;
+                context->debug_location_breakpoint_target = breakpoint_target;
+            }
+        } debug_operations_scope(context_, &operations, depth);
+        const bool debugger_statement = operations.isDebuggerStatement();
+        const bool repeated_location = operations.isRepeatedLocation(static_cast<uint32_t>(line));
+        bool breakpoint_target = false;
+        if (found != context_->debug_codes.end()) {
+            const auto &locations = found->second.first_breakpoints;
+            const auto first = std::lower_bound(locations.begin(), locations.end(), static_cast<uint32_t>(line), [](const auto &location, uint32_t target_line) {
+                return location.first < target_line;
+            });
+            breakpoint_target = first != locations.end() && first->first == static_cast<uint32_t>(line) && first->second == operations.offset();
+        }
+        bool debugger_paused = false;
+        if (debugger_statement && context_->debug_statement_cb) {
+            debugger_paused = context_->debug_statement_cb(context_, context_->debug_user);
+        }
+        if ((context_->debug_execution_enabled || debugger_statement) && context_->debug_location_cb) {
+            context_->debug_location_repeat = repeated_location || debugger_paused;
+            context_->debug_location_breakpoint_target = breakpoint_target;
+            context_->debug_location_cb(context_, filename.c_str(), line, column, depth, tag, context_->debug_user);
+        }
+        // Step keeps Escargot's always-stop state active so the next executable location reaches the owner-thread callback.
+        return (context_->debug_execution_enabled || debugger_statement) ? DebuggerOperationsRef::Step : DebuggerOperationsRef::Continue;
+    }
+
+private:
+    EscargotContextOpaque *context_;
+};
+
+static EscargotValue debuggerError(EscargotContextOpaque *context, const char *message) {
+    if (!context || !context->debug_operations) return nullptr;
+    auto *state = context->debug_operations->executionState();
+    return ErrorObjectRef::create(state, ErrorObjectRef::TypeError, StringRef::createFromASCII(message, std::strlen(message)));
+}
+#endif
 
 static ValueRef *asVal(EscargotValue v) { return static_cast<ValueRef *>(v); }
 
@@ -333,6 +463,9 @@ extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
 
 extern "C" void escargot_context_free(EscargotContext *ctx) {
     if (!ctx) return;
+#ifdef ESCARGOT_DEBUGGER
+    escargot_debugger_detach(ctx);
+#endif
     ctx->pending_throw.clear();
     ctx->pending_throw_set = false;
     if (ctx->pending_throw_value) {
@@ -406,6 +539,170 @@ extern "C" void escargot_context_set_opaque(EscargotContext *ctx, void *opaque) 
 extern "C" void *escargot_context_get_opaque(EscargotContext *ctx) {
     return ctx ? ctx->opaque : nullptr;
 }
+
+#ifdef ESCARGOT_DEBUGGER
+extern "C" bool escargot_debugger_attach(EscargotContext *ctx, EscargotDebugSourceFn source_cb,
+                                           EscargotDebugBreakLocationsFn break_locations_cb,
+                                           EscargotDebugLocationFn location_cb,
+                                           EscargotDebuggerStatementFn debugger_cb, void *user) {
+    if (!ctx || !ctx->ctx.get() || !source_cb) return false;
+    if (ctx->ctx.get()->isDebuggerRunning()) return false;
+    ctx->debug_source_cb = source_cb;
+    ctx->debug_break_locations_cb = break_locations_cb;
+    ctx->debug_location_cb = location_cb;
+    ctx->debug_statement_cb = debugger_cb;
+    ctx->debug_user = user;
+    ctx->debug_execution_enabled = false;
+    ctx->debug_operations = nullptr;
+    ctx->debug_depth = 0;
+    ctx->debug_location_repeat = false;
+    ctx->debug_location_breakpoint_target = false;
+    return ctx->ctx.get()->initDebuggerClient(new BridgeDebuggerClient(ctx));
+}
+
+extern "C" void escargot_debugger_set_execution(EscargotContext *ctx, bool enabled) {
+    if (!ctx || !ctx->ctx.get() || !ctx->ctx.get()->isDebuggerRunning()) return;
+    ctx->debug_execution_enabled = enabled;
+    if (enabled) ctx->ctx.get()->setAsAlwaysStopState();
+}
+
+extern "C" void escargot_debugger_detach(EscargotContext *ctx) {
+    if (!ctx || !ctx->ctx.get()) return;
+    ctx->debug_execution_enabled = false;
+    ctx->debug_operations = nullptr;
+    ctx->debug_depth = 0;
+    ctx->debug_location_repeat = false;
+    ctx->debug_location_breakpoint_target = false;
+    if (ctx->ctx.get()->isDebuggerRunning()) (void)ctx->ctx.get()->disableDebugger();
+    ctx->debug_codes.clear();
+    ctx->debug_source_cb = nullptr;
+    ctx->debug_break_locations_cb = nullptr;
+    ctx->debug_location_cb = nullptr;
+    ctx->debug_statement_cb = nullptr;
+    ctx->debug_user = nullptr;
+}
+
+extern "C" int escargot_debugger_copy_stack(EscargotContext *ctx, EscargotDebugFrame *out, int max) {
+    if (!ctx || !ctx->debug_operations || !out || max <= 0) return 0;
+    DebuggerOperationsRef::DebuggerStackTraceDataVector stack;
+    ctx->debug_operations->getStackTrace(stack);
+    const int count = std::min<int>(max, static_cast<int>(stack.size()));
+    for (int i = 0; i < count; ++i) {
+        auto &frame = out[i];
+        std::memset(&frame, 0, sizeof(frame));
+        const std::string name = DebuggerOperationsRef::getFunctionName(stack[i].weakCodeRef)->toStdUTF8String();
+        auto found = ctx->debug_codes.find(stack[i].weakCodeRef);
+        const std::string filename = found == ctx->debug_codes.end() ? std::string() : found->second.filename;
+        std::snprintf(frame.name, sizeof(frame.name), "%s", name.c_str());
+        std::snprintf(frame.filename, sizeof(frame.filename), "%s", filename.c_str());
+        frame.line = static_cast<int>(stack[i].line);
+        frame.column = static_cast<int>(stack[i].column);
+        frame.script_tag = found == ctx->debug_codes.end() ? 0 : found->second.tag;
+    }
+    return count;
+}
+
+extern "C" int escargot_debugger_depth(EscargotContext *ctx) {
+    return ctx && ctx->debug_operations ? ctx->debug_depth : 0;
+}
+
+extern "C" uint64_t escargot_debugger_frame_token(EscargotContext *ctx) {
+    if (!ctx || !ctx->debug_operations) return 0;
+    return ctx->debug_operations->frameToken();
+}
+
+extern "C" bool escargot_debugger_location_is_repeat(EscargotContext *ctx) {
+    return ctx && ctx->debug_operations && ctx->debug_location_repeat;
+}
+
+extern "C" bool escargot_debugger_location_is_breakpoint_target(EscargotContext *ctx) {
+    return ctx && ctx->debug_operations && ctx->debug_location_breakpoint_target;
+}
+
+extern "C" EscargotValue escargot_debugger_scope(EscargotContext *ctx, int frame, int scope_index) {
+    if (!ctx || !ctx->debug_operations || frame < 0 || scope_index < 0) return nullptr;
+    DebuggerOperationsRef::DebuggerStackTraceDataVector stack;
+    ctx->debug_operations->getStackTrace(stack);
+    if (static_cast<size_t>(frame) >= stack.size() || stack[frame].depth == SIZE_MAX) return nullptr;
+    const uint32_t state_index = static_cast<uint32_t>(stack[frame].depth);
+    DebuggerOperationsRef::LexicalScopeChainVector kinds;
+    ctx->debug_operations->getLexicalScopeChain(state_index, kinds);
+    auto *state = ctx->debug_operations->executionState();
+    auto *object = ObjectRef::create(state, nullptr);
+    for (size_t reverse = kinds.size(); reverse > 0; --reverse) {
+        const uint32_t index = static_cast<uint32_t>(reverse - 1);
+        const auto kind = kinds[index];
+        bool seen_function = false;
+        for (uint32_t prior = 0; prior < index; ++prior) {
+            if (kinds[prior] == DebuggerOperationsRef::FUNCTION_ENVIRONMENT) {
+                seen_function = true;
+                break;
+            }
+        }
+        bool include = false;
+        if (scope_index == 0) {
+            include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && !seen_function;
+        } else if (scope_index == 1) {
+            include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && seen_function;
+        } else if (scope_index == 2) {
+            include = kind == DebuggerOperationsRef::GLOBAL_ENVIRONMENT;
+        }
+        if (include) {
+            const auto properties = ctx->debug_operations->getLexicalScopeChainProperties(state_index, index);
+            for (size_t property_index = 0; property_index < properties.size(); ++property_index) {
+                const auto &property = properties[property_index];
+                if (property.key && property.value.hasValue()) {
+                    // Walk outward-to-inward so inner bindings replace outer ones.
+                    object->defineDataProperty(state, property.key, const_cast<ValueRef *>(property.value.value()), true, true, true);
+                }
+            }
+        }
+    }
+    return retain(ctx, object);
+}
+
+extern "C" EscargotValue escargot_debugger_this(EscargotContext *ctx, int frame) {
+    if (!ctx || !ctx->debug_operations || frame < 0) return nullptr;
+    DebuggerOperationsRef::DebuggerStackTraceDataVector stack;
+    ctx->debug_operations->getStackTrace(stack);
+    if (static_cast<size_t>(frame) >= stack.size() || stack[frame].depth == SIZE_MAX) return nullptr;
+    return retain(ctx, ctx->debug_operations->frameThis(static_cast<uint32_t>(stack[frame].depth)));
+}
+
+extern "C" EscargotValue escargot_debugger_eval_frame(EscargotContext *ctx, int frame,
+                                                        const char *expr, size_t expr_len,
+                                                        EscargotValue *out_exception) {
+    if (out_exception) *out_exception = nullptr;
+    if (!ctx || !ctx->debug_operations || !expr) return nullptr;
+    if (frame != 0) {
+        if (out_exception) *out_exception = retain(ctx, static_cast<ValueRef *>(debuggerError(ctx, "Escargot supports evaluation only in the top paused frame")));
+        return nullptr;
+    }
+    ValueRef *exception = nullptr;
+    ValueRef *result = ctx->debug_operations->evalValue(StringRef::createFromUTF8(expr, expr_len), exception);
+    if (exception) {
+        if (out_exception) *out_exception = retain(ctx, exception);
+        return nullptr;
+    }
+    return retain(ctx, result);
+}
+#else
+extern "C" bool escargot_debugger_attach(EscargotContext *, EscargotDebugSourceFn, EscargotDebugBreakLocationsFn,
+                                           EscargotDebugLocationFn, EscargotDebuggerStatementFn, void *) { return false; }
+extern "C" void escargot_debugger_set_execution(EscargotContext *, bool) {}
+extern "C" void escargot_debugger_detach(EscargotContext *) {}
+extern "C" int escargot_debugger_copy_stack(EscargotContext *, EscargotDebugFrame *, int) { return 0; }
+extern "C" int escargot_debugger_depth(EscargotContext *) { return 0; }
+extern "C" uint64_t escargot_debugger_frame_token(EscargotContext *) { return 0; }
+extern "C" bool escargot_debugger_location_is_repeat(EscargotContext *) { return false; }
+extern "C" bool escargot_debugger_location_is_breakpoint_target(EscargotContext *) { return false; }
+extern "C" EscargotValue escargot_debugger_scope(EscargotContext *, int, int) { return nullptr; }
+extern "C" EscargotValue escargot_debugger_this(EscargotContext *, int) { return nullptr; }
+extern "C" EscargotValue escargot_debugger_eval_frame(EscargotContext *, int, const char *, size_t, EscargotValue *out_exception) {
+    if (out_exception) *out_exception = nullptr;
+    return nullptr;
+}
+#endif
 
 extern "C" EscargotEvalResult escargot_eval(EscargotContext *c, const char *src, size_t src_len,
                                             const char *filename, size_t filename_len) {

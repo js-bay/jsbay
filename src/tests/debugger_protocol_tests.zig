@@ -184,7 +184,7 @@ test "debugger protocol: disable waits for an earlier async-depth owner request"
 }
 
 test "debugger protocol: exception configuration before first enable takes effect" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "debugger-n4-preenable-exception");
     defer session.deinit();
@@ -217,7 +217,7 @@ test "debugger protocol: exception configuration before first enable takes effec
 }
 
 test "debugger protocol: breakpoint configuration before first enable takes effect" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "preenable-breakpoint");
     defer session.deinit();
@@ -253,8 +253,8 @@ test "debugger protocol: breakpoint configuration before first enable takes effe
     try testing.expect(probe.result.err == null);
 }
 
-test "debugger protocol: NG pauses an old function compiled before Debugger.enable" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+test "debugger protocol: pauses a function compiled before Debugger.enable" {
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "preenabled-function-breakpoint");
     defer session.deinit();
@@ -278,13 +278,19 @@ test "debugger protocol: NG pauses an old function compiled before Debugger.enab
 
     const enable_at = try send(&session, "Debugger.enable", "", 7401);
     try testing.expect(responseIsSuccess(try pumpResponse(&session, enable_at, 7401), 7401));
-    // The requested constant declaration is removed by NG. Resolution must report and hit the following executable return line.
+    // QuickJS retains the constant initialization; QuickJS-NG folds it into the return.
+    const expected_line: i32 = if (comptime backend.active_backend == .quickjs) 1 else 2;
+    const expected_column: i32 = if (comptime backend.active_backend == .quickjs) 14 else 9;
     const breakpoint_at = try send(&session, "Debugger.setBreakpointByUrl", "{\"url\":\"preenabled-function.js\",\"lineNumber\":1}", 7402);
     const breakpoint_response = try pumpResponse(&session, breakpoint_at, 7402);
     try testing.expect(responseIsSuccess(breakpoint_response, 7402));
     try testing.expect(std.mem.indexOf(u8, breakpoint_response, "\"scriptId\"") != null);
-    try testing.expect(std.mem.indexOf(u8, breakpoint_response, "\"lineNumber\":2") != null);
-    try testing.expect(std.mem.indexOf(u8, breakpoint_response, "\"columnNumber\":9") != null);
+    const expected_line_json = try std.fmt.allocPrint(alloc, "\"lineNumber\":{d}", .{expected_line});
+    defer alloc.free(expected_line_json);
+    const expected_column_json = try std.fmt.allocPrint(alloc, "\"columnNumber\":{d}", .{expected_column});
+    defer alloc.free(expected_column_json);
+    try testing.expect(std.mem.indexOf(u8, breakpoint_response, expected_line_json) != null);
+    try testing.expect(std.mem.indexOf(u8, breakpoint_response, expected_column_json) != null);
 
     var probe: EvalProbe = .{ .id = session.id, .source = "globalThis.__preenabledFunction();", .filename = "preenabled-function-driver.js" };
     defer probe.deinit();
@@ -293,7 +299,8 @@ test "debugger protocol: NG pauses an old function compiled before Debugger.enab
     const first_pause = try waitForPause(&session, first_pause_from);
     try testing.expect(first_pause);
     try testing.expect(std.mem.indexOf(u8, session.got.items[first_pause_from..], "preenabled-function.js") != null);
-    try testing.expect(std.mem.indexOf(u8, session.got.items[first_pause_from..], "\"columnNumber\":9") != null);
+    try testing.expect(std.mem.indexOf(u8, session.got.items[first_pause_from..], expected_line_json) != null);
+    try testing.expect(std.mem.indexOf(u8, session.got.items[first_pause_from..], expected_column_json) != null);
     const step_pause_from = session.got.items.len;
     const step_at = try send(&session, "Debugger.stepOver", "", 7403);
     try testing.expect(try waitResponseWithoutTick(&session, step_at, 7403));
@@ -306,8 +313,26 @@ test "debugger protocol: NG pauses an old function compiled before Debugger.enab
     try testing.expect(probe.result.err == null);
 }
 
-test "debugger protocol: NG resolves a pending breakpoint after compilation" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+test "debugger protocol: reports truncated possible breakpoints for a large classic bundle" {
+    if (comptime backend.active_backend != .quickjs) return;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "classic-break-location-budget");
+    defer session.deinit();
+    var source: std.ArrayList(u8) = .empty;
+    defer source.deinit(alloc);
+    try source.appendSlice(alloc, "var value = 0;\n");
+    for (0..8_193) |_| try source.appendSlice(alloc, "value += 1;\n");
+    const prepared = engine.evalScript(session.id, source.items, "classic-break-location-budget.js");
+    defer if (prepared.result) |value| std.heap.c_allocator.free(value);
+    defer if (prepared.err) |value| if (prepared.err_is_heap) std.heap.c_allocator.free(value);
+    try testing.expect(prepared.err == null);
+    const script_id = debugger_mod.scriptIdForUrl(session.id, "classic-break-location-budget.js");
+    try testing.expect(script_id != 0);
+    try testing.expectError(error.LocationsTruncated, debugger_mod.possibleBreakpoints(session.id, script_id, 0, 0, 8_200, 0));
+}
+
+test "debugger protocol: resolves a pending breakpoint after compilation" {
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "pending-compiled-breakpoint");
     defer session.deinit();
@@ -336,7 +361,8 @@ test "debugger protocol: NG resolves a pending breakpoint after compilation" {
     const parsed_at = std.mem.indexOf(u8, events, "Debugger.scriptParsed") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOfPos(u8, events, parsed_at + 1, "Debugger.scriptParsed") == null);
     try testing.expect(std.mem.indexOf(u8, events, "Debugger.breakpointResolved") != null);
-    try testing.expect(std.mem.indexOf(u8, events, "\"lineNumber\":2") != null);
+    const expected_line = if (comptime backend.active_backend == .quickjs) "\"lineNumber\":1" else "\"lineNumber\":2";
+    try testing.expect(std.mem.indexOf(u8, events, expected_line) != null);
 
     const resume_at = try send(&session, "Debugger.resume", "", 7503);
     try testing.expect(try waitResponseWithoutTick(&session, resume_at, 7503));
@@ -345,7 +371,7 @@ test "debugger protocol: NG resolves a pending breakpoint after compilation" {
 }
 
 test "debugger protocol: NG distinguishes two executable columns on one line" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "same-line-columns");
     defer session.deinit();

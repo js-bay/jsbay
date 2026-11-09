@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     jsbay_build.linkConsumer(exe, jsbay);
+    b.installArtifact(exe);
 
     const probe = b.addLibrary(.{
         .name = "zig-consumer-compile-probe",

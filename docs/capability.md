@@ -1,8 +1,10 @@
 # Escargot / Hermes — capability vs QuickJS
 
-Backends selected with `-Dbackend=escargot` or `-Dbackend=hermes`. ABI is not frozen yet (full engine_thread suite / inspector / QJS native_handle class_id still missing; Escargot has rejection tracker; spike native_handle opaque+call+finalize+method this-binding; Hermes host ESM shim). Suite lists below are what `src/tests/all_tests.zig` imports for each backend; out-of-scope suites stay out of the aggregator. Production gap ranking: `docs/production-gaps.md`.
+Backends selected with `-Dbackend=escargot` or `-Dbackend=hermes`. ABI is not frozen yet (full engine_thread coverage and QJS native_handle class_id still incomplete; Escargot has rejection tracker; spike native_handle opaque+call+finalize+method this-binding; Hermes host ESM shim). Suite lists below are what `src/tests/all_tests.zig` imports for each backend; out-of-scope suites stay out of the aggregator. Production gap ranking: `docs/production-gaps.md`.
 
 Shared tree: both engines live under `src/backend/{escargot,hermes}/`. Build one at a time via `-Dbackend=…` (not a multi-engine pack).
+
+QuickJS-family engines and Escargot use native source locations for stepping. Step out pauses at the first shallower caller location, which can be on the call line before an assignment completes; V8 may instead advance to the next statement. Before/after locations can share coordinates, so inspect variable values and callee effects to distinguish them. Recursive callers remain observable one at a time.
 
 ## Escargot (`-Dbackend=escargot`)
 
@@ -32,7 +34,7 @@ Scope: eval, value/object, Promise (+ host rejection tracker), buffers, timers, 
 | native_handle | **partial** | ExtraData opaque + call + finalize (teardown-forced; no GC finalizer — UAF with pending_finals); MethodBox this-binding; no QJS class_id / CallbackStore suite |
 | engine_thread / thick C ABI | **partial** | full suite; hostInstall **same-thread only**; `skipEscargotEtHost` kept (Context thread-affine); DestroyDefer×2 permanent (bdwgc ABRT); mid-script interrupt **permanent** (no EscargotPublic hook) |
 | heap limit / interrupt | **partial** | `runGc` → `Memory::gc`; soft `getMemoryUsage` via `Memory::heapSize`/`totalSize`; **no** mid-script interrupt (permanent); `requestInterrupt` returns true but only sets a bit; `setMemoryLimit`→false (permanent); no create-time heap cap |
-| inspector / CDP / debugger | **no** | |
+| inspector / CDP / debugger | **yes** | Shared transport and native execution hooks; line breakpoints, stepping, source retrieval, and top-frame evaluation |
 | rejection tracker | **yes** | `registerPromiseRejectCallback`; report after microtask drain |
 | buffer copy / transferable | **partial** | native transfer green; C `copyBuffer` imported; DataView OOB-after-resize → INVALID (aligned with QJS) |
 
@@ -64,7 +66,7 @@ Scope: eval, value/object, Promise, buffers, timers, host_object, `.hbc` bytecod
 | native_handle | **partial** | NativeState opaque + call + finalize (NativeState dtor + pending_finals claim); MethodBox this-binding (hermes_dup on setMethod); no QJS class_id suite |
 | engine_thread / thick C ABI | **partial** | full suite; hostInstall + destroy-defer + nested + filename + after-stop + stop-interrupt green; bind_sync 5/5 |
 | heap limit / interrupt | **partial** | soft `getMemoryUsage` via `getHeapInfo`; **create-time** `MaxHeapSize` via Zig `EngineConfig.max_heap_size` / `-Dhermes-max-heap` (**not** in `jsbay_engine_create` C ABI); `setMemoryLimit`→false; **user** `requestInterrupt` = bit only (no mid-script); stop/destroy mid-script via `asyncTriggerTimeout` + softRearm/drain |
-| inspector / CDP / debugger | **no** | |
+| inspector / CDP / debugger | **yes** | Shared transport with native CDPAgent; engine-owned Runtime and Debugger object handles |
 | rejection tracker | **yes** | `HermesInternal.enablePromiseRejectionTracker` + host queue/flush after microtask drain; setTimeout(100|2000) → cancellable double-microtask (Escargot-style sync-catch silence); module-shim top-level throw via `hermes_report_unhandled_rejection` |
 | buffer copy / transferable | **partial** | transfer polyfill green; C `copyBuffer` imported; exotic-getter green (pristine `%TypedArray%` brand+getters); Hermes `.resize` windows still Skip |
 | native_function host-throw | **yes** | NativeResult.err / nested throw / CJS missing-module / value `.err` OK; getPropertyString loop green (`var` across Hermes evals) |
@@ -164,7 +166,7 @@ Supported threading configuration: `ENABLE_THREADING`, `ENABLE_TLS_ACCESS_BY_PTH
 - Escargot ET+host: **same-thread only**; `skipEscargotEtHost` — diminishing returns vs per-ET Context
 - Escargot DestroyDefer (2): bdwgc ABRT — not cheap
 - Hermes `ArrayBuffer.resize` — **permanent Skip**
-- inspector / CDP; CJS bytecode cache (QJS-only); Hermes ESM beyond TLA; native_handle class_id
+- CJS bytecode cache (QJS-only); Hermes ESM beyond TLA; native_handle class_id
 
 ## Capability snapshot (vs QuickJS-NG; **not a production tag** / diminishing returns)
 
@@ -178,7 +180,7 @@ Supported threading configuration: `ENABLE_THREADING`, `ENABLE_TLS_ACCESS_BY_PTH
 
 **Hard gaps (accept or switch engines before a production tag)**
 - Escargot: no mid-script interrupt; ET×host cannot cross threads (needs per-thread VM)
-- Both: no runtime `setMemoryLimit` (Hermes create-time MaxHeapSize only; Escargot has no cap); no inspector/CDP; no QuickJS-shaped CJS bytecode cache
+- Both: no runtime `setMemoryLimit` (Hermes create-time MaxHeapSize only; Escargot has no cap); no QuickJS-shaped CJS bytecode cache
 - Hermes: no `ArrayBuffer.resize`; ESM is a shim, not native module codegen
 - Escargot DestroyDefer / precise weak: bdwgc limits
 

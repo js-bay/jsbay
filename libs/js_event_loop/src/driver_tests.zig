@@ -1211,6 +1211,32 @@ test "attach discards a stop requested while idle so the new attachment drives" 
     driver.detach();
 }
 
+test "a host callback completed before schedule returns does not suppress the next wake" {
+    const Fixture = struct {
+        turns: usize = 0,
+
+        fn schedule(_: ?*anyopaque, _: u64, task: *const fn (?*anyopaque) callconv(.c) void, task_context: ?*anyopaque) callconv(.c) bool {
+            task(task_context);
+            return true;
+        }
+
+        fn cancel(_: ?*anyopaque) callconv(.c) void {}
+
+        fn drive(context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.turns += 1;
+        }
+    };
+    const driver = try js_event_loop.Driver.create(std.testing.allocator);
+    defer driver.destroy();
+    var fixture: Fixture = .{};
+    try driver.attach(.{ .context = &fixture, .schedule = Fixture.schedule, .cancel = Fixture.cancel }, Fixture.drive, &fixture);
+    defer driver.detach();
+    try std.testing.expectEqual(@as(usize, 1), fixture.turns);
+    driver.wake();
+    try std.testing.expectEqual(@as(usize, 2), fixture.turns);
+}
+
 test "testing.advance installs Loop virtual clock for now and timers" {
     const Probe = struct {
         fired: usize = 0,

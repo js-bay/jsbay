@@ -108,7 +108,8 @@ fn expectedDomains() []const []const u8 {
     return switch (backend.active_backend) {
         .quickjs_ng, .quickjs => &.{ "Runtime", "Debugger", "Profiler", "HeapProfiler", "Performance", "Schema" },
         .jsc => &.{ "Runtime", "HeapProfiler", "Performance", "Schema" },
-        .escargot, .hermes => &.{ "Runtime", "Performance", "Schema" },
+        .escargot => &.{ "Runtime", "Debugger", "HeapProfiler", "Performance", "Schema" },
+        .hermes => &.{ "Runtime", "Debugger", "Profiler", "HeapProfiler", "Performance", "Schema" },
     };
 }
 
@@ -228,18 +229,8 @@ test "cdp discovery: HTTP protocol describes only implemented domains with resol
         try testing.expect(hasCommand(heap, "collectGarbage"));
         try testing.expect(!hasCommand(heap, "takeHeapSnapshot"));
     }
-    if (comptime backend.active_backend == .quickjs_ng) {
+    if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
         try testing.expect(hasCommand(domainByName(domains, "Debugger").?, "setBreakpointByUrl"));
-    } else if (comptime backend.active_backend == .quickjs) {
-        const debugger = domainByName(domains, "Debugger") orelse return error.TestUnexpectedResult;
-        try testing.expect(hasCommand(debugger, "enable"));
-        try testing.expect(hasCommand(debugger, "disable"));
-        try testing.expect(hasCommand(debugger, "getScriptSource"));
-        try testing.expect(hasCommand(debugger, "setAsyncCallStackDepth"));
-        try testing.expect(hasEvent(debugger, "scriptParsed"));
-        try testing.expect(!hasCommand(debugger, "setBreakpointByUrl"));
-        try testing.expect(!hasCommand(debugger, "pause"));
-        try testing.expect(!hasCommand(debugger, "evaluateOnCallFrame"));
     }
 
     var types = std.StringHashMap(void).init(alloc);
