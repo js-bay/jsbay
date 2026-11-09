@@ -97,11 +97,9 @@ This path depends on platform JavaScriptCore symbols. It does not turn JSC into 
 
 ### iOS 26.5 system JavaScriptCore teardown limitation
 
-The iOS 26.5 Simulator runtime (23F77) has a known limitation when a system JavaScriptCore context has accepted a remote Inspector frontend. Discovering an inspectable context without a frontend can release cleanly. After one frontend connection and a normal detach, releasing the context or VM can terminate with `SIGTRAP` while destroying `Inspector::JSGlobalObjectInspectorController`; the minimal repro does not need Runtime or Debugger commands.
+The iOS 26.5 Simulator runtime (23F77) has a known system JavaScriptCore limitation: after an Inspector frontend connects and detaches, normal context or VM teardown can terminate with `SIGTRAP` in `Inspector::JSGlobalObjectInspectorController`. The failure does not require Runtime or Debugger commands.
 
-Setting the public inspectable flag to false to let the platform close the frontend, or retaining another context in the group and collecting garbage, did not avoid the trap. The exact internal cause has not been proven. This project uses only the system JavaScriptCore framework and does not work around the limitation by bundling a replacement runtime, retaining a VM indefinitely, or disabling runtime safety checks.
-
-Safari's graphical Inspector was not attached in the simulator test: Safari listed the running simulator under Develop but reported no inspectable applications. Physical iOS 26.5 has not been tested. Treat successful Inspector protocol commands on this runtime as incomplete until normal teardown has also been verified.
+This runtime does not satisfy the normal-teardown requirement for Inspector compatibility. JS Bay uses the system JavaScriptCore framework and provides no workaround for this limitation. Physical iOS 26.5 compatibility is unverified.
 
 ## Lifetime
 

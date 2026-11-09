@@ -897,7 +897,7 @@ async function main() {
 
         const inner = 'globalThis.__cdpNestedSource = 42;\n//# sourceURL=cdp-nested-source.js';
         const nested = disp.awaitEvent(message => message.method === 'Debugger.scriptParsed' && message.params?.url === 'cdp-nested-source.js', timeoutMs, 'nested-script-parsed');
-        disp.sendCommand(14, 'Runtime.evaluate', { expression: `eval(${JSON.stringify(inner)});\n//# sourceURL=cdp-source-parent.js` });
+        disp.sendCommand(14, 'Runtime.evaluate', { expression: 'eval("globalThis.__cdpNestedSource = 42;\\n//# sourceURL=cdp-nested-source.js");\n//# sourceURL=cdp-source-parent.js' });
         const evaluated = await disp.awaitReply(14, timeoutMs, 'nested-source-evaluate');
         if (evaluated.error) throw new E2EError('nested-source-evaluate', JSON.stringify(evaluated));
         disp.sendCommand(15, 'Debugger.getScriptSource', { scriptId: (await nested).params.scriptId });
