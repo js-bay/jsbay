@@ -766,6 +766,16 @@ async function main() {
         if (properties.error || !properties.result?.result?.some(property => property.name === 'answer' && property.value?.value === 42)) {
           throw new E2EError('native-console-properties', JSON.stringify(properties));
         }
+        const emptyLog = disp.awaitEvent(message => message.method === 'Runtime.consoleAPICalled' && message.params?.type === 'log' && Array.isArray(message.params?.args) && message.params.args.length === 0, timeoutMs, 'native-empty-log');
+        disp.sendCommand(23, 'Runtime.evaluate', { expression: 'console.log()' });
+        const emptyLogReply = await disp.awaitReply(23, timeoutMs, 'native-empty-log-evaluate');
+        if (emptyLogReply.error) throw new E2EError('native-empty-log-evaluate', JSON.stringify(emptyLogReply));
+        await emptyLog;
+        const emptyWarning = disp.awaitEvent(message => message.method === 'Runtime.consoleAPICalled' && message.params?.type === 'warning' && Array.isArray(message.params?.args) && message.params.args.length === 0, timeoutMs, 'native-empty-warning');
+        disp.sendCommand(24, 'Runtime.evaluate', { expression: 'console.warn()' });
+        const emptyWarningReply = await disp.awaitReply(24, timeoutMs, 'native-empty-warning-evaluate');
+        if (emptyWarningReply.error) throw new E2EError('native-empty-warning-evaluate', JSON.stringify(emptyWarningReply));
+        await emptyWarning;
         ok('native Runtime context and typed console object handles');
       }, 'native-runtime');
     }
@@ -781,6 +791,71 @@ async function main() {
       },
       'debugger-enable'
     );
+
+    if (!opts.nativeDebugger && !opts.lineBreakpoints) {
+      await runStep(
+        'exception pause preserves the application exception across debugger evaluation',
+        async () => {
+          const source = [
+            'const __cdpExceptionSentinel = { kind: "application-sentinel" };',
+            'try {',
+            '  throw __cdpExceptionSentinel;',
+            '} catch (caught) {',
+            '  globalThis.__cdpExceptionSentinelPreserved = caught === __cdpExceptionSentinel;',
+            '}',
+            '//# sourceURL=cdp-pending-exception.js',
+          ].join('\n');
+          let paused = false;
+          try {
+            disp.sendCommand(170, 'Debugger.setPauseOnExceptions', { state: 'all' });
+            const configured = await disp.awaitReply(170, timeoutMs, 'pending-exception-configure');
+            if (configured.error) throw new E2EError('pending-exception-configure', JSON.stringify(configured));
+            const pauseEvent = disp.awaitEvent(message => message.method === 'Debugger.paused' && message.params?.reason === 'exception', timeoutMs, 'pending-exception-pause');
+            disp.sendCommand(171, 'Runtime.evaluate', { expression: source });
+            const pause = await pauseEvent;
+            paused = true;
+            const frame = pause.params?.callFrames?.[0];
+            if (!frame?.callFrameId) throw new E2EError('pending-exception-frame', JSON.stringify(pause));
+            disp.sendCommand(172, 'Debugger.evaluateOnCallFrame', { callFrameId: frame.callFrameId, expression: '(() => { throw new Error("debug-evaluation-error"); })()' });
+            const debugEvaluation = await disp.awaitReply(172, timeoutMs, 'pending-exception-debug-evaluation');
+            if (debugEvaluation.error || !debugEvaluation.result?.exceptionDetails) {
+              throw new E2EError('pending-exception-debug-evaluation', JSON.stringify(debugEvaluation));
+            }
+            const resumed = disp.awaitEvent(message => message.method === 'Debugger.resumed', timeoutMs, 'pending-exception-resume');
+            disp.sendCommand(173, 'Debugger.resume', {});
+            const resume = await disp.awaitReply(173, timeoutMs, 'pending-exception-resume-reply');
+            if (resume.error) throw new E2EError('pending-exception-resume-reply', JSON.stringify(resume));
+            await resumed;
+            paused = false;
+            const application = await disp.awaitReply(171, timeoutMs, 'pending-exception-application');
+            if (application.error || application.result?.exceptionDetails) throw new E2EError('pending-exception-application', JSON.stringify(application));
+            disp.sendCommand(174, 'Runtime.evaluate', { expression: 'globalThis.__cdpExceptionSentinelPreserved' });
+            const preserved = await disp.awaitReply(174, timeoutMs, 'pending-exception-preserved');
+            if (preserved.error || preserved.result?.result?.value !== true) throw new E2EError('pending-exception-preserved', JSON.stringify(preserved));
+            ok('exception pause preserves application exception identity after debugger evaluation');
+          } finally {
+            if (paused) {
+              try {
+                disp.sendCommand(175, 'Debugger.resume', {});
+                await disp.awaitReply(175, timeoutMs, 'pending-exception-cleanup-resume');
+              } catch (_) {
+              }
+            }
+            try {
+              disp.sendCommand(176, 'Debugger.setPauseOnExceptions', { state: 'none' });
+              await disp.awaitReply(176, timeoutMs, 'pending-exception-cleanup-policy');
+            } catch (_) {
+            }
+            try {
+              disp.sendCommand(177, 'Runtime.evaluate', { expression: 'delete globalThis.__cdpExceptionSentinelPreserved' });
+              await disp.awaitReply(177, timeoutMs, 'pending-exception-cleanup-global');
+            } catch (_) {
+            }
+          }
+        },
+        'pending-exception'
+      );
+    }
 
     await runStep(
       'breakpoint, paused frame evaluation, and stepping',

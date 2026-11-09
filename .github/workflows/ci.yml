@@ -109,6 +109,9 @@ jobs:
       - name: Check public C and C++ headers
         run: zig build tool -- check-c-abi
 
+      - name: Test Hermes console bridge contract
+        run: node --test tests/hermes-console-contract.test.mjs
+
       - name: Test independent packages
         run: |
           set -euo pipefail

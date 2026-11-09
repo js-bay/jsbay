@@ -868,6 +868,7 @@ fn preparePatchedQuickJsNg(b: *std.Build, tool: *std.Build.Step.Compile) std.Bui
     run.addFileArg(b.path("vendor/quickjs-ng-debug-receiver.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-debug-step.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-debug-eval-cache.patch"));
+    run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
     return out;
 }
 
@@ -892,6 +893,7 @@ fn preparePatchedQuickJs(b: *std.Build, tool: *std.Build.Step.Compile) std.Build
     run.addFileArg(b.path("vendor/quickjs-debugger.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-receiver.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-step.patch"));
+    run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
     return out;
 }
 
@@ -1129,6 +1131,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-debugger.patch"));
             hash.update(@embedFile("vendor/quickjs-debug-receiver.patch"));
             hash.update(@embedFile("vendor/quickjs-debug-step.patch"));
+            hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
             hash.update(@embedFile("src/backend/quickjs/quickjs_shim.h"));
             hash.update(@embedFile("src/backend/quickjs/qjs_wrapper_quickjs.c"));
             hash.update(@embedFile("src/backend/quickjs/bytecode.zig"));
@@ -1150,6 +1153,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-ng-debug-receiver.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-debug-step.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-debug-eval-cache.patch"));
+            hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
             hash.update(@embedFile("src/backend/quickjs_ng/qjs_wrapper_ng.c"));
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
         },

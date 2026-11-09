@@ -694,7 +694,7 @@ extern "C" void hermes_inspector_stop(JsbayHermesInspector *inspector) {
 extern "C" void hermes_inspector_console(JsbayHermesContext *ctx, const HermesValue *args,
                                          size_t argc, int level) {
     try {
-        if (!ctx || !args)
+        if (!ctx || (argc != 0 && !args))
             return;
         auto *inspector = hermes_context_get_inspector(ctx);
         if (!inspector || !inspector->debug_api)

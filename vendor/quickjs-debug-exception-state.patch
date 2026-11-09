@@ -1,0 +1,11 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8328,3 +8328,7 @@
++        JSValue pending_exception = rt->current_exception;
++        rt->current_exception = JS_UNINITIALIZED;
+         rt->in_exception_hook = 1;
+         rt->exception_handler(ctx, caught, rt->exception_opaque);
++        JS_FreeValue(ctx, rt->current_exception);
++        rt->current_exception = pending_exception;
+         rt->in_exception_hook = 0;

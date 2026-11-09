@@ -38,6 +38,7 @@
         "vendor/quickjs-debugger.patch",
         "vendor/quickjs-debug-receiver.patch",
         "vendor/quickjs-debug-step.patch",
+        "vendor/quickjs-debug-exception-state.patch",
         "vendor/quickjs-inspector-off.patch",
         "vendor/quickjs-async-stack.patch",
         "vendor/quickjs-ubsan.patch",

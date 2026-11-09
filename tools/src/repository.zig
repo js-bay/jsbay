@@ -277,7 +277,7 @@ test "debugger compilation instrumentation rejects missing or ambiguous sites" {
 }
 
 fn patchEngine(c: Context, args: []const []const u8, ng: bool) !void {
-    if (args.len != 17) return error.Usage;
+    if (args.len != 18) return error.Usage;
     if (!try c.exists(try c.fmt("{s}/{s}", .{ args[0], if (ng) "quickjs.h" else "quickjs.c" }))) return error.MissingUpstream;
     try copyTree(c, args[0], args[1], true);
     const cwd = try std.process.currentPathAlloc(c.init.io, c.allocator());
