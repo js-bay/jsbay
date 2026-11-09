@@ -1,6 +1,6 @@
 //! Chrome DevTools Protocol inspector transport (MVP).
 //!
-//! Byte-level WebSocket + minimal HTTP discovery endpoints, built directly on raw POSIX socket syscalls (no std.net / std.Io.net — see the "Raw POSIX socket layer" note below for why).
+//! Byte-level WebSocket + minimal HTTP discovery endpoints, built on a small cross-platform loopback socket layer.
 //!
 //! Responsibilities:
 //!   - Bind a TCP port, accept connections on a background thread.
@@ -14,28 +14,33 @@
 const std = @import("std");
 const inspector = @import("inspector");
 const zev = @import("zev");
+const socket = @import("portable_socket");
 
 // A callback can request destruction of its transport. Its own socket worker must unwind before the transport can be released.
 threadlocal var callback_transport: ?*Transport = null;
 
-// -- Raw POSIX socket layer ------------------------------------------------- This accept loop uses fcntl to poll a nonblocking listener so shutdown can be observed without closing a descriptor used by another thread. Use the matching libc calls directly because the std.Io network API treats EAGAIN from this configuration as a programmer error.
+// -- Portable socket layer -------------------------------------------------
 const RawSocket = struct {
-    handle: std.posix.fd_t,
+    handle: socket.Handle,
 
     fn close(s: RawSocket) void {
-        _ = std.posix.system.close(s.handle);
+        (socket.Socket{ .handle = s.handle }).close();
     }
 
-    fn setNonBlocking(s: RawSocket, nonblocking: bool) !void {
-        const flags = std.posix.system.fcntl(s.handle, std.posix.F.GETFL, @as(c_int, 0));
-        if (flags < 0) return error.FcntlFailed;
-        const mask: c_int = @intCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
-        const new_flags: c_int = if (nonblocking) flags | mask else flags & ~mask;
-        if (std.posix.system.fcntl(s.handle, std.posix.F.SETFL, new_flags) < 0) return error.FcntlFailed;
+    fn setNonBlocking(s: RawSocket, enabled: bool) !void {
+        try (socket.Socket{ .handle = s.handle }).setNonBlocking(enabled);
     }
 
-    fn read(s: RawSocket, buf: []u8) !usize {
-        return std.posix.read(s.handle, buf);
+    fn read(s: RawSocket, buffer: []u8) !usize {
+        return (socket.Socket{ .handle = s.handle }).read(buffer);
+    }
+
+    fn write(s: RawSocket, buffer: []const u8) !usize {
+        return (socket.Socket{ .handle = s.handle }).write(buffer);
+    }
+
+    fn shutdownBoth(s: RawSocket) void {
+        (socket.Socket{ .handle = s.handle }).shutdownBoth();
     }
 
     fn writeAll(s: RawSocket, bytes: []const u8) !void {
@@ -48,60 +53,31 @@ const RawSocket = struct {
             if (sess) |active| {
                 if (active.closed.load(.acquire)) return error.Closed;
             }
-            const n = std.c.send(s.handle, bytes.ptr + off, bytes.len - off, std.posix.MSG.NOSIGNAL);
-            if (n < 0) {
-                switch (std.posix.errno(n)) {
-                    .INTR => continue,
-                    .AGAIN => {
-                        try waitSocket(s, std.posix.POLL.OUT, deadline, sess);
-                        continue;
-                    },
-                    else => return error.WriteFailed,
-                }
-            }
+            const n = s.write(bytes[off..]) catch |err| switch (err) {
+                error.Interrupted => continue,
+                error.WouldBlock => {
+                    try waitSocket(s, socket.PollEvent.write, deadline, sess);
+                    continue;
+                },
+                else => return error.WriteFailed,
+            };
             if (n == 0) return error.WriteFailed;
             off += @intCast(n);
         }
     }
-
-    fn shutdownBoth(s: RawSocket) void {
-        _ = std.posix.system.shutdown(s.handle, std.posix.SHUT.RDWR);
-    }
 };
 
 const RawListener = struct {
-    handle: std.posix.fd_t,
+    listener: socket.Listener,
     port: u16,
 
-    fn close(l: RawListener) void {
-        _ = std.posix.system.close(l.handle);
-    }
-
-    /// Bind+listen on 127.0.0.1:want_port (0 = ephemeral). `port` on the returned value is the actually-bound port.
-    fn openStreamSocket() !std.posix.fd_t {
-        const raw = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        if (raw < 0) return error.SocketFailed;
-        return @intCast(raw);
+    fn close(listener: RawListener) void {
+        listener.listener.close();
     }
 
     fn listenIp4Loopback(want_port: u16) !RawListener {
-        const fd = openStreamSocket() catch return error.SocketFailed;
-        errdefer _ = std.posix.system.close(fd);
-
-        const reuse: c_int = 1;
-        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&reuse));
-
-        var addr: std.posix.sockaddr.in = .{
-            .port = std.mem.nativeToBig(u16, want_port),
-            .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
-        };
-        if (std.posix.system.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) < 0) return error.BindFailed;
-        if (std.posix.system.listen(fd, 128) < 0) return error.ListenFailed;
-
-        var actual: std.posix.sockaddr.in = undefined;
-        var actual_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.in);
-        if (std.posix.system.getsockname(fd, @ptrCast(&actual), &actual_len) < 0) return error.GetSockNameFailed;
-        return .{ .handle = fd, .port = std.mem.bigToNative(u16, actual.port) };
+        const listener = try socket.listenLoopback(want_port);
+        return .{ .listener = listener, .port = listener.port };
     }
 };
 
@@ -133,7 +109,7 @@ const Session = struct {
     id: SessionId,
     stream: RawSocket,
     allocator: std.mem.Allocator,
-    /// The registry owns one reference, each reader/writer owns one while it runs, and lookupSession retains a temporary send lease.  The fd is only closed by the final release, so a recycled fd cannot be used by a sender or worker that already held a lease.
+    /// The registry owns one reference, each reader/writer owns one while it runs, and lookupSession retains a temporary send lease. The socket is only closed by the final release, so a recycled handle cannot be used by a sender or worker that already held a lease.
     refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
     /// Reserved before either worker is spawned.  A slot stays occupied until both detached workers exit, so rapid disconnects cannot bypass the connection cap while writers are still draining or timing out.
     workers_remaining: std.atomic.Value(u8) = std.atomic.Value(u8).init(2),
@@ -164,7 +140,7 @@ const Session = struct {
         self.allocator.destroy(self);
     }
 
-    /// This transition is deliberately separate from close(2): shutdown wakes both workers, but the descriptor remains owned until their/session leases have drained.
+    /// This transition is deliberately separate from closing the socket: shutdown wakes both workers, but the handle remains owned until their/session leases have drained.
     fn requestClose(self: *Session) void {
         if (self.closed.swap(true, .acq_rel)) return;
         self.queue_mu.lock();
@@ -310,7 +286,7 @@ pub const Transport = struct {
         return &self.interface;
     }
 
-    /// Outside an event handler, waits for every owned thread and descriptor. In this transport's handler, requests shutdown and returns; the last worker releases the transport after all callbacks have unwound. The allocator and handler context must outlive that deferred release.
+    /// Outside an event handler, waits for every owned thread and socket. In this transport's handler, requests shutdown and returns; the last worker releases the transport after all callbacks have unwound. The allocator and handler context must outlive that deferred release.
     pub fn deinit(self: *Transport) void {
         if (self.deinit_started.swap(true, .acq_rel)) return;
         if (callback_transport == self) {
@@ -326,7 +302,7 @@ pub const Transport = struct {
             self.workers_mu.unlock();
             return;
         }
-        // Signal shutdown. The accept loop polls the shutdown flag between short poll() calls and exits on its own — we MUST NOT close the listener here because a blocking accept() racing with close() on the same fd is still unsafe (see the RawSocket note above).
+        // Signal shutdown. The accept loop polls the shutdown flag between short waits and exits on its own; closing the listener while accept is using its handle can race with the system call.
         self.shutdown.store(true, .seq_cst);
 
         // Join accept thread. Safe now because the accept loop exits on its next poll-timeout after it sees shutdown==true.
@@ -335,7 +311,7 @@ pub const Transport = struct {
             self.accept_thread = null;
         }
 
-        // Only now is it safe to close the listener (accept thread has joined so no concurrent accept() on this fd).
+        // Only now is it safe to close the listener because the accept thread has joined.
         if (self.server) |s| {
             s.close();
             self.server = null;
@@ -346,7 +322,7 @@ pub const Transport = struct {
         for (self.sessions.items) |sess| sess.requestClose();
         self.sessions_mu.unlock();
 
-        // Wait for detached workers so no reader, writer, or transport-owned fd remains once deinit returns.
+        // Wait for detached workers so no reader, writer, or transport-owned socket remains once deinit returns.
         self.workers_mu.lock();
         while (self.workers_alive != 0) self.workers_changed.wait(&self.workers_mu);
         self.workers_mu.unlock();
@@ -532,31 +508,21 @@ pub const Transport = struct {
 fn acceptLoop(t: *Transport) void {
     defer t.acceptGone();
     const listener = t.server orelse return;
-    const listener_fd = listener.handle;
+    const listener_fd = listener.listener.socket.handle;
 
     // Make the listener non-blocking so we can poll with a short timeout and observe the shutdown flag frequently. This avoids a BADF panic that happens when a blocking accept() races with close() in deinit().
     (RawSocket{ .handle = listener_fd }).setNonBlocking(true) catch return;
 
     while (!t.shutdown.load(.seq_cst)) {
-        var pfds = [_]std.posix.pollfd{.{
-            .fd = listener_fd,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const rc = std.posix.poll(&pfds, 100) catch return;
-        if (rc == 0) continue; // timeout — loop and re-check shutdown
-        if (pfds[0].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) return;
-        if (pfds[0].revents & std.posix.POLL.IN == 0) continue;
+        const polled = (socket.Socket{ .handle = listener_fd }).poll(.read, io_poll_ms) catch return;
+        if (polled.timed_out) continue;
+        if (polled.closed) return;
+        if (!polled.ready) continue;
 
-        const accepted_fd = std.posix.system.accept(listener_fd, null, null);
-        if (accepted_fd < 0) {
-            switch (std.posix.errno(accepted_fd)) {
-                .AGAIN, .INTR => continue,
-                .CONNABORTED, .MFILE, .NFILE => continue,
-                else => return,
-            }
-        }
-        const conn = RawSocket{ .handle = @intCast(accepted_fd) };
+        const conn = switch (listener.listener.accept() catch return) {
+            .accepted => |accepted| RawSocket{ .handle = accepted },
+            .retry => continue,
+        };
         conn.setNonBlocking(true) catch {
             conn.close();
             continue;
@@ -582,7 +548,7 @@ fn handleConnection(t: *Transport, conn: RawSocket) !void {
         if (t.shutdown.load(.acquire)) return error.Closed;
         const n = stream.read(buf[used..]) catch |err| switch (err) {
             error.WouldBlock => {
-                try waitSocket(stream, std.posix.POLL.IN, deadline, null);
+                try waitSocket(stream, .read, deadline, null);
                 continue;
             },
             else => return err,
@@ -859,7 +825,7 @@ fn writerLoop(sess: *Session) void {
     defer {
         const final_worker = sess.workerFinished();
         sess.release();
-        // deinit waits on this counter.  It is notified only after this worker has released its Session reference and, for the last worker, after the descriptor can no longer be retained by a worker.
+        // deinit waits on this counter. It is notified only after this worker has released its Session reference and, for the last worker, after no worker can retain the socket.
         if (final_worker) t.sessionSlotGone();
         t.workerGone();
     }
@@ -899,7 +865,7 @@ fn writerLoop(sess: *Session) void {
     }
 }
 
-fn waitSocket(stream: RawSocket, events: i16, deadline: ?i64, sess: ?*Session) !void {
+fn waitSocket(stream: RawSocket, events: socket.PollEvent, deadline: ?i64, sess: ?*Session) !void {
     while (true) {
         if (sess) |active| {
             // The close signal is Session-owned.  This path deliberately needs no transport lock while the writer is polling.
@@ -911,11 +877,10 @@ fn waitSocket(stream: RawSocket, events: i16, deadline: ?i64, sess: ?*Session) !
             if (remaining <= 0) return error.TimedOut;
             timeout = @intCast(@min(remaining, @as(i64, io_poll_ms)));
         }
-        var pfds = [_]std.posix.pollfd{.{ .fd = stream.handle, .events = events, .revents = 0 }};
-        const ready = try std.posix.poll(&pfds, timeout);
-        if (ready == 0) continue;
-        if (pfds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) return error.SocketClosed;
-        if (pfds[0].revents & events != 0) return;
+        const result = try (socket.Socket{ .handle = stream.handle }).poll(events, timeout);
+        if (result.timed_out) continue;
+        if (result.closed) return error.SocketClosed;
+        if (result.ready) return;
     }
 }
 
@@ -1046,7 +1011,7 @@ fn readExact(sess: *Session, buf: []u8) !void {
         if (sess.closed.load(.acquire) or sess.transport.shutdown.load(.acquire)) return error.Closed;
         const n = sess.stream.read(buf[got..]) catch |err| switch (err) {
             error.WouldBlock => {
-                try waitSocket(sess.stream, std.posix.POLL.IN, null, sess);
+                try waitSocket(sess.stream, .read, null, sess);
                 continue;
             },
             else => return err,

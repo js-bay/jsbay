@@ -4,46 +4,12 @@ const std = @import("std");
 const testing = std.testing;
 const transport = @import("inspector_transport");
 const zev = @import("zev");
+const test_client = @import("test_client");
 
 // -- Test harness helpers -------------------------------------------------
 
-const TestStream = struct {
-    handle: std.posix.fd_t,
-
-    fn read(s: TestStream, buf: []u8) !usize {
-        return std.posix.read(s.handle, buf);
-    }
-
-    fn writeAll(s: TestStream, bytes: []const u8) !void {
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const n = std.posix.system.write(s.handle, bytes.ptr + off, bytes.len - off);
-            if (n < 0) {
-                if (std.posix.errno(n) == .INTR) continue;
-                return error.WriteFailed;
-            }
-            off += @intCast(n);
-        }
-    }
-
-    fn close(s: TestStream) void {
-        _ = std.posix.system.close(s.handle);
-    }
-};
-
-fn connectLoopback(port: u16) !TestStream {
-    const raw_fd = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (raw_fd < 0) return error.SocketFailed;
-    const fd: std.posix.fd_t = @intCast(raw_fd);
-    errdefer _ = std.posix.system.close(fd);
-    var addr: std.posix.sockaddr.in = .{
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7F000001), // 127.0.0.1
-    };
-    if (std.posix.system.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) < 0) return error.ConnectFailed;
-    return .{ .handle = fd };
-}
-
+const TestStream = test_client.Stream;
+const connectLoopback = test_client.connectLoopback;
 fn connect(port: u16) !TestStream {
     return connectLoopback(port);
 }

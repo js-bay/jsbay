@@ -63,7 +63,6 @@ pub fn startWithTransport(instance_id: i32, transport: *Transport, opts: struct 
 /// Convenience API backed by the optional HTTP/WebSocket package.
 pub fn start(instance_id: i32, opts: StartOptions) StartError!*Handle {
     if (comptime !@import("build_options").inspector_transport) return error.UnsupportedFeature;
-    if (comptime @import("builtin").os.tag == .windows) return error.UnsupportedPlatform;
     const endpoint = inspector_transport.Transport.init(std.heap.c_allocator, opts.port) catch return error.OutOfMemory;
     endpoint.setProtocolJson(protocolJson());
     return startWithTransport(instance_id, endpoint.asTransport(), .{

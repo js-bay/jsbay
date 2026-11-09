@@ -1,48 +1,16 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const transport = @import("inspector_transport");
+const test_client = @import("test_client");
 
 comptime {
     _ = @import("transport_contract_tests.zig");
     _ = @import("governance_contract_tests.zig");
 }
 
-const Stream = struct {
-    handle: std.posix.fd_t,
-
-    fn read(self: Stream, buffer: []u8) !usize {
-        return std.posix.read(self.handle, buffer);
-    }
-
-    fn writeAll(self: Stream, bytes: []const u8) !void {
-        var written: usize = 0;
-        while (written < bytes.len) {
-            const result = std.posix.system.write(self.handle, bytes.ptr + written, bytes.len - written);
-            if (result < 0) {
-                if (std.posix.errno(result) == .INTR) continue;
-                return error.WriteFailed;
-            }
-            written += @intCast(result);
-        }
-    }
-
-    fn close(self: Stream) void {
-        _ = std.posix.system.close(self.handle);
-    }
-};
-
-fn connect(port: u16) !Stream {
-    const raw = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (raw < 0) return error.SocketFailed;
-    const fd: std.posix.fd_t = @intCast(raw);
-    errdefer _ = std.posix.system.close(fd);
-    var address: std.posix.sockaddr.in = .{
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7f000001),
-    };
-    if (std.posix.system.connect(fd, @ptrCast(&address), @sizeOf(std.posix.sockaddr.in)) < 0) return error.ConnectFailed;
-    return .{ .handle = fd };
-}
+const Stream = test_client.Stream;
+const connect = test_client.connectLoopback;
 
 fn readHeaders(allocator: std.mem.Allocator, stream: Stream) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
@@ -110,6 +78,7 @@ test "loopback HTTP discovery, WebSocket text, and close" {
     instance.setDiscoveryTarget(.{ .title = "test", .kind = "node", .url = "file:///test.js", .id = "transport-test" });
     var state = State{ .transport = instance };
     try instance.start(&state, handler);
+    try testing.expect(instance.boundPort() != 0);
 
     const http = try connect(instance.boundPort());
     defer http.close();
@@ -135,4 +104,11 @@ test "loopback HTTP discovery, WebSocket text, and close" {
     try socket.writeAll(&[_]u8{ 0x88, 0x80, 1, 2, 3, 4, 1, 2 });
     const close = try readFrame(socket, &frame_buffer);
     try testing.expectEqual(@as(u8, 8), close.opcode);
+}
+
+test "Windows socket handles preserve the high bit" {
+    if (builtin.os.tag == .windows) {
+        const expected = std.math.maxInt(usize) - 0x1234;
+        try testing.expectEqual(expected, @import("portable_socket").handleRoundTripForTest(expected));
+    }
 }
