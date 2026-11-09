@@ -223,6 +223,8 @@ size_t jsbay_engine_list(int *out_ids, size_t cap);
 /* Any thread. Fills out; returns false if missing, teardown-pending, or bad struct_size. Snapshot may tear across locks; lengths only.
    flags bit2 is reserved/unused (teardown is refused by the control-plane lease, not reported). */
 bool jsbay_engine_snapshot(int instance_id, jsbay_instance_snapshot_t *out);
+/* Any thread. Returns false for generation 0. Teardown-pending entries count as present. Returns true only after the requested generation is absent or has been replaced. A true result means its runtime and callbacks have ended; host loop cleanup may still be pending. */
+bool jsbay_engine_is_destroyed(int instance_id, uint64_t generation);
 
 /* Owner-thread snapshot of runtime allocator stats (mirrors Zig runtime_control.MemoryUsage).
  * Backends that cannot report a field leave it zero. struct_size must be set by the caller to

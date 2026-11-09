@@ -33,6 +33,9 @@ async function main() {
   assert.equal(await reused.evaluateAsync('new Promise(resolve => setTimeout(() => resolve(17), 0))', 'reused.js'), 17)
   reused.close()
   await new Promise(resolve => setImmediate(resolve))
+  const idle = addon.create(704)
+  idle.close()
+  assert.equal(addon.stats().destroys, 5)
   const cleanup = execFileSync(process.execPath, [resolve(__dirname, 'embed_cleanup_consumer.cjs')], {
     encoding: 'utf8',
     env: process.env,

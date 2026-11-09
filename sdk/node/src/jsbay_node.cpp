@@ -62,7 +62,7 @@ struct Engine {
     int id = 0;
     std::thread::id owner;
     bool closed = false, destroy_pending = false, destroyed = false;
-    bool core_destroy_requested = false, close_wake_pending = false, close_from_operation = false;
+    bool core_destroy_requested = false;
     uint64_t core_generation = 0;
     bool wrapper_finalized = false, cleanup_hook_registered = false,
          environment_cleaning_up = false;
@@ -142,16 +142,12 @@ static void requestClose(Engine *engine);
 
 struct Operation {
     Engine *engine;
-    bool close_synchronously;
-    explicit Operation(Engine *value, bool synchronous_close = true)
-        : engine(value), close_synchronously(synchronous_close) {
+    explicit Operation(Engine *value) : engine(value) {
         ++engine->active_operations;
     }
     ~Operation() {
-        if (--engine->active_operations == 0 && engine->destroy_pending) {
-            engine->close_from_operation = close_synchronously;
+        if (--engine->active_operations == 0 && engine->destroy_pending)
             finishClose(engine);
-        }
     }
 };
 
@@ -303,7 +299,7 @@ static void wakeLoop(uv_async_t *async) {
         if (loop->owner->environment_cleaning_up)
             finishClose(loop->owner);
         else {
-            Operation operation(loop->owner, loop->owner->embed_destroy_callback == nullptr);
+            Operation operation(loop->owner);
             NodeTurn turn(loop->owner);
         }
         return;
@@ -382,18 +378,10 @@ static bool snapshotCurrentGeneration(Engine *engine) {
            snapshot.generation == engine->core_generation;
 }
 
-static bool snapshotNewGeneration(Engine *engine) {
-    jsbay_instance_snapshot_t snapshot{};
-    snapshot.struct_size = sizeof(snapshot);
-    return jsbay_engine_snapshot(engine->id, &snapshot) &&
-           snapshot.generation != engine->core_generation;
-}
-
 static void scheduleCloseWake(Engine *engine) {
     auto *loop = engine->loop;
     if (!loop || !loop->async_ready || uv_is_closing(reinterpret_cast<uv_handle_t *>(&loop->async)))
         return;
-    engine->close_wake_pending = true;
     (void)uv_async_send(&loop->async);
 }
 
@@ -470,19 +458,12 @@ static void finishClose(Engine *engine) {
         maybeDeleteEngine(engine);
         return;
     }
-    if (!engine->core_destroy_requested) {
-        if (snapshotCurrentGeneration(engine)) {
-            engine->core_destroy_requested = true;
-            releaseCoreValues(engine);
-            jsbay_engine_destroy(engine->id);
-        }
+    if (!engine->core_destroy_requested && snapshotCurrentGeneration(engine)) {
+        engine->core_destroy_requested = true;
+        releaseCoreValues(engine);
+        jsbay_engine_destroy(engine->id);
     }
-    if (snapshotCurrentGeneration(engine)) {
-        scheduleCloseWake(engine);
-        return;
-    }
-    if (!engine->environment_cleaning_up && !engine->close_from_operation &&
-        !engine->close_wake_pending && !snapshotNewGeneration(engine)) {
+    if (!jsbay_engine_is_destroyed(engine->id, engine->core_generation)) {
         scheduleCloseWake(engine);
         return;
     }

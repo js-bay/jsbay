@@ -1687,6 +1687,10 @@ pub export fn jsbay_engine_snapshot(instance_id: c_int, out: ?*InstanceSnapshotC
     return true;
 }
 
+pub export fn jsbay_engine_is_destroyed(instance_id: c_int, generation: u64) bool {
+    return @import("runtime/instance_map.zig").isDestroyed(@intCast(instance_id), generation);
+}
+
 /// Owner-thread memory snapshot. Fills zeros first; false when missing, wrong thread, or null out.
 pub const MemoryUsageC = extern struct {
     struct_size: u32,
