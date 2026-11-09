@@ -25,6 +25,14 @@ async function main() {
   assert.equal(addon.stats().closeAttempts, 1)
   assert.throws(() => closeOnLog.evaluate('1', 'closed-after-log.js'), /status 4/)
   assert.equal(addon.stats().destroys, 2)
+  assert.equal(addon.rawCloseOnLog(703), true)
+  const reused = addon.create(703)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(addon.stats().destroyDuringLog, 0)
+  assert.equal(addon.stats().destroys, 3)
+  assert.equal(await reused.evaluateAsync('new Promise(resolve => setTimeout(() => resolve(17), 0))', 'reused.js'), 17)
+  reused.close()
+  await new Promise(resolve => setImmediate(resolve))
   const cleanup = execFileSync(process.execPath, [resolve(__dirname, 'embed_cleanup_consumer.cjs')], {
     encoding: 'utf8',
     env: process.env,

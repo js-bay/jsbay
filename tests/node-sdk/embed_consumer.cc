@@ -17,6 +17,8 @@ std::atomic<unsigned> destroys{0};
 std::atomic<unsigned> task_enters{0};
 std::atomic<unsigned> task_leaves{0};
 std::atomic<unsigned> close_attempts{0};
+std::atomic<unsigned> destroy_during_log{0};
+std::atomic<bool> log_active{false};
 
 void log(int, jsbay_log_level_t, const char *, void *data) {
     ++logs;
@@ -25,11 +27,15 @@ void log(int, jsbay_log_level_t, const char *, void *data) {
         ++close_attempts;
         state->close_on_log = false;
         napi_value engine = nullptr;
+        log_active.store(true);
         if (napi_get_reference_value(state->env, state->engine, &engine) == napi_ok)
             jsbay_node_close(state->env, engine);
+        log_active.store(false);
     }
 }
 void destroyed(void *data) {
+    if (log_active.load())
+        ++destroy_during_log;
     ++destroys;
     auto *state = static_cast<State *>(data);
     if (state->engine)
@@ -80,6 +86,40 @@ napi_value createCloseOnLog(napi_env env, napi_callback_info info) {
 napi_value createUnclosed(napi_env env, napi_callback_info info) {
     return createEngine(env, info, false, true);
 }
+napi_value rawCloseOnLog(napi_env env, napi_callback_info info) {
+    size_t count = 1;
+    napi_value args[1];
+    napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
+    int32_t id = 0;
+    if (count != 1 || napi_get_value_int32(env, args[0], &id) != napi_ok) {
+        napi_throw_type_error(env, nullptr, "instance id is required");
+        return nullptr;
+    }
+    auto *state = new State{env, nullptr, true, false};
+    napi_value engine = jsbay_node_create(env, id, log, state, destroyed);
+    if (!engine) {
+        delete state;
+        return nullptr;
+    }
+    if (napi_create_reference(env, engine, 1, &state->engine) != napi_ok) {
+        jsbay_node_close(env, engine);
+        napi_throw_error(env, nullptr, "could not retain embedded engine");
+        return nullptr;
+    }
+    const char source[] = "console.info('raw close'); 13";
+    const char filename[] = "raw-close.js";
+    jsbay_value_t value = 0, exception = 0;
+    jsbay_engine_evaluate(id, {reinterpret_cast<const uint8_t *>(source), sizeof(source) - 1},
+                          {reinterpret_cast<const uint8_t *>(filename), sizeof(filename) - 1},
+                          nullptr, &value, &exception);
+    if (value)
+        jsbay_value_release(value);
+    if (exception)
+        jsbay_value_release(exception);
+    napi_value output;
+    napi_get_boolean(env, true, &output);
+    return output;
+}
 napi_value tryDuplicate(napi_env env, napi_callback_info info) {
     size_t count = 1;
     napi_value args[1];
@@ -109,7 +149,8 @@ napi_value stats(napi_env env, napi_callback_info) {
     for (const auto &[name, counter] :
          {std::pair{"logs", &logs}, std::pair{"destroys", &destroys},
           std::pair{"taskEnters", &task_enters}, std::pair{"taskLeaves", &task_leaves},
-          std::pair{"closeAttempts", &close_attempts}}) {
+          std::pair{"closeAttempts", &close_attempts},
+          std::pair{"destroyDuringLog", &destroy_during_log}}) {
         napi_create_uint32(env, counter->load(), &value);
         napi_set_named_property(env, out, name, value);
     }
@@ -124,6 +165,8 @@ napi_value init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "createCloseOnLog", value);
     napi_create_function(env, "createUnclosed", NAPI_AUTO_LENGTH, createUnclosed, nullptr, &value);
     napi_set_named_property(env, exports, "createUnclosed", value);
+    napi_create_function(env, "rawCloseOnLog", NAPI_AUTO_LENGTH, rawCloseOnLog, nullptr, &value);
+    napi_set_named_property(env, exports, "rawCloseOnLog", value);
     napi_create_function(env, "tryDuplicate", NAPI_AUTO_LENGTH, tryDuplicate, nullptr, &value);
     napi_set_named_property(env, exports, "tryDuplicate", value);
     napi_create_function(env, "stats", NAPI_AUTO_LENGTH, stats, nullptr, &value);

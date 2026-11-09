@@ -62,6 +62,8 @@ struct Engine {
     int id = 0;
     std::thread::id owner;
     bool closed = false, destroy_pending = false, destroyed = false;
+    bool core_destroy_requested = false, close_wake_pending = false, close_from_operation = false;
+    uint64_t core_generation = 0;
     bool wrapper_finalized = false, cleanup_hook_registered = false,
          environment_cleaning_up = false;
     unsigned active_operations = 0;
@@ -140,12 +142,16 @@ static void requestClose(Engine *engine);
 
 struct Operation {
     Engine *engine;
-    explicit Operation(Engine *value) : engine(value) {
+    bool close_synchronously;
+    explicit Operation(Engine *value, bool synchronous_close = true)
+        : engine(value), close_synchronously(synchronous_close) {
         ++engine->active_operations;
     }
     ~Operation() {
-        if (--engine->active_operations == 0 && engine->destroy_pending)
+        if (--engine->active_operations == 0 && engine->destroy_pending) {
+            engine->close_from_operation = close_synchronously;
             finishClose(engine);
+        }
     }
 };
 
@@ -297,7 +303,7 @@ static void wakeLoop(uv_async_t *async) {
         if (loop->owner->environment_cleaning_up)
             finishClose(loop->owner);
         else {
-            Operation operation(loop->owner);
+            Operation operation(loop->owner, loop->owner->embed_destroy_callback == nullptr);
             NodeTurn turn(loop->owner);
         }
         return;
@@ -344,11 +350,12 @@ static void closeHandle(uv_handle_t *handle) {
         maybeDeleteEngine(engine);
     }
 }
-static void closeLoop(Engine *engine) {
+static void closeLoop(Engine *engine, bool detach_core) {
     auto *loop = engine->loop;
     if (!loop)
         return;
-    (void)jsbay_engine_detach_loop(engine->id);
+    if (detach_core)
+        (void)jsbay_engine_detach_loop(engine->id);
     {
         std::lock_guard<std::mutex> lock(loop->mutex);
         loop->closing = true;
@@ -366,6 +373,45 @@ static void closeLoop(Engine *engine) {
         engine->loop = nullptr;
         delete loop;
     }
+}
+
+static bool snapshotCurrentGeneration(Engine *engine) {
+    jsbay_instance_snapshot_t snapshot{};
+    snapshot.struct_size = sizeof(snapshot);
+    return jsbay_engine_snapshot(engine->id, &snapshot) &&
+           snapshot.generation == engine->core_generation;
+}
+
+static bool snapshotNewGeneration(Engine *engine) {
+    jsbay_instance_snapshot_t snapshot{};
+    snapshot.struct_size = sizeof(snapshot);
+    return jsbay_engine_snapshot(engine->id, &snapshot) &&
+           snapshot.generation != engine->core_generation;
+}
+
+static void scheduleCloseWake(Engine *engine) {
+    auto *loop = engine->loop;
+    if (!loop || !loop->async_ready || uv_is_closing(reinterpret_cast<uv_handle_t *>(&loop->async)))
+        return;
+    engine->close_wake_pending = true;
+    (void)uv_async_send(&loop->async);
+}
+
+static void releaseCoreValues(Engine *engine) {
+    for (auto value :
+         {engine->dispatch_ok, engine->dispatch_error, engine->bind_function, engine->get_prototype,
+          engine->object_is, engine->object_prototype, engine->get_descriptor, engine->has_own,
+          engine->error_constructor, engine->create_object, engine->define_property,
+          engine->guest_stack_getter, engine->completion_failure, engine->guest_promise,
+          engine->guest_resolve, engine->guest_then, engine->guest_promise_prototype})
+        if (value)
+            jsbay_value_release(value);
+    engine->dispatch_ok = engine->dispatch_error = engine->bind_function = 0;
+    engine->get_prototype = engine->object_is = engine->object_prototype = 0;
+    engine->get_descriptor = engine->has_own = engine->error_constructor = 0;
+    engine->create_object = engine->define_property = engine->guest_stack_getter = 0;
+    engine->completion_failure = engine->guest_promise = engine->guest_resolve = 0;
+    engine->guest_then = engine->guest_promise_prototype = 0;
 }
 
 static void rejectObservers(Engine *engine) {
@@ -390,6 +436,56 @@ static void rejectObservers(Engine *engine) {
 static void finishClose(Engine *engine) {
     if (engine->destroyed || engine->active_operations != 0)
         return;
+    if (!engine->embed_destroy_callback) {
+        engine->destroyed = true;
+        rejectObservers(engine);
+        for (auto *completion : engine->completions) {
+            completion->engine = nullptr;
+            completion->completed = true;
+            releaseCompletion(completion);
+        }
+        engine->completions.clear();
+        releaseCoreValues(engine);
+        if (engine->promise_then) {
+            napi_delete_reference(engine->env, engine->promise_then);
+            engine->promise_then = nullptr;
+        }
+        if (engine->host_stack_getter) {
+            napi_delete_reference(engine->env, engine->host_stack_getter);
+            engine->host_stack_getter = nullptr;
+        }
+        if (engine->async_context) {
+            napi_async_destroy(engine->env, engine->async_context);
+            engine->async_context = nullptr;
+        }
+        for (auto reference : {engine->async_resource, engine->wrapper})
+            if (reference)
+                napi_delete_reference(engine->env, reference);
+        engine->async_resource = nullptr;
+        engine->wrapper = nullptr;
+        closeLoop(engine, true);
+        jsbay_engine_destroy(engine->id);
+        engine->embed_task_observer = nullptr;
+        engine->embed_task_observer_data = nullptr;
+        maybeDeleteEngine(engine);
+        return;
+    }
+    if (!engine->core_destroy_requested) {
+        if (snapshotCurrentGeneration(engine)) {
+            engine->core_destroy_requested = true;
+            releaseCoreValues(engine);
+            jsbay_engine_destroy(engine->id);
+        }
+    }
+    if (snapshotCurrentGeneration(engine)) {
+        scheduleCloseWake(engine);
+        return;
+    }
+    if (!engine->environment_cleaning_up && !engine->close_from_operation &&
+        !engine->close_wake_pending && !snapshotNewGeneration(engine)) {
+        scheduleCloseWake(engine);
+        return;
+    }
     engine->destroyed = true;
     rejectObservers(engine);
     for (auto *completion : engine->completions) {
@@ -398,14 +494,6 @@ static void finishClose(Engine *engine) {
         releaseCompletion(completion);
     }
     engine->completions.clear();
-    for (auto value :
-         {engine->dispatch_ok, engine->dispatch_error, engine->bind_function, engine->get_prototype,
-          engine->object_is, engine->object_prototype, engine->get_descriptor, engine->has_own,
-          engine->error_constructor, engine->create_object, engine->define_property,
-          engine->guest_stack_getter, engine->completion_failure, engine->guest_promise,
-          engine->guest_resolve, engine->guest_then, engine->guest_promise_prototype})
-        if (value)
-            jsbay_value_release(value);
     if (engine->promise_then) {
         napi_delete_reference(engine->env, engine->promise_then);
         engine->promise_then = nullptr;
@@ -423,8 +511,7 @@ static void finishClose(Engine *engine) {
             napi_delete_reference(engine->env, reference);
     engine->async_resource = nullptr;
     engine->wrapper = nullptr;
-    closeLoop(engine);
-    jsbay_engine_destroy(engine->id);
+    closeLoop(engine, false);
     engine->embed_task_observer = nullptr;
     engine->embed_task_observer_data = nullptr;
     if (engine->embed_destroy_callback) {
@@ -1551,11 +1638,18 @@ static napi_value createEngine(napi_env env, int32_t id, jsbay_log_handler_t log
     } else if (!jsbay_engine_create(id, nullptr, nullptr)) {
         return throwText(env, "could not create JsBay engine");
     }
+    jsbay_instance_snapshot_t snapshot{};
+    snapshot.struct_size = sizeof(snapshot);
+    if (!jsbay_engine_snapshot(id, &snapshot)) {
+        jsbay_engine_destroy(id);
+        return throwText(env, "could not initialize JsBay engine");
+    }
     napi_value out;
     napi_create_object(env, &out);
     auto *engine = new Engine{};
     engine->env = env;
     engine->id = id;
+    engine->core_generation = snapshot.generation;
     engine->owner = std::this_thread::get_id();
     engine->loop = new Loop{};
     engine->loop->owner = engine;
