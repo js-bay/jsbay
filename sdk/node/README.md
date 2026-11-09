@@ -64,3 +64,9 @@ Closing rejects pending evaluations but does not abort the host's I/O or returne
 Run `bash tests/node-sdk/run_native_consumer.sh` to build and exercise the SDK. `JSBAY_LIBRARY` selects an existing compatible archive; otherwise the script builds QuickJS-NG. The helper requires CMake; set `CMAKE` to select its executable. Set `TSC` to a TypeScript compiler script to also check declarations and package import conditions. The independent consumer requires `--expose-gc`; the helper supplies it.
 
 The helper builds both a test addon with fault controls and a Release CMake addon. It runs the basic and independent consumers against both, runs the fault consumer only against the test addon, and verifies that the production addon exports no test hooks. See [SDK quality checks](../QUALITY.md) and the [testing guide](../../docs/testing.md#native-promise-and-nodejs-consumers) for coverage and CI entry points.
+
+## Embedding
+
+An existing Node-API addon can compile `src/jsbay_node.cpp` into its own module with `JSBAY_NODE_EMBEDDED` and include `include/jsbay_node_embed.h`. This keeps one addon, one linked JsBay core, and one owner event loop. Do not load the SDK as a second `.node` module for the same engine.
+
+Call `jsbay_node_create` with a positive instance id, optional native log handler, and a destruction callback. After creation succeeds, the destruction callback owns the supplied user data and runs once after the core engine has been destroyed. It can release native and Node-API references but must not call JavaScript or use JsBay values. `jsbay_node_set_task_observer` is for native metrics only; its callbacks must not call Node-API or JsBay APIs. `jsbay_node_close` requests the same deferred close used by `Engine.close` and is safe during a log callback or host callback.

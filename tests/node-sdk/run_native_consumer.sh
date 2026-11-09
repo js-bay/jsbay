@@ -31,7 +31,7 @@ case "$(uname -s)" in
   Linux) flags=(-shared -fPIC -pthread) ;;
   *) echo "unsupported Node platform" >&2; exit 2 ;;
 esac
-"${CXX:-c++}" -std=c++17 -DJSBAY_NODE_TESTING=1 "${flags[@]}" -I"$root/include" -I"$node_include" -I"$(dirname "$node_include")" "$root/sdk/node/src/jsbay_node.cpp" "$archive" -o "$temporary_addon"
+"${CXX:-c++}" -std=c++17 -DJSBAY_NODE_TESTING=1 "${flags[@]}" -I"$root/include" -I"$root/sdk/node/include" -I"$node_include" -I"$(dirname "$node_include")" "$root/sdk/node/src/jsbay_node.cpp" "$archive" -o "$temporary_addon"
 mv -f "$temporary_addon" "$addon"
 JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
 JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
@@ -43,6 +43,9 @@ for review_case in cleanup-pending completion-reasons shared-handler-error synch
   JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
 done
 JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/conversion_fault_consumer.cjs"
+embed_addon="$output_dir/jsbay_node_embed.node"
+"${CXX:-c++}" -std=c++17 -DJSBAY_NODE_EMBEDDED=1 "${flags[@]}" -I"$root/include" -I"$root/sdk/node/include" -I"$node_include" -I"$(dirname "$node_include")" "$root/sdk/node/src/jsbay_node.cpp" "$root/tests/node-sdk/embed_consumer.cc" "$archive" -o "$embed_addon"
+JSBAY_NODE_EMBED_ADDON="$embed_addon" "$node_bin" "$root/tests/node-sdk/embed_consumer.cjs"
 mkdir -p "$package_root/node_modules/@js-bay"
 ln -s "$root/sdk/node" "$package_root/node_modules/@js-bay/node"
 JSBAY_NODE_ADDON="$addon" JSBAY_NODE_PACKAGE_ROOT="$package_root/package.mjs" "$node_bin" "$root/tests/node-sdk/package_consumer.mjs"

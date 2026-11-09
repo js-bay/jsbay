@@ -194,6 +194,15 @@ pub fn remove(instance_id: i32) ?*EngineInstance {
     return kv.value;
 }
 
+/// Returns true once the requested generation is no longer registered. Unlike control-plane queries, teardown-pending entries remain visible so hosts can wait for physical runtime destruction.
+pub fn isDestroyed(instance_id: i32, generation: u64) bool {
+    if (generation == 0) return false;
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return true;
+    return inst.generation != generation;
+}
+
 pub const InstancePtrs = struct {
     /// Valid ActiveEngine context only when `backend_tag == active_backend` (mono handle).
     ctx: ActiveEngine.Context,

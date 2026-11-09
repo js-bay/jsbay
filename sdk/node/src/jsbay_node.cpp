@@ -1,5 +1,6 @@
 #include "jsbay.h"
 #include "jsbay_async.h"
+#include "jsbay_node_embed.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -61,6 +62,8 @@ struct Engine {
     int id = 0;
     std::thread::id owner;
     bool closed = false, destroy_pending = false, destroyed = false;
+    bool core_destroy_requested = false;
+    uint64_t core_generation = 0;
     bool wrapper_finalized = false, cleanup_hook_registered = false,
          environment_cleaning_up = false;
     unsigned active_operations = 0;
@@ -76,6 +79,10 @@ struct Engine {
     napi_ref async_resource = nullptr, wrapper = nullptr;
     napi_async_context async_context = nullptr;
     bool observer_retained = false;
+    void *embed_user_data = nullptr;
+    void (*embed_destroy_callback)(void *) = nullptr;
+    void *embed_task_observer_data = nullptr;
+    void (*embed_task_observer)(void *, bool) = nullptr;
     jsbay_value_t guest_promise = 0, guest_resolve = 0, guest_then = 0, guest_promise_prototype = 0;
     jsbay_value_t guest_stack_getter = 0, completion_failure = 0;
 };
@@ -274,9 +281,15 @@ static void fireTimer(uv_timer_t *timer) {
     if (task) {
         Operation operation(loop->owner);
         NodeTurn turn(loop->owner);
-        if (turn.ready && !loop->owner->closed)
+        if (turn.ready && !loop->owner->closed) {
+            auto observer = loop->owner->embed_task_observer;
+            auto *observer_data = loop->owner->embed_task_observer_data;
+            if (observer)
+                observer(observer_data, true);
             task(data);
-        else
+            if (observer)
+                observer(observer_data, false);
+        } else
             requestClose(loop->owner);
     }
 }
@@ -333,11 +346,12 @@ static void closeHandle(uv_handle_t *handle) {
         maybeDeleteEngine(engine);
     }
 }
-static void closeLoop(Engine *engine) {
+static void closeLoop(Engine *engine, bool detach_core) {
     auto *loop = engine->loop;
     if (!loop)
         return;
-    (void)jsbay_engine_detach_loop(engine->id);
+    if (detach_core)
+        (void)jsbay_engine_detach_loop(engine->id);
     {
         std::lock_guard<std::mutex> lock(loop->mutex);
         loop->closing = true;
@@ -355,6 +369,37 @@ static void closeLoop(Engine *engine) {
         engine->loop = nullptr;
         delete loop;
     }
+}
+
+static bool snapshotCurrentGeneration(Engine *engine) {
+    jsbay_instance_snapshot_t snapshot{};
+    snapshot.struct_size = sizeof(snapshot);
+    return jsbay_engine_snapshot(engine->id, &snapshot) &&
+           snapshot.generation == engine->core_generation;
+}
+
+static void scheduleCloseWake(Engine *engine) {
+    auto *loop = engine->loop;
+    if (!loop || !loop->async_ready || uv_is_closing(reinterpret_cast<uv_handle_t *>(&loop->async)))
+        return;
+    (void)uv_async_send(&loop->async);
+}
+
+static void releaseCoreValues(Engine *engine) {
+    for (auto value :
+         {engine->dispatch_ok, engine->dispatch_error, engine->bind_function, engine->get_prototype,
+          engine->object_is, engine->object_prototype, engine->get_descriptor, engine->has_own,
+          engine->error_constructor, engine->create_object, engine->define_property,
+          engine->guest_stack_getter, engine->completion_failure, engine->guest_promise,
+          engine->guest_resolve, engine->guest_then, engine->guest_promise_prototype})
+        if (value)
+            jsbay_value_release(value);
+    engine->dispatch_ok = engine->dispatch_error = engine->bind_function = 0;
+    engine->get_prototype = engine->object_is = engine->object_prototype = 0;
+    engine->get_descriptor = engine->has_own = engine->error_constructor = 0;
+    engine->create_object = engine->define_property = engine->guest_stack_getter = 0;
+    engine->completion_failure = engine->guest_promise = engine->guest_resolve = 0;
+    engine->guest_then = engine->guest_promise_prototype = 0;
 }
 
 static void rejectObservers(Engine *engine) {
@@ -379,6 +424,49 @@ static void rejectObservers(Engine *engine) {
 static void finishClose(Engine *engine) {
     if (engine->destroyed || engine->active_operations != 0)
         return;
+    if (!engine->embed_destroy_callback) {
+        engine->destroyed = true;
+        rejectObservers(engine);
+        for (auto *completion : engine->completions) {
+            completion->engine = nullptr;
+            completion->completed = true;
+            releaseCompletion(completion);
+        }
+        engine->completions.clear();
+        releaseCoreValues(engine);
+        if (engine->promise_then) {
+            napi_delete_reference(engine->env, engine->promise_then);
+            engine->promise_then = nullptr;
+        }
+        if (engine->host_stack_getter) {
+            napi_delete_reference(engine->env, engine->host_stack_getter);
+            engine->host_stack_getter = nullptr;
+        }
+        if (engine->async_context) {
+            napi_async_destroy(engine->env, engine->async_context);
+            engine->async_context = nullptr;
+        }
+        for (auto reference : {engine->async_resource, engine->wrapper})
+            if (reference)
+                napi_delete_reference(engine->env, reference);
+        engine->async_resource = nullptr;
+        engine->wrapper = nullptr;
+        closeLoop(engine, true);
+        jsbay_engine_destroy(engine->id);
+        engine->embed_task_observer = nullptr;
+        engine->embed_task_observer_data = nullptr;
+        maybeDeleteEngine(engine);
+        return;
+    }
+    if (!engine->core_destroy_requested && snapshotCurrentGeneration(engine)) {
+        engine->core_destroy_requested = true;
+        releaseCoreValues(engine);
+        jsbay_engine_destroy(engine->id);
+    }
+    if (!jsbay_engine_is_destroyed(engine->id, engine->core_generation)) {
+        scheduleCloseWake(engine);
+        return;
+    }
     engine->destroyed = true;
     rejectObservers(engine);
     for (auto *completion : engine->completions) {
@@ -387,14 +475,6 @@ static void finishClose(Engine *engine) {
         releaseCompletion(completion);
     }
     engine->completions.clear();
-    for (auto value :
-         {engine->dispatch_ok, engine->dispatch_error, engine->bind_function, engine->get_prototype,
-          engine->object_is, engine->object_prototype, engine->get_descriptor, engine->has_own,
-          engine->error_constructor, engine->create_object, engine->define_property,
-          engine->guest_stack_getter, engine->completion_failure, engine->guest_promise,
-          engine->guest_resolve, engine->guest_then, engine->guest_promise_prototype})
-        if (value)
-            jsbay_value_release(value);
     if (engine->promise_then) {
         napi_delete_reference(engine->env, engine->promise_then);
         engine->promise_then = nullptr;
@@ -412,8 +492,16 @@ static void finishClose(Engine *engine) {
             napi_delete_reference(engine->env, reference);
     engine->async_resource = nullptr;
     engine->wrapper = nullptr;
-    closeLoop(engine);
-    jsbay_engine_destroy(engine->id);
+    closeLoop(engine, false);
+    engine->embed_task_observer = nullptr;
+    engine->embed_task_observer_data = nullptr;
+    if (engine->embed_destroy_callback) {
+        auto callback = engine->embed_destroy_callback;
+        auto *user_data = engine->embed_user_data;
+        engine->embed_destroy_callback = nullptr;
+        engine->embed_user_data = nullptr;
+        callback(user_data);
+    }
     maybeDeleteEngine(engine);
 }
 static void environmentCleanup(void *opaque) {
@@ -1516,54 +1604,33 @@ static napi_value closeEngine(napi_env env, napi_callback_info info) {
     return undefined(env);
 }
 
-static napi_value create(napi_env env, napi_callback_info info) {
-    size_t count = 1;
-    napi_value args[1];
-    napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
-    int32_t id = 0;
-    bool supplied_id = false;
-    if (count == 1) {
-        napi_value value;
-        bool has_id = false;
-        if (napi_has_named_property(env, args[0], "instanceId", &has_id) == napi_ok && has_id) {
-            double numeric_id = 0;
-            if (napi_get_named_property(env, args[0], "instanceId", &value) != napi_ok)
-                return nullptr;
-            napi_valuetype value_type;
-            if (napi_typeof(env, value, &value_type) != napi_ok)
-                return nullptr;
-            if (value_type != napi_undefined) {
-                if (napi_get_value_double(env, value, &numeric_id) != napi_ok ||
-                    !std::isfinite(numeric_id) || numeric_id < 1 || numeric_id > 2147483647 ||
-                    std::floor(numeric_id) != numeric_id)
-                    return throwText(env, "instanceId must be a positive int32");
-                id = static_cast<int32_t>(numeric_id);
-                supplied_id = true;
-            }
-        }
-    }
-    if (supplied_id) {
-        if (!jsbay_engine_create(id, nullptr, nullptr))
+static napi_value createEngine(napi_env env, int32_t id, jsbay_log_handler_t log_handler,
+                               void *user_data, void (*destroy_callback)(void *)) {
+    if (id < 1)
+        return throwText(env, "instanceId must be a positive int32");
+    if (log_handler) {
+        jsbay_engine_create_options_t options{};
+        options.struct_size = sizeof(options);
+        options.backend = JSBAY_BACKEND_PRIMARY;
+        options.log_handler = log_handler;
+        options.log_user_data = user_data;
+        if (!jsbay_engine_create_with_options(id, &options))
             return throwText(env, "could not create JsBay engine");
-    } else {
-        do {
-            id = next_instance_id.fetch_add(1);
-            if (id <= 0)
-                return throwText(env, "could not allocate a JsBay instance id");
-            jsbay_instance_snapshot_t snapshot{};
-            snapshot.struct_size = sizeof(snapshot);
-            if (jsbay_engine_snapshot(id, &snapshot))
-                continue;
-            if (!jsbay_engine_create(id, nullptr, nullptr))
-                return throwText(env, "could not create JsBay engine");
-            break;
-        } while (true);
+    } else if (!jsbay_engine_create(id, nullptr, nullptr)) {
+        return throwText(env, "could not create JsBay engine");
+    }
+    jsbay_instance_snapshot_t snapshot{};
+    snapshot.struct_size = sizeof(snapshot);
+    if (!jsbay_engine_snapshot(id, &snapshot)) {
+        jsbay_engine_destroy(id);
+        return throwText(env, "could not initialize JsBay engine");
     }
     napi_value out;
     napi_create_object(env, &out);
     auto *engine = new Engine{};
     engine->env = env;
     engine->id = id;
+    engine->core_generation = snapshot.generation;
     engine->owner = std::this_thread::get_id();
     engine->loop = new Loop{};
     engine->loop->owner = engine;
@@ -1633,9 +1700,77 @@ static napi_value create(napi_env env, napi_callback_info info) {
         {"bind", nullptr, bindSync, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"bindAsync", nullptr, bindAsync, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"close", nullptr, closeEngine, nullptr, nullptr, nullptr, napi_default, nullptr}};
-    napi_define_properties(env, out, sizeof(methods) / sizeof(methods[0]), methods);
+    if (napi_define_properties(env, out, sizeof(methods) / sizeof(methods[0]), methods) !=
+        napi_ok) {
+        requestClose(engine);
+        return throwText(env, "could not define JsBay engine methods");
+    }
+    engine->embed_user_data = user_data;
+    engine->embed_destroy_callback = destroy_callback;
     return out;
 }
+static napi_value create(napi_env env, napi_callback_info info) {
+    size_t count = 1;
+    napi_value args[1];
+    napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
+    int32_t id = 0;
+    if (count == 1) {
+        napi_value value;
+        bool has_id = false;
+        if (napi_has_named_property(env, args[0], "instanceId", &has_id) != napi_ok)
+            return nullptr;
+        if (has_id) {
+            if (napi_get_named_property(env, args[0], "instanceId", &value) != napi_ok)
+                return nullptr;
+            napi_valuetype value_type;
+            double numeric_id = 0;
+            if (napi_typeof(env, value, &value_type) != napi_ok)
+                return nullptr;
+            if (value_type != napi_undefined) {
+                if (napi_get_value_double(env, value, &numeric_id) != napi_ok ||
+                    !std::isfinite(numeric_id) || numeric_id < 1 || numeric_id > 2147483647 ||
+                    std::floor(numeric_id) != numeric_id)
+                    return throwText(env, "instanceId must be a positive int32");
+                id = static_cast<int32_t>(numeric_id);
+            }
+        }
+    }
+    if (id == 0) {
+        do {
+            id = next_instance_id.fetch_add(1);
+            if (id <= 0)
+                return throwText(env, "could not allocate a JsBay instance id");
+            jsbay_instance_snapshot_t snapshot{};
+            snapshot.struct_size = sizeof(snapshot);
+            if (!jsbay_engine_snapshot(id, &snapshot))
+                break;
+        } while (true);
+    }
+    return createEngine(env, id, nullptr, nullptr, nullptr);
+}
+} // namespace
+#ifdef JSBAY_NODE_EMBEDDED
+extern "C" napi_value jsbay_node_create(napi_env env, int instance_id,
+                                        jsbay_log_handler_t log_handler, void *user_data,
+                                        jsbay_node_destroy_callback_t destroy_callback) {
+    return createEngine(env, instance_id, log_handler, user_data, destroy_callback);
+}
+extern "C" void jsbay_node_close(napi_env env, napi_value value) {
+    Engine *engine = unwrap(env, value);
+    if (!engine || engine->closed || !requireEngine(env, engine))
+        return;
+    requestClose(engine);
+}
+extern "C" bool jsbay_node_set_task_observer(napi_env env, napi_value value,
+                                             jsbay_node_task_observer_t observer, void *user_data) {
+    Engine *engine = unwrap(env, value);
+    if (!engine || engine->closed || !requireEngine(env, engine))
+        return false;
+    engine->embed_task_observer = observer;
+    engine->embed_task_observer_data = user_data;
+    return true;
+}
+#else
 #ifdef JSBAY_NODE_TESTING
 static napi_value testFail(napi_env env, napi_callback_info info) {
     size_t count = 1;
@@ -1675,5 +1810,5 @@ static napi_value init(napi_env env, napi_value exports) {
 #endif
     return exports;
 }
-} // namespace
 NAPI_MODULE(NODE_GYP_MODULE_NAME, init)
+#endif
