@@ -491,6 +491,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "inspector_transport", .module = inspector_transport },
                     .{ .name = "test_client", .module = inspector_transport_dep.module("portable_test_client") },
+                    .{ .name = "portable_socket", .module = inspector_transport_dep.module("portable_socket") },
                     .{ .name = "zev", .module = zev },
                 },
             }),

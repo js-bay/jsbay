@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 const transport = @import("inspector_transport");
 const test_client = @import("test_client");
@@ -103,4 +104,11 @@ test "loopback HTTP discovery, WebSocket text, and close" {
     try socket.writeAll(&[_]u8{ 0x88, 0x80, 1, 2, 3, 4, 1, 2 });
     const close = try readFrame(socket, &frame_buffer);
     try testing.expectEqual(@as(u8, 8), close.opcode);
+}
+
+test "Windows socket handles preserve the high bit" {
+    if (builtin.os.tag == .windows) {
+        const expected = std.math.maxInt(usize) - 0x1234;
+        try testing.expectEqual(expected, @import("portable_socket").handleRoundTripForTest(expected));
+    }
 }
