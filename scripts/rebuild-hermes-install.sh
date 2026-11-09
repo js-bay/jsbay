@@ -66,8 +66,7 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
 ninja -C "$BUILD" -j"$JOBS"
 ninja -C "$BUILD" install
 
-# Hermes installs the VM API but not JSI, while the bridge is compiled against
-# both. Keep the prefix self-contained for the bridge and downstream linker.
+# Hermes installs the VM API but not JSI, while the bridge is compiled against both. Keep the prefix self-contained for the bridge and downstream linker.
 mkdir -p "$PREFIX/include/jsi" "$PREFIX/lib"
 cp -f "$SRC/API/jsi/jsi/"*.h "$PREFIX/include/jsi/"
 JSI_LIB="$(find "$BUILD" -name 'libjsi.so' -print -quit)"
