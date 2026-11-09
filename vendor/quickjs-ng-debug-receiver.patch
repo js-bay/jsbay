@@ -351,14 +351,16 @@ diff --git a/quickjs.c b/quickjs.c
  /* return the position of the next opcode */
  static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
                               JSAtom var_name, int scope_level, int op,
-@@ -38584,6 +38784,10 @@
-         fd->super_call_allowed = fd->parent->super_call_allowed;
-         fd->super_allowed = fd->parent->super_allowed;
-         fd->arguments_allowed = fd->parent->arguments_allowed;
-+#if JSBAY_INSPECTOR
-+        if (jsbay_capture_arrow_this(ctx, fd))
-+            goto fail;
+@@ -37004,6 +37204,11 @@
+ #ifndef QJS_DISABLE_PARSER
+     if (fd->has_eval_call)
+         add_eval_variables(ctx, fd);
+ #endif // QJS_DISABLE_PARSER
++
++#if JSBAY_INSPECTOR && !defined(QJS_DISABLE_PARSER)
++    if (fd->func_type == JS_PARSE_FUNC_ARROW && jsbay_capture_arrow_this(ctx, fd))
++        goto fail;
 +#endif
-     } else if (func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT) {
-         fd->new_target_allowed = true; // although new.target === undefined
-         fd->super_call_allowed = false;
+ 
+     /* add the module global variables in the closure */
+     if (fd->module) {

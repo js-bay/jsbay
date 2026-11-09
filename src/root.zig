@@ -149,6 +149,7 @@ pub const c_api = struct {
     pub const jsbay_engine_get_admission_class = c_api_impl.jsbay_engine_get_admission_class;
     pub const jsbay_engine_list = c_api_impl.jsbay_engine_list;
     pub const jsbay_engine_snapshot = c_api_impl.jsbay_engine_snapshot;
+    pub const jsbay_engine_is_destroyed = c_api_impl.jsbay_engine_is_destroyed;
     pub const jsbay_engine_inspector_start = c_api_impl.jsbay_engine_inspector_start;
     pub const jsbay_engine_inspector_stop = c_api_impl.jsbay_engine_inspector_stop;
     pub const jsbay_engine_compile_bytecode = c_api_impl.jsbay_engine_compile_bytecode;

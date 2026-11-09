@@ -33,7 +33,7 @@ The public Zig API mirrors the typed C ABI. Owner-thread observability includes 
 
 ## Thread and lifetime rules
 
-Create, evaluate, run the loop, access values, and destroy on the owner thread. Do not store a value handle in work that may run on another thread. The ordinary cross-thread controls are `jsbay_engine_request_interrupt` and `jsbay_engine_stop_loop`; the synchronous-native extension has its own completion boundary.
+Create, evaluate, run the loop, access values, and release values on the owner thread. Prefer destroying there too; `jsbay_engine_destroy` also supports a joining control-thread call as described in the [API contract](api-contract.md#instances-and-threads). Do not send value handles to another thread. Cross-thread controls and queued submissions are listed in the contract. For native Promise completion, send only the request ID and copied result data through `jsbay_async_complete`; the synchronous-native extension has its separate completion API.
 
 `destroy` closes the instance to new public work. If it is called from JavaScript or a native callback, cleanup may wait until the callback unwinds. A destroyed value is never valid again, even if the same instance ID is reused.
 
@@ -47,13 +47,17 @@ Do not run a second scheduler for the same instance.
 
 ## C and SDKs
 
-The stable C declarations are in `include/jsbay.h`. Android, Apple, .NET, and Harmony are wrappers over that ABI; their READMEs provide installation and linker settings. Create an engine on its owner thread, use it there, release every owned `jsbay_value_t`, then destroy it there. Do not let a finalizer or garbage collector call destroy or value-release APIs.
+The stable C declarations are in `include/jsbay.h`, with optional native-call extensions in `include/jsbay_async.h` and `include/jsbay_sync.h`. Android, Apple, .NET, Harmony, and [Node.js](../sdk/node/README.md) wrap that ABI; their READMEs provide installation and linker settings. Handle-based bindings require explicit release of owned values. The Node.js SDK copies supported values into the receiving runtime instead of exposing `jsbay_value_t` handles.
+
+Create an engine on its owner thread, use it there, release every owned `jsbay_value_t`, then destroy it there. Garbage-collector finalizers must schedule owner-thread cleanup rather than directly calling destroy or value-release APIs. In Node.js, use `Engine.create()` and close the engine in `finally`; the SDK attaches the engine loop to Node.js and handles fallback disposal during garbage collection or environment shutdown.
 
 All C text input is length-delimited UTF-8. `data == NULL && len == 0` is an empty string; a null pointer with a nonzero length is invalid. Returned `jsbay_bytes_t` storage belongs to the library and must be released with `jsbay_free_bytes` exactly once (double free aborts). Check every `jsbay_status_t`; a JavaScript exception is an owned value, not necessarily a string.
 
 ## Modules and native functions
 
-The stable C ABI has no general module-loader registration. Use its normal evaluation entry point and configure any application-specific loading outside the runtime. Native callbacks receive borrowed value handles. Copy ordinary data before starting asynchronous work; retain a value only through the supported reference or retain APIs. For the optional synchronous-native bridge, read [native-sync.md](native-sync.md).
+The stable C ABI has no general module-loader registration. Use its normal evaluation entry point and configure any application-specific loading outside the runtime. Native callbacks receive borrowed value handles. Copy ordinary data before starting asynchronous work; retain a value only through the supported reference or retain APIs.
+
+Choose [native asynchronous calls](native-async.md) when JavaScript should receive a Promise and continue running. Choose [synchronous native calls](native-sync.md) when JavaScript must wait for a native result before returning. The synchronous API blocks its owner without pumping either runtime, so its completion must not depend on that same owner queue. Node.js `bindAsync` uses the Promise interface and accepts host values, Promises, or thenables.
 
 The C and SDK contract, including ownership and status semantics, is in [api-contract.md](api-contract.md).
 

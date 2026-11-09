@@ -19,7 +19,7 @@ printf '%s\n' "$commit" | cmp - "$package/COMMIT"
 printf '%s\n' "$backend" | cmp - "$package/backend"
 cmp "$root/LICENSE" "$package/LICENSE"
 cmp "$root/THIRD_PARTY_NOTICES.md" "$package/THIRD_PARTY_NOTICES.md"
-for header in jsbay.h jsbay_bytecode.h jsbay_sync.h; do
+for header in jsbay.h jsbay_bytecode.h jsbay_sync.h jsbay_async.h; do
     cmp "$root/include/$header" "$package/include/$header"
 done
 library="$package/lib/libjsbay.a"
@@ -29,7 +29,7 @@ libraries=(-lm -pthread)
 if [[ $(uname -s) == Darwin ]]; then
     libraries=(-lm -framework Foundation -framework JavaScriptCore -lobjc -fsanitize=undefined)
 fi
-for consumer in value_contract_consumer value_edge_consumer jsc_bind_contract_consumer c_consumer bytecode_consumer native_sync_consumer; do
+for consumer in value_contract_consumer value_edge_consumer jsc_bind_contract_consumer c_consumer bytecode_consumer native_sync_consumer async_promise_consumer; do
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -I"$package/include" \
         "$root/tests/$consumer.c" "$library" "${libraries[@]}" -o "$work/bin/$consumer"
     "$work/bin/$consumer"

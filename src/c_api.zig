@@ -21,6 +21,7 @@ const typed_bytecode = @import("script/typed_bytecode.zig");
 const native_sync = @import("js_event_loop").native_sync;
 const host_wake = @import("js_event_loop").host_wake;
 const submission = @import("runtime/submission.zig");
+const api_async = @import("abi/api_async.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -1458,7 +1459,10 @@ pub export fn jsbay_engine_cancel(instance_id: c_int, generation: u64) bool {
     defer lease.end();
     if (lease.inst.generation != generation) return false;
     const accepted = runtime_control.requestShutdownCancel(id);
-    if (accepted) native_sync.cancelForInstance(id);
+    if (accepted) {
+        native_sync.cancelForInstance(id);
+        api_async.cancelGeneration(id, generation);
+    }
     return accepted;
 }
 
@@ -1681,6 +1685,10 @@ pub export fn jsbay_engine_snapshot(instance_id: c_int, out: ?*InstanceSnapshotC
         .max_pending_bytes = usage.limits.max_pending_bytes,
     };
     return true;
+}
+
+pub export fn jsbay_engine_is_destroyed(instance_id: c_int, generation: u64) bool {
+    return @import("runtime/instance_map.zig").isDestroyed(@intCast(instance_id), generation);
 }
 
 /// Owner-thread memory snapshot. Fills zeros first; false when missing, wrong thread, or null out.
@@ -3939,6 +3947,79 @@ pub export fn jsbay_sync_complete(request_id: u64, outcome_status: c_int, kind_r
         .stale => API_STALE_VALUE,
         .out_of_memory => API_OUT_OF_MEMORY,
     };
+}
+
+pub const AsyncPayloadKindC = enum(c_int) {
+    utf8_string = 0,
+    bytes = 1,
+    json = 2,
+    undefined = 3,
+    _,
+};
+
+/// Create a Promise associated with one native completion request. Owner thread only.
+pub export fn jsbay_promise_create(instance_id_raw: c_int, out_request_id: ?*u64, out_promise: ?*u64, out_exception: ?*u64) c_int {
+    if (out_request_id) |request| request.* = 0;
+    if (out_promise) |value| value.* = 0;
+    if (out_exception) |exception| exception.* = 0;
+    const request_id = out_request_id orelse return API_INVALID_ARGUMENT;
+    const promise_handle = out_promise orelse return API_INVALID_ARGUMENT;
+    if (out_exception == null) return API_INVALID_ARGUMENT;
+    const id: i32 = @intCast(instance_id_raw);
+    if (packedTagOf(id) != null) return API_UNSUPPORTED;
+    var op = switch (beginApiOp(id)) {
+        .status => |status| return status,
+        .ok => |value| value,
+    };
+    defer op.deinit();
+    switch (api_async.create(id)) {
+        .status => |status| return status,
+        .ok => |created| {
+            request_id.* = created.request_id;
+            promise_handle.* = created.promise;
+            return API_OK;
+        },
+    }
+}
+
+/// Settle a pending native Promise with an owner-thread Value. The value is borrowed.
+pub export fn jsbay_promise_settle(request_id: u64, outcome_status: c_int, value: u64) c_int {
+    const outcome: api_async.Outcome = switch (outcome_status) {
+        API_OK => .ok,
+        API_EXCEPTION => .exception,
+        else => return API_INVALID_ARGUMENT,
+    };
+    const instance_id = api_async.instanceFor(request_id) orelse return API_STALE_VALUE;
+    var op = switch (beginApiOp(instance_id)) {
+        .status => |status| return status,
+        .ok => |value_op| value_op,
+    };
+    defer op.deinit();
+    if (packed_api_value.isPackedHandle(value)) return API_INVALID_ARGUMENT;
+    return api_async.settle(request_id, outcome, value);
+}
+
+/// Copy a typed result and queue its Promise settlement on the owning JavaScript thread. Safe on any thread.
+pub export fn jsbay_async_complete(request_id: u64, outcome_status: c_int, kind_raw: c_int, data_arg: Utf8) c_int {
+    const data = checkedUtf8(data_arg) orelse return API_INVALID_ARGUMENT;
+    const outcome: api_async.Outcome = switch (outcome_status) {
+        API_OK => .ok,
+        API_EXCEPTION => .exception,
+        else => return API_INVALID_ARGUMENT,
+    };
+    const kind: api_async.PayloadKind = switch (kind_raw) {
+        @backingInt(AsyncPayloadKindC.utf8_string) => .utf8_string,
+        @backingInt(AsyncPayloadKindC.bytes) => .bytes,
+        @backingInt(AsyncPayloadKindC.json) => .json,
+        @backingInt(AsyncPayloadKindC.undefined) => .undefined,
+        else => return API_INVALID_ARGUMENT,
+    };
+    return api_async.complete(request_id, outcome, kind, data);
+}
+
+/// Queue rejection with a neutral cancellation Error. Safe on any thread.
+pub export fn jsbay_async_cancel(request_id: u64) c_int {
+    return api_async.cancel(request_id);
 }
 
 // ---- Event loop (optional, for platforms that need it) ----

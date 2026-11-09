@@ -239,6 +239,32 @@ test "cdp receiver: derived constructor keeps this in TDZ before super" {
     try receiverScenario("receiver-derived-tdz.js", "class Base {} class Child extends Base { constructor(){ debugger; super(); } } new Child();", "this", "ReferenceError");
 }
 
+test "cdp receiver: sloppy strict and TDZ frames keep distinct evaluation modes" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "receiver-mode-rotation.js");
+    defer session.deinit();
+    try enable(&session);
+
+    var sloppy = EvalBox{ .id = session.id, .script = "function sloppyFrame(){ debugger; } sloppyFrame();", .filename = "receiver-mode-sloppy.js" };
+    defer sloppy.deinit();
+    _ = try pause(&session, &sloppy);
+    try evaluate(&session, "this === globalThis", "\"value\":true");
+    try resumeSession(&session);
+
+    var strict = EvalBox{ .id = session.id, .script = "function strictFrame(){ 'use strict'; debugger; } strictFrame();", .filename = "receiver-mode-strict.js" };
+    defer strict.deinit();
+    _ = try pause(&session, &strict);
+    try evaluate(&session, "this === undefined", "\"value\":true");
+    try resumeSession(&session);
+
+    var tdz = EvalBox{ .id = session.id, .script = "class Base {} class Child extends Base { constructor(){ debugger; super(); } } new Child();", .filename = "receiver-mode-tdz.js" };
+    defer tdz.deinit();
+    _ = try pause(&session, &tdz);
+    try evaluate(&session, "this", "ReferenceError");
+    try resumeSession(&session);
+}
+
 test "cdp receiver: derived arrow keeps this in TDZ before super" {
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
     try receiverScenario("receiver-derived-arrow-tdz.js", "class Base {} class Child extends Base { constructor(){ const arrow = () => { debugger; }; arrow.call({ r: 1 }); super(); } } new Child();", "this.r", "ReferenceError");

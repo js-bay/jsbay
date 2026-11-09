@@ -70,6 +70,57 @@ test "c_api: lifecycle arms and tears down runtime interrupt control" {
     try testing.expect(!runtime_control.requestInterrupt(id));
 }
 
+test "c_api: destroy query waits for callback unwind and distinguishes reuse" {
+    const Probe = struct {
+        var generation: u64 = 0;
+        var armed = false;
+        var saw_live_during_callback = false;
+
+        fn log(instance_id: i32, _: types.LogLevel, _: [*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+            if (!armed) return;
+            c_api.jsbay_engine_destroy(instance_id);
+            saw_live_during_callback = !c_api.jsbay_engine_is_destroyed(instance_id, generation);
+        }
+    };
+    const id = helpers.nextInstanceId();
+    try testing.expect(!c_api.jsbay_engine_is_destroyed(id, 0));
+    try testing.expect(c_api.jsbay_engine_create(id, Probe.log, null));
+
+    var snap: c_api.InstanceSnapshotC = undefined;
+    snap.struct_size = @sizeOf(c_api.InstanceSnapshotC);
+    try testing.expect(c_api.jsbay_engine_snapshot(id, &snap));
+    Probe.generation = snap.generation;
+    try testing.expect(!c_api.jsbay_engine_is_destroyed(id, snap.generation));
+    Probe.armed = true;
+    const source = "console.info('destroy')";
+    const filename = "destroy.js";
+    var value: u64 = 0;
+    var exception: u64 = 0;
+    _ = c_api.jsbay_engine_evaluate(id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &value, &exception);
+    if (value != 0) _ = c_api.jsbay_value_release(value);
+    if (exception != 0) _ = c_api.jsbay_value_release(exception);
+    try testing.expect(Probe.saw_live_during_callback);
+    try testing.expect(c_api.jsbay_engine_is_destroyed(id, snap.generation));
+
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+    var replacement: c_api.InstanceSnapshotC = undefined;
+    replacement.struct_size = @sizeOf(c_api.InstanceSnapshotC);
+    try testing.expect(c_api.jsbay_engine_snapshot(id, &replacement));
+    try testing.expect(c_api.jsbay_engine_is_destroyed(id, snap.generation));
+    try testing.expect(!c_api.jsbay_engine_is_destroyed(id, replacement.generation));
+
+    for ([_]i32{ 0, -1 }) |special_id| {
+        try testing.expect(c_api.jsbay_engine_create(special_id, null, null));
+        var special: c_api.InstanceSnapshotC = undefined;
+        special.struct_size = @sizeOf(c_api.InstanceSnapshotC);
+        try testing.expect(c_api.jsbay_engine_snapshot(special_id, &special));
+        try testing.expect(!c_api.jsbay_engine_is_destroyed(special_id, special.generation));
+        c_api.jsbay_engine_destroy(special_id);
+        try testing.expect(c_api.jsbay_engine_is_destroyed(special_id, special.generation));
+    }
+}
+
 test "c_api: missing instances are errors across public evaluation entry points" {
     const id = helpers.nextInstanceId();
     const sentinel: [*:0]const u8 = @ptrFromInt(1);
