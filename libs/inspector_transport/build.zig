@@ -14,6 +14,20 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }).module("inspector");
+    const portable_socket = b.addModule("portable_socket", .{
+        .root_source_file = b.path("src/portable_socket.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    portable_socket.addCSourceFile(.{ .file = b.path("src/socket.c"), .flags = &.{} });
+    if (target.result.os.tag == .windows) portable_socket.linkSystemLibrary("ws2_32", .{});
+    const test_client = b.addModule("portable_test_client", .{
+        .root_source_file = b.path("src/test_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "portable_socket", .module = portable_socket }},
+    });
     const transport = b.addModule("inspector_transport", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -22,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "zev", .module = zev },
             .{ .name = "inspector", .module = inspector },
+            .{ .name = "portable_socket", .module = portable_socket },
         },
     });
     const tests = b.addTest(.{
@@ -33,11 +48,13 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zev", .module = zev },
                 .{ .name = "inspector_transport", .module = transport },
+                .{ .name = "test_client", .module = test_client },
             },
         }),
     });
     const run_tests = b.addRunArtifact(tests);
     b.step("test", "Run inspector HTTP/WebSocket transport tests").dependOn(&run_tests.step);
+    b.step("test-build", "Compile inspector HTTP/WebSocket transport tests without running them").dependOn(&tests.step);
 
     const fmt_step = b.step("fmt", "Run zig fmt on inspector_transport package source files");
     const fmt = b.addFmt(.{

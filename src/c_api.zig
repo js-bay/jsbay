@@ -2932,7 +2932,7 @@ test "c_api: inspector startup preserves backend source collection policy" {
     defer jsbay_engine_destroy(id);
     if (comptime !@import("build_options").inspector or !backend.supportsSourceJournal(backend.active_backend)) return error.SkipZigTest;
     var port: u16 = 0;
-    if (comptime !@import("build_options").inspector_transport or @import("builtin").os.tag == .windows) {
+    if (comptime !@import("build_options").inspector_transport) {
         try testing.expect(!jsbay_engine_inspector_start(id, 0, &port));
         try testing.expectEqual(@as(u16, 0), port);
         const result = engine.evalScript(id, "42", "inspector-without-http.js");

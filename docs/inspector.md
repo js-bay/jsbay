@@ -63,7 +63,7 @@ Production hosts that fix `-Dbackend=quickjs` can retrieve source identity throu
 
 ## Build options
 
-`-Dinspector=false` disables CDP and source-debugging hooks. `-Dinspector-transport=false` keeps host-provided CDP transport support while omitting the bundled HTTP/WebSocket entry. `-Dheap-snapshot=false` omits QuickJS-family heap snapshots while retaining CDP garbage collection. The bundled network entry is unavailable on Windows. These switches do not remove public C ABI symbols.
+`-Dinspector=false` disables CDP and source-debugging hooks. `-Dinspector-transport=false` keeps host-provided CDP transport support while omitting the bundled HTTP/WebSocket entry. `-Dheap-snapshot=false` omits QuickJS-family heap snapshots while retaining CDP garbage collection. The bundled HTTP/WebSocket transport supports loopback connections on Windows; consumers of its static library must link `ws2_32`. These switches do not remove public C ABI symbols.
 
 ## Safari Web Inspector
 

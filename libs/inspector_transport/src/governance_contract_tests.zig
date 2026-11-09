@@ -6,45 +6,10 @@ const std = @import("std");
 const testing = std.testing;
 const transport = @import("inspector_transport");
 const zev = @import("zev");
+const test_client = @import("test_client");
 
-const Stream = struct {
-    handle: std.posix.fd_t,
-
-    fn writeAll(self: Stream, bytes: []const u8) !void {
-        var offset: usize = 0;
-        while (offset < bytes.len) {
-            const wrote = std.posix.system.write(self.handle, bytes.ptr + offset, bytes.len - offset);
-            if (wrote < 0) {
-                if (std.posix.errno(wrote) == .INTR) continue;
-                return error.WriteFailed;
-            }
-            offset += @intCast(wrote);
-        }
-    }
-
-    fn readByte(self: Stream) !u8 {
-        var one: [1]u8 = undefined;
-        if ((try std.posix.read(self.handle, &one)) == 0) return error.EndOfStream;
-        return one[0];
-    }
-
-    fn close(self: Stream) void {
-        _ = std.posix.system.close(self.handle);
-    }
-};
-
-fn connectLoopback(port: u16) !Stream {
-    const raw = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (raw < 0) return error.SocketFailed;
-    const fd: std.posix.fd_t = @intCast(raw);
-    errdefer _ = std.posix.system.close(fd);
-    var addr: std.posix.sockaddr.in = .{
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, 0x7f000001),
-    };
-    if (std.posix.system.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.in)) < 0) return error.ConnectFailed;
-    return .{ .handle = fd };
-}
+const Stream = test_client.Stream;
+const connectLoopback = test_client.connectLoopback;
 
 fn readHttpHeaders(stream: Stream) !void {
     var suffix: [4]u8 = undefined;
@@ -394,7 +359,7 @@ test "transport: a peer that stops reading cannot indefinitely retain a send" {
     defer stream.close();
     // Shrink the advertised receive window before the handshake.  The peer never reads a frame after this point, so a large response must exercise the server's slow-client policy rather than just an in-memory mock.
     const receive_bytes: c_int = 1024;
-    try std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&receive_bytes));
+    try stream.setReceiveBuffer(receive_bytes);
     try handshake(stream, "slow-peer");
     const session = opened.wait(1);
 
@@ -423,7 +388,7 @@ test "transport: a slow session filling its budget does not block a second sessi
     const slow = try connectLoopback(t.boundPort());
     defer slow.close();
     const receive_bytes: c_int = 1024;
-    try std.posix.setsockopt(slow.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&receive_bytes));
+    try slow.setReceiveBuffer(receive_bytes);
     try handshake(slow, "queue-peer");
     const slow_id = opened.wait(1);
     const fast = try connectLoopback(t.boundPort());
