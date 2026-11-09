@@ -313,6 +313,12 @@ test "c_api: packed-alt typed evaluate number + retain/release (real non-primary
         var number: f64 = 0;
         try std.testing.expectEqual(API_OK, jsbay_value_to_number(value, &number));
         try std.testing.expectEqual(@as(f64, 42), number);
+        var scope_probe = ValueScopeProbe{ .instance_id = id };
+        try std.testing.expectEqual(API_OK, jsbay_engine_with_value_scope(id, ValueScopeProbe.callback, &scope_probe));
+        try std.testing.expect(scope_probe.called);
+        try std.testing.expectEqual(API_OK, scope_probe.value_status);
+        try std.testing.expectEqual(API_OK, scope_probe.type_status);
+        try std.testing.expectEqual(API_OK, scope_probe.release_status);
         var retained: u64 = 0;
         try std.testing.expectEqual(API_OK, jsbay_value_retain(value, &retained));
         defer _ = jsbay_value_release(retained);
@@ -378,6 +384,12 @@ test "c_api: forced packed_alt typed value (Linux primary-tag)" {
     var number: f64 = 0;
     try std.testing.expectEqual(API_OK, jsbay_value_to_number(value, &number));
     try std.testing.expectEqual(@as(f64, 42), number);
+    var scope_probe = ValueScopeProbe{ .instance_id = id };
+    try std.testing.expectEqual(API_OK, jsbay_engine_with_value_scope(id, ValueScopeProbe.callback, &scope_probe));
+    try std.testing.expect(scope_probe.called);
+    try std.testing.expectEqual(API_OK, scope_probe.value_status);
+    try std.testing.expectEqual(API_OK, scope_probe.type_status);
+    try std.testing.expectEqual(API_OK, scope_probe.release_status);
 
     var obj: u64 = 0;
     try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "({n:7,s:'hi'})", .len = 14 }, .{ .data = "<forced-obj>", .len = 12 }, null, &obj, &exception));
@@ -1273,6 +1285,187 @@ pub export fn jsbay_engine_create_with_limits(
     }
     if (log_handler) |lh| lh(id, .info, "jsbay create ok", log_user_data);
     return true;
+}
+
+const ValueScopeProbe = struct {
+    instance_id: c_int,
+    called: bool = false,
+    value_status: c_int = -1,
+    type_status: c_int = -1,
+    release_status: c_int = -1,
+    nested_status: c_int = -1,
+    nested_called: bool = false,
+    kind: c_int = -1,
+    anchor_before: usize = 0,
+    anchor_after: usize = 0,
+
+    fn callback(user_data: ?*anyopaque) callconv(.c) void {
+        const self: *ValueScopeProbe = @ptrCast(@alignCast(user_data.?));
+        self.called = true;
+        self.nested_status = jsbay_engine_with_value_scope(self.instance_id, nestedCallback, self);
+        if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+            self.anchor_before = backend.ActiveEngineModule.debugStackAnchorSp(engine.getContext(self.instance_id) orelse null);
+        }
+        var value: u64 = 0;
+        self.value_status = jsbay_value_undefined(self.instance_id, &value);
+        if (self.value_status == API_OK) {
+            self.type_status = jsbay_value_type(value, &self.kind);
+            self.release_status = jsbay_value_release(value);
+        }
+        if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+            self.anchor_after = backend.ActiveEngineModule.debugStackAnchorSp(engine.getContext(self.instance_id) orelse null);
+        }
+    }
+
+    fn nestedCallback(user_data: ?*anyopaque) callconv(.c) void {
+        const self: *ValueScopeProbe = @ptrCast(@alignCast(user_data.?));
+        self.nested_called = true;
+    }
+};
+
+const ValueScopeDestroyProbe = struct {
+    instance_id: c_int,
+    context_alive_in_callback: bool = false,
+    post_destroy_status: c_int = -1,
+
+    fn callback(user_data: ?*anyopaque) callconv(.c) void {
+        const self: *ValueScopeDestroyProbe = @ptrCast(@alignCast(user_data.?));
+        jsbay_engine_destroy(self.instance_id);
+        self.context_alive_in_callback = engine.getContext(self.instance_id) != null;
+        var value: u64 = 0;
+        self.post_destroy_status = jsbay_value_undefined(self.instance_id, &value);
+    }
+};
+
+const ValueScopeJsProbe = struct {
+    instance_id: c_int,
+    create_status: c_int = -1,
+    get_status: c_int = -1,
+    exception_type_status: c_int = -1,
+    exception_release_status: c_int = -1,
+    object_release_status: c_int = -1,
+    recovery_status: c_int = -1,
+    recovery_number_status: c_int = -1,
+    exception_kind: c_int = -1,
+    recovery_number: f64 = 0,
+
+    fn callback(user_data: ?*anyopaque) callconv(.c) void {
+        const self: *ValueScopeJsProbe = @ptrCast(@alignCast(user_data.?));
+        const source = "Object.defineProperty({}, 'failing', { get() { throw new Error('scope getter'); } })";
+        const filename = "<value-scope-getter>";
+        var object: u64 = 0;
+        var exception: u64 = 0;
+        self.create_status = jsbay_engine_evaluate(self.instance_id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &object, &exception);
+        if (self.create_status == API_OK) {
+            const key = "failing";
+            var property: u64 = 0;
+            self.get_status = jsbay_value_get(object, .{ .data = key.ptr, .len = key.len }, &property, &exception);
+            if (exception != 0) {
+                self.exception_type_status = jsbay_value_type(exception, &self.exception_kind);
+                self.exception_release_status = jsbay_value_release(exception);
+                exception = 0;
+            }
+            if (property != 0) _ = jsbay_value_release(property);
+            self.object_release_status = jsbay_value_release(object);
+        }
+        if (exception != 0) _ = jsbay_value_release(exception);
+
+        const recovery_source = "6 * 7";
+        const recovery_filename = "<value-scope-recovery>";
+        var result: u64 = 0;
+        exception = 0;
+        self.recovery_status = jsbay_engine_evaluate(self.instance_id, .{ .data = recovery_source.ptr, .len = recovery_source.len }, .{ .data = recovery_filename.ptr, .len = recovery_filename.len }, null, &result, &exception);
+        if (self.recovery_status == API_OK) self.recovery_number_status = jsbay_value_to_number(result, &self.recovery_number);
+        if (result != 0) _ = jsbay_value_release(result);
+        if (exception != 0) _ = jsbay_value_release(exception);
+    }
+};
+
+const ValueScopeWrongThreadProbe = struct {
+    instance_id: c_int,
+    status: c_int = -1,
+    called: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn callback(user_data: ?*anyopaque) callconv(.c) void {
+        const self: *ValueScopeWrongThreadProbe = @ptrCast(@alignCast(user_data.?));
+        self.called.store(true, .release);
+    }
+
+    fn run(self: *ValueScopeWrongThreadProbe) void {
+        self.status = jsbay_engine_with_value_scope(self.instance_id, callback, self);
+    }
+};
+
+test "c_api: value scope batches typed calls without moving the stack anchor" {
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    defer jsbay_engine_destroy(id);
+
+    var probe = ValueScopeProbe{ .instance_id = id };
+    try std.testing.expectEqual(API_OK, jsbay_engine_with_value_scope(id, ValueScopeProbe.callback, &probe));
+    try std.testing.expect(probe.called);
+    try std.testing.expectEqual(API_OK, probe.nested_status);
+    try std.testing.expect(probe.nested_called);
+    try std.testing.expectEqual(API_OK, probe.value_status);
+    try std.testing.expectEqual(API_OK, probe.type_status);
+    try std.testing.expectEqual(API_OK, probe.release_status);
+    try std.testing.expectEqual(@as(c_int, 0), probe.kind);
+    if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+        try std.testing.expect(probe.anchor_before != 0);
+        try std.testing.expectEqual(probe.anchor_before, probe.anchor_after);
+    }
+}
+
+test "c_api: value scope holds destruction until callback returns" {
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    var probe = ValueScopeDestroyProbe{ .instance_id = id };
+    try std.testing.expectEqual(API_OK, jsbay_engine_with_value_scope(id, ValueScopeDestroyProbe.callback, &probe));
+    try std.testing.expect(probe.context_alive_in_callback);
+    try std.testing.expectEqual(API_INSTANCE_NOT_FOUND, probe.post_destroy_status);
+    try std.testing.expect(engine.getContext(id) == null);
+}
+
+test "c_api: value scope continues after a throwing getter" {
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    defer jsbay_engine_destroy(id);
+
+    var probe = ValueScopeJsProbe{ .instance_id = id };
+    try std.testing.expectEqual(API_OK, jsbay_engine_with_value_scope(id, ValueScopeJsProbe.callback, &probe));
+    try std.testing.expectEqual(API_OK, probe.create_status);
+    try std.testing.expectEqual(API_EXCEPTION, probe.get_status);
+    try std.testing.expectEqual(API_OK, probe.exception_type_status);
+    try std.testing.expectEqual(@as(c_int, 5), probe.exception_kind);
+    try std.testing.expectEqual(API_OK, probe.exception_release_status);
+    try std.testing.expectEqual(API_OK, probe.object_release_status);
+    try std.testing.expectEqual(API_OK, probe.recovery_status);
+    try std.testing.expectEqual(API_OK, probe.recovery_number_status);
+    try std.testing.expectEqual(@as(f64, 42), probe.recovery_number);
+}
+
+test "c_api: value scope rejects null callback, missing instance, and wrong thread" {
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    defer jsbay_engine_destroy(id);
+
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_engine_with_value_scope(id, null, null));
+
+    var missing_called = false;
+    const MissingProbe = struct {
+        fn callback(user_data: ?*anyopaque) callconv(.c) void {
+            const called: *bool = @ptrCast(@alignCast(user_data.?));
+            called.* = true;
+        }
+    };
+    try std.testing.expectEqual(API_INSTANCE_NOT_FOUND, jsbay_engine_with_value_scope(id + 100000, MissingProbe.callback, &missing_called));
+    try std.testing.expect(!missing_called);
+
+    var wrong_thread = ValueScopeWrongThreadProbe{ .instance_id = id };
+    const thread = try std.Thread.spawn(.{}, ValueScopeWrongThreadProbe.run, .{&wrong_thread});
+    thread.join();
+    try std.testing.expectEqual(API_WRONG_THREAD, wrong_thread.status);
+    try std.testing.expect(!wrong_thread.called.load(.acquire));
 }
 
 test "c_api: engine creation keeps recursion below native stack limits" {
@@ -2650,6 +2843,34 @@ fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) 
 
 fn beginPackedCleanupOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) PackedJsOpResult {
     return beginPackedJsOpMode(instance_id, tag, ctx_addr, false);
+}
+
+pub const ValueScopeCallback = ?*const fn (?*anyopaque) callconv(.c) void;
+
+/// Keep one owner-thread admission and JS-stack lease around a synchronous batch of typed Value API calls.
+pub export fn jsbay_engine_with_value_scope(instance_id: c_int, callback: ValueScopeCallback, user_data: ?*anyopaque) c_int {
+    const cb = callback orelse return API_INVALID_ARGUMENT;
+    const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        const ready = switch (packedInstanceReady(id)) {
+            .status => |status| return status,
+            .ok => |value| value,
+        };
+        var op = switch (beginPackedCleanupOp(id, ready.tag, ready.ctx_addr)) {
+            .status => |status| return status,
+            .ok => |value| value,
+        };
+        defer op.deinit();
+        cb(user_data);
+        return API_OK;
+    }
+    var op = switch (beginCleanupApiOp(id)) {
+        .status => |status| return status,
+        .ok => |value| value,
+    };
+    defer op.deinit();
+    cb(user_data);
+    return API_OK;
 }
 
 const PackedValueOp = struct {

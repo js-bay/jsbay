@@ -385,7 +385,7 @@ static void scheduleCloseWake(Engine *engine) {
     (void)uv_async_send(&loop->async);
 }
 
-static void releaseCoreValues(Engine *engine) {
+static void releaseCoreValuesImpl(Engine *engine) {
     for (auto value :
          {engine->dispatch_ok, engine->dispatch_error, engine->bind_function, engine->get_prototype,
           engine->object_is, engine->object_prototype, engine->get_descriptor, engine->has_own,
@@ -400,6 +400,16 @@ static void releaseCoreValues(Engine *engine) {
     engine->create_object = engine->define_property = engine->guest_stack_getter = 0;
     engine->completion_failure = engine->guest_promise = engine->guest_resolve = 0;
     engine->guest_then = engine->guest_promise_prototype = 0;
+}
+
+static void releaseCoreValuesInScope(void *user_data) noexcept {
+    releaseCoreValuesImpl(static_cast<Engine *>(user_data));
+}
+
+static void releaseCoreValues(Engine *engine) {
+    if (jsbay_engine_with_value_scope(engine->id, releaseCoreValuesInScope, engine) == JSBAY_OK)
+        return;
+    releaseCoreValuesImpl(engine);
 }
 
 static void rejectObservers(Engine *engine) {
@@ -1490,7 +1500,7 @@ static napi_value evaluateAsync(napi_env env, napi_callback_info info) {
     return promise;
 }
 
-static bool initializeIntrinsics(Engine *engine) {
+static bool initializeIntrinsicsImpl(Engine *engine) {
     if (jsbay_value_new_error(engine->id, text("could not create host completion handler"),
                               &engine->completion_failure) != JSBAY_OK)
         return false;
@@ -1582,6 +1592,23 @@ static bool initializeIntrinsics(Engine *engine) {
     napi_typeof(engine->env, getter, &getter_type);
     return getter_type != napi_function ||
            napi_create_reference(engine->env, getter, 1, &engine->host_stack_getter) == napi_ok;
+}
+
+struct IntrinsicsScope {
+    Engine *engine;
+    bool initialized = false;
+};
+
+static void initializeIntrinsicsInScope(void *user_data) noexcept {
+    auto *scope = static_cast<IntrinsicsScope *>(user_data);
+    scope->initialized = initializeIntrinsicsImpl(scope->engine);
+}
+
+static bool initializeIntrinsics(Engine *engine) {
+    IntrinsicsScope scope{engine, false};
+    const auto status =
+        jsbay_engine_with_value_scope(engine->id, initializeIntrinsicsInScope, &scope);
+    return status == JSBAY_OK && scope.initialized;
 }
 static napi_value closeEngine(napi_env env, napi_callback_info info) {
     napi_value self;
