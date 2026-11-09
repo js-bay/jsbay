@@ -17,6 +17,7 @@
  *   zig build debug-owner-embed-test -Dbackend=quickjs_ng
  *
  * Both QuickJS-family backends expose Sources and execution debugging.
+ *
  * --port 0 binds an ephemeral port.
  */
 
