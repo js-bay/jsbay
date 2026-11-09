@@ -121,6 +121,16 @@ jobs:
           zig build tool -- check-docs
           zig build tool -- check-tooling
 
+      - name: Check first-party comment prose
+        run: |
+          set -euo pipefail
+          node --test tests/comment-prose.test.mjs
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            node scripts/check-comment-prose.mjs --base "origin/$GITHUB_BASE_REF"
+          else
+            node scripts/check-comment-prose.mjs --base HEAD^
+          fi
+
       - name: SDK quality — portable (native / Android style / .NET)
         run: make check CHECKS=native-format,android-style,dotnet-style,dotnet-lint
 

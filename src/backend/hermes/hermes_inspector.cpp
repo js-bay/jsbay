@@ -653,8 +653,7 @@ extern "C" void hermes_inspector_close_sessions(JsbayHermesInspector *inspector)
             discardOutboundSession(inspector, session_id);
         }
         sessions.clear();
-        // A disconnected client must not strand the engine in a debugger pause.
-        // AsyncDebuggerAPI owns the pause loop, so this is safe from the reader thread.
+        // A disconnected client must not strand the engine in a debugger pause. AsyncDebuggerAPI owns the pause loop, so this is safe from the reader thread.
         inspector->debug_api->asyncDebuggerAPI().triggerInterrupt_TS(
             [api = inspector->debug_api.get()](FbHermesRuntime &) {
                 if (api->asyncDebuggerAPI().isWaitingForCommand()) {

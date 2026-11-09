@@ -55,6 +55,14 @@ bash tests/process-isolation/run.sh
 #   bash tests/harmony-sdk/run-process-isolation-device.sh
 ```
 
+## Machine-enforced source constraints
+
+| Rule | Command | Automated scope |
+| --- | --- | --- |
+| Changed line-comment prose uses one physical line per paragraph. | `node scripts/check-comment-prose.mjs --base <commit>` | Changed tracked and untracked first-party source files with `//`, `///`, or shell `#` comments; structured lists, code examples, tool directives, licenses, and generated sources are excluded. Vendor/upstream code and generated patch results remain manual review scope. |
+
+Run the command with the pull request base revision locally. CI uses `origin/${{ github.base_ref }}` for pull requests and `HEAD^` for main pushes.
+
 `tests/process-isolation/run.sh` builds a fault-injection archive (test-only
 `-Dfault-injection=true`) and proves a Zig/native abort kills only the child
 process. Android hardware and iOS Simulator runners do the same on-device / in-sim;
