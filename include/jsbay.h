@@ -178,6 +178,10 @@ bool jsbay_engine_create(int instance_id, jsbay_log_handler_t log_handler, void 
 bool jsbay_engine_create_with_limits(int instance_id, jsbay_log_handler_t log_handler, void *log_user_data, const jsbay_resource_limits_t *limits);
 /* Thread-safe. Joins teardown: when called off the owner thread it waits until the instance is gone (including waking a blocking run_loop). Prefer owner-thread destroy after releasing values when following the embed shutdown checklist. A destroy requested from a JS/native callback on the owner may defer physical cleanup until that callback unwinds; a later destroy joins that work. */
 void jsbay_engine_destroy(int instance_id);
+typedef void (*jsbay_value_scope_callback_t)(void *user_data);
+/* Owner-thread synchronous scope for batching typed Value API calls. The callback must return without yielding or crossing threads, and C++ exceptions must not cross the callback boundary; each typed API call keeps its normal validation and error behavior. This is not a transaction and does not roll back changes. A destroy requested by the callback follows the existing deferred-destroy rules and physical teardown waits until the callback returns. Nested scopes for the same instance are supported. */
+jsbay_status_t jsbay_engine_with_value_scope(int instance_id, jsbay_value_scope_callback_t callback,
+                                             void *user_data);
 bool jsbay_engine_request_interrupt(int instance_id);
 bool jsbay_engine_clear_interrupt(int instance_id);
 bool jsbay_engine_cancel(int instance_id, uint64_t generation);
