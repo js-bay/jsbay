@@ -159,11 +159,15 @@ static void assert_hot_invalid_opcode_uses_cold_error_path(JSContext *ctx) {
     assert(JS_VALUE_GET_TAG(compiled) == JS_TAG_FUNCTION_BYTECODE);
     JSFunctionBytecode *bytecode = JS_VALUE_GET_PTR(compiled);
     assert(bytecode && bytecode->byte_code_len > 0);
+    const uint8_t saved_opcode = bytecode->byte_code_buf[0];
     bytecode->byte_code_buf[0] = 0xff;
 
     JS_SetLocationHandler(rt, location, NULL);
     uint64_t before = JS_GetLocationDispatchProbe(rt);
-    JSValue result = JS_EvalFunction(ctx, compiled);
+    /* Keep ownership until the bytecode is restored for the destructor's opcode scan. */
+    JSValue result = JS_EvalFunction(ctx, JS_DupValue(ctx, compiled));
+    bytecode->byte_code_buf[0] = saved_opcode;
+    JS_FreeValue(ctx, compiled);
     assert(JS_IsException(result));
     assert(JS_GetLocationDispatchProbe(rt) == before);
     JS_FreeValue(ctx, result);
