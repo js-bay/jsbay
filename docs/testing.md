@@ -123,9 +123,7 @@ The runner fails when no case runs, or when a case fails or times out. Its [mani
 
 ## state_tcas harness diagrams
 
-Fixed `exhaust.play` stories record `Observation`s and lock Mermaid state +
-sequence diagrams under `docs/state-tcas-*.md`. Index and regenerate
-commands: [state_tcas sequence diagrams](state-tcas-sequences.md).
+Fixed `exhaust.play` stories record `Observation`s and lock Mermaid state + sequence diagrams under `docs/state-tcas-*.md`. Index and regenerate commands: [state_tcas sequence diagrams](state-tcas-sequences.md).
 
 ```sh
 zig build test-state-tcas -Dbackend=quickjs_ng --summary all
@@ -136,5 +134,4 @@ zig build test-state-tcas-engine -Dbackend=quickjs_ng --summary all
 #   touch .state_tcas-update-pictures && zig build test-state-tcas ... && rm .state_tcas-update-pictures
 ```
 
-CI runs `zig build test-state-tcas` on the Linux governance job (Scheduler/Driver
-suite + explore gates). Engine harnesses ride `test-engine` via `all_tests.zig`.
+CI runs `zig build test-state-tcas` on the Linux governance job (Scheduler/Driver suite + explore gates). Engine harnesses ride `test-engine` via `all_tests.zig`.

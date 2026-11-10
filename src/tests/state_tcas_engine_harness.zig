@@ -13,8 +13,7 @@
 //!    no L2 variant. Never call `loop.dispatchEvents*` from explore.
 //! 3. **Rebuild invariant**: act-log prefix → boot+apply observations match the
 //!    live walk. Empty queues must not enable advance/checkpoint.
-//! 4. **Key fields** (dfsKeyed): enqueue flags, advance_count, **Trace content**
-//!    (fnv-fold of recorder bytes — not length alone), via `ExploreWorld.key`.
+//! 4. **Key fields** (dfsKeyed): enqueue flags, advance_count, pending script queue, **Trace content** (fnv-fold of recorder bytes — not length alone), via `ExploreWorld.key`.
 //! 5. **Out of explore (intentional)**: SyncWait begin↔end oscillation and
 //!    beginExecution pairing stay on direct+Safety tests (see checklist below);
 //!    do not add them to `ExploreAct` without a keyed depth-1 gate.
@@ -425,7 +424,7 @@ test "state_tcas engine: exhaust.play two script tasks one-per-tick" {
 }
 
 test "state_tcas engine: testing.setNow ClockRewind; clampNow absorbs; advance still clamps" {
-    // Stage B: engine L1 mirrors Driver.testing. advance(i32,i64)i64 stays clamp host-tick.
+    // Engine L1 mirrors Driver.testing. advance(i32,i64)i64 stays clamp host-tick.
     try helpers.withDefaultEngine(struct {
         fn run(id: i32) !void {
             try engine.testing.setNow(id, 100);
@@ -455,6 +454,8 @@ const ExploreAct = enum {
     advance,
 };
 
+const PendingScript = enum(u2) { none = 0, a = 1, b = 2 };
+
 /// Live engine. Undo destroys the instance and replays the act log — honest because ActiveEngine / Driver / queues cannot be value-copied for BFS. Enabled set is finite: each enqueue once, at most `max_advances` advances.
 const ExploreWorld = struct {
     id: i32,
@@ -466,6 +467,8 @@ const ExploreWorld = struct {
     enqueued_a: bool = false,
     enqueued_b: bool = false,
     enqueued_timer: bool = false,
+    pending_queue: [2]PendingScript = .{ .none, .none },
+    pending_len: u8 = 0,
     advance_count: usize = 0,
     max_advances: usize = 3,
 
@@ -501,6 +504,8 @@ const ExploreWorld = struct {
         self.enqueued_a = false;
         self.enqueued_b = false;
         self.enqueued_timer = false;
+        self.pending_queue = .{ .none, .none };
+        self.pending_len = 0;
         self.advance_count = 0;
         self.bad_order = false;
         self.delivered = false;
@@ -526,12 +531,16 @@ const ExploreWorld = struct {
                 try testing.expect(engine.dispatchTask(self.id, "__stRecord__('A'); queueMicrotask(() => __stRecord__('a'));"));
                 self.enqueued_a = true;
                 self.ever_enqueued = true;
+                self.pending_queue[self.pending_len] = .a;
+                self.pending_len += 1;
             },
             .enqueue_b => {
                 if (self.enqueued_b) return;
                 try testing.expect(engine.dispatchTask(self.id, "__stRecord__('B'); queueMicrotask(() => __stRecord__('b'));"));
                 self.enqueued_b = true;
                 self.ever_enqueued = true;
+                self.pending_queue[self.pending_len] = .b;
+                self.pending_len += 1;
             },
             .enqueue_timer => {
                 if (self.enqueued_timer) return;
@@ -549,6 +558,21 @@ const ExploreWorld = struct {
         var snap: [64]u8 = undefined;
         const tr = Trace.snapshot(&snap);
         if (brokenTaskMicroPairs(tr)) self.bad_order = true;
+        if (act == .advance and self.pending_len > 0 and after > before) {
+            for (tr[before..after]) |c| {
+                if (c == 'A' and self.pending_queue[0] == .a) {
+                    self.pending_queue[0] = self.pending_queue[1];
+                    self.pending_queue[1] = .none;
+                    self.pending_len -= 1;
+                    break;
+                } else if (c == 'B' and self.pending_queue[0] == .b) {
+                    self.pending_queue[0] = self.pending_queue[1];
+                    self.pending_queue[1] = .none;
+                    self.pending_len -= 1;
+                    break;
+                }
+            }
+        }
     }
 
     pub fn enabled(self: *@This()) []const ExploreAct {
@@ -589,7 +613,7 @@ const ExploreWorld = struct {
     }
 
     pub fn key(self: *const @This()) u64 {
-        // State-keyed for dfsKeyed: enqueue flags + advance_count decide enabled(); Trace length+content distinguish equal-length delivery orders ("Aa" vs "Bb").
+        // State-keyed for dfsKeyed: enqueue flags + advance_count decide enabled(); pending script queue tracks FIFO delivery order; Trace length+content distinguish equal-length delivery orders ("Aa" vs "Bb").
         // Monitor sticky bits (ever_enqueued / delivered / bad_order) are not keyed: bad_order fails Safety on observe; delivered/ever_enqueued are finish helpers recomputed or sticky outside prune.
         var k: u64 = 0;
         if (self.enqueued_a) k |= 1;
@@ -597,7 +621,9 @@ const ExploreWorld = struct {
         if (self.enqueued_timer) k |= 4;
         k |= @as(u64, @intCast(self.advance_count)) << 3;
         k |= @as(u64, @intCast(Trace.currentLen() & 0x3f)) << 8;
-        k ^= Trace.fnv1a() << 16;
+        k |= @as(u64, @backingInt(self.pending_queue[0])) << 14;
+        k |= @as(u64, @backingInt(self.pending_queue[1])) << 16;
+        k ^= Trace.fnv1a() << 18;
         return k;
     }
 
@@ -610,7 +636,7 @@ const ExploreWorld = struct {
     }
 
     fn isEnabled(ctx: *@This()) bool {
-        // Sticky: seed after DFS undo is idle, but work was offered this run. Using only live enqueue flags makes finish-after-undo a no-op (P1-2).
+        // Sticky: seed after DFS undo is idle, but work was offered this run. Using only live enqueue flags makes finish-after-undo a no-op.
         return ctx.ever_enqueued;
     }
 
@@ -744,8 +770,8 @@ test "state_tcas engine: BFS clone of ActiveEngine intentionally unsupported" {
     try testing.expect(!@hasDecl(engine, "clone"));
 }
 
-test "state_tcas engine: dfsKeyed key identical when enqueue order differs before drain" {
-    // Before any advance, Trace is empty: enqueue_a then enqueue_b must share a key with the reverse order (same enabled set).
+test "state_tcas engine: dfsKeyed key distinguishes pending script order before drain" {
+    // Before any advance, Trace is empty, but pending script order determines future delivery order, so distinct FIFO enqueue orders must produce distinct keys.
     var wa = ExploreWorld{ .id = helpers.nextInstanceId() };
     defer wa.deinit();
     var wb = ExploreWorld{ .id = helpers.nextInstanceId() };
@@ -754,7 +780,7 @@ test "state_tcas engine: dfsKeyed key identical when enqueue order differs befor
     try wa.step(.enqueue_b);
     try wb.step(.enqueue_b);
     try wb.step(.enqueue_a);
-    try testing.expectEqual(wa.key(), wb.key());
+    try testing.expect(wa.key() != wb.key());
     try testing.expectEqual(wa.enabled().len, wb.enabled().len);
 }
 

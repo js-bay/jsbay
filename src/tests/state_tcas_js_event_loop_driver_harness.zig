@@ -525,7 +525,7 @@ const ExploreWorld = struct {
     late_fired: usize = 0,
     suspended: bool = false,
     now_target: u64 = 0,
-    /// Sticky across undo/rebuild: a timer was ever armed this run (Liveness). Not cleared by `boot`/`rebuild` — seed must not vacuum `liv.finish` (P1-2).
+    /// Sticky across undo/rebuild: a timer was ever armed this run (Liveness). Not cleared by `boot`/`rebuild` — seed must not vacuum `liv.finish`.
     ever_armed: bool = false,
     /// When false, enabled() omits suspend/resume (keeps unkeyed DFS small).
     allow_suspend: bool = true,
@@ -741,8 +741,7 @@ const ExploreWorld = struct {
     }
 
     pub fn key(self: *const @This()) u64 {
-        // State-keyed (not path-keyed): omit act-log length so equivalent Driver snapshots prune.
-        // Include the depth-cap bit because enabled() becomes empty at len >= 8; without it, a capped leaf can prune a shallower equivalent state that still expands.
+        // State-keyed: omit act-log path details so equivalent Driver snapshots prune, but preserve remaining exploration depth (8 - len) so states reached with larger remaining budgets are not pruned by visits at smaller budgets.
         var k: u64 = 0;
         k |= @as(u64, @intFromBool(self.early_armed));
         k |= @as(u64, @intFromBool(self.late_armed)) << 1;
@@ -752,7 +751,8 @@ const ExploreWorld = struct {
         k |= @as(u64, @intCast(self.late_fired & 0x3)) << 6;
         k |= @as(u64, @intFromBool(self.suspended)) << 8;
         k |= @as(u64, @intCast(self.now_target & 0x3f)) << 9;
-        k |= @as(u64, @intFromBool(self.len >= 8)) << 15;
+        const remaining_depth: u64 = if (self.len < 8) @as(u64, @intCast(8 - self.len)) else 0;
+        k |= (remaining_depth & 0xf) << 15;
         return k;
     }
 
@@ -761,7 +761,7 @@ const ExploreWorld = struct {
     }
 
     pub fn isEnabled(ctx: *@This()) bool {
-        // Sticky: seed after DFS undo is idle. Live armed/suspend alone makes finish-after-undo a no-op when no goal was noted (P1-2).
+        // Sticky: seed after DFS undo is idle. Live armed/suspend alone makes finish-after-undo a no-op when no goal was noted.
         return ctx.ever_armed;
     }
 
@@ -852,7 +852,7 @@ test "state_tcas Driver: BFS clone of live Driver intentionally unsupported" {
     try std.testing.expect(!@hasDecl(Driver, "clone"));
 }
 
-test "state_tcas Driver: dfsKeyed depth-cap bit keeps expandability distinct" {
+test "state_tcas Driver: dfsKeyed remaining depth keeps expandability distinct" {
     var world: ExploreWorld = .{ .allocator = std.testing.allocator, .allow_suspend = false, .dual_timers = false };
     try world.boot();
     defer world.teardown();
@@ -868,8 +868,9 @@ test "state_tcas Driver: dfsKeyed depth-cap bit keeps expandability distinct" {
     try std.testing.expect(key_open != key_capped);
     world.len = 3;
     try std.testing.expect(world.enabled().len > 0);
-    try std.testing.expectEqual(key_open, world.key());
+    try std.testing.expect(key_open != world.key());
     world.len = saved_len;
+    try std.testing.expectEqual(key_open, world.key());
 }
 
 test "state_tcas Driver: rebuild cost split boot vs replay" {

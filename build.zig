@@ -567,7 +567,7 @@ pub fn build(b: *std.Build) void {
         const check_explore_gates_step = b.step("check-state-tcas-explore-gates", "Ban L2 Ungated / loop.dispatchEvents* in state_tcas explore harnesses");
         check_explore_gates_step.dependOn(&check_explore_gates.step);
         test_state_tcas_step.dependOn(&check_explore_gates.step);
-        // Local `zig build test` must not skip explore gates (P2 / Round-1).
+        // Local `zig build test` must not skip explore gates.
         test_step.dependOn(&check_explore_gates.step);
     }
 
