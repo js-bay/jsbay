@@ -8,7 +8,7 @@ The bridge runs outside the inspected process. The target only has to enable the
 
 - iOS Simulator: supported. The bridge reads `RWI_LISTEN_SOCKET` from the booted simulator and attaches over the relay socket.
 - macOS: not supported by this transport. The relay is reached through XPC mach services instead of a socket, and both `com.apple.webinspector` and `com.apple.webinspector.debugger` interrupt connections from processes without the private Web Inspector entitlement. Use Safari Web Inspector on macOS.
-- iOS device: unverified. The relay is reachable through usbmuxd on paper, but no device transport is implemented.
+- iOS device: not implemented. A device exposes the relay as a lockdown or remote service discovery service instead of a socket, and USB port forwarding cannot reach that service, so the device path needs its own tunnel.
 - Only one target per bridge process. The first JavaScript target of the selected application is used.
 
 ## Usage
