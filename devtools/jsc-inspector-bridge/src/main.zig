@@ -27,8 +27,10 @@ const Options = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
-    const argv = try init.minimal.args.toSlice(allocator);
+    const arena = init.arena.allocator();
+    const argv = try init.minimal.args.toSlice(arena);
+    // The client, the bridge, and the transport outlive the argument arena. An arena ignores every free it did not just hand out, so a long debug session would grow until the process is killed.
+    const allocator = std.heap.smp_allocator;
     const options = parseOptions(argv[1..]) catch {
         try usage(init);
         return error.Usage;

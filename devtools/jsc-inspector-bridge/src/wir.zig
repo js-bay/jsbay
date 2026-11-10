@@ -79,21 +79,20 @@ pub const Client = struct {
             try connectUnix(path);
         if (trace_enabled) std.debug.print("[trace] relay transport connected\n", .{});
 
+        errdefer _ = std.c.close(fd);
+        const connection_id = try uuid4(io, allocator);
+        errdefer allocator.free(connection_id);
+        const sender_id = try uuid4(io, allocator);
+        errdefer allocator.free(sender_id);
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .fd = fd,
-            .connection_id = try uuid4(io, allocator),
-            .sender_id = try uuid4(io, allocator),
+            .connection_id = connection_id,
+            .sender_id = sender_id,
         };
-        errdefer allocator.free(self.sender_id);
-        errdefer allocator.free(self.connection_id);
-        self.reader = std.Thread.spawn(.{}, readerMain, .{self}) catch |err| {
-            allocator.free(self.connection_id);
-            allocator.destroy(self);
-            return err;
-        };
+        self.reader = std.Thread.spawn(.{}, readerMain, .{self}) catch |err| return err;
         return self;
     }
 
@@ -108,6 +107,7 @@ pub const Client = struct {
         self.send_mutex.deinit();
         self.allocator.free(self.sender_id);
         self.allocator.free(self.connection_id);
+        _ = std.c.close(self.fd);
         const allocator = self.allocator;
         allocator.destroy(self);
     }
@@ -281,9 +281,9 @@ pub const Client = struct {
 
 fn traceFrame(direction: []const u8, label: []const u8, bytes: []const u8) void {
     if (!trace_enabled) return;
-    var scratch: [8192]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
-    if (describeFrame(fixed.allocator(), bytes)) |text| {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    if (describeFrame(arena.allocator(), bytes)) |text| {
         std.debug.print("[trace] {s} {s} {d} bytes {s}\n", .{ direction, label, bytes.len, text });
         return;
     }
@@ -305,7 +305,7 @@ fn describeFrame(allocator: Allocator, bytes: []const u8) ?[]const u8 {
         };
         return text[0..@min(text.len, 400)];
     }
-    const selector = argument.get("__selector") orelse return null;
+    const selector = value.get("__selector") orelse argument.get("__selector") orelse return null;
     return switch (selector) {
         .string => |name| name,
         else => null,

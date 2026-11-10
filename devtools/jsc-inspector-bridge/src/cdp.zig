@@ -67,13 +67,13 @@ pub const Frontend = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        sendText: *const fn (ctx: *anyopaque, session: transport.SessionId, text: []const u8) void,
+        sendText: *const fn (ctx: *anyopaque, session: transport.SessionId, text: []const u8) bool,
         closeSession: *const fn (ctx: *anyopaque, session: transport.SessionId) void,
         boundPort: *const fn (ctx: *anyopaque) u16,
     };
 
-    pub fn sendText(self: Frontend, session: transport.SessionId, text: []const u8) void {
-        self.vtable.sendText(self.ctx, session, text);
+    pub fn sendText(self: Frontend, session: transport.SessionId, text: []const u8) bool {
+        return self.vtable.sendText(self.ctx, session, text);
     }
 
     pub fn closeSession(self: Frontend, session: transport.SessionId) void {
@@ -113,6 +113,8 @@ pub const WireRelay = struct {
         const self: *WireRelay = @ptrCast(@alignCast(ctx));
         var message = (try self.client.next(timeout_ms)) orelse return null;
         defer message.deinit(self.client.allocator);
+        // One relay connection watches one application, so a disconnect notification is always about the target this bridge attached to.
+        if (std.mem.eql(u8, message.name, "_rpc_applicationDisconnected:")) return error.TargetDisconnected;
         if (!std.mem.eql(u8, message.name, "_rpc_applicationSentData:")) return null;
         const data = switch (message.info.get("WIRMessageDataKey") orelse return null) {
             .data => |bytes| bytes,
@@ -132,13 +134,16 @@ pub const WireRelay = struct {
     }
 };
 
+/// The loopback transport refuses a message that would overflow its queue and, for a CDP session, closes it. A reply has to stay below that limit or the client would lose the session instead of seeing an error.
+const max_frontend_bytes: usize = 3 * 1024 * 1024;
+
 /// Adapts the loopback CDP transport to the `Frontend` interface.
 pub const TransportFrontend = struct {
     transport: *transport.Transport,
 
-    fn sendText(ctx: *anyopaque, session: transport.SessionId, text: []const u8) void {
+    fn sendText(ctx: *anyopaque, session: transport.SessionId, text: []const u8) bool {
         const self: *TransportFrontend = @ptrCast(@alignCast(ctx));
-        _ = self.transport.sendText(session, text);
+        return self.transport.sendText(session, text);
     }
 
     fn closeSession(ctx: *anyopaque, session: transport.SessionId) void {
@@ -257,14 +262,65 @@ pub const Bridge = struct {
         return self.frontend.boundPort();
     }
 
+    /// Releases the state the bridge owns. The relay, the frontend, and the target belong to whoever created them.
+    pub fn deinit(self: *Bridge) void {
+        self.mutex.lock();
+        self.clearScopeMergesLocked();
+        self.scope_merges.deinit(self.allocator);
+        var merge_iterator = self.merges.iterator();
+        while (merge_iterator.next()) |entry| {
+            for (entry.value_ptr.parts) |slot| {
+                if (slot) |owned| self.allocator.free(owned);
+            }
+        }
+        self.merges.deinit(self.allocator);
+        self.pending.deinit(self.allocator);
+        self.sessions.deinit(self.allocator);
+        var script_iterator = self.scripts.iterator();
+        while (script_iterator.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.url);
+        }
+        self.scripts.deinit(self.allocator);
+        replaceSite(self.allocator, &self.last_caller, null);
+        replaceSite(self.allocator, &self.armed_caller, null);
+        self.mutex.unlock();
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+
     /// Copies relay notifications into every session until the relay closes.
     pub fn pump(self: *Bridge) !void {
         while (true) {
             if (self.relay.isClosed()) return;
-            const data = (try self.relay.nextData(500, self.allocator)) orelse continue;
+            const data = (self.relay.nextData(500, self.allocator) catch |err| switch (err) {
+                // The inspected process is gone, so its relay sender is gone as well and attached clients can only be released.
+                error.TargetDisconnected => return self.closeAllSessions(),
+                else => return err,
+            }) orelse continue;
             defer self.allocator.free(data);
             self.deliver(data);
         }
+    }
+
+    /// Detaches every client without telling the relay, which no longer has the target either.
+    fn closeAllSessions(self: *Bridge) void {
+        self.frontend_mutex.lock();
+        defer self.frontend_mutex.unlock();
+        self.mutex.lock();
+        const ids = self.allocator.alloc(transport.SessionId, self.sessions.items.len) catch {
+            self.mutex.unlock();
+            return;
+        };
+        for (self.sessions.items, 0..) |session, index| ids[index] = session.id;
+        for (ids) |id| self.dropSessionState(id);
+        self.sessions.clearRetainingCapacity();
+        self.clearScopeMergesLocked();
+        replaceSite(self.allocator, &self.last_caller, null);
+        replaceSite(self.allocator, &self.armed_caller, null);
+        self.mutex.unlock();
+        defer self.allocator.free(ids);
+        for (ids) |id| self.frontend.closeSession(id);
     }
 
     fn handleEvent(ctx: ?*anyopaque, event: transport.Event) void {
@@ -311,12 +367,7 @@ pub const Bridge = struct {
         self.dropSessionState(id);
         if (empty) {
             // The relay object ids die with the frontend sender, so a later client must not reuse them.
-            var iterator = self.scope_merges.iterator();
-            while (iterator.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*);
-            }
-            self.scope_merges.clearRetainingCapacity();
+            self.clearScopeMergesLocked();
             replaceSite(self.allocator, &self.last_caller, null);
             replaceSite(self.allocator, &self.armed_caller, null);
         }
@@ -349,6 +400,20 @@ pub const Bridge = struct {
     }
 
     pub fn onMessage(self: *Bridge, session_id: transport.SessionId, payload: []const u8) void {
+        self.mutex.lock();
+        var attached = false;
+        for (self.sessions.items) |session| {
+            if (session.id == session_id) {
+                attached = true;
+                break;
+            }
+        }
+        self.mutex.unlock();
+        // A rejected or already closed session can still have messages in flight; those must not reach the target or the shared caller state.
+        if (!attached) {
+            logDrop("message from a session that is not attached");
+            return;
+        }
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch {
             return self.replyError(session_id, null, -32700, "Parse error");
         };
@@ -372,6 +437,7 @@ pub const Bridge = struct {
                 if (params.object.get("objectId")) |object_id| {
                     if (object_id == .string) {
                         if (self.scopePartner(object_id.string)) |partner| {
+                            defer self.allocator.free(partner);
                             return self.startMergedProperties(session_id, id, params, object_id.string, partner);
                         }
                     }
@@ -389,7 +455,7 @@ pub const Bridge = struct {
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const translated = translateParams(arena.allocator(), name, params) catch {
+        const translated = translateParams(self, arena.allocator(), name, params) catch {
             return self.replyError(session_id, id, -32603, "Translation failed");
         };
         var envelope = std.json.ObjectMap{};
@@ -408,6 +474,9 @@ pub const Bridge = struct {
             armStepOut(self);
         } else if (std.mem.eql(u8, name, "Debugger.resume") or std.mem.eql(u8, name, "Debugger.stepOver") or std.mem.eql(u8, name, "Debugger.stepInto") or std.mem.eql(u8, name, "Debugger.continueToLocation")) {
             clearCaller(self);
+            self.mutex.lock();
+            self.clearScopeMergesLocked();
+            self.mutex.unlock();
         }
         self.relay.sendData(&self.target, writer.written());
         if (std.mem.eql(u8, name, "Runtime.enable")) self.sendExecutionContext(session_id);
@@ -422,7 +491,7 @@ pub const Bridge = struct {
     /// JSC keeps its single JavaScript context in the inspected process and never announces it, while CDP clients wait for `Runtime.executionContextCreated` before they can evaluate anything.
     fn sendExecutionContext(self: *Bridge, session_id: transport.SessionId) void {
         const event = "{\"method\":\"Runtime.executionContextCreated\",\"params\":{\"context\":{\"id\":1,\"origin\":\"\",\"name\":\"jsbay\",\"uniqueId\":\"jsbay-context-1\",\"auxData\":{\"isDefault\":true,\"type\":\"default\"}}}}";
-        self.frontend.sendText(session_id, event);
+        _ = self.frontend.sendText(session_id, event);
     }
 
     fn localReply(self: *Bridge, session_id: transport.SessionId, id: std.json.Value, name: []const u8) void {
@@ -442,7 +511,7 @@ pub const Bridge = struct {
         object.put(arena.allocator(), "result", result) catch return;
         var writer: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &writer.writer) catch return;
-        self.frontend.sendText(session_id, writer.written());
+        _ = self.frontend.sendText(session_id, writer.written());
     }
 
     fn replyError(self: *Bridge, session_id: transport.SessionId, id: ?std.json.Value, code: i64, message: []const u8) void {
@@ -456,7 +525,7 @@ pub const Bridge = struct {
         object.put(arena.allocator(), "error", .{ .object = error_object }) catch return;
         var writer: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &writer.writer) catch return;
-        self.frontend.sendText(session_id, writer.written());
+        _ = self.frontend.sendText(session_id, writer.written());
     }
 
     fn register(self: *Bridge, session_id: transport.SessionId, client_id: i64, kind: MethodKind, merge_id: u64) u64 {
@@ -484,10 +553,21 @@ pub const Bridge = struct {
         self.relay.sendData(&self.target, json);
     }
 
-    fn scopePartner(self: *Bridge, object_id: []const u8) ?[]const u8 {
+    /// Owned copy of the paired object id. The map entry can be replaced by a later pause while the request is in flight.
+    fn scopePartner(self: *Bridge, object_id: []const u8) ?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.scope_merges.get(object_id);
+        const partner = self.scope_merges.get(object_id) orelse return null;
+        return self.allocator.dupe(u8, partner) catch null;
+    }
+
+    fn clearScopeMergesLocked(self: *Bridge) void {
+        var iterator = self.scope_merges.iterator();
+        while (iterator.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.scope_merges.clearRetainingCapacity();
     }
 
     fn recordScopeMerge(self: *Bridge, local_id: []const u8, block_id: []const u8) void {
@@ -578,7 +658,7 @@ pub const Bridge = struct {
         response.put(arena.allocator(), "result", .{ .object = result_map }) catch return;
         var out: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = response }, .{}, &out.writer) catch return;
-        self.frontend.sendText(session, out.written());
+        self.sendReply(session, client_id, out.written());
     }
 
     /// Serializes the `properties` array of a `Runtime.getProperties` reply, or null when the relay reported an error for that half.
@@ -646,7 +726,19 @@ pub const Bridge = struct {
         };
         var writer: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = copy }, .{}, &writer.writer) catch return;
-        self.frontend.sendText(pending.session, writer.written());
+        self.sendReply(pending.session, pending.client_id, writer.written());
+    }
+
+    /// Answers a client, turning a message the transport cannot carry into an error reply so the request is not left hanging.
+    fn sendReply(self: *Bridge, session: transport.SessionId, client_id: i64, text: []const u8) void {
+        if (text.len > max_frontend_bytes) {
+            logDrop("reply larger than the transport accepts");
+            return self.replyError(session, .{ .integer = client_id }, -32000, "Reply exceeds the CDP transport message limit");
+        }
+        if (!self.frontend.sendText(session, text)) {
+            logDrop("reply the transport refused");
+            return self.replyError(session, .{ .integer = client_id }, -32000, "Reply could not be queued for delivery");
+        }
     }
 
     fn take(self: *Bridge, relay_id: u64) ?Pending {
@@ -659,10 +751,14 @@ pub const Bridge = struct {
     fn broadcast(self: *Bridge, allocator: Allocator, object: std.json.ObjectMap) void {
         var writer: std.Io.Writer.Allocating = .init(allocator);
         std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &writer.writer) catch return;
+        if (writer.written().len > max_frontend_bytes) {
+            logDrop("event larger than the transport accepts");
+            return;
+        }
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items) |session| {
-            self.frontend.sendText(session.id, writer.written());
+            _ = self.frontend.sendText(session.id, writer.written());
         }
     }
 };
@@ -737,7 +833,10 @@ const evaluate_on_call_frame_keys = [_][]const u8{
 };
 
 /// JSC only stops on statement boundaries, so an offset inside an expression resolves to a later statement, often on the next line. Keeping the line and dropping the offset stops at the requested statement instead, which is what the Safari Web Inspector does.
-fn dropStatementOffset(params: *std.json.ObjectMap) void {
+/// JSC resolves a breakpoint per statement, so a column offset is dropped to keep the breakpoint on the statement under the client's cursor. Two cases keep it: a single-line script, where the column is the only way to name a statement, and `continueToLocation`, where zeroing the column moves the target behind the position execution resumes from.
+fn dropStatementOffset(self: *Bridge, method: []const u8, params: *std.json.ObjectMap) void {
+    if (std.mem.eql(u8, method, "Debugger.continueToLocation")) return;
+    if (targetsSingleLineScript(self, params.*)) return;
     if (params.getPtr("columnNumber")) |column| {
         if (column.* == .integer and column.integer > 0) column.* = .{ .integer = 0 };
     }
@@ -748,7 +847,34 @@ fn dropStatementOffset(params: *std.json.ObjectMap) void {
     }
 }
 
-fn translateParams(allocator: Allocator, method: []const u8, params: std.json.Value) !?std.json.Value {
+fn targetsSingleLineScript(self: *Bridge, params: std.json.ObjectMap) bool {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (scriptIdOf(params)) |script_id| {
+        if (self.scripts.get(script_id)) |script| return script.end_line == 0;
+    }
+    if (params.get("url")) |url| {
+        if (url == .string) {
+            var iterator = self.scripts.iterator();
+            while (iterator.next()) |entry| {
+                if (std.mem.eql(u8, entry.value_ptr.url, url.string)) return entry.value_ptr.end_line == 0;
+            }
+        }
+    }
+    return false;
+}
+
+fn scriptIdOf(params: std.json.ObjectMap) ?[]const u8 {
+    if (params.get("scriptId")) |value| {
+        if (value == .string) return value.string;
+    }
+    const location = params.get("location") orelse return null;
+    if (location != .object) return null;
+    const nested = location.object.get("scriptId") orelse return null;
+    return if (nested == .string) nested.string else null;
+}
+
+fn translateParams(self: *Bridge, allocator: Allocator, method: []const u8, params: std.json.Value) !?std.json.Value {
     if (params != .object) return null;
     const source = params.object;
     if (std.mem.eql(u8, method, "Debugger.setBreakpointByUrl") or std.mem.eql(u8, method, "Debugger.setBreakpoint") or std.mem.eql(u8, method, "Debugger.continueToLocation")) {
@@ -761,7 +887,7 @@ fn translateParams(allocator: Allocator, method: []const u8, params: std.json.Va
             filtered.put(allocator, "options", .{ .object = options }) catch {};
             _ = filtered.swapRemove("condition");
         }
-        dropStatementOffset(&filtered);
+        dropStatementOffset(self, method, &filtered);
         return .{ .object = filtered };
     }
     const allowed: ?[]const []const u8 = if (std.mem.eql(u8, method, "Runtime.evaluate"))
@@ -1058,7 +1184,9 @@ fn postProcessEvent(self: *Bridge, allocator: Allocator, object: std.json.Object
                 if (location != .object) continue;
                 const script_value = location.object.get("scriptId") orelse continue;
                 if (script_value != .string) continue;
-                const url = scriptUrl(self, script_value.string) orelse continue;
+                const borrowed = scriptUrl(self, script_value.string) orelse continue;
+                // The script map can drop this slice on a later pause, so the reply keeps its own copy.
+                const url = allocator.dupe(u8, borrowed) catch continue;
                 frame.object.put(allocator, "url", .{ .string = url }) catch {};
             }
             normalizeStepOutPause(self, allocator, params);

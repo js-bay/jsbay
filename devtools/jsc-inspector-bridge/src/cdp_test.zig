@@ -25,6 +25,7 @@ const FakeRelay = struct {
     hold_close: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     close_entered: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     close_released: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    disconnect: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn record(self: *FakeRelay, kind: Recorded.Kind, json: []const u8) void {
         const copy = self.allocator.dupe(u8, json) catch return;
@@ -67,9 +68,10 @@ const FakeRelay = struct {
     }
 
     fn nextData(ctx: *anyopaque, timeout_ms: u64, allocator: Allocator) anyerror!?[]u8 {
-        _ = ctx;
         _ = timeout_ms;
         _ = allocator;
+        const self: *FakeRelay = @ptrCast(@alignCast(ctx));
+        if (self.disconnect.swap(false, .acquire)) return error.TargetDisconnected;
         return null;
     }
 
@@ -111,6 +113,12 @@ const FakeRelay = struct {
         return total;
     }
 
+    fn deinit(self: *FakeRelay) void {
+        for (self.recorded.items) |entry| self.allocator.free(entry.json);
+        self.recorded.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
     fn lastCommand(self: *FakeRelay) ?[]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -135,12 +143,16 @@ const FakeFrontend = struct {
     sent: std.ArrayListUnmanaged(Outgoing) = .empty,
     closed: std.ArrayListUnmanaged(transport.SessionId) = .empty,
 
-    fn sendText(ctx: *anyopaque, session: transport.SessionId, text: []const u8) void {
+    fn sendText(ctx: *anyopaque, session: transport.SessionId, text: []const u8) bool {
         const self: *FakeFrontend = @ptrCast(@alignCast(ctx));
-        const copy = self.allocator.dupe(u8, text) catch return;
+        const copy = self.allocator.dupe(u8, text) catch return false;
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.sent.append(self.allocator, .{ .session = session, .json = copy }) catch self.allocator.free(copy);
+        self.sent.append(self.allocator, .{ .session = session, .json = copy }) catch {
+            self.allocator.free(copy);
+            return false;
+        };
+        return true;
     }
 
     fn closeSession(ctx: *anyopaque, session: transport.SessionId) void {
@@ -198,6 +210,13 @@ const FakeFrontend = struct {
         return null;
     }
 
+    fn deinit(self: *FakeFrontend) void {
+        for (self.sent.items) |entry| self.allocator.free(entry.json);
+        self.sent.deinit(self.allocator);
+        self.closed.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
     /// Sessions the bridge asked the transport to close.
     fn closedIds(self: *FakeFrontend, allocator: Allocator) ![]transport.SessionId {
         self.mutex.lock();
@@ -207,24 +226,39 @@ const FakeFrontend = struct {
 };
 
 const Harness = struct {
+    /// Scaffolding allocator for parsed replies. The bridge, the relay, and the frontend own memory that a real run would free, so they use the checking allocator and report a leak at the end of the test.
     allocator: Allocator,
+    durable: Allocator,
     relay: *FakeRelay,
     frontend: *FakeFrontend,
     bridge: *cdp.Bridge,
 
     fn create(allocator: Allocator) !Harness {
-        const relay = try allocator.create(FakeRelay);
-        relay.* = .{ .allocator = allocator };
-        const frontend = try allocator.create(FakeFrontend);
-        frontend.* = .{ .allocator = allocator };
+        const durable = std.testing.allocator;
+        const relay = try durable.create(FakeRelay);
+        errdefer durable.destroy(relay);
+        relay.* = .{ .allocator = durable };
+        const frontend = try durable.create(FakeFrontend);
+        errdefer durable.destroy(frontend);
+        frontend.* = .{ .allocator = durable };
         const target = wir.Target{
-            .application = try allocator.dupe(u8, "PID:1"),
-            .application_name = try allocator.dupe(u8, "test-demo"),
+            .application = try durable.dupe(u8, "PID:1"),
+            .application_name = try durable.dupe(u8, "test-demo"),
             .page = 1,
-            .title = try allocator.dupe(u8, "JSContext"),
+            .title = try durable.dupe(u8, "JSContext"),
         };
-        const bridge = try cdp.Bridge.init(allocator, relay.relay(), frontend.frontend(), target);
-        return .{ .allocator = allocator, .relay = relay, .frontend = frontend, .bridge = bridge };
+        const bridge = try cdp.Bridge.init(durable, relay.relay(), frontend.frontend(), target);
+        return .{ .allocator = allocator, .durable = durable, .relay = relay, .frontend = frontend, .bridge = bridge };
+    }
+
+    fn deinit(self: *Harness) void {
+        const target = self.bridge.target;
+        self.bridge.deinit();
+        self.durable.free(target.application);
+        self.durable.free(target.application_name);
+        self.durable.free(target.title);
+        self.frontend.deinit();
+        self.relay.deinit();
     }
 
     fn sessionCount(self: *Harness) usize {
@@ -264,6 +298,7 @@ test "bridge forwards an evaluate and returns its result" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
     harness.bridge.openSession(1);
 
     harness.bridge.onMessage(1, "{\"id\":3,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"1+1\",\"returnByValue\":true}}");
@@ -277,6 +312,7 @@ test "merged scope properties answer the client when one half fails" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
     harness.bridge.openSession(1);
     harness.bridge.deliver(paused_with_scopes);
 
@@ -284,30 +320,44 @@ test "merged scope properties answer the client when one half fails" {
     const commands = try harness.relay.commands(arena.allocator());
     try std.testing.expectEqual(@as(usize, 2), commands.items.len);
 
-    try harness.replyTo(0, "{\"result\":{\"result\":{\"properties\":[{\"name\":\"a\",\"value\":{\"type\":\"number\",\"value\":1}}]}}}");
+    try harness.replyTo(0, "{\"result\":{\"properties\":[{\"name\":\"a\",\"value\":{\"type\":\"number\",\"value\":1}}]}}");
     try harness.replyTo(1, "{\"error\":{\"code\":-32000,\"message\":\"Could not find object with given id\"}}");
 
     const ids = try harness.frontend.replyIds(arena.allocator());
     try std.testing.expectEqual(@as(usize, 1), ids.len);
     try std.testing.expectEqual(@as(i64, 7), ids[0].integer);
     try std.testing.expectEqual(@as(usize, 0), harness.mergeCount());
+
+    const reply = (try harness.frontend.replyFor(arena.allocator(), 7)) orelse return error.MissingReply;
+    try std.testing.expect(reply.object.get("error") == null);
+    const properties = reply.object.get("result").?.object.get("result").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), properties.len);
+    try std.testing.expectEqualStrings("a", properties[0].object.get("name").?.string);
 }
 
 test "a request with a string id still gets a reply" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
     harness.bridge.openSession(1);
 
     harness.bridge.onMessage(1, "{\"id\":\"abc\",\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"1+1\"}}");
 
     try std.testing.expectEqual(@as(usize, 1), harness.frontend.count());
+    try std.testing.expectEqual(@as(usize, 0), (try harness.relay.commands(arena.allocator())).items.len);
+    const ids = try harness.frontend.replyIds(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqualStrings("abc", ids[0].string);
+    const reply = (try harness.frontend.replyFor(arena.allocator(), 0)) orelse null;
+    _ = reply;
 }
 
 test "closing a session drops its pending requests and merges" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
     harness.bridge.openSession(1);
     harness.bridge.deliver(paused_with_scopes);
     harness.bridge.onMessage(1, "{\"id\":11,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"1+1\"}}");
@@ -324,6 +374,7 @@ test "injected debugger commands use their own relay ids" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
     harness.bridge.openSession(1);
     harness.bridge.next_id = 1_000_000;
 
@@ -350,6 +401,7 @@ test "an injected command reply never reaches a client" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
     harness.bridge.openSession(1);
 
     harness.bridge.onMessage(1, "{\"id\":9,\"method\":\"Debugger.enable\"}");
@@ -372,6 +424,7 @@ test "a session that opens while the last one closes stays attached" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
 
     harness.bridge.openSession(1);
     harness.relay.hold_close.store(true, .release);
@@ -390,13 +443,13 @@ test "a session that opens while the last one closes stays attached" {
     const closer = try std.Thread.spawn(.{}, Closer.run, .{harness.bridge});
     var waited: usize = 0;
     while (!harness.relay.close_entered.load(.acquire) and waited < 2000) : (waited += 1) zev.sleepMilliseconds(1);
+    // Without the close in flight there is no interleaving to check.
+    try std.testing.expect(harness.relay.close_entered.load(.acquire));
 
+    // The opener arrives while `sendDidClose` is still in flight. It has to wait for the close to finish instead of attaching underneath it.
     const opener = try std.Thread.spawn(.{}, Opener.run, .{harness.bridge});
-    waited = 0;
-    while (waited < 2000) : (waited += 1) {
-        if (harness.sessionCount() == 1 and harness.relay.attachedNow()) break;
-        zev.sleepMilliseconds(1);
-    }
+    zev.sleepMilliseconds(50);
+    try std.testing.expectEqual(@as(usize, 0), harness.sessionCount());
 
     harness.relay.close_released.store(true, .release);
     closer.join();
@@ -410,6 +463,7 @@ test "a second CDP session is rejected while one is attached" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
 
     harness.bridge.openSession(1);
     harness.bridge.openSession(2);
@@ -430,6 +484,7 @@ test "a reattach after close is accepted again" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
 
     harness.bridge.openSession(1);
     harness.bridge.closeSession(1);
@@ -438,6 +493,104 @@ test "a reattach after close is accepted again" {
     try std.testing.expectEqual(@as(usize, 1), harness.sessionCount());
     try std.testing.expectEqual(@as(usize, 2), harness.relay.countOf(.connect));
     try std.testing.expectEqual(@as(usize, 0), (try harness.frontend.closedIds(arena.allocator())).len);
+}
+
+test "a message from a session that is not attached never reaches the target" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+
+    // Session 2 was rejected when it opened; a frame it sent before the close must not reach the relay.
+    harness.bridge.onMessage(2, "{\"id\":5,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"1+1\"}}");
+
+    try std.testing.expectEqual(@as(usize, 0), (try harness.relay.commands(arena.allocator())).items.len);
+    try std.testing.expectEqual(@as(usize, 0), harness.frontend.count());
+    try std.testing.expectEqual(@as(usize, 0), harness.pendingCount());
+}
+
+test "a reply the transport cannot carry becomes an error for the request that asked for it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+
+    harness.bridge.deliver("{\"method\":\"Debugger.scriptParsed\",\"params\":{\"scriptId\":\"5\",\"url\":\"app.js\",\"endLine\":40}}");
+    harness.bridge.onMessage(1, "{\"id\":22,\"method\":\"Debugger.getScriptSource\",\"params\":{\"scriptId\":\"5\"}}");
+
+    const commands = try harness.relay.commands(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), commands.items.len);
+
+    // A four megabyte script source would overflow the transport queue, which closes the session instead of reporting a failure.
+    const source = try arena.allocator().alloc(u8, 4 * 1024 * 1024);
+    @memset(source, 'x');
+    const reply = try std.fmt.allocPrint(arena.allocator(), "{{\"result\":{{\"scriptSource\":\"{s}\"}}}}", .{source});
+    try harness.replyTo(0, reply);
+
+    const ids = try harness.frontend.replyIds(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), ids.len);
+    try std.testing.expectEqual(@as(i64, 22), ids[0].integer);
+    const answer = (try harness.frontend.replyFor(arena.allocator(), 22)) orelse return error.MissingReply;
+    try std.testing.expectEqual(@as(i64, -32000), answer.object.get("error").?.object.get("code").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), harness.sessionCount());
+}
+
+test "scope merges are dropped when execution resumes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+    harness.bridge.deliver(paused_with_scopes);
+
+    harness.bridge.onMessage(1, "{\"id\":8,\"method\":\"Debugger.resume\"}");
+    harness.bridge.onMessage(1, "{\"id\":9,\"method\":\"Runtime.getProperties\",\"params\":{\"objectId\":\"local-1\"}}");
+
+    // One forwarded resume plus one plain getProperties: the pause's scope pairing is gone, so there is no second command.
+    try std.testing.expectEqual(@as(usize, 2), (try harness.relay.commands(arena.allocator())).items.len);
+}
+
+test "a breakpoint column survives for a single-line script and is dropped elsewhere" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+    harness.bridge.deliver("{\"method\":\"Debugger.scriptParsed\",\"params\":{\"scriptId\":\"5\",\"url\":\"bundle.min.js\",\"endLine\":0,\"endColumn\":9000}}");
+    harness.bridge.deliver("{\"method\":\"Debugger.scriptParsed\",\"params\":{\"scriptId\":\"6\",\"url\":\"app.js\",\"endLine\":40,\"endColumn\":1}}");
+
+    harness.bridge.onMessage(1, "{\"id\":31,\"method\":\"Debugger.setBreakpoint\",\"params\":{\"location\":{\"scriptId\":\"5\",\"lineNumber\":0,\"columnNumber\":42}}}");
+    harness.bridge.onMessage(1, "{\"id\":32,\"method\":\"Debugger.setBreakpoint\",\"params\":{\"location\":{\"scriptId\":\"6\",\"lineNumber\":4,\"columnNumber\":9}}}");
+    harness.bridge.onMessage(1, "{\"id\":33,\"method\":\"Debugger.continueToLocation\",\"params\":{\"location\":{\"scriptId\":\"6\",\"lineNumber\":12,\"columnNumber\":7}}}");
+
+    const commands = try harness.relay.commands(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 3), commands.items.len);
+    const columns = [_]i64{ 42, 0, 7 };
+    for (commands.items, columns) |command, expected| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), command, .{});
+        const location = parsed.value.object.get("params").?.object.get("location").?.object;
+        try std.testing.expectEqual(expected, location.get("columnNumber").?.integer);
+    }
+}
+
+test "a target disconnect releases the attached client" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+
+    harness.relay.disconnect.store(true, .release);
+    try harness.bridge.pump();
+
+    try std.testing.expectEqual(@as(usize, 0), harness.sessionCount());
+    const closed = try harness.frontend.closedIds(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), closed.len);
+    try std.testing.expectEqual(@as(transport.SessionId, 1), closed[0]);
+    // The relay is not asked to close a target that is already gone.
+    try std.testing.expectEqual(@as(usize, 0), harness.relay.countOf(.did_close));
 }
 
 test "reply detection compares the parsed id" {

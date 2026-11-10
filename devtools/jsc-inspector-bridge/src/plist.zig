@@ -92,6 +92,7 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Error!Value {
     if (table_start > bytes.len - trailer_size or table_len > bytes.len - trailer_size - table_start) return error.InvalidPlist;
 
     var parser = Parser{
+        .cache = .empty,
         .allocator = allocator,
         .bytes = bytes,
         .offset_size = offset_size,
@@ -99,10 +100,13 @@ pub fn parse(allocator: Allocator, bytes: []const u8) Error!Value {
         .object_count = object_count,
         .table_start = table_start,
     };
+    defer parser.cache.deinit(allocator);
     return parser.object(top_object, 0);
 }
 
 const Parser = struct {
+    /// Objects that were already built. A plist may reference one object from several containers, and without this a diamond of references would cost exponential time.
+    cache: std.AutoHashMapUnmanaged(u64, Value),
     allocator: Allocator,
     bytes: []const u8,
     offset_size: u8,
@@ -118,7 +122,14 @@ const Parser = struct {
         return @intCast(offset);
     }
 
-    fn object(self: Parser, index: u64, depth: u8) Error!Value {
+    fn object(self: *Parser, index: u64, depth: u8) Error!Value {
+        if (self.cache.get(index)) |cached| return cached;
+        const value = try self.objectBody(index, depth);
+        self.cache.put(self.allocator, index, value) catch {};
+        return value;
+    }
+
+    fn objectBody(self: *Parser, index: u64, depth: u8) Error!Value {
         if (depth > max_depth) return error.DepthLimit;
         const offset = try self.objectOffset(index);
         if (offset >= self.bytes.len) return error.Truncated;
@@ -520,6 +531,53 @@ fn utf16Units(allocator: Allocator, text: []const u8) Error![]u16 {
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+test "a plist that references one object twice does not cost exponential time" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    // Object 0 holds an integer; every following object is an array of two references to the previous one, so the graph has 40 levels and 2^40 paths.
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    try bytes.appendSlice(allocator, "bplist00");
+    var offsets: std.ArrayListUnmanaged(u64) = .empty;
+    const levels: u64 = 40;
+    var object: u64 = 0;
+    while (object <= levels) : (object += 1) {
+        try offsets.append(allocator, bytes.items.len);
+        if (object == 0) {
+            try bytes.appendSlice(allocator, &.{ 0x10, 0x07 });
+            continue;
+        }
+        const previous: u8 = @intCast(object - 1);
+        try bytes.appendSlice(allocator, &.{ 0xA2, previous, previous });
+    }
+    const table_start = bytes.items.len;
+    var word: [8]u8 = undefined;
+    for (offsets.items) |offset| {
+        std.mem.writeInt(u32, word[0..4], @intCast(offset), .big);
+        try bytes.appendSlice(allocator, word[0..4]);
+    }
+    try bytes.appendSlice(allocator, &.{ 0, 0, 0, 0, 0, 0, 4, 1 });
+    std.mem.writeInt(u64, &word, offsets.items.len, .big);
+    try bytes.appendSlice(allocator, &word);
+    std.mem.writeInt(u64, &word, offsets.items.len - 1, .big);
+    try bytes.appendSlice(allocator, &word);
+    std.mem.writeInt(u64, &word, table_start, .big);
+    try bytes.appendSlice(allocator, &word);
+
+    const value = try parse(allocator, bytes.items);
+    // Both halves of every array are the same parsed object.
+    var current = value;
+    var remaining: u64 = levels;
+    while (remaining > 1) : (remaining -= 1) {
+        const left = current.array[0];
+        const right = current.array[1];
+        try std.testing.expect(left.array.ptr == right.array.ptr);
+        current = left;
+    }
+    try std.testing.expectEqual(@as(i64, 7), current.array[0].integer);
 }
 
 test "decode a plist produced by the platform serializer" {
