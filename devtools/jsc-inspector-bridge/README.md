@@ -7,7 +7,7 @@ The bridge runs outside the inspected process. The target only has to enable the
 ## Status
 
 - iOS Simulator: supported. The bridge reads `RWI_LISTEN_SOCKET` from the booted simulator and attaches over the relay socket.
-- macOS: gap. The macOS relay is reached through XPC mach services rather than a socket, and the Safari frontend service rejects third-party clients. The bridge does not provide a macOS transport yet; use Safari Web Inspector there.
+- macOS: not supported by this transport. The relay is reached through XPC mach services instead of a socket, and both `com.apple.webinspector` and `com.apple.webinspector.debugger` interrupt connections from processes without the private Web Inspector entitlement. Use Safari Web Inspector on macOS.
 - iOS device: unverified. The relay is reachable through usbmuxd on paper, but no device transport is implemented.
 - Only one target per bridge process. The first JavaScript target of the selected application is used.
 
@@ -58,6 +58,10 @@ The bridge adds state that CDP clients require but the relay omits:
 - CDP scope types: relay `nestedLexical` scopes become `block`, `globalLexicalEnvironment` becomes `script`, and the innermost `closure` scope becomes `local`.
 - `result` instead of `properties` for `Runtime.getProperties`, and `exceptionDetails` for thrown evaluation results.
 - `Debugger.setBreakpointsActive` is sent after `Debugger.enable`, because JSC does not pause at a resolved breakpoint until the debugger activates breakpoints.
+
+## macOS
+
+The macOS relay has no UNIX socket. `webinspectord` publishes only the `com.apple.webinspector` and `com.apple.webinspector.debugger` mach endpoints, and a third-party XPC client receives `Connection interrupted` from both services because the daemon checks for Apple's private Web Inspector entitlements. Producing a CDP endpoint for a macOS host therefore requires either a signed helper that holds those entitlements or an in-process debugger path that does not use the relay.
 
 ## Known fidelity differences
 
