@@ -1,0 +1,76 @@
+# jsbay-inspector-bridge
+
+`jsbay-inspector-bridge` exposes a JavaScriptCore target as a Chrome DevTools Protocol endpoint. It connects to the WebKit Inspector Relay, attaches to a JavaScript target, and serves CDP discovery plus a WebSocket endpoint on loopback.
+
+The bridge runs outside the inspected process. The target only has to enable the system JSC remote inspector, for example with `JSGlobalContextSetInspectable`. No debugger code is linked into the host application, and Safari Web Inspector keeps working against the same target.
+
+## Status
+
+- iOS Simulator: supported. The bridge reads `RWI_LISTEN_SOCKET` from the booted simulator and attaches over the relay socket.
+- macOS: gap. The macOS relay is reached through XPC mach services rather than a socket, and the Safari frontend service rejects third-party clients. The bridge does not provide a macOS transport yet; use Safari Web Inspector there.
+- iOS device: unverified. The relay is reachable through usbmuxd on paper, but no device transport is implemented.
+- Only one target per bridge process. The first JavaScript target of the selected application is used.
+
+## Usage
+
+Build and run from this directory:
+
+```sh
+zig build
+zig-out/bin/jsbay-inspector-bridge --socket "$RWI_LISTEN_SOCKET"
+```
+
+Options:
+
+- `--socket <path>`: relay socket. Required for the simulator path.
+- `--application <name>`: application name reported by the relay. Defaults to the newest process that reports a JavaScript target.
+- `--target <title>`: JavaScript target title. Defaults to the first target.
+- `--port <port>`: CDP port. `0` selects an ephemeral port.
+- `--probe`: attach, enable `Runtime`, print the relay traffic, and exit.
+- `--trace`: dump relay frames on stderr.
+
+The command prints the discovery URL, for example `http://127.0.0.1:9229/json/list`. Point DevTools or a CDP client at that endpoint.
+
+Typical simulator flow:
+
+```sh
+xcrun simctl spawn "$UDID" launchctl kickstart user/foreground/com.apple.webinspectord
+xcrun simctl spawn "$UDID" /path/to/jsc-demo &
+RWI_LISTEN_SOCKET="$(xcrun simctl spawn "$UDID" launchctl getenv RWI_LISTEN_SOCKET)"
+zig-out/bin/jsbay-inspector-bridge --socket "$RWI_LISTEN_SOCKET" --application jsc-demo
+```
+
+## Translation scope
+
+Commands are forwarded to the relay with the CDP method and parameters, and relay notifications are copied to every attached CDP session. Command ids are rewritten per session so concurrent clients cannot consume each other's replies.
+
+Forwarded domains:
+
+- `Runtime`: enable, disable, evaluate, callFunctionOn, getProperties, releaseObject, releaseObjectGroup, discardConsoleEntries, getIsolateId.
+- `Debugger`: enable, disable, breakpoints, resume, stepping, pause-on-exceptions, frame evaluation, script source, search, blackboxing, async stack traces, instrumentation breakpoints.
+
+Enable and disable commands for other domains return an empty result so a general-purpose frontend can finish its handshake. Unsupported methods return JSON-RPC error `-32601`.
+
+The bridge adds state that CDP clients require but the relay omits:
+
+- `debuggerId` on `Debugger.enable`.
+- `url` on paused call frames, resolved from recorded `Debugger.scriptParsed` notifications.
+- CDP scope types: relay `nestedLexical` scopes become `block`, `globalLexicalEnvironment` becomes `script`, and the innermost `closure` scope becomes `local`.
+- `result` instead of `properties` for `Runtime.getProperties`, and `exceptionDetails` for thrown evaluation results.
+- `Debugger.setBreakpointsActive` is sent after `Debugger.enable`, because JSC does not pause at a resolved breakpoint until the debugger activates breakpoints.
+
+## Known fidelity differences
+
+These come from the JSC target and its relay protocol rather than from the bridge:
+
+- Pause on exceptions is accepted by JSC but no pause is delivered for thrown exceptions in the tested simulator targets.
+- Block-scoped bindings are reported in a separate `block` scope. Frontends that merge block bindings into the frame's local scope show fewer names in the local scope.
+- Column-granular breakpoints can resolve to the next executable statement, so a pause may land one line below the requested position.
+
+## Tests
+
+```sh
+zig build test
+```
+
+`zig build test` covers the binary plist codec and the relay UUID format. End-to-end checks against a simulator target live in `tests/apple-sdk/run-jsc-bridge-sim.sh` in the repository root.

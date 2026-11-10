@@ -54,7 +54,7 @@ Authority for what a running build advertises is `Schema.getDomains` and the sup
 
 | Area | `quickjs` | `quickjs_ng` | `jsc` | `escargot` | `hermes` |
 | --- | --- | --- | --- | --- | --- |
-| CDP `Debugger` | Partial execution support: source breakpoints, pause/resume, stepping, and frame evaluation | Same | Use [Safari Web Inspector](#safari-web-inspector) | Native location hooks; frame evaluation and stepping | Native CDP agent; frame evaluation and stepping |
+| CDP `Debugger` | Partial execution support: source breakpoints, pause/resume, stepping, and frame evaluation | Same | Safari Web Inspector; CDP on Simulator through the [host bridge](#jsc-cdp-bridge) | Native location hooks; frame evaluation and stepping | Native CDP agent; frame evaluation and stepping |
 | CDP `Runtime` / `Profiler` / `Performance` | Partial | Partial | Runtime + Performance | Runtime + Performance | Native Runtime + Profiler; shared Performance |
 | CDP `HeapProfiler` | Collection and bounded snapshots | Collection and bounded snapshots | Collection | Collection | Native heap commands in the manifest |
 | Safari Web Inspector | No | No | Supported JSC builds only | No | No |
@@ -94,6 +94,16 @@ Build the simulator example with `zig build safari-demo-build -Dbackend=jsc -Dta
 The regression requires normal context teardown as well as successful debugger commands. A native JavaScriptCore shutdown crash fails the check; debugger command success alone does not establish runtime compatibility.
 
 This path depends on platform JavaScriptCore symbols. It does not turn JSC into the CDP source debugger and it is not enabled by the CDP build option.
+
+### JSC CDP bridge
+
+`devtools/jsc-inspector-bridge` exposes a JSC target as a CDP endpoint for hosts that need the same client tooling as the other backends. The bridge runs as a separate host process, attaches to the WebKit Inspector Relay, and serves `/json` discovery plus a CDP WebSocket on loopback. The target keeps its Safari Web Inspector support and needs no extra code or build flags.
+
+The bridge covers `Runtime` and `Debugger`: evaluation, property inspection, source breakpoints, paused-frame evaluation, stepping, resume, script sources, and console events. It adds the CDP fields the relay omits, including `debuggerId`, call-frame URLs, CDP scope types, and `exceptionDetails` for thrown evaluation results. Its [README](../devtools/jsc-inspector-bridge/README.md) lists the exact command and parameter mapping.
+
+Supported path: iOS Simulator, using the relay socket reported by `RWI_LISTEN_SOCKET`. macOS is a gap: the macOS relay is reached through XPC mach services instead of a socket, and the Safari frontend service rejects third-party clients, so the bridge provides no macOS transport. Physical device support is unverified.
+
+Known target gaps on the Simulator: JSC accepts `Debugger.setPauseOnExceptions` but does not deliver a pause for thrown exceptions or `debugger;` statements in the tested targets, block bindings appear in a separate scope, and column-granular breakpoints can resolve to the next executable statement. Breakpoint, stepping, and frame-evaluation flows pass.
 
 ### iOS 26.5 system JavaScriptCore teardown limitation
 
