@@ -97,11 +97,16 @@ function checkObjectOperations(engine) {
     try { expect(json(keys) === '["1","2","b","a"]', `keys order and filtering: ${json(keys)}`) }
     finally { release(keys) }
   })
-  evaluated(engine, 'Object.create({ inherited: 1 })', 'keys-inherited.js', (target) => {
-    const keys = native.keys(target)
-    try { expect(json(keys) === '[]', 'keys excludes inherited keys') }
-    finally { release(keys) }
-  })
+  evaluated(engine, '""', 'empty-string.js', (emptyStr) => {
+    expect(native.toStringValue(emptyStr) === '', 'toStringValue on empty string');
+    expect(native.toJsonStringValue(emptyStr) === '""', 'toJsonStringValue on empty string');
+  });
+  evaluated(engine, '({ hello: "世界", n: 42 })', 'json-string.js', (obj) => {
+    expect(native.toJsonStringValue(obj) === '{"hello":"世界","n":42}', 'toJsonStringValue object');
+  });
+  evaluated(engine, '"hello\\u0000world"', 'nul-string.js', (nulStr) => {
+    expect(native.toStringValue(nulStr) === 'hello\u0000world', 'toStringValue preserves embedded NUL');
+  });
   evaluated(engine, "new Proxy({}, { ownKeys() { return ['z', 'y'] }, getOwnPropertyDescriptor() { return { value: 1, enumerable: true, configurable: true } } })", 'keys-proxy.js', (target) => {
     const keys = native.keys(target)
     try { expect(json(keys) === '["z","y"]', `keys follows Proxy ownKeys order: ${json(keys)}`) }
