@@ -129,7 +129,7 @@ Fixed `exhaust.play` stories record `Observation`s and lock Mermaid state + sequ
 zig build test-state-tcas -Dbackend=quickjs_ng --summary all
 zig build test-state-tcas-engine -Dbackend=quickjs_ng --summary all
 
-# Explore-gate script: Bash 3.2+ (`zig build check-state-tcas-explore-gates`; also pulled into test-state-tcas / test).
+# Explore-gate check: native Zig via state_tcas (`zig build check-state-tcas-explore-gates`; also pulled into test-state-tcas / test).
 # rewrite goldens (cwd = package root; build.zig setCwd for these steps):
 #   touch .state_tcas-update-pictures && zig build test-state-tcas ... && rm .state_tcas-update-pictures
 ```

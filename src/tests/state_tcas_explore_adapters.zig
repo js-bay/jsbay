@@ -12,102 +12,16 @@ pub fn monoNs() u64 {
     return @as(u64, @intCast(@max(ts.nanoseconds, 0)));
 }
 
-/// Picture lock wrapper robust to Windows CRLF checkout conversions. If disk golden has `\r` but matches `expected` when stripped, rewrites with LF before locking.
+/// Picture lock wrapper robust to Windows CRLF checkout conversions (state_tcas v0.2.0 handles CRLF normalization natively in `state_tcas.picture.lock`).
 pub fn lockNormalized(
     io: std.Io,
     allocator: std.mem.Allocator,
     path: []const u8,
     expected: []const u8,
 ) !void {
-    if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20))) |disk| {
-        defer allocator.free(disk);
-        if (std.mem.indexOfScalar(u8, disk, '\r') != null) {
-            var clean = try allocator.alloc(u8, disk.len);
-            defer allocator.free(clean);
-            var i: usize = 0;
-            for (disk) |c| {
-                if (c != '\r') {
-                    clean[i] = c;
-                    i += 1;
-                }
-            }
-            if (std.mem.eql(u8, expected, clean[0..i])) {
-                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = expected });
-            }
-        }
-    } else |_| {}
     try state_tcas.picture.lock(io, allocator, path, expected);
 }
 
-/// DFS duck: world + Safety + Liveness.
-pub fn Monitored(comptime Act: type, comptime World: type) type {
-    return struct {
-        inner: *World,
-        saf: *state_tcas.monitor.Safety(*World),
-        liv: *state_tcas.monitor.Liveness(*World),
-
-        pub fn enabled(self: *@This()) []const Act {
-            return self.inner.enabled();
-        }
-
-        pub fn step(self: *@This(), act: Act) !void {
-            try self.inner.step(act);
-            try self.saf.observe();
-            self.liv.note();
-        }
-
-        pub fn undo(self: *@This(), act: Act) void {
-            self.inner.undo(act);
-        }
-    };
-}
-
-/// dfsKeyed duck: monitored step plus `key` forwarded from the world.
-pub fn MonitoredKeyed(comptime Act: type, comptime World: type) type {
-    return struct {
-        inner: *World,
-        saf: *state_tcas.monitor.Safety(*World),
-        liv: *state_tcas.monitor.Liveness(*World),
-
-        pub fn enabled(self: *@This()) []const Act {
-            return self.inner.enabled();
-        }
-
-        pub fn step(self: *@This(), act: Act) !void {
-            try self.inner.step(act);
-            try self.saf.observe();
-            self.liv.note();
-        }
-
-        pub fn undo(self: *@This(), act: Act) void {
-            self.inner.undo(act);
-        }
-
-        pub fn key(self: *const @This()) u64 {
-            return self.inner.key();
-        }
-    };
-}
-
-/// dfsKeyed duck without monitors (world already folds checks into step, or prune-only smoke).
-pub fn KeyedOnly(comptime Act: type, comptime World: type) type {
-    return struct {
-        inner: *World,
-
-        pub fn enabled(self: *@This()) []const Act {
-            return self.inner.enabled();
-        }
-
-        pub fn step(self: *@This(), act: Act) !void {
-            try self.inner.step(act);
-        }
-
-        pub fn undo(self: *@This(), act: Act) void {
-            self.inner.undo(act);
-        }
-
-        pub fn key(self: *const @This()) u64 {
-            return self.inner.key();
-        }
-    };
-}
+pub const Monitored = state_tcas.Monitored;
+pub const MonitoredKeyed = state_tcas.MonitoredKeyed;
+pub const KeyedOnly = state_tcas.KeyedOnly;

@@ -140,6 +140,9 @@ jobs:
       - name: state_tcas harness (Scheduler/Driver + picture locks; no ActiveEngine)
         run: zig build test-state-tcas -Dbackend=quickjs_ng --summary all
 
+      - name: state_tcas engine harness (ActiveEngine + host dispatch / JS queues)
+        run: zig build test-state-tcas-engine -Dbackend=quickjs_ng --summary all
+
       - name: SDK quality — portable (native / Android style / .NET)
         run: make check CHECKS=native-format,android-style,dotnet-style,dotnet-lint
 
@@ -377,6 +380,15 @@ jobs:
       # transport-off, inspector-disabled, location dispatch, and the pinned Test262 subset run on linux-engine every PR and on extended macos daily. This job keeps the Darwin engine suite.
       - name: Engine tests (quickjs_ng)
         run: zig build test-engine -Dbackend=quickjs_ng --summary all
+
+      - name: Check state_tcas explore gates
+        run: zig build check-state-tcas-explore-gates
+
+      - name: Run state_tcas harness (Scheduler/Driver)
+        run: zig build test-state-tcas -Dbackend=quickjs_ng --summary all
+
+      - name: Run state_tcas engine harness
+        run: zig build test-state-tcas-engine -Dbackend=quickjs_ng --summary all
 
       - name: Public Zig module consumer (quickjs_ng)
         working-directory: tests/zig-consumer
@@ -622,6 +634,12 @@ jobs:
       - name: Run engine tests without the POSIX inspector transport
         shell: bash
         run: zig build test-engine -Dbackend=quickjs_ng -Dinspector-transport=false --summary all
+      - name: Check state_tcas explore gates
+        shell: bash
+        run: zig build check-state-tcas-explore-gates
+      - name: Run state_tcas harness (Scheduler/Driver)
+        shell: bash
+        run: zig build test-state-tcas -Dbackend=quickjs_ng -Dinspector-transport=false --summary all
       - name: Build and run the public C consumer
         shell: bash
         run: |

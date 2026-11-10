@@ -562,8 +562,36 @@ pub fn build(b: *std.Build) void {
         test_state_tcas_step.dependOn(&run_state_tcas_harness.step);
 
         // CI/process: ban L2 Ungated / loop.dispatchEvents* in explore harness files.
-        const check_explore_gates = b.addSystemCommand(&.{"bash"});
-        check_explore_gates.addFileArg(b.path("scripts/check-state-tcas-explore-gates.sh"));
+        const gate_check_exe = state_tcas_dep.artifact("explore_gate_check");
+        const check_explore_gates = b.addRunArtifact(gate_check_exe);
+        check_explore_gates.setCwd(b.path("."));
+        const explore_harnesses = [_][]const u8{
+            "src/tests/state_tcas_calendar_harness.zig",
+            "src/tests/state_tcas_engine_harness.zig",
+            "src/tests/state_tcas_event_loop_harness.zig",
+            "src/tests/state_tcas_harness.zig",
+            "src/tests/state_tcas_js_event_loop_driver_harness.zig",
+            "src/tests/state_tcas_js_event_loop_harness.zig",
+            "src/tests/state_tcas_monitor_harness.zig",
+        };
+        for (explore_harnesses) |harness_path| {
+            check_explore_gates.addArgs(&.{
+                "--path",            harness_path,
+                "--forbid",          "Ungated",
+                "--forbid",          "dispatchEventsUngated",
+                "--forbid",          "dispatchEventsLimited",
+                "--forbid",          ".loop.dispatchEvents",
+                "--ignore-comments", "--rule-end",
+            });
+        }
+        check_explore_gates.addArgs(&.{
+            "--path",            "src/tests/state_tcas_engine_harness.zig",
+            "--forbid",          "explore.bfs(",
+            "--ignore-comments", "--rule-end",
+            "--path",            "src/tests/state_tcas_js_event_loop_driver_harness.zig",
+            "--forbid",          "explore.bfs(",
+            "--ignore-comments", "--rule-end",
+        });
         const check_explore_gates_step = b.step("check-state-tcas-explore-gates", "Ban L2 Ungated / loop.dispatchEvents* in state_tcas explore harnesses");
         check_explore_gates_step.dependOn(&check_explore_gates.step);
         test_state_tcas_step.dependOn(&check_explore_gates.step);
