@@ -281,10 +281,35 @@ pub const Client = struct {
 
 fn traceFrame(direction: []const u8, label: []const u8, bytes: []const u8) void {
     if (!trace_enabled) return;
+    var scratch: [8192]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    if (describeFrame(fixed.allocator(), bytes)) |text| {
+        std.debug.print("[trace] {s} {s} {d} bytes {s}\n", .{ direction, label, bytes.len, text });
+        return;
+    }
     const limit = @min(bytes.len, 48);
     std.debug.print("[trace] {s} {s} {d} bytes ", .{ direction, label, bytes.len });
     for (bytes[0..limit]) |byte| std.debug.print("{x:0>2}", .{byte});
     std.debug.print("\n", .{});
+}
+
+/// Renders the inspector payload a relay frame carries, so `--trace` shows the commands and events themselves instead of plist bytes.
+fn describeFrame(allocator: Allocator, bytes: []const u8) ?[]const u8 {
+    const value = plist.parse(allocator, bytes) catch return null;
+    const argument = value.get("__argument") orelse value;
+    if (argument.get("WIRMessageDataKey") orelse argument.get("WIRSocketDataKey")) |payload| {
+        const text = switch (payload) {
+            .data => |data| data,
+            .string => |string| string,
+            else => return null,
+        };
+        return text[0..@min(text.len, 400)];
+    }
+    const selector = argument.get("__selector") orelse return null;
+    return switch (selector) {
+        .string => |name| name,
+        else => null,
+    };
 }
 
 fn connectUnix(path: []const u8) Error!std.posix.fd_t {

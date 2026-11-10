@@ -18,7 +18,7 @@ if [[ ! -x "$bridge" ]]; then
   (cd "$root/devtools/jsc-inspector-bridge" && zig build)
 fi
 
-# JSC resumes instead of pausing when a stepOut leaves a JavaScript frame that a native frame called.
+# After a stepOut from a JavaScript callback that a native frame called, the relay reports Debugger.resumed and never reports another pause, so the caller frame cannot be shown.
 # Console API calls stay with the host console client, so the relay never reports console arguments.
 jsc_unsupported_steps=(
   native-callback-step-out
