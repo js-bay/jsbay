@@ -8,7 +8,10 @@ JavaScript scheduling on `zev`. Depends on `zev` and the Zig stdlib; no JS engin
 
 - dispatch: `dispatchEventsLimited`; optional `dispatch_budget` / `dispatch_time_budget_ms` (`null` = unlimited)
 - `Driver.now` → `Loop.nowMs`
-- tests: `Driver.testing.advance` / `setNow` install `Loop.setClock` (no parallel `test_now`)
+- tests (`Driver.testing` layers; no parallel `test_now`):
+  - **L0** `runOnce` / `advance` — gated production turn path; only L0 for explore *dispatch* acts. `advance` clamp-pushes the clock (stale-host contract) then runs a turn.
+  - **L1** `setNow` — strict install (`error.ClockRewind` on rewind; same tick OK); `clampNow` — intentional `@max`. Clock-only; explore may use for pure clock acts.
+  - **L2** `dispatchEventsUngated` — clamp-push + `Loop.dispatchEventsLimited`, bypasses suspend / SyncWait / failure / before_turn / stop / turn_active / execution_depth / checkpoint. Escape only; never an explore act. Old `dispatchEvents` is a `@compileError` pointing here or to L0.
 - notify / timer start use zev coalesce; attached hosts get a schedule nudge. `cancel` and public `wake` still signal the waiter
 - blocking `run` / `runFor` wrap `beginRun` / `endRun` so owner wake-skip matches `Loop.run`
 - virtual clock: park for an external wake; do not sleep a virtual delay as wall time
@@ -56,3 +59,5 @@ zig build test
 ```
 
 Pure scheduling / native-wait / notification contracts live here; real-engine ordering and lifecycle tests are in the root suite. Root `zig build test` also runs this suite and forwards `-Dtest-filter`.
+
+Root `state_tcas` harnesses: live `Driver` / ActiveEngine explore uses **act-log + `dfs`/`dfsKeyed`** (no fake BFS / clone). L0/L1 only in explore; L2 `dispatchEventsUngated` is gap-only. See `docs/harness.md` act-log-vs-bfs in the `state_tcas` package and `scripts/check-state-tcas-explore-gates.sh`.

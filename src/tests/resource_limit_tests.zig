@@ -134,7 +134,7 @@ test "containment limits keep direct timer drains alive through callback destruc
         try helpers.evalOk(id, "setInterval(()=>console.log('close'),0)");
         _ = timers.beginTick(id, 0) orelse return error.NoTimer;
         const instance = instances.getInstance(id) orelse return error.NoInstance;
-        @import("js_event_loop").Driver.testing.dispatchEvents(instance.loop, 0);
+        @import("js_event_loop").Driver.testing.dispatchEventsUngated(instance.loop, 0);
         timers.endTick(id);
         if (single) {
             try std.testing.expect(timers.fireOneDue(id, 0));

@@ -134,6 +134,12 @@ jobs:
             node scripts/check-comment-prose.mjs --base HEAD^
           fi
 
+      - name: Check state_tcas explore gates (no L2 Ungated in harness)
+        run: zig build check-state-tcas-explore-gates
+
+      - name: state_tcas harness (Scheduler/Driver + picture locks; no ActiveEngine)
+        run: zig build test-state-tcas -Dbackend=quickjs_ng --summary all
+
       - name: SDK quality — portable (native / Android style / .NET)
         run: make check CHECKS=native-format,android-style,dotnet-style,dotnet-lint
 
