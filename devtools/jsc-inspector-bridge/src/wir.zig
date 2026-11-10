@@ -79,7 +79,7 @@ pub const Client = struct {
             try connectUnix(path);
         if (trace_enabled) std.debug.print("[trace] relay transport connected\n", .{});
 
-        errdefer _ = std.c.close(fd);
+        errdefer _ = std.posix.system.close(fd);
         const connection_id = try uuid4(io, allocator);
         errdefer allocator.free(connection_id);
         const sender_id = try uuid4(io, allocator);
@@ -107,7 +107,7 @@ pub const Client = struct {
         self.send_mutex.deinit();
         self.allocator.free(self.sender_id);
         self.allocator.free(self.connection_id);
-        _ = std.c.close(self.fd);
+        _ = std.posix.system.close(self.fd);
         const allocator = self.allocator;
         allocator.destroy(self);
     }

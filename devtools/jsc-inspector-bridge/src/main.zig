@@ -55,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const bridge = try cdp.Bridge.start(allocator, init.io, client, target, options.port);
+    defer bridge.deinit();
     try print(init, "CDP endpoint: http://127.0.0.1:{d}/json/list\n", .{bridge.boundPort()});
     try bridge.pump();
 }

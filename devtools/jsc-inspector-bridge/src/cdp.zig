@@ -180,6 +180,9 @@ pub const Bridge = struct {
     scripts: std.StringHashMapUnmanaged(Script) = .empty,
     last_caller: ?CallerSite = null,
     armed_caller: ?CallerSite = null,
+    /// Set by `start`, which builds the relay adapter and the CDP transport and therefore owns them.
+    relay_owner: ?*WireRelay = null,
+    frontend_owner: ?*TransportFrontend = null,
     next_id: u64 = 1,
     next_merge: u64 = 1,
 
@@ -234,6 +237,13 @@ pub const Bridge = struct {
         errdefer transport_owner.transport.deinit();
         _ = io;
         const self = try init(allocator, wire.relay(), transport_owner.frontend(), target);
+        errdefer {
+            transport_owner.transport.deinit();
+            _ = allocator.destroy(transport_owner);
+            _ = allocator.destroy(wire);
+        }
+        self.relay_owner = wire;
+        self.frontend_owner = transport_owner;
         transport_owner.transport.setProtocolJson("{}");
         transport_owner.transport.setDiscoveryTarget(.{
             .title = target.title,
@@ -262,8 +272,13 @@ pub const Bridge = struct {
         return self.frontend.boundPort();
     }
 
-    /// Releases the state the bridge owns. The relay, the frontend, and the target belong to whoever created them.
+    /// Releases the state the bridge owns, including the relay adapter and the CDP transport that `start` built. The target belongs to the caller.
     pub fn deinit(self: *Bridge) void {
+        // The transport closes its sessions on the way down, so it has to go first: those calls still need the bridge state below.
+        if (self.frontend_owner) |owner| {
+            owner.transport.deinit();
+            self.frontend_owner = null;
+        }
         self.mutex.lock();
         self.clearScopeMergesLocked();
         self.scope_merges.deinit(self.allocator);
@@ -285,6 +300,14 @@ pub const Bridge = struct {
         replaceSite(self.allocator, &self.last_caller, null);
         replaceSite(self.allocator, &self.armed_caller, null);
         self.mutex.unlock();
+        if (self.relay_owner) |owner| {
+            self.relay_owner = null;
+            self.allocator.destroy(owner);
+        }
+        if (self.frontend_owner) |owner| {
+            self.frontend_owner = null;
+            self.allocator.destroy(owner);
+        }
         const allocator = self.allocator;
         allocator.destroy(self);
     }
