@@ -68,7 +68,7 @@ fn probe(init: std.process.Init, allocator: std.mem.Allocator, client: *wir.Clie
             else => continue,
         };
         try print(init, "relay data: {s}\n", .{data});
-        if (std.mem.indexOf(u8, data, "\"id\":1") != null) return;
+        if (cdp.isReplyTo(allocator, data, 1)) return;
     }
     return error.ProbeTimeout;
 }

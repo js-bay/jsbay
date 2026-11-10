@@ -12,6 +12,15 @@ const zev = @import("zev");
 
 const Allocator = std.mem.Allocator;
 
+/// True when `data` is a relay reply for `id`. The parsed id is compared because the probe's command id also prefixes other ids such as 10 or 1000000.
+pub fn isReplyTo(allocator: Allocator, data: []const u8, id: i64) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, data, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const raw = parsed.value.object.get("id") orelse return false;
+    return raw == .integer and raw.integer == id;
+}
+
 /// Reports a message the bridge discarded. Every dropped message is a debugging dead end, so `--trace` shows the reason.
 fn logDrop(reason: []const u8) void {
     if (wir.trace_enabled) std.debug.print("[drop] {s}\n", .{reason});
@@ -271,23 +280,30 @@ pub const Bridge = struct {
         self.frontend_mutex.lock();
         defer self.frontend_mutex.unlock();
         self.mutex.lock();
-        const first = self.sessions.items.len == 0;
+        // JSC keeps one JavaScript context and the bridge owns one relay frontend sender, so a second client would silently share breakpoint, domain, and pause state with the first. Reject it instead of running two sessions over one sender.
+        if (self.sessions.items.len > 0) {
+            self.mutex.unlock();
+            logDrop("CDP session rejected because another session is open");
+            return self.frontend.closeSession(id);
+        }
         self.sessions.append(self.allocator, .{ .id = id }) catch {
             self.mutex.unlock();
             return self.frontend.closeSession(id);
         };
         self.mutex.unlock();
         // The relay forgets the frontend sender when the last client detached, so a later client needs it registered again before commands reach the target.
-        if (first) self.relay.connectFrontend(&self.target);
+        self.relay.connectFrontend(&self.target);
     }
 
     pub fn closeSession(self: *Bridge, id: transport.SessionId) void {
         self.frontend_mutex.lock();
         defer self.frontend_mutex.unlock();
         self.mutex.lock();
+        var removed = false;
         for (self.sessions.items, 0..) |session, index| {
             if (session.id == id) {
                 _ = self.sessions.orderedRemove(index);
+                removed = true;
                 break;
             }
         }
@@ -305,7 +321,7 @@ pub const Bridge = struct {
             replaceSite(self.allocator, &self.armed_caller, null);
         }
         self.mutex.unlock();
-        if (empty) self.relay.sendDidClose(&self.target);
+        if (removed and empty) self.relay.sendDidClose(&self.target);
     }
 
     /// Drops the requests and merges that a closed session will never collect. Caller holds `mutex`.

@@ -101,6 +101,16 @@ const FakeRelay = struct {
         return out;
     }
 
+    fn countOf(self: *FakeRelay, kind: Recorded.Kind) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var total: usize = 0;
+        for (self.recorded.items) |entry| {
+            if (entry.kind == kind) total += 1;
+        }
+        return total;
+    }
+
     fn lastCommand(self: *FakeRelay) ?[]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -186,6 +196,13 @@ const FakeFrontend = struct {
             return parsed.value;
         }
         return null;
+    }
+
+    /// Sessions the bridge asked the transport to close.
+    fn closedIds(self: *FakeFrontend, allocator: Allocator) ![]transport.SessionId {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return allocator.dupe(transport.SessionId, self.closed.items);
     }
 };
 
@@ -387,4 +404,46 @@ test "a session that opens while the last one closes stays attached" {
 
     try std.testing.expectEqual(@as(usize, 1), harness.sessionCount());
     try std.testing.expect(harness.relay.attachedNow());
+}
+
+test "a second CDP session is rejected while one is attached" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+
+    harness.bridge.openSession(1);
+    harness.bridge.openSession(2);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.sessionCount());
+    try std.testing.expectEqual(@as(usize, 1), harness.relay.countOf(.connect));
+    const rejected = try harness.frontend.closedIds(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), rejected.len);
+    try std.testing.expectEqual(@as(transport.SessionId, 2), rejected[0]);
+
+    harness.bridge.closeSession(1);
+    try std.testing.expectEqual(@as(usize, 1), harness.relay.countOf(.did_close));
+    harness.bridge.closeSession(2);
+    try std.testing.expectEqual(@as(usize, 1), harness.relay.countOf(.did_close));
+}
+
+test "a reattach after close is accepted again" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+
+    harness.bridge.openSession(1);
+    harness.bridge.closeSession(1);
+    harness.bridge.openSession(2);
+
+    try std.testing.expectEqual(@as(usize, 1), harness.sessionCount());
+    try std.testing.expectEqual(@as(usize, 2), harness.relay.countOf(.connect));
+    try std.testing.expectEqual(@as(usize, 0), (try harness.frontend.closedIds(arena.allocator())).len);
+}
+
+test "reply detection compares the parsed id" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(cdp.isReplyTo(allocator, "{\"id\":1,\"result\":{}}", 1));
+    try std.testing.expect(!cdp.isReplyTo(allocator, "{\"id\":10,\"result\":{}}", 1));
+    try std.testing.expect(!cdp.isReplyTo(allocator, "{\"id\":\"1\"}", 1));
+    try std.testing.expect(!cdp.isReplyTo(allocator, "not json", 1));
 }

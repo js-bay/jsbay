@@ -10,6 +10,7 @@ The bridge runs outside the inspected process. The target only has to enable the
 - macOS: not supported by this transport. The relay is reached through XPC mach services instead of a socket, and both `com.apple.webinspector` and `com.apple.webinspector.debugger` interrupt connections from processes without the private Web Inspector entitlement. Use Safari Web Inspector on macOS.
 - iOS device: supported through a forwarder. A device exposes the relay as the lockdown service `com.apple.webinspector`, or as `com.apple.webinspector.shim.remote` over remote service discovery, instead of a socket. Open that service and pipe it to a loopback TCP port, then attach with `--socket tcp://host:port`. The inspected application must be running in the foreground on an unlocked device; a locked or backgrounded application still appears in the relay application list but reports no JavaScript target, and the bridge then fails with a discovery error.
 - Only one target per bridge process. The first JavaScript target of the selected application is used.
+- One CDP client at a time. The bridge owns a single relay frontend sender, so a second client would share breakpoint, pause, and domain state with the first, and a `Debugger.disable` from either would affect both. The second WebSocket is closed when it opens; reconnect one frontend at a time.
 
 ## Usage
 
