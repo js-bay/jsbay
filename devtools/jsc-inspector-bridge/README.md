@@ -10,6 +10,7 @@ The bridge runs outside the inspected process. The target only has to enable the
 - macOS: not supported by this transport. The relay is reached through XPC mach services instead of a socket, and both `com.apple.webinspector` and `com.apple.webinspector.debugger` interrupt connections from processes without the private Web Inspector entitlement. Use Safari Web Inspector on macOS.
 - iOS device: supported through a forwarder. A device exposes the relay as the lockdown service `com.apple.webinspector`, or as `com.apple.webinspector.shim.remote` over remote service discovery, instead of a socket. Open that service and pipe it to a loopback TCP port, then attach with `--socket tcp://host:port`. The inspected application must be running in the foreground on an unlocked device; a locked or backgrounded application still appears in the relay application list but reports no JavaScript target, and the bridge then fails with a discovery error.
 - Only one target per bridge process. The first JavaScript target of the selected application is used.
+- A client is detached when the inspected application exits: the relay reports the disconnect, the bridge closes every CDP session, and the process ends. Reconnect a client after the target has a JavaScript context again.
 - One CDP client at a time. The bridge owns a single relay frontend sender, so a second client would share breakpoint, pause, and domain state with the first, and a `Debugger.disable` from either would affect both. The second WebSocket is closed when it opens; reconnect one frontend at a time.
 
 ## Usage
@@ -72,7 +73,7 @@ The bridge adds state that CDP clients require but the relay omits:
 - `Debugger.setBreakpointsActive` is sent after `Debugger.enable`, because JSC does not pause at a resolved breakpoint until the debugger activates breakpoints.
 - `Debugger.setPauseOnDebuggerStatements` is sent after `Debugger.enable`, because JSC only stops at a `debugger` statement once a frontend arms that switch. CDP has no equivalent command.
 - `Runtime.executionContextCreated` with one synthetic context after `Runtime.enable`. JSC has a single context and never announces it, and CDP clients wait for the announcement before they evaluate. `contextId` and `uniqueContextId` are dropped from forwarded requests, and evaluation results carry that context id.
-- Offsets of column breakpoints are dropped, so the breakpoint resolves to the statement on the requested line instead of a later statement.
+- A column offset on a breakpoint is dropped when the script spans more than one line, so the breakpoint resolves to the statement on the requested line instead of a later statement. A single-line script keeps the offset, where it is the only way to name a statement, and `Debugger.continueToLocation` keeps it because zeroing the column would move the target behind the position execution resumes from.
 - A step out that returns to the end of the outermost statement reports the statement that made the call, matching other CDP engines.
 
 ## macOS
