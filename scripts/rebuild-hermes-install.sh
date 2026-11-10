@@ -34,24 +34,60 @@ if [[ -f "$PATCH" ]]; then
     exit 1
   fi
 fi
+PATCH="$ROOT/vendor/hermes-cdp-frame-url.patch"
+if [[ -f "$PATCH" ]]; then
+  if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
+    echo "Hermes frame URL patch already applied"
+  else
+    patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+  fi
+fi
+PATCH="$ROOT/vendor/hermes-cdp-cancel-pending.patch"
+if [[ -f "$PATCH" ]]; then
+  if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
+    echo "Hermes pending-command cancellation patch already applied"
+  else
+    patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+  fi
+fi
+PATCH="$ROOT/vendor/hermes-debugger-step-out.patch"
+if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
+  echo "Hermes return breakpoint restoration patch already applied"
+else
+  patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+fi
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" \
   -DHERMES_ENABLE_TEST=OFF \
+  -DHERMES_ENABLE_DEBUGGER=ON \
   -DICU_ROOT="$ICU" \
   -DCMAKE_PREFIX_PATH="$ICU"
 ninja -C "$BUILD" -j"$JOBS"
 ninja -C "$BUILD" install
 
+# Hermes installs the VM API but not JSI, while the bridge is compiled against both. Keep the prefix self-contained for the bridge and downstream linker.
+mkdir -p "$PREFIX/include/jsi" "$PREFIX/lib"
+cp -f "$SRC/API/jsi/jsi/"*.h "$PREFIX/include/jsi/"
+JSI_LIB="$(find "$BUILD" -name 'libjsi.so' -print -quit)"
+if [[ -z "$JSI_LIB" ]]; then
+  echo "ERROR: Hermes build did not produce libjsi.so" >&2
+  exit 1
+fi
+cp -f "$JSI_LIB" "$PREFIX/lib/"
+
 : "${CXX:=g++}"
 export JSBAY_ICU_LIB_DIR="${JSBAY_ICU_LIB_DIR:-$ICU/lib}"
-"$CXX" -shared -fPIC -std=c++17 -O0 -g \
+"$CXX" -DHERMES_ENABLE_DEBUGGER -shared -fPIC -std=c++17 -O0 -g \
   -I "$ROOT/src/backend/hermes" -I "$PREFIX/include" \
   -L "$PREFIX/lib" -L "$JSBAY_ICU_LIB_DIR" \
   -Wl,-rpath,'$ORIGIN' -Wl,-rpath,"$JSBAY_ICU_LIB_DIR" \
   -o "$PREFIX/lib/libhermes_bridge.so" \
   "$ROOT/src/backend/hermes/hermes_bridge.cpp" "$ROOT/src/backend/hermes/hermes_esm.cpp" \
+  "$ROOT/src/backend/hermes/hermes_inspector.cpp" \
   -lhermesvm -ljsi -lgcc_s
+
+bash "$ROOT/scripts/native-prefix-stamp.sh" hermes write "$PREFIX"
 
 echo "Hermes install ready: $PREFIX (bridge: libhermes_bridge.so)"
 echo "Zig: export JSBAY_LIBSTDCXX=/path/to/libstdc++.a"

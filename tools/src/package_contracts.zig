@@ -260,6 +260,7 @@ test "published package includes every engine patch build input" {
         .stderr_limit = .limited(16 * 1024 * 1024),
     }), .allocator = allocator };
     defer fetched.deinit();
+    if (!fetched.succeeded()) std.debug.print("package fetch failed:\n{s}\n{s}", .{ fetched.result.stdout, fetched.result.stderr });
     try testing.expect(fetched.succeeded());
     const hash = std.mem.trim(u8, fetched.result.stdout, " \t\r\n");
     const archive = try path(allocator, global_cache, &.{ "p", try std.fmt.allocPrint(allocator, "{s}.tar.gz", .{hash}) });

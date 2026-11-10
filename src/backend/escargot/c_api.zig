@@ -25,6 +25,28 @@ pub extern fn escargot_context_new(rt: ?*Runtime) ?*Context;
 pub extern fn escargot_context_free(ctx: ?*Context) void;
 pub extern fn escargot_context_set_opaque(ctx: ?*Context, opaque_ptr: ?*anyopaque) void;
 pub extern fn escargot_context_get_opaque(ctx: ?*Context) ?*anyopaque;
+pub const DebugSourceFn = *const fn (ctx: ?*Context, filename: [*:0]const u8, source: [*]const u8, source_len: usize, user: ?*anyopaque) callconv(.c) u64;
+pub const DebugBreakLocationsFn = *const fn (ctx: ?*Context, filename: [*:0]const u8, line: c_int, column: c_int, script_tag: u64, complete: c_int, truncated: c_int, user: ?*anyopaque) callconv(.c) void;
+pub const DebugLocationFn = *const fn (ctx: ?*Context, filename: [*:0]const u8, line: c_int, column: c_int, depth: c_int, script_tag: u64, user: ?*anyopaque) callconv(.c) void;
+pub const DebuggerStatementFn = *const fn (ctx: ?*Context, user: ?*anyopaque) callconv(.c) bool;
+pub const DebugFrame = extern struct {
+    name: [256]u8,
+    filename: [512]u8,
+    line: c_int,
+    column: c_int,
+    script_tag: u64,
+};
+pub extern fn escargot_debugger_attach(ctx: ?*Context, source_cb: ?DebugSourceFn, break_locations_cb: ?DebugBreakLocationsFn, location_cb: ?DebugLocationFn, debugger_cb: ?DebuggerStatementFn, user: ?*anyopaque) bool;
+pub extern fn escargot_debugger_set_execution(ctx: ?*Context, enabled: bool) void;
+pub extern fn escargot_debugger_detach(ctx: ?*Context) void;
+pub extern fn escargot_debugger_copy_stack(ctx: ?*Context, out: [*]DebugFrame, max: c_int) c_int;
+pub extern fn escargot_debugger_depth(ctx: ?*Context) c_int;
+pub extern fn escargot_debugger_frame_token(ctx: ?*Context) u64;
+pub extern fn escargot_debugger_location_is_repeat(ctx: ?*Context) bool;
+pub extern fn escargot_debugger_location_is_breakpoint_target(ctx: ?*Context) bool;
+pub extern fn escargot_debugger_scope(ctx: ?*Context, frame: c_int, scope_index: c_int) Value;
+pub extern fn escargot_debugger_this(ctx: ?*Context, frame: c_int) Value;
+pub extern fn escargot_debugger_eval_frame(ctx: ?*Context, frame: c_int, expr: [*]const u8, expr_len: usize, out_exception: *Value) Value;
 pub extern fn escargot_eval(ctx: ?*Context, src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) EvalResultC;
 pub extern fn escargot_eval_result_free(r: EvalResultC) void;
 pub extern fn escargot_undefined() Value;

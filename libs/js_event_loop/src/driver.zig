@@ -444,6 +444,9 @@ pub const Driver = struct {
         }
         const host = attached.host;
         self.host_ops_in_flight += 1;
+        // A host callback can finish on its owner before schedule returns on the notifying thread. Publish the pending slot first so completion can clear it permanently.
+        self.scheduled = true;
+        self.scheduled_delay = delay_ms;
         self.state_mutex.unlock();
         const ok = host.schedule(host.context, delay_ms, attachedTrampoline, self);
         self.state_mutex.lock();
@@ -459,9 +462,11 @@ pub const Driver = struct {
             self.state_mutex.unlock();
             return !failed;
         }
-        self.scheduled = ok;
-        self.scheduled_delay = if (ok) delay_ms else null;
-        if (!ok) self.last_error = error.ScheduleFailed;
+        if (!ok) {
+            self.scheduled = false;
+            self.scheduled_delay = null;
+            self.last_error = error.ScheduleFailed;
+        }
         std.debug.assert(self.host_ops_in_flight != 0);
         self.host_ops_in_flight -= 1;
         self.host_ops_cv.broadcast();

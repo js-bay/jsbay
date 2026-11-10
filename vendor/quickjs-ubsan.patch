@@ -1,7 +1,7 @@
 diff --git a/quickjs.c b/quickjs.c
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1960,8 +1960,13 @@ static inline int js_resize_array(JSContext *ctx, void **parray, int elem_size,
+@@ -1960,7 +1960,12 @@ static inline int js_resize_array(JSContext *ctx, void **parray, int elem_size,
      }
  }
  
@@ -15,3 +15,14 @@ diff --git a/quickjs.c b/quickjs.c
 -    dbuf_init2(s, ctx->rt, (DynBufReallocFunc *)js_realloc_rt);
 +    dbuf_init2(s, ctx->rt, js_dbuf_realloc_rt);
  }
+diff --git a/cutils.h b/cutils.h
+--- a/cutils.h
++++ b/cutils.h
+@@ -25,6 +25,7 @@
+ #ifndef CUTILS_H
+ #define CUTILS_H
+ 
++#include <stddef.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <inttypes.h>

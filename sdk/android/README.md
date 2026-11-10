@@ -30,6 +30,16 @@ API level so newer Bionic symbols stay out of `libjsbay.so`.
 
 Repository `./build-android.sh` defaults `QUICKJS_BACKEND` to classic `quickjs`. Set `QUICKJS_BACKEND=quickjs_ng` for the NG variant. The script resolves the repository from its own location; pass an explicit source root only when needed, and never hardcode a developer machine path.
 
+## CDP debugging
+
+Call `engine.startInspector(0)` on the Engine owner thread to start the bundled CDP HTTP/WebSocket listener and receive its selected port. Connect a DevTools client to that port, then call `engine.stopInspector()` on the same owner thread before closing the Engine. Both QuickJS-family packages expose breakpoints, stepping, and paused-frame evaluation.
+
+The host app must declare `<uses-permission android:name="android.permission.INTERNET" />` in its Android manifest before opening the listener. Prefer a debug manifest when debugging is only available in debug builds. The AAR does not add this permission automatically.
+
+For a USB-connected device, forward the returned loopback port before opening Chrome DevTools: `adb forward tcp:<host-port> tcp:<device-port>`. The host can then run `node tests/inspector/e2e.cjs --host 127.0.0.1 --port <host-port> --debugger-flow`. The app must keep its owner Looper running while the debugger is attached; do not run ordinary application work from a paused debugger command.
+
+`tests/android-sdk/run-inspector-device.sh <jniLibs>` runs this contract through `DedicatedEngineThread` in an ADB shell process on an attached device. This validates SDK ownership and forwarding, but does not exercise an installed app's sandbox or manifest permissions. Supply both `libjsbay.so` and `libjsbay_android.so` for the device ABI, and set `JAVA_HOME`, `ANDROID_SDK_ROOT`, and `KOTLIN_GRADLE_LIB` for the test compiler. The driver creates a temporary device payload and ADB forwarding rule, then stops the engine and removes both.
+
 ## Owner thread and multi-instance hosts
 
 Create one `Engine` per instance id on a **dedicated** Looper thread. Do not create engines on the process main/UI thread: automatic LoopDriver attach would schedule JavaScript there and share one thread across many instances.

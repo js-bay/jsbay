@@ -492,7 +492,7 @@ test "cdp alignment: Runtime.awaitPromise completion is discarded after its WebS
 }
 
 test "cdp alignment: last Debugger session disconnect cools native hooks when reconcile posting fails" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-debugger-disconnect-cooldown");
     defer session.deinit();
@@ -527,7 +527,7 @@ test "cdp alignment: last Debugger session disconnect cools native hooks when re
 }
 
 test "cdp alignment: async depth without Debugger.enable keeps an explicitly attached debugger armed" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-debugger-explicit-attach-async-depth");
     defer session.deinit();
@@ -542,7 +542,7 @@ test "cdp alignment: async depth without Debugger.enable keeps an explicitly att
 }
 
 test "cdp alignment: Debugger.setSkipAllPauses suppresses and restores debugger statements" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-skip-pauses");
     defer session.deinit();
@@ -582,7 +582,7 @@ test "cdp alignment: Debugger.setSkipAllPauses suppresses and restores debugger 
 }
 
 test "cdp alignment: Debugger.getPossibleBreakpoints excludes a comment-only line" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-possible-breakpoints");
     defer session.deinit();
@@ -609,7 +609,7 @@ test "cdp alignment: Debugger.getPossibleBreakpoints excludes a comment-only lin
 }
 
 test "cdp alignment: Debugger.getPossibleBreakpoints includes unexecuted locations beyond 32 functions" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-possible-many-functions");
     defer session.deinit();
@@ -633,7 +633,7 @@ test "cdp alignment: Debugger.getPossibleBreakpoints includes unexecuted locatio
 }
 
 test "cdp alignment: Debugger.getPossibleBreakpoints includes never-executed branch locations" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-possible-unexecuted-branch");
     defer session.deinit();
@@ -652,7 +652,7 @@ test "cdp alignment: Debugger.getPossibleBreakpoints includes never-executed bra
 }
 
 test "cdp alignment: Debugger.getPossibleBreakpoints keeps separate tables for same-url sources" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-possible-same-url");
     defer session.deinit();
@@ -682,8 +682,41 @@ test "cdp alignment: Debugger.getPossibleBreakpoints keeps separate tables for s
     try testing.expect(std.mem.indexOf(u8, second_response, "\"lineNumber\":6") != null);
 }
 
-test "cdp alignment: classic compiler tags preserve sourceURL identities" {
-    if (comptime backend.active_backend != .quickjs) return;
+test "cdp alignment: sourceURL comment grammar is consistent" {
+    if (comptime !backend.supportsSourceJournal(backend.active_backend)) return error.SkipZigTest;
+    var session = try openSession(testing.allocator, "cdp-source-directive-grammar");
+    defer session.deinit();
+    const cases = [_]struct { directive: []const u8, url: []const u8 }{
+        .{ .directive = "//# sourceURL=directive-a.js", .url = "directive-a.js" },
+        .{ .directive = "//@\tsourceURL=  directive-b.js  ", .url = "directive-b.js" },
+        .{ .directive = "//# sourceURL=\tdirective-c.js", .url = "directive-c.js" },
+        .{ .directive = "//#sourceURL=directive-d.js", .url = "directive-fallback.js" },
+        .{ .directive = "// sourceURL=directive-e.js", .url = "directive-fallback.js" },
+        .{ .directive = "// # sourceURL=directive-f.js", .url = "directive-fallback.js" },
+        .{ .directive = "//#  sourceURL=directive-g.js", .url = "directive-fallback.js" },
+        .{ .directive = "//# sourceURL=directive-h.js extra", .url = "directive-fallback.js" },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(testing.allocator, "1;\n{s}", .{case.directive});
+        defer testing.allocator.free(source);
+        const result = engine.evalScript(session.id, source, "directive-fallback.js");
+        defer discardEval(result);
+        try testing.expect(result.err == null);
+        const scripts = debugger_mod.snapshotScripts(session.id);
+        defer debugger_mod.freeScriptSnapshot(scripts);
+        var found = false;
+        for (scripts) |script| {
+            if (std.mem.eql(u8, script.source, source)) {
+                try testing.expectEqualStrings(case.url, script.url);
+                found = true;
+            }
+        }
+        try testing.expect(found);
+    }
+}
+
+test "cdp alignment: compiler tags preserve sourceURL identities" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-classic-source-identities");
     defer session.deinit();
@@ -737,8 +770,8 @@ test "cdp alignment: classic compiler tags preserve sourceURL identities" {
     try testing.expect(std.mem.indexOf(u8, second_source, "__classicSecond") != null);
 }
 
-test "cdp alignment: classic HTML comments do not extend sourceURL directives" {
-    if (comptime backend.active_backend != .quickjs) return error.SkipZigTest;
+test "cdp alignment: HTML comments do not extend sourceURL directives" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-classic-html-source-url");
     defer session.deinit();
@@ -982,7 +1015,7 @@ test "cdp alignment: inspector exception reporting does not replace an existing 
 }
 
 test "cdp alignment: Profiler.setSamplingInterval validates and configures the next profile" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-profiler");
     defer session.deinit();
@@ -1014,7 +1047,7 @@ test "cdp alignment: Profiler.setSamplingInterval validates and configures the n
 }
 
 test "cdp alignment: Profiler.start does not override the configured sampling interval" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-profiler-start-interval");
     defer session.deinit();
@@ -1086,7 +1119,7 @@ test "cdp alignment: heap snapshot progress prepares the frontend loader before 
 }
 
 test "cdp alignment: Performance metrics have a live timestamp and real heap usage" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-alignment-performance");
     defer session.deinit();
@@ -1202,7 +1235,7 @@ test "cdp regression: Performance configuration acknowledges only after an owner
 }
 
 test "cdp regression: Performance configuration does not run from a paused debugger control drain" {
-    if (comptime backend.active_backend != .quickjs_ng) return error.SkipZigTest;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-performance-paused-boundary");
     defer session.deinit();
@@ -1295,7 +1328,7 @@ test "cdp alignment: Performance rejects unsupported threadTicks at both protoco
 }
 
 test "cdp regression: Debugger.getPossibleBreakpoints defaults end to script end" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-review-possible-default-end");
     defer session.deinit();
@@ -1311,7 +1344,7 @@ test "cdp regression: Debugger.getPossibleBreakpoints defaults end to script end
 }
 
 test "cdp regression: Debugger keeps B locations after A B A with one URL" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-review-same-url-aba");
     defer session.deinit();
@@ -1338,7 +1371,7 @@ test "cdp regression: Debugger keeps B locations after A B A with one URL" {
 }
 
 test "cdp regression: Runtime.evaluate input scriptId has its own locations" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-review-runtime-input-script");
     defer session.deinit();
@@ -1353,7 +1386,7 @@ test "cdp regression: Runtime.evaluate input scriptId has its own locations" {
 }
 
 test "cdp regression: Runtime.evaluate A B A keeps B possible breakpoints" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-review-repl-aba");
     defer session.deinit();
@@ -1445,7 +1478,7 @@ test "cdp regression: inspector rejection observer does not coerce hostile reaso
 }
 
 fn reviewInvalidBreakpointStartLine(line_json: []const u8, request_id: i64) !void {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-review-invalid-breakpoint-line");
     defer session.deinit();
@@ -1518,7 +1551,7 @@ test "cdp regression: reconnect retains an old closure source identity" {
 }
 
 test "cdp governance: an old closure pause keeps its original same-url script identity" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-governance-old-closure");
     defer session.deinit();
@@ -1569,7 +1602,7 @@ test "cdp governance: an old closure pause keeps its original same-url script id
 }
 
 test "cdp governance: an old closure console stack keeps its original same-url script identity" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-governance-old-console-closure");
     defer session.deinit();
@@ -1609,7 +1642,7 @@ test "cdp governance: an old closure console stack keeps its original same-url s
 }
 
 test "cdp governance: nested eval locations do not contaminate the outer script" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-governance-nested-eval");
     defer session.deinit();
@@ -1627,7 +1660,7 @@ test "cdp governance: nested eval locations do not contaminate the outer script"
 }
 
 test "cdp governance: a cached C ABI closure keeps its script identity after a same-url replacement" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openCapiSession(alloc, "cdp-governance-cached-closure");
     defer session.deinit();
@@ -1703,7 +1736,7 @@ test "cdp governance: a cached C ABI closure keeps its script identity after a s
 }
 
 test "cdp governance: an evicted old closure is never attributed to a newer same-url script" {
-    if (comptime backend.active_backend != .quickjs_ng) return;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-governance-evicted-closure");
     defer session.deinit();
@@ -1736,6 +1769,56 @@ test "cdp governance: an evicted old closure is never attributed to a newer same
     try testing.expect(paused);
     try testing.expect(invoke.ok);
     try testing.expect(std.mem.indexOf(u8, paused_event, "\"scriptId\":\"0\"") != null);
+}
+
+test "cdp governance: live closure keeps sourceURL after source eviction" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    var session = try openSession(testing.allocator, "cdp-evicted-source-url");
+    defer session.deinit();
+    _ = try pumpResponse(&session, try send(&session, "Debugger.enable", "", 1351), 1351);
+    const original = engine.evalScript(session.id, "globalThis.__evictedSourceUrl = function(){ debugger; };\n//# sourceURL=retained-closure.js", "original-container.js");
+    defer discardEval(original);
+    try testing.expect(original.err == null);
+    const original_id = debugger_mod.scriptIdForUrl(session.id, "retained-closure.js");
+    try testing.expect(original_id != 0);
+    for (0..debugger_mod.max_retained_scripts + 1) |revision| {
+        const source = try std.fmt.allocPrint(testing.allocator, "globalThis.__sourceUrlRevision={d};", .{revision});
+        defer testing.allocator.free(source);
+        const result = engine.evalScript(session.id, source, "source-url-churn.js");
+        defer discardEval(result);
+        try testing.expect(result.err == null);
+    }
+    try testing.expect(debugger_mod.scriptById(session.id, original_id) == null);
+    var invoke = EvalProbe{ .id = session.id, .source = "__evictedSourceUrl();", .filename = "source-url-invoke.js" };
+    const from = session.got.items.len;
+    const thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&invoke});
+    var joined = false;
+    defer if (!joined) {
+        debugger_mod.resumeExecution(session.id);
+        thread.join();
+    };
+    try testing.expect(try waitForFrame(&session, from, "Debugger.paused", 400));
+    const paused = try testing.allocator.dupe(u8, session.got.items[from..]);
+    defer testing.allocator.free(paused);
+    const resume_at = try send(&session, "Debugger.resume", "", 1352);
+    try testing.expect(try waitResponseNoTick(&session, resume_at, 1352));
+    thread.join();
+    joined = true;
+    try testing.expect(invoke.ok);
+    var messages = std.mem.splitScalar(u8, paused, '\n');
+    var checked = false;
+    while (messages.next()) |message| {
+        if (message.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, message, .{});
+        defer parsed.deinit();
+        const method = parsed.value.object.get("method") orelse continue;
+        if (method != .string or !std.mem.eql(u8, method.string, "Debugger.paused")) continue;
+        const frames = parsed.value.object.get("params").?.object.get("callFrames").?.array;
+        try testing.expect(frames.items.len != 0);
+        try testing.expectEqualStrings("retained-closure.js", frames.items[0].object.get("url").?.string);
+        checked = true;
+    }
+    try testing.expect(checked);
 }
 
 test "cdp regression: by-value await settlement may stop inspector from a host callback" {

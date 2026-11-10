@@ -1,0 +1,152 @@
+diff --git a/include/hermes/VM/Debugger/Debugger.h b/include/hermes/VM/Debugger/Debugger.h
+index 00f4cfc..cf23430 100644
+--- a/include/hermes/VM/Debugger/Debugger.h
++++ b/include/hermes/VM/Debugger/Debugger.h
+@@ -184,6 +184,7 @@ class Debugger {
+   /// processInstUnderDebuggerOpCode() we purposely keep breakpoint uninstalled
+   /// to reuse the Interpreter loop.
+   std::pair<CodeBlock *, uint32_t> breakpointToRestore_{nullptr, 0};
++  uint32_t breakpointToRestoreFrameOffset_{0};
+ 
+   /// What conditions the debugger needs to stop on exceptions.
+   PauseOnThrowMode pauseOnThrowMode_{PauseOnThrowMode::None};
+@@ -449,6 +450,11 @@ class Debugger {
+   /// \return status after processing
+   ExecutionStatus processInstUnderDebuggerOpCode(InterpreterState &state);
+ 
++  void restoreBreakpointAtReturn(
++      CodeBlock *codeBlock,
++      uint32_t offset,
++      uint32_t frameOffset);
++
+  private:
+   /// The primary debugger command loop.
+   ExecutionStatus debuggerLoop(
+diff --git a/lib/VM/Debugger/Debugger.cpp b/lib/VM/Debugger/Debugger.cpp
+index 7214372..ef79de9 100644
+--- a/lib/VM/Debugger/Debugger.cpp
++++ b/lib/VM/Debugger/Debugger.cpp
+@@ -824,6 +824,7 @@ void Debugger::uninstallBreakpoint(
+   if (breakpointToRestore_.first == codeBlock &&
+       breakpointToRestore_.second == offset) {
+     breakpointToRestore_ = {nullptr, 0};
++    breakpointToRestoreFrameOffset_ = 0;
+   } else {
+     codeBlock->uninstallBreakpointAtOffset(offset, opCode);
+   }
+@@ -1053,11 +1054,24 @@ bool Debugger::restoreBreakpointIfAny() {
+     breakpointToRestore_.first->installBreakpointAtOffset(
+         breakpointToRestore_.second);
+     breakpointToRestore_ = {nullptr, 0};
++    breakpointToRestoreFrameOffset_ = 0;
+     return true;
+   }
+   return false;
+ }
+ 
++void Debugger::restoreBreakpointAtReturn(
++    CodeBlock *codeBlock,
++    uint32_t offset,
++    uint32_t frameOffset) {
++  if (breakpointToRestore_.first == codeBlock &&
++      breakpointToRestore_.second == offset &&
++      breakpointToRestoreFrameOffset_ == frameOffset) {
++    restoreBreakpointIfAny();
++    clearRestorationBreakpoints();
++  }
++}
++
+ void Debugger::clearRestorationBreakpoints() {
+   doClearNonUserBreakpoints(/*isStepBreakpoint*/ false);
+   pauseOnAllCodeBlocksToRestoreBreakpoint_ = false;
+@@ -1121,6 +1135,7 @@ ExecutionStatus Debugger::processInstUnderDebuggerOpCode(
+       // opportunity we'll install the breakpoint back. This variable keeps
+       // track of the breakpoint to restore.
+       breakpointToRestore_ = {codeBlock, offset};
++      breakpointToRestoreFrameOffset_ = runtime_.getCurrentFrameOffset();
+     } else {
+       runtime_.setCurrentIP(ip);
+       ExecutionStatus status = runtime_.stepFunction(newState);
+diff --git a/lib/VM/Interpreter.cpp b/lib/VM/Interpreter.cpp
+index 80fe72c..1bd5b51 100644
+--- a/lib/VM/Interpreter.cpp
++++ b/lib/VM/Interpreter.cpp
+@@ -1789,6 +1789,13 @@ tailCall:
+         // Store the return value.
+         res = O1REG(Ret);
+ 
++#ifdef HERMES_ENABLE_DEBUGGER
++        runtime.debugger_.restoreBreakpointAtReturn(
++            curCodeBlock,
++            CUROFFSET,
++            runtime.getCurrentFrameOffset());
++#endif
++
+         ip = FRAME.getSavedIP();
+         curCodeBlock = FRAME.getSavedCodeBlock();
+ 
+diff --git a/unittests/API/DebuggerTest.cpp b/unittests/API/DebuggerTest.cpp
+index d7fb8ba..cc3f0af 100644
+--- a/unittests/API/DebuggerTest.cpp
++++ b/unittests/API/DebuggerTest.cpp
+@@ -70,6 +70,32 @@ struct DebuggerAPITest : public ::testing::Test {
+   }
+ };
+ 
++struct ReturnRestoreObserver : public debugger::EventObserver {
++  explicit ReturnRestoreObserver(std::shared_ptr<HermesRuntime> runtime)
++      : runtime(std::move(runtime)) {}
++
++  Command didPause(Debugger &debugger) override {
++    const auto reason = debugger.getProgramState().getPauseReason();
++    if (reason == PauseReason::Breakpoint) {
++      ++breakpointPauses;
++      if (!requestedAsyncPause) {
++        requestedAsyncPause = true;
++        debugger.triggerAsyncPause(AsyncPauseKind::Implicit);
++      }
++    } else if (reason == PauseReason::AsyncTriggerImplicit) {
++      ++implicitPauses;
++      runtime->global().getPropertyAsFunction(*runtime, "eval").call(
++          *runtime, "__retRestoreProbe(0);");
++    }
++    return Command::continueExecution();
++  }
++
++  std::shared_ptr<HermesRuntime> runtime;
++  bool requestedAsyncPause{false};
++  uint32_t breakpointPauses{0};
++  uint32_t implicitPauses{0};
++};
++
+ TEST_F(DebuggerAPITest, SetAgentTest) {
+   // A basic test that exercises setting the debugger event observer by virtue
+   // of running the DebuggerAPITest constructor.
+@@ -448,6 +474,27 @@ TEST_F(DebuggerAPITest, ImplicitAsyncPauseTest) {
+       observer.pauseReasons);
+ }
+ 
++TEST_F(DebuggerAPITest, ReturnBreakpointRestoresOnlyItsOwnFrame) {
++  eval(
++      "function __retRestoreProbe(n) {\n"
++      "  if (n > 0) __retRestoreProbe(n - 1);\n"
++      "  return n;\n"
++      "}\n");
++  const auto scripts = rt->getDebugger().getLoadedScripts();
++  ASSERT_FALSE(scripts.empty());
++  SourceLocation location = scripts.back();
++  location.line = 3;
++  location.column = 1;
++  ASSERT_NE(kInvalidBreakpoint, rt->getDebugger().setBreakpoint(location));
++
++  ReturnRestoreObserver returnObserver(rt);
++  rt->getDebugger().setEventObserver(&returnObserver);
++  eval("__retRestoreProbe(1);");
++
++  EXPECT_EQ(1u, returnObserver.implicitPauses);
++  EXPECT_EQ(2u, returnObserver.breakpointPauses);
++}
++
+ TEST_F(DebuggerAPITest, ExplicitAsyncPauseTest) {
+   rt->getDebugger().triggerAsyncPause(AsyncPauseKind::Explicit);
+   eval("var x = 5;");

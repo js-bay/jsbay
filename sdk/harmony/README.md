@@ -8,6 +8,16 @@ Create an `Engine` and use its values from one ArkTS Worker. Close owned values 
 
 Pin each instance id to one dedicated ArkTS Worker for its whole lifetime. The native bridge records the creating thread id and raises `JsBayStatus.WrongThread` if Engine or Value APIs run elsewhere. Do not send `Engine`, `Value`, or their N-API wrappers to another Worker, and do not create many engines on the UI/main thread of a Worker that also renders.
 
+## CDP debugging
+
+Call `engine.inspectorStart(0)` from the Engine owner Worker to start the bundled CDP HTTP/WebSocket listener and receive its selected port. Call `engine.inspectorStop()` from that Worker before `close()`. Both QuickJS-family builds expose Chrome DevTools breakpoints, stepping, and paused-frame evaluation.
+
+The host application's `module.json5` must request `ohos.permission.INTERNET` to bind the listener. Expose the returned app-local port with `hdc fport tcp:<forwarded-port> tcp:<app-port>`, then run `node tests/inspector/e2e.cjs --host 127.0.0.1 --port <forwarded-port> --debugger-flow` on the development host. The owner Worker must continue processing debugger control work while execution is paused. Do not use a paused debugger command to run ordinary application tasks.
+
+Prepare a device test app with `node tests/harmony-sdk/prepare-inspector-hap.cjs <new-directory> [HAR]`. It creates a HAP project with the public SDK dependency, network permission, owner Worker, and a Stop button that closes the Engine before terminating the Worker. Configure signing locally, install dependencies in its `entry` directory with `ohpm install`, then build with `hvigorw --mode module -p module=entry@default assembleHap`. Install and launch the app, read the selected port from the `JsBayCDP` log tag, and forward that port before running the protocol test. Remove the forwarding rule after testing.
+
+For host-side protocol checks, build the N-API consumer with `tests/harmony-sdk/run_native_consumer.sh`, then run `JSBAY_HARMONY_NODE=<addon> node tests/harmony-sdk/inspector_consumer.cjs`. This exercises the same native bridge and core from a Worker; device verification also requires the Harmony SDK and its debugging transport.
+
 The C ABI `jsbay_engine_request_interrupt(instanceId)` may run on an independent native thread. The ArkTS `requestInterrupt()` instance method still needs a wrapper available in the current Worker; it cannot interrupt a synchronous evaluation that is blocking that same Worker.
 
 `Value.string()` decodes the engine's UTF-8 bytes with ArkTS `util.TextDecoder` and preserves embedded NUL and Unicode. JavaScript throws remain `JsException` with their original `value`. `describeAndClose()` reads and consumes that value; if `toString` throws, it closes both values and returns `"JavaScript exception"`. It reports borrowed, stale, and wrong-thread failures instead of hiding them. `JsBayStatusError.status` and `.code` identify C ABI failures; its constructor accepts `(status, code?)`, and `JsException` accepts an owned `Value`.

@@ -1,0 +1,11 @@
+diff --git a/API/hermes/cdp/RemoteObjectConverters.cpp b/API/hermes/cdp/RemoteObjectConverters.cpp
+index 8a8a0f0..0000000 100644
+--- a/API/hermes/cdp/RemoteObjectConverters.cpp
++++ b/API/hermes/cdp/RemoteObjectConverters.cpp
+@@ -168,6 +168,7 @@ m::debugger::CallFrame m::debugger::makeCallFrame(
+   result.callFrameId = std::to_string(callFrameIndex);
+   result.functionName = callFrameInfo.functionName;
+   result.location = makeLocation(callFrameInfo.location);
++  result.url = callFrameInfo.location.fileName;
+ 
+   uint32_t scopeCount = lexicalInfo.getScopesCount();

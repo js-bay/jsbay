@@ -13,7 +13,7 @@ pub const Result = struct {
     cache_hit: bool = false,
 };
 
-const source_url_cache_envelope = backend.active_backend == .quickjs and @import("build_options").inspector;
+const source_url_cache_envelope = backend.isQuickJsApiBackend(backend.active_backend) and @import("build_options").inspector;
 const cache_envelope_magic = "JBSURL01";
 const cache_envelope_header_len = cache_envelope_magic.len + @sizeOf(u32);
 
@@ -46,7 +46,7 @@ fn evaluateQuickJs(ctx: ActiveEngine.Context, source: []const u8, filename: []co
     const gpa = std.heap.c_allocator;
     const path = cacheFile(source, filename, cache_dir, version);
     defer if (path) |owned| gpa.free(owned);
-    // Raw bytecode remains opaque. Classic QuickJS cache entries carry the compiler-selected identity in an outer envelope because runtime script tags are deliberately not serialized.
+    // Raw bytecode remains opaque. Cache entries carry the compiler-selected identity in an outer envelope because runtime script tags are deliberately not serialized.
     const filename_z = gpa.dupeSentinel(u8, filename, 0) catch return .{ .out_of_memory = true };
     defer gpa.free(filename_z);
     if (path) |file| {

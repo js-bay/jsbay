@@ -413,7 +413,7 @@ test "instance readers wait until debugger initialization finishes" {
 
 const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
     test "debugger: a breakpoint pauses on that line and resume finishes the script" {
-        if (comptime !backend.supportsDebugger(backend.active_backend)) return;
+        if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
         const id = helpers.nextInstanceId();
         try helpers.withEngine(id, .{}, struct {
             fn run(instance_id: i32) !void {
@@ -445,7 +445,7 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
     }
 
     test "debugger: native callback attaches cold runtime before the next outer-frame location" {
-        if (comptime backend.active_backend != .quickjs_ng) return;
+        if (comptime !backend.supportsDebugger(backend.active_backend)) return;
         const id = helpers.nextInstanceId();
         var toggle = NativeFrameDebuggerToggle{ .id = id };
         active_native_frame_debugger_toggle = &toggle;
@@ -481,7 +481,7 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
     }
 
     test "debugger: native callback detaches before the next outer-frame location" {
-        if (comptime backend.active_backend != .quickjs_ng) return;
+        if (comptime !backend.supportsDebugger(backend.active_backend)) return;
         const id = helpers.nextInstanceId();
         var toggle = NativeFrameDebuggerToggle{ .id = id };
         active_native_frame_debugger_toggle = &toggle;
@@ -673,7 +673,7 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
     }
 
     test "debugger: conditional breakpoint checks do not evict the application script journal" {
-        if (comptime backend.active_backend != .quickjs_ng) return error.SkipZigTest;
+        if (comptime !backend.supportsDebugger(backend.active_backend)) return error.SkipZigTest;
         const id = helpers.nextInstanceId();
         try helpers.withEngine(id, .{}, struct {
             fn run(instance_id: i32) !void {
@@ -836,6 +836,36 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
                 try testing.expect(caught_box.status_ok.load(.seq_cst));
             }
         }.run);
+    }
+
+    test "debugger: uncaught exceptions pause after leaving catch regions" {
+        if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
+        const scripts = [_][]const u8{
+            "try { 1; } catch (e) {} throw new Error('after normal try');",
+            "try { throw 1; } catch (e) {} throw new Error('after catch');",
+            "function leave() { try { return 1; } finally {} } leave(); throw new Error('after finally');",
+            "function leave() { try { return 1; } catch (e) {} } leave(); throw new Error('after return');",
+        };
+        for (scripts) |script| {
+            const id = helpers.nextInstanceId();
+            try testing.expect(engine.create(id, .{}));
+            defer engine.destroy(id);
+            try attachDebuggerForTest(id);
+            debugger_mod.setExceptionPause(id, .uncaught);
+            var box = EvalBox{ .id = id, .script = script, .filename = "catch-region.js" };
+            const thread = try std.Thread.spawn(.{}, evalOnThread, .{&box});
+            var joined = false;
+            defer if (!joined) {
+                debugger_mod.resumeExecution(id);
+                thread.join();
+            };
+            try testing.expect(waitPaused(id));
+            try testing.expectEqual(debugger_mod.PauseReason.exception, debugger_mod.pausedReason(id));
+            debugger_mod.resumeExecution(id);
+            thread.join();
+            joined = true;
+            try testing.expect(!box.status_ok.load(.seq_cst));
+        }
     }
 
     test "debugger: constructing Error does not pause as an exception" {

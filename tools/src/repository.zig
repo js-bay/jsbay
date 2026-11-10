@@ -257,7 +257,7 @@ fn copyTree(c: Context, source: []const u8, destination: []const u8, exclude_git
 }
 
 fn debugEvalInstrumented(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
-    const needle = "helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, \"<debugger>\", JS_EVAL_TYPE_GLOBAL);";
+    const needle = "helper = JS_Eval(ctx, factory_source, factory_source_len, \"<debugger>\", JS_EVAL_TYPE_GLOBAL);";
     if (std.mem.count(u8, source, needle) != 1) return error.InvalidDebugEvalSource;
     return std.mem.replaceOwned(u8, allocator, source, needle, "puts(\"JSBAY_DEBUG_EVAL_HELPER_COMPILED\"); fflush(stdout); " ++ needle);
 }
@@ -271,13 +271,13 @@ fn instrumentDebugEval(c: Context, args: []const []const u8) !void {
 }
 
 test "debugger compilation instrumentation rejects missing or ambiguous sites" {
-    const needle = "helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, \"<debugger>\", JS_EVAL_TYPE_GLOBAL);";
+    const needle = "helper = JS_Eval(ctx, factory_source, factory_source_len, \"<debugger>\", JS_EVAL_TYPE_GLOBAL);";
     try std.testing.expectError(error.InvalidDebugEvalSource, debugEvalInstrumented(std.testing.allocator, ""));
     try std.testing.expectError(error.InvalidDebugEvalSource, debugEvalInstrumented(std.testing.allocator, needle ++ needle));
 }
 
 fn patchEngine(c: Context, args: []const []const u8, ng: bool) !void {
-    if (args.len != (if (ng) @as(usize, 13) else 14)) return error.Usage;
+    if (args.len != 18) return error.Usage;
     if (!try c.exists(try c.fmt("{s}/{s}", .{ args[0], if (ng) "quickjs.h" else "quickjs.c" }))) return error.MissingUpstream;
     try copyTree(c, args[0], args[1], true);
     const cwd = try std.process.currentPathAlloc(c.init.io, c.allocator());

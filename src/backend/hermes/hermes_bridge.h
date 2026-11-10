@@ -10,6 +10,7 @@ extern "C" {
 
 typedef struct JsbayHermesRuntimeOpaque JsbayHermesRuntime;
 typedef struct JsbayHermesContextOpaque JsbayHermesContext;
+typedef struct JsbayHermesInspector JsbayHermesInspector;
 typedef void *HermesValue;
 
 typedef struct {
@@ -31,6 +32,41 @@ void hermes_context_free(JsbayHermesContext *ctx);
 
 void hermes_context_set_opaque(JsbayHermesContext *ctx, void *opaque);
 void *hermes_context_get_opaque(JsbayHermesContext *ctx);
+
+/* Hermes CDPAgent bridge. Start and stop run on the engine owner thread; session and command admission are thread-safe. Every accepted runtime task calls exactly one of run or cancel. */
+typedef void (*HermesInspectorEmitFn)(uint64_t session_id, const char *json, size_t len,
+                                      void *user_data);
+typedef void (*HermesInspectorCloseFn)(uint64_t session_id, void *user_data);
+typedef bool (*HermesInspectorEnqueueFn)(void (*run)(void *), void (*cancel)(void *),
+                                         void *task_data, void *user_data);
+typedef struct {
+    int64_t id;
+    uint32_t flags;
+    const char *method;
+    size_t method_len;
+    const char *script_id;
+    size_t script_id_len;
+    const char *expression;
+    size_t expression_len;
+} HermesInspectorMessageInfo;
+typedef void (*HermesInspectorInfoSink)(void *target, const HermesInspectorMessageInfo *info);
+typedef bool (*HermesInspectorParseFn)(const char *json, size_t len, HermesInspectorInfoSink sink,
+                                       void *target);
+JsbayHermesInspector *hermes_inspector_start(JsbayHermesContext *ctx, int32_t instance_id,
+                                             HermesInspectorEmitFn emit,
+                                             HermesInspectorCloseFn close,
+                                             HermesInspectorEnqueueFn enqueue, void *user_data,
+                                             HermesInspectorParseFn parse);
+bool hermes_inspector_session_open(JsbayHermesInspector *inspector, uint64_t session_id);
+bool hermes_inspector_message(JsbayHermesInspector *inspector, uint64_t session_id,
+                              const char *json, size_t len);
+void hermes_inspector_session_close(JsbayHermesInspector *inspector, uint64_t session_id);
+void hermes_inspector_close_sessions(JsbayHermesInspector *inspector);
+void hermes_inspector_stop(JsbayHermesInspector *inspector);
+void hermes_inspector_console(JsbayHermesContext *ctx, const HermesValue *args, size_t argc,
+                              int level);
+void hermes_inspector_source_begin(JsbayHermesContext *ctx, const char *source, size_t source_len);
+void hermes_inspector_source_end(JsbayHermesContext *ctx);
 
 HermesEvalResult hermes_eval(JsbayHermesContext *ctx, const char *src, size_t src_len,
                              const char *filename, size_t filename_len);

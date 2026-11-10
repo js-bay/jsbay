@@ -2,7 +2,7 @@
 const std = @import("std");
 const lifecycle = @import("escargot/lifecycle.zig");
 const value_mod = @import("escargot/value.zig");
-const c_api = @import("escargot/c_api.zig");
+pub const c_api = @import("escargot/c_api.zig");
 const console_mod = @import("escargot/console.zig");
 const timers_mod = @import("escargot/timers.zig");
 

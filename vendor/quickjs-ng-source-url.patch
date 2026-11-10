@@ -1,0 +1,266 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -657,7 +657,7 @@
+     /* if NULL, eval is not supported */
+     JSValue (*eval_internal)(JSContext *ctx, JSValueConst this_obj,
+                              const char *input, size_t input_len,
+-                             const char *filename, int line, int flags, int scope_idx);
++                             const char *filename, int line, int flags, int scope_idx, char **jsbay_source_url_out);
+     void *user_opaque;
+ };
+ 
+@@ -1518,7 +1518,7 @@
+                                            JS_MarkFunc *mark_func);
+ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+                                const char *input, size_t input_len,
+-                               const char *filename, int line, int flags, int scope_idx);
++                               const char *filename, int line, int flags, int scope_idx, char **jsbay_source_url_out);
+ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
+ static int js_module_attributes_equal(JSContext *ctx, JSValueConst attr1,
+                                       JSValueConst attr2);
+@@ -8885,13 +8885,15 @@
+     return 0;
+ }
+ 
+-static void js_set_debugger_script_tag_one(JSFunctionBytecode *b, uint64_t tag,
++static void js_set_debugger_script_tag_one(JSContext *ctx, JSFunctionBytecode *b, uint64_t tag, JSAtom filename,
+                                            JSFunctionBytecode **ancestors, int depth)
+ {
+     int i;
+     for (i = 0; i < depth; i++) if (ancestors[i] == b) return;
+     ancestors[depth] = b;
+     b->debugger_script_tag = tag;
++    JS_FreeAtom(ctx, b->filename);
++    b->filename = JS_DupAtom(ctx, filename);
+     for (i = 0; i < b->cpool_count; i++) {
+         JSValue value = b->cpool[i];
+         JSFunctionBytecode *child = NULL;
+@@ -8899,16 +8901,16 @@
+             child = JS_VALUE_GET_PTR(value);
+         else if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT && js_class_has_bytecode(JS_VALUE_GET_OBJ(value)->class_id))
+             child = JS_VALUE_GET_OBJ(value)->u.func.function_bytecode;
+-        if (child) js_set_debugger_script_tag_one(child, tag, ancestors, depth + 1);
+-    }
+-}
+-
+-static int js_set_debugger_script_tag(JSValueConst value, uint64_t tag)
++        if (child) js_set_debugger_script_tag_one(ctx, child, tag, filename, ancestors, depth + 1);
++    }
++}
++
++static int js_set_debugger_script_tag(JSContext *ctx, JSValueConst value, uint64_t tag, JSAtom filename)
+ {
+     JSFunctionBytecode *ancestors[JS_BREAK_LOCATION_MAX_DEPTH];
+     if (!tag || JS_VALUE_GET_TAG(value) != JS_TAG_FUNCTION_BYTECODE) return -1;
+     if (js_check_debugger_script_tag_tree(JS_VALUE_GET_PTR(value), ancestors, 0)) return -1;
+-    js_set_debugger_script_tag_one(JS_VALUE_GET_PTR(value), tag, ancestors, 0);
++    js_set_debugger_script_tag_one(ctx, JS_VALUE_GET_PTR(value), tag, filename, ancestors, 0);
+     return 0;
+ }
+ 
+@@ -8916,14 +8918,18 @@
+                             const char *source, size_t source_len)
+ {
+     uint64_t tag;
++    JSAtom filename_atom;
+     if (!ctx->rt->script_tag_handler || !filename || !source) return 0;
+     if (JS_VALUE_GET_TAG(value) != JS_TAG_FUNCTION_BYTECODE) return 0;
+     {
+         JSFunctionBytecode *ancestors[JS_BREAK_LOCATION_MAX_DEPTH];
+         if (js_check_debugger_script_tag_tree(JS_VALUE_GET_PTR(value), ancestors, 0)) return 0;
+     }
++    filename_atom = JS_NewAtom(ctx, filename);
++    if (filename_atom == JS_ATOM_NULL) return 0;
+     tag = ctx->rt->script_tag_handler(ctx, filename, source, source_len, ctx->rt->script_tag_opaque);
+-    if (js_set_debugger_script_tag(value, tag)) return 0;
++    if (js_set_debugger_script_tag(ctx, value, tag, filename_atom)) tag = 0;
++    JS_FreeAtom(ctx, filename_atom);
+     return tag;
+ }
+ #endif
+@@ -23403,6 +23409,10 @@
+     JSFunctionDef *cur_func;
+     bool is_module; /* parsing a module */
+     bool allow_html_comments;
++#if JSBAY_INSPECTOR
++    const uint8_t *jsbay_source_url;
++    size_t jsbay_source_url_len;
++#endif
+ } JSParseState;
+ 
+ typedef struct JSOpCode {
+@@ -23571,6 +23581,23 @@
+ }
+ 
+ #ifndef QJS_DISABLE_PARSER
++
++#if JSBAY_INSPECTOR
++static void jsbay_note_source_url(JSParseState *s, const uint8_t *begin, const uint8_t *end)
++{
++    const uint8_t *p = begin;
++    const uint8_t *url;
++    if (end - p < 12 || (*p != '#' && *p != '@')) return;
++    if ((p[1] != ' ' && p[1] != '\t') || memcmp(p + 2, "sourceURL=", 10)) return;
++    url = p + 12;
++    while (url < end && (*url == ' ' || *url == '\t')) url++;
++    while (end > url && (end[-1] == ' ' || end[-1] == '\t')) end--;
++    if (url == end) return;
++    for (p = url; p < end; p++) if (*p == ' ' || *p == '\t' || *p == '\r') return;
++    s->jsbay_source_url = url;
++    s->jsbay_source_url_len = end - url;
++}
++#endif
+ 
+ static __exception int next_token(JSParseState *s);
+ 
+@@ -24070,6 +24097,9 @@
+     int c;
+     bool ident_has_escape;
+     JSAtom atom;
++#if JSBAY_INSPECTOR
++    const uint8_t *comment_start = NULL;
++#endif
+ 
+     if (js_check_stack_overflow(s->ctx->rt, 1000)) {
+         JS_ThrowStackOverflow(s->ctx);
+@@ -24164,6 +24194,9 @@
+         } else if (p[1] == '/') {
+             /* line comment */
+             p += 2;
++#if JSBAY_INSPECTOR
++            comment_start = p;
++#endif
+         skip_line_comment:
+             for(;;) {
+                 if (*p == '\0' && p >= s->buf_end)
+@@ -24181,6 +24214,10 @@
+                     p++;
+                 }
+             }
++#if JSBAY_INSPECTOR
++            if (comment_start) jsbay_note_source_url(s, comment_start, p);
++            comment_start = NULL;
++#endif
+             s->mark = p;
+             goto redo;
+         } else if (p[1] == '=') {
+@@ -39159,7 +39196,7 @@
+ /* `export_name` and `input` may be pure ASCII or UTF-8 encoded */
+ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+                                  const char *input, size_t input_len,
+-                                 const char *filename, int line, int flags, int scope_idx)
++                                 const char *filename, int line, int flags, int scope_idx, char **jsbay_source_url_out)
+ {
+     JSParseState s1, *s = &s1;
+     int err, eval_type;
+@@ -39252,7 +39289,32 @@
+     if (JS_IsException(fun_obj))
+         goto fail1;
+ #if JSBAY_INSPECTOR
+-    JS_RebindScriptTag(ctx, fun_obj, filename, input, input_len);
++    if (s->jsbay_source_url && (ctx->rt->script_tag_handler || jsbay_source_url_out)) {
++        char *source_url = js_strndup(ctx, (const char *)s->jsbay_source_url, s->jsbay_source_url_len);
++        if (!source_url) {
++            JS_FreeValue(ctx, fun_obj);
++            goto fail1;
++        }
++        if (jsbay_source_url_out) {
++            *jsbay_source_url_out = js_strdup(ctx, source_url);
++            if (!*jsbay_source_url_out) {
++                js_free(ctx, source_url);
++                JS_FreeValue(ctx, fun_obj);
++                goto fail1;
++            }
++        }
++        JS_RebindScriptTag(ctx, fun_obj, source_url, input, input_len);
++        js_free(ctx, source_url);
++    } else {
++        if (jsbay_source_url_out) {
++            *jsbay_source_url_out = js_strdup(ctx, filename);
++            if (!*jsbay_source_url_out) {
++                JS_FreeValue(ctx, fun_obj);
++                goto fail1;
++            }
++        }
++        JS_RebindScriptTag(ctx, fun_obj, filename, input, input_len);
++    }
+ #endif
+     /* Could add a flag to avoid resolution if necessary */
+     if (m) {
+@@ -39279,7 +39341,7 @@
+ /* the indirection is needed to make 'eval' optional */
+ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+                                const char *input, size_t input_len,
+-                               const char *filename, int line, int flags, int scope_idx)
++                               const char *filename, int line, int flags, int scope_idx, char **jsbay_source_url_out)
+ {
+     JSRuntime *rt = ctx->rt;
+ 
+@@ -39291,7 +39353,7 @@
+         ctx->error_back_trace = JS_UNDEFINED;
+     }
+     return ctx->eval_internal(ctx, this_obj, input, input_len, filename, line,
+-                              flags, scope_idx);
++                              flags, scope_idx, jsbay_source_url_out);
+ }
+ 
+ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
+@@ -39306,7 +39368,7 @@
+     str = JS_ToCStringLen(ctx, &len, val);
+     if (!str)
+         return JS_EXCEPTION;
+-    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", 1, flags, scope_idx);
++    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", 1, flags, scope_idx, NULL);
+     JS_FreeCString(ctx, str);
+     return ret;
+ 
+@@ -39346,7 +39408,7 @@
+     assert((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL ||
+            (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE);
+     ret = JS_EvalInternal(ctx, this_obj, input, input_len, filename, line,
+-                          eval_flags, -1);
++                          eval_flags, -1, NULL);
+     return ret;
+ }
+ 
+@@ -39366,6 +39428,18 @@
+ {
+     return JS_EvalThis2(ctx, ctx->global_obj, input, input_len, options);
+ }
++
++#if JSBAY_INSPECTOR
++JSValue jsbay_qjs_eval_with_source_url(JSContext *ctx, const char *input, size_t input_len,
++                                      const char *filename, int eval_flags, char **source_url)
++{
++    assert((eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_GLOBAL ||
++           (eval_flags & JS_EVAL_TYPE_MASK) == JS_EVAL_TYPE_MODULE);
++    if (source_url) *source_url = NULL;
++    return JS_EvalInternal(ctx, ctx->global_obj, input, input_len, filename, 1,
++                           eval_flags, -1, source_url);
++}
++#endif
+ 
+ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
+ {
+@@ -65904,7 +65978,7 @@
+     }
+     JS_AddIntrinsicRegExpCompiler(ctx); // otherwise regexp literals don't parse
+     val = __JS_EvalInternal(ctx, JS_UNDEFINED, input, input_len, "<unnamed>", 1,
+-                            JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY, -1);
++                            JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_COMPILE_ONLY, -1, NULL);
+     if (JS_IsException(val)) {
+         const char *msg = JS_ToCString(ctx, rt->current_exception);
+         // gruesome hack to recognize exceptions from import statements;
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1058,6 +1058,10 @@
+ /* 'input' must be zero terminated i.e. input[input_len] = '\0'. */
+ JS_EXTERN JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
+                           const char *filename, int eval_flags);
++#if JSBAY_INSPECTOR
++JS_EXTERN JSValue jsbay_qjs_eval_with_source_url(JSContext *ctx, const char *input, size_t input_len,
++                                                const char *filename, int eval_flags, char **source_url);
++#endif
+ JS_EXTERN JSValue JS_Eval2(JSContext *ctx, const char *input, size_t input_len,
+                            JSEvalOptions *options);
+ JS_EXTERN JSValue JS_EvalThis(JSContext *ctx, JSValueConst this_obj,

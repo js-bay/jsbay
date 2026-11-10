@@ -3,6 +3,7 @@ const std = @import("std");
 
 pub const Runtime = opaque {};
 pub const Context = opaque {};
+pub const Inspector = opaque {};
 pub const Value = ?*anyopaque;
 
 pub const EvalResultC = extern struct {
@@ -27,6 +28,19 @@ pub extern fn hermes_context_new(rt: ?*Runtime) ?*Context;
 pub extern fn hermes_context_free(ctx: ?*Context) void;
 pub extern fn hermes_context_set_opaque(ctx: ?*Context, opaque_ptr: ?*anyopaque) void;
 pub extern fn hermes_context_get_opaque(ctx: ?*Context) ?*anyopaque;
+pub const InspectorEmitFn = *const fn (session_id: u64, json: [*]const u8, len: usize, user_data: ?*anyopaque) callconv(.c) void;
+pub const InspectorCloseFn = *const fn (session_id: u64, user_data: ?*anyopaque) callconv(.c) void;
+pub const InspectorEnqueueFn = *const fn (run: *const fn (?*anyopaque) callconv(.c) void, cancel: *const fn (?*anyopaque) callconv(.c) void, task_data: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) bool;
+pub const InspectorMessageInfo = extern struct { id: i64, flags: u32, method: ?[*]const u8, method_len: usize, script_id: ?[*]const u8, script_id_len: usize, expression: ?[*]const u8, expression_len: usize };
+pub const InspectorInfoSink = *const fn (?*anyopaque, *const InspectorMessageInfo) callconv(.c) void;
+pub const InspectorParseFn = *const fn ([*]const u8, usize, InspectorInfoSink, ?*anyopaque) callconv(.c) bool;
+pub extern fn hermes_inspector_start(ctx: ?*Context, instance_id: i32, emit: ?InspectorEmitFn, close: ?InspectorCloseFn, enqueue: ?InspectorEnqueueFn, user_data: ?*anyopaque, parse: ?InspectorParseFn) ?*Inspector;
+pub extern fn hermes_inspector_session_open(inspector: ?*Inspector, session_id: u64) bool;
+pub extern fn hermes_inspector_message(inspector: ?*Inspector, session_id: u64, json: [*]const u8, len: usize) bool;
+pub extern fn hermes_inspector_session_close(inspector: ?*Inspector, session_id: u64) void;
+pub extern fn hermes_inspector_close_sessions(inspector: ?*Inspector) void;
+pub extern fn hermes_inspector_stop(inspector: ?*Inspector) void;
+pub extern fn hermes_inspector_console(ctx: ?*Context, args: ?[*]const Value, argc: usize, level: c_int) void;
 pub extern fn hermes_eval(ctx: ?*Context, src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) EvalResultC;
 pub extern fn hermes_eval_result_free(r: EvalResultC) void;
 pub extern fn hermes_undefined() Value;

@@ -16,6 +16,14 @@ By default, `Engine(id:)` and `[[JSBayEngine alloc] initWithIdentifier:error:]` 
 
 Preferred shape: start a dedicated thread, ensure it runs a `CFRunLoop`, construct the engine there, and keep all `Value` work on that owner thread.
 
+## CDP debugging
+
+Call `try engine.startInspector(port: 0)` on the Engine owner thread to start the bundled CDP HTTP/WebSocket listener. Call `try engine.stopInspector()` on that thread before closing the Engine. Both QuickJS-family packages expose Chrome DevTools breakpoints, stepping, and paused-frame evaluation. The JSC package keeps its Safari Web Inspector path for source debugging.
+
+The listener is local to the app. An iOS Simulator listener is reachable at `127.0.0.1:<port>` on the development host; a physical device needs forwarding to its app-local port. Run `node tests/inspector/e2e.cjs --host <forwarded-host> --port <forwarded-port> --debugger-flow` against that endpoint. Keep the Engine owner run loop active while paused; debugger commands are control work and application work must wait for resume.
+
+For a reproducible Simulator C ABI check, set `JSBAY_IOS_SIM_UDID` to a booted simulator and run `bash tests/apple-sdk/run-inspector-sim.sh <ios-simulator-libjsbay.a>` with an archive for the host's simulator architecture. This compiles the public owner-thread example, runs the shared CDP flow, and requires `CLEAN_EXIT`; it leaves the caller's simulator running. Physical-device forwarding and Safari GUI attachment are not covered by this fixture.
+
 ```swift
 // On a dedicated owner thread (not the process main thread):
 let engine = try Engine(id: 1)

@@ -19,6 +19,7 @@ pub fn Module(comptime Host: type) type {
         const state_mod = @import("state.zig").Module(Host);
         const console_cdp = @import("console.zig").Module(Host);
         const debugger_cdp = @import("debugger_cdp.zig").Module(Host);
+        const native_cdp = @import("native_cdp.zig").Module(Host);
         const await_promise = @import("await_promise.zig").Module(Host);
 
         const InspectorState = state_mod.InspectorState;
@@ -38,8 +39,13 @@ pub fn Module(comptime Host: type) type {
                 state_mod.releaseStateLease(state);
             }
             switch (event.kind) {
-                .session_opened => if (!state_mod.addSession(state, event.session_id)) state.transport.closeSession(event.session_id),
+                .session_opened => {
+                    if (!state_mod.addSession(state, event.session_id) or !native_cdp.sessionOpened(state, event.session_id)) {
+                        state.transport.closeSession(event.session_id);
+                    }
+                },
                 .session_closed => {
+                    native_cdp.sessionClosed(state, event.session_id);
                     // The debugger owns session removal because it must turn the vanished session's async-depth request into an owner task. Await cleanup may still inspect its pending records afterwards.
                     debugger_cdp.sessionClosed(state, event.session_id);
                     await_promise.closeSession(state, event.session_id);
@@ -111,6 +117,8 @@ pub fn Module(comptime Host: type) type {
 
             const id = req.id;
             const method = req.method;
+
+            if (native_cdp.handle(state, session_id, id, method, text)) return;
 
             // Dispatch table — we do cheap string compares here; the surface is small.
             if (std.mem.eql(u8, method, "Schema.getDomains")) {
@@ -204,12 +212,8 @@ pub fn Module(comptime Host: type) type {
                 .quickjs_ng => if (build_options.heap_snapshot) &protocol_domains.quickjs_ng else &protocol_domains.quickjs_ng_no_heap,
                 .quickjs => if (build_options.heap_snapshot) &protocol_domains.quickjs else &protocol_domains.quickjs_no_heap,
                 .jsc => &protocol_domains.jsc,
-                // Spike backends: minimal Schema surface (inspector is out of spike scope).
-                .escargot, .hermes => &[_]protocol_domains.Domain{
-                    .{ .name = "Runtime" },
-                    .{ .name = "Performance" },
-                    .{ .name = "Schema" },
-                },
+                .hermes => &protocol_domains.hermes,
+                .escargot => &protocol_domains.escargot,
             };
             var out: std.Io.Writer.Allocating = .init(state.allocator);
             defer out.deinit();

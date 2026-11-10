@@ -21,7 +21,7 @@ Fact source: `docs/capability.md`. Gaps ranked by impact on embedding hosts. Thi
 | Hermes ESM remainder | TLA via async wrapper + `awaitThenable`; sticky-fail + JSON attributes; other shim limits remain |
 | Hermes `object_ops` | Suite green; destroy-during-trap via `api_bind.spikeInstall` |
 | Buffer copy / transferable | C `copyBuffer` imported; exotic-getter green; Hermes `ArrayBuffer.resize` permanently skipped (no native `.resize`) |
-| Inspector / CDP | Long-term; debugger hooks exist on QuickJS-NG only |
+| Inspector / CDP | Execution debugging is available on non-JSC engines; optional commands and parameters vary by backend (see `inspector.md` and `/json/protocol`) |
 
 ## Later
 
@@ -42,6 +42,7 @@ Fact source: `docs/capability.md`. Gaps ranked by impact on embedding hosts. Thi
 
 - Escargot: no mid-script interrupt API; Context is thread-affine (host/dispatch engine-thread cases are skipped); no on-disk bytecode blob; `setMemoryLimit` always false; finalize/weak paths are teardown-forced; ET×host hard rejects remain.
 - Hermes: user `requestInterrupt` does not arm sticky mid-script stop; `setMemoryLimit` always false (use create-time `MaxHeapSize`); no native `ArrayBuffer.resize`; ESM is a host-side transform with remaining shim limits; async/async-generator fixtures are stripped in this build; finalize/weak paths are teardown-forced.
+- System JavaScriptCore: the iOS 26.5 Simulator runtime (23F77) can terminate during normal context or VM teardown after a remote Inspector frontend has connected and detached, even without debugger commands. See [the Inspector limitation](inspector.md#ios-265-system-javascriptcore-teardown-limitation); physical iOS compatibility is unverified.
 - Neither backend is in the mainline CI matrix; treat capability and gap docs as the contract until a production tag.
 
 ## Verify

@@ -83,6 +83,8 @@ pub fn Module(comptime Host: type) type {
             title: []u8,
             url: []u8,
             target_id: []u8,
+            /// Owner-created native protocol agent, retained until transport leases and queued runtime work have drained.
+            native_debugger: ?*anyopaque = null,
 
             /// Per-session bookkeeping. Protected by `mutex`.
             mutex: sync.Mutex = .{},

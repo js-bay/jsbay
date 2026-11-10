@@ -65,6 +65,7 @@ async function runE2e() {
   try {
     const port = await within(Promise.race([ready, exited]), 8000, `inspector demo did not become ready\n${stderr}`);
     await run(process.execPath, ['tests/inspector/e2e.cjs', '--port', String(port)]);
+    await run(process.execPath, ['tests/inspector/e2e.cjs', '--port', String(port), '--debugger-flow']);
   } finally {
     await stop(child);
     await new Promise(resolveClose => log.end(resolveClose));

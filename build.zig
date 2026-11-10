@@ -125,6 +125,7 @@ pub fn linkConsumer(consumer: *std.Build.Step.Compile, dependency: *std.Build.De
         .framework_path_system => |path| consumer.root_module.addSystemFrameworkPath(path),
         else => {},
     };
+    for (core.root_module.lib_paths.items) |path| consumer.root_module.addLibraryPath(path);
     if (core.zig_lib_dir) |compiler_lib| {
         consumer.zig_lib_dir = compiler_lib;
         compiler_lib.addStepDependencies(&consumer.step);
@@ -216,6 +217,12 @@ pub fn build(b: *std.Build) void {
     }
     if (multi_pack and (backend == .escargot or backend == .hermes)) {
         std.process.fatal("Spike backends cannot be the primary of a multi-pack build", .{});
+    }
+    if (backend == .escargot or backend == .hermes) {
+        const prefix = if (backend == .escargot) spike_escargot_install else spike_hermes_install;
+        const stamp_script = b.root.joinString(b.allocator, "scripts/native-prefix-stamp.sh") catch @panic("OOM");
+        const install_path = if (std.fs.path.isAbsolute(prefix)) prefix else b.root.joinString(b.allocator, prefix) catch @panic("OOM");
+        _ = b.run(&.{ "bash", stamp_script, @tagName(backend), "check", install_path });
     }
 
     const zev_dep = b.dependency("zev", .{
@@ -361,6 +368,7 @@ pub fn build(b: *std.Build) void {
         const sysroot_include = b.fmt("{s}/usr/include", .{sysroot});
         lib_module.addSystemIncludePath(.{ .cwd_relative = sysroot_include });
         lib_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sysroot}) });
+        lib_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sysroot}) });
     }
 
     lib_module.addImport("zev", zev);
@@ -434,12 +442,18 @@ pub fn build(b: *std.Build) void {
     test_module.addImport("bytecode_cache", bytecode_cache);
     if (qjs_mod) |qjs| test_module.addImport("qjs", qjs);
 
+    if (apple_sysroot) |sysroot| {
+        test_module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sysroot}) });
+        test_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sysroot}) });
+        test_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sysroot}) });
+    }
     addPlatformCompatSources(b, test_module);
     addBackendSources(b, test_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
 
     const unit_tests = b.addTest(.{
         .root_module = test_module,
         .filters = if (stress_tests) &.{"stress"} else if (test_filter) |filter| &.{filter} else &.{},
+        .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
@@ -447,6 +461,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_unit_tests.step);
     b.step("test-engine", "Run engine tests without independent package suites").dependOn(&run_unit_tests.step);
     b.step("test-compile", "Compile engine tests without running them").dependOn(&unit_tests.step);
+    if (backend == .jsc and os == .ios) {
+        const install_ios_jsc_tests = b.addInstallArtifact(unit_tests, .{ .dest_sub_path = "jsbay-jsc-tests" });
+        b.step("jsc-ios-test-build", "Build the JSC unit-test executable for an iOS Simulator").dependOn(&install_ios_jsc_tests.step);
+    }
 
     if (!stress_tests) {
         const zev_tests = b.addTest(.{
@@ -684,6 +702,19 @@ pub fn build(b: *std.Build) void {
     const demo_step = b.step("inspector-demo", "Run CDP inspector demo harness");
     demo_step.dependOn(&run_demo.step);
 
+    if (backend != .jsc and inspector_enabled and inspector_transport_enabled) {
+        const cdp_test = b.addSystemCommand(&.{"node"});
+        cdp_test.addFileArg(b.path("tests/inspector/debugger_driver.cjs"));
+        cdp_test.addArtifactArg(demo_exe);
+        if (backend == .hermes) {
+            cdp_test.addArg("--typed-console");
+            cdp_test.addArg("--native-debugger");
+        }
+        if (backend == .escargot) cdp_test.addArg("--line-breakpoints");
+        cdp_test.addFileInput(b.path("tests/inspector/e2e.cjs"));
+        b.step("test-cdp", "Run CDP breakpoint, paused-frame evaluation, stepping and reconnect tests").dependOn(&cdp_test.step);
+    }
+
     // --- Pauseable DevTools owner-thread C embed sample ---
     // Dedicated owner pthread: create → inspector_start → run_loop → destroy.
     // Main/client only calls stop_loop. Prefer -Dbackend=quickjs_ng for Debugger.
@@ -700,6 +731,10 @@ pub fn build(b: *std.Build) void {
         });
         embed_module.addIncludePath(b.path("include"));
         embed_module.linkLibrary(lib);
+        if (backend == .escargot) {
+            // The C-only consumer resolves the static bridge and its native dependencies.
+            addEscargotSources(b, embed_module, spike_escargot_install, spike_libstdcxx.?);
+        }
         for (lib.root_module.include_dirs.items) |include| switch (include) {
             .framework_path => |p| embed_module.addFrameworkPath(p),
             .framework_path_system => |p| embed_module.addSystemFrameworkPath(p),
@@ -742,6 +777,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        if (apple_sysroot) |sysroot| {
+            safari_module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sysroot}) });
+            safari_module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sysroot}) });
+            safari_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sysroot}) });
+        }
         safari_module.addImport("jsbay_tools", internal_tools_module);
         safari_module.addOptions("build_options", build_options);
         safari_module.addImport("zev", zev);
@@ -751,21 +791,48 @@ pub fn build(b: *std.Build) void {
         safari_module.addImport("bytecode_cache", bytecode_cache);
         safari_module.linkFramework("JavaScriptCore", .{});
         safari_module.linkFramework("Foundation", .{});
+        safari_module.linkFramework("CoreFoundation", .{});
+        safari_module.addCSourceFile(.{
+            .file = b.path("examples/apple_run_loop.c"),
+            .flags = if (apple_sysroot) |sysroot| &.{ "-isysroot", sysroot } else &.{},
+        });
         safari_module.addCSourceFile(.{
             .file = b.path("src/backend/jsc/module_loader.m"),
-            .flags = &.{ "-fobjc-arc", "-Wno-unused-function" },
+            .flags = if (apple_sysroot) |sysroot| &.{ "-fobjc-arc", "-Wno-unused-function", "-isysroot", sysroot } else &.{ "-fobjc-arc", "-Wno-unused-function" },
         });
         addPlatformCompatSources(b, safari_module);
 
         const safari_demo = b.addExecutable(.{
             .name = "jsc-safari-demo",
             .root_module = safari_module,
+            .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
         });
-        b.installArtifact(safari_demo);
+        const install_safari_demo = b.addInstallArtifact(safari_demo, .{});
+        b.getInstallStep().dependOn(&install_safari_demo.step);
+        const safari_build_step = b.step("safari-demo-build", "Build the JSC Safari inspector demo");
+        safari_build_step.dependOn(&install_safari_demo.step);
         const run_safari = b.addRunArtifact(safari_demo);
         forwardRunArgs(b, run_safari);
         const safari_step = b.step("safari-demo", "Run JSC Safari-attachable inspector demo (macOS/iOS only)");
         safari_step.dependOn(&run_safari.step);
+
+        if (os == .macos) {
+            const safari_loop_test_module = b.createModule(.{
+                .root_source_file = b.path("examples/apple_run_loop_tests.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            safari_loop_test_module.linkFramework("CoreFoundation", .{});
+            safari_loop_test_module.addCSourceFile(.{
+                .file = b.path("examples/apple_run_loop.c"),
+                .flags = &.{"-DJSBAY_APPLE_RUN_LOOP_TEST=1"},
+            });
+            const safari_loop_tests = b.addTest(.{ .root_module = safari_loop_test_module });
+            const run_safari_loop_tests = b.addRunArtifact(safari_loop_tests);
+            b.step("test-safari-demo-loop", "Test the JSC Safari demo Apple run-loop host").dependOn(&run_safari_loop_tests.step);
+            test_step.dependOn(&run_safari_loop_tests.step);
+        }
     }
 }
 
@@ -798,7 +865,12 @@ fn preparePatchedQuickJsNg(b: *std.Build, tool: *std.Build.Step.Compile) std.Bui
     run.addFileArg(b.path("vendor/quickjs-ng-inspector-off.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-location-precision.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-error-stack-header.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-source-url.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-catch-regions.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-debug-receiver.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-debug-step.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-debug-eval-cache.patch"));
+    run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
     return out;
 }
 
@@ -820,6 +892,10 @@ fn preparePatchedQuickJs(b: *std.Build, tool: *std.Build.Step.Compile) std.Build
     run.addFileArg(b.path("vendor/quickjs-transfer-neuter.patch"));
     run.addFileArg(b.path("vendor/quickjs-script-tags.patch"));
     run.addFileArg(b.path("vendor/quickjs-error-stack-header.patch"));
+    run.addFileArg(b.path("vendor/quickjs-debugger.patch"));
+    run.addFileArg(b.path("vendor/quickjs-debug-receiver.patch"));
+    run.addFileArg(b.path("vendor/quickjs-debug-step.patch"));
+    run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
     return out;
 }
 
@@ -885,7 +961,7 @@ fn addOneBackendSources(
 fn addEscargotSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8) void {
     // EscargotPublic C bridge + libescargot (g++/local-exec TLS).
     // Zig's linkSystemLibrary("stdc++") is special-cased to libc++ — link libstdc++.a by path.
-    const install = b.path(install_prefix);
+    const install: std.Build.LazyPath = if (std.fs.path.isAbsolute(install_prefix)) .{ .cwd_relative = install_prefix } else b.path(install_prefix);
     m.addIncludePath(install.path(b, "include"));
     m.addIncludePath(b.path("src/backend/escargot"));
     m.addObjectFile(install.path(b, "lib/escargot_bridge.o"));
@@ -911,7 +987,7 @@ fn addEscargotSources(b: *std.Build, m: *std.Build.Module, install_prefix: []con
 fn addHermesSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8, icu_lib_dir: []const u8) void {
     // Hermes/JSI C bridge as a shared lib (libhermes_bridge.so), not a .o into the Zig binary. HostFunction throw paths must unwind with GCC libstdc++/libgcc_s that hermesvm.so uses.
     _ = libstdcxx;
-    const install = b.path(install_prefix);
+    const install: std.Build.LazyPath = if (std.fs.path.isAbsolute(install_prefix)) .{ .cwd_relative = install_prefix } else b.path(install_prefix);
     m.addIncludePath(b.path("src/backend/hermes"));
     m.addIncludePath(install.path(b, "include"));
     m.addLibraryPath(install.path(b, "lib"));
@@ -1054,6 +1130,10 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-inspector-off.patch"));
             hash.update(@embedFile("vendor/quickjs-transfer-neuter.patch"));
             hash.update(@embedFile("vendor/quickjs-error-stack-header.patch"));
+            hash.update(@embedFile("vendor/quickjs-debugger.patch"));
+            hash.update(@embedFile("vendor/quickjs-debug-receiver.patch"));
+            hash.update(@embedFile("vendor/quickjs-debug-step.patch"));
+            hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
             hash.update(@embedFile("src/backend/quickjs/quickjs_shim.h"));
             hash.update(@embedFile("src/backend/quickjs/qjs_wrapper_quickjs.c"));
             hash.update(@embedFile("src/backend/quickjs/bytecode.zig"));
@@ -1070,7 +1150,12 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-ng-inspector-off.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-location-precision.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-error-stack-header.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-source-url.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-catch-regions.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-debug-receiver.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-debug-step.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-debug-eval-cache.patch"));
+            hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
             hash.update(@embedFile("src/backend/quickjs_ng/qjs_wrapper_ng.c"));
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
         },

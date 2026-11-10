@@ -1,0 +1,330 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -448,6 +448,11 @@
+     /* only used in generators. Current stack pointer value. NULL if
+        the function is running. */
+     JSValue *cur_sp;
++#if JSBAY_INSPECTOR
++    /* Borrowed from the active call or its async state. */
++    JSValue jsbay_debug_this;
++    BOOL jsbay_debug_this_valid;
++#endif
+     int catch_count;
+ } JSStackFrame;
+ 
+@@ -735,6 +740,9 @@
+     uint8_t has_debug : 1;
+     uint8_t read_only_bytecode : 1;
+     uint8_t is_direct_or_indirect_eval : 1; /* used by JS_GetScriptOrModuleName() */
++#if JSBAY_INSPECTOR
++    uint8_t jsbay_debug_eval_helper : 1;
++#endif
+     /* XXX: 10 bits available */
+     uint8_t *byte_code_buf; /* (self pointer) */
+     int byte_code_len;
+@@ -2590,14 +2598,65 @@
+ static JSValue js_debug_local_variables(JSContext *ctx, JSStackFrame *frame)
+ {
+     JSFunctionBytecode *bytecode;
+-    JSValue result = JS_NewObject(ctx);
+-    int index;
++    JSObject *function;
++    JSValue result = JS_NewObjectProto(ctx, JS_NULL);
++    int index, has_this = 0, this_tdz = 0;
+     if (JS_IsException(result) || !frame) return result;
+     bytecode = JS_GetFunctionBytecode(frame->cur_func);
+     if (!bytecode) return result;
+     for (index = 0; index < bytecode->arg_count + bytecode->var_count; index++) {
+         JSValue value = index < bytecode->arg_count ? frame->arg_buf[index] : frame->var_buf[index - bytecode->arg_count];
+-        if (!JS_IsUninitialized(value)) JS_SetProperty(ctx, result, bytecode->vardefs[index].var_name, JS_DupValue(ctx, value));
++        if (bytecode->vardefs[index].var_name == JS_ATOM_this && JS_IsUninitialized(value)) {
++            this_tdz = 1;
++        } else if (!JS_IsUninitialized(value)) {
++            if (bytecode->vardefs[index].var_name == JS_ATOM_this)
++                has_this = 1;
++            if (JS_DefinePropertyValue(ctx, result, bytecode->vardefs[index].var_name, JS_DupValue(ctx, value), JS_PROP_C_W_E) < 0) {
++                JS_FreeValue(ctx, result);
++                return JS_EXCEPTION;
++            }
++        }
++    }
++    function = JS_VALUE_GET_TAG(frame->cur_func) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(frame->cur_func) : NULL;
++    if (!has_this && function && function->u.func.var_refs) {
++        for (index = 0; index < bytecode->closure_var_count; index++) {
++            JSVarRef *ref = function->u.func.var_refs[index];
++            if (bytecode->closure_var[index].var_name == JS_ATOM_this && ref && ref->pvalue) {
++                if (JS_IsUninitialized(*ref->pvalue)) {
++                    this_tdz = 1;
++                    break;
++                }
++                if (JS_DefinePropertyValue(ctx, result, JS_ATOM_this, JS_DupValue(ctx, *ref->pvalue), JS_PROP_C_W_E) < 0) {
++                    JS_FreeValue(ctx, result);
++                    return JS_EXCEPTION;
++                }
++                has_this = 1;
++                break;
++            }
++        }
++    }
++    if (!has_this && !this_tdz && frame->jsbay_debug_this_valid) {
++        JSValue value;
++        uint32_t tag = JS_VALUE_GET_TAG(frame->jsbay_debug_this);
++        if (!(bytecode->js_mode & JS_MODE_STRICT)) {
++            if (likely(tag == JS_TAG_OBJECT)) {
++                value = JS_DupValue(ctx, frame->jsbay_debug_this);
++            } else if (tag == JS_TAG_NULL || tag == JS_TAG_UNDEFINED) {
++                value = JS_DupValue(ctx, ctx->global_obj);
++            } else {
++                value = JS_ToObject(ctx, frame->jsbay_debug_this);
++            }
++        } else {
++            value = JS_DupValue(ctx, frame->jsbay_debug_this);
++        }
++        if (JS_IsException(value) || JS_DefinePropertyValue(ctx, result, JS_ATOM_this, value, JS_PROP_C_W_E) < 0) {
++            JS_FreeValue(ctx, result);
++            return JS_EXCEPTION;
++        }
++    }
++    if (this_tdz && JS_DefinePropertyValue(ctx, result, JS_ATOM_this, JS_UNINITIALIZED, JS_PROP_C_W_E) < 0) {
++        JS_FreeValue(ctx, result);
++        return JS_EXCEPTION;
+     }
+     return result;
+ }
+@@ -2606,7 +2665,7 @@
+ {
+     JSFunctionBytecode *bytecode;
+     JSObject *function;
+-    JSValue result = JS_NewObject(ctx);
++    JSValue result = JS_NewObjectProto(ctx, JS_NULL);
+     int index;
+     if (JS_IsException(result) || !frame || JS_VALUE_GET_TAG(frame->cur_func) != JS_TAG_OBJECT) return result;
+     function = JS_VALUE_GET_OBJ(frame->cur_func);
+@@ -2614,7 +2673,10 @@
+     if (!bytecode || !function->u.func.var_refs) return result;
+     for (index = 0; index < bytecode->closure_var_count; index++) {
+         JSVarRef *ref = function->u.func.var_refs[index];
+-        if (ref && ref->pvalue && !JS_IsUninitialized(*ref->pvalue)) JS_SetProperty(ctx, result, bytecode->closure_var[index].var_name, JS_DupValue(ctx, *ref->pvalue));
++        if (ref && ref->pvalue && !JS_IsUninitialized(*ref->pvalue) && JS_DefinePropertyValue(ctx, result, bytecode->closure_var[index].var_name, JS_DupValue(ctx, *ref->pvalue), JS_PROP_C_W_E) < 0) {
++            JS_FreeValue(ctx, result);
++            return JS_EXCEPTION;
++        }
+     }
+     return result;
+ }
+@@ -2627,13 +2689,52 @@
+     return js_debug_local_variables(ctx, frame);
+ }
+ 
++static void jsbay_mark_debug_eval_helper(JSValue value)
++{
++    JSFunctionBytecode *bytecode = jsbay_script_tag_child(value);
++    int index;
++    if (!bytecode || bytecode->jsbay_debug_eval_helper) return;
++    bytecode->jsbay_debug_eval_helper = 1;
++    for (index = 0; index < bytecode->cpool_count; index++)
++        jsbay_mark_debug_eval_helper(bytecode->cpool[index]);
++}
++
++static char *jsbay_debug_eval_source(JSContext *ctx, const char *expr, size_t len, int strict, int tdz)
++{
++    static const char hex[] = "0123456789abcdef";
++    const char *prefix = tdz ? "(function(){with(arguments[0]){return class extends null{constructor(){return {value:eval(\"" : strict ? "(function(){with(arguments[0]){return function(){'use strict';return eval(\"" : "(function(){with(arguments[0]){return function(){return eval(\"";
++    const char *suffix = tdz ? "\")};}}}})" : "\")};}})";
++    char *out, *p;
++    size_t index, cap;
++    if (len > (SIZE_MAX - 256) / 6) return NULL;
++    cap = len * 6 + 256;
++    out = js_malloc(ctx, cap);
++    if (!out) return NULL;
++    p = out;
++    memcpy(p, prefix, strlen(prefix)); p += strlen(prefix);
++    for (index = 0; index < len; index++) {
++        unsigned char c = (unsigned char)expr[index];
++        if (c == '\\' || c == '\"') { *p++ = '\\'; *p++ = c; }
++        else if (c < 0x20) { memcpy(p, "\\u00", 4); p += 4; *p++ = hex[c >> 4]; *p++ = hex[c & 15]; }
++        else if (c == 0xe2 && index + 2 < len && (unsigned char)expr[index + 1] == 0x80 && ((unsigned char)expr[index + 2] == 0xa8 || (unsigned char)expr[index + 2] == 0xa9)) { memcpy(p, (unsigned char)expr[index + 2] == 0xa8 ? "\\u2028" : "\\u2029", 6); p += 6; index += 2; }
++        else *p++ = c;
++    }
++    memcpy(p, suffix, strlen(suffix)); p += strlen(suffix);
++    *p = '\0';
++    return out;
++}
++
+ JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, size_t len)
+ {
+-    static const char helper_source[] = "(function(__jsbayScope,__jsbayExpression){return (function(){with(__jsbayScope){return eval(__jsbayExpression);}}).call(this);})";
+-    JSValue local = js_debug_local_variables(ctx, js_debug_frame(ctx, frame_index));
+-    JSValue closure = js_debug_closure_variables(ctx, js_debug_frame(ctx, frame_index));
+-    JSValue helper, expression, global, result;
+-    JSValue args[2];
++    JSStackFrame *frame = js_debug_frame(ctx, frame_index);
++    JSFunctionBytecode *bytecode = frame ? JS_GetFunctionBytecode(frame->cur_func) : NULL;
++    JSValue local = js_debug_local_variables(ctx, frame);
++    JSValue closure = js_debug_closure_variables(ctx, frame);
++    JSValue helper, runner, global, result;
++    int has_this, this_tdz;
++    JSValue this_value;
++    char *source;
++    JSScriptTagHandler *saved_source_handler;
+     if (JS_IsException(local) || JS_IsException(closure)) {
+         JS_FreeValue(ctx, local);
+         JS_FreeValue(ctx, closure);
+@@ -2645,20 +2746,51 @@
+         return JS_EXCEPTION;
+     }
+     JS_FreeValue(ctx, closure);
+-    helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, "<debugger>", JS_EVAL_TYPE_GLOBAL);
++    this_tdz = 0;
++    if (JS_HasProperty(ctx, local, JS_ATOM_this) > 0) {
++        this_value = JS_GetProperty(ctx, local, JS_ATOM_this);
++        if (JS_IsException(this_value)) { JS_FreeValue(ctx, local); return this_value; }
++        this_tdz = JS_IsUninitialized(this_value);
++        JS_FreeValue(ctx, this_value);
++    }
++    source = jsbay_debug_eval_source(ctx, expr, len, bytecode && (bytecode->js_mode & JS_MODE_STRICT), this_tdz);
++    if (!source) { JS_FreeValue(ctx, local); return JS_ThrowOutOfMemory(ctx); }
++    saved_source_handler = ctx->rt->jsbay_script_tag_handler;
++    ctx->rt->jsbay_script_tag_handler = NULL;
++    helper = JS_Eval(ctx, source, strlen(source), "<debugger>", JS_EVAL_TYPE_GLOBAL);
++    ctx->rt->jsbay_script_tag_handler = saved_source_handler;
++    js_free(ctx, source);
+     if (JS_IsException(helper)) { JS_FreeValue(ctx, local); return helper; }
+-    expression = JS_NewStringLen(ctx, expr, len);
+-    if (JS_IsException(expression)) { JS_FreeValue(ctx, helper); JS_FreeValue(ctx, local); return expression; }
+-    args[0] = local;
+-    args[1] = expression;
++    jsbay_mark_debug_eval_helper(helper);
++    has_this = JS_HasProperty(ctx, local, JS_ATOM_this);
++    if (has_this < 0) {
++        JS_FreeValue(ctx, helper);
++        JS_FreeValue(ctx, local);
++        return JS_EXCEPTION;
++    }
+     global = JS_GetPropertyStr(ctx, local, "this");
+-    if (JS_IsException(global) || JS_IsUndefined(global) || JS_IsUninitialized(global)) {
++    if (JS_IsException(global)) {
++        JS_FreeValue(ctx, helper);
++        JS_FreeValue(ctx, local);
++        return JS_EXCEPTION;
++    }
++    if ((!has_this || JS_IsUninitialized(global)) && !(bytecode && (bytecode->js_mode & JS_MODE_STRICT))) {
+         JS_FreeValue(ctx, global);
+         global = JS_GetGlobalObject(ctx);
+     }
+-    result = JS_Call(ctx, helper, global, 2, args);
++    runner = JS_Call(ctx, helper, JS_UNDEFINED, 1, &local);
++    if (JS_IsException(runner)) result = runner;
++    else if (this_tdz) {
++        JSValue boxed = JS_CallConstructor(ctx, runner, 0, NULL);
++        if (JS_IsException(boxed)) result = boxed;
++        else {
++            result = JS_GetPropertyStr(ctx, boxed, "value");
++            JS_FreeValue(ctx, boxed);
++        }
++    }
++    else result = JS_Call(ctx, runner, global, 0, NULL);
++    JS_FreeValue(ctx, runner);
+     JS_FreeValue(ctx, global);
+-    JS_FreeValue(ctx, expression);
+     JS_FreeValue(ctx, helper);
+     JS_FreeValue(ctx, local);
+     return result;
+@@ -18902,6 +19034,10 @@
+             sp = sf->cur_sp;
+             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
+             pc = sf->cur_pc;
++#if JSBAY_INSPECTOR
++            sf->jsbay_debug_this = s->this_val;
++            sf->jsbay_debug_this_valid = TRUE;
++#endif
+             sf->prev_frame = rt->current_stack_frame;
+             rt->current_stack_frame = sf;
+             if (s->throw_flag)
+@@ -18939,6 +19075,10 @@
+ 
+     sf->js_mode = b->js_mode;
+     sf->catch_count = 0;
++#if JSBAY_INSPECTOR
++    sf->jsbay_debug_this = (JSValue)this_obj;
++    sf->jsbay_debug_this_valid = TRUE;
++#endif
+     arg_buf = argv;
+     sf->arg_count = argc;
+     sf->cur_func = (JSValue)func_obj;
+@@ -19476,7 +19616,11 @@
+                 pc += 4;
+                 call_argv = sp - call_argc;
+                 sf->cur_pc = pc;
++#if JSBAY_INSPECTOR
++                if (b->jsbay_debug_eval_helper || js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
++#else
+                 if (js_same_value(ctx, call_argv[-1], ctx->eval_obj)) {
++#endif
+                     if (call_argc >= 1)
+                         obj = call_argv[0];
+                     else
+@@ -22155,6 +22299,10 @@
+     sf->arg_buf = (JSValue *)(s + 1);
+     sf->cur_func = JS_DupValue(ctx, func_obj);
+     s->this_val = JS_DupValue(ctx, this_obj);
++#if JSBAY_INSPECTOR
++    sf->jsbay_debug_this = s->this_val;
++    sf->jsbay_debug_this_valid = TRUE;
++#endif
+     s->argc = argc;
+     sf->arg_count = arg_buf_len;
+     sf->var_buf = sf->arg_buf + arg_buf_len;
+@@ -34550,6 +34698,39 @@
+     }
+ }
+ 
++#if JSBAY_INSPECTOR
++static int jsbay_capture_arrow_this(JSContext *ctx, JSFunctionDef *s)
++{
++    JSFunctionDef *fd;
++    int var_idx;
++
++    for (fd = s->parent; fd; fd = fd->parent) {
++        if (fd->has_this_binding) {
++            var_idx = resolve_pseudo_var(ctx, fd, JS_ATOM_this);
++            if (var_idx < 0)
++                return -1;
++            capture_var(fd, &fd->vars[var_idx]);
++            return get_closure_var(ctx, s, fd, JS_CLOSURE_LOCAL, var_idx,
++                                   JS_ATOM_this, FALSE, fd->vars[var_idx].is_lexical,
++                                   JS_VAR_NORMAL) < 0 ? -1 : 0;
++        }
++        if (fd->is_eval) {
++            var_idx = find_closure_var(ctx, fd, JS_ATOM_this);
++            if (var_idx >= 0) {
++                JSClosureVar *cv = &fd->closure_var[var_idx];
++                JSClosureTypeEnum closure_type = cv->closure_type == JS_CLOSURE_GLOBAL ||
++                    cv->closure_type == JS_CLOSURE_GLOBAL_DECL ||
++                    cv->closure_type == JS_CLOSURE_GLOBAL_REF ? JS_CLOSURE_GLOBAL_REF : JS_CLOSURE_REF;
++                return get_closure_var(ctx, s, fd, closure_type, var_idx,
++                                       cv->var_name, cv->is_const, cv->is_lexical,
++                                       cv->var_kind) < 0 ? -1 : 0;
++            }
++        }
++    }
++    return 0;
++}
++#endif
++
+ /* return the position of the next opcode or -1 if error */
+ static int resolve_scope_var(JSContext *ctx, JSFunctionDef *s,
+                              JSAtom var_name, int scope_level, int op,
+@@ -37737,6 +37918,11 @@
+        other variable lookup is done. */
+     if (fd->has_eval_call)
+         add_eval_variables(ctx, fd);
++
++#if JSBAY_INSPECTOR
++    if (fd->func_type == JS_PARSE_FUNC_ARROW && jsbay_capture_arrow_this(ctx, fd))
++        goto fail;
++#endif
+ 
+     /* add the module global variables in the closure */
+     if (fd->is_eval) {

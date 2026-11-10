@@ -1,6 +1,6 @@
-//! Line breakpoints for the QuickJS backend.
+//! Source breakpoints and execution control for native debugger hooks.
 //!
-//! QuickJS reports each source line through `JS_SetLocationHandler` and each thrown exception through `JS_SetExceptionHandler`. This file decides whether to pause, then blocks the engine thread until `resumeExecution` or a step clears the pause. While paused it drains host tasks so a debugger command posted from another thread can run against the live stack. JavaScriptCore has no equivalent hook; attach is a no-op there.
+//! QuickJS-family engines and Escargot report executable locations to this module. It decides whether to pause, then blocks the engine thread until `resumeExecution` or a step clears the pause. While paused it drains debugger control tasks so requests posted from another thread can inspect the live stack. JavaScriptCore uses Safari Web Inspector; Hermes owns its CDP pause loop.
 
 const std = @import("std");
 const backend = @import("../backend.zig");
@@ -60,7 +60,7 @@ const Script = struct {
     source_map_url: []u8,
     // Journal storage is FIFO, but a source can be evaluated again after a newer revision with the same URL has been recorded.
     last_note_generation: u64 = 0,
-    // Exact bytecode locations collected by the QuickJS-NG evaluator before the temporary top-level bytecode is released. These are deliberately separate from the source journal: scanning source text would claim comments and whitespace are executable locations.
+    // Native bytecode locations are retained independently of source text, which cannot distinguish executable statements from comments or whitespace.
     break_locations: std.ArrayList(SourceLocation) = .empty,
     break_locations_collected: bool = false,
     break_locations_truncated: bool = false,
@@ -105,6 +105,7 @@ const Binding = struct {
     paused_line: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     paused_column: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     paused_depth: i32 = 0,
+    paused_frame_token: u64 = 0,
     paused_reason: PauseReason = .breakpoint,
     mode: StepMode = .run,
     next_breakpoint_id: u32 = 1,
@@ -125,6 +126,7 @@ const Binding = struct {
     skip_line: i32 = -1,
     skip_column: i32 = -1,
     skip_depth: i32 = 0,
+    skip_frame_token: u64 = 0,
     skip_url: [512]u8 = undefined,
     skip_url_len: usize = 0,
     skip_script_tag: u64 = 0,
@@ -265,7 +267,7 @@ pub fn attachSourceCollector(instance_id: i32, runtime: *anyopaque) bool {
         existing.runtime = runtime;
         existing.source_collection_owned.store(true, .seq_cst);
         armSource(existing);
-        return true;
+        return existing.source_armed.load(.seq_cst);
     }
     const binding = std.heap.c_allocator.create(Binding) catch return false;
     binding.* = .{
@@ -281,7 +283,7 @@ pub fn attachSourceCollector(instance_id: i32, runtime: *anyopaque) bool {
     binding.source_collection_owned.store(true, .seq_cst);
     armSource(binding);
     binding.mutex.unlock();
-    return true;
+    return binding.source_armed.load(.seq_cst);
 }
 
 /// Retain reader-thread Debugger configuration while the first enable is queued. A prepared binding intentionally has no runtime and is never armed; `attach` is the sole owner-thread transition that installs native callbacks.
@@ -741,7 +743,7 @@ pub fn locationsForId(instance_id: i32, id: u32) []BreakLocation {
     return list.toOwnedSlice(std.heap.c_allocator) catch &.{};
 }
 
-/// Returns exact bytecode locations captured while this script was evaluated. `start` is inclusive and `end` is exclusive, with CDP's zero-based source coordinates. `restrictToFunction` is intentionally rejected by the CDP adapter because QuickJS-NG does not expose a stable function-range identity.
+/// Returns exact bytecode locations captured while this script was evaluated. `start` is inclusive and `end` is exclusive, with CDP's zero-based source coordinates. `restrictToFunction` is intentionally rejected by the CDP adapter because the native hooks do not expose a stable function-range identity.
 pub fn possibleBreakpoints(
     instance_id: i32,
     script_id: u32,
@@ -801,11 +803,12 @@ pub fn copyDebugStack(instance_id: i32) []DebugFrame {
         }
         return out;
     }
-    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return &.{};
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return &.{};
     const ctx = engine.getContext(instance_id) orelse return &.{};
-    const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
-    var raw: [64]qjs.JSDebugFrameInfo = undefined;
-    const n = qjs.JS_CopyDebugStack(ctx, &raw, raw.len);
+    const c_api = backend.ActiveEngineModule.c_api;
+    const NativeFrame = if (comptime backend.isEscargotBackend(backend.active_backend)) c_api.DebugFrame else c_api.qjs.JSDebugFrameInfo;
+    var raw: [64]NativeFrame = undefined;
+    const n = if (comptime backend.isEscargotBackend(backend.active_backend)) c_api.escargot_debugger_copy_stack(ctx, &raw, raw.len) else c_api.qjs.JS_CopyDebugStack(ctx, &raw, raw.len);
     if (n <= 0) return &.{};
     const count: usize = @intCast(n);
     const out = std.heap.c_allocator.alloc(DebugFrame, count) catch return &.{};
@@ -815,7 +818,7 @@ pub fn copyDebugStack(instance_id: i32) []DebugFrame {
         const column: i32 = if (frame.column > 0) frame.column - 1 else 0;
         out[i] = .{
             .name = std.heap.c_allocator.dupe(u8, name) catch &.{},
-            .url = std.heap.c_allocator.dupe(u8, url) catch &.{},
+            .url = dupeSourceUrl(instance_id, frame.script_tag, url) catch &.{},
             .line = frame.line,
             .column = column,
             .script_tag = if (comptime backend.supportsSourceJournal(backend.active_backend)) frame.script_tag else 0,
@@ -842,12 +845,13 @@ pub fn writeDebugStack(instance_id: i32, out: []StackFrameBuf) usize {
     if (comptime backend.isJscApiBackend(backend.active_backend)) {
         return @import("../backend/jsc/backtrace.zig").writeStack(instance_id, out);
     }
-    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return 0;
+    if (comptime !backend.supportsDebugger(backend.active_backend)) return 0;
     const ctx = engine.getContext(instance_id) orelse return 0;
-    const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
-    var raw: [16]qjs.JSDebugFrameInfo = undefined;
+    const c_api = backend.ActiveEngineModule.c_api;
+    const NativeFrame = if (comptime backend.isEscargotBackend(backend.active_backend)) c_api.DebugFrame else c_api.qjs.JSDebugFrameInfo;
+    var raw: [16]NativeFrame = undefined;
     const max_n: usize = @min(out.len, raw.len);
-    const n = qjs.JS_CopyDebugStack(ctx, &raw, @intCast(max_n));
+    const n = if (comptime backend.isEscargotBackend(backend.active_backend)) c_api.escargot_debugger_copy_stack(ctx, &raw, @intCast(max_n)) else c_api.qjs.JS_CopyDebugStack(ctx, &raw, @intCast(max_n));
     if (n <= 0) return 0;
     const count: usize = @min(@as(usize, @intCast(n)), max_n);
     for (raw[0..count], out[0..count]) |frame, *dst| {
@@ -869,6 +873,10 @@ pub fn writeDebugStack(instance_id: i32, out: []StackFrameBuf) usize {
 /// The receiver of a paused frame, when it is an object. Caller frees it. Engine thread only, while paused.
 pub fn copyDebugThis(instance_id: i32, frame_index: i32) ?backend.ActiveEngine.Value {
     if (comptime !@import("build_options").inspector) return null;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        const ctx = engine.getContext(instance_id) orelse return null;
+        return backend.ActiveEngineModule.c_api.escargot_debugger_this(ctx, frame_index);
+    }
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return null;
     const ctx = engine.getContext(instance_id) orelse return null;
     const c_api = @import("../backend.zig").ActiveEngineModule.c_api;
@@ -886,6 +894,10 @@ pub fn copyDebugThis(instance_id: i32, frame_index: i32) ?backend.ActiveEngine.V
 
 pub fn copyDebugScope(instance_id: i32, frame_index: i32, scope: u8) ?backend.ActiveEngine.Value {
     if (comptime !@import("build_options").inspector) return null;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        const ctx = engine.getContext(instance_id) orelse return null;
+        return backend.ActiveEngineModule.c_api.escargot_debugger_scope(ctx, frame_index, scope);
+    }
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return null;
     const ctx = engine.getContext(instance_id) orelse return null;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
@@ -899,21 +911,42 @@ pub const FrameEval = struct {
     text: []u8,
 };
 
+pub const FrameValue = struct {
+    value: ?backend.ActiveEngine.Value = null,
+    exception: ?backend.ActiveEngine.Value = null,
+};
+
+/// Preserves primitive types and retained object identity for a paused-frame expression. The caller releases either returned engine value on the owner thread.
+pub fn evalDebugFrameValue(instance_id: i32, frame_index: i32, expr: []const u8) FrameValue {
+    if (comptime !@import("build_options").inspector or !backend.supportsDebugger(backend.active_backend)) return .{};
+    const ctx = engine.getContext(instance_id) orelse return .{};
+    const c_api = backend.ActiveEngineModule.c_api;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        var exception: c_api.Value = null;
+        const result = c_api.escargot_debugger_eval_frame(ctx, frame_index, expr.ptr, expr.len, &exception);
+        if (exception) |thrown| return .{ .exception = thrown };
+        if (result) |value| return .{ .value = value };
+        return .{};
+    }
+    const qjs = c_api.qjs;
+    const value = qjs.JS_EvalInDebugFrame(ctx, frame_index, expr.ptr, expr.len);
+    if (value.tag == qjs.JS_TAG_EXCEPTION) return .{ .exception = qjs.JS_GetException(ctx) };
+    return .{ .value = value };
+}
+
 /// Evaluate `expr` in a paused frame. Caller frees `text`. Engine thread only.
 pub fn evalDebugFrame(instance_id: i32, frame_index: i32, expr: []const u8) FrameEval {
     if (comptime !@import("build_options").inspector) return .{ .ok = false, .text = &.{} };
-    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return .{ .ok = false, .text = &.{} };
     const ctx = engine.getContext(instance_id) orelse return .{ .ok = false, .text = &.{} };
-    const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
     const ActiveEngine = backend.ActiveEngine;
-    const value = qjs.JS_EvalInDebugFrame(ctx, frame_index, expr.ptr, expr.len);
-    if (value.tag == @import("../backend.zig").ActiveEngineModule.qjs.JS_TAG_EXCEPTION) {
-        const thrown = qjs.JS_GetException(ctx);
+    const result = evalDebugFrameValue(instance_id, frame_index, expr);
+    if (result.exception) |thrown| {
         const text = ActiveEngine.valueToString(ctx, thrown) orelse
             std.heap.c_allocator.dupe(u8, "exception") catch &.{};
         ActiveEngine.freeValue(ctx, thrown);
         return .{ .ok = false, .text = @constCast(text) };
     }
+    const value = result.value orelse return .{ .ok = false, .text = &.{} };
     const text = ActiveEngine.valueToString(ctx, value) orelse
         std.heap.c_allocator.dupe(u8, "") catch &.{};
     ActiveEngine.freeValue(ctx, value);
@@ -931,6 +964,7 @@ fn continueWith(instance_id: i32, mode: StepMode) void {
     binding.skip_line = binding.paused_line.load(.seq_cst);
     binding.skip_column = binding.paused_column.load(.seq_cst);
     binding.skip_depth = binding.paused_depth;
+    binding.skip_frame_token = binding.paused_frame_token;
     binding.skip_seen_same = false;
     binding.skip_saw_deeper = false;
     refreshSteppingOrSkipPendingLocked(binding);
@@ -938,36 +972,15 @@ fn continueWith(instance_id: i32, mode: StepMode) void {
     binding.pause.store(0, .seq_cst);
 }
 
-fn finishStepOut(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) bool {
-    binding.mutex.lock();
-    defer binding.mutex.unlock();
-    if (binding.mode != .step_out or depth >= binding.paused_depth) return false;
-    // The callee returned to the call expression. Step over that line so the pause lands on the caller's next statement.
-    const n = @min(url.len, binding.skip_url.len);
-    if (n > 0) @memcpy(binding.skip_url[0..n], url[0..n]);
-    binding.skip_url_len = n;
-    binding.skip_script_tag = script_tag;
-    binding.skip_line = line;
-    binding.skip_column = column;
-    binding.skip_depth = depth;
-    binding.skip_seen_same = true;
-    binding.skip_saw_deeper = false;
-    binding.mode = .step_over;
-    binding.paused_depth = depth;
-    refreshSteppingOrSkipPendingLocked(binding);
-    return true;
-}
-
-fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) bool {
+fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64, frame_token: u64, repeated: bool) bool {
     binding.mutex.lock();
     defer binding.mutex.unlock();
     if (binding.skip_line < 0) return false;
-    const same = binding.skip_script_tag == script_tag and binding.skip_line == line and binding.skip_column == column and binding.skip_depth == depth and
+    const same = binding.skip_frame_token == frame_token and binding.skip_script_tag == script_tag and binding.skip_line == line and binding.skip_depth == depth and binding.skip_column == column and
         binding.skip_url_len == url.len and
         std.mem.eql(u8, binding.skip_url[0..binding.skip_url_len], url);
-    if (same) {
+    if (same and repeated) {
         if (binding.skip_saw_deeper) {
-            // The call we stepped over returned to its own line.
             binding.skip_line = -1;
             binding.skip_column = -1;
             binding.skip_url_len = 0;
@@ -975,16 +988,12 @@ fn consumeSkip(binding: *Binding, url: []const u8, line: i32, column: i32, depth
             refreshSteppingOrSkipPendingLocked(binding);
             return true;
         }
-        if (!binding.skip_seen_same) {
-            binding.skip_seen_same = true;
-            return true;
-        }
         binding.skip_line = -1;
         binding.skip_column = -1;
         binding.skip_url_len = 0;
         binding.skip_script_tag = 0;
         refreshSteppingOrSkipPendingLocked(binding);
-        return false;
+        return true;
     }
     if (depth > binding.skip_depth) {
         binding.skip_saw_deeper = true;
@@ -1025,10 +1034,16 @@ fn armSource(binding: *Binding) void {
     if (comptime !@import("build_options").inspector) return;
     if (comptime !backend.supportsSourceJournal(backend.active_backend)) return;
     if (binding.source_armed.load(.seq_cst)) return;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        const ctx = engine.getContext(binding.instance_id) orelse return;
+        const armed = backend.ActiveEngineModule.c_api.escargot_debugger_attach(ctx, @ptrCast(&scriptTagTrampoline), @ptrCast(&breakLocationTrampoline), @ptrCast(&locationTrampoline), @ptrCast(&escargotDebuggerTrampoline), binding);
+        binding.source_armed.store(armed, .seq_cst);
+        return;
+    }
     const rt = binding.runtime orelse return;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
     qjs.JS_SetScriptTagHandler(@ptrCast(rt), @ptrCast(&scriptTagTrampoline), binding);
-    if (comptime backend.active_backend == .quickjs_ng) {
+    if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
         qjs.JS_SetBreakLocationHandler(@ptrCast(rt), @ptrCast(&breakLocationTrampoline), binding);
     }
     binding.source_armed.store(true, .seq_cst);
@@ -1038,9 +1053,16 @@ fn armExecution(binding: *Binding) void {
     if (comptime !@import("build_options").inspector) return;
     if (comptime !backend.supportsDebugger(backend.active_backend)) return;
     if (binding.execution_armed.load(.seq_cst)) return;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        const ctx = engine.getContext(binding.instance_id) orelse return;
+        backend.ActiveEngineModule.c_api.escargot_debugger_set_execution(ctx, true);
+        binding.handler_install_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+        binding.execution_armed.store(true, .seq_cst);
+        return;
+    }
     const rt = binding.runtime orelse return;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
-    if (comptime backend.active_backend == .quickjs_ng) {
+    if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
         qjs.JS_SetLocationHandler(@ptrCast(rt), @ptrCast(&locationTrampoline), binding);
         qjs.JS_SetExceptionHandler(@ptrCast(rt), @ptrCast(&exceptionTrampoline), binding);
         qjs.jsbay_qjs_set_location_work_predicate(@ptrCast(rt), @ptrCast(&locationWorkPredicate));
@@ -1053,11 +1075,17 @@ fn armExecution(binding: *Binding) void {
 
 fn disarmExecution(binding: *Binding) void {
     if (comptime !@import("build_options").inspector) return;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        if (!binding.execution_armed.swap(false, .seq_cst)) return;
+        if (engine.getContext(binding.instance_id)) |ctx| backend.ActiveEngineModule.c_api.escargot_debugger_set_execution(ctx, false);
+        binding.handler_install_thread_id.store(0, .seq_cst);
+        return;
+    }
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
     if (!binding.execution_armed.swap(false, .seq_cst)) return;
     const rt = binding.runtime orelse return;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
-    if (comptime backend.active_backend == .quickjs_ng) {
+    if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
         qjs.jsbay_qjs_set_location_work_predicate(@ptrCast(rt), null);
         qjs.jsbay_qjs_set_exception_work_predicate(@ptrCast(rt), null);
         qjs.JS_SetLocationHandler(@ptrCast(rt), null, null);
@@ -1069,12 +1097,17 @@ fn disarmExecution(binding: *Binding) void {
 
 fn disarmSource(binding: *Binding) void {
     if (comptime !@import("build_options").inspector) return;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        if (!binding.source_armed.swap(false, .seq_cst)) return;
+        if (engine.getContext(binding.instance_id)) |ctx| backend.ActiveEngineModule.c_api.escargot_debugger_detach(ctx);
+        return;
+    }
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return;
     if (!binding.source_armed.swap(false, .seq_cst)) return;
     const rt = binding.runtime orelse return;
     const qjs = @import("../backend.zig").ActiveEngineModule.c_api.qjs;
     qjs.JS_SetScriptTagHandler(@ptrCast(rt), null, null);
-    if (comptime backend.active_backend == .quickjs_ng) qjs.JS_SetBreakLocationHandler(@ptrCast(rt), null, null);
+    if (comptime backend.isQuickJsApiBackend(backend.active_backend)) qjs.JS_SetBreakLocationHandler(@ptrCast(rt), null, null);
 }
 
 fn destroyBinding(binding: *Binding) void {
@@ -1225,49 +1258,44 @@ test "debugger: blackbox cache snapshot releases partial OOM allocations" {
     }.run, .{patterns[0..]});
 }
 
-fn shouldPause(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) ?PauseReason {
-    return breakpointHit(binding, url, line, column, depth, script_tag);
+fn shouldPause(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64, frame_token: u64, repeated: bool, breakpoint_eligible: bool) ?PauseReason {
+    return breakpointHit(binding, url, line, column, depth, script_tag, frame_token, repeated, breakpoint_eligible);
 }
 
-fn breakpointHit(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64) ?PauseReason {
+fn breakpointHit(binding: *Binding, url: []const u8, line: i32, column: i32, depth: i32, script_tag: u64, frame_token: u64, repeated: bool, breakpoint_eligible: bool) ?PauseReason {
     binding.mutex.lock();
     if (binding.break_requested.swap(0, .seq_cst) != 0) {
         binding.mutex.unlock();
         return .other;
     }
+    if (breakpoint_eligible and !repeated and binding.breakpoints_active.load(.seq_cst) != 0) {
+        var index: usize = 0;
+        while (index < binding.breakpoints.items.len) : (index += 1) {
+            const bp = binding.breakpoints.items[index];
+            const tagged_script = scriptByTagLocked(binding, script_tag);
+            const breakpoint_url = if (tagged_script) |script| script.url else url;
+            if (!urlPatternMatch(bp, breakpoint_url)) continue;
+            if (tagged_script) |script| {
+                const resolved = resolveBreakpoint(script.*, bp) orelse continue;
+                if (resolved.line != line or resolved.column != column) continue;
+            } else if (bp.line != line or bp.column != column) continue;
+            const cond = std.heap.c_allocator.dupe(u8, bp.condition) catch continue;
+            binding.mutex.unlock();
+            const ok = cond.len == 0 or conditionPasses(binding, cond);
+            if (cond.len > 0) std.heap.c_allocator.free(cond);
+            if (ok) return .breakpoint;
+            binding.mutex.lock();
+        }
+    }
+    const same_paused_location = binding.paused_frame_token == frame_token and binding.paused_script_tag == script_tag and binding.paused_line.load(.seq_cst) == line and binding.paused_depth == depth and binding.paused_url_len == url.len and std.mem.eql(u8, binding.paused_url[0..binding.paused_url_len], url);
     const stepped = switch (binding.mode) {
-        .step_in => true,
-        .step_over => depth <= binding.paused_depth,
+        .step_in => !same_paused_location,
+        .step_over => depth < binding.paused_depth or (depth == binding.paused_depth and !same_paused_location),
         .step_out => depth < binding.paused_depth,
         .run => false,
     };
-    if (stepped) {
-        binding.mutex.unlock();
-        return .step;
-    }
-    if (binding.breakpoints_active.load(.seq_cst) == 0) {
-        binding.mutex.unlock();
-        return null;
-    }
-    var index: usize = 0;
-    while (index < binding.breakpoints.items.len) : (index += 1) {
-        const bp = binding.breakpoints.items[index];
-        const tagged_script = scriptByTagLocked(binding, script_tag);
-        const breakpoint_url = if (tagged_script) |script| script.url else url;
-        if (!urlPatternMatch(bp, breakpoint_url)) continue;
-        if (tagged_script) |script| {
-            const resolved = resolveBreakpoint(script.*, bp) orelse continue;
-            if (resolved.line != line or resolved.column != column) continue;
-        } else if (bp.line != line or bp.column != column) continue;
-        const cond = std.heap.c_allocator.dupe(u8, bp.condition) catch continue;
-        binding.mutex.unlock();
-        const ok = cond.len == 0 or conditionPasses(binding, cond);
-        if (cond.len > 0) std.heap.c_allocator.free(cond);
-        if (ok) return .breakpoint;
-        binding.mutex.lock();
-    }
     binding.mutex.unlock();
-    return null;
+    return if (stepped) .step else null;
 }
 
 fn scriptByUrlLocked(binding: *Binding, url: []const u8) ?Script {
@@ -1393,15 +1421,16 @@ fn firstBreakColumn(source: []const u8, line: i32, requested: i32) ?i32 {
     return null;
 }
 
-/// Maps a requested breakpoint to the earliest executable location at or after it. QuickJS-NG supplies these locations from compiled bytecode; other backends retain source-only resolution because they have no execution callback.
+/// Maps a requested breakpoint to the earliest native executable location at or after it. Source-only journals retain their line-based lookup.
 fn resolveBreakpoint(script: Script, bp: Breakpoint) ?struct { line: i32, column: i32 } {
-    if (comptime backend.active_backend == .quickjs_ng) {
+    if (comptime backend.supportsDebugger(backend.active_backend)) {
         if (!script.break_locations_collected or script.break_locations_truncated) return null;
         var resolved: ?SourceLocation = null;
+        const requested_column: i32 = if (comptime backend.isEscargotBackend(backend.active_backend)) 0 else bp.column;
         for (script.break_locations.items) |location| {
             if (location.line < bp.line) continue;
-            if (location.line == bp.line and location.column < bp.column) continue;
-            if (resolved == null or location.line < resolved.?.line or (location.line == resolved.?.line and location.column < resolved.?.column)) {
+            if (location.line == bp.line and location.column < requested_column) continue;
+            if (resolved == null or location.line < resolved.?.line or (requested_column != 0 and location.line == resolved.?.line and location.column < resolved.?.column)) {
                 resolved = location;
             }
         }
@@ -1483,7 +1512,7 @@ fn matchStar(atom: Atom, rest: []const u8, text: []const u8) bool {
     }
 }
 
-/// Runs after an NG compilation unit is complete but before it can execute. Returning the retained journal id makes the native bytecode tag stable for its lifetime; a failed allocation deliberately returns zero (unknown).
+/// Runs after a native compilation unit is complete but before it can execute. Returning the retained journal id makes the native bytecode tag stable for its lifetime; a failed allocation deliberately returns zero (unknown).
 fn scriptTagTrampoline(
     _: ?*anyopaque,
     filename: [*c]const u8,
@@ -1499,7 +1528,7 @@ fn scriptTagTrampoline(
     return registerScript(binding.instance_id, filename_text, text);
 }
 
-/// Called by the QuickJS-NG evaluator before it releases the top-level bytecode. It only copies source metadata into the bounded journal; it must not execute JavaScript or take ownership of engine values.
+/// Copies native executable locations into the bounded journal without executing JavaScript or taking ownership of engine values.
 fn breakLocationTrampoline(
     _: ?*anyopaque,
     filename: [*c]const u8,
@@ -1556,8 +1585,43 @@ fn scriptByTagLocked(binding: *Binding, tag: u64) ?*Script {
     return scriptByIdLocked(binding, @intCast(tag));
 }
 
+fn dupeSourceUrl(instance_id: i32, tag: u64, fallback: []const u8) ![]u8 {
+    const binding = lockBinding(instance_id) orelse return std.heap.c_allocator.dupe(u8, fallback);
+    defer binding.mutex.unlock();
+    const url = if (scriptByTagLocked(binding, tag)) |script| script.url else fallback;
+    return std.heap.c_allocator.dupe(u8, url);
+}
+
+fn nativeFrameToken(ctx: ?*anyopaque) u64 {
+    if (comptime !@import("build_options").inspector) return 0;
+    const pointer = ctx orelse return 0;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        return backend.ActiveEngineModule.c_api.escargot_debugger_frame_token(@ptrCast(@alignCast(pointer)));
+    } else if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+        return backend.ActiveEngineModule.c_api.qjs.JS_GetDebugFrameToken(@ptrCast(@alignCast(pointer)));
+    } else return 0;
+}
+
+fn nativeLocationIsRepeat(ctx: ?*anyopaque) bool {
+    if (comptime !@import("build_options").inspector) return false;
+    const pointer = ctx orelse return false;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        return backend.ActiveEngineModule.c_api.escargot_debugger_location_is_repeat(@ptrCast(@alignCast(pointer)));
+    } else if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+        return backend.ActiveEngineModule.c_api.qjs.JS_IsDebugLocationRepeat(@ptrCast(@alignCast(pointer))) != 0;
+    } else return false;
+}
+
+fn nativeBreakpointIsEligible(ctx: ?*anyopaque) bool {
+    if (comptime !@import("build_options").inspector) return false;
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        const pointer = ctx orelse return false;
+        return backend.ActiveEngineModule.c_api.escargot_debugger_location_is_breakpoint_target(@ptrCast(@alignCast(pointer)));
+    } else return true;
+}
+
 fn locationTrampoline(
-    _: ?*anyopaque,
+    ctx: ?*anyopaque,
     filename: [*c]const u8,
     line: c_int,
     column: c_int,
@@ -1565,20 +1629,25 @@ fn locationTrampoline(
     script_tag: u64,
     opaque_ptr: ?*anyopaque,
 ) callconv(.c) void {
+    const repeated = nativeLocationIsRepeat(ctx);
+    const breakpoint_eligible = nativeBreakpointIsEligible(ctx);
     const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return));
     if (binding.skip_all_pauses.load(.seq_cst) != 0) return;
     if (binding.suppress.load(.seq_cst) != 0) return;
     binding.exception_hold.store(0, .seq_cst);
     if (binding.alive.load(.seq_cst) == 0) return;
     if (!hasPendingLocationWork(binding)) return;
-    const url = if (filename == null) "" else std.mem.span(filename);
-    const hook_column: i32 = if (column > 0) column - 1 else 0;
+    const raw_url = if (filename == null) "" else std.mem.span(filename);
+    const url = dupeSourceUrl(binding.instance_id, script_tag, raw_url) catch return;
+    defer std.heap.c_allocator.free(url);
+    // Escargot exposes executable locations at line granularity; preserve native frame columns for CDP presentation but normalize control-flow matching to avoid a same-line `debugger;` re-pause after resume.
+    const hook_column: i32 = if (comptime backend.isEscargotBackend(backend.active_backend)) 0 else if (column > 0) column - 1 else 0;
+    const frame_token = nativeFrameToken(ctx);
     const explicit_pause = binding.break_requested.load(.seq_cst) != 0;
-    if (!explicit_pause and consumeSkip(binding, url, line, hook_column, depth, script_tag)) return;
-    if (!explicit_pause and finishStepOut(binding, url, line, hook_column, depth, script_tag)) return;
+    if (!explicit_pause and consumeSkip(binding, url, line, hook_column, depth, script_tag, frame_token, repeated)) return;
     if (!explicit_pause and isBlackboxed(binding, url)) return;
-    const reason = shouldPause(binding, url, line, hook_column, depth, script_tag) orelse return;
-    enterPause(binding, url, line, hook_column, depth, reason, script_tag);
+    const reason = shouldPause(binding, url, line, hook_column, depth, script_tag, frame_token, repeated, breakpoint_eligible) orelse return;
+    enterPause(binding, url, line, hook_column, depth, reason, script_tag, frame_token);
 }
 
 fn exceptionTrampoline(
@@ -1601,13 +1670,18 @@ fn exceptionTrampoline(
     pauseAtTopFrame(binding, .exception);
 }
 
-fn debuggerTrampoline(_: ?*anyopaque, opaque_ptr: ?*anyopaque) callconv(.c) void {
-    const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return));
-    if (binding.skip_all_pauses.load(.seq_cst) != 0) return;
-    if (binding.suppress.load(.seq_cst) != 0) return;
-    if (binding.alive.load(.seq_cst) == 0) return;
-    if (binding.break_on_debugger.load(.seq_cst) == 0) return;
+fn debuggerTrampoline(ctx: ?*anyopaque, opaque_ptr: ?*anyopaque) callconv(.c) void {
+    _ = escargotDebuggerTrampoline(ctx, opaque_ptr);
+}
+
+fn escargotDebuggerTrampoline(_: ?*anyopaque, opaque_ptr: ?*anyopaque) callconv(.c) bool {
+    const binding: *Binding = @ptrCast(@alignCast(opaque_ptr orelse return false));
+    if (binding.skip_all_pauses.load(.seq_cst) != 0) return false;
+    if (binding.suppress.load(.seq_cst) != 0) return false;
+    if (binding.alive.load(.seq_cst) == 0) return false;
+    if (binding.break_on_debugger.load(.seq_cst) == 0) return false;
     pauseAtTopFrame(binding, .other);
+    return true;
 }
 
 fn pauseAtTopFrame(binding: *Binding, reason: PauseReason) void {
@@ -1618,13 +1692,20 @@ fn pauseAtTopFrame(binding: *Binding, reason: PauseReason) void {
     var column: i32 = 0;
     var depth: i32 = 0;
     var script_tag: u64 = 0;
+    var frame_token: u64 = 0;
     if (stack.len > 0) {
         const frame = stack[0];
         url_len = @min(frame.url.len, url_buf.len);
         if (url_len > 0) @memcpy(url_buf[0..url_len], frame.url[0..url_len]);
         line = frame.line;
         column = frame.column;
-        depth = @intCast(stack.len);
+        if (engine.getContext(binding.instance_id)) |ctx| {
+            depth = if (comptime backend.isEscargotBackend(backend.active_backend))
+                backend.ActiveEngineModule.c_api.escargot_debugger_depth(ctx)
+            else
+                backend.ActiveEngineModule.c_api.qjs.JS_GetDebugStackDepth(ctx);
+            frame_token = nativeFrameToken(@ptrCast(ctx));
+        }
         script_tag = frame.script_tag;
         for (stack) |item| {
             if (item.name.len > 0) std.heap.c_allocator.free(item.name);
@@ -1632,7 +1713,7 @@ fn pauseAtTopFrame(binding: *Binding, reason: PauseReason) void {
         }
         std.heap.c_allocator.free(stack);
     }
-    enterPause(binding, url_buf[0..url_len], line, column, depth, reason, script_tag);
+    enterPause(binding, url_buf[0..url_len], line, column, depth, reason, script_tag, frame_token);
 }
 
 fn enterPause(
@@ -1643,11 +1724,13 @@ fn enterPause(
     depth: i32,
     reason: PauseReason,
     script_tag: u64,
+    frame_token: u64,
 ) void {
     binding.mutex.lock();
     binding.mode = .run;
     refreshSteppingOrSkipPendingLocked(binding);
     binding.paused_depth = depth;
+    binding.paused_frame_token = frame_token;
     binding.paused_reason = reason;
     binding.paused_script_tag = script_tag;
     const n = @min(url.len, binding.paused_url.len);

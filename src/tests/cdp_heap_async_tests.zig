@@ -119,8 +119,8 @@ fn usedSize(payload: []const u8) !i64 {
     return std.fmt.parseInt(i64, rest[0..end], 10);
 }
 
-test "cdp: QuickJS rejects unsupported debugger commands while keeping async stacks available" {
-    if (comptime backend.active_backend != .quickjs) return;
+test "cdp: Safari backends reject CDP execution commands while keeping async stacks available" {
+    if (comptime !backend.isJscApiBackend(backend.active_backend)) return error.SkipZigTest;
     const alloc = testing.allocator;
     var session = try openSession(alloc, "cdp-quickjs-debugger-capabilities");
     defer session.deinit();

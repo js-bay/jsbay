@@ -28,7 +28,6 @@ JSValue jsbay_qjs_JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
     if (JS_IsException(val)) js_free(ctx, data);
     return val;
 }
-
 static atomic_flag qjs_class_ids_lock = ATOMIC_FLAG_INIT;
 static _Atomic JSClassID qjs_array_buffer_class_id;
 static _Atomic JSClassID qjs_typed_array_class_ids[12];
@@ -269,18 +268,3 @@ JSValue JS_NewInternalError(JSContext *ctx, const char *fmt, ...) {
     }
     return error;
 }
-
-#if JSBAY_INSPECTOR
-typedef void JSLocationHandler(JSContext *, const char *, int, int, int, void *);
-typedef void JSExceptionHandler(JSContext *, int, void *);
-typedef void JSDebuggerHandler(JSContext *, void *);
-void JS_SetLocationHandler(JSRuntime *rt, JSLocationHandler *cb, void *opaque) { (void)rt; (void)cb; (void)opaque; }
-void JS_RequestLocationCallback(JSRuntime *rt) { (void)rt; }
-void JS_SetExceptionHandler(JSRuntime *rt, JSExceptionHandler *cb, void *opaque) { (void)rt; (void)cb; (void)opaque; }
-void JS_SetDebuggerHandler(JSRuntime *rt, JSDebuggerHandler *cb, void *opaque) { (void)rt; (void)cb; (void)opaque; }
-JSValue JS_CopyDebugScope(JSContext *ctx, int frame_index, int scope) { (void)frame_index; (void)scope; return JS_UNDEFINED; }
-JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, size_t len) {
-    (void)frame_index; (void)expr; (void)len;
-    return JS_ThrowTypeError(ctx, "%s", "Frame evaluation is unavailable in QuickJS");
-}
-#endif

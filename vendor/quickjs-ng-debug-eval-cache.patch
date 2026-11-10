@@ -1,62 +1,203 @@
+diff --git a/quickjs.c b/quickjs.c
+index 14d1672..bec5a93 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -637,6 +637,9 @@
+@@ -651,6 +651,11 @@ struct JSContext {
      JSValue array_proto_values;
      JSValue throw_type_error;
      JSValue eval_obj;
 +#if JSBAY_INSPECTOR
-+    JSValue debugger_eval_helper;
++    JSValue debugger_eval_sloppy_factory;
++    JSValue debugger_eval_strict_factory;
++    JSValue debugger_eval_tdz_factory;
 +#endif
  
      JSValue global_obj; /* global object */
      JSValue global_var_obj; /* contains the global let/const definitions */
-@@ -2746,11 +2749,15 @@
-         return JS_EXCEPTION;
+@@ -2812,61 +2817,25 @@ static void jsbay_mark_debug_eval_helper(JSValue value)
+         jsbay_mark_debug_eval_helper(bytecode->cpool[index]);
+ }
+ 
+-static char *jsbay_debug_eval_source(JSContext *ctx, const char *expr, size_t len, bool strict, bool tdz)
+-{
+-    static const char hex[] = "0123456789abcdef";
+-    const char *prefix = tdz ? "(function(){with(arguments[0]){return class extends null{constructor(){return {value:eval(\"" : strict ? "(function(){with(arguments[0]){return function(){'use strict';return eval(\"" : "(function(){with(arguments[0]){return function(){return eval(\"";
+-    const char *suffix = tdz ? "\")};}}}})" : "\")};}})";
+-    char *out, *p;
+-    size_t index, cap;
+-
+-    if (len > (SIZE_MAX - 256) / 6)
+-        return NULL;
+-    cap = len * 6 + 256;
+-    out = js_malloc(ctx, cap);
+-    if (!out)
+-        return NULL;
+-    p = out;
+-    memcpy(p, prefix, strlen(prefix));
+-    p += strlen(prefix);
+-    for (index = 0; index < len; index++) {
+-        unsigned char c = (unsigned char)expr[index];
+-        if (c == '\\' || c == '\"') {
+-            *p++ = '\\';
+-            *p++ = c;
+-        } else if (c < 0x20) {
+-            memcpy(p, "\\u00", 4);
+-            p += 4;
+-            *p++ = hex[c >> 4];
+-            *p++ = hex[c & 15];
+-        } else if (c == 0xe2 && index + 2 < len && (unsigned char)expr[index + 1] == 0x80 && ((unsigned char)expr[index + 2] == 0xa8 || (unsigned char)expr[index + 2] == 0xa9)) {
+-            memcpy(p, (unsigned char)expr[index + 2] == 0xa8 ? "\\u2028" : "\\u2029", 6);
+-            p += 6;
+-            index += 2;
+-        } else {
+-            *p++ = c;
+-        }
+-    }
+-    memcpy(p, suffix, strlen(suffix));
+-    p += strlen(suffix);
+-    *p = '\0';
+-    return out;
+-}
+-
+ JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, size_t len)
+ {
++    static const char sloppy_factory_source[] = "(function(){with(arguments[0]){return function(){return eval(arguments[0]);};}})";
++    static const char strict_factory_source[] = "(function(){with(arguments[0]){return function(){'use strict';return eval(arguments[0]);};}})";
++    static const char tdz_factory_source[] = "(function(){with(arguments[0]){return class extends null{constructor(){return {value:eval(arguments[0])};}}}})";
+     JSStackFrame *sf = js_debug_frame(ctx, frame_index);
+     JSObject *function = sf && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT ? JS_VALUE_GET_OBJ(sf->cur_func) : NULL;
+     JSFunctionBytecode *bytecode = function && js_class_has_bytecode(function->class_id) ? function->u.func.function_bytecode : NULL;
+     JSValue local = js_debug_local_variables(ctx, sf);
+     JSValue closure = js_debug_closure_variables(ctx, sf);
+-    JSValue helper, runner;
++    JSValue helper, runner, expression;
+     JSValue global;
+     JSValue result;
+     int has_this;
+     bool this_tdz;
+     JSValue this_value;
+-    char *source;
++    JSValue *factory;
++    const char *factory_source;
++    size_t factory_source_len;
+     JSScriptTagHandler *saved_source_handler;
+ 
+     if (JS_IsException(local) || JS_IsException(closure)) {
+@@ -2887,29 +2856,48 @@ JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, s
+         this_tdz = JS_IsUninitialized(this_value);
+         JS_FreeValue(ctx, this_value);
      }
-     JS_FreeValue(ctx, closure);
--    helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, "<debugger>", JS_EVAL_TYPE_GLOBAL);
+-    source = jsbay_debug_eval_source(ctx, expr, len, bytecode && bytecode->is_strict_mode, this_tdz);
+-    if (!source) {
+-        JS_FreeValue(ctx, local);
+-        return JS_ThrowOutOfMemory(ctx);
++    if (this_tdz) {
++        factory = &ctx->debugger_eval_tdz_factory;
++        factory_source = tdz_factory_source;
++        factory_source_len = sizeof(tdz_factory_source) - 1;
++    } else if (bytecode && bytecode->is_strict_mode) {
++        factory = &ctx->debugger_eval_strict_factory;
++        factory_source = strict_factory_source;
++        factory_source_len = sizeof(strict_factory_source) - 1;
++    } else {
++        factory = &ctx->debugger_eval_sloppy_factory;
++        factory_source = sloppy_factory_source;
++        factory_source_len = sizeof(sloppy_factory_source) - 1;
+     }
+-    saved_source_handler = ctx->rt->script_tag_handler;
+-    ctx->rt->script_tag_handler = NULL;
+-    helper = JS_Eval(ctx, source, strlen(source), "<debugger>", JS_EVAL_TYPE_GLOBAL);
+-    ctx->rt->script_tag_handler = saved_source_handler;
+-    js_free(ctx, source);
 -    if (JS_IsException(helper)) {
 -        JS_FreeValue(ctx, local);
 -        return helper;
--    }
-+    if (JS_IsUndefined(ctx->debugger_eval_helper)) {
-+        helper = JS_Eval(ctx, helper_source, sizeof(helper_source) - 1, "<debugger>", JS_EVAL_TYPE_GLOBAL);
++    if (JS_IsUndefined(*factory)) {
++        saved_source_handler = ctx->rt->script_tag_handler;
++        ctx->rt->script_tag_handler = NULL;
++        helper = JS_Eval(ctx, factory_source, factory_source_len, "<debugger>", JS_EVAL_TYPE_GLOBAL);
++        ctx->rt->script_tag_handler = saved_source_handler;
 +        if (JS_IsException(helper)) {
 +            JS_FreeValue(ctx, local);
 +            return helper;
 +        }
-+        ctx->debugger_eval_helper = helper;
++        jsbay_mark_debug_eval_helper(helper);
++        *factory = helper;
 +    }
-+    helper = JS_DupValue(ctx, ctx->debugger_eval_helper);
-     expression = JS_NewStringLen(ctx, expr, len);
-     if (JS_IsException(expression)) {
++    helper = JS_DupValue(ctx, *factory);
++    expression = JS_NewStringLen(ctx, expr, len);
++    if (JS_IsException(expression)) {
++        JS_FreeValue(ctx, helper);
++        JS_FreeValue(ctx, local);
++        return expression;
+     }
+-    jsbay_mark_debug_eval_helper(helper);
+     has_this = JS_HasProperty(ctx, local, JS_ATOM_this);
+     if (has_this < 0) {
++        JS_FreeValue(ctx, expression);
          JS_FreeValue(ctx, helper);
-@@ -3212,6 +3219,9 @@
+         JS_FreeValue(ctx, local);
+         return JS_EXCEPTION;
+     }
+     global = JS_GetPropertyStr(ctx, local, "this");
+     if (JS_IsException(global)) {
++        JS_FreeValue(ctx, expression);
+         JS_FreeValue(ctx, helper);
+         JS_FreeValue(ctx, local);
+         return JS_EXCEPTION;
+@@ -2922,7 +2910,7 @@ JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, s
+     if (JS_IsException(runner))
+         result = runner;
+     else if (this_tdz) {
+-        JSValue boxed = JS_CallConstructor(ctx, runner, 0, NULL);
++        JSValue boxed = JS_CallConstructor(ctx, runner, 1, &expression);
+         if (JS_IsException(boxed))
+             result = boxed;
+         else {
+@@ -2931,9 +2919,10 @@ JSValue JS_EvalInDebugFrame(JSContext *ctx, int frame_index, const char *expr, s
+         }
+     }
+     else
+-        result = JS_Call(ctx, runner, global, 0, NULL);
++        result = JS_Call(ctx, runner, global, 1, &expression);
+     JS_FreeValue(ctx, runner);
+     JS_FreeValue(ctx, global);
++    JS_FreeValue(ctx, expression);
+     JS_FreeValue(ctx, helper);
+     JS_FreeValue(ctx, local);
+     return result;
+@@ -3415,6 +3404,11 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
      ctx->error_back_trace = JS_UNDEFINED;
      ctx->error_prepare_stack = JS_UNDEFINED;
      ctx->error_stack_trace_limit = js_int32(10);
 +#if JSBAY_INSPECTOR
-+    ctx->debugger_eval_helper = JS_UNDEFINED;
++    ctx->debugger_eval_sloppy_factory = JS_UNDEFINED;
++    ctx->debugger_eval_strict_factory = JS_UNDEFINED;
++    ctx->debugger_eval_tdz_factory = JS_UNDEFINED;
 +#endif
      init_list_head(&ctx->loaded_modules);
      // TODO(bnoordhuis) use getrandom() etc.
      ctx->random_state = js__gettimeofday_us();
-@@ -3333,6 +3343,9 @@
+@@ -3536,6 +3530,11 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
  
      JS_MarkValue(rt, ctx->throw_type_error, mark_func);
      JS_MarkValue(rt, ctx->eval_obj, mark_func);
 +#if JSBAY_INSPECTOR
-+    JS_MarkValue(rt, ctx->debugger_eval_helper, mark_func);
++    JS_MarkValue(rt, ctx->debugger_eval_sloppy_factory, mark_func);
++    JS_MarkValue(rt, ctx->debugger_eval_strict_factory, mark_func);
++    JS_MarkValue(rt, ctx->debugger_eval_tdz_factory, mark_func);
 +#endif
  
      JS_MarkValue(rt, ctx->array_proto_values, mark_func);
      for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
-@@ -3415,6 +3428,9 @@
+@@ -3618,6 +3617,11 @@ void JS_FreeContext(JSContext *ctx)
  
      JS_FreeValue(ctx, ctx->throw_type_error);
      JS_FreeValue(ctx, ctx->eval_obj);
 +#if JSBAY_INSPECTOR
-+    JS_FreeValue(ctx, ctx->debugger_eval_helper);
++    JS_FreeValue(ctx, ctx->debugger_eval_sloppy_factory);
++    JS_FreeValue(ctx, ctx->debugger_eval_strict_factory);
++    JS_FreeValue(ctx, ctx->debugger_eval_tdz_factory);
 +#endif
  
      JS_FreeValue(ctx, ctx->array_proto_values);
