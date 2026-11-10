@@ -44,13 +44,13 @@ pub fn main(init: std.process.Init) !void {
     var client = try wir.Client.connect(allocator, init.io, options.socket.?);
     defer client.deinit();
 
-    const target = try wir.attach(client, options.application, options.target, 10_000);
+    // The bridge holds its own copy of the identifiers; this one keeps them alive for the probe path and releases them on the way out.
+    var target = try wir.attach(client, options.application, options.target, 10_000);
+    defer target.deinit(allocator);
     try print(init, "attached: application={s} page={d} title={s}\n", .{ target.application_name, target.page, target.title });
 
     if (options.probe) {
-        var probe_target = target;
-        defer probe_target.deinit(allocator);
-        try probe(init, allocator, client, &probe_target);
+        try probe(init, allocator, client, &target);
         return;
     }
 
