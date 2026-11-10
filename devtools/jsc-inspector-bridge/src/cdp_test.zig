@@ -3,6 +3,7 @@
 const std = @import("std");
 const cdp = @import("cdp.zig");
 const wir = @import("wir.zig");
+const plist = @import("plist.zig");
 const zev = @import("zev");
 const transport = @import("inspector_transport");
 
@@ -537,7 +538,7 @@ test "a reply the transport cannot carry becomes an error for the request that a
     try std.testing.expectEqual(@as(usize, 1), harness.sessionCount());
 }
 
-test "scope merges are dropped when execution resumes" {
+test "scope pairing ends when the target reports that it resumed" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var harness = try Harness.create(arena.allocator());
@@ -545,11 +546,29 @@ test "scope merges are dropped when execution resumes" {
     harness.bridge.openSession(1);
     harness.bridge.deliver(paused_with_scopes);
 
+    // A resume the client asked for but the target has not confirmed leaves the pairing in place.
     harness.bridge.onMessage(1, "{\"id\":8,\"method\":\"Debugger.resume\"}");
     harness.bridge.onMessage(1, "{\"id\":9,\"method\":\"Runtime.getProperties\",\"params\":{\"objectId\":\"local-1\"}}");
+    try std.testing.expectEqual(@as(usize, 3), (try harness.relay.commands(arena.allocator())).items.len);
 
-    // One forwarded resume plus one plain getProperties: the pause's scope pairing is gone, so there is no second command.
-    try std.testing.expectEqual(@as(usize, 2), (try harness.relay.commands(arena.allocator())).items.len);
+    harness.bridge.deliver("{\"method\":\"Debugger.resumed\"}");
+    harness.bridge.onMessage(1, "{\"id\":10,\"method\":\"Runtime.getProperties\",\"params\":{\"objectId\":\"local-1\"}}");
+
+    // The pause is over, so the scope pairing is gone and the next request forwards one command.
+    try std.testing.expectEqual(@as(usize, 4), (try harness.relay.commands(arena.allocator())).items.len);
+}
+
+test "a disconnect for another application does not end the session" {
+    const mine = plist.Value{ .dict = &.{
+        .{ .key = "WIRApplicationIdentifierKey", .value = .{ .string = "PID:41" } },
+    } };
+    const other = plist.Value{ .dict = &.{
+        .{ .key = "WIRApplicationIdentifierKey", .value = .{ .string = "PID:42" } },
+    } };
+    try std.testing.expect(cdp.isTargetDisconnect("_rpc_applicationDisconnected:", mine, "PID:41"));
+    try std.testing.expect(!cdp.isTargetDisconnect("_rpc_applicationDisconnected:", other, "PID:41"));
+    try std.testing.expect(!cdp.isTargetDisconnect("_rpc_applicationSentListing:", mine, "PID:41"));
+    try std.testing.expect(!cdp.isTargetDisconnect("_rpc_applicationDisconnected:", .null, "PID:41"));
 }
 
 test "a breakpoint column survives for a single-line script and is dropped elsewhere" {

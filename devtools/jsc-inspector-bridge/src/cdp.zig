@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const wir = @import("wir.zig");
+const plist = @import("plist.zig");
 const transport = @import("inspector_transport");
 const zev = @import("zev");
 
@@ -88,6 +89,8 @@ pub const Frontend = struct {
 /// Adapts a live relay connection to the `Relay` interface.
 pub const WireRelay = struct {
     client: *wir.Client,
+    /// Application the bridge attached to. The relay reports disconnects for other applications on the same connection.
+    application: []const u8,
 
     fn connectFrontend(ctx: *anyopaque, target: *const wir.Target) void {
         const self: *WireRelay = @ptrCast(@alignCast(ctx));
@@ -113,8 +116,8 @@ pub const WireRelay = struct {
         const self: *WireRelay = @ptrCast(@alignCast(ctx));
         var message = (try self.client.next(timeout_ms)) orelse return null;
         defer message.deinit(self.client.allocator);
-        // One relay connection watches one application, so a disconnect notification is always about the target this bridge attached to.
-        if (std.mem.eql(u8, message.name, "_rpc_applicationDisconnected:")) return error.TargetDisconnected;
+        if (isTargetDisconnect(message.name, message.info, self.application)) return error.TargetDisconnected;
+        if (std.mem.eql(u8, message.name, "_rpc_applicationDisconnected:")) return null;
         if (!std.mem.eql(u8, message.name, "_rpc_applicationSentData:")) return null;
         const data = switch (message.info.get("WIRMessageDataKey") orelse return null) {
             .data => |bytes| bytes,
@@ -133,6 +136,16 @@ pub const WireRelay = struct {
         } };
     }
 };
+
+/// True when a relay notification reports that the application this bridge attached to is gone. The relay also reports disconnects for applications it merely listed, and those must not end the session.
+pub fn isTargetDisconnect(name: []const u8, info: plist.Value, application: []const u8) bool {
+    if (!std.mem.eql(u8, name, "_rpc_applicationDisconnected:")) return false;
+    const disconnected = switch (info.get("WIRApplicationIdentifierKey") orelse return false) {
+        .string => |text| text,
+        else => return false,
+    };
+    return std.mem.eql(u8, disconnected, application);
+}
 
 /// The loopback transport refuses a message that would overflow its queue and, for a CDP session, closes it. A reply has to stay below that limit or the client would lose the session instead of seeing an error.
 const max_frontend_bytes: usize = 3 * 1024 * 1024;
@@ -230,7 +243,8 @@ pub const Bridge = struct {
 
     pub fn start(allocator: Allocator, io: std.Io, client: *wir.Client, target: wir.Target, port: u16) !*Bridge {
         const wire = try allocator.create(WireRelay);
-        wire.* = .{ .client = client };
+        errdefer allocator.destroy(wire);
+        wire.* = .{ .client = client, .application = target.application };
         const transport_owner = try allocator.create(TransportFrontend);
         errdefer allocator.destroy(transport_owner);
         transport_owner.* = .{ .transport = try transport.Transport.init(allocator, port) };
@@ -331,19 +345,21 @@ pub const Bridge = struct {
         self.frontend_mutex.lock();
         defer self.frontend_mutex.unlock();
         self.mutex.lock();
-        const ids = self.allocator.alloc(transport.SessionId, self.sessions.items.len) catch {
-            self.mutex.unlock();
-            return;
-        };
-        for (self.sessions.items, 0..) |session, index| ids[index] = session.id;
-        for (ids) |id| self.dropSessionState(id);
+        // One client at a time is the contract, so a fixed buffer covers every session that can be open.
+        var ids: [4]transport.SessionId = undefined;
+        var count: usize = 0;
+        for (self.sessions.items) |session| {
+            if (count == ids.len) break;
+            ids[count] = session.id;
+            count += 1;
+        }
+        for (ids[0..count]) |id| self.dropSessionState(id);
         self.sessions.clearRetainingCapacity();
         self.clearScopeMergesLocked();
         replaceSite(self.allocator, &self.last_caller, null);
         replaceSite(self.allocator, &self.armed_caller, null);
         self.mutex.unlock();
-        defer self.allocator.free(ids);
-        for (ids) |id| self.frontend.closeSession(id);
+        for (ids[0..count]) |id| self.frontend.closeSession(id);
     }
 
     fn handleEvent(ctx: ?*anyopaque, event: transport.Event) void {
@@ -495,11 +511,8 @@ pub const Bridge = struct {
         std.json.Stringify.value(std.json.Value{ .object = envelope }, .{}, &writer.writer) catch return;
         if (std.mem.eql(u8, name, "Debugger.stepOut")) {
             armStepOut(self);
-        } else if (std.mem.eql(u8, name, "Debugger.resume") or std.mem.eql(u8, name, "Debugger.stepOver") or std.mem.eql(u8, name, "Debugger.stepInto") or std.mem.eql(u8, name, "Debugger.continueToLocation")) {
+        } else if (std.mem.eql(u8, name, "Debugger.resume") or std.mem.eql(u8, name, "Debugger.stepOver") or std.mem.eql(u8, name, "Debugger.stepInto") or std.mem.eql(u8, name, "Debugger.continueToLocation") or std.mem.eql(u8, name, "Debugger.stepOut")) {
             clearCaller(self);
-            self.mutex.lock();
-            self.clearScopeMergesLocked();
-            self.mutex.unlock();
         }
         self.relay.sendData(&self.target, writer.written());
         if (std.mem.eql(u8, name, "Runtime.enable")) self.sendExecutionContext(session_id);
@@ -774,10 +787,6 @@ pub const Bridge = struct {
     fn broadcast(self: *Bridge, allocator: Allocator, object: std.json.ObjectMap) void {
         var writer: std.Io.Writer.Allocating = .init(allocator);
         std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &writer.writer) catch return;
-        if (writer.written().len > max_frontend_bytes) {
-            logDrop("event larger than the transport accepts");
-            return;
-        }
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items) |session| {
@@ -1108,6 +1117,12 @@ fn postProcessEvent(self: *Bridge, allocator: Allocator, object: std.json.Object
         .string => |text| text,
         else => return object,
     };
+    // The relay sends this notification without params, so it is handled before the params check. The pause that owned the scope pairing is over, however execution resumed; a resume command the target rejected keeps the pairing because the target stays paused.
+    if (std.mem.eql(u8, method, "Debugger.resumed")) {
+        self.mutex.lock();
+        self.clearScopeMergesLocked();
+        self.mutex.unlock();
+    }
     const params_value = object.getPtr("params") orelse return object;
     var params = switch (params_value.*) {
         .object => |*map| map,
