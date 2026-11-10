@@ -692,8 +692,7 @@ static void loopDispatch(napi_env env, napi_value callback, void *context, void 
     if (!binding)
         return;
     binding->pending.store(false, std::memory_order_release);
-    if (!binding->active.load(std::memory_order_acquire) ||
-        binding->engine->closed)
+    if (!binding->active.load(std::memory_order_acquire) || binding->engine->closed)
         return;
     uint64_t generation, delay;
     bool clear_only = false;
