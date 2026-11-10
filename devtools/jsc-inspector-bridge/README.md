@@ -72,11 +72,11 @@ The macOS relay has no UNIX socket. `webinspectord` publishes only the `com.appl
 
 These come from the JSC target and its relay protocol rather than from the bridge:
 
-- Pause on exceptions is accepted by JSC but no pause is delivered for thrown exceptions in the tested simulator targets.
 - A step out that leaves a JavaScript callback which a native frame called resumes execution instead of pausing in the calling JavaScript frame, because the relay cannot step across native frames.
+- Breakpoints are statement granular, so two breakpoints that resolve to the same statement collapse into one and the relay rejects the second as an existing location.
 - Console API calls are not visible. JSC reports console output to the console client the host application installs, and the relay receives nothing, so CDP frontends show no `Runtime.consoleAPICalled` events. Breakpoints, stepping, and evaluation are unaffected. A host that reports its console messages to the Web Inspector console client makes them available to the relay.
 - Block-scoped bindings are reported in a separate `block` scope. Frontends that merge block bindings into the frame's local scope show fewer names in the local scope.
-- Breakpoints are statement granular: an offset inside a multi-line expression resolves to the start of the statement that contains it.
+- A breakpoint offset inside a multi-line expression resolves to the start of the statement that contains it.
 
 ## Tests
 

@@ -103,7 +103,7 @@ The bridge covers `Runtime` and `Debugger`: evaluation, property inspection, sou
 
 Supported path: iOS Simulator, using the relay socket reported by `RWI_LISTEN_SOCKET`. macOS is not supported by this transport: the macOS relay has no socket, and both Web Inspector mach services interrupt third-party XPC clients that lack Apple's private Web Inspector entitlements. Physical device support is unverified.
 
-Known target gaps on the Simulator: JSC accepts `Debugger.setPauseOnExceptions` but does not deliver a pause for thrown exceptions, a step out of a JavaScript callback that a native frame called resumes instead of pausing in the caller, console API calls stay with the host console client and never reach the relay, block bindings appear in a separate scope, and breakpoints are statement granular. The CDP debugger flow of `tests/inspector/e2e.cjs` passes against the bridge except the steps that assert those behaviors.
+Known target gaps on the Simulator: a step out of a JavaScript callback that a native frame called resumes instead of pausing in the caller, console API calls stay with the host console client and never reach the relay, block bindings appear in a separate scope, and breakpoints are statement granular, so two breakpoints that resolve to the same statement cannot coexist. The CDP debugger flow of `tests/inspector/e2e.cjs` passes against the bridge except the steps that assert those behaviors. Exception pauses work, including a pause inside `Runtime.evaluate` and frame evaluation while the application exception is in flight.
 
 ### iOS 26.5 system JavaScriptCore teardown limitation
 
