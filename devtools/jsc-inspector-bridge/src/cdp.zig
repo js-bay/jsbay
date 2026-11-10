@@ -23,12 +23,28 @@ pub const Bridge = struct {
     pending: std.AutoHashMapUnmanaged(u64, Pending) = .empty,
     merges: std.AutoHashMapUnmanaged(u64, Merge) = .empty,
     scope_merges: std.StringHashMapUnmanaged([]u8) = .empty,
-    scripts: std.StringHashMapUnmanaged([]u8) = .empty,
+    scripts: std.StringHashMapUnmanaged(Script) = .empty,
+    last_caller: ?CallerSite = null,
+    armed_caller: ?CallerSite = null,
     next_id: u64 = 1,
     next_merge: u64 = 1,
 
     const Session = struct {
         id: transport.SessionId,
+    };
+
+    const Script = struct {
+        url: []u8,
+        end_line: i64,
+        end_column: i64,
+    };
+
+    /// A pause position that a `Debugger.stepOut` returns to, taken from the frame below the frame being stepped out of.
+    const CallerSite = struct {
+        script_id: []u8,
+        function_name: []u8,
+        line: i64,
+        column: i64,
     };
 
     const Pending = struct {
@@ -105,10 +121,14 @@ pub const Bridge = struct {
 
     fn openSession(self: *Bridge, id: transport.SessionId) void {
         self.mutex.lock();
-        defer self.mutex.unlock();
+        const first = self.sessions.items.len == 0;
         self.sessions.append(self.allocator, .{ .id = id }) catch {
-            self.transport.closeSession(id);
+            self.mutex.unlock();
+            return self.transport.closeSession(id);
         };
+        self.mutex.unlock();
+        // The relay forgets the frontend sender when the last client detached, so a later client needs it registered again before commands reach the target.
+        if (first) self.client.connectFrontend(&self.target) catch {};
     }
 
     fn closeSession(self: *Bridge, id: transport.SessionId) void {
@@ -157,7 +177,7 @@ pub const Bridge = struct {
         if (!isRelayMethod(name)) return self.localReply(session_id, id, name);
         if (std.mem.eql(u8, name, "Debugger.getScriptSource")) {
             const known = if (params == .object) switch (params.object.get("scriptId") orelse std.json.Value{ .null = {} }) {
-                .string => |script_id| scriptUrl(self, script_id) != null,
+                .string => |script_id| hasScript(self, script_id),
                 else => false,
             } else false;
             if (!known) return self.replyError(session_id, id, -32602, "Unknown scriptId");
@@ -180,11 +200,25 @@ pub const Bridge = struct {
 
         var writer: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = envelope }, .{}, &writer.writer) catch return;
+        if (std.mem.eql(u8, name, "Debugger.stepOut")) {
+            armStepOut(self);
+        } else if (std.mem.eql(u8, name, "Debugger.resume") or std.mem.eql(u8, name, "Debugger.stepOver") or std.mem.eql(u8, name, "Debugger.stepInto") or std.mem.eql(u8, name, "Debugger.continueToLocation")) {
+            clearCaller(self);
+        }
         self.client.sendData(&self.target, self.client.sender_id, writer.written()) catch {};
+        if (std.mem.eql(u8, name, "Runtime.enable")) self.sendExecutionContext(session_id);
         // A Web Inspector frontend activates breakpoints after enabling the debugger. JSC does not pause at a resolved breakpoint until that switch is on.
         if (std.mem.eql(u8, name, "Debugger.enable")) {
             self.client.sendData(&self.target, self.client.sender_id, "{\"id\":1000000,\"method\":\"Debugger.setBreakpointsActive\",\"params\":{\"active\":true}}") catch {};
+            // JSC only pauses at `debugger` statements when the frontend arms this WebKit-specific switch. CDP has no equivalent command.
+            self.client.sendData(&self.target, self.client.sender_id, "{\"id\":1000001,\"method\":\"Debugger.setPauseOnDebuggerStatements\",\"params\":{\"enabled\":true}}") catch {};
         }
+    }
+
+    /// JSC keeps its single JavaScript context in the inspected process and never announces it, while CDP clients wait for `Runtime.executionContextCreated` before they can evaluate anything.
+    fn sendExecutionContext(self: *Bridge, session_id: transport.SessionId) void {
+        const event = "{\"method\":\"Runtime.executionContextCreated\",\"params\":{\"context\":{\"id\":1,\"origin\":\"\",\"name\":\"jsbay\",\"uniqueId\":\"jsbay-context-1\",\"auxData\":{\"isDefault\":true,\"type\":\"default\"}}}}";
+        _ = self.transport.sendText(session_id, event);
     }
 
     fn localReply(self: *Bridge, session_id: transport.SessionId, id: std.json.Value, name: []const u8) void {
@@ -448,10 +482,22 @@ const evaluate_on_call_frame_keys = [_][]const u8{
     "returnByValue", "generatePreview", "emulateUserGesture",
 };
 
+/// JSC only stops on statement boundaries, so an offset inside an expression resolves to a later statement, often on the next line. Keeping the line and dropping the offset stops at the requested statement instead, which is what the Safari Web Inspector does.
+fn dropStatementOffset(params: *std.json.ObjectMap) void {
+    if (params.getPtr("columnNumber")) |column| {
+        if (column.* == .integer and column.integer > 0) column.* = .{ .integer = 0 };
+    }
+    const location = params.getPtr("location") orelse return;
+    if (location.* != .object) return;
+    if (location.object.getPtr("columnNumber")) |column| {
+        if (column.* == .integer and column.integer > 0) column.* = .{ .integer = 0 };
+    }
+}
+
 fn translateParams(allocator: Allocator, method: []const u8, params: std.json.Value) !?std.json.Value {
     if (params != .object) return null;
     const source = params.object;
-    if (std.mem.eql(u8, method, "Debugger.setBreakpointByUrl") or std.mem.eql(u8, method, "Debugger.setBreakpoint")) {
+    if (std.mem.eql(u8, method, "Debugger.setBreakpointByUrl") or std.mem.eql(u8, method, "Debugger.setBreakpoint") or std.mem.eql(u8, method, "Debugger.continueToLocation")) {
         var filtered = std.json.ObjectMap{};
         var iterator = source.iterator();
         while (iterator.next()) |entry| filtered.put(allocator, entry.key_ptr.*, entry.value_ptr.*) catch {};
@@ -461,6 +507,7 @@ fn translateParams(allocator: Allocator, method: []const u8, params: std.json.Va
             filtered.put(allocator, "options", .{ .object = options }) catch {};
             _ = filtered.swapRemove("condition");
         }
+        dropStatementOffset(&filtered);
         return .{ .object = filtered };
     }
     const allowed: ?[]const []const u8 = if (std.mem.eql(u8, method, "Runtime.evaluate"))
@@ -478,13 +525,25 @@ fn translateParams(allocator: Allocator, method: []const u8, params: std.json.Va
         for (keys) |key| {
             if (source.get(key)) |value| filtered.put(allocator, key, value) catch {};
         }
+        // The bridge advertises one synthetic context; the relay addresses the only context the target has.
+        _ = filtered.swapRemove("contextId");
+        _ = filtered.swapRemove("uniqueContextId");
         return .{ .object = filtered };
     }
     return .{ .object = source };
 }
 
 fn scriptUrl(self: *Bridge, script_id: []const u8) ?[]const u8 {
-    return self.scripts.get(script_id);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const script = self.scripts.get(script_id) orelse return null;
+    return script.url;
+}
+
+fn hasScript(self: *Bridge, script_id: []const u8) bool {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    return self.scripts.contains(script_id);
 }
 
 fn recordScript(self: *Bridge, params: std.json.ObjectMap) void {
@@ -501,8 +560,144 @@ fn recordScript(self: *Bridge, params: std.json.ObjectMap) void {
         else => "",
     };
     const url = if (raw_url.len != 0) raw_url else source_url;
-    const owned = self.allocator.dupe(u8, url) catch return;
-    if (self.scripts.fetchPut(self.allocator, script_id, owned) catch null) |previous| self.allocator.free(previous.value);
+    const owned_url = self.allocator.dupe(u8, url) catch return;
+    const owned_key = self.allocator.dupe(u8, script_id) catch {
+        self.allocator.free(owned_url);
+        return;
+    };
+    const script = Bridge.Script{
+        .url = owned_url,
+        .end_line = switch (params.get("endLine") orelse std.json.Value{ .integer = -1 }) {
+            .integer => |value| value,
+            else => -1,
+        },
+        .end_column = switch (params.get("endColumn") orelse std.json.Value{ .integer = -1 }) {
+            .integer => |value| value,
+            else => -1,
+        },
+    };
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const entry = self.scripts.getOrPut(self.allocator, owned_key) catch {
+        self.allocator.free(owned_key);
+        self.allocator.free(owned_url);
+        return;
+    };
+    if (entry.found_existing) {
+        self.allocator.free(owned_key);
+        self.allocator.free(entry.value_ptr.url);
+    }
+    entry.value_ptr.* = script;
+}
+
+fn replaceSite(allocator: Allocator, slot: *?Bridge.CallerSite, site: ?Bridge.CallerSite) void {
+    if (slot.*) |*previous| {
+        allocator.free(previous.script_id);
+        allocator.free(previous.function_name);
+    }
+    slot.* = site;
+}
+
+fn callerSite(allocator: Allocator, frame: std.json.Value) !Bridge.CallerSite {
+    if (frame != .object) return error.MissingFrame;
+    const location = frame.object.get("location") orelse return error.MissingFrame;
+    if (location != .object) return error.MissingFrame;
+    const script = location.object.get("scriptId") orelse return error.MissingFrame;
+    if (script != .string) return error.MissingFrame;
+    const line = switch (location.object.get("lineNumber") orelse return error.MissingFrame) {
+        .integer => |value| value,
+        else => return error.MissingFrame,
+    };
+    if (line < 0) return error.MissingFrame;
+    const column = switch (location.object.get("columnNumber") orelse std.json.Value{ .integer = 0 }) {
+        .integer => |value| @max(value, 0),
+        else => 0,
+    };
+    const function_name = switch (frame.object.get("functionName") orelse std.json.Value{ .string = "" }) {
+        .string => |text| text,
+        else => "",
+    };
+    return .{
+        .script_id = try allocator.dupe(u8, script.string),
+        .function_name = try allocator.dupe(u8, function_name),
+        .line = line,
+        .column = column,
+    };
+}
+
+/// Remembers where the frame below the current top frame is paused, so a later step out can report that call site.
+fn storeCaller(self: *Bridge, frames: std.json.Array) void {
+    if (frames.items.len < 2) return clearCaller(self);
+    const site = callerSite(self.allocator, frames.items[1]) catch return clearCaller(self);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    replaceSite(self.allocator, &self.last_caller, site);
+}
+
+fn armStepOut(self: *Bridge) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    replaceSite(self.allocator, &self.armed_caller, null);
+    const caller = self.last_caller orelse return;
+    const copy = copyCallerSite(self, caller) catch return;
+    self.armed_caller = copy;
+}
+
+fn copyCallerSite(self: *Bridge, site: Bridge.CallerSite) !Bridge.CallerSite {
+    const script_id = try self.allocator.dupe(u8, site.script_id);
+    errdefer self.allocator.free(script_id);
+    return .{
+        .script_id = script_id,
+        .function_name = try self.allocator.dupe(u8, site.function_name),
+        .line = site.line,
+        .column = site.column,
+    };
+}
+
+fn clearCaller(self: *Bridge) void {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    replaceSite(self.allocator, &self.last_caller, null);
+    replaceSite(self.allocator, &self.armed_caller, null);
+}
+
+/// JSC reports the position after the last top-level statement once a step out leaves the outermost statement. Other CDP engines report the call site the frame is returning to.
+fn normalizeStepOutPause(self: *Bridge, allocator: Allocator, params: *const std.json.ObjectMap) void {
+    const frames = switch (params.get("callFrames") orelse return) {
+        .array => |items| items,
+        else => return,
+    };
+    if (frames.items.len == 0) return;
+    const top = &frames.items[0];
+    if (top.* != .object) return;
+    const location = top.object.get("location") orelse return;
+    if (location != .object) return;
+    const script_value = location.object.get("scriptId") orelse return;
+    if (script_value != .string) return;
+    const line = switch (location.object.get("lineNumber") orelse return) {
+        .integer => |value| value,
+        else => return,
+    };
+    const column = switch (location.object.get("columnNumber") orelse std.json.Value{ .integer = 0 }) {
+        .integer => |value| value,
+        else => 0,
+    };
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const armed = self.armed_caller orelse return;
+    if (!std.mem.eql(u8, armed.script_id, script_value.string)) return;
+    const script = self.scripts.get(script_value.string) orelse return;
+    if (script.end_line < 0) return;
+    const at_end = line == script.end_line and (column == script.end_column or script.end_column < 0);
+    const past_end = line > script.end_line;
+    if (!at_end and !past_end) return;
+    var rewritten = std.json.ObjectMap{};
+    rewritten.put(allocator, "scriptId", .{ .string = armed.script_id }) catch return;
+    rewritten.put(allocator, "lineNumber", .{ .integer = armed.line }) catch return;
+    rewritten.put(allocator, "columnNumber", .{ .integer = armed.column }) catch return;
+    top.object.put(allocator, "location", .{ .object = rewritten }) catch return;
+    top.object.put(allocator, "functionName", .{ .string = armed.function_name }) catch return;
+    replaceSite(self.allocator, &self.armed_caller, null);
 }
 
 fn postProcessEvent(self: *Bridge, allocator: Allocator, object: std.json.ObjectMap) !std.json.ObjectMap {
@@ -528,8 +723,18 @@ fn postProcessEvent(self: *Bridge, allocator: Allocator, object: std.json.Object
     }
     if (!std.mem.eql(u8, method, "Debugger.paused")) return object;
     const reason = params.get("reason") orelse return object;
+    if (reason == .string) {
+        const mapped: ?[]const u8 = if (std.mem.eql(u8, reason.string, "Breakpoint") or std.mem.eql(u8, reason.string, "DebuggerStatement") or std.mem.eql(u8, reason.string, "PauseOnNextStatement"))
+            "other"
+        else if (std.mem.eql(u8, reason.string, "FunctionCall"))
+            "instrumentation"
+        else if (std.mem.eql(u8, reason.string, "BlackboxedScript"))
+            "other"
+        else
+            null;
+        if (mapped) |replacement| params.put(allocator, "reason", .{ .string = replacement }) catch {};
+    }
     if (reason == .string and std.mem.eql(u8, reason.string, "Breakpoint")) {
-        params.put(allocator, "reason", .{ .string = "other" }) catch {};
         if (params.get("data")) |data| {
             if (data == .object) {
                 if (data.object.get("breakpointId")) |breakpoint| {
@@ -590,6 +795,10 @@ fn postProcessEvent(self: *Bridge, allocator: Allocator, object: std.json.Object
         if (frames_value.* == .array) {
             for (frames_value.array.items) |*frame| {
                 if (frame.* != .object) continue;
+                // CDP names the top-level script frame with an empty name; the relay calls that frame global code.
+                if (frame.object.getPtr("functionName")) |name_value| {
+                    if (name_value.* == .string and std.mem.eql(u8, name_value.string, "global code")) name_value.* = .{ .string = "" };
+                }
                 if (frame.object.get("url") != null) continue;
                 const location = frame.object.get("location") orelse continue;
                 if (location != .object) continue;
@@ -598,6 +807,8 @@ fn postProcessEvent(self: *Bridge, allocator: Allocator, object: std.json.Object
                 const url = scriptUrl(self, script_value.string) orelse continue;
                 frame.object.put(allocator, "url", .{ .string = url }) catch {};
             }
+            normalizeStepOutPause(self, allocator, params);
+            storeCaller(self, frames_value.array);
         }
     }
     return object;
@@ -614,6 +825,7 @@ fn postProcessReply(allocator: Allocator, object: std.json.ObjectMap, kind: Brid
             if (result.get("debuggerId") == null) result.put(allocator, "debuggerId", .{ .string = "jsbay-jsc-bridge" }) catch {};
         },
         .evaluate, .evaluate_on_call_frame => {
+            if (kind == .evaluate) result.put(allocator, "executionContextId", .{ .integer = 1 }) catch {};
             const thrown = switch (result.get("wasThrown") orelse std.json.Value{ .bool = false }) {
                 .bool => |flag| flag,
                 else => false,

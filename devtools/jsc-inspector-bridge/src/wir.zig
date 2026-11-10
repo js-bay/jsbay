@@ -177,6 +177,17 @@ pub const Client = struct {
         } });
     }
 
+    /// Registers this client as a frontend sender for the target. `_rpc_forwardDidClose` removes the sender again.
+    pub fn connectFrontend(self: *Client, target: *const Target) Error!void {
+        try self.send("_rpc_forwardSocketSetup:", .{ .dict = &.{
+            .{ .key = "WIRApplicationIdentifierKey", .value = .{ .string = target.application } },
+            .{ .key = "WIRConnectionIdentifierKey", .value = .{ .string = self.connection_id } },
+            .{ .key = "WIRSenderKey", .value = .{ .string = self.sender_id } },
+            .{ .key = "WIRPageIdentifierKey", .value = .{ .integer = target.page } },
+            .{ .key = "WIRMessageDataTypeChunkSupportedKey", .value = .{ .integer = 0 } },
+        } });
+    }
+
     pub fn sendDidClose(self: *Client, target: *const Target) Error!void {
         try self.sendDidCloseFor(target, self.sender_id);
     }
@@ -339,19 +350,14 @@ pub fn attach(client: *Client, application_name: ?[]const u8, target_name: ?[]co
         const candidate_deadline = @min(deadline, zev.monotonicMilliseconds() + 1500);
         const found = (try waitForPage(client, candidate.id, target_name, candidate_deadline)) orelse continue;
         errdefer client.allocator.free(found.title);
-        try client.send("_rpc_forwardSocketSetup:", .{ .dict = &.{
-            .{ .key = "WIRApplicationIdentifierKey", .value = .{ .string = candidate.id } },
-            .{ .key = "WIRConnectionIdentifierKey", .value = .{ .string = client.connection_id } },
-            .{ .key = "WIRSenderKey", .value = .{ .string = client.sender_id } },
-            .{ .key = "WIRPageIdentifierKey", .value = .{ .integer = found.page } },
-            .{ .key = "WIRMessageDataTypeChunkSupportedKey", .value = .{ .integer = 0 } },
-        } });
-        return .{
+        const target = Target{
             .application = try client.allocator.dupe(u8, candidate.id),
             .application_name = try client.allocator.dupe(u8, candidate.name),
             .page = found.page,
             .title = found.title,
         };
+        try client.connectFrontend(&target);
+        return target;
     }
     return error.DiscoveryFailed;
 }
@@ -364,6 +370,7 @@ fn collectApplications(allocator: Allocator, candidates: *std.ArrayListUnmanaged
     };
     for (entries) |entry| {
         const name = entry.value.getString("WIRApplicationNameKey") orelse continue;
+        if (trace_enabled) std.debug.print("[trace] relay application id={s} name={s}\n", .{ entry.key, name });
         if (wanted) |match| {
             if (!std.mem.eql(u8, name, match)) continue;
         }

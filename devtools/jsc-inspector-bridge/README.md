@@ -57,7 +57,12 @@ The bridge adds state that CDP clients require but the relay omits:
 - `url` on paused call frames, resolved from recorded `Debugger.scriptParsed` notifications.
 - CDP scope types: relay `nestedLexical` scopes become `block`, `globalLexicalEnvironment` becomes `script`, and the innermost `closure` scope becomes `local`.
 - `result` instead of `properties` for `Runtime.getProperties`, and `exceptionDetails` for thrown evaluation results.
+- An empty `functionName` for the top-level script frame, which the relay reports as `global code`.
 - `Debugger.setBreakpointsActive` is sent after `Debugger.enable`, because JSC does not pause at a resolved breakpoint until the debugger activates breakpoints.
+- `Debugger.setPauseOnDebuggerStatements` is sent after `Debugger.enable`, because JSC only stops at a `debugger` statement once a frontend arms that switch. CDP has no equivalent command.
+- `Runtime.executionContextCreated` with one synthetic context after `Runtime.enable`. JSC has a single context and never announces it, and CDP clients wait for the announcement before they evaluate. `contextId` and `uniqueContextId` are dropped from forwarded requests, and evaluation results carry that context id.
+- Offsets of column breakpoints are dropped, so the breakpoint resolves to the statement on the requested line instead of a later statement.
+- A step out that returns to the end of the outermost statement reports the statement that made the call, matching other CDP engines.
 
 ## macOS
 
@@ -68,8 +73,10 @@ The macOS relay has no UNIX socket. `webinspectord` publishes only the `com.appl
 These come from the JSC target and its relay protocol rather than from the bridge:
 
 - Pause on exceptions is accepted by JSC but no pause is delivered for thrown exceptions in the tested simulator targets.
+- A step out that leaves a JavaScript callback which a native frame called resumes execution instead of pausing in the calling JavaScript frame, because the relay cannot step across native frames.
+- Console API calls are not visible. JSC reports console output to the console client the host application installs, and the relay receives nothing, so CDP frontends show no `Runtime.consoleAPICalled` events. Breakpoints, stepping, and evaluation are unaffected. A host that reports its console messages to the Web Inspector console client makes them available to the relay.
 - Block-scoped bindings are reported in a separate `block` scope. Frontends that merge block bindings into the frame's local scope show fewer names in the local scope.
-- Column-granular breakpoints can resolve to the next executable statement, so a pause may land one line below the requested position.
+- Breakpoints are statement granular: an offset inside a multi-line expression resolves to the start of the statement that contains it.
 
 ## Tests
 
@@ -77,4 +84,6 @@ These come from the JSC target and its relay protocol rather than from the bridg
 zig build test
 ```
 
-`zig build test` covers the binary plist codec and the relay UUID format. End-to-end checks against a simulator target live in `tests/apple-sdk/run-jsc-bridge-sim.sh` in the repository root.
+`zig build test` covers the binary plist codec and the relay UUID format.
+
+End-to-end checks against a simulator target live in `tests/apple-sdk/run-jsc-bridge-sim.sh` in the repository root. The script starts the demo and the bridge, runs the CDP debugger flow of `tests/inspector/e2e.cjs`, and skips the steps that describe behavior JSC cannot produce.

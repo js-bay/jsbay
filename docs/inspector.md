@@ -99,11 +99,11 @@ This path depends on platform JavaScriptCore symbols. It does not turn JSC into 
 
 `devtools/jsc-inspector-bridge` exposes a JSC target as a CDP endpoint for hosts that need the same client tooling as the other backends. The bridge runs as a separate host process, attaches to the WebKit Inspector Relay, and serves `/json` discovery plus a CDP WebSocket on loopback. The target keeps its Safari Web Inspector support and needs no extra code or build flags.
 
-The bridge covers `Runtime` and `Debugger`: evaluation, property inspection, source breakpoints, paused-frame evaluation, stepping, resume, script sources, and console events. It adds the CDP fields the relay omits, including `debuggerId`, call-frame URLs, CDP scope types, and `exceptionDetails` for thrown evaluation results. Its [README](../devtools/jsc-inspector-bridge/README.md) lists the exact command and parameter mapping.
+The bridge covers `Runtime` and `Debugger`: evaluation, property inspection, source breakpoints, paused-frame evaluation, stepping, resume, and script sources. It adds the CDP fields and state the relay omits, including `debuggerId`, call-frame URLs, CDP scope types, `exceptionDetails` for thrown evaluation results, a `debugger`-statement switch, and one synthetic execution context. Its [README](../devtools/jsc-inspector-bridge/README.md) lists the exact command and parameter mapping.
 
 Supported path: iOS Simulator, using the relay socket reported by `RWI_LISTEN_SOCKET`. macOS is not supported by this transport: the macOS relay has no socket, and both Web Inspector mach services interrupt third-party XPC clients that lack Apple's private Web Inspector entitlements. Physical device support is unverified.
 
-Known target gaps on the Simulator: JSC accepts `Debugger.setPauseOnExceptions` but does not deliver a pause for thrown exceptions or `debugger;` statements in the tested targets, block bindings appear in a separate scope, and column-granular breakpoints can resolve to the next executable statement. Breakpoint, stepping, and frame-evaluation flows pass.
+Known target gaps on the Simulator: JSC accepts `Debugger.setPauseOnExceptions` but does not deliver a pause for thrown exceptions, a step out of a JavaScript callback that a native frame called resumes instead of pausing in the caller, console API calls stay with the host console client and never reach the relay, block bindings appear in a separate scope, and breakpoints are statement granular. The CDP debugger flow of `tests/inspector/e2e.cjs` passes against the bridge except the steps that assert those behaviors.
 
 ### iOS 26.5 system JavaScriptCore teardown limitation
 
