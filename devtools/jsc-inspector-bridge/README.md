@@ -49,6 +49,8 @@ zig-out/bin/jsbay-inspector-bridge --socket tcp://127.0.0.1:9380 --application j
 
 The relay reports applications by process name, which is the application's display or executable name rather than its bundle identifier. Pass the name the relay reports to `--application`.
 
+The demo target in this repository builds for the simulator only. The device SDK ships TAPI stubs for `arm64e-ios` alone, and the Zig linker matches a stub by exact architecture, so an `arm64` device link resolves no system symbols; a device build comes from Xcode. The bridge does not depend on how the inspected app was built, so any device app that registers an inspectable JavaScript context works.
+
 ## Translation scope
 
 Commands are forwarded to the relay with the CDP method and parameters, and relay notifications are copied to every attached CDP session. Command ids are rewritten per session so concurrent clients cannot consume each other's replies.
