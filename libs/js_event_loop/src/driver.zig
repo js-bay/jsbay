@@ -26,7 +26,7 @@ pub const Driver = struct {
     dispatch_budget: ?usize = null,
     /// Optional time cap for one native dispatch turn (`Loop.nowMs` from turn start). `null` = no limit.
     dispatch_time_budget_ms: ?u64 = null,
-    /// Absolute ms for an installed Loop virtual clock. Tests set this through `testing.advance` / `testing.setNow`; production leaves it null so `Loop` uses the system monotonic clock.
+    /// Absolute ms for an installed Loop virtual clock. Tests set via `testing.setNow` (strict), `testing.clampNow` / `testing.advance` (clamp); production leaves it null so `Loop` uses the system monotonic clock.
     loop_clock_ms: ?u64 = null,
 
     const Mode = enum { idle, running, attached };
@@ -97,6 +97,7 @@ pub const Driver = struct {
         return self.loop_clock_ms.?;
     }
 
+    /// Test/host-tick clamp: never moves the virtual clock backwards (`@max`).
     fn advanceLoopClock(self: *Driver, now_ms: u64) void {
         self.loop_clock_ms = if (self.loop_clock_ms) |current| @max(current, now_ms) else now_ms;
         self.syncLoopClock();
@@ -570,27 +571,44 @@ pub const Notifier = struct {
 };
 
 const DriverTesting = if (builtin.is_test) struct {
-    /// Executes one complete turn and returns its internal deadline for assertions.
+    /// Test entry layers:
+    /// - **L0** `runOnce` / `advance`: gated production turn path. Only L0 may be explore/exhaust *dispatch* acts.
+    /// - **L1** `setNow` (strict) / `clampNow` (@max): clock-only, no dispatch. Explore may use L1 for pure clock acts.
+    /// - **L2** `dispatchEventsUngated`: bypasses the full turn/prepare gate. Escape hatch only — never an explore act.
+    ///
+    /// L0 runs one complete gated turn and returns its internal deadline for assertions. Gated native delivery must use L0.
     pub fn runOnce(driver: *Driver, hooks: Driver.Hooks) ?u64 {
         return driver.runOnce(hooks);
     }
 
-    /// Sets/advances the Loop virtual clock without running a turn.
-    pub fn setNow(driver: *Driver, now: u64) void {
+    /// L1: install/advance the Loop virtual clock without a turn. First install OK; `now == current` OK; `now < current` → `error.ClockRewind` (no silent undo-by-rewind).
+    pub fn setNow(driver: *Driver, now: u64) error{ClockRewind}!void {
+        if (driver.loop_clock_ms) |current| {
+            if (now < current) return error.ClockRewind;
+        }
+        driver.loop_clock_ms = now;
+        driver.syncLoopClock();
+    }
+
+    /// L1: intentional silent `@max` clock merge (stale host timestamps / multi-source). No turn.
+    pub fn clampNow(driver: *Driver, now: u64) void {
         driver.advanceLoopClock(now);
     }
 
-    /// Advances the Loop virtual clock (`Loop.setClock` / `Loop.nowMs`) and executes one complete turn.
+    /// L0: push clock with **clamp** (host-tick / stale-timestamp product contract), then one gated turn. Does not `ClockRewind` — use `setNow` when harness needs a strict install.
     pub fn advance(driver: *Driver, hooks: Driver.Hooks, now: u64) ?u64 {
         driver.advanceLoopClock(now);
         return driver.runOnce(hooks);
     }
 
-    /// Advances the Loop virtual clock and dispatches native readiness without selecting a JavaScript task.
-    pub fn dispatchEvents(driver: *Driver, now: u64) void {
+    /// L2: clamp-push clock then `Loop.dispatchEventsLimited`, bypassing Scheduler/Driver turn gates. Full bypass set: suspend, SyncWait, hasFailure, before_turn, shouldStop/stop latch, turn_active, execution_depth / checkpoint (allowsQueuedWork). Clock push uses clamp, not `setNow` strict — so callers like `resource_limit(..., 0)` do not hit `ClockRewind`. Never use as an explore/exhaust act.
+    pub fn dispatchEventsUngated(driver: *Driver, now: u64) void {
         driver.advanceLoopClock(now);
         driver.loop.dispatchEventsLimited(driver.dispatch_budget, driver.dispatch_time_budget_ms);
     }
+
+    /// Removed: old name silently bypassed gates. Use L0 (`advance`/`runOnce`) or L2 (`dispatchEventsUngated`).
+    pub const dispatchEvents = @compileError("use testing.advance/runOnce (L0) or testing.dispatchEventsUngated (L2 escape)");
 } else struct {};
 
 pub const testing = DriverTesting;

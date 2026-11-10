@@ -239,6 +239,8 @@ pub fn build(b: *std.Build) void {
     const inspector_transport = inspector_transport_dep.module("inspector_transport");
     const bytecode_cache_dep = b.dependency("bytecode_cache", .{ .target = target, .optimize = optimize });
     const bytecode_cache = bytecode_cache_dep.module("bytecode_cache");
+    const state_tcas_dep = b.dependency("state_tcas", .{ .target = target, .optimize = optimize });
+    const state_tcas = state_tcas_dep.module("state_tcas");
 
     // The checked-in gitlinks are copied into the build cache before patching, leaving both the submodule checkout and an imported source snapshot intact.
     // Prepare QuickJS tree if any packed engine needs it (first QJS-family wins for translate-c).
@@ -440,6 +442,7 @@ pub fn build(b: *std.Build) void {
     test_module.addImport("inspector", inspector);
     test_module.addImport("inspector_transport", inspector_transport);
     test_module.addImport("bytecode_cache", bytecode_cache);
+    test_module.addImport("state_tcas", state_tcas);
     if (qjs_mod) |qjs| test_module.addImport("qjs", qjs);
 
     if (apple_sysroot) |sysroot| {
@@ -465,6 +468,15 @@ pub fn build(b: *std.Build) void {
         const install_ios_jsc_tests = b.addInstallArtifact(unit_tests, .{ .dest_sub_path = "jsbay-jsc-tests" });
         b.step("jsc-ios-test-build", "Build the JSC unit-test executable for an iOS Simulator").dependOn(&install_ios_jsc_tests.step);
     }
+
+    // state_tcas + ActiveEngine / host dispatch / real JS queues (filters unit test binary).
+    const state_tcas_engine_tests = b.addTest(.{
+        .root_module = test_module,
+        .filters = if (test_filter) |filter| &.{filter} else &.{"state_tcas engine"},
+    });
+    const run_state_tcas_engine = b.addRunArtifact(state_tcas_engine_tests);
+    run_state_tcas_engine.setCwd(b.path("."));
+    b.step("test-state-tcas-engine", "Run state_tcas harnesses over ActiveEngine + host dispatch / JS queues").dependOn(&run_state_tcas_engine.step);
 
     if (!stress_tests) {
         const zev_tests = b.addTest(.{
@@ -524,6 +536,65 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "bytecode_cache", .module = bytecode_cache }},
         }), .filters = if (test_filter) |filter| &.{filter} else &.{} });
         test_step.dependOn(&b.addRunArtifact(bytecode_cache_tests).step);
+
+        // state_tcas: calendar / toy ducks / real Scheduler+Driver (Timer/Notifier) / Safety-Liveness. Independent of ActiveEngine vendors so it can green without QuickJS checkout. Driver.testing pulls zev.Loop; import zev like js_event_loop package tests.
+        const state_tcas_harness = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/tests/state_tcas_harness.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "state_tcas", .module = state_tcas },
+                    .{ .name = "js_event_loop", .module = js_event_loop },
+                    .{ .name = "zev", .module = zev },
+                },
+            }),
+            .filters = if (test_filter) |filter| &.{filter} else &.{},
+        });
+        const run_state_tcas_harness = b.addRunArtifact(state_tcas_harness);
+        // Picture lock goldens live under docs/; tests must run from package root.
+        run_state_tcas_harness.setCwd(b.path("."));
+        test_step.dependOn(&run_state_tcas_harness.step);
+        const test_state_tcas_step = b.step("test-state-tcas", "Run state_tcas harnesses: calendar / toy+Scheduler+Driver / Safety-Liveness (no ActiveEngine)");
+        test_state_tcas_step.dependOn(&run_state_tcas_harness.step);
+
+        // CI/process: ban L2 Ungated / loop.dispatchEvents* in explore harness files.
+        const gate_check_exe = state_tcas_dep.artifact("explore_gate_check");
+        const check_explore_gates = b.addRunArtifact(gate_check_exe);
+        check_explore_gates.setCwd(b.path("."));
+        const explore_harnesses = [_][]const u8{
+            "src/tests/state_tcas_calendar_harness.zig",
+            "src/tests/state_tcas_engine_harness.zig",
+            "src/tests/state_tcas_event_loop_harness.zig",
+            "src/tests/state_tcas_harness.zig",
+            "src/tests/state_tcas_js_event_loop_driver_harness.zig",
+            "src/tests/state_tcas_js_event_loop_harness.zig",
+            "src/tests/state_tcas_monitor_harness.zig",
+        };
+        for (explore_harnesses) |harness_path| {
+            check_explore_gates.addArgs(&.{
+                "--path",            harness_path,
+                "--forbid",          "Ungated",
+                "--forbid",          "dispatchEventsUngated",
+                "--forbid",          "dispatchEventsLimited",
+                "--forbid",          ".loop.dispatchEvents",
+                "--ignore-comments", "--rule-end",
+            });
+        }
+        check_explore_gates.addArgs(&.{
+            "--path",            "src/tests/state_tcas_engine_harness.zig",
+            "--forbid",          "explore.bfs(",
+            "--ignore-comments", "--rule-end",
+            "--path",            "src/tests/state_tcas_js_event_loop_driver_harness.zig",
+            "--forbid",          "explore.bfs(",
+            "--ignore-comments", "--rule-end",
+        });
+        const check_explore_gates_step = b.step("check-state-tcas-explore-gates", "Ban L2 Ungated / loop.dispatchEvents* in state_tcas explore harnesses");
+        check_explore_gates_step.dependOn(&check_explore_gates.step);
+        test_state_tcas_step.dependOn(&check_explore_gates.step);
+        // Local `zig build test` must not skip explore gates.
+        test_step.dependOn(&check_explore_gates.step);
     }
 
     const dispatch_contract_step = b.step("test-ng-dispatch", "Run QuickJS-NG location-dispatch contract");

@@ -1,3 +1,5 @@
+* text=auto eol=lf
+
 # Patch files contain leading diff markers and upstream context whitespace.
 vendor/*.patch -whitespace
 # Keep third-party license text as published, including blank-line spacing.

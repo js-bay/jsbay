@@ -10,6 +10,7 @@ Public declarations are in [the installed header](../include/jsbay.h). These gui
 - [Inspector](inspector.md): CDP setup, compatibility, and Safari inspection.
 - [Architecture](architecture.md): package boundaries and source placement.
 - [Testing](testing.md), [QuickJS upgrades](quickjs-upgrade.md), and [performance](performance.md).
+- [state_tcas sequence diagrams](state-tcas-sequences.md): Mermaid locks from Scheduler / Driver / Engine harness stories.
 - [Release](release.md).
 - [Capability matrix](capability.md): Escargot/Hermes spike coverage vs QuickJS/JSC.
 - [Production gaps](production-gaps.md) and [adversarial review](adversarial-review.md).

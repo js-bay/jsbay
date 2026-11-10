@@ -460,7 +460,7 @@ test "attached suspend cancels Host schedule; wake stays dirty until resume" {
 
     const driver = try js_event_loop.Driver.create(std.testing.allocator);
     defer driver.destroy();
-    js_event_loop.Driver.testing.setNow(driver, 1_000);
+    try js_event_loop.Driver.testing.setNow(driver, 1_000);
     var fixture = Fixture{ .driver = driver };
     try driver.attach(.{ .context = &fixture, .schedule = Fixture.schedule, .cancel = Fixture.cancel }, Fixture.drive, &fixture);
     try std.testing.expectEqual(@as(usize, 1), fixture.schedules);
@@ -482,7 +482,7 @@ test "attached suspend cancels Host schedule; wake stays dirty until resume" {
     try std.testing.expect(timer.isActive());
 
     // Time passes and foreign wakes arrive while suspended: no Host schedule, no fire.
-    js_event_loop.Driver.testing.setNow(driver, 5_000);
+    try js_event_loop.Driver.testing.setNow(driver, 5_000);
     driver.wake();
     driver.wake();
     try std.testing.expectEqual(schedules_before_suspend, fixture.schedules);
@@ -608,7 +608,7 @@ test "attached soft Host cancel survives suspend resume (SDK hard-cancel regress
     {
         const driver = try js_event_loop.Driver.create(std.testing.allocator);
         defer driver.destroy();
-        js_event_loop.Driver.testing.setNow(driver, 1_000);
+        try js_event_loop.Driver.testing.setNow(driver, 1_000);
         var fixture = Fixture{ .driver = driver, .hard_cancel = false };
         try driver.attach(.{ .context = &fixture, .schedule = Fixture.schedule, .cancel = Fixture.cancel }, Fixture.drive, &fixture);
         fixture.runScheduled();
@@ -624,7 +624,7 @@ test "attached soft Host cancel survives suspend resume (SDK hard-cancel regress
         try std.testing.expect(fixture.alive);
         try std.testing.expect(fixture.task == null);
 
-        js_event_loop.Driver.testing.setNow(driver, 5_000);
+        try js_event_loop.Driver.testing.setNow(driver, 5_000);
         driver.resumeScheduling();
         try std.testing.expect(driver.lastError() == null);
         try std.testing.expect(fixture.alive);
@@ -638,7 +638,7 @@ test "attached soft Host cancel survives suspend resume (SDK hard-cancel regress
     {
         const driver = try js_event_loop.Driver.create(std.testing.allocator);
         defer driver.destroy();
-        js_event_loop.Driver.testing.setNow(driver, 1_000);
+        try js_event_loop.Driver.testing.setNow(driver, 1_000);
         var fixture = Fixture{ .driver = driver, .hard_cancel = true };
         try driver.attach(.{ .context = &fixture, .schedule = Fixture.schedule, .cancel = Fixture.cancel }, Fixture.drive, &fixture);
         fixture.runScheduled();
@@ -650,7 +650,7 @@ test "attached soft Host cancel survives suspend resume (SDK hard-cancel regress
 
         driver.suspendScheduling();
         try std.testing.expect(!fixture.alive);
-        js_event_loop.Driver.testing.setNow(driver, 5_000);
+        try js_event_loop.Driver.testing.setNow(driver, 5_000);
         driver.resumeScheduling();
         try std.testing.expect(driver.lastError() != null);
         try std.testing.expectEqual(js_event_loop.Driver.Error.ScheduleFailed, driver.lastError().?);

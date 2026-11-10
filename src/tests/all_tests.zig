@@ -170,6 +170,7 @@ comptime {
         _ = @import("resource_limit_tests.zig");
         _ = @import("host_wake_tests.zig");
         _ = @import("js_event_loop_contract_tests.zig");
+        _ = @import("state_tcas_engine_harness.zig");
     }
     _ = @import("browser_event_loop_tests.zig");
     _ = @import("jsc_microtask_contract_tests.zig");

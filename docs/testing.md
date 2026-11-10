@@ -120,3 +120,18 @@ bash tests/qjs-regression/run.sh --engine quickjs --unpatched
 ```
 
 The runner fails when no case runs, or when a case fails or times out. Its [manifest](../tests/qjs-regression/manifest.txt) records every exception with a reason. Use `--unpatched` to confirm a new failure before adding an exception.
+
+## state_tcas harness diagrams
+
+Fixed `exhaust.play` stories record `Observation`s and lock Mermaid state + sequence diagrams under `docs/state-tcas-*.md`. Index and regenerate commands: [state_tcas sequence diagrams](state-tcas-sequences.md).
+
+```sh
+zig build test-state-tcas -Dbackend=quickjs_ng --summary all
+zig build test-state-tcas-engine -Dbackend=quickjs_ng --summary all
+
+# Explore-gate check: native Zig via state_tcas (`zig build check-state-tcas-explore-gates`; also pulled into test-state-tcas / test).
+# rewrite goldens (cwd = package root; build.zig setCwd for these steps):
+#   touch .state_tcas-update-pictures && zig build test-state-tcas ... && rm .state_tcas-update-pictures
+```
+
+CI runs `zig build test-state-tcas` on the Linux governance job (Scheduler/Driver suite + explore gates). Engine harnesses ride `test-engine` via `all_tests.zig`.

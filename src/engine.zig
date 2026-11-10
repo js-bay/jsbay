@@ -492,6 +492,9 @@ pub fn runEventLoopOnce(instance_id: i32) void {
 }
 
 pub const testing = if (@import("builtin").is_test) struct {
+    /// L0 host-tick: clamp-push clock + gated turn. ABI frozen — `now_ms < 0` /
+    /// not admitted / idle → `-1`; never `ClockRewind`. Stale-host product contract
+    /// (see `timers_tests`). For strict install use `setNow`.
     pub fn advance(instance_id: i32, now_ms: i64) i64 {
         if (now_ms < 0) return -1;
         const engine_thread = @import("runtime/engine_thread.zig");
@@ -502,6 +505,29 @@ pub const testing = if (@import("builtin").is_test) struct {
         var turn = TurnContext{ .instance_id = instance_id };
         const next = event_loop.Driver.testing.advance(ptrs.loop, turn.hooks(), @intCast(now_ms)) orelse return -1;
         return @intCast(@min(next, @as(u64, std.math.maxInt(i64))));
+    }
+
+    /// L1 strict clock install (delegates `Driver.testing.setNow`). `now_ms < 0` →
+    /// `InvalidArgument`; rewind → `ClockRewind`. Does not run a turn.
+    pub fn setNow(instance_id: i32, now_ms: i64) error{ ClockRewind, InvalidArgument, NotAdmitted }!void {
+        if (now_ms < 0) return error.InvalidArgument;
+        const engine_thread = @import("runtime/engine_thread.zig");
+        const lease = engine_thread.beginEval(instance_id);
+        defer finishEvalEntry(instance_id, lease);
+        if (!lease.allowed) return error.NotAdmitted;
+        const ptrs = instance_map.getPtrs(instance_id) orelse return error.NotAdmitted;
+        try event_loop.Driver.testing.setNow(ptrs.loop, @intCast(now_ms));
+    }
+
+    /// L1 intentional `@max` clock merge (delegates `Driver.testing.clampNow`). `now_ms < 0` → `InvalidArgument`; does not run a turn.
+    pub fn clampNow(instance_id: i32, now_ms: i64) error{ InvalidArgument, NotAdmitted }!void {
+        if (now_ms < 0) return error.InvalidArgument;
+        const engine_thread = @import("runtime/engine_thread.zig");
+        const lease = engine_thread.beginEval(instance_id);
+        defer finishEvalEntry(instance_id, lease);
+        if (!lease.allowed) return error.NotAdmitted;
+        const ptrs = instance_map.getPtrs(instance_id) orelse return error.NotAdmitted;
+        event_loop.Driver.testing.clampNow(ptrs.loop, @intCast(now_ms));
     }
 } else struct {};
 
