@@ -540,7 +540,7 @@ jobs:
         run: |
           set -euo pipefail
           zig build safari-demo-build -Dbackend=jsc -Dtarget=aarch64-ios.14.0-simulator "-Dapple-sysroot=$(xcrun --sdk iphonesimulator --show-sdk-path)"
-          (cd devtools/jsc-inspector-bridge && zig build)
+          (cd devtools/jsc-inspector-bridge && zig build && zig build test)
 
       - name: JSC CDP bridge debugger flow
         shell: bash
