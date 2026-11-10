@@ -254,8 +254,11 @@ static napi_value wrapValue(napi_env env, Engine *e, jsbay_value_t h, bool borro
     if (!h)
         return nullptr;
     napi_value o;
-    if (napi_create_object(env, &o) != napi_ok)
+    if (napi_create_object(env, &o) != napi_ok) {
+        if (!borrowed && !e->closed)
+            (void)jsbay_value_release(h);
         return makeError(env, "cannot allocate JsBay Value wrapper");
+    }
     retainEngine(e);
     auto *v = new Value{e, h, borrowed, true};
     if (napi_wrap(
