@@ -130,18 +130,20 @@ export class Value {
   }
   /** Returns the UTF-8 string directly from native memory. */
   string(): string {
-    return invoke(() => typeof native.toStringValue === 'function' ?
-      native.toStringValue(this.native()) as string :
-      util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(this.toUtf8()), { stream: false }));
+    if (typeof native.toStringValue === 'function') {
+      return invoke(() => native.toStringValue(this.native()) as string);
+    }
+    return util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(this.toUtf8()), { stream: false });
   }
   toJson(): ArrayBuffer {
     return invoke(() => native.toJson(this.native()) as ArrayBuffer);
   }
   /** Returns the JSON representation directly as an ArkTS string without ArrayBuffer allocation. */
   jsonString(): string {
-    return invoke(() => typeof native.toJsonStringValue === 'function' ?
-      native.toJsonStringValue(this.native()) as string :
-      util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(this.toJson()), { stream: false }));
+    if (typeof native.toJsonStringValue === 'function') {
+      return invoke(() => native.toJsonStringValue(this.native()) as string);
+    }
+    return util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(this.toJson()), { stream: false });
   }
   /** Returns a newly allocated copy of this JavaScript ArrayBuffer. */
   copyBuffer(): ArrayBuffer {
@@ -231,6 +233,9 @@ function invoke<T>(operation: () => T): T {
   try {
     return operation();
   } catch (cause) {
+    if (cause instanceof JsException || cause instanceof JsBayStatusError) {
+      throw cause;
+    }
     const raw = (cause as NativeThrown).value;
     if (raw !== undefined) {
       throw new JsException(Value.fromNative(raw));
