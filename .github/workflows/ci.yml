@@ -535,6 +535,22 @@ jobs:
           JSBAY_APPLE_SMOKE=simulator ./build-apple.sh quickjs_ng
           grep -Fx 'PASS: iOS Simulator consumer smoke' build-apple/consumer-probes/ios-simulator-consumer.status
 
+      - name: Build the JSC CDP bridge and its simulator demo
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig build safari-demo-build -Dbackend=jsc -Dtarget=aarch64-ios.14.0-simulator "-Dapple-sysroot=$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          (cd devtools/jsc-inspector-bridge && zig build)
+
+      - name: JSC CDP bridge debugger flow
+        shell: bash
+        run: |
+          set -euo pipefail
+          udid="$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | .value[] | select(.isAvailable == true) | select(.name | startswith("iPhone"))] | .[0].udid // empty')"
+          test -n "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          JSBAY_IOS_SIM_UDID="$udid" bash tests/apple-sdk/run-jsc-bridge-sim.sh zig-out/bin/jsc-safari-demo --line-breakpoints
+
   macos-android:
     name: macos-android
     runs-on: macos-26

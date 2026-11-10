@@ -48,7 +48,16 @@ if [[ -z "$demo_pid" ]]; then
   exit 1
 fi
 
-socket="$(xcrun simctl spawn "$simulator" launchctl getenv RWI_LISTEN_SOCKET)"
+# The socket path appears in the simulator environment once webinspectord runs, which happens on demand.
+socket="$(xcrun simctl spawn "$simulator" launchctl getenv RWI_LISTEN_SOCKET || true)"
+if [[ -z "$socket" ]]; then
+  xcrun simctl spawn "$simulator" launchctl kickstart user/foreground/com.apple.webinspectord >/dev/null 2>&1 || true
+  for _ in $(seq 1 50); do
+    socket="$(xcrun simctl spawn "$simulator" launchctl getenv RWI_LISTEN_SOCKET || true)"
+    if [[ -n "$socket" ]]; then break; fi
+    sleep 0.2
+  done
+fi
 if [[ -z "$socket" ]]; then
   echo "webinspectord socket is unset; is the simulator booted?" >&2
   exit 1
