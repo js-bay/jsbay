@@ -54,21 +54,28 @@ if [[ -z "$socket" ]]; then
   exit 1
 fi
 
-"$bridge" --socket "$socket" --application "$application_name" --port "$port" >"$bridge_log" 2>&1 &
-bridge_pid=$!
-for _ in $(seq 1 200); do
-  if grep -q '^CDP endpoint' "$bridge_log"; then break; fi
-  if ! kill -0 "$bridge_pid" 2>/dev/null; then
-    echo "bridge exited; log $bridge_log" >&2
+start_bridge() {
+  : >"$bridge_log"
+  "$bridge" --socket "$socket" --application "$application_name" --port "$port" >"$bridge_log" 2>&1 &
+  bridge_pid=$!
+  for _ in $(seq 1 200); do
+    if grep -q '^CDP endpoint' "$bridge_log"; then return 0; fi
+    if ! kill -0 "$bridge_pid" 2>/dev/null; then return 1; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+if ! start_bridge; then
+  # A target killed without closing its inspector session can leave the relay without application records. Restarting the daemon clears that state; the demo reconnects to the next session.
+  xcrun simctl spawn "$simulator" launchctl kickstart -k user/foreground/com.apple.webinspectord
+  socket="$(xcrun simctl spawn "$simulator" launchctl getenv RWI_LISTEN_SOCKET)"
+  sleep 1
+  if ! start_bridge; then
+    echo "bridge did not accept CDP connections; log $bridge_log" >&2
     cat "$bridge_log" >&2
     exit 1
   fi
-  sleep 0.1
-done
-if ! grep -q '^CDP endpoint' "$bridge_log"; then
-  echo "bridge did not accept CDP connections; log $bridge_log" >&2
-  cat "$bridge_log" >&2
-  exit 1
 fi
 
 skip_args=()
