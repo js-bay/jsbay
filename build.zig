@@ -537,9 +537,7 @@ pub fn build(b: *std.Build) void {
         }), .filters = if (test_filter) |filter| &.{filter} else &.{} });
         test_step.dependOn(&b.addRunArtifact(bytecode_cache_tests).step);
 
-        // state_tcas: calendar / toy ducks / real Scheduler+Driver (Timer/Notifier) / Safety-Liveness.
-        // Independent of ActiveEngine vendors so it can green without QuickJS checkout.
-        // Driver.testing pulls zev.Loop; import zev like js_event_loop package tests.
+        // state_tcas: calendar / toy ducks / real Scheduler+Driver (Timer/Notifier) / Safety-Liveness. Independent of ActiveEngine vendors so it can green without QuickJS checkout. Driver.testing pulls zev.Loop; import zev like js_event_loop package tests.
         const state_tcas_harness = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/tests/state_tcas_harness.zig"),

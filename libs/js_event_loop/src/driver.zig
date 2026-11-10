@@ -575,14 +575,13 @@ const DriverTesting = if (builtin.is_test) struct {
     /// - **L0** `runOnce` / `advance`: gated production turn path. Only L0 may be explore/exhaust *dispatch* acts.
     /// - **L1** `setNow` (strict) / `clampNow` (@max): clock-only, no dispatch. Explore may use L1 for pure clock acts.
     /// - **L2** `dispatchEventsUngated`: bypasses the full turn/prepare gate. Escape hatch only — never an explore act.
-    /// No gated-native-only helper this tip; use L0 when native delivery must honor gates.
-    /// L0: one complete gated turn; returns internal deadline for assertions.
+    ///
+    /// L0 runs one complete gated turn and returns its internal deadline for assertions. Gated native delivery must use L0.
     pub fn runOnce(driver: *Driver, hooks: Driver.Hooks) ?u64 {
         return driver.runOnce(hooks);
     }
 
-    /// L1: install/advance the Loop virtual clock without a turn.
-    /// First install OK; `now == current` OK; `now < current` → `error.ClockRewind` (no silent undo-by-rewind).
+    /// L1: install/advance the Loop virtual clock without a turn. First install OK; `now == current` OK; `now < current` → `error.ClockRewind` (no silent undo-by-rewind).
     pub fn setNow(driver: *Driver, now: u64) error{ClockRewind}!void {
         if (driver.loop_clock_ms) |current| {
             if (now < current) return error.ClockRewind;

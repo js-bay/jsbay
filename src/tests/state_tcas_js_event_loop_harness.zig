@@ -1,16 +1,10 @@
 //! Drives the real `js_event_loop.Scheduler` under `state_tcas` explore.
 //!
-//! Unlike `state_tcas_event_loop_harness.zig` (toy EventLoopModel duck), this
-//! file mutates a live Scheduler through begin/end APIs. Toy macro/micro
-//! counters sit beside it so Safety can express the host obligation "drain
-//! the checkpoint before the next queued task"; the Scheduler itself does not
-//! own those queues.
+//! Unlike `state_tcas_event_loop_harness.zig` (toy EventLoopModel duck), this file mutates a live Scheduler through begin/end APIs. Toy macro/micro counters sit beside it so Safety can express the host obligation "drain the checkpoint before the next queued task"; the Scheduler itself does not own those queues.
 //!
 //! ## Layering vs live Driver/Engine
-//! - **This file**: Scheduler + host toy queues are **value-copyable** →
-//!   `dfs` / `dfsKeyed` / **`explore.bfs`** are all honest here (`Snap` clone).
-//! - **Live Driver / ActiveEngine**: opaque `zev.Loop` → act-log + DFS only
-//!   (`*_driver_harness.zig`, `*_engine_harness.zig`). Do not claim those as BFS.
+//! - **This file**: Scheduler + host toy queues are **value-copyable** → `dfs` / `dfsKeyed` / **`explore.bfs`** are all honest here (`Snap` clone).
+//! - **Live Driver / ActiveEngine**: opaque `zev.Loop` → act-log + DFS only (`*_driver_harness.zig`, `*_engine_harness.zig`). Do not claim those as BFS.
 //! - L2 Ungated / Loop direct dispatch: gap file only; never explore acts here.
 //!
 //! Run: `zig build test-state-tcas`
@@ -126,8 +120,7 @@ const Host = struct {
     }
 
     pub fn enabled(self: *@This()) []const Act {
-        // Sync-wait begin/end is covered by direct API + Safety tests; offering it
-        // here would let plain DFS oscillate forever (begin↔end, same key).
+        // Sync-wait begin/end is covered by direct API + Safety tests; offering it here would let plain DFS oscillate forever (begin↔end, same key).
         var n: usize = 0;
         if (self.enqueues_left > 0) {
             self.acts_buf[n] = .enqueue_macro;

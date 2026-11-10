@@ -1,9 +1,6 @@
 //! L2 / Ungated gap probes for live `Driver.testing` — NOT explore acts.
 //!
-//! These tests intentionally call `dispatchEventsUngated` to lock the contract
-//! that L2 still bypasses SyncWait / suspend while L0 does not. Keep them out
-//! of `*_harness.zig` so CI can ban Ungated / `loop.dispatchEvents*` from
-//! explore files without allowlisting call sites inside the same file.
+//! These tests intentionally call `dispatchEventsUngated` to lock the contract that L2 still bypasses SyncWait / suspend while L0 does not. Keep them out of `*_harness.zig` so CI can ban Ungated / `loop.dispatchEvents*` from explore files without allowlisting call sites inside the same file.
 //!
 //! Run: `zig build test-state-tcas` (via state_tcas_harness aggregator).
 
@@ -35,10 +32,7 @@ fn emptyHooks(ctx: ?*anyopaque) Driver.Hooks {
 }
 
 test "state_tcas Driver gap: dispatchEventsUngated bypasses sync_wait" {
-    // L2 Ungated clamp-pushes the clock and calls Loop.dispatchEventsLimited
-    // directly — it does not go through Scheduler.runTurn. During an open SyncWait
-    // that means native Timer callbacks can still fire. L0 runOnce/advance is gated;
-    // Ungated is the explicit escape (never an explore act).
+    // L2 Ungated clamp-pushes the clock and calls Loop.dispatchEventsLimited directly — it does not go through Scheduler.runTurn. During an open SyncWait that means native Timer callbacks can still fire. L0 runOnce/advance is gated; Ungated is the explicit escape (never an explore act).
     const Probe = struct {
         fired: usize = 0,
         fn timer(context: ?*anyopaque, _: *Timer) void {

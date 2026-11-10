@@ -1,28 +1,18 @@
 //! state_tcas over a real ActiveEngine + host dispatch / JS queues.
 //!
-//! Goes past bare Scheduler/Driver: creates an engine instance, queues real
-//! script tasks / native postTasks / Promise microtasks / setTimeout(0), and
-//! drives turns with `engine.testing.advance` (production TurnContext hooks).
+//! Goes past bare Scheduler/Driver: creates an engine instance, queues real script tasks / native postTasks / Promise microtasks / setTimeout(0), and drives turns with `engine.testing.advance` (production TurnContext hooks).
 //!
 //! ## Process (live Engine — no fake BFS)
-//! 1. **Explore shape**: act-log rebuild + `dfs` / `dfsKeyed` only. `undo` =
-//!    destroyEngine + replay. Never claim `explore.bfs` over ActiveEngine/Driver.
-//! 2. **L0/L1/L2 discipline**: explore dispatch = L0 `engine.testing.advance` /
-//!    production turn path; pure clock = L1 `engine.testing.setNow` (strict);
-//!    L2 Driver escape hatch is gap-only (`*_driver_gap.zig`). `ExploreAct` has
-//!    no L2 variant. Never call `loop.dispatchEvents*` from explore.
-//! 3. **Rebuild invariant**: act-log prefix → boot+apply observations match the
-//!    live walk. Empty queues must not enable advance/checkpoint.
+//! 1. **Explore shape**: act-log rebuild + `dfs` / `dfsKeyed` only. `undo` = destroyEngine + replay. Never claim `explore.bfs` over ActiveEngine/Driver.
+//! 2. **L0/L1/L2 discipline**: explore dispatch = L0 `engine.testing.advance` / production turn path; pure clock = L1 `engine.testing.setNow` (strict); L2 Driver escape hatch is gap-only (`*_driver_gap.zig`). `ExploreAct` has no L2 variant. Never call `loop.dispatchEvents*` from explore.
+//! 3. **Rebuild invariant**: act-log prefix → boot+apply observations match the live walk. Empty queues must not enable advance/checkpoint.
 //! 4. **Key fields** (dfsKeyed): enqueue flags, advance_count, pending script queue, **Trace content** (fnv-fold of recorder bytes — not length alone), via `ExploreWorld.key`.
-//! 5. **Out of explore (intentional)**: SyncWait begin↔end oscillation and
-//!    beginExecution pairing stay on direct+Safety tests (see checklist below);
-//!    do not add them to `ExploreAct` without a keyed depth-1 gate.
+//! 5. **Out of explore (intentional)**: SyncWait begin↔end oscillation and beginExecution pairing stay on direct+Safety tests (see checklist below); do not add them to `ExploreAct` without a keyed depth-1 gate.
 //!
-//! Checklist (direct, not DFS): beginExecution host gate; SyncWait covered on
-//! Scheduler/Driver harnesses + gap Ungated probes.
+//! Checklist (direct, not DFS): beginExecution host gate; SyncWait covered on Scheduler/Driver harnesses + gap Ungated probes.
 //!
-//! Cookbook: state_tcas tip 61ba72c / docs/harness.md (act-log-vs-bfs, testing helpers).
-//! Prefer catching jsbay contract bugs; do not "fix" production unless clear.
+//! Cookbook: state_tcas tip 61ba72c / docs/harness.md (act-log-vs-bfs, testing helpers). Prefer catching jsbay contract bugs; do not "fix" production unless clear.
+//!
 //! Run: `zig build test-state-tcas-engine`. Also via `zig build test`.
 
 const std = @import("std");
@@ -445,8 +435,7 @@ test "state_tcas engine: testing.setNow ClockRewind; clampNow absorbs; advance s
 
 // ─── DFS explore with act-log rebuild (engine opaque → no BFS) ───────────────
 
-/// Explore acts: enqueue + L0 `advance` only. No L2 escape; clock acts use
-/// `engine.testing.setNow` outside this enum when needed.
+/// Explore acts: enqueue + L0 `advance` only. No L2 escape; clock acts use `engine.testing.setNow` outside this enum when needed.
 const ExploreAct = enum {
     enqueue_a,
     enqueue_b,
@@ -494,10 +483,7 @@ const ExploreWorld = struct {
         self.created = false;
     }
 
-    /// Replay `log[0..n]` after destroy. Only enabled-legal acts appear in the
-    /// log (step only appends after apply); rebuild must stay infallible for
-    /// those prefixes — OOM/`EngineCreateFailed` is the only unexpected path,
-    /// hence `undo` uses `catch unreachable` (package undo is void).
+    /// Replay `log[0..n]` after destroy. Only enabled-legal acts appear in the log (step only appends after apply); rebuild must stay infallible for those prefixes — OOM/`EngineCreateFailed` is the only unexpected path, hence `undo` uses `catch unreachable` (package undo is void).
     fn rebuild(self: *@This()) !void {
         self.destroyEngine();
         Trace.reset();
@@ -614,6 +600,7 @@ const ExploreWorld = struct {
 
     pub fn key(self: *const @This()) u64 {
         // State-keyed for dfsKeyed: enqueue flags + advance_count decide enabled(); pending script queue tracks FIFO delivery order; Trace length+content distinguish equal-length delivery orders ("Aa" vs "Bb").
+        //
         // Monitor sticky bits (ever_enqueued / delivered / bad_order) are not keyed: bad_order fails Safety on observe; delivered/ever_enqueued are finish helpers recomputed or sticky outside prune.
         var k: u64 = 0;
         if (self.enqueued_a) k |= 1;

@@ -1,19 +1,11 @@
 //! Drives a real `js_event_loop.Driver` (+ Timer / Notifier) under `state_tcas`.
 //!
 //! ## Process (live Driver — no fake BFS)
-//! 1. **Explore shape**: act-log rebuild + `dfs` / `dfsKeyed` only. `undo` = teardown +
-//!    boot + replay `log[0..len]`. Never value-copy / half-clone `Driver`/`zev.Loop`.
-//! 2. **L0/L1/L2 discipline**: explore/exhaust *dispatch* acts = L0 (`runOnce`/`advance`)
-//!    only; pure clock acts may use L1 `setNow`; L2 escape hatch is gap-only
-//!    (`state_tcas_js_event_loop_driver_gap.zig`). `ExploreAct` physically has no L2.
-//! 3. **Rebuild invariant**: any prefix of the act-log, after boot+apply, matches the
-//!    observations seen when exploration reached that prefix.
-//! 4. **Key fields** (dfsKeyed): early/late armed+cancelled+fired, suspended, now_target,
-//!    dual_timers / allow_suspend flags as encoded by `ExploreWorld.key`.
-//! 5. **Out of explore (intentional)**: SyncWait begin↔end pairs, Notifier notify,
-//!    and beginExecution stop-latch stay on **direct** contract tests above (and
-//!    gap Ungated probes). Do not add oscillating begin/end to `ExploreAct`
-//!    without a keyed depth-1 gate — cookbook forbids sync-wait oscillation in DFS.
+//! 1. **Explore shape**: act-log rebuild + `dfs` / `dfsKeyed` only. `undo` = teardown + boot + replay `log[0..len]`. Never value-copy / half-clone `Driver`/`zev.Loop`.
+//! 2. **L0/L1/L2 discipline**: explore/exhaust *dispatch* acts = L0 (`runOnce`/`advance`) only; pure clock acts may use L1 `setNow`; L2 escape hatch is gap-only (`state_tcas_js_event_loop_driver_gap.zig`). `ExploreAct` physically has no L2.
+//! 3. **Rebuild invariant**: any prefix of the act-log, after boot+apply, matches the observations seen when exploration reached that prefix.
+//! 4. **Key fields** (dfsKeyed): early/late armed+cancelled+fired, suspended, now_target, dual_timers / allow_suspend flags as encoded by `ExploreWorld.key`.
+//! 5. **Out of explore (intentional)**: SyncWait begin↔end pairs, Notifier notify, and beginExecution stop-latch stay on **direct** contract tests above (and gap Ungated probes). Do not add oscillating begin/end to `ExploreAct` without a keyed depth-1 gate — cookbook forbids sync-wait oscillation in DFS.
 //!
 //! Checklist (direct, not DFS explore):
 //! - sync_wait gates `runOnce`/`advance` (no native dispatch)
@@ -21,8 +13,7 @@
 //! - cancel-after-due; same-deadline FIFO; stop latch + beginExecution
 //! - gap: `dispatchEventsUngated` still bypasses sync_wait / suspend / Notifier gate
 //!
-//! Scheduler-only `explore.bfs` lives in `state_tcas_js_event_loop_harness.zig` (value
-//! Snap). Do not read "js_event_loop BFS" as covering this live Driver file.
+//! Scheduler-only `explore.bfs` lives in `state_tcas_js_event_loop_harness.zig` (value Snap). Do not read "js_event_loop BFS" as covering this live Driver file.
 //!
 //! Run: `zig build test-state-tcas`
 
@@ -188,9 +179,7 @@ test "state_tcas Driver: Notifier delivers via runOnce; suspend blocks turn path
 }
 
 test "state_tcas Driver: stop then idle runOnce ignores prior stop latch" {
-    // Mirrors driver_tests: requestStop while idle is ignored by shouldStop
-    // (mode == .idle). beginExecution makes runTurn refuse the turn so
-    // finish_turn is skipped; after end(), a later idle runOnce still runs.
+    // Mirrors driver_tests: requestStop while idle is ignored by shouldStop (mode == .idle). beginExecution makes runTurn refuse the turn so finish_turn is skipped; after end(), a later idle runOnce still runs.
     const Probe = struct {
         finished: usize = 0,
         fn finish(context: ?*anyopaque) void {
@@ -658,11 +647,7 @@ const ExploreWorld = struct {
         }
     }
 
-    /// Replay saved act-log after boot. Log only contains enabled-legal acts
-    /// (`step` appends after a successful `apply`); rebuild of those prefixes
-    /// must stay infallible. Unexpected create/OOM → `undo`'s `catch unreachable`
-    /// (package undo is void). Prefer pre-boot in the DFS test so create cannot
-    /// surprise mid-search.
+    /// Replay saved act-log after boot. Log only contains enabled-legal acts (`step` appends after a successful `apply`); rebuild of those prefixes must stay infallible. Unexpected create/OOM → `undo`'s `catch unreachable` (package undo is void). Prefer pre-boot in the DFS test so create cannot surprise mid-search.
     fn rebuild(self: *@This()) !void {
         const saved = self.log;
         const n = self.len;

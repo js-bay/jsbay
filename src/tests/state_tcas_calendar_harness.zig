@@ -1,7 +1,7 @@
 //! state_tcas calendar: schedule / cancel / fireDue / ClockRewind / compact / advanceToNext.
-//! Also wires a Safety observe on fireDue (cancelled must never deliver), and a
-//! DES+DFS explore that undoes via Calendar.clone / resetTo.
-//! Proves the path dependency; does not exercise JS engine semantics.
+//!
+//! Also wires a Safety observe on fireDue (cancelled must never deliver), and a DES+DFS explore that undoes via Calendar.clone / resetTo. Proves the path dependency; does not exercise JS engine semantics.
+//!
 //! Run: `zig build test-state-tcas`
 
 const std = @import("std");

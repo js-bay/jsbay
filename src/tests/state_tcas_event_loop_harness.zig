@@ -3,14 +3,9 @@
 //! Contract (from src/tests/browser_event_loop_tests.zig / microtask_order_tests.zig):
 //! - At most one queued JS task starts per turn.
 //! - Its full microtask checkpoint drains before another queued task may start.
-//! - Microtasks enqueued during a task (or during the checkpoint) run in that
-//!   checkpoint; a timer scheduled inside a callback is a later macrotask.
+//! - Microtasks enqueued during a task (or during the checkpoint) run in that checkpoint; a timer scheduled inside a callback is a later macrotask.
 //!
-//! This does NOT drive `libs/js_event_loop` or the JS engine (vendors /
-//! ActiveEngine). For the real Scheduler under explore, see
-//! `state_tcas_js_event_loop_harness.zig`. Safety catches illegal task starts;
-//! Liveness requires that once work was offered, a drained-idle goal was
-//! observed during the run.
+//! This does NOT drive `libs/js_event_loop` or the JS engine (vendors / ActiveEngine). For the real Scheduler under explore, see `state_tcas_js_event_loop_harness.zig`. Safety catches illegal task starts; Liveness requires that once work was offered, a drained-idle goal was observed during the run.
 //!
 //! Run: `zig build test-state-tcas`
 
