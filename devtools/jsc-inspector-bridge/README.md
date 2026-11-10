@@ -8,7 +8,7 @@ The bridge runs outside the inspected process. The target only has to enable the
 
 - iOS Simulator: supported. The bridge reads `RWI_LISTEN_SOCKET` from the booted simulator and attaches over the relay socket.
 - macOS: not supported by this transport. The relay is reached through XPC mach services instead of a socket, and both `com.apple.webinspector` and `com.apple.webinspector.debugger` interrupt connections from processes without the private Web Inspector entitlement. Use Safari Web Inspector on macOS.
-- iOS device: not implemented. A device exposes the relay as a lockdown or remote service discovery service instead of a socket, and USB port forwarding cannot reach that service, so the device path needs its own tunnel.
+- iOS device: not implemented. A device exposes the relay as a lockdown or remote service discovery service instead of a socket, and USB port forwarding cannot reach that service, so the device path needs its own tunnel. A tunnel that republishes the relay on a TCP port works with `--socket tcp://host:port`.
 - Only one target per bridge process. The first JavaScript target of the selected application is used.
 
 ## Usage
@@ -22,7 +22,7 @@ zig-out/bin/jsbay-inspector-bridge --socket "$RWI_LISTEN_SOCKET"
 
 Options:
 
-- `--socket <path>`: relay socket. Required for the simulator path.
+- `--socket <path>`: relay socket. Required for the simulator path. `tcp://host:port` attaches through a forwarder that exposes the relay on a TCP port.
 - `--application <name>`: application name reported by the relay. Defaults to the newest process that reports a JavaScript target.
 - `--target <title>`: JavaScript target title. Defaults to the first target.
 - `--port <port>`: CDP port. `0` selects an ephemeral port.

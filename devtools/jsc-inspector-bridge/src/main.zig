@@ -97,7 +97,7 @@ fn usage(init: std.process.Init) !void {
     try print(init,
         \\usage: jsbay-inspector-bridge --socket <path> [--application <name>] [--target <name>] [--port <port>]
         \\
-        \\  --socket       webinspectord relay socket (RWI_LISTEN_SOCKET from a booted simulator)
+        \\  --socket       webinspectord relay socket (RWI_LISTEN_SOCKET from a booted simulator), or tcp://host:port
         \\  --application  application name shown by the relay; defaults to the first application
         \\  --target       JavaScript target title; defaults to the first JavaScript target
         \\  --port         CDP listener port; 0 selects an ephemeral port

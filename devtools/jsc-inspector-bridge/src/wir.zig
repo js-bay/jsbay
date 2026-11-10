@@ -71,18 +71,13 @@ pub const Client = struct {
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reader: ?std.Thread = null,
 
+    /// Connects to the relay. `path` is a UNIX socket path, or `tcp://host:port` for a relay that an external tunnel exposes on a TCP port.
     pub fn connect(allocator: Allocator, io: std.Io, path: []const u8) Error!*Client {
-        if (path.len == 0 or path.len >= 104) return error.ConnectFailed;
-        const raw = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-        if (raw < 0) return error.SocketFailed;
-        const fd: std.posix.fd_t = @intCast(raw);
-        errdefer _ = std.posix.system.close(fd);
-
-        var address = sockaddr_un{};
-        address.len = @intCast(@sizeOf(sockaddr_un));
-        address.family = @intCast(std.posix.AF.UNIX);
-        @memcpy(address.path[0..path.len], path);
-        if (std.posix.system.connect(fd, @ptrCast(&address), @sizeOf(sockaddr_un)) < 0) return error.ConnectFailed;
+        const fd = if (std.mem.startsWith(u8, path, "tcp://"))
+            try connectTcp(path["tcp://".len..])
+        else
+            try connectUnix(path);
+        if (trace_enabled) std.debug.print("[trace] relay transport connected\n", .{});
 
         const self = try allocator.create(Client);
         errdefer allocator.destroy(self);
@@ -290,6 +285,53 @@ fn traceFrame(direction: []const u8, label: []const u8, bytes: []const u8) void 
     std.debug.print("[trace] {s} {s} {d} bytes ", .{ direction, label, bytes.len });
     for (bytes[0..limit]) |byte| std.debug.print("{x:0>2}", .{byte});
     std.debug.print("\n", .{});
+}
+
+fn connectUnix(path: []const u8) Error!std.posix.fd_t {
+    if (path.len == 0 or path.len >= 104) return error.ConnectFailed;
+    const raw = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+    if (raw < 0) return error.SocketFailed;
+    const fd: std.posix.fd_t = @intCast(raw);
+    errdefer _ = std.posix.system.close(fd);
+
+    var address = sockaddr_un{};
+    address.len = @intCast(@sizeOf(sockaddr_un));
+    address.family = @intCast(std.posix.AF.UNIX);
+    @memcpy(address.path[0..path.len], path);
+    if (std.posix.system.connect(fd, @ptrCast(&address), @sizeOf(sockaddr_un)) < 0) return error.ConnectFailed;
+    return fd;
+}
+
+fn connectTcp(endpoint: []const u8) Error!std.posix.fd_t {
+    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.ConnectFailed;
+    const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return error.ConnectFailed;
+    const octets = parseIp4(endpoint[0..colon]) orelse return error.ConnectFailed;
+    const raw = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (raw < 0) return error.SocketFailed;
+    const fd: std.posix.fd_t = @intCast(raw);
+    errdefer _ = std.posix.system.close(fd);
+    const address: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = @bitCast(octets),
+    };
+    if (std.posix.system.connect(fd, @ptrCast(&address), @sizeOf(std.posix.sockaddr.in)) < 0) return error.ConnectFailed;
+    return fd;
+}
+
+fn parseIp4(host: []const u8) ?[4]u8 {
+    var octets: [4]u8 = undefined;
+    var count: usize = 0;
+    var start: usize = 0;
+    for (host, 0..) |byte, index| {
+        if (byte != '.') continue;
+        if (count == 3) return null;
+        octets[count] = std.fmt.parseInt(u8, host[start..index], 10) catch return null;
+        count += 1;
+        start = index + 1;
+    }
+    if (count != 3) return null;
+    octets[3] = std.fmt.parseInt(u8, host[start..], 10) catch return null;
+    return octets;
 }
 
 pub fn uuid4(io: std.Io, allocator: Allocator) ![]u8 {
