@@ -8,7 +8,7 @@ The bridge runs outside the inspected process. The target only has to enable the
 
 - iOS Simulator: supported. The bridge reads `RWI_LISTEN_SOCKET` from the booted simulator and attaches over the relay socket.
 - macOS: not supported by this transport. The relay is reached through XPC mach services instead of a socket, and both `com.apple.webinspector` and `com.apple.webinspector.debugger` interrupt connections from processes without the private Web Inspector entitlement. Use Safari Web Inspector on macOS.
-- iOS device: not implemented. A device exposes the relay as a lockdown or remote service discovery service instead of a socket, and USB port forwarding cannot reach that service, so the device path needs its own tunnel. A tunnel that republishes the relay on a TCP port works with `--socket tcp://host:port`.
+- iOS device: supported through a forwarder. A device exposes the relay as the lockdown service `com.apple.webinspector`, or as `com.apple.webinspector.shim.remote` over remote service discovery, instead of a socket. Open that service and pipe it to a loopback TCP port, then attach with `--socket tcp://host:port`. The inspected application must be running in the foreground on an unlocked device; a locked or backgrounded application still appears in the relay application list but reports no JavaScript target, and the bridge then fails with a discovery error.
 - Only one target per bridge process. The first JavaScript target of the selected application is used.
 
 ## Usage
@@ -39,6 +39,14 @@ xcrun simctl spawn "$UDID" /path/to/jsc-demo &
 RWI_LISTEN_SOCKET="$(xcrun simctl spawn "$UDID" launchctl getenv RWI_LISTEN_SOCKET)"
 zig-out/bin/jsbay-inspector-bridge --socket "$RWI_LISTEN_SOCKET" --application jsc-demo
 ```
+
+Typical device flow. Keep the application in the foreground on an unlocked device, pipe the `com.apple.webinspector` lockdown service to a loopback TCP port with a forwarder, then attach through it:
+
+```sh
+zig-out/bin/jsbay-inspector-bridge --socket tcp://127.0.0.1:9380 --application jsc-demo
+```
+
+The relay reports applications by process name, which is the application's display or executable name rather than its bundle identifier. Pass the name the relay reports to `--application`.
 
 ## Translation scope
 
