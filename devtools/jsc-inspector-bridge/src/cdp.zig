@@ -12,13 +12,153 @@ const zev = @import("zev");
 
 const Allocator = std.mem.Allocator;
 
+/// Reports a message the bridge discarded. Every dropped message is a debugging dead end, so `--trace` shows the reason.
+fn logDrop(reason: []const u8) void {
+    if (wir.trace_enabled) std.debug.print("[drop] {s}\n", .{reason});
+}
+
+/// The relay operations the bridge performs. Production uses `wir.Client`; tests script the replies so the translation layer runs without a simulator.
+pub const Relay = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        connectFrontend: *const fn (ctx: *anyopaque, target: *const wir.Target) void,
+        sendDidClose: *const fn (ctx: *anyopaque, target: *const wir.Target) void,
+        sendData: *const fn (ctx: *anyopaque, target: *const wir.Target, json: []const u8) void,
+        isClosed: *const fn (ctx: *anyopaque) bool,
+        /// Next `_rpc_applicationSentData` payload, owned by the caller, or null when the timeout expires.
+        nextData: *const fn (ctx: *anyopaque, timeout_ms: u64, allocator: Allocator) anyerror!?[]u8,
+    };
+
+    pub fn connectFrontend(self: Relay, target: *const wir.Target) void {
+        self.vtable.connectFrontend(self.ctx, target);
+    }
+
+    pub fn sendDidClose(self: Relay, target: *const wir.Target) void {
+        self.vtable.sendDidClose(self.ctx, target);
+    }
+
+    pub fn sendData(self: Relay, target: *const wir.Target, json: []const u8) void {
+        self.vtable.sendData(self.ctx, target, json);
+    }
+
+    pub fn isClosed(self: Relay) bool {
+        return self.vtable.isClosed(self.ctx);
+    }
+
+    pub fn nextData(self: Relay, timeout_ms: u64, allocator: Allocator) anyerror!?[]u8 {
+        return self.vtable.nextData(self.ctx, timeout_ms, allocator);
+    }
+};
+
+/// The CDP side of the bridge. Production uses the loopback transport; tests record the messages instead.
+pub const Frontend = struct {
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        sendText: *const fn (ctx: *anyopaque, session: transport.SessionId, text: []const u8) void,
+        closeSession: *const fn (ctx: *anyopaque, session: transport.SessionId) void,
+        boundPort: *const fn (ctx: *anyopaque) u16,
+    };
+
+    pub fn sendText(self: Frontend, session: transport.SessionId, text: []const u8) void {
+        self.vtable.sendText(self.ctx, session, text);
+    }
+
+    pub fn closeSession(self: Frontend, session: transport.SessionId) void {
+        self.vtable.closeSession(self.ctx, session);
+    }
+
+    pub fn boundPort(self: Frontend) u16 {
+        return self.vtable.boundPort(self.ctx);
+    }
+};
+
+/// Adapts a live relay connection to the `Relay` interface.
+pub const WireRelay = struct {
+    client: *wir.Client,
+
+    fn connectFrontend(ctx: *anyopaque, target: *const wir.Target) void {
+        const self: *WireRelay = @ptrCast(@alignCast(ctx));
+        self.client.connectFrontend(target) catch {};
+    }
+
+    fn sendDidClose(ctx: *anyopaque, target: *const wir.Target) void {
+        const self: *WireRelay = @ptrCast(@alignCast(ctx));
+        self.client.sendDidClose(target) catch {};
+    }
+
+    fn sendData(ctx: *anyopaque, target: *const wir.Target, json: []const u8) void {
+        const self: *WireRelay = @ptrCast(@alignCast(ctx));
+        self.client.sendData(target, self.client.sender_id, json) catch {};
+    }
+
+    fn isClosed(ctx: *anyopaque) bool {
+        const self: *WireRelay = @ptrCast(@alignCast(ctx));
+        return self.client.isClosed();
+    }
+
+    fn nextData(ctx: *anyopaque, timeout_ms: u64, allocator: Allocator) anyerror!?[]u8 {
+        const self: *WireRelay = @ptrCast(@alignCast(ctx));
+        var message = (try self.client.next(timeout_ms)) orelse return null;
+        defer message.deinit(self.client.allocator);
+        if (!std.mem.eql(u8, message.name, "_rpc_applicationSentData:")) return null;
+        const data = switch (message.info.get("WIRMessageDataKey") orelse return null) {
+            .data => |bytes| bytes,
+            else => return null,
+        };
+        return try allocator.dupe(u8, data);
+    }
+
+    pub fn relay(self: *WireRelay) Relay {
+        return .{ .ctx = self, .vtable = &.{
+            .connectFrontend = connectFrontend,
+            .sendDidClose = sendDidClose,
+            .sendData = sendData,
+            .isClosed = isClosed,
+            .nextData = nextData,
+        } };
+    }
+};
+
+/// Adapts the loopback CDP transport to the `Frontend` interface.
+pub const TransportFrontend = struct {
+    transport: *transport.Transport,
+
+    fn sendText(ctx: *anyopaque, session: transport.SessionId, text: []const u8) void {
+        const self: *TransportFrontend = @ptrCast(@alignCast(ctx));
+        _ = self.transport.sendText(session, text);
+    }
+
+    fn closeSession(ctx: *anyopaque, session: transport.SessionId) void {
+        const self: *TransportFrontend = @ptrCast(@alignCast(ctx));
+        self.transport.closeSession(session);
+    }
+
+    fn boundPort(ctx: *anyopaque) u16 {
+        const self: *TransportFrontend = @ptrCast(@alignCast(ctx));
+        return self.transport.boundPort();
+    }
+
+    pub fn frontend(self: *TransportFrontend) Frontend {
+        return .{ .ctx = self, .vtable = &.{
+            .sendText = sendText,
+            .closeSession = closeSession,
+            .boundPort = boundPort,
+        } };
+    }
+};
+
 pub const Bridge = struct {
     allocator: Allocator,
-    io: std.Io,
-    client: *wir.Client,
+    relay: Relay,
     target: wir.Target,
-    transport: *transport.Transport,
+    frontend: Frontend,
     mutex: zev.Mutex = .{},
+    /// Serializes the relay frontend registration with session add and remove. Taking it under `mutex` would order two relay calls by hash-map iteration.
+    frontend_mutex: zev.Mutex = .{},
     sessions: std.ArrayListUnmanaged(Session) = .empty,
     pending: std.AutoHashMapUnmanaged(u64, Pending) = .empty,
     merges: std.AutoHashMapUnmanaged(u64, Merge) = .empty,
@@ -48,17 +188,19 @@ pub const Bridge = struct {
     };
 
     const Pending = struct {
-        session: transport.SessionId,
-        client_id: i64,
-        kind: MethodKind,
+        session: transport.SessionId = 0,
+        client_id: i64 = 0,
+        kind: MethodKind = .other,
         merge_id: u64 = 0,
+        /// Commands the bridge issues on a client's behalf. Their replies belong to no client.
+        internal: bool = false,
     };
 
     const Merge = struct {
         session: transport.SessionId,
         client_id: i64,
         received: u8 = 0,
-        first: ?[]u8 = null,
+        parts: [2]?[]u8 = .{ null, null },
     };
 
     pub const MethodKind = enum {
@@ -70,42 +212,48 @@ pub const Bridge = struct {
     };
 
     pub fn start(allocator: Allocator, io: std.Io, client: *wir.Client, target: wir.Target, port: u16) !*Bridge {
-        const self = try allocator.create(Bridge);
-        errdefer allocator.destroy(self);
-        self.* = .{
-            .allocator = allocator,
-            .io = io,
-            .client = client,
-            .target = target,
-            .transport = try transport.Transport.init(allocator, port),
-        };
-        errdefer self.transport.deinit();
-        self.transport.setProtocolJson("{}");
-        self.transport.setDiscoveryTarget(.{
+        const wire = try allocator.create(WireRelay);
+        wire.* = .{ .client = client };
+        const transport_owner = try allocator.create(TransportFrontend);
+        errdefer allocator.destroy(transport_owner);
+        transport_owner.* = .{ .transport = try transport.Transport.init(allocator, port) };
+        errdefer transport_owner.transport.deinit();
+        _ = io;
+        const self = try init(allocator, wire.relay(), transport_owner.frontend(), target);
+        transport_owner.transport.setProtocolJson("{}");
+        transport_owner.transport.setDiscoveryTarget(.{
             .title = target.title,
             .kind = "node",
             .url = "",
             .id = target.title,
         });
-        try self.transport.start(self, handleEvent);
+        try transport_owner.transport.start(self, handleEvent);
+        return self;
+    }
+
+    /// Builds a bridge over the given relay and frontend. Production reaches this through `start`; tests pair it with a scripted relay.
+    pub fn init(allocator: Allocator, relay: Relay, frontend: Frontend, target: wir.Target) !*Bridge {
+        const self = try allocator.create(Bridge);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .relay = relay,
+            .target = target,
+            .frontend = frontend,
+        };
         return self;
     }
 
     pub fn boundPort(self: *Bridge) u16 {
-        return self.transport.boundPort();
+        return self.frontend.boundPort();
     }
 
     /// Copies relay notifications into every session until the relay closes.
     pub fn pump(self: *Bridge) !void {
         while (true) {
-            if (self.client.isClosed()) return;
-            var message = (try self.client.next(500)) orelse continue;
-            defer message.deinit(self.allocator);
-            if (!std.mem.eql(u8, message.name, "_rpc_applicationSentData:")) continue;
-            const data = switch (message.info.get("WIRMessageDataKey") orelse continue) {
-                .data => |bytes| bytes,
-                else => continue,
-            };
+            if (self.relay.isClosed()) return;
+            const data = (try self.relay.nextData(500, self.allocator)) orelse continue;
+            defer self.allocator.free(data);
             self.deliver(data);
         }
     }
@@ -119,19 +267,23 @@ pub const Bridge = struct {
         }
     }
 
-    fn openSession(self: *Bridge, id: transport.SessionId) void {
+    pub fn openSession(self: *Bridge, id: transport.SessionId) void {
+        self.frontend_mutex.lock();
+        defer self.frontend_mutex.unlock();
         self.mutex.lock();
         const first = self.sessions.items.len == 0;
         self.sessions.append(self.allocator, .{ .id = id }) catch {
             self.mutex.unlock();
-            return self.transport.closeSession(id);
+            return self.frontend.closeSession(id);
         };
         self.mutex.unlock();
         // The relay forgets the frontend sender when the last client detached, so a later client needs it registered again before commands reach the target.
-        if (first) self.client.connectFrontend(&self.target) catch {};
+        if (first) self.relay.connectFrontend(&self.target);
     }
 
-    fn closeSession(self: *Bridge, id: transport.SessionId) void {
+    pub fn closeSession(self: *Bridge, id: transport.SessionId) void {
+        self.frontend_mutex.lock();
+        defer self.frontend_mutex.unlock();
         self.mutex.lock();
         for (self.sessions.items, 0..) |session, index| {
             if (session.id == id) {
@@ -140,11 +292,47 @@ pub const Bridge = struct {
             }
         }
         const empty = self.sessions.items.len == 0;
+        self.dropSessionState(id);
+        if (empty) {
+            // The relay object ids die with the frontend sender, so a later client must not reuse them.
+            var iterator = self.scope_merges.iterator();
+            while (iterator.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.*);
+            }
+            self.scope_merges.clearRetainingCapacity();
+            replaceSite(self.allocator, &self.last_caller, null);
+            replaceSite(self.allocator, &self.armed_caller, null);
+        }
         self.mutex.unlock();
-        if (empty) self.client.sendDidClose(&self.target) catch {};
+        if (empty) self.relay.sendDidClose(&self.target);
     }
 
-    fn onMessage(self: *Bridge, session_id: transport.SessionId, payload: []const u8) void {
+    /// Drops the requests and merges that a closed session will never collect. Caller holds `mutex`.
+    fn dropSessionState(self: *Bridge, id: transport.SessionId) void {
+        var pending_ids: std.ArrayListUnmanaged(u64) = .empty;
+        defer pending_ids.deinit(self.allocator);
+        var pending_iterator = self.pending.iterator();
+        while (pending_iterator.next()) |entry| {
+            if (entry.value_ptr.internal) continue;
+            if (entry.value_ptr.session == id) pending_ids.append(self.allocator, entry.key_ptr.*) catch {};
+        }
+        for (pending_ids.items) |key| _ = self.pending.remove(key);
+
+        var merge_ids: std.ArrayListUnmanaged(u64) = .empty;
+        defer merge_ids.deinit(self.allocator);
+        var merge_iterator = self.merges.iterator();
+        while (merge_iterator.next()) |entry| {
+            if (entry.value_ptr.session == id) merge_ids.append(self.allocator, entry.key_ptr.*) catch {};
+        }
+        for (merge_ids.items) |key| {
+            if (self.merges.fetchRemove(key)) |removed| {
+                for (removed.value.parts) |slot| if (slot) |owned| self.allocator.free(owned);
+            }
+        }
+    }
+
+    pub fn onMessage(self: *Bridge, session_id: transport.SessionId, payload: []const u8) void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch {
             return self.replyError(session_id, null, -32700, "Parse error");
         };
@@ -189,12 +377,12 @@ pub const Bridge = struct {
             return self.replyError(session_id, id, -32603, "Translation failed");
         };
         var envelope = std.json.ObjectMap{};
-        const client_id: ?i64 = switch (id) {
+        const client_id: i64 = switch (id) {
             .integer => |value| value,
-            else => null,
+            else => return self.replyError(session_id, id, -32600, "Invalid request id"),
         };
-        const relay_id = if (client_id) |value| self.register(session_id, value, kindOf(name), 0) else 0;
-        envelope.put(arena.allocator(), "id", if (client_id != null) .{ .integer = @intCast(relay_id) } else id) catch return;
+        const relay_id = self.register(session_id, client_id, kindOf(name), 0);
+        envelope.put(arena.allocator(), "id", .{ .integer = @intCast(relay_id) }) catch return;
         envelope.put(arena.allocator(), "method", .{ .string = name }) catch return;
         if (translated) |value| envelope.put(arena.allocator(), "params", value) catch return;
 
@@ -205,20 +393,20 @@ pub const Bridge = struct {
         } else if (std.mem.eql(u8, name, "Debugger.resume") or std.mem.eql(u8, name, "Debugger.stepOver") or std.mem.eql(u8, name, "Debugger.stepInto") or std.mem.eql(u8, name, "Debugger.continueToLocation")) {
             clearCaller(self);
         }
-        self.client.sendData(&self.target, self.client.sender_id, writer.written()) catch {};
+        self.relay.sendData(&self.target, writer.written());
         if (std.mem.eql(u8, name, "Runtime.enable")) self.sendExecutionContext(session_id);
         // A Web Inspector frontend activates breakpoints after enabling the debugger. JSC does not pause at a resolved breakpoint until that switch is on.
         if (std.mem.eql(u8, name, "Debugger.enable")) {
-            self.client.sendData(&self.target, self.client.sender_id, "{\"id\":1000000,\"method\":\"Debugger.setBreakpointsActive\",\"params\":{\"active\":true}}") catch {};
+            self.inject("Debugger.setBreakpointsActive", "{\"active\":true}", arena.allocator());
             // JSC only pauses at `debugger` statements when the frontend arms this WebKit-specific switch. CDP has no equivalent command.
-            self.client.sendData(&self.target, self.client.sender_id, "{\"id\":1000001,\"method\":\"Debugger.setPauseOnDebuggerStatements\",\"params\":{\"enabled\":true}}") catch {};
+            self.inject("Debugger.setPauseOnDebuggerStatements", "{\"enabled\":true}", arena.allocator());
         }
     }
 
     /// JSC keeps its single JavaScript context in the inspected process and never announces it, while CDP clients wait for `Runtime.executionContextCreated` before they can evaluate anything.
     fn sendExecutionContext(self: *Bridge, session_id: transport.SessionId) void {
         const event = "{\"method\":\"Runtime.executionContextCreated\",\"params\":{\"context\":{\"id\":1,\"origin\":\"\",\"name\":\"jsbay\",\"uniqueId\":\"jsbay-context-1\",\"auxData\":{\"isDefault\":true,\"type\":\"default\"}}}}";
-        _ = self.transport.sendText(session_id, event);
+        self.frontend.sendText(session_id, event);
     }
 
     fn localReply(self: *Bridge, session_id: transport.SessionId, id: std.json.Value, name: []const u8) void {
@@ -238,7 +426,7 @@ pub const Bridge = struct {
         object.put(arena.allocator(), "result", result) catch return;
         var writer: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &writer.writer) catch return;
-        _ = self.transport.sendText(session_id, writer.written());
+        self.frontend.sendText(session_id, writer.written());
     }
 
     fn replyError(self: *Bridge, session_id: transport.SessionId, id: ?std.json.Value, code: i64, message: []const u8) void {
@@ -252,7 +440,7 @@ pub const Bridge = struct {
         object.put(arena.allocator(), "error", .{ .object = error_object }) catch return;
         var writer: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &writer.writer) catch return;
-        _ = self.transport.sendText(session_id, writer.written());
+        self.frontend.sendText(session_id, writer.written());
     }
 
     fn register(self: *Bridge, session_id: transport.SessionId, client_id: i64, kind: MethodKind, merge_id: u64) u64 {
@@ -262,6 +450,22 @@ pub const Bridge = struct {
         self.next_id += 1;
         self.pending.put(self.allocator, relay_id, .{ .session = session_id, .client_id = client_id, .kind = kind, .merge_id = merge_id }) catch {};
         return relay_id;
+    }
+
+    /// Reserves a relay id for a command the bridge issues itself. The reply is dropped instead of routed to a client.
+    fn registerInternal(self: *Bridge) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const relay_id = self.next_id;
+        self.next_id += 1;
+        self.pending.put(self.allocator, relay_id, .{ .internal = true }) catch {};
+        return relay_id;
+    }
+
+    fn inject(self: *Bridge, method: []const u8, params_json: []const u8, allocator: Allocator) void {
+        const relay_id = self.registerInternal();
+        const json = std.fmt.allocPrint(allocator, "{{\"id\":{d},\"method\":\"{s}\",\"params\":{s}}}", .{ relay_id, method, params_json }) catch return;
+        self.relay.sendData(&self.target, json);
     }
 
     fn scopePartner(self: *Bridge, object_id: []const u8) ?[]const u8 {
@@ -312,49 +516,45 @@ pub const Bridge = struct {
             envelope.put(arena.allocator(), "params", .{ .object = filtered }) catch return;
             var writer: std.Io.Writer.Allocating = .init(arena.allocator());
             std.json.Stringify.value(std.json.Value{ .object = envelope }, .{}, &writer.writer) catch return;
-            self.client.sendData(&self.target, self.client.sender_id, writer.written()) catch return;
+            self.relay.sendData(&self.target, writer.written());
         }
     }
 
     fn mergePart(self: *Bridge, merge_id: u64, object: std.json.ObjectMap) void {
-        const result_value = object.get("result") orelse return;
-        if (result_value != .object) return;
-        const properties = result_value.object.get("properties") orelse return;
-        if (properties != .array) return;
-        var writer: std.Io.Writer.Allocating = .init(self.allocator);
-        defer writer.deinit();
-        std.json.Stringify.value(properties, .{}, &writer.writer) catch return;
-        const owned = self.allocator.dupe(u8, writer.written()) catch return;
-
+        const properties = extractProperties(self.allocator, object);
         self.mutex.lock();
-        const entry = self.merges.getPtr(merge_id);
-        if (entry == null) {
+        const entry = self.merges.getPtr(merge_id) orelse {
             self.mutex.unlock();
-            self.allocator.free(owned);
+            if (properties) |owned| self.allocator.free(owned);
+            logDrop("merged reply for an unknown merge");
+            return;
+        };
+        const slot = entry.received;
+        if (slot < entry.parts.len) entry.parts[slot] = properties else if (properties) |owned| self.allocator.free(owned);
+        entry.received += 1;
+        if (entry.received < entry.parts.len) {
+            self.mutex.unlock();
             return;
         }
-        if (entry.?.received == 0) {
-            entry.?.first = owned;
-            entry.?.received = 1;
-            self.mutex.unlock();
-            return;
-        }
-        const first = entry.?.first.?;
-        const session = entry.?.session;
-        const client_id = entry.?.client_id;
+        const session = entry.session;
+        const client_id = entry.client_id;
+        const first = entry.parts[0];
+        const second = entry.parts[1];
         _ = self.merges.remove(merge_id);
         self.mutex.unlock();
-        defer self.allocator.free(first);
-        defer self.allocator.free(owned);
+        defer if (first) |owned| self.allocator.free(owned);
+        defer if (second) |owned| self.allocator.free(owned);
+        if (first == null and second == null) return self.replyError(session, .{ .integer = client_id }, -32603, "Scope properties unavailable");
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
-        const left = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), first, .{}) catch return;
-        const right = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), owned, .{}) catch return;
-        if (left != .array or right != .array) return;
         var combined = std.json.Array.init(arena.allocator());
-        for (left.array.items) |item| combined.append(item) catch {};
-        for (right.array.items) |item| combined.append(item) catch {};
+        for ([_]?[]const u8{ first, second }) |part| {
+            const owned = part orelse continue;
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), owned, .{}) catch continue;
+            if (parsed != .array) continue;
+            for (parsed.array.items) |item| combined.append(item) catch {};
+        }
         var result_map = std.json.ObjectMap{};
         result_map.put(arena.allocator(), "result", .{ .array = combined }) catch return;
         var response = std.json.ObjectMap{};
@@ -362,37 +562,75 @@ pub const Bridge = struct {
         response.put(arena.allocator(), "result", .{ .object = result_map }) catch return;
         var out: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = response }, .{}, &out.writer) catch return;
-        _ = self.transport.sendText(session, out.written());
+        self.frontend.sendText(session, out.written());
     }
 
-    fn deliver(self: *Bridge, data: []const u8) void {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch return;
+    /// Serializes the `properties` array of a `Runtime.getProperties` reply, or null when the relay reported an error for that half.
+    fn extractProperties(allocator: Allocator, object: std.json.ObjectMap) ?[]u8 {
+        const result_value = object.get("result") orelse return null;
+        if (result_value != .object) return null;
+        const properties = result_value.object.get("properties") orelse return null;
+        if (properties != .array) return null;
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        std.json.Stringify.value(properties, .{}, &writer.writer) catch return null;
+        return allocator.dupe(u8, writer.written()) catch null;
+    }
+
+    /// Routes one relay notification or reply. Exposed so tests can feed scripted relay traffic.
+    pub fn deliver(self: *Bridge, data: []const u8) void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, data, .{}) catch {
+            logDrop("relay data that is not JSON");
+            return;
+        };
         defer parsed.deinit();
         const object = switch (parsed.value) {
             .object => |map| map,
-            else => return,
+            else => {
+                logDrop("relay data that is not a JSON object");
+                return;
+            },
         };
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         var copy = object;
         if (object.get("method") != null) {
-            copy = postProcessEvent(self, arena.allocator(), object) catch return;
+            copy = postProcessEvent(self, arena.allocator(), object) catch {
+                logDrop("relay event that could not be translated");
+                return;
+            };
             self.broadcast(arena.allocator(), copy);
             return;
         }
-        const id = object.get("id") orelse return;
-        const relay_id: u64 = switch (id) {
-            .integer => |value| if (value >= 0) @intCast(value) else return,
-            else => return,
+        const id = object.get("id") orelse {
+            logDrop("relay message without an id or method");
+            return;
         };
-        const pending = self.take(relay_id) orelse return;
+        const relay_id: u64 = switch (id) {
+            .integer => |value| if (value >= 0) @intCast(value) else {
+                logDrop("relay reply with a negative id");
+                return;
+            },
+            else => {
+                logDrop("relay reply with a non-integer id");
+                return;
+            },
+        };
+        const pending = self.take(relay_id) orelse {
+            logDrop("relay reply for an unknown or already answered id");
+            return;
+        };
+        if (pending.internal) return;
         if (pending.merge_id != 0) return self.mergePart(pending.merge_id, object);
         copy.put(arena.allocator(), "id", .{ .integer = pending.client_id }) catch return;
-        if (pending.kind != .other) copy = postProcessReply(arena.allocator(), copy, pending.kind) catch return;
+        if (pending.kind != .other) copy = postProcessReply(arena.allocator(), copy, pending.kind) catch {
+            logDrop("relay reply that could not be translated");
+            return;
+        };
         var writer: std.Io.Writer.Allocating = .init(arena.allocator());
         std.json.Stringify.value(std.json.Value{ .object = copy }, .{}, &writer.writer) catch return;
-        _ = self.transport.sendText(pending.session, writer.written());
+        self.frontend.sendText(pending.session, writer.written());
     }
 
     fn take(self: *Bridge, relay_id: u64) ?Pending {
@@ -408,7 +646,7 @@ pub const Bridge = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.sessions.items) |session| {
-            _ = self.transport.sendText(session.id, writer.written());
+            self.frontend.sendText(session.id, writer.written());
         }
     }
 };

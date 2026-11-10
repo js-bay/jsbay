@@ -92,6 +92,6 @@ These come from the JSC target and its relay protocol rather than from the bridg
 zig build test
 ```
 
-`zig build test` covers the binary plist codec and the relay UUID format.
+`zig build test` covers the binary plist codec, the relay UUID format, and the bridge state machine. The bridge tests pair a scripted relay with a recording frontend, so session lifecycle, reply routing, injected command ids, and merged scope properties run without a simulator. Tests that need a real target live in `tests/apple-sdk/run-jsc-bridge-sim.sh` and `tests/inspector/e2e.cjs`.
 
 End-to-end checks against a simulator target live in `tests/apple-sdk/run-jsc-bridge-sim.sh` in the repository root. The script starts the demo and the bridge, runs the CDP debugger flow of `tests/inspector/e2e.cjs`, and skips the steps that describe behavior JSC cannot produce.

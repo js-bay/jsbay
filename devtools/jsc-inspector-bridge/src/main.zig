@@ -14,6 +14,7 @@ test {
     _ = plist;
     _ = wir;
     _ = cdp;
+    _ = @import("cdp_test.zig");
 }
 
 const Options = struct {
