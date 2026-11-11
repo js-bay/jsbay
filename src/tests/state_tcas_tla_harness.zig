@@ -1,8 +1,5 @@
 //! TLA+ specification locking and Apalache ITF trace replay harness for JS event loop Scheduler.
-//!
-//! Verifies model declarations anti-drift, positive execution trace replay,
-//! negative counterexample rejection during sync wait, and action coverage.
-//!
+//! Verifies model declarations anti-drift, positive execution trace replay, negative counterexample rejection during sync wait, and dynamic action coverage.
 //! Run: `zig build test-state-tcas`
 //! Update golden: touch .state_tcas-update-tla && zig build test-state-tcas && rm -f .state_tcas-update-tla
 
@@ -40,113 +37,171 @@ pub const SchedulerConfig = struct {
 
 pub const SchedulerTlaContext = struct {
     sched: Scheduler = .{},
-    state: SchedulerState = .idle,
     macro_q: usize = 0,
     micro_q: usize = 0,
-    sync_wait_guard: ?Scheduler.SyncWait = null,
+    after_task: bool = false,
+    sync_wait_stack: [SchedulerConfig.max_sync_depth]Scheduler.SyncWait = undefined,
+    sync_wait_depth: usize = 0,
     task_guard: ?Scheduler.Task = null,
     checkpoint_guard: ?Scheduler.Checkpoint = null,
+    acts_buf: [8]SchedulerAct = undefined,
     allocator: std.mem.Allocator,
 
     pub fn prepare(self: *@This()) !void {
+        self.release();
         self.sched = .{};
-        self.state = .idle;
         self.macro_q = 0;
         self.micro_q = 0;
-        self.sync_wait_guard = null;
+        self.after_task = false;
+        self.sync_wait_depth = 0;
         self.task_guard = null;
         self.checkpoint_guard = null;
     }
 
     pub fn release(self: *@This()) void {
         if (self.task_guard) |*t| _ = t.end();
+        self.task_guard = null;
         if (self.checkpoint_guard) |*c| c.end();
-        if (self.sync_wait_guard) |*s| s.end();
+        self.checkpoint_guard = null;
+        while (self.sync_wait_depth > 0) {
+            self.sync_wait_depth -= 1;
+            self.sync_wait_stack[self.sync_wait_depth].end();
+        }
+        self.after_task = false;
     }
 
     pub fn project(self: *const @This()) SchedulerState {
-        return self.state;
+        // Dynamic state projection directly derived from Scheduler and pending queue state.
+        if (self.sched.sync_wait_depth.load(.acquire) > 0) return .in_sync_wait;
+        if (self.sched.execution_depth > 0) return .in_task;
+        if (self.sched.checkpoint_active) return .in_checkpoint;
+        if (self.after_task) return .after_task;
+        return .idle;
     }
 
-    pub fn enabled(self: *const @This()) []const SchedulerAct {
-        return switch (self.state) {
-            .idle => if (self.macro_q > 0)
-                &.{ .enqueue_macro, .enqueue_micro, .begin_queued_task, .begin_sync_wait }
-            else
-                &.{ .enqueue_macro, .enqueue_micro, .begin_sync_wait },
-            .in_task => &.{ .enqueue_micro, .end_queued_task },
-            .after_task => &.{.begin_checkpoint},
-            .in_checkpoint => if (self.micro_q > 0)
-                &.{.drain_micro}
-            else
-                &.{.end_checkpoint},
-            .in_sync_wait => &.{.end_sync_wait},
-        };
+    pub fn enabled(self: *@This()) []const SchedulerAct {
+        var n: usize = 0;
+        // Enqueue operations bounded by SchedulerConfig constants.
+        if (self.macro_q < SchedulerConfig.max_queued_tasks) {
+            self.acts_buf[n] = .enqueue_macro;
+            n += 1;
+        }
+        if (self.micro_q < SchedulerConfig.max_microtasks) {
+            self.acts_buf[n] = .enqueue_micro;
+            n += 1;
+        }
+
+        // Synchronous native wait entry and exit (supports nesting up to max_sync_depth).
+        if (self.sync_wait_depth < SchedulerConfig.max_sync_depth) {
+            self.acts_buf[n] = .begin_sync_wait;
+            n += 1;
+        }
+        if (self.sync_wait_depth > 0) {
+            self.acts_buf[n] = .end_sync_wait;
+            n += 1;
+        }
+
+        // HTML5 Event Loop invariant & Scheduler contract: Queued tasks may start only if microtasks are drained.
+        if (self.macro_q > 0 and self.sched.allowsQueuedWork() and self.micro_q == 0) {
+            self.acts_buf[n] = .begin_queued_task;
+            n += 1;
+        }
+
+        // Active task completion.
+        if (self.sched.execution_depth > 0 and !self.sched.checkpoint_active) {
+            self.acts_buf[n] = .end_queued_task;
+            n += 1;
+        }
+
+        // Microtask checkpoint entry: required when leaving a task with microtasks, or when idle with pending microtasks.
+        if (self.micro_q > 0 and self.sched.allowsQueuedWork() and !self.after_task and self.sched.execution_depth == 0) {
+            self.acts_buf[n] = .begin_checkpoint;
+            n += 1;
+        }
+        if (self.after_task) {
+            self.acts_buf[n] = .begin_checkpoint;
+            n += 1;
+        }
+
+        // Checkpoint execution and completion.
+        if (self.sched.checkpoint_active) {
+            if (self.micro_q > 0) {
+                self.acts_buf[n] = .drain_micro;
+                n += 1;
+            } else {
+                self.acts_buf[n] = .end_checkpoint;
+                n += 1;
+            }
+        }
+
+        return self.acts_buf[0..n];
     }
 
     pub fn step(self: *@This(), act: SchedulerAct, pic: ?*state_tcas.Picture) !void {
-        const before = @tagName(self.state);
+        const before = @tagName(self.project());
         switch (act) {
             .enqueue_macro => {
+                if (self.macro_q >= SchedulerConfig.max_queued_tasks) return error.QueueOverflow;
                 self.macro_q += 1;
             },
             .enqueue_micro => {
+                if (self.micro_q >= SchedulerConfig.max_microtasks) return error.QueueOverflow;
                 self.micro_q += 1;
             },
             .begin_queued_task => {
                 if (self.task_guard != null) return error.TaskAlreadyRunning;
-                const task = self.sched.beginQueuedTask() orelse return error.ActionNotEnabled;
+                const task = self.sched.beginQueuedTask() orelse return error.SchedulerRejected;
                 self.task_guard = task;
                 self.macro_q -|= 1;
-                self.state = .in_task;
             },
             .end_queued_task => {
                 if (self.task_guard) |*t| {
                     const is_outer = t.end();
                     self.task_guard = null;
-                    self.state = if (is_outer) .after_task else .in_task;
+                    if (is_outer) {
+                        self.after_task = (self.micro_q > 0);
+                    }
                 } else return error.NoTaskToComplete;
             },
             .begin_checkpoint => {
                 if (self.checkpoint_guard != null) return error.CheckpointAlreadyRunning;
-                const cp = self.sched.beginCheckpoint() orelse return error.ActionNotEnabled;
+                const cp = self.sched.beginCheckpoint() orelse return error.SchedulerRejected;
                 self.checkpoint_guard = cp;
-                self.state = .in_checkpoint;
+                self.after_task = false;
             },
             .drain_micro => {
-                if (self.state != .in_checkpoint) return error.ActionNotEnabled;
-                if (self.micro_q == 0) return error.ActionNotEnabled;
+                if (!self.sched.checkpoint_active) return error.SchedulerRejected;
+                if (self.micro_q == 0) return error.QueueUnderflow;
                 self.micro_q -= 1;
             },
             .end_checkpoint => {
                 if (self.checkpoint_guard) |*c| {
                     c.end();
                     self.checkpoint_guard = null;
-                    self.state = .idle;
+                    self.after_task = false;
                 } else return error.NoCheckpointToComplete;
             },
             .begin_sync_wait => {
-                if (self.sync_wait_guard != null) return error.ActionNotEnabled;
-                self.sync_wait_guard = self.sched.beginSyncWait();
-                self.state = .in_sync_wait;
+                if (self.sync_wait_depth >= SchedulerConfig.max_sync_depth) return error.SyncWaitOverflow;
+                self.sync_wait_stack[self.sync_wait_depth] = self.sched.beginSyncWait();
+                self.sync_wait_depth += 1;
             },
             .end_sync_wait => {
-                if (self.sync_wait_guard) |*s| {
-                    s.end();
-                    self.sync_wait_guard = null;
-                    self.state = .idle;
-                } else return error.NoSyncWaitToComplete;
+                if (self.sync_wait_depth == 0) return error.SyncWaitUnderflow;
+                self.sync_wait_depth -= 1;
+                self.sync_wait_stack[self.sync_wait_depth].end();
             },
         }
 
+        const after = @tagName(self.project());
         if (pic) |p| {
             try p.observe(self.allocator, .{
                 .before = before,
-                .after = @tagName(self.state),
+                .after = after,
                 .label = @tagName(act),
                 .rejected = false,
                 .mutated = true,
-                .note = @tagName(self.state),
+                .note = after,
                 .from = "Host",
                 .to = "Scheduler",
             });
@@ -167,6 +222,21 @@ test "state_tcas tla: lock Scheduler model declarations" {
         SchedulerState,
         SchedulerConfig,
     );
+}
+
+test "state_tcas tla: checkExtends confirms scheduler_spec extends scheduler_model" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const spec_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "docs/tla/scheduler_spec.tla",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(spec_bytes);
+
+    try std.testing.expect(state_tcas.tla.checkExtends(spec_bytes, "scheduler_model"));
 }
 
 test "state_tcas tla: replay ITF trace for task then checkpoint drain" {
@@ -195,7 +265,7 @@ test "state_tcas tla: replay ITF trace for task then checkpoint drain" {
 
     try std.testing.expectEqual(@as(usize, 7), stats.actions_replayed);
     try std.testing.expectEqual(@as(usize, 8), stats.states_verified);
-    try std.testing.expectEqual(SchedulerState.idle, ctx.state);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project());
     try std.testing.expectEqual(@as(usize, 7), pic.steps.items.len);
 }
 
@@ -213,7 +283,7 @@ test "state_tcas tla: replay counterexample trace expecting ActionNotEnabled dur
 
     var ctx: SchedulerTlaContext = .{ .allocator = allocator };
 
-    _ = try state_tcas.tla.replayJsonTraceWithOptions(
+    const stats = try state_tcas.tla.replayJsonTraceWithOptions(
         SchedulerAct,
         &ctx,
         allocator,
@@ -227,27 +297,75 @@ test "state_tcas tla: replay counterexample trace expecting ActionNotEnabled dur
         },
     );
 
-    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.state);
+    try std.testing.expectEqual(@as(usize, 1), stats.actions_replayed);
+    // Harness release() safely cleans up all guards upon trace completion returning state to idle.
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project());
 }
 
-test "state_tcas tla: verify action coverage across replay traces" {
-    const covered_actions = [_]SchedulerAct{
-        .enqueue_macro,
-        .enqueue_micro,
-        .begin_queued_task,
-        .end_queued_task,
-        .begin_checkpoint,
-        .drain_micro,
-        .end_checkpoint,
-        .begin_sync_wait,
-        .end_sync_wait,
-    };
+test "state_tcas tla: Scheduler implementation rejects beginQueuedTask during sync wait" {
+    var ctx: SchedulerTlaContext = .{ .allocator = std.testing.allocator };
+    try ctx.step(.begin_sync_wait, null);
 
-    try state_tcas.tla.verifyCoverage(SchedulerAct, &covered_actions);
+    // Directly verify that the live Scheduler's allowsQueuedWork() returns false and beginQueuedTask returns null.
+    try std.testing.expect(!ctx.sched.allowsQueuedWork());
+    try std.testing.expect(ctx.sched.beginQueuedTask() == null);
+    try std.testing.expectError(error.SchedulerRejected, ctx.step(.begin_queued_task, null));
 
-    // Omission of actions detected by verifyCoverage
+    try ctx.step(.end_sync_wait, null);
+    try std.testing.expect(ctx.sched.allowsQueuedWork());
+}
+
+test "state_tcas tla: dynamic action coverage across replay traces" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const trace1_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "docs/tla/scheduler_task_checkpoint_trace.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(trace1_bytes);
+
+    const trace2_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "docs/tla/scheduler_sync_wait_lifecycle_trace.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(trace2_bytes);
+
+    var ctx: SchedulerTlaContext = .{ .allocator = allocator };
+
+    var pic1: state_tcas.Picture = .{};
+    defer pic1.deinit(allocator);
+    _ = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace1_bytes, &pic1);
+
+    var pic2: state_tcas.Picture = .{};
+    defer pic2.deinit(allocator);
+    _ = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace2_bytes, &pic2);
+
+    // Collect all executed actions dynamically from the replay observations.
+    var executed: std.ArrayList(SchedulerAct) = .empty;
+    defer executed.deinit(allocator);
+
+    for (pic1.steps.items) |step| {
+        if (std.meta.stringToEnum(SchedulerAct, step.label)) |act| {
+            try executed.append(allocator, act);
+        }
+    }
+    for (pic2.steps.items) |step| {
+        if (std.meta.stringToEnum(SchedulerAct, step.label)) |act| {
+            try executed.append(allocator, act);
+        }
+    }
+
+    // Verify dynamic coverage of all 9 actions across the replay suite.
+    try state_tcas.tla.verifyCoverage(SchedulerAct, executed.items);
+
+    // Verify omission detection on partial set.
     try std.testing.expectError(
         error.ActUncovered,
-        state_tcas.tla.verifyCoverage(SchedulerAct, covered_actions[0..7]),
+        state_tcas.tla.verifyCoverage(SchedulerAct, executed.items[0..4]),
     );
 }

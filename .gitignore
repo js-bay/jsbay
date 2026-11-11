@@ -39,6 +39,7 @@ vendor/icu-prefix
 # Local scratch / gate run logs
 /*.txt
 /bridge-build.txt
+.state_tcas-update-*
 
 # Escargot / Hermes sources are git submodules (vendor/escargot, vendor/hermes).
 # Do not ignore those paths.
