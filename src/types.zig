@@ -2,6 +2,17 @@
 
 const std = @import("std");
 
+/// Strongly typed engine instance identifier to communicate intent and avoid ambiguous primitive integers.
+pub const InstanceId = enum(i32) {
+    _,
+    pub fn fromInt(id: i32) InstanceId {
+        return @enumFromInt(id);
+    }
+    pub fn toInt(self: InstanceId) i32 {
+        return @intFromEnum(self);
+    }
+};
+
 pub const LogLevel = enum(c_int) {
     debug = 0,
     info = 1,
