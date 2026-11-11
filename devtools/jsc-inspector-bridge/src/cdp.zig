@@ -234,6 +234,8 @@ pub const Bridge = struct {
         evaluate_on_call_frame,
         call_function_on,
         get_properties,
+        /// A resume, step, or continue command. The relay reports `Debugger.resumed` for these and does not always answer the command itself.
+        resume_like,
         other,
     };
 
@@ -773,6 +775,27 @@ pub const Bridge = struct {
         }
     }
 
+    /// The relay does not answer every resume or step command, sometimes only reporting `Debugger.resumed`. Answer the oldest outstanding such request so a client that waits for the reply does not hang; a relay reply that arrives later is dropped as already answered.
+    fn answerResume(self: *Bridge) void {
+        self.mutex.lock();
+        var oldest: ?u64 = null;
+        var iterator = self.pending.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.kind != .resume_like) continue;
+            if (oldest == null or entry.key_ptr.* < oldest.?) oldest = entry.key_ptr.*;
+        }
+        const chosen = oldest orelse {
+            self.mutex.unlock();
+            return;
+        };
+        const pending = self.pending.fetchRemove(chosen) orelse {
+            self.mutex.unlock();
+            return;
+        };
+        self.mutex.unlock();
+        self.replyResult(pending.value.session, .{ .integer = pending.value.client_id }, "{}");
+    }
+
     fn take(self: *Bridge, relay_id: u64) ?Pending {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -796,6 +819,7 @@ fn kindOf(name: []const u8) Bridge.MethodKind {
     if (std.mem.eql(u8, name, "Runtime.evaluate")) return .evaluate;
     if (std.mem.eql(u8, name, "Debugger.evaluateOnCallFrame")) return .evaluate_on_call_frame;
     if (std.mem.eql(u8, name, "Runtime.callFunctionOn")) return .call_function_on;
+    if (std.mem.eql(u8, name, "Debugger.resume") or std.mem.eql(u8, name, "Debugger.stepOver") or std.mem.eql(u8, name, "Debugger.stepInto") or std.mem.eql(u8, name, "Debugger.stepOut") or std.mem.eql(u8, name, "Debugger.continueToLocation")) return .resume_like;
     if (std.mem.eql(u8, name, "Runtime.getProperties")) return .get_properties;
     return .other;
 }
@@ -1135,6 +1159,7 @@ fn postProcessEvent(self: *Bridge, allocator: Allocator, object: std.json.Object
         self.mutex.lock();
         self.clearScopeMergesLocked();
         self.mutex.unlock();
+        self.answerResume();
     }
     const params_value = object.getPtr("params") orelse return object;
     var params = switch (params_value.*) {
@@ -1280,7 +1305,7 @@ fn postProcessReply(allocator: Allocator, object: std.json.ObjectMap, kind: Brid
                 _ = result.swapRemove("properties");
             }
         },
-        .other => {},
+        .resume_like, .other => {},
     }
     return object;
 }

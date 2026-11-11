@@ -672,6 +672,38 @@ test "a URL breakpoint keeps its column only when every matching script is singl
     try std.testing.expectEqual(@as(i64, 0), dropped.value.object.get("params").?.object.get("columnNumber").?.integer);
 }
 
+test "a resume the relay only reports as an event still answers the client" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+    harness.bridge.deliver(paused_with_scopes);
+
+    // The paused notification was already broadcast, so count from there.
+    const before = harness.frontend.count();
+    harness.bridge.onMessage(1, "{\"id\":61,\"method\":\"Debugger.stepOver\"}");
+    try std.testing.expectEqual(before, harness.frontend.count());
+
+    harness.bridge.deliver("{\"method\":\"Debugger.resumed\"}");
+    const reply = (try harness.frontend.replyFor(arena.allocator(), 61)) orelse return error.MissingReply;
+    try std.testing.expect(reply.object.get("error") == null);
+    try std.testing.expectEqual(@as(usize, 0), reply.object.get("result").?.object.count());
+
+    // The relay's own reply for the same command arrives afterwards and must not produce a second answer.
+    const commands = try harness.relay.commands(arena.allocator());
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), commands.items[0], .{});
+    const relay_id = parsed.value.object.get("id").?.integer;
+    const late = try std.fmt.allocPrint(arena.allocator(), "{{\"id\":{d},\"result\":{{}}}}", .{relay_id});
+    harness.bridge.deliver(late);
+    // Exactly one answer for the command, no matter which of the two paths produced it.
+    var answers: usize = 0;
+    for (try harness.frontend.replyIds(arena.allocator())) |id| {
+        if (id == .integer and id.integer == 61) answers += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), answers);
+}
+
 test "reply detection compares the parsed id" {
     const allocator = std.testing.allocator;
     try std.testing.expect(cdp.isReplyTo(allocator, "{\"id\":1,\"result\":{}}", 1));

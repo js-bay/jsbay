@@ -75,6 +75,7 @@ The bridge adds state that CDP clients require but the relay omits:
 - `Runtime.executionContextCreated` with one synthetic context after `Runtime.enable`. JSC has a single context and never announces it, and CDP clients wait for the announcement before they evaluate. `contextId` and `uniqueContextId` are dropped from forwarded requests, and evaluation results carry that context id.
 - A column offset on a breakpoint is dropped when the script spans more than one line, so the breakpoint resolves to the statement on the requested line instead of a later statement. A single-line script keeps the offset, where it is the only way to name a statement, and `Debugger.continueToLocation` keeps it because zeroing the column would move the target behind the position execution resumes from.
 - A step out that returns to the end of the outermost statement reports the statement that made the call, matching other CDP engines.
+- A `Debugger.resumed` notification also answers the oldest outstanding resume, step, or continue command, because the relay reports the notification and does not always answer the command itself. A relay reply that arrives afterwards is dropped as already answered.
 
 ## macOS
 
@@ -87,6 +88,7 @@ These come from the JSC target and its relay protocol rather than from the bridg
 - A step out that leaves a JavaScript callback which a native frame called resumes execution instead of pausing in the calling JavaScript frame. The relay reports `Debugger.resumed` and then no further pause, so there is no frame to report and the client waits until execution stops for another reason.
 - `Debugger.pause` arms a pause for the next JavaScript statement. A target that is not running JavaScript, for example one whose only work happens in native code, reports no pause until script executes again.
 - Breakpoints are statement granular, so two breakpoints that resolve to the same statement collapse into one and the relay rejects the second as an existing location.
+- A URL breakpoint registered before the script it names has been parsed does not bind to that script: `Debugger.setBreakpointByUrl` reports no locations and the breakpoint never fires. A frontend that sets breakpoints before scripts load has to set them again after `Debugger.scriptParsed`.
 - Console API calls are not visible. JSC reports console output to the console client the host application installs, and the relay receives nothing, so CDP frontends show no `Runtime.consoleAPICalled` events. Breakpoints, stepping, and evaluation are unaffected. A host that reports its console messages to the Web Inspector console client makes them available to the relay.
 - Block-scoped bindings are reported in a separate `block` scope. Frontends that merge block bindings into the frame's local scope show fewer names in the local scope.
 - A breakpoint offset inside a multi-line expression resolves to the start of the statement that contains it.
