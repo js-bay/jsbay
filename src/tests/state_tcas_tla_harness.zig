@@ -191,6 +191,8 @@ pub const SchedulerTlaContext = struct {
             },
             .drain_micro => {
                 if (!self.sched.checkpoint_active or self.sched.isSynchronouslyWaiting()) return error.SchedulerRejected;
+                if (!self.sched.beginBackendDrain()) return error.SchedulerRejected;
+                defer self.sched.endBackendDrain();
                 if (self.micro_q == 0) return error.QueueUnderflow;
                 self.micro_q -= 1;
             },
