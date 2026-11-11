@@ -870,3 +870,33 @@ test "value: 10-arg call — all arguments accessible and summable" {
         }
     }.run);
 }
+
+test "value: OwnedValue wrap and unwrap semantics" {
+    const id = helpers.nextInstanceId();
+    try helpers.withEngine(id, .{}, struct {
+        fn run(inst: i32) !void {
+            const ctx = engine.getContext(inst) orelse return error.ContextUnavailable;
+            const num = backend.ActiveEngine.newInt32Val(ctx, 42);
+            defer backend.ActiveEngine.freeValue(ctx, num);
+            const owned = value.OwnedValue.from(num);
+            try testing.expect(backend.ActiveEngine.sameValue(ctx, num, owned.unwrap()));
+        }
+    }.run);
+}
+
+test "value: Global reference with custom allocator cleans up without leak" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const str = backend.ActiveEngine.newStringVal(ctx, "hello-zen");
+    defer backend.ActiveEngine.freeValue(ctx, str);
+
+    var g = @import("../root.zig").reference.Global(value.Local).init(id, str);
+    defer g.deinit();
+
+    const retrieved = g.get() orelse return error.GlobalLookupFailed;
+    defer backend.ActiveEngine.freeValue(ctx, retrieved);
+    try testing.expect(backend.ActiveEngine.sameValue(ctx, str, retrieved));
+}

@@ -104,3 +104,8 @@ pub const arrayClear = dispatch.arrayClear;
 
 /// `defineDataProperty(instance_id, obj, key, val, writable) bool`. Data descriptor. `writable == false` throws on strict assignment.
 pub const defineDataProperty = dispatch.defineDataProperty;
+
+// ---- Ownership wrappers ----
+
+pub const Local = @import("reference.zig").Local;
+pub const OwnedValue = @import("reference.zig").OwnedValue;

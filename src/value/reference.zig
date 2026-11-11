@@ -36,6 +36,19 @@ const ActiveEngine = backend.ActiveEngine;
 /// Convenience alias so consumers can write `reference.Local` instead of reaching into the backend module for the Value type.
 pub const Local = ActiveEngine.Value;
 
+/// Explicit wrapper representing an owned JavaScript Value whose ownership is transferred to the callee.
+pub const OwnedValue = struct {
+    value: Local,
+
+    pub fn from(v: Local) OwnedValue {
+        return .{ .value = v };
+    }
+
+    pub fn unwrap(self: OwnedValue) Local {
+        return self.value;
+    }
+};
+
 // ----------------------------------------------------------------------
 // Scope
 // ----------------------------------------------------------------------
