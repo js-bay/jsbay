@@ -6,17 +6,19 @@ This document details the formal specification locking and counterexample trace 
 
 The `state_tcas` v0.3.0 integration provides two formal verification mechanisms:
 1. **Declaration Anti-Drift Locking (`state_tcas.tla.lock`)**: Maintains a single source of truth by locking the TLA+ action/state vocabulary and bounded configuration constants generated from native Zig types against checked-in golden specifications (`docs/tla/scheduler_model.tla`).
-2. **Apalache ITF Trace Replay (`state_tcas.tla.replayJsonTrace` / `replayJsonTraceWithOptions`)**: Replays execution traces and model-checker counterexamples (in Informal Trace Format) against the live `js_event_loop.Scheduler` harness (`SchedulerTlaContext`), validating enabling guards (`error.ActionNotEnabled`) and state projection alignment (`error.TraceDiverged`).
+2. **ITF Trace Replay (`state_tcas.tla.replayJsonTrace` / `replayJsonTraceWithOptions`)**: Replays execution traces and counterexamples (authored in Apalache Informal Trace Format ADR-015 structure) against the live `js_event_loop.Scheduler` harness (`SchedulerTlaContext`), validating enabling guards (`error.ActionNotEnabled`) and multi-variable state projections (`error.TraceDiverged`).
 
 ## Formal Specifications and Traces
 
 | Artifact | Type | Description | Harness |
 | --- | --- | --- | --- |
 | [scheduler_model.tla](tla/scheduler_model.tla) | TLA+ Module | Locked declarations for JS event loop Scheduler vocabulary and bounds | `src/tests/state_tcas_tla_harness.zig` |
-| [scheduler_spec.tla](tla/scheduler_spec.tla) | TLA+ Specification | Formal state machine specification extending `scheduler_model` with safety invariants | `src/tests/state_tcas_tla_harness.zig` |
+| [scheduler_spec.tla](tla/scheduler_spec.tla) | TLA+ Specification | State machine specification extending `scheduler_model` with safety invariants | `src/tests/state_tcas_tla_harness.zig` |
+| [scheduler.cfg](tla/scheduler.cfg) | TLC Configuration | Model checker configuration asserting TypeOK and consistency invariants | `src/tests/state_tcas_tla_harness.zig` |
 | [scheduler_task_checkpoint_trace.json](tla/scheduler_task_checkpoint_trace.json) | Positive ITF Trace | Replay of canonical task execution followed by microtask checkpoint drain | `src/tests/state_tcas_tla_harness.zig` |
 | [scheduler_sync_wait_lifecycle_trace.json](tla/scheduler_sync_wait_lifecycle_trace.json) | Positive ITF Trace | Replay of synchronous native wait entry and exit lifecycle | `src/tests/state_tcas_tla_harness.zig` |
 | [scheduler_sync_wait_rejection_trace.json](tla/scheduler_sync_wait_rejection_trace.json) | Negative ITF Trace | Counterexample verifying queued task execution rejection during synchronous wait | `src/tests/state_tcas_tla_harness.zig` |
+| [scheduler_checkpoint_sync_wait_rejection_trace.json](tla/scheduler_checkpoint_sync_wait_rejection_trace.json) | Negative ITF Trace | Counterexample verifying microtask drain rejection during sync wait within checkpoint | `src/tests/state_tcas_tla_harness.zig` |
 
 ## Regenerating Golden Specifications
 

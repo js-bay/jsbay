@@ -142,8 +142,8 @@ pub const SchedulerTlaContext = struct {
             n += 1;
         }
 
-        // Checkpoint execution and completion.
-        if (self.sched.checkpoint_active) {
+        // Checkpoint execution and completion (strictly prohibited during synchronous wait).
+        if (self.sched.checkpoint_active and self.sync_wait_depth == 0) {
             if (self.micro_q > 0) {
                 self.acts_buf[n] = .drain_micro;
                 n += 1;
@@ -175,6 +175,7 @@ pub const SchedulerTlaContext = struct {
             },
             .end_queued_task => {
                 if (self.task_guard) |*t| {
+                    if (self.sched.isSynchronouslyWaiting()) return error.SchedulerRejected;
                     const is_outer = t.end();
                     self.task_guard = null;
                     if (is_outer) {
@@ -189,12 +190,13 @@ pub const SchedulerTlaContext = struct {
                 self.after_task = false;
             },
             .drain_micro => {
-                if (!self.sched.checkpoint_active) return error.SchedulerRejected;
+                if (!self.sched.checkpoint_active or self.sched.isSynchronouslyWaiting()) return error.SchedulerRejected;
                 if (self.micro_q == 0) return error.QueueUnderflow;
                 self.micro_q -= 1;
             },
             .end_checkpoint => {
                 if (self.checkpoint_guard) |*c| {
+                    if (self.sched.isSynchronouslyWaiting()) return error.SchedulerRejected;
                     c.end();
                     self.checkpoint_guard = null;
                     self.after_task = false;
@@ -324,6 +326,38 @@ test "state_tcas tla: replay counterexample trace expecting ActionNotEnabled dur
     try std.testing.expectEqual(SchedulerState.idle, ctx.project().state);
 }
 
+test "state_tcas tla: replay counterexample expecting ActionNotEnabled when draining micro during sync wait" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const trace_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "docs/tla/scheduler_checkpoint_sync_wait_rejection_trace.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(trace_bytes);
+
+    var ctx: SchedulerTlaContext = .{ .allocator = allocator };
+
+    const stats = try state_tcas.tla.replayJsonTraceWithOptions(
+        SchedulerAct,
+        &ctx,
+        allocator,
+        trace_bytes,
+        null,
+        .{
+            .expect_rejection = .{
+                .at_step = 4,
+                .err = error.ActionNotEnabled,
+            },
+        },
+    );
+
+    try std.testing.expectEqual(@as(usize, 3), stats.actions_replayed);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().state);
+}
+
 test "state_tcas tla: TraceDiverged triggered when queue counters diverge in ITF trace" {
     const allocator = std.testing.allocator;
     const divergent_trace =
@@ -341,10 +375,17 @@ test "state_tcas tla: TraceDiverged triggered when queue counters diverge in ITF
     );
 }
 
-test "state_tcas tla: begin_checkpoint is not enabled during sync wait even if after_task" {
+test "state_tcas tla: begin_checkpoint is not enabled during sync wait after task with microtasks" {
     var ctx: SchedulerTlaContext = .{ .allocator = std.testing.allocator };
-    ctx.after_task = true;
+    try ctx.step(.enqueue_macro, null);
+    try ctx.step(.begin_queued_task, null);
+    try ctx.step(.enqueue_micro, null);
+    try ctx.step(.end_queued_task, null);
+    try std.testing.expectEqual(SchedulerState.after_task, ctx.project().state);
+
+    // Enter synchronous wait after task.
     try ctx.step(.begin_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.project().state);
 
     const en = ctx.enabled();
     for (en) |act| {
@@ -353,7 +394,40 @@ test "state_tcas tla: begin_checkpoint is not enabled during sync wait even if a
     try std.testing.expectError(error.SchedulerRejected, ctx.step(.begin_checkpoint, null));
 
     try ctx.step(.end_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.after_task, ctx.project().state);
     try std.testing.expect(ctx.sched.allowsQueuedWork());
+
+    // Checkpoint can now proceed.
+    try ctx.step(.begin_checkpoint, null);
+    try ctx.step(.drain_micro, null);
+    try ctx.step(.end_checkpoint, null);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().state);
+}
+
+test "state_tcas tla: drain_micro and end_checkpoint reject operations during sync wait within checkpoint" {
+    var ctx: SchedulerTlaContext = .{ .allocator = std.testing.allocator };
+    try ctx.step(.enqueue_micro, null);
+    try ctx.step(.begin_checkpoint, null);
+    try std.testing.expectEqual(SchedulerState.in_checkpoint, ctx.project().state);
+
+    // Enter synchronous wait from within checkpoint callback.
+    try ctx.step(.begin_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.project().state);
+
+    const en = ctx.enabled();
+    for (en) |act| {
+        try std.testing.expect(act != .drain_micro);
+        try std.testing.expect(act != .end_checkpoint);
+    }
+    try std.testing.expectError(error.SchedulerRejected, ctx.step(.drain_micro, null));
+    try std.testing.expectError(error.SchedulerRejected, ctx.step(.end_checkpoint, null));
+
+    try ctx.step(.end_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_checkpoint, ctx.project().state);
+
+    try ctx.step(.drain_micro, null);
+    try ctx.step(.end_checkpoint, null);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().state);
 }
 
 test "state_tcas tla: Scheduler implementation rejects beginQueuedTask during sync wait" {

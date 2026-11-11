@@ -60,14 +60,15 @@ BeginCheckpoint ==
 
 DrainMicro ==
     /\ state = "in_checkpoint"
+    /\ sync_depth = 0
     /\ micro_q > 0
     /\ micro_q' = micro_q - 1
     /\ UNCHANGED <<state, saved_state, macro_q, sync_depth>>
 
 EndCheckpoint ==
     /\ state = "in_checkpoint"
-    /\ micro_q = 0
     /\ sync_depth = 0
+    /\ micro_q = 0
     /\ state' = "idle"
     /\ UNCHANGED <<saved_state, macro_q, micro_q, sync_depth>>
 
@@ -98,12 +99,12 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
-\* Safety Invariant: While synchronous wait is active, state is in_sync_wait and no queued tasks may run.
-Inv_NoQueuedWorkDuringSyncWait ==
+\* Safety Invariant: Active synchronous wait strictly correlates with in_sync_wait state.
+Inv_SyncWaitStateConsistency ==
     sync_depth > 0 <=> state = "in_sync_wait"
 
-\* Safety Invariant: Checkpoint is active only when not in synchronous wait.
-Inv_CheckpointMutualExclusion ==
-    state = "in_checkpoint" => sync_depth = 0
+\* Safety Invariant: When synchronous wait is inactive, saved_state must be idle.
+Inv_SyncWaitIdleWhenInactive ==
+    sync_depth = 0 => saved_state = "idle"
 
 ====
