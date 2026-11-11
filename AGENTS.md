@@ -28,3 +28,27 @@ Renaming a public symbol is a breaking change: say so in the PR. Rewriting git h
 - Separate independent paragraphs with a blank comment line. Preserve meaningful line breaks in lists, tables, code examples, command output, license notices, and formatter/linter directives. Keep each list item's prose together; preserve indentation in nested structures.
 - Runtime log messages should describe the event and useful context. Do not embed manual line wrapping in a message; preserve line breaks only for structured or inherently multiline content such as stack traces. Do not change required log fields or protocol formats to apply this prose rule.
 - Review comment edits separately from code edits. Verify that executable tokens and tool directives are unchanged, then run the privacy check and the format checks for affected languages.
+
+## Architecture and Zig Zen tenets
+
+Follow the Zen of Zig (`zig zen`) across all first-party Zig code, internal modules, and C ABI boundaries:
+
+- Communicate intent precisely. Avoid hidden control flow, implicit state conversions, or ambiguous types. Use strong types rather than raw primitive integers where IDs represent specific handles or resources (e.g. `InstanceId`).
+- Edge cases matter. Treat boundary conditions, cancellation, re-entrancy, and allocation failures as first-class control paths rather than exceptional afterthoughts.
+- Favor reading code over writing code. Be explicit and transparent; optimize for clarity and local comprehension over brevity or syntactic tricks.
+- Only one obvious way to do things. Maintain uniform patterns across backend bindings, lifecycle handlers, and data structures.
+- Runtime crashes are better than bugs. Panic or abort immediately on corrupt state rather than continuing in an invalid or compromised runtime state.
+- Compile errors are better than runtime crashes. Push validation into the type system and comptime checks so defects are caught at build time.
+- Incremental improvements. Refactor subsystems step-by-step with continuous test verification, avoiding risky flag-day rewrites.
+- Avoid local maximums. Do not choose short-term convenience when it compromises the long-term architecture or memory safety contract.
+- Reduce the amount one must remember. Rely on consistent naming, transparent ownership transfer, and uniform lifecycle conventions.
+- Focus on code rather than style. Let formatters and linters govern formatting; focus human energy on architecture, invariants, and algorithms.
+- Resource allocation may fail; resource deallocation must succeed. All heap allocation must handle failure explicitly. Do not hide heap allocations behind implicit constructors. Deallocation paths (`deinit`, `reset`, `destroy`) must never allocate heap memory and must not fail.
+- Memory is a resource. Explicit allocator discipline: do not hardcode `std.heap.c_allocator` inside internal modules. Internal structs, queues, registries, and tasks must accept an explicit `std.mem.Allocator` parameter (such as an instance-owned general-purpose allocator) so lifecycles are caller-governed and fully verifiable by `std.testing.allocator` in test suites. Restrict process-level ABI allocation to the public C export boundary (`src/c_api.zig`) where buffers are transferred to the foreign host.
+
+Key architectural rules derived from these tenets:
+
+- Explicit error sets and error unions. Functions that can fail must return typed Zig error sets (`Error!T`) rather than erasing failure reasons into `bool` or untyped integer codes. Map typed Zig error sets to public C status codes (`jsbay_status_t`) at the outermost export boundary using exhaustive `switch` statements without default `else` branches, ensuring newly added internal error cases cause compile-time errors if unhandled.
+- Strict assertion semantics. `std.debug.assert` introduces an invariant based on `unreachable`. Use assertions solely for impossible internal invariants that must indicate a programming defect when tripped. Never use `assert` for external input validation, foreign parameters, host callbacks, or conditions that can fail at runtime due to memory pressure or user scripts; handle those cases with explicit conditional checks and error returns. Never disable runtime safety checks to mask unverified assertions.
+- Comptime and inlining discipline. Keep `comptime` focused on backend dispatch, type safety, and C trampoline generation. Avoid deeply nested macro-style metaprogramming that inflates binary size or degrades compilation speed. Do not mark functions `inline fn` unless required for performance-critical primitives with profiled verification.
+- Ownership transparency in manual and GC lifecycles. Distinguish owned values from borrowed references in type signatures. Functions that take ownership of a reference must require an owned handle type so transfers are visible at call sites. Balance retained JS references with explicit `errdefer` / `defer` scopes, and ensure container destruction preemptively unlinks and resets live handles before the underlying VM context is freed.
