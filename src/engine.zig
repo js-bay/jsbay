@@ -830,13 +830,14 @@ fn runOneAsync(instance_id: i32) bool {
     const PendingScript = struct {
         script: [:0]const u8,
         resources: *@import("runtime/resource_limits.zig").Budget,
+        allocator: std.mem.Allocator,
     };
     const task = instance_map.withInstanceReturn(instance_id, struct {
         pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?PendingScript {
             inst.task_mutex.lock();
             defer inst.task_mutex.unlock();
             const script = inst.task_queue.popFront() orelse return null;
-            return .{ .script = script, .resources = inst.resources };
+            return .{ .script = script, .resources = inst.resources, .allocator = inst.allocator };
         }
     }{}) orelse {
         _ = queued.end();
@@ -844,7 +845,7 @@ fn runOneAsync(instance_id: i32) bool {
     };
     const script = task.script;
     defer {
-        std.heap.c_allocator.free(script);
+        task.allocator.free(script);
         task.resources.release(.script_task, script.len);
     }
     const result = ActiveEngine.eval(ptrs.ctx, script, "<dispatch>");

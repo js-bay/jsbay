@@ -1891,3 +1891,22 @@ test "adoptTypedValue adopts successful serialization" {
     try testing.expectEqual(status_ok, adopted.status);
     try testing.expectEqualStrings("123", adopted.result.?);
 }
+
+test "adoptTypedValue handles thrown exception during serialization" {
+    const testing = std.testing;
+    const helpers = @import("../tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+
+    const eval_res = engine.evalScript(id, "(() => { const err = new Error('thrown-error'); return err; })()", "<err-test>");
+    defer helpers.freeEvalResult(eval_res);
+    try testing.expect(eval_res.err == null);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const err_str = ActiveEngine.newStringVal(ctx, "manual-error");
+    const adopted = adoptTypedValue(ctx, err_str, status_exception);
+    defer if (adopted.err) |e| std.heap.c_allocator.free(e);
+    try testing.expectEqual(status_exception, adopted.status);
+    try testing.expectEqualStrings("manual-error", adopted.err.?);
+}

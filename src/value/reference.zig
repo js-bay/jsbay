@@ -29,7 +29,7 @@
 //!
 //! ## Thread affinity
 //!
-//! All Global, Weak, and Rooted operations (init, get, reset, deinit) must be performed on the owning engine thread. Engine teardown walks the intrusive bookkeeping list to reset dangling references before runtime destruction.
+//! All Global, Weak, and Rooted operations (init, get, reset, deinit) must be performed on the owning engine thread. Engine teardown walks the intrusive bookkeeping list to reset dangling references before runtime destruction. OwnedValue represents local scoped ownership and must not outlive its owning context.
 
 const std = @import("std");
 const backend = @import("../backend.zig");

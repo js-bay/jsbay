@@ -322,6 +322,20 @@ test "engine: dispatchTask runs on runEventLoopOnce and sets globals" {
     try testing.expectEqualStrings("123", res.result.?);
 }
 
+test "engine: dispatchTask with testing.allocator runs and frees without leak or heap corruption" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    try testing.expect(engine.dispatchTask(id, "globalThis.__zen_task__ = 789;"));
+    engine.runEventLoopOnce(id);
+
+    const res = engine.evalScript(id, "globalThis.__zen_task__", "<alloc-test>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqualStrings("789", res.result.?);
+}
+
 test "engine: dispatchTask reports rejection for a destroyed instance" {
     const id = helpers.nextInstanceId();
     try testing.expect(engine.create(id, .{}));
