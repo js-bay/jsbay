@@ -336,6 +336,14 @@ test "engine: dispatchTask with testing.allocator runs and frees without leak or
     try testing.expectEqualStrings("789", res.result.?);
 }
 
+test "engine: dispatchTask queued with testing.allocator cleans up on engine destroy" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+
+    try testing.expect(engine.dispatchTask(id, "globalThis.__unran__ = 999;"));
+    engine.destroy(id);
+}
+
 test "engine: dispatchTask reports rejection for a destroyed instance" {
     const id = helpers.nextInstanceId();
     try testing.expect(engine.create(id, .{}));
