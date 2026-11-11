@@ -1,9 +1,6 @@
 //! WebKit Inspector Relay client.
 //!
-//! The relay sends length-prefixed binary plists: a four-byte big-endian payload length followed by
-//! a plist dictionary with `messageName` and `userInfo`. Protocol JSON travels inside the `data`
-//! value under `WIRSocketDataKey`. This client only owns the transport, discovery, and attach
-//! handshake; CDP translation lives above it.
+//! The relay sends length-prefixed binary plists: a four-byte big-endian payload length followed by a plist dictionary with `messageName` and `userInfo`. Protocol JSON travels inside the `data` value under `WIRSocketDataKey`. This client only owns the transport, discovery, and attach handshake; CDP translation lives above it.
 
 const std = @import("std");
 const plist = @import("plist.zig");

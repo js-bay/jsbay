@@ -1,9 +1,6 @@
 //! Binary property-list support for the WebKit Inspector Relay envelope.
 //!
-//! The relay transports JSON protocol messages inside `WIRSocketDataKey` data values, but the
-//! envelope itself (message name plus user info) is a binary plist. The bridge needs only the
-//! value kinds the relay uses: dictionaries, arrays, strings, integers, booleans, data, real
-//! numbers, dates, and UIDs. Unsupported object kinds are reported as invalid input.
+//! The relay transports JSON protocol messages inside `WIRSocketDataKey` data values, but the envelope itself (message name plus user info) is a binary plist. The bridge needs only the value kinds the relay uses: dictionaries, arrays, strings, integers, booleans, data, real numbers, dates, and UIDs. Unsupported object kinds are reported as invalid input.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

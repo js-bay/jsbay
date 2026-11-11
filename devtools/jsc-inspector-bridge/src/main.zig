@@ -1,8 +1,6 @@
 //! Host-side WebKit Inspector Relay to Chrome DevTools Protocol bridge for JSC targets.
 //!
-//! The bridge connects to the local or simulator `webinspectord` relay socket, attaches to a
-//! JavaScript target, and exposes a loopback CDP endpoint. It never runs inside the inspected
-//! process; the target only enables the system JSC remote inspector.
+//! The bridge connects to the local or simulator `webinspectord` relay socket, attaches to a JavaScript target, and exposes a loopback CDP endpoint. It never runs inside the inspected process; the target only enables the system JSC remote inspector.
 
 const std = @import("std");
 const plist = @import("plist.zig");
