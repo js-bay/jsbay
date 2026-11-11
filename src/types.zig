@@ -6,10 +6,10 @@ const std = @import("std");
 pub const InstanceId = enum(i32) {
     _,
     pub fn fromInt(id: i32) InstanceId {
-        return @enumFromInt(id);
+        return @fromBackingInt(@intCast(id));
     }
     pub fn toInt(self: InstanceId) i32 {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
