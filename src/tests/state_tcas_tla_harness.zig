@@ -35,6 +35,13 @@ pub const SchedulerConfig = struct {
     pub const max_sync_depth: usize = 8;
 };
 
+pub const ProjectedState = struct {
+    state: SchedulerState,
+    macro_q: usize,
+    micro_q: usize,
+    sync_depth: usize,
+};
+
 pub const SchedulerTlaContext = struct {
     sched: Scheduler = .{},
     macro_q: usize = 0,
@@ -70,13 +77,25 @@ pub const SchedulerTlaContext = struct {
         self.after_task = false;
     }
 
-    pub fn project(self: *const @This()) SchedulerState {
-        // Dynamic state projection directly derived from Scheduler and pending queue state.
-        if (self.sched.sync_wait_depth.load(.acquire) > 0) return .in_sync_wait;
-        if (self.sched.execution_depth > 0) return .in_task;
-        if (self.sched.checkpoint_active) return .in_checkpoint;
-        if (self.after_task) return .after_task;
-        return .idle;
+    pub fn project(self: *const @This()) ProjectedState {
+        // Dynamic state projection directly derived from Scheduler execution, sync wait counters, and host queues.
+        const st: SchedulerState = if (self.sched.sync_wait_depth.load(.acquire) > 0)
+            .in_sync_wait
+        else if (self.sched.execution_depth > 0)
+            .in_task
+        else if (self.sched.checkpoint_active)
+            .in_checkpoint
+        else if (self.after_task)
+            .after_task
+        else
+            .idle;
+
+        return .{
+            .state = st,
+            .macro_q = self.macro_q,
+            .micro_q = self.micro_q,
+            .sync_depth = self.sync_wait_depth,
+        };
     }
 
     pub fn enabled(self: *@This()) []const SchedulerAct {
@@ -107,8 +126,8 @@ pub const SchedulerTlaContext = struct {
             n += 1;
         }
 
-        // Active task completion.
-        if (self.sched.execution_depth > 0 and !self.sched.checkpoint_active) {
+        // Active task completion: can only complete when sync wait is not blocking the task stack.
+        if (self.sched.execution_depth > 0 and self.sync_wait_depth == 0 and !self.sched.checkpoint_active) {
             self.acts_buf[n] = .end_queued_task;
             n += 1;
         }
@@ -118,7 +137,7 @@ pub const SchedulerTlaContext = struct {
             self.acts_buf[n] = .begin_checkpoint;
             n += 1;
         }
-        if (self.after_task) {
+        if (self.after_task and self.sched.allowsQueuedWork()) {
             self.acts_buf[n] = .begin_checkpoint;
             n += 1;
         }
@@ -138,7 +157,7 @@ pub const SchedulerTlaContext = struct {
     }
 
     pub fn step(self: *@This(), act: SchedulerAct, pic: ?*state_tcas.Picture) !void {
-        const before = @tagName(self.project());
+        const before = @tagName(self.project().state);
         switch (act) {
             .enqueue_macro => {
                 if (self.macro_q >= SchedulerConfig.max_queued_tasks) return error.QueueOverflow;
@@ -193,7 +212,7 @@ pub const SchedulerTlaContext = struct {
             },
         }
 
-        const after = @tagName(self.project());
+        const after = @tagName(self.project().state);
         if (pic) |p| {
             try p.observe(self.allocator, .{
                 .before = before,
@@ -265,7 +284,10 @@ test "state_tcas tla: replay ITF trace for task then checkpoint drain" {
 
     try std.testing.expectEqual(@as(usize, 7), stats.actions_replayed);
     try std.testing.expectEqual(@as(usize, 8), stats.states_verified);
-    try std.testing.expectEqual(SchedulerState.idle, ctx.project());
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().state);
+    try std.testing.expectEqual(@as(usize, 0), ctx.project().macro_q);
+    try std.testing.expectEqual(@as(usize, 0), ctx.project().micro_q);
+    try std.testing.expectEqual(@as(usize, 0), ctx.project().sync_depth);
     try std.testing.expectEqual(@as(usize, 7), pic.steps.items.len);
 }
 
@@ -299,7 +321,39 @@ test "state_tcas tla: replay counterexample trace expecting ActionNotEnabled dur
 
     try std.testing.expectEqual(@as(usize, 1), stats.actions_replayed);
     // Harness release() safely cleans up all guards upon trace completion returning state to idle.
-    try std.testing.expectEqual(SchedulerState.idle, ctx.project());
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().state);
+}
+
+test "state_tcas tla: TraceDiverged triggered when queue counters diverge in ITF trace" {
+    const allocator = std.testing.allocator;
+    const divergent_trace =
+        \\{
+        \\  "vars": ["state", "macro_q", "micro_q", "sync_depth"],
+        \\  "states": [
+        \\    { "#meta": { "index": 0 }, "action": "init", "state": "idle", "macro_q": 99, "micro_q": 0, "sync_depth": 0 }
+        \\  ]
+        \\}
+    ;
+    var ctx: SchedulerTlaContext = .{ .allocator = allocator };
+    try std.testing.expectError(
+        error.TraceDiverged,
+        state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, divergent_trace, null),
+    );
+}
+
+test "state_tcas tla: begin_checkpoint is not enabled during sync wait even if after_task" {
+    var ctx: SchedulerTlaContext = .{ .allocator = std.testing.allocator };
+    ctx.after_task = true;
+    try ctx.step(.begin_sync_wait, null);
+
+    const en = ctx.enabled();
+    for (en) |act| {
+        try std.testing.expect(act != .begin_checkpoint);
+    }
+    try std.testing.expectError(error.SchedulerRejected, ctx.step(.begin_checkpoint, null));
+
+    try ctx.step(.end_sync_wait, null);
+    try std.testing.expect(ctx.sched.allowsQueuedWork());
 }
 
 test "state_tcas tla: Scheduler implementation rejects beginQueuedTask during sync wait" {
@@ -313,6 +367,53 @@ test "state_tcas tla: Scheduler implementation rejects beginQueuedTask during sy
 
     try ctx.step(.end_sync_wait, null);
     try std.testing.expect(ctx.sched.allowsQueuedWork());
+}
+
+test "state_tcas tla: nested sync wait inside in_task preserves execution depth and resumes task" {
+    var ctx: SchedulerTlaContext = .{ .allocator = std.testing.allocator };
+
+    try ctx.step(.enqueue_macro, null);
+    try ctx.step(.begin_queued_task, null);
+    try std.testing.expectEqual(SchedulerState.in_task, ctx.project().state);
+
+    // Enter first level sync wait from inside task.
+    try ctx.step(.begin_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.project().state);
+    try std.testing.expectEqual(@as(usize, 1), ctx.project().sync_depth);
+
+    // Enter second level nested sync wait.
+    try ctx.step(.begin_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.project().state);
+    try std.testing.expectEqual(@as(usize, 2), ctx.project().sync_depth);
+
+    // Exit nested level.
+    try ctx.step(.end_sync_wait, null);
+    try std.testing.expectEqual(@as(usize, 1), ctx.project().sync_depth);
+    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.project().state);
+
+    // Exit outer sync wait -> state smoothly resumes to in_task.
+    try ctx.step(.end_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_task, ctx.project().state);
+    try std.testing.expectEqual(@as(usize, 0), ctx.project().sync_depth);
+
+    // Finish task.
+    try ctx.step(.end_queued_task, null);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().state);
+}
+
+test "state_tcas tla: sync wait depth is bounded by SchedulerConfig.max_sync_depth" {
+    var ctx: SchedulerTlaContext = .{ .allocator = std.testing.allocator };
+    var i: usize = 0;
+    while (i < SchedulerConfig.max_sync_depth) : (i += 1) {
+        try ctx.step(.begin_sync_wait, null);
+    }
+    try std.testing.expectEqual(SchedulerConfig.max_sync_depth, ctx.project().sync_depth);
+    try std.testing.expectError(error.SyncWaitOverflow, ctx.step(.begin_sync_wait, null));
+
+    while (i > 0) : (i -= 1) {
+        try ctx.step(.end_sync_wait, null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ctx.project().sync_depth);
 }
 
 test "state_tcas tla: dynamic action coverage across replay traces" {
