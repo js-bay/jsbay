@@ -1,0 +1,23 @@
+{
+  "#meta": {
+    "format": "ITF",
+    "description": "Counterexample trace verifying queued task rejection during synchronous wait"
+  },
+  "states": [
+    {
+      "#meta": { "index": 0 },
+      "action": "init",
+      "state": "idle"
+    },
+    {
+      "#meta": { "index": 1 },
+      "action": "begin_sync_wait",
+      "state": "in_sync_wait"
+    },
+    {
+      "#meta": { "index": 2 },
+      "action": "begin_queued_task",
+      "state": "in_task"
+    }
+  ]
+}

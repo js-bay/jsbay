@@ -1,0 +1,48 @@
+{
+  "#meta": {
+    "format": "ITF",
+    "description": "JS event loop scheduler task then microtask checkpoint drain trace"
+  },
+  "states": [
+    {
+      "#meta": { "index": 0 },
+      "action": "init",
+      "state": "idle"
+    },
+    {
+      "#meta": { "index": 1 },
+      "action": "enqueue_macro",
+      "state": "idle"
+    },
+    {
+      "#meta": { "index": 2 },
+      "action": "begin_queued_task",
+      "state": "in_task"
+    },
+    {
+      "#meta": { "index": 3 },
+      "action": "enqueue_micro",
+      "state": "in_task"
+    },
+    {
+      "#meta": { "index": 4 },
+      "action": "end_queued_task",
+      "state": "after_task"
+    },
+    {
+      "#meta": { "index": 5 },
+      "action": "begin_checkpoint",
+      "state": "in_checkpoint"
+    },
+    {
+      "#meta": { "index": 6 },
+      "action": "drain_micro",
+      "state": "in_checkpoint"
+    },
+    {
+      "#meta": { "index": 7 },
+      "action": "end_checkpoint",
+      "state": "idle"
+    }
+  ]
+}
