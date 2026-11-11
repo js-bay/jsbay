@@ -163,7 +163,7 @@ pub export fn jsbay_engine_create_with_options(
     if (options.struct_size >= @offsetOf(EngineCreateOptionsC, "max_heap_size") + @sizeOf(u64)) {
         config.max_heap_size = @intCast(options.max_heap_size);
     }
-    if (!engine.createWithBackend(id, config, requested)) return false;
+    engine.createWithBackend(id, config, requested) catch return false;
     // runtime_control is mono-only; packed-alt skips it inside createWithBackend.
     if (requested == backend.active_backend) {
         if (!runtime_control.init(id)) {
@@ -2280,13 +2280,19 @@ fn drainApiJobs(op: *ApiOp) bool {
 }
 
 fn discardBackendResult(ctx: ActiveEngine.Context, result: api_backend.Result) void {
-    if (result.value) |value| ActiveEngine.freeValue(ctx, value);
-    if (result.exception) |exception| ActiveEngine.freeValue(ctx, exception);
+    switch (result) {
+        .ok => |value| ActiveEngine.freeValue(ctx, value),
+        .exception => |exception| ActiveEngine.freeValue(ctx, exception),
+        .out_of_memory => {},
+    }
 }
 
 fn discardBytesResult(ctx: ActiveEngine.Context, result: api_backend.BytesResult) void {
-    if (result.bytes) |bytes| std.heap.c_allocator.free(bytes);
-    if (result.exception) |exception| ActiveEngine.freeValue(ctx, exception);
+    switch (result) {
+        .ok => |bytes| std.heap.c_allocator.free(bytes),
+        .exception => |exception| ActiveEngine.freeValue(ctx, exception),
+        .out_of_memory, .invalid_argument => {},
+    }
 }
 
 fn discardTypedBytecodeResult(ctx: ActiveEngine.Context, result: typed_bytecode.Result) void {
@@ -2525,12 +2531,14 @@ pub export fn jsbay_value_new_string(instance_id: c_int, input: Utf8, out_value:
     };
     defer op.deinit();
     const result = api_backend.newString(op.ctx, bytes);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u8, len: usize, out_value: *u64) c_int {
@@ -2567,12 +2575,14 @@ pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u
     };
     defer op.deinit();
     const result = api_backend.newArrayBuffer(op.ctx, bytes);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
@@ -2669,12 +2679,14 @@ pub export fn jsbay_value_new_object(instance_id: c_int, out_value: *u64) c_int 
     };
     defer op.deinit();
     const result = api_backend.newObject(op.ctx);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 pub export fn jsbay_value_new_array(instance_id: c_int, out_value: *u64) c_int {
@@ -2703,12 +2715,14 @@ pub export fn jsbay_value_new_array(instance_id: c_int, out_value: *u64) c_int {
     };
     defer op.deinit();
     const result = api_backend.newArray(op.ctx, 0);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 // The remaining Value operations are exported here while their backend-typed exception paths are being shared by all three engines. They clear every output before reporting unsupported so FFI callers never observe stale data.
@@ -3288,12 +3302,14 @@ pub export fn jsbay_value_new_json(instance_id_raw: c_int, input_arg: Utf8, out_
         discardBackendResult(op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            const stored = apiStore(id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, out_value: *u64) c_int {
     out_value.* = 0;
@@ -3323,13 +3339,15 @@ pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, o
     };
     defer op.deinit();
     const result = api_backend.newError(op.ctx, message);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        // Constructors report an internal failure as a non-exception status; no out_exception exists on this API surface.
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            // Constructors report an internal failure as a non-exception status; no out_exception exists on this API surface.
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
@@ -3375,22 +3393,25 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.invalid_argument) return API_INVALID_ARGUMENT;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
+    switch (result) {
+        .ok => |bytes| {
+            // QuickJS exposes unpaired UTF-16 surrogates as WTF-8. The public ABI promises ordinary UTF-8, so rewrite each surrogate half to U+FFFD in place. Valid UTF-8 (including NUL and paired emoji) is untouched.
+            if (!std.unicode.utf8ValidateSlice(bytes)) {
+                std.unicode.wtf8ToUtf8Lossy(bytes, bytes) catch {
+                    std.heap.c_allocator.free(bytes);
+                    return API_INVALID_ARGUMENT;
+                };
+            }
+            out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
+            return API_OK;
+        },
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => return API_OUT_OF_MEMORY,
+        .invalid_argument => return API_INVALID_ARGUMENT,
     }
-    const bytes = result.bytes orelse return API_OUT_OF_MEMORY;
-    // QuickJS exposes unpaired UTF-16 surrogates as WTF-8. The public ABI promises ordinary UTF-8, so rewrite each surrogate half to U+FFFD in place. Valid UTF-8 (including NUL and paired emoji) is untouched.
-    if (!std.unicode.utf8ValidateSlice(bytes)) {
-        std.unicode.wtf8ToUtf8Lossy(bytes, bytes) catch {
-            std.heap.c_allocator.free(bytes);
-            return API_INVALID_ARGUMENT;
-        };
-    }
-    out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
-    return API_OK;
 }
 pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
@@ -3418,15 +3439,18 @@ pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: 
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.invalid_argument) return API_INVALID_ARGUMENT;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
+    switch (result) {
+        .ok => |bytes| {
+            out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
+            return API_OK;
+        },
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => return API_OUT_OF_MEMORY,
+        .invalid_argument => return API_INVALID_ARGUMENT,
     }
-    const bytes = result.bytes orelse return API_OUT_OF_MEMORY;
-    out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
-    return API_OK;
 }
 pub export fn jsbay_value_copy_buffer(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
@@ -3454,15 +3478,18 @@ pub export fn jsbay_value_copy_buffer(value: u64, out_bytes: *Bytes, out_excepti
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.invalid_argument) return API_INVALID_ARGUMENT;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
+    switch (result) {
+        .ok => |bytes| {
+            out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
+            return API_OK;
+        },
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => return API_OUT_OF_MEMORY,
+        .invalid_argument => return API_INVALID_ARGUMENT,
     }
-    const bytes = result.bytes orelse return API_OUT_OF_MEMORY;
-    out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
-    return API_OK;
 }
 pub export fn jsbay_free_bytes(bytes: Bytes) void {
     if (bytes.data) |data| std.heap.c_allocator.free(data[0..bytes.len]);
@@ -3499,12 +3526,14 @@ pub export fn jsbay_value_get(object: u64, key_arg: Utf8, out_value: *u64, out_e
         discardBackendResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(data.op.id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(data.op.id, val, out_value),
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_exception: *u64) c_int {
     out_exception.* = 0;
@@ -3549,12 +3578,14 @@ pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_except
         discardBackendResult(object_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.exception) |exception| {
-        const stored = apiStore(object_data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    return API_OK;
+    return switch (result) {
+        .ok => API_OK,
+        .exception => |exception| {
+            const stored = apiStore(object_data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u64, argc: usize, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
@@ -3638,12 +3669,14 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         discardBackendResult(function_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(function_data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(function_data.op.id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(function_data.op.id, val, out_value),
+        .exception => |exception| {
+            const stored = apiStore(function_data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: usize, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
@@ -3717,27 +3750,36 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
         discardBackendResult(function_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(function_data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(function_data.op.id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(function_data.op.id, val, out_value),
+        .exception => |exception| {
+            const stored = apiStore(function_data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 /// Publish a boolean backend result, or its original throw value, once the microtask checkpoint has run. A checkpoint that tears the instance down publishes nothing.
 fn finishBoolOp(op: *ApiOp, result: api_backend.BoolResult, out_flag: *bool, out_exception: *u64) c_int {
     if (!drainApiJobs(op)) {
-        if (result.exception) |exception| ActiveEngine.freeValue(op.ctx, exception);
+        switch (result) {
+            .exception => |exception| ActiveEngine.freeValue(op.ctx, exception),
+            else => {},
+        }
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
+    switch (result) {
+        .ok => |val| {
+            out_flag.* = val;
+            return API_OK;
+        },
+        .exception => |exception| {
+            const stored = apiStore(op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => return API_OUT_OF_MEMORY,
     }
-    out_flag.* = result.value;
-    return API_OK;
 }
 
 fn keyedBoolOp(
@@ -3825,12 +3867,14 @@ pub export fn jsbay_value_keys(object: u64, out_array: *u64, out_exception: *u64
         discardBackendResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(data.op.id, result.value orelse return API_OUT_OF_MEMORY, out_array);
+    return switch (result) {
+        .ok => |val| apiStore(data.op.id, val, out_array),
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 pub export fn jsbay_value_instance_of(value: u64, constructor: u64, out_result: *bool, out_exception: *u64) c_int {
@@ -4002,12 +4046,14 @@ fn syncNewStringFromPayload(instance_id: i32, payload: []const u8, out_value: *u
     defer op.deinit();
     // UTF-8 already validated on the completer thread for STRING / EXCEPTION paths.
     const result = api_backend.newString(op.ctx, payload);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(instance_id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(instance_id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 fn syncAdoptOrCopyArrayBuffer(instance_id: i32, payload: []u8, out_value: *u64) c_int {
@@ -4039,12 +4085,14 @@ fn syncAdoptOrCopyArrayBuffer(instance_id: i32, payload: []u8, out_value: *u64) 
 
     const result = api_backend.newArrayBuffer(op.ctx, payload);
     std.heap.c_allocator.free(payload);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(instance_id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(instance_id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: usize, args: ?[*]const u64, out_value: *u64, out_exception: *u64) callconv(.c) c_int {

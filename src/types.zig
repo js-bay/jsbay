@@ -1,5 +1,7 @@
 //! Public types shared across the engine. All C ABI types are `extern struct` / `extern enum`.
 
+const std = @import("std");
+
 pub const LogLevel = enum(c_int) {
     debug = 0,
     info = 1,
@@ -62,6 +64,8 @@ pub const ErrorObserver = *const fn (*const ErrorEvent, ?*anyopaque) callconv(.c
 
 /// Configuration for creating an engine instance.
 pub const EngineConfig = struct {
+    /// Instance-level allocator for internal engine structures. Defaults to `std.heap.c_allocator` when null.
+    allocator: ?std.mem.Allocator = null,
     /// Native timer and asynchronous callback budgets; zero disables that resource.
     resource_limits: @import("runtime/resource_limits.zig").Limits = .{},
     log_handler: ?LogHandler = null,

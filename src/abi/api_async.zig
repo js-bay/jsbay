@@ -75,9 +75,14 @@ pub fn create(instance_id: i32) CreateResult {
     var committed = false;
     defer if (!committed) instance.resources.release(.tsfn_call, 0);
     const ptrs = instance_map.getPtrs(instance_id) orelse return .{ .status = 4 };
-    const failed = api_backend.newError(ptrs.ctx, "native promise completion allocation failed");
-    if (failed.exception) |exception| ActiveEngine.freeValue(ptrs.ctx, exception);
-    const failure = failed.value orelse return .{ .status = 6 };
+    const failure = switch (api_backend.newError(ptrs.ctx, "native promise completion allocation failed")) {
+        .ok => |val| val,
+        .exception => |exception| {
+            ActiveEngine.freeValue(ptrs.ctx, exception);
+            return .{ .status = 6 };
+        },
+        .out_of_memory => return .{ .status = 6 },
+    };
     defer if (!committed) ActiveEngine.freeValue(ptrs.ctx, failure);
     var deferred = promise.create(instance_id) orelse return .{ .status = 6 };
     defer if (!committed) deferred.deinit();
@@ -291,22 +296,26 @@ fn runDelivery(context: ?*anyopaque) void {
     else if (delivery.outcome == .exception and delivery.kind != .json)
         api_backend.newError(ctx.ctx, delivery.data)
     else switch (delivery.kind) {
-        .undefined => .{ .value = ActiveEngine.newUndefinedVal(ctx.ctx) },
+        .undefined => .{ .ok = ActiveEngine.newUndefinedVal(ctx.ctx) },
         .utf8_string => api_backend.newString(ctx.ctx, delivery.data),
         .bytes => api_backend.newArrayBuffer(ctx.ctx, delivery.data),
         .json => api_backend.parseJson(ctx.ctx, delivery.data),
     };
-    if (made.value) |made_value| {
-        value = made_value;
-        defer ActiveEngine.freeValue(ctx.ctx, value);
-        _ = if (delivery.action == .complete and delivery.outcome == .ok) delivery.request.deferred.resolve(value) else delivery.request.deferred.reject(value);
-    } else if (made.exception) |exception| {
-        defer ActiveEngine.freeValue(ctx.ctx, exception);
-        // Error construction can itself fail without an allocated Error value. Keep cancellation and message rejections observable under that pressure.
-        const reason = if (making_error or ActiveEngine.isNull(ctx.ctx, exception) or ActiveEngine.isUndefined(ctx.ctx, exception)) delivery.request.failure else exception;
-        _ = delivery.request.deferred.reject(reason);
-    } else {
-        _ = delivery.request.deferred.reject(delivery.request.failure);
+    switch (made) {
+        .ok => |made_value| {
+            value = made_value;
+            defer ActiveEngine.freeValue(ctx.ctx, value);
+            _ = if (delivery.action == .complete and delivery.outcome == .ok) delivery.request.deferred.resolve(value) else delivery.request.deferred.reject(value);
+        },
+        .exception => |exception| {
+            defer ActiveEngine.freeValue(ctx.ctx, exception);
+            // Error construction can itself fail without an allocated Error value. Keep cancellation and message rejections observable under that pressure.
+            const reason = if (making_error or ActiveEngine.isNull(ctx.ctx, exception) or ActiveEngine.isUndefined(ctx.ctx, exception)) delivery.request.failure else exception;
+            _ = delivery.request.deferred.reject(reason);
+        },
+        .out_of_memory => {
+            _ = delivery.request.deferred.reject(delivery.request.failure);
+        },
     }
 }
 

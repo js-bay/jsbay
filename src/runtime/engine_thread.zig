@@ -1653,7 +1653,7 @@ fn serializeThreadValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value) ap
         backend.ActiveEngineModule.lifecycle.enterJs(ctx)
     else
         true;
-    if (!entered) return .{ .out_of_memory = true };
+    if (!entered) return .out_of_memory;
     defer if (comptime backend.isQuickJsApiBackend(backend.active_backend)) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
     return api_backend.toUtf8(ctx, value);
 }
@@ -1663,18 +1663,23 @@ fn adoptTypedValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value, status:
     const serialized = serializeThreadValue(ctx, value);
     // ToString itself may enqueue microtasks.  Drain them before the enclosing admission closes, unless that conversion asked to destroy this runtime.
     if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
-    if (serialized.out_of_memory) return .{ .status = status_out_of_memory, .result = null, .err = null };
-    if (serialized.bytes) |bytes| return if (status == status_ok)
-        .{ .status = status_ok, .result = bytes, .err = null }
-    else
-        .{ .status = status_exception, .result = null, .err = bytes };
-    if (serialized.exception) |serialization_exception| {
-        defer ActiveEngine.freeValue(ctx, serialization_exception);
-        const thrown = serializeThreadValue(ctx, serialization_exception);
-        if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
-        if (thrown.bytes) |bytes| return .{ .status = status_exception, .result = null, .err = bytes };
-        if (thrown.exception) |nested| ActiveEngine.freeValue(ctx, nested);
-        if (thrown.out_of_memory) return .{ .status = status_out_of_memory, .result = null, .err = null };
+    switch (serialized) {
+        .ok => |bytes| return if (status == status_ok)
+            .{ .status = status_ok, .result = bytes, .err = null }
+        else
+            .{ .status = status_exception, .result = null, .err = bytes },
+        .exception => |serialization_exception| {
+            defer ActiveEngine.freeValue(ctx, serialization_exception);
+            const thrown = serializeThreadValue(ctx, serialization_exception);
+            if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
+            switch (thrown) {
+                .ok => |bytes| return .{ .status = status_exception, .result = null, .err = bytes },
+                .exception => |nested| ActiveEngine.freeValue(ctx, nested),
+                .out_of_memory, .invalid_argument => {},
+            }
+        },
+        .out_of_memory => return .{ .status = status_out_of_memory, .result = null, .err = null },
+        .invalid_argument => {},
     }
     const fallback = std.heap.c_allocator.dupe(u8, "Unable to serialize JavaScript result") catch
         return .{ .status = status_out_of_memory, .result = null, .err = null };

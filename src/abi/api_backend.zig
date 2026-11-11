@@ -5,25 +5,25 @@ const builtin = @import("builtin");
 const backend = @import("../backend.zig");
 const ActiveEngine = backend.ActiveEngine;
 
-pub const Result = struct {
-    value: ?ActiveEngine.Value = null,
-    exception: ?ActiveEngine.Value = null,
-    out_of_memory: bool = false,
+pub const Result = union(enum) {
+    ok: ActiveEngine.Value,
+    exception: ActiveEngine.Value,
+    out_of_memory,
 };
 
 /// Predicate-style operations report their boolean separately from a thrown JavaScript value, so `false` is never confused with an exception.
-pub const BoolResult = struct {
-    value: bool = false,
-    exception: ?ActiveEngine.Value = null,
-    out_of_memory: bool = false,
+pub const BoolResult = union(enum) {
+    ok: bool,
+    exception: ActiveEngine.Value,
+    out_of_memory,
 };
 
 /// Conversion results deliberately keep a thrown JavaScript value separate from allocation failure.  The older convenience helpers flatten both to null and drain exceptions, which is unsuitable for the typed C ABI.
-pub const BytesResult = struct {
-    bytes: ?[]u8 = null,
-    exception: ?ActiveEngine.Value = null,
-    out_of_memory: bool = false,
-    invalid_argument: bool = false,
+pub const BytesResult = union(enum) {
+    ok: []u8,
+    exception: ActiveEngine.Value,
+    out_of_memory,
+    invalid_argument,
 };
 
 pub fn toUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
@@ -37,7 +37,7 @@ pub fn toUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult 
 
 pub fn toJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     // JSON text has no top-level representation for these values.  JSC's native stringify currently yields "null" for undefined, so enforce the public cross-backend contract before invoking backend conversion.
-    if (ActiveEngine.isUndefined(ctx, value) or ActiveEngine.isFunction(ctx, value)) return .{ .invalid_argument = true };
+    if (ActiveEngine.isUndefined(ctx, value) or ActiveEngine.isFunction(ctx, value)) return .invalid_argument;
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsToJson(ctx, value),
         .jsc => jscToJson(ctx, value),
@@ -181,41 +181,41 @@ fn qjsConstructorResult(ctx: ActiveEngine.Context, value: ActiveEngine.Value) Re
         ActiveEngine.freeValue(ctx, value);
         const exception = m.qjs.JS_GetException(ctx);
         ActiveEngine.freeValue(ctx, exception);
-        return .{ .out_of_memory = true };
+        return .out_of_memory;
     }
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 /// Typed string construction keeps JSC's UTF-16 allocation failure distinct from an empty JavaScript string and never publishes a QJS exception tag.
 pub fn newString(ctx: ActiveEngine.Context, input: []const u8) Result {
-    if (consumeConstructorFault()) return .{ .out_of_memory = true };
+    if (consumeConstructorFault()) return .out_of_memory;
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsConstructorResult(ctx, ActiveEngine.newStringVal(ctx, input)),
         .jsc => jscNewString(ctx, input),
         .escargot, .hermes => blk: {
             const v = ActiveEngine.newStringVal(ctx, input);
-            break :blk if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+            break :blk if (v == null) .out_of_memory else .{ .ok = v };
         },
     };
 }
 
 /// Object construction follows the same no-pending-exception contract as strings. A constructor API has no exception output, so every backend-side allocation failure is reported as OUT_OF_MEMORY with a cleared output.
 pub fn newObject(ctx: ActiveEngine.Context) Result {
-    if (consumeConstructorFault()) return .{ .out_of_memory = true };
+    if (consumeConstructorFault()) return .out_of_memory;
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsConstructorResult(ctx, ActiveEngine.newObject(ctx)),
-        .jsc => if (ActiveEngine.newObject(ctx)) |value| .{ .value = value } else .{ .out_of_memory = true },
-        .escargot, .hermes => .{ .value = ActiveEngine.newObject(ctx) },
+        .jsc => if (ActiveEngine.newObject(ctx)) |value| .{ .ok = value } else .out_of_memory,
+        .escargot, .hermes => if (ActiveEngine.newObject(ctx)) |value| .{ .ok = value } else .out_of_memory,
     };
 }
 
 /// `len` is already constrained to a valid native array length by the public caller. Backends which cannot allocate it return OUT_OF_MEMORY and retain no pending exception.
 pub fn newArray(ctx: ActiveEngine.Context, len: u32) Result {
-    if (consumeConstructorFault()) return .{ .out_of_memory = true };
+    if (consumeConstructorFault()) return .out_of_memory;
     return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => qjsConstructorResult(ctx, ActiveEngine.newArray(ctx, len) orelse return .{ .out_of_memory = true }),
-        .jsc => if (ActiveEngine.newArray(ctx, len)) |value| .{ .value = value } else .{ .out_of_memory = true },
-        .escargot, .hermes => if (ActiveEngine.newArray(ctx, len)) |value| .{ .value = value } else .{ .out_of_memory = true },
+        .quickjs, .quickjs_ng => qjsConstructorResult(ctx, ActiveEngine.newArray(ctx, len) orelse return .out_of_memory),
+        .jsc => if (ActiveEngine.newArray(ctx, len)) |value| .{ .ok = value } else .out_of_memory,
+        .escargot, .hermes => if (ActiveEngine.newArray(ctx, len)) |value| .{ .ok = value } else .out_of_memory,
     };
 }
 
@@ -225,10 +225,10 @@ pub fn newArrayBuffer(ctx: ActiveEngine.Context, bytes: []const u8) Result {
         .quickjs, .quickjs_ng => blk: {
             const m = backend.ActiveEngineModule;
             if (m.c_api.jsIsException(value)) break :blk .{ .exception = m.qjs.JS_GetException(ctx) };
-            break :blk .{ .value = value };
+            break :blk .{ .ok = value };
         },
-        .jsc => if (value == null) .{ .out_of_memory = true } else .{ .value = value },
-        .escargot, .hermes => if (value == null) .{ .out_of_memory = true } else .{ .value = value },
+        .jsc => if (value == null) .out_of_memory else .{ .ok = value },
+        .escargot, .hermes => if (value == null) .out_of_memory else .{ .ok = value },
     };
 }
 
@@ -242,8 +242,8 @@ pub fn copyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesRes
     else if (ActiveEngine.dataViewInfo(ctx, value)) |view|
         view.bytes[view.byte_offset .. view.byte_offset + view.byte_length]
     else
-        return .{ .invalid_argument = true };
-    return .{ .bytes = std.heap.c_allocator.dupe(u8, source) catch return .{ .out_of_memory = true } };
+        return .invalid_argument;
+    return .{ .ok = std.heap.c_allocator.dupe(u8, source) catch return .out_of_memory };
 }
 
 fn jscCopyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
@@ -251,7 +251,7 @@ fn jscCopyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResu
     const intrinsics = @import("../backend/jsc/value.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
     const effective = @import("../backend/jsc/common.zig").liftValue(ctx_ref, value);
-    if (!m.jsc.JSValueIsObject(ctx_ref, effective)) return .{ .invalid_argument = true };
+    if (!m.jsc.JSValueIsObject(ctx_ref, effective)) return .invalid_argument;
 
     var exception: m.jsc.JSValueRef = null;
     const kind = m.jsc.JSValueGetTypedArrayType(ctx_ref, effective, &exception);
@@ -267,16 +267,16 @@ fn jscCopyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResu
     } else {
         buffer = m.jsc.JSObjectGetTypedArrayBuffer(ctx_ref, @constCast(effective), &exception);
         if (exception != null) return jscBufferException(ctx, exception);
-        if (buffer == null) return .{ .invalid_argument = true };
+        if (buffer == null) return .invalid_argument;
 
         const validator = if (kind == m.jsc.kJSTypedArrayTypeNone)
             intrinsics.dataViewByteLengthGetter(@ptrCast(ctx))
         else
             intrinsics.typedArrayValues(@ptrCast(ctx));
-        const validate = validator orelse return .{ .out_of_memory = true };
+        const validate = validator orelse return .out_of_memory;
         const validation_result = m.jsc.JSObjectCallAsFunction(ctx_ref, validate, @constCast(effective), 0, null, &exception);
         if (exception != null) return jscBufferException(ctx, exception);
-        if (validation_result == null) return .{ .out_of_memory = true };
+        if (validation_result == null) return .out_of_memory;
 
         byte_offset = m.jsc.JSObjectGetTypedArrayByteOffset(ctx_ref, @constCast(effective), &exception);
         if (exception != null) return jscBufferException(ctx, exception);
@@ -298,34 +298,34 @@ fn jscCopyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResu
     m.jsc.JSValueProtect(ctx_ref, destination);
     defer m.jsc.JSValueUnprotect(ctx_ref, destination);
 
-    const set_fn = intrinsics.typedArraySet(@ptrCast(ctx)) orelse return .{ .out_of_memory = true };
+    const set_fn = intrinsics.typedArraySet(@ptrCast(ctx)) orelse return .out_of_memory;
     const args = [_]m.jsc.JSValueRef{source};
     exception = null;
     const set_result = m.jsc.JSObjectCallAsFunction(ctx_ref, set_fn, destination, args.len, &args, &exception);
     if (exception != null) return jscBufferException(ctx, exception);
-    if (set_result == null) return .{ .out_of_memory = true };
+    if (set_result == null) return .out_of_memory;
 
     exception = null;
     const copied_len = m.jsc.JSObjectGetTypedArrayByteLength(ctx_ref, destination, &exception);
     if (exception != null) return jscBufferException(ctx, exception);
-    if (copied_len != byte_length) return .{ .out_of_memory = true };
+    if (copied_len != byte_length) return .out_of_memory;
     const ptr = m.jsc.JSObjectGetTypedArrayBytesPtr(ctx_ref, destination, &exception);
     if (exception != null) return jscBufferException(ctx, exception);
-    if (ptr == null and copied_len != 0) return .{ .out_of_memory = true };
+    if (ptr == null and copied_len != 0) return .out_of_memory;
     const source_bytes: []const u8 = if (copied_len == 0)
         &.{}
     else
         @as([*]const u8, @ptrCast(ptr.?))[0..copied_len];
-    return .{ .bytes = std.heap.c_allocator.dupe(u8, source_bytes) catch return .{ .out_of_memory = true } };
+    return .{ .ok = std.heap.c_allocator.dupe(u8, source_bytes) catch return .out_of_memory };
 }
 
 fn jscBufferException(ctx: ActiveEngine.Context, exception: @import("../backend/jsc.zig").jsc.JSValueRef) BytesResult {
     const m = @import("../backend/jsc.zig");
-    const thrown = exception orelse return .{ .out_of_memory = true };
+    const thrown = exception orelse return .out_of_memory;
     if (m.jsc.JSValueIsObject(@ptrCast(ctx), thrown)) {
         const type_error_prototype = @import("../backend/jsc/value.zig").typeErrorPrototype(@ptrCast(ctx));
         if (type_error_prototype) |prototype| {
-            if (m.jsc.JSValueIsStrictEqual(@ptrCast(ctx), m.jsc.JSObjectGetPrototype(@ptrCast(ctx), @constCast(thrown)), prototype)) return .{ .invalid_argument = true };
+            if (m.jsc.JSValueIsStrictEqual(@ptrCast(ctx), m.jsc.JSObjectGetPrototype(@ptrCast(ctx), @constCast(thrown)), prototype)) return .invalid_argument;
         }
     }
     return .{ .exception = ActiveEngine.dupValue(ctx, thrown) };
@@ -335,20 +335,20 @@ fn qjsGet(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const 
     const m = backend.ActiveEngineModule;
     const value = m.qjs.JS_GetPropertyStr(ctx, object, key.ptr);
     if (m.c_api.jsIsException(value)) return .{ .exception = m.qjs.JS_GetException(ctx) };
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn qjsCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
     const m = backend.ActiveEngineModule;
     const value = m.qjs.JS_Call(ctx, function, this_value, @intCast(args.len), @constCast(args.ptr));
     if (m.c_api.jsIsException(value)) return .{ .exception = m.qjs.JS_GetException(ctx) };
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn qjsSet(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const u8, value: ActiveEngine.Value) Result {
     const m = backend.ActiveEngineModule;
     if (m.qjs.JS_SetPropertyStr(ctx, object, key.ptr, value) < 0) return .{ .exception = m.qjs.JS_GetException(ctx) };
-    return .{ .value = ActiveEngine.undefinedValue() };
+    return .{ .ok = ActiveEngine.undefinedValue() };
 }
 
 fn qjsPendingException(ctx: ActiveEngine.Context) ActiveEngine.Value {
@@ -374,18 +374,18 @@ fn qjsConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: [
     const m = backend.ActiveEngineModule;
     const value = m.qjs.JS_CallConstructor(ctx, function, @intCast(args.len), @constCast(args.ptr));
     if (m.c_api.jsIsException(value)) return .{ .exception = qjsPendingException(ctx) };
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn qjsHas(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const u8) BoolResult {
     const m = backend.ActiveEngineModule;
     // JS_HasProperty reports false for primitives; the `in` operator throws.
     if (m.c_api.jsbay_qjs_JS_IsObject(object) == 0) return .{ .exception = qjsTypeError(ctx, "cannot use 'in' operator to search for a key in a non-object") };
-    const atom = qjsKeyAtom(ctx, key) orelse return .{ .out_of_memory = true };
+    const atom = qjsKeyAtom(ctx, key) orelse return .out_of_memory;
     defer m.qjs.JS_FreeAtom(ctx, atom);
     const found = m.qjs.JS_HasProperty(ctx, object, atom);
     if (found < 0) return .{ .exception = qjsPendingException(ctx) };
-    return .{ .value = found != 0 };
+    return .{ .ok = found != 0 };
 }
 
 fn qjsDelete(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const u8) BoolResult {
@@ -393,12 +393,12 @@ fn qjsDelete(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]con
     const target = m.qjs.JS_ToObject(ctx, object);
     if (m.c_api.jsIsException(target)) return .{ .exception = qjsPendingException(ctx) };
     defer m.qjs.JS_FreeValue(ctx, target);
-    const atom = qjsKeyAtom(ctx, key) orelse return .{ .out_of_memory = true };
+    const atom = qjsKeyAtom(ctx, key) orelse return .out_of_memory;
     defer m.qjs.JS_FreeAtom(ctx, atom);
     // Flags 0 selects non-strict semantics: refusal is false, not a TypeError.
     const deleted = m.qjs.JS_DeleteProperty(ctx, target, atom, 0);
     if (deleted < 0) return .{ .exception = qjsPendingException(ctx) };
-    return .{ .value = deleted != 0 };
+    return .{ .ok = deleted != 0 };
 }
 
 fn qjsKeys(ctx: ActiveEngine.Context, object: ActiveEngine.Value) Result {
@@ -427,23 +427,23 @@ fn qjsKeys(ctx: ActiveEngine.Context, object: ActiveEngine.Value) Result {
             return .{ .exception = qjsPendingException(ctx) };
         }
     }
-    return .{ .value = array };
+    return .{ .ok = array };
 }
 
 fn qjsInstanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, constructor: ActiveEngine.Value) BoolResult {
     const m = backend.ActiveEngineModule;
     const result = m.JS_IsInstanceOf(ctx, value, constructor);
     if (result < 0) return .{ .exception = qjsPendingException(ctx) };
-    return .{ .value = result != 0 };
+    return .{ .ok = result != 0 };
 }
 
 fn qjsParseJson(ctx: ActiveEngine.Context, input: []const u8) Result {
     const m = backend.ActiveEngineModule;
-    const bytes = std.heap.c_allocator.dupeSentinel(u8, input, 0) catch return .{ .out_of_memory = true };
+    const bytes = std.heap.c_allocator.dupeSentinel(u8, input, 0) catch return .out_of_memory;
     defer std.heap.c_allocator.free(bytes);
     const value = m.qjs.JS_ParseJSON(ctx, bytes.ptr, bytes.len, "<json>");
     if (m.c_api.jsIsException(value)) return .{ .exception = m.qjs.JS_GetException(ctx) };
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn qjsNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
@@ -461,7 +461,7 @@ fn qjsNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
         m.qjs.JS_FreeValue(ctx, error_value);
         return .{ .exception = m.qjs.JS_GetException(ctx) };
     }
-    return .{ .value = error_value };
+    return .{ .ok = error_value };
 }
 
 fn qjsBytes(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
@@ -469,8 +469,8 @@ fn qjsBytes(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     var len: usize = 0;
     const text = m.qjs.JS_ToCStringLen(ctx, &len, value) orelse return .{ .exception = m.qjs.JS_GetException(ctx) };
     defer m.qjs.JS_FreeCString(ctx, text);
-    const bytes = std.heap.c_allocator.dupe(u8, text[0..len]) catch return .{ .out_of_memory = true };
-    return .{ .bytes = bytes };
+    const bytes = std.heap.c_allocator.dupe(u8, text[0..len]) catch return .out_of_memory;
+    return .{ .ok = bytes };
 }
 
 fn qjsToUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
@@ -482,7 +482,7 @@ fn qjsToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     const json = m.qjs.JS_JSONStringify(ctx, value, m.c_api.JS_UNDEFINED, m.c_api.JS_UNDEFINED);
     if (m.c_api.jsIsException(json)) return .{ .exception = m.qjs.JS_GetException(ctx) };
     defer m.qjs.JS_FreeValue(ctx, json);
-    if (m.c_api.jsIsUndefined(json)) return .{ .invalid_argument = true };
+    if (m.c_api.jsIsUndefined(json)) return .invalid_argument;
     return qjsBytes(ctx, json);
 }
 
@@ -496,17 +496,17 @@ fn jscGet(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: []const u8
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    if (target == null) return .{ .out_of_memory = true };
-    const name = @import("../backend/jsc/common.zig").jsStringFromSlice(key) orelse return .{ .out_of_memory = true };
+    if (target == null) return .out_of_memory;
+    const name = @import("../backend/jsc/common.zig").jsStringFromSlice(key) orelse return .out_of_memory;
     defer m.jsc.JSStringRelease(name);
     const value = m.jsc.JSObjectGetProperty(ctx_ref, target, name, &exception);
     if (exception != null) {
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    if (value == null) return .{ .out_of_memory = true };
+    if (value == null) return .out_of_memory;
     m.jsc.JSValueProtect(ctx_ref, value);
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn jscCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
@@ -522,7 +522,7 @@ fn jscCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: 
             m.jsc.JSValueProtect(ctx_ref, type_error);
             return .{ .exception = type_error };
         }
-        if (boxed == null) return .{ .out_of_memory = true };
+        if (boxed == null) return .out_of_memory;
         _ = m.jsc.JSObjectCallAsFunction(ctx_ref, boxed, m.jsc.JSContextGetGlobalObject(ctx_ref), 0, null, &type_error);
         if (type_error != null) {
             m.jsc.JSValueProtect(ctx_ref, type_error);
@@ -530,22 +530,24 @@ fn jscCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: 
         }
         // A boxed primitive cannot be callable, but keep an owned fallback for an implementation that does not populate `type_error`.
         const error_result = jscNewError(ctx, "value is not callable");
-        if (error_result.value) |value| return .{ .exception = value };
-        return error_result;
+        return switch (error_result) {
+            .ok => |value| .{ .exception = value },
+            else => error_result,
+        };
     }
     const target: m.jsc.JSObjectRef = @ptrCast(@constCast(lifted_function));
-    const apply = @import("../backend/jsc/value.zig").functionApply(ctx) orelse return .{ .out_of_memory = true };
+    const apply = @import("../backend/jsc/value.zig").functionApply(ctx) orelse return .out_of_memory;
     var exception: m.jsc.JSValueRef = null;
     var lifted_args = std.ArrayList(m.jsc.JSValueRef).empty;
     defer lifted_args.deinit(std.heap.c_allocator);
-    lifted_args.ensureTotalCapacityPrecise(std.heap.c_allocator, args.len) catch return .{ .out_of_memory = true };
+    lifted_args.ensureTotalCapacityPrecise(std.heap.c_allocator, args.len) catch return .out_of_memory;
     for (args) |arg| lifted_args.appendAssumeCapacity(@import("../backend/jsc/common.zig").liftValue(ctx_ref, arg));
     const arg_array = m.jsc.JSObjectMakeArray(ctx_ref, lifted_args.items.len, lifted_args.items.ptr, &exception);
     if (exception != null) {
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    if (arg_array == null) return .{ .out_of_memory = true };
+    if (arg_array == null) return .out_of_memory;
     const lifted_this = @import("../backend/jsc/common.zig").liftValue(ctx_ref, this_value);
     const apply_args = [_]m.jsc.JSValueRef{ lifted_this, arg_array };
     // `apply` is the pristine Function.prototype.apply captured at context creation. Its object receiver is the target function, preserving the exact primitive/null/undefined `this` argument under strict mode.
@@ -554,9 +556,9 @@ fn jscCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: 
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    if (value == null) return .{ .out_of_memory = true };
+    if (value == null) return .out_of_memory;
     m.jsc.JSValueProtect(ctx_ref, value);
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn jscSet(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: []const u8, value: ActiveEngine.Value) Result {
@@ -571,8 +573,8 @@ fn jscSet(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: []const u8
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    if (target == null) return .{ .out_of_memory = true };
-    const name = @import("../backend/jsc/common.zig").jsStringFromSlice(key) orelse return .{ .out_of_memory = true };
+    if (target == null) return .out_of_memory;
+    const name = @import("../backend/jsc/common.zig").jsStringFromSlice(key) orelse return .out_of_memory;
     defer m.jsc.JSStringRelease(name);
     m.jsc.JSObjectSetProperty(ctx_ref, target, name, common.liftValue(ctx_ref, value), 0, &exception);
     // `set` consumes the duplicate supplied by the public API.  JSC property assignment does not consume a JSValueProtect reference itself.
@@ -580,14 +582,17 @@ fn jscSet(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: []const u8
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    return .{ .value = ActiveEngine.undefinedValue() };
+    return .{ .ok = ActiveEngine.undefinedValue() };
 }
 
 fn jscTypeError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const m = @import("../backend/jsc.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
     const made = jscNewError(ctx, message);
-    const error_value = made.value orelse return made;
+    const error_value = switch (made) {
+        .ok => |value| value,
+        else => return made,
+    };
     // The pristine TypeError.prototype keeps `name` and `instanceof` correct even when page code has replaced the global TypeError.
     if (@import("../backend/jsc/value.zig").typeErrorPrototype(@ptrCast(ctx))) |prototype| {
         m.jsc.JSObjectSetPrototype(ctx_ref, @ptrCast(@constCast(error_value)), prototype);
@@ -609,17 +614,21 @@ fn jscCallIntrinsic(ctx: ActiveEngine.Context, function: @import("../backend/jsc
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    if (value == null) return .{ .out_of_memory = true };
+    if (value == null) return .out_of_memory;
     m.jsc.JSValueProtect(ctx_ref, value);
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn jscBoolResult(ctx: ActiveEngine.Context, result: Result) BoolResult {
     const m = @import("../backend/jsc.zig");
-    if (result.exception) |exception| return .{ .exception = exception };
-    const value = result.value orelse return .{ .out_of_memory = result.out_of_memory };
-    defer ActiveEngine.freeValue(ctx, value);
-    return .{ .value = m.jsc.JSValueToBoolean(@ptrCast(ctx), value) };
+    switch (result) {
+        .exception => |exception| return .{ .exception = exception },
+        .ok => |value| {
+            defer ActiveEngine.freeValue(ctx, value);
+            return .{ .ok = m.jsc.JSValueToBoolean(@ptrCast(ctx), value) };
+        },
+        .out_of_memory => return .out_of_memory,
+    }
 }
 
 fn jscKeyValue(ctx: ActiveEngine.Context, key: []const u8) ?@import("../backend/jsc.zig").jsc.JSValueRef {
@@ -640,7 +649,7 @@ fn jscConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: [
     }
     var lifted_args = std.ArrayList(m.jsc.JSValueRef).empty;
     defer lifted_args.deinit(std.heap.c_allocator);
-    lifted_args.ensureTotalCapacityPrecise(std.heap.c_allocator, args.len) catch return .{ .out_of_memory = true };
+    lifted_args.ensureTotalCapacityPrecise(std.heap.c_allocator, args.len) catch return .out_of_memory;
     for (args) |arg| lifted_args.appendAssumeCapacity(common.liftValue(ctx_ref, arg));
     var exception: m.jsc.JSValueRef = null;
     const value = m.jsc.JSObjectCallAsConstructor(ctx_ref, @ptrCast(@constCast(lifted_function)), lifted_args.items.len, lifted_args.items.ptr, &exception);
@@ -648,37 +657,37 @@ fn jscConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: [
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    if (value == null) return .{ .out_of_memory = true };
+    if (value == null) return .out_of_memory;
     m.jsc.JSValueProtect(ctx_ref, value);
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn jscHas(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: []const u8) BoolResult {
     const common = @import("../backend/jsc/common.zig");
-    const intrinsics = jscObjectIntrinsics(ctx) orelse return .{ .out_of_memory = true };
-    const key_value = jscKeyValue(ctx, key) orelse return .{ .out_of_memory = true };
+    const intrinsics = jscObjectIntrinsics(ctx) orelse return .out_of_memory;
+    const key_value = jscKeyValue(ctx, key) orelse return .out_of_memory;
     const args = [_]@import("../backend/jsc.zig").jsc.JSValueRef{ common.liftValue(@ptrCast(ctx), object), key_value };
     return jscBoolResult(ctx, jscCallIntrinsic(ctx, intrinsics.has, &args));
 }
 
 fn jscDelete(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: []const u8) BoolResult {
     const common = @import("../backend/jsc/common.zig");
-    const intrinsics = jscObjectIntrinsics(ctx) orelse return .{ .out_of_memory = true };
-    const key_value = jscKeyValue(ctx, key) orelse return .{ .out_of_memory = true };
+    const intrinsics = jscObjectIntrinsics(ctx) orelse return .out_of_memory;
+    const key_value = jscKeyValue(ctx, key) orelse return .out_of_memory;
     const args = [_]@import("../backend/jsc.zig").jsc.JSValueRef{ common.liftValue(@ptrCast(ctx), object), key_value };
     return jscBoolResult(ctx, jscCallIntrinsic(ctx, intrinsics.delete, &args));
 }
 
 fn jscKeys(ctx: ActiveEngine.Context, object: ActiveEngine.Value) Result {
     const common = @import("../backend/jsc/common.zig");
-    const intrinsics = jscObjectIntrinsics(ctx) orelse return .{ .out_of_memory = true };
+    const intrinsics = jscObjectIntrinsics(ctx) orelse return .out_of_memory;
     const args = [_]@import("../backend/jsc.zig").jsc.JSValueRef{common.liftValue(@ptrCast(ctx), object)};
     return jscCallIntrinsic(ctx, intrinsics.keys, &args);
 }
 
 fn jscInstanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, constructor: ActiveEngine.Value) BoolResult {
     const common = @import("../backend/jsc/common.zig");
-    const intrinsics = jscObjectIntrinsics(ctx) orelse return .{ .out_of_memory = true };
+    const intrinsics = jscObjectIntrinsics(ctx) orelse return .out_of_memory;
     const args = [_]@import("../backend/jsc.zig").jsc.JSValueRef{ common.liftValue(@ptrCast(ctx), value), common.liftValue(@ptrCast(ctx), constructor) };
     return jscBoolResult(ctx, jscCallIntrinsic(ctx, intrinsics.instance_of, &args));
 }
@@ -687,23 +696,25 @@ fn jscParseJson(ctx: ActiveEngine.Context, input: []const u8) Result {
     const m = @import("../backend/jsc.zig");
     const common = @import("../backend/jsc/common.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
-    const text = common.jsStringFromSlice(input) orelse return .{ .out_of_memory = true };
+    const text = common.jsStringFromSlice(input) orelse return .out_of_memory;
     defer m.jsc.JSStringRelease(text);
     const value = m.jsc.JSValueMakeFromJSONString(ctx_ref, text);
     if (value == null) {
         const error_result = jscNewError(ctx, "invalid JSON");
-        if (error_result.value) |exception| return .{ .exception = exception };
-        return .{ .out_of_memory = true };
+        return switch (error_result) {
+            .ok => |exception| .{ .exception = exception },
+            else => .out_of_memory,
+        };
     }
     m.jsc.JSValueProtect(ctx_ref, value);
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn jscNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const m = @import("../backend/jsc.zig");
     const common = @import("../backend/jsc/common.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
-    const text = common.jsStringFromSlice(message) orelse return .{ .out_of_memory = true };
+    const text = common.jsStringFromSlice(message) orelse return .out_of_memory;
     defer m.jsc.JSStringRelease(text);
     const argument = m.jsc.JSValueMakeString(ctx_ref, text);
     var exception: m.jsc.JSValueRef = null;
@@ -712,21 +723,21 @@ fn jscNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    if (value == null) return .{ .out_of_memory = true };
+    if (value == null) return .out_of_memory;
     m.jsc.JSValueProtect(ctx_ref, value);
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn jscNewString(ctx: ActiveEngine.Context, input: []const u8) Result {
     const m = @import("../backend/jsc.zig");
     const common = @import("../backend/jsc/common.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
-    const text = common.jsStringFromSlice(input) orelse return .{ .out_of_memory = true };
+    const text = common.jsStringFromSlice(input) orelse return .out_of_memory;
     defer m.jsc.JSStringRelease(text);
     const value = m.jsc.JSValueMakeString(ctx_ref, text);
-    if (value == null) return .{ .out_of_memory = true };
+    if (value == null) return .out_of_memory;
     m.jsc.JSValueProtect(ctx_ref, value);
-    return .{ .value = value };
+    return .{ .ok = value };
 }
 
 fn jscToUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
@@ -738,9 +749,9 @@ fn jscToUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    const text = string orelse return .{ .out_of_memory = true };
+    const text = string orelse return .out_of_memory;
     defer m.jsc.JSStringRelease(text);
-    return .{ .bytes = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(std.heap.c_allocator, text) orelse return .{ .out_of_memory = true } };
+    return .{ .ok = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(std.heap.c_allocator, text) orelse return .out_of_memory };
 }
 
 fn jscToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
@@ -752,20 +763,20 @@ fn jscToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
         m.jsc.JSValueProtect(ctx_ref, exception);
         return .{ .exception = exception };
     }
-    const text = result orelse return .{ .invalid_argument = true };
+    const text = result orelse return .invalid_argument;
     defer m.jsc.JSStringRelease(text);
-    return .{ .bytes = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(std.heap.c_allocator, text) orelse return .{ .out_of_memory = true } };
+    return .{ .ok = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(std.heap.c_allocator, text) orelse return .out_of_memory };
 }
 
 fn escargotOp(result: @import("../backend/escargot/c_api.zig").OpResult) Result {
     if (result.exception != null) return .{ .exception = result.exception };
-    if (result.value != null) return .{ .value = result.value };
-    return .{ .out_of_memory = true };
+    if (result.value != null) return .{ .ok = result.value };
+    return .out_of_memory;
 }
 
 fn escargotBoolOp(result: @import("../backend/escargot/c_api.zig").BoolOpResult) BoolResult {
     if (result.exception != null) return .{ .exception = result.exception };
-    return .{ .value = result.value };
+    return .{ .ok = result.value };
 }
 
 fn escargotConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
@@ -807,13 +818,13 @@ fn escargotCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_va
 fn hermesNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const c = @import("../backend/hermes/c_api.zig");
     const v = c.hermes_new_error(ctx, 0, message.ptr, message.len);
-    return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+    return if (v == null) .out_of_memory else .{ .ok = v };
 }
 
 fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const c = @import("../backend/escargot/c_api.zig");
     const v = c.escargot_new_error(ctx, 0, message.ptr, message.len);
-    return if (v == null) .{ .out_of_memory = true } else .{ .value = v };
+    return if (v == null) .out_of_memory else .{ .ok = v };
 }
 
 fn spikeToUtf8(ctx: ActiveEngine.Context, comptime which: enum { escargot, hermes }, value: ActiveEngine.Value) BytesResult {
@@ -821,12 +832,15 @@ fn spikeToUtf8(ctx: ActiveEngine.Context, comptime which: enum { escargot, herme
         .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_value_to_string_result(ctx, value)),
         .hermes => hermesOp(@import("../backend/hermes/c_api.zig").hermes_value_to_string_result(ctx, value)),
     };
-    if (op.exception) |exception| return .{ .exception = exception };
-    if (op.out_of_memory) return .{ .out_of_memory = true };
-    const str_val = op.value orelse return .{ .out_of_memory = true };
-    defer ActiveEngine.freeValue(ctx, str_val);
-    const bytes = ActiveEngine.valueToStringAlloc(std.heap.c_allocator, ctx, str_val) orelse return .{ .out_of_memory = true };
-    return .{ .bytes = bytes };
+    switch (op) {
+        .exception => |exception| return .{ .exception = exception },
+        .out_of_memory => return .out_of_memory,
+        .ok => |str_val| {
+            defer ActiveEngine.freeValue(ctx, str_val);
+            const bytes = ActiveEngine.valueToStringAlloc(std.heap.c_allocator, ctx, str_val) orelse return .out_of_memory;
+            return .{ .ok = bytes };
+        },
+    }
 }
 
 fn spikeToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value, comptime which: enum { escargot, hermes }) BytesResult {
@@ -834,23 +848,25 @@ fn spikeToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value, comptime wh
         .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_json_stringify_result(ctx, value)),
         .hermes => hermesOp(@import("../backend/hermes/c_api.zig").hermes_json_stringify_result(ctx, value)),
     };
-    if (op.exception) |exception| return .{ .exception = exception };
-    if (op.out_of_memory) return .{ .out_of_memory = true };
-    const json_val = op.value orelse return .{ .out_of_memory = true };
+    const json_val = switch (op) {
+        .exception => |exception| return .{ .exception = exception },
+        .out_of_memory => return .out_of_memory,
+        .ok => |val| val,
+    };
     defer ActiveEngine.freeValue(ctx, json_val);
-    if (ActiveEngine.isUndefined(ctx, json_val)) return .{ .invalid_argument = true };
+    if (ActiveEngine.isUndefined(ctx, json_val)) return .invalid_argument;
     // Convert the JSON string Value to owned UTF-8 bytes.
     return toUtf8(ctx, json_val);
 }
 
 fn hermesOp(result: @import("../backend/hermes/c_api.zig").OpResult) Result {
     if (result.exception != null) return .{ .exception = result.exception };
-    if (result.value != null) return .{ .value = result.value };
-    return .{ .out_of_memory = true };
+    if (result.value != null) return .{ .ok = result.value };
+    return .out_of_memory;
 }
 fn hermesBoolOp(result: @import("../backend/hermes/c_api.zig").BoolOpResult) BoolResult {
     if (result.exception != null) return .{ .exception = result.exception };
-    return .{ .value = result.value };
+    return .{ .ok = result.value };
 }
 fn hermesConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
     const c = @import("../backend/hermes/c_api.zig");
