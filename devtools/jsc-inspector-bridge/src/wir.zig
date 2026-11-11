@@ -383,9 +383,7 @@ const ApplicationCandidate = struct { id: []u8, name: []u8 };
 
 /// Runs the relay handshake and attaches to one JavaScript target.
 ///
-/// Several processes can register the same application name, for example after a previous demo has
-/// not exited. Candidates are tried newest PID first and only an application that reports a
-/// JavaScript target is selected.
+/// Several processes can register the same application name, for example after a previous demo has not exited. Candidates are tried newest PID first and only an application that reports a JavaScript target is selected.
 pub fn attach(client: *Client, application_name: ?[]const u8, target_name: ?[]const u8, timeout_ms: u64) Error!Target {
     try client.send("_rpc_reportIdentifier:", .{ .dict = &.{
         .{ .key = "WIRConnectionIdentifierKey", .value = .{ .string = client.connection_id } },

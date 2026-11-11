@@ -325,8 +325,7 @@ const Encoder = struct {
         const index: Ref = @intCast(self.nodes.items.len);
         try self.nodes.append(self.allocator, .null);
         errdefer _ = self.nodes.pop();
-        // Evaluate the node before touching `items`: recursive `add` calls may grow and
-        // reallocate the list, so the placeholder must be written back through a fresh view.
+        // Evaluate the node before touching `items`: recursive `add` calls may grow and reallocate the list, so the placeholder must be written back through a fresh view.
         const node: Node = switch (value) {
             .null => .null,
             .boolean => |flag| .{ .boolean = flag },

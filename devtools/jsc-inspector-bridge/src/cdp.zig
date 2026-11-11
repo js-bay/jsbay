@@ -864,7 +864,6 @@ const evaluate_on_call_frame_keys = [_][]const u8{
     "returnByValue", "generatePreview", "emulateUserGesture",
 };
 
-/// JSC only stops on statement boundaries, so an offset inside an expression resolves to a later statement, often on the next line. Keeping the line and dropping the offset stops at the requested statement instead, which is what the Safari Web Inspector does.
 /// JSC resolves a breakpoint per statement, so a column offset is dropped to keep the breakpoint on the statement under the client's cursor. Two cases keep it: a single-line script, where the column is the only way to name a statement, and `continueToLocation`, where zeroing the column moves the target behind the position execution resumes from.
 fn dropStatementOffset(self: *Bridge, method: []const u8, params: *std.json.ObjectMap) void {
     if (std.mem.eql(u8, method, "Debugger.continueToLocation")) return;

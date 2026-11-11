@@ -19,6 +19,7 @@ if [[ ! -x "$bridge" ]]; then
 fi
 
 # A JavaScript callback that a native frame called is the only frame on the paused stack, so a stepOut has no JavaScript caller to stop in: the relay reports Debugger.resumed and the next pause, if any, is a fresh breakpoint hit.
+
 # Console API calls stay with the host console client, so the relay never reports console arguments.
 jsc_unsupported_steps=(
   native-callback-step-out
