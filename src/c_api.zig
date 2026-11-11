@@ -1671,7 +1671,7 @@ pub export fn jsbay_engine_cancel(instance_id: c_int, generation: u64) bool {
     const accepted = runtime_control.requestShutdownCancel(id);
     if (accepted) {
         native_sync.cancelForInstance(id);
-        api_async.cancelGeneration(@enumFromInt(id), generation);
+        api_async.cancelGeneration(types.InstanceId.fromInt(id), generation);
     }
     return accepted;
 }
@@ -2180,6 +2180,7 @@ const ApiOp = struct {
     ctx: ActiveEngine.Context,
     lease: engine_thread.EvalLease,
     entered_js: bool,
+    allocator: std.mem.Allocator,
     execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
     fn deinit(self: *ApiOp) void {
@@ -2199,9 +2200,8 @@ fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    if (@import("runtime/instance_map.zig").getInstance(id)) |inst| {
-        if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
-    }
+    const inst = @import("runtime/instance_map.zig").getInstance(id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
+    if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
     const lease = engine_thread.beginEval(id);
     if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
     const ctx = engine.getContext(id) orelse {
@@ -2213,7 +2213,7 @@ fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
         engine.finishEvalEntry(id, lease);
         return .{ .status = API_WRONG_THREAD };
     }
-    if (!require_execution) return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js } };
+    if (!require_execution) return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator } };
     const execution = @import("runtime/js_scheduler.zig").beginExecution(id) orelse {
         if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
             if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
@@ -2221,7 +2221,7 @@ fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
         engine.finishEvalEntry(id, lease);
         return .{ .status = API_INSTANCE_NOT_FOUND };
     };
-    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .execution = execution } };
+    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator, .execution = execution } };
 }
 
 fn beginApiOp(id: i32) ApiOpResult {
@@ -3782,7 +3782,7 @@ fn finishBoolOp(op: *ApiOp, result: api_backend.BoolResult, out_flag: *bool, out
     if (!drainApiJobs(op)) {
         switch (result) {
             .exception => |exception| ActiveEngine.freeValue(op.ctx, exception),
-            else => {},
+            .ok, .out_of_memory => {},
         }
         return API_INSTANCE_NOT_FOUND;
     }
@@ -4019,7 +4019,7 @@ pub export fn jsbay_engine_bind(instance_id_raw: c_int, name_arg: Utf8, callback
         .ok => |ok| ok,
     };
     defer op.deinit();
-    const installed = api_bind.install(id, op.ctx, name, cb, user_data, finalize);
+    const installed = api_bind.install(op.allocator, id, op.ctx, name, cb, user_data, finalize);
     switch (installed) {
         .out_of_memory => return API_OUT_OF_MEMORY,
         .exception => |exception| {
@@ -4258,7 +4258,7 @@ pub export fn jsbay_promise_create(instance_id_raw: c_int, out_request_id: ?*u64
         .ok => |value| value,
     };
     defer op.deinit();
-    switch (api_async.create(@enumFromInt(id))) {
+    switch (api_async.create(types.InstanceId.fromInt(id))) {
         .status => |status| return status,
         .ok => |created| {
             request_id.* = created.request_id;

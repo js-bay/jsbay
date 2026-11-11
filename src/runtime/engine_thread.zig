@@ -1675,7 +1675,8 @@ fn adoptTypedValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value, status:
             switch (thrown) {
                 .ok => |bytes| return .{ .status = status_exception, .result = null, .err = bytes },
                 .exception => |nested| ActiveEngine.freeValue(ctx, nested),
-                .out_of_memory, .invalid_argument => {},
+                .out_of_memory => return .{ .status = status_out_of_memory, .result = null, .err = null },
+                .invalid_argument => {},
             }
         },
         .out_of_memory => return .{ .status = status_out_of_memory, .result = null, .err = null },
@@ -1874,4 +1875,19 @@ fn deadlineFrom(timeout_ms: u64) i64 {
     if (room <= 0) return now;
     const add: i64 = if (timeout_ms > @as(u64, @intCast(room))) room else @intCast(timeout_ms);
     return now + add;
+}
+
+test "adoptTypedValue adopts successful serialization" {
+    const testing = std.testing;
+    const helpers = @import("../tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const num = ActiveEngine.newInt32Val(ctx, 123);
+    const adopted = adoptTypedValue(ctx, num, status_ok);
+    defer if (adopted.result) |res| std.heap.c_allocator.free(res);
+    try testing.expectEqual(status_ok, adopted.status);
+    try testing.expectEqualStrings("123", adopted.result.?);
 }

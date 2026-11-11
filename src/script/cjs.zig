@@ -224,29 +224,29 @@ fn runWrappedSource(
     buf.appendSlice(state.allocator, source) catch return error.OutOfMemory;
     buf.appendSlice(state.allocator, "\n})") catch return error.OutOfMemory;
 
-    var wrapper_fn = OwnedValue.init(try compileWrapper(state.ctx, buf.items, filename));
-    defer wrapper_fn.deinit(state.ctx);
+    var wrapper_fn = OwnedValue.init(state.ctx, try compileWrapper(state.ctx, buf.items, filename));
+    defer wrapper_fn.deinit();
 
     // Build fresh exports + module = { exports }.
-    var exports_obj = OwnedValue.init(ActiveEngine.newObject(state.ctx));
-    defer exports_obj.deinit(state.ctx);
+    var exports_obj = OwnedValue.init(state.ctx, ActiveEngine.newObject(state.ctx));
+    defer exports_obj.deinit();
 
-    var module_obj = OwnedValue.init(ActiveEngine.newObject(state.ctx));
-    defer module_obj.deinit(state.ctx);
+    var module_obj = OwnedValue.init(state.ctx, ActiveEngine.newObject(state.ctx));
+    defer module_obj.deinit();
 
     // Duplicate exports for the module.exports property so freeing either side independently is safe.
     const exp_for_module = ActiveEngine.dupValue(state.ctx, exports_obj.borrow());
     ActiveEngine.setPropertyStr(state.ctx, module_obj.borrow(), "exports", exp_for_module);
 
-    var filename_val = OwnedValue.init(ActiveEngine.newStringVal(state.ctx, filename));
-    defer filename_val.deinit(state.ctx);
+    var filename_val = OwnedValue.init(state.ctx, ActiveEngine.newStringVal(state.ctx, filename));
+    defer filename_val.deinit();
 
-    var dirname_val = OwnedValue.init(ActiveEngine.newStringVal(state.ctx, dirname));
-    defer dirname_val.deinit(state.ctx);
+    var dirname_val = OwnedValue.init(state.ctx, ActiveEngine.newStringVal(state.ctx, dirname));
+    defer dirname_val.deinit();
 
     // The instance's global `require` is the same function — reuse it via globalThis.require rather than synthesising a bound wrapper.
-    var require_fn = OwnedValue.init(getGlobalRequire(state.ctx));
-    defer require_fn.deinit(state.ctx);
+    var require_fn = OwnedValue.init(state.ctx, getGlobalRequire(state.ctx));
+    defer require_fn.deinit();
 
     const argv = [_]ActiveEngine.Value{
         exports_obj.borrow(),
@@ -1136,21 +1136,21 @@ fn runWrapperWithRequire(
     require_fn: @import("../backend.zig").ActiveEngineModule.qjs.JSValue,
     filename: []const u8,
 ) CjsCacheCbError!@import("../backend.zig").ActiveEngineModule.qjs.JSValue {
-    var exports_obj = OwnedValue.init(ActiveEngine.newObject(state.ctx));
-    defer exports_obj.deinit(state.ctx);
+    var exports_obj = OwnedValue.init(state.ctx, ActiveEngine.newObject(state.ctx));
+    defer exports_obj.deinit();
 
-    var module_obj = OwnedValue.init(ActiveEngine.newObject(state.ctx));
-    defer module_obj.deinit(state.ctx);
+    var module_obj = OwnedValue.init(state.ctx, ActiveEngine.newObject(state.ctx));
+    defer module_obj.deinit();
 
     const exp_for_module = ActiveEngine.dupValue(state.ctx, exports_obj.borrow());
     ActiveEngine.setPropertyStr(state.ctx, module_obj.borrow(), "exports", exp_for_module);
 
     const dirname = dirnameOf(filename);
-    var filename_val = OwnedValue.init(ActiveEngine.newStringVal(state.ctx, filename));
-    defer filename_val.deinit(state.ctx);
+    var filename_val = OwnedValue.init(state.ctx, ActiveEngine.newStringVal(state.ctx, filename));
+    defer filename_val.deinit();
 
-    var dirname_val = OwnedValue.init(ActiveEngine.newStringVal(state.ctx, dirname));
-    defer dirname_val.deinit(state.ctx);
+    var dirname_val = OwnedValue.init(state.ctx, ActiveEngine.newStringVal(state.ctx, dirname));
+    defer dirname_val.deinit();
 
     const argv = [_]ActiveEngine.Value{
         exports_obj.borrow(),

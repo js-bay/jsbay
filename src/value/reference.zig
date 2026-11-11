@@ -25,7 +25,11 @@
 //!
 //! ## Implementation note: heap-allocated handle
 //!
-//! `Global` and `Weak` are value types that may be moved/copied (e.g. by return-by-value from `init`). To keep their bookkeeping stable across such moves, the actual state lives in a heap-allocated `Cell` and the Global/Weak holds a stable pointer to it. The Cell embeds the intrusive `RefEntry` so `engine.destroy` can walk all live references and force-reset them before tearing down the JS runtime — preventing use-after- free when consumers forget to call `reset()` themselves.
+//! `Global` and `Weak` are value types that may be moved/copied (e.g. by return-by-value from `init`). To keep their bookkeeping stable across such moves, the actual state lives in a heap-allocated `Cell` and the Global/Weak holds a stable pointer to it. The Cell embeds the intrusive `RefEntry` so `engine.destroy` can walk all live references and force-reset them before tearing down the JS runtime — preventing use-after-free when consumers forget to call `reset()` themselves.
+//!
+//! ## Thread affinity
+//!
+//! All Global, Weak, and Rooted operations (init, get, reset, deinit) must be performed on the owning engine thread. Engine teardown walks the intrusive bookkeeping list to reset dangling references before runtime destruction.
 
 const std = @import("std");
 const backend = @import("../backend.zig");
@@ -38,10 +42,11 @@ pub const Local = ActiveEngine.Value;
 
 /// Explicit wrapper representing an owned JavaScript Value whose ownership is transferred to the callee.
 pub const OwnedValue = struct {
+    ctx: ActiveEngine.Context,
     raw: Local,
 
-    pub fn init(v: Local) OwnedValue {
-        return .{ .raw = v };
+    pub fn init(ctx: ActiveEngine.Context, v: Local) OwnedValue {
+        return .{ .ctx = ctx, .raw = v };
     }
 
     pub fn borrow(self: *const OwnedValue) Local {
@@ -54,8 +59,8 @@ pub const OwnedValue = struct {
         return val;
     }
 
-    pub fn deinit(self: *OwnedValue, ctx: ActiveEngine.Context) void {
-        ActiveEngine.freeValue(ctx, self.raw);
+    pub fn deinit(self: *OwnedValue) void {
+        ActiveEngine.freeValue(self.ctx, self.raw);
         self.raw = ActiveEngine.undefinedValue();
     }
 };
@@ -225,12 +230,6 @@ fn registerEntryDirect(inst: *instance_map.EngineInstance, entry: *instance_map.
     entry.next = inst.ref_bookkeeping.head;
     if (inst.ref_bookkeeping.head) |h| h.prev = entry;
     inst.ref_bookkeeping.head = entry;
-}
-
-/// Insert `entry` at the head of the engine's bookkeeping list. `entry` must already have its `reset_fn` set.
-fn registerEntry(instance_id: i32, entry: *instance_map.RefEntry) void {
-    const inst = instance_map.getInstance(instance_id) orelse return;
-    registerEntryDirect(inst, entry);
 }
 
 /// Unlink `entry` from the engine's bookkeeping list. Safe to call even if the engine has been torn down or the entry was already unlinked.

@@ -60,6 +60,7 @@ pub const CreateError = error{
     InstanceInsertFailed,
 };
 
+/// Convenience wrapper preserving boolean return for existing callers; calls createWithBackend with the active backend.
 pub fn create(instance_id: i32, config: types.EngineConfig) bool {
     createWithBackend(instance_id, config, backend.active_backend) catch return false;
     return true;
@@ -139,7 +140,7 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
             .instance_id = instance_id,
             .engine_handles = .{ .mono = .{ .runtime = runtime, .ctx = ctx } },
             .loop = loop,
-            .timers = timers.TimerRegistry.init(),
+            .timers = timers.TimerRegistry.initWithAllocator(alloc),
             .log_handler = config.log_handler,
             .log_user_data = config.log_user_data,
         };
@@ -183,7 +184,7 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
         .instance_id = instance_id,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
         .loop = loop,
-        .timers = timers.TimerRegistry.init(),
+        .timers = timers.TimerRegistry.initWithAllocator(alloc),
         .log_handler = config.log_handler,
         .log_user_data = config.log_user_data,
     };
@@ -723,7 +724,7 @@ pub fn destroyRuntime(instance_id: i32) void {
     defer inspector_state.endEngineDestroy(instance_id);
 
     if (!dispatch.closeInstanceTasks(instance_id)) return;
-    @import("abi/api_async.zig").cancelForInstance(@enumFromInt(instance_id));
+    @import("abi/api_async.zig").cancelForInstance(types.InstanceId.fromInt(instance_id));
     @import("js_event_loop").host_wake.drop(instance_id);
     // Drain Hide/Show/stop leases before touching the Driver (R3 getPtrs∩destroy).
     instance_map.waitForControlOps(instance_id);

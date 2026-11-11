@@ -876,19 +876,18 @@ test "value: OwnedValue wrap and unwrap semantics" {
     try helpers.withEngine(id, .{}, struct {
         fn run(inst: i32) !void {
             const ctx = engine.getContext(inst) orelse return error.ContextUnavailable;
-            const num = backend.ActiveEngine.newInt32Val(ctx, 42);
-            defer backend.ActiveEngine.freeValue(ctx, num);
-            const owned = value.OwnedValue.init(num);
-            try testing.expect(backend.ActiveEngine.sameValue(ctx, num, owned.borrow()));
+            var num_owned = value.OwnedValue.init(ctx, backend.ActiveEngine.newInt32Val(ctx, 42));
+            defer num_owned.deinit();
+            try testing.expectEqual(@as(i32, 42), backend.ActiveEngine.toInt32(ctx, num_owned.borrow()));
 
-            var obj = value.OwnedValue.init(backend.ActiveEngine.newObject(ctx));
+            var obj = value.OwnedValue.init(ctx, backend.ActiveEngine.newObject(ctx));
             try testing.expect(backend.ActiveEngine.isObjectVal(ctx, obj.borrow()));
             const released = obj.release();
             try testing.expect(backend.ActiveEngine.isUndefined(ctx, obj.borrow()));
             backend.ActiveEngine.freeValue(ctx, released);
 
-            var auto_freed = value.OwnedValue.init(backend.ActiveEngine.newInt32Val(ctx, 100));
-            auto_freed.deinit(ctx);
+            var auto_freed = value.OwnedValue.init(ctx, backend.ActiveEngine.newInt32Val(ctx, 100));
+            auto_freed.deinit();
             try testing.expect(backend.ActiveEngine.isUndefined(ctx, auto_freed.borrow()));
         }
     }.run);
@@ -925,4 +924,53 @@ test "value: Weak reference with custom allocator cleans up without leak" {
 
     const live = w.get() orelse return error.WeakLookupFailed;
     try testing.expect(backend.ActiveEngine.sameValue(ctx, obj, live));
+}
+
+test "value: Rooted lifecycle roots, unroots, and cleans up" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const obj = backend.ActiveEngine.newObject(ctx);
+    defer backend.ActiveEngine.freeValue(ctx, obj);
+
+    var r = @import("../root.zig").reference.Rooted.init(id, obj);
+    try testing.expect(r.isEmpty());
+    r.root();
+    try testing.expect(!r.isEmpty());
+    r.root();
+    r.unroot();
+    try testing.expect(!r.isEmpty());
+    r.unroot();
+    try testing.expect(r.isEmpty());
+    r.unroot();
+    r.deinit();
+    try testing.expect(r.isEmpty());
+}
+
+test "value: Global, Weak, and Rooted safe deinit after engine destroy" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const str = backend.ActiveEngine.newStringVal(ctx, "dangling-zen");
+    var g = @import("../root.zig").reference.Global(value.Local).init(id, str);
+    backend.ActiveEngine.freeValue(ctx, str);
+
+    const obj = backend.ActiveEngine.newObject(ctx);
+    var w = @import("../root.zig").reference.Weak(value.Local).init(id, obj);
+    var r = @import("../root.zig").reference.Rooted.init(id, obj);
+    r.root();
+    backend.ActiveEngine.freeValue(ctx, obj);
+
+    engine.destroy(id);
+
+    try testing.expect(g.get() == null);
+    try testing.expect(w.isEmpty());
+    try testing.expect(r.isEmpty());
+
+    g.deinit();
+    w.deinit();
+    r.deinit();
 }

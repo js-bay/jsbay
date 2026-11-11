@@ -41,20 +41,18 @@ fn statusException(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) ba
     return m.c_api.JS_EXCEPTION;
 }
 
-pub fn install(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
+pub fn install(alloc: std.mem.Allocator, id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     if (comptime backend.isJscApiBackend(backend.active_backend)) {
-        return jscInstall(id, ctx, name, callback, user_data, finalize);
+        return jscInstall(alloc, id, ctx, name, callback, user_data, finalize);
     }
     if (comptime backend.isSpikeBackend(backend.active_backend)) {
-        return spikeInstall(id, ctx, name, callback, user_data, finalize);
+        return spikeInstall(alloc, id, ctx, name, callback, user_data, finalize);
     }
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) {
-        _ = .{ id, ctx, name, callback, user_data, finalize };
+        _ = .{ alloc, id, ctx, name, callback, user_data, finalize };
         return .out_of_memory;
     }
     const m = backend.ActiveEngineModule;
-    const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse return .out_of_memory;
-    const alloc = inst.allocator;
     const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const binding = alloc.create(Binding) catch {
         alloc.free(name_z);
@@ -167,9 +165,7 @@ fn spikeThrowValue(ctx: backend.ActiveEngine.Context, exception: backend.ActiveE
     return null;
 }
 
-fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
-    const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse return .out_of_memory;
-    const alloc = inst.allocator;
+fn spikeInstall(alloc: std.mem.Allocator, id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const binding = alloc.create(Binding) catch {
         alloc.free(name_z);
@@ -280,11 +276,9 @@ fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEn
     return spikeThrow(ctx, "native callback returned invalid status");
 }
 
-fn jscInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
+fn jscInstall(alloc: std.mem.Allocator, id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     const m = @import("../backend/jsc.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
-    const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse return .out_of_memory;
-    const alloc = inst.allocator;
     const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const js_name = @import("../backend/jsc/common.zig").jsStringFromSlice(name) orelse {
         alloc.free(name_z);
