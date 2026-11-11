@@ -26,23 +26,23 @@ pub const BytesResult = union(enum) {
     invalid_argument,
 };
 
-pub fn toUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+pub fn toUtf8(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => qjsToUtf8(ctx, value),
-        .jsc => jscToUtf8(ctx, value),
-        .escargot => spikeToUtf8(ctx, .escargot, value),
-        .hermes => spikeToUtf8(ctx, .hermes, value),
+        .quickjs, .quickjs_ng => qjsToUtf8(allocator, ctx, value),
+        .jsc => jscToUtf8(allocator, ctx, value),
+        .escargot => spikeToUtf8(allocator, ctx, .escargot, value),
+        .hermes => spikeToUtf8(allocator, ctx, .hermes, value),
     };
 }
 
-pub fn toJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+pub fn toJson(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     // JSON text has no top-level representation for these values.  JSC's native stringify currently yields "null" for undefined, so enforce the public cross-backend contract before invoking backend conversion.
     if (ActiveEngine.isUndefined(ctx, value) or ActiveEngine.isFunction(ctx, value)) return .invalid_argument;
     return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => qjsToJson(ctx, value),
-        .jsc => jscToJson(ctx, value),
-        .escargot => spikeToJson(ctx, value, .escargot),
-        .hermes => spikeToJson(ctx, value, .hermes),
+        .quickjs, .quickjs_ng => qjsToJson(allocator, ctx, value),
+        .jsc => jscToJson(allocator, ctx, value),
+        .escargot => spikeToJson(allocator, ctx, value, .escargot),
+        .hermes => spikeToJson(allocator, ctx, value, .hermes),
     };
 }
 
@@ -232,8 +232,8 @@ pub fn newArrayBuffer(ctx: ActiveEngine.Context, bytes: []const u8) Result {
     };
 }
 
-pub fn copyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
-    if (comptime backend.isJscApiBackend(backend.active_backend)) return jscCopyBuffer(ctx, value);
+pub fn copyBuffer(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+    if (comptime backend.isJscApiBackend(backend.active_backend)) return jscCopyBuffer(allocator, ctx, value);
 
     const source: []const u8 = if (ActiveEngine.getArrayBufferSliceVal(ctx, value)) |bytes|
         bytes
@@ -243,10 +243,10 @@ pub fn copyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesRes
         view.bytes[view.byte_offset .. view.byte_offset + view.byte_length]
     else
         return .invalid_argument;
-    return .{ .ok = std.heap.c_allocator.dupe(u8, source) catch return .out_of_memory };
+    return .{ .ok = allocator.dupe(u8, source) catch return .out_of_memory };
 }
 
-fn jscCopyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+fn jscCopyBuffer(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     const m = @import("../backend/jsc.zig");
     const intrinsics = @import("../backend/jsc/value.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
@@ -316,7 +316,7 @@ fn jscCopyBuffer(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResu
         &.{}
     else
         @as([*]const u8, @ptrCast(ptr.?))[0..copied_len];
-    return .{ .ok = std.heap.c_allocator.dupe(u8, source_bytes) catch return .out_of_memory };
+    return .{ .ok = allocator.dupe(u8, source_bytes) catch return .out_of_memory };
 }
 
 fn jscBufferException(ctx: ActiveEngine.Context, exception: @import("../backend/jsc.zig").jsc.JSValueRef) BytesResult {
@@ -464,26 +464,26 @@ fn qjsNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     return .{ .ok = error_value };
 }
 
-fn qjsBytes(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+fn qjsBytes(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     const m = backend.ActiveEngineModule;
     var len: usize = 0;
     const text = m.qjs.JS_ToCStringLen(ctx, &len, value) orelse return .{ .exception = m.qjs.JS_GetException(ctx) };
     defer m.qjs.JS_FreeCString(ctx, text);
-    const bytes = std.heap.c_allocator.dupe(u8, text[0..len]) catch return .out_of_memory;
+    const bytes = allocator.dupe(u8, text[0..len]) catch return .out_of_memory;
     return .{ .ok = bytes };
 }
 
-fn qjsToUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
-    return qjsBytes(ctx, value);
+fn qjsToUtf8(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+    return qjsBytes(allocator, ctx, value);
 }
 
-fn qjsToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+fn qjsToJson(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     const m = backend.ActiveEngineModule;
     const json = m.qjs.JS_JSONStringify(ctx, value, m.c_api.JS_UNDEFINED, m.c_api.JS_UNDEFINED);
     if (m.c_api.jsIsException(json)) return .{ .exception = m.qjs.JS_GetException(ctx) };
     defer m.qjs.JS_FreeValue(ctx, json);
     if (m.c_api.jsIsUndefined(json)) return .invalid_argument;
-    return qjsBytes(ctx, json);
+    return qjsBytes(allocator, ctx, json);
 }
 
 fn jscGet(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: []const u8) Result {
@@ -743,7 +743,7 @@ fn jscNewString(ctx: ActiveEngine.Context, input: []const u8) Result {
     return .{ .ok = value };
 }
 
-fn jscToUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+fn jscToUtf8(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     const m = @import("../backend/jsc.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
     var exception: m.jsc.JSValueRef = null;
@@ -754,10 +754,10 @@ fn jscToUtf8(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     }
     const text = string orelse return .out_of_memory;
     defer m.jsc.JSStringRelease(text);
-    return .{ .ok = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(std.heap.c_allocator, text) orelse return .out_of_memory };
+    return .{ .ok = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(allocator, text) orelse return .out_of_memory };
 }
 
-fn jscToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
+fn jscToJson(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     const m = @import("../backend/jsc.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
     var exception: m.jsc.JSValueRef = null;
@@ -768,7 +768,7 @@ fn jscToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value) BytesResult {
     }
     const text = result orelse return .invalid_argument;
     defer m.jsc.JSStringRelease(text);
-    return .{ .ok = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(std.heap.c_allocator, text) orelse return .out_of_memory };
+    return .{ .ok = @import("../backend/jsc/common.zig").jsStringToOwnedAlloc(allocator, text) orelse return .out_of_memory };
 }
 
 fn escargotOp(result: @import("../backend/escargot/c_api.zig").OpResult) Result {
@@ -830,7 +830,7 @@ fn escargotNewError(ctx: ActiveEngine.Context, message: []const u8) Result {
     return if (v == null) .out_of_memory else .{ .ok = v };
 }
 
-fn spikeToUtf8(ctx: ActiveEngine.Context, comptime which: enum { escargot, hermes }, value: ActiveEngine.Value) BytesResult {
+fn spikeToUtf8(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, comptime which: enum { escargot, hermes }, value: ActiveEngine.Value) BytesResult {
     const op = switch (which) {
         .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_value_to_string_result(ctx, value)),
         .hermes => hermesOp(@import("../backend/hermes/c_api.zig").hermes_value_to_string_result(ctx, value)),
@@ -840,13 +840,13 @@ fn spikeToUtf8(ctx: ActiveEngine.Context, comptime which: enum { escargot, herme
         .out_of_memory => return .out_of_memory,
         .ok => |str_val| {
             defer ActiveEngine.freeValue(ctx, str_val);
-            const bytes = ActiveEngine.valueToStringAlloc(std.heap.c_allocator, ctx, str_val) orelse return .out_of_memory;
+            const bytes = ActiveEngine.valueToStringAlloc(allocator, ctx, str_val) orelse return .out_of_memory;
             return .{ .ok = bytes };
         },
     }
 }
 
-fn spikeToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value, comptime which: enum { escargot, hermes }) BytesResult {
+fn spikeToJson(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, value: ActiveEngine.Value, comptime which: enum { escargot, hermes }) BytesResult {
     const op = switch (which) {
         .escargot => escargotOp(@import("../backend/escargot/c_api.zig").escargot_json_stringify_result(ctx, value)),
         .hermes => hermesOp(@import("../backend/hermes/c_api.zig").hermes_json_stringify_result(ctx, value)),
@@ -859,7 +859,7 @@ fn spikeToJson(ctx: ActiveEngine.Context, value: ActiveEngine.Value, comptime wh
     defer ActiveEngine.freeValue(ctx, json_val);
     if (ActiveEngine.isUndefined(ctx, json_val)) return .invalid_argument;
     // Convert the JSON string Value to owned UTF-8 bytes.
-    return toUtf8(ctx, json_val);
+    return toUtf8(allocator, ctx, json_val);
 }
 
 fn hermesOp(result: @import("../backend/hermes/c_api.zig").OpResult) Result {

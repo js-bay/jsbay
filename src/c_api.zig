@@ -3405,7 +3405,7 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
         .ok => |ok| ok,
     };
     defer data.deinit();
-    const result = api_backend.toUtf8(data.op.ctx, data.value);
+    const result = api_backend.toUtf8(std.heap.c_allocator, data.op.ctx, data.value);
     if (!drainApiJobs(&data.op)) {
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
@@ -3451,7 +3451,7 @@ pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: 
         .ok => |ok| ok,
     };
     defer data.deinit();
-    const result = api_backend.toJson(data.op.ctx, data.value);
+    const result = api_backend.toJson(std.heap.c_allocator, data.op.ctx, data.value);
     if (!drainApiJobs(&data.op)) {
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
@@ -3490,7 +3490,7 @@ pub export fn jsbay_value_copy_buffer(value: u64, out_bytes: *Bytes, out_excepti
         .ok => |ok| ok,
     };
     defer data.deinit();
-    const result = api_backend.copyBuffer(data.op.ctx, data.value);
+    const result = api_backend.copyBuffer(std.heap.c_allocator, data.op.ctx, data.value);
     if (!drainApiJobs(&data.op)) {
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;

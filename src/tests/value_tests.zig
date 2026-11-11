@@ -974,3 +974,33 @@ test "value: Global, Weak, and Rooted safe deinit after engine destroy" {
     w.deinit();
     r.deinit();
 }
+
+test "value: api_backend toUtf8, toJson, and copyBuffer with testing.allocator" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const str = backend.ActiveEngine.newStringVal(ctx, "zen-utf8");
+    defer backend.ActiveEngine.freeValue(ctx, str);
+
+    const utf8_res = @import("../abi/api_backend.zig").toUtf8(testing.allocator, ctx, str);
+    switch (utf8_res) {
+        .ok => |bytes| {
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualStrings("zen-utf8", bytes);
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const num = backend.ActiveEngine.newInt32Val(ctx, 42);
+    defer backend.ActiveEngine.freeValue(ctx, num);
+    const json_res = @import("../abi/api_backend.zig").toJson(testing.allocator, ctx, num);
+    switch (json_res) {
+        .ok => |bytes| {
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualStrings("42", bytes);
+        },
+        else => return error.UnexpectedResult,
+    }
+}

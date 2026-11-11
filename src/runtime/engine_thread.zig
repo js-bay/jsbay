@@ -1655,7 +1655,7 @@ fn serializeThreadValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value) ap
         true;
     if (!entered) return .out_of_memory;
     defer if (comptime backend.isQuickJsApiBackend(backend.active_backend)) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
-    return api_backend.toUtf8(ctx, value);
+    return api_backend.toUtf8(std.heap.c_allocator, ctx, value);
 }
 
 fn adoptTypedValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value, status: c_int) Adopted {
