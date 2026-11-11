@@ -191,6 +191,8 @@ pub const Bridge = struct {
     scripts: std.StringHashMapUnmanaged(Script) = .empty,
     /// Script ids in parse order, so the metadata map can drop the oldest entry when it reaches its cap.
     script_order: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// Ids whose metadata the cap dropped. Requests for them still reach the relay, which decides whether the source is still available.
+    evicted_scripts: std.ArrayListUnmanaged([]const u8) = .empty,
     last_caller: ?CallerSite = null,
     armed_caller: ?CallerSite = null,
     /// Set by `start`, which builds the relay adapter and the CDP transport and therefore owns them.
@@ -315,6 +317,8 @@ pub const Bridge = struct {
         }
         self.scripts.deinit(self.allocator);
         self.script_order.deinit(self.allocator);
+        for (self.evicted_scripts.items) |evicted| self.allocator.free(evicted);
+        self.evicted_scripts.deinit(self.allocator);
         replaceSite(self.allocator, &self.last_caller, null);
         replaceSite(self.allocator, &self.armed_caller, null);
         self.mutex.unlock();
@@ -490,7 +494,7 @@ pub const Bridge = struct {
         if (!isRelayMethod(name)) return self.localReply(session_id, id, name);
         if (std.mem.eql(u8, name, "Debugger.getScriptSource")) {
             const known = if (params == .object) switch (params.object.get("scriptId") orelse std.json.Value{ .null = {} }) {
-                .string => |script_id| hasScript(self, script_id),
+                .string => |script_id| scriptKnown(self, script_id),
                 else => false,
             } else false;
             if (!known) return self.replyError(session_id, id, -32602, "Unknown scriptId");
@@ -911,6 +915,8 @@ fn targetsSingleLineScript(self: *Bridge, params: std.json.ObjectMap) bool {
     if (scriptIdOf(params)) |script_id| {
         if (self.scripts.get(script_id)) |script| return script.end_line == 0;
     }
+    // The pattern is not evaluated against recorded URLs, so the client's offset is kept: the relay resolves it against every match, and a single-line match needs it to name a statement.
+    if (params.get("urlRegex") != null) return true;
     const url = switch (params.get("url") orelse return false) {
         .string => |text| text,
         else => return false,
@@ -993,10 +999,15 @@ fn scriptUrl(self: *Bridge, script_id: []const u8) ?[]const u8 {
     return script.url;
 }
 
-fn hasScript(self: *Bridge, script_id: []const u8) bool {
+/// An id the target announced keeps its source request even after the metadata cap dropped its entry, because the relay may still hold the source. Only an id the target never announced is answered locally.
+fn scriptKnown(self: *Bridge, script_id: []const u8) bool {
     self.mutex.lock();
     defer self.mutex.unlock();
-    return self.scripts.contains(script_id);
+    if (self.scripts.contains(script_id)) return true;
+    for (self.evicted_scripts.items) |evicted| {
+        if (std.mem.eql(u8, evicted, script_id)) return true;
+    }
+    return false;
 }
 
 fn recordScript(self: *Bridge, params: std.json.ObjectMap) void {
@@ -1045,8 +1056,13 @@ fn recordScript(self: *Bridge, params: std.json.ObjectMap) void {
     while (self.script_order.items.len > max_scripts) {
         const oldest = self.script_order.orderedRemove(0);
         const removed = self.scripts.fetchRemove(oldest) orelse continue;
+        const tombstone = self.allocator.dupe(u8, removed.key) catch null;
         self.allocator.free(removed.key);
         self.allocator.free(removed.value.url);
+        if (tombstone) |owned| self.evicted_scripts.append(self.allocator, owned) catch self.allocator.free(owned);
+        while (self.evicted_scripts.items.len > max_scripts) {
+            self.allocator.free(self.evicted_scripts.orderedRemove(0));
+        }
     }
 }
 

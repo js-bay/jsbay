@@ -743,6 +743,34 @@ test "script metadata stays bounded" {
     try std.testing.expectEqual(@as(usize, 1024), harness.bridge.scripts.count());
     try std.testing.expect(harness.bridge.scripts.get("s0") == null);
     try std.testing.expect(harness.bridge.scripts.get("s1099") != null);
+
+    // The metadata of an evicted script is gone, but a source request for it still reaches the relay, which decides whether the source is there.
+    harness.bridge.openSession(1);
+    harness.bridge.onMessage(1, "{\"id\":41,\"method\":\"Debugger.getScriptSource\",\"params\":{\"scriptId\":\"s0\"}}");
+    harness.bridge.onMessage(1, "{\"id\":42,\"method\":\"Debugger.getScriptSource\",\"params\":{\"scriptId\":\"never-announced\"}}");
+    const commands = try harness.relay.commands(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 1), commands.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, commands.items[0], "\"s0\"") != null);
+    const refused = (try harness.frontend.replyFor(arena.allocator(), 42)) orelse return error.MissingReply;
+    try std.testing.expect(refused.object.get("error") != null);
+}
+
+test "a regex breakpoint keeps the client column offset" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+
+    harness.bridge.onMessage(1, "{\"id\":51,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":{\"urlRegex\":\"cdp-.*\",\"lineNumber\":0,\"columnNumber\":30}}");
+    harness.bridge.onMessage(1, "{\"id\":52,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":{\"url\":\"never-parsed.js\",\"lineNumber\":2,\"columnNumber\":30}}");
+
+    const commands = try harness.relay.commands(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), commands.items.len);
+    var regex = try std.json.parseFromSlice(std.json.Value, arena.allocator(), commands.items[0], .{});
+    try std.testing.expectEqual(@as(i64, 30), regex.value.object.get("params").?.object.get("columnNumber").?.integer);
+    var literal = try std.json.parseFromSlice(std.json.Value, arena.allocator(), commands.items[1], .{});
+    try std.testing.expectEqual(@as(i64, 0), literal.value.object.get("params").?.object.get("columnNumber").?.integer);
 }
 
 test "reply detection compares the parsed id" {

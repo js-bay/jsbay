@@ -93,7 +93,8 @@ These come from the JSC target and its relay protocol rather than from the bridg
 - Console API calls are not visible. JSC reports console output to the console client the host application installs, and the relay receives nothing, so CDP frontends show no `Runtime.consoleAPICalled` events. Breakpoints, stepping, and evaluation are unaffected. A host that reports its console messages to the Web Inspector console client makes them available to the relay.
 - Block-scoped bindings are reported in a separate `block` scope. Frontends that merge block bindings into the frame's local scope show fewer names in the local scope.
 - A breakpoint offset inside a multi-line expression resolves to the start of the statement that contains it.
-- Script metadata keeps the most recent 1024 scripts of a target that parses more than that, so an older script reports no URL and keeps no breakpoint column offset, like a script parsed before the bridge attached.
+- Script metadata keeps the most recent 1024 scripts of a target that parses more than that, so an older script reports no URL and keeps no breakpoint column offset, like a script parsed before the bridge attached. A source request for such a script still reaches the relay, which decides whether it still holds the source.
+- A `urlRegex` breakpoint keeps the client's column offset for every script the pattern matches, whether single-line or not, because the bridge does not evaluate the pattern against recorded script URLs.
 
 ## Tests
 

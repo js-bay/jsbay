@@ -77,12 +77,17 @@ start_bridge() {
 }
 
 if ! start_bridge; then
-  # A target killed without closing its inspector session can leave the relay without application records. Restarting the daemon clears that state; the demo reconnects to the next session.
+  # A target killed without closing its inspector session can leave the relay without application records. Only that state justifies restarting the shared daemon, which drops every other inspector session in this simulator, so any other failure is reported as it is.
+  if ! grep -qE 'error: (DiscoveryTimeout|DiscoveryFailed)' "$bridge_log"; then
+    echo "bridge did not accept CDP connections; log $bridge_log" >&2
+    cat "$bridge_log" >&2
+    exit 1
+  fi
   xcrun simctl spawn "$simulator" launchctl kickstart -k user/foreground/com.apple.webinspectord
   socket="$(xcrun simctl spawn "$simulator" launchctl getenv RWI_LISTEN_SOCKET)"
   sleep 1
   if ! start_bridge; then
-    echo "bridge did not accept CDP connections; log $bridge_log" >&2
+    echo "bridge did not accept CDP connections after a relay restart; log $bridge_log" >&2
     cat "$bridge_log" >&2
     exit 1
   fi
