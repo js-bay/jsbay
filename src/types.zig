@@ -76,6 +76,9 @@ pub const ErrorObserver = *const fn (*const ErrorEvent, ?*anyopaque) callconv(.c
 /// Configuration for creating an engine instance.
 pub const EngineConfig = struct {
     /// Instance-level allocator for internal engine structures. Defaults to `std.heap.c_allocator` when null.
+    /// Requirements:
+    /// 1. Thread safety: must be safe for concurrent allocations across host dispatch threads and the engine thread.
+    /// 2. Lifetime: must outlive the engine and all Global/Weak/Rooted reference cells created against this instance.
     allocator: ?std.mem.Allocator = null,
     /// Native timer and asynchronous callback budgets; zero disables that resource.
     resource_limits: @import("runtime/resource_limits.zig").Limits = .{},

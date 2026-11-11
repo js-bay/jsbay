@@ -77,7 +77,7 @@ pub const EngineInstance = struct {
         };
     }
 
-    allocator: std.mem.Allocator = std.heap.c_allocator,
+    allocator: std.mem.Allocator,
     instance_id: i32,
     /// Changes on every successful publication, including when an id is reused. Asynchronous producers must capture this with `dispatch.captureInstanceToken` before starting work and use it when posting the result.
     generation: u64 = 0,

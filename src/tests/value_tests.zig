@@ -878,8 +878,8 @@ test "value: OwnedValue wrap and unwrap semantics" {
             const ctx = engine.getContext(inst) orelse return error.ContextUnavailable;
             const num = backend.ActiveEngine.newInt32Val(ctx, 42);
             defer backend.ActiveEngine.freeValue(ctx, num);
-            const owned = value.OwnedValue.from(num);
-            try testing.expect(backend.ActiveEngine.sameValue(ctx, num, owned.unwrap()));
+            const owned = value.OwnedValue.init(num);
+            try testing.expect(backend.ActiveEngine.sameValue(ctx, num, owned.borrow()));
 
             var obj = value.OwnedValue.init(backend.ActiveEngine.newObject(ctx));
             try testing.expect(backend.ActiveEngine.isObjectVal(ctx, obj.borrow()));

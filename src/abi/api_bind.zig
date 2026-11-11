@@ -14,7 +14,7 @@ pub const Finalize = *const fn (?*anyopaque) callconv(.c) void;
 
 pub const Binding = struct {
     instance_id: i32,
-    allocator: std.mem.Allocator = std.heap.c_allocator,
+    allocator: std.mem.Allocator,
     callback: Callback,
     user_data: ?*anyopaque,
     finalize: ?Finalize,
@@ -53,7 +53,8 @@ pub fn install(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, cal
         return .out_of_memory;
     }
     const m = backend.ActiveEngineModule;
-    const alloc = if (@import("../runtime/instance_map.zig").getInstance(id)) |inst| inst.allocator else std.heap.c_allocator;
+    const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse return .out_of_memory;
+    const alloc = inst.allocator;
     const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const binding = alloc.create(Binding) catch {
         alloc.free(name_z);
@@ -167,7 +168,8 @@ fn spikeThrowValue(ctx: backend.ActiveEngine.Context, exception: backend.ActiveE
 }
 
 fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
-    const alloc = if (@import("../runtime/instance_map.zig").getInstance(id)) |inst| inst.allocator else std.heap.c_allocator;
+    const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse return .out_of_memory;
+    const alloc = inst.allocator;
     const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const binding = alloc.create(Binding) catch {
         alloc.free(name_z);
@@ -281,7 +283,8 @@ fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEn
 fn jscInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     const m = @import("../backend/jsc.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
-    const alloc = if (@import("../runtime/instance_map.zig").getInstance(id)) |inst| inst.allocator else std.heap.c_allocator;
+    const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse return .out_of_memory;
+    const alloc = inst.allocator;
     const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const js_name = @import("../backend/jsc/common.zig").jsStringFromSlice(name) orelse {
         alloc.free(name_z);

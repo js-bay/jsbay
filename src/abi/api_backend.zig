@@ -532,7 +532,8 @@ fn jscCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: 
         const error_result = jscNewError(ctx, "value is not callable");
         return switch (error_result) {
             .ok => |value| .{ .exception = value },
-            else => error_result,
+            .exception => |e| .{ .exception = e },
+            .out_of_memory => .out_of_memory,
         };
     }
     const target: m.jsc.JSObjectRef = @ptrCast(@constCast(lifted_function));
@@ -591,7 +592,8 @@ fn jscTypeError(ctx: ActiveEngine.Context, message: []const u8) Result {
     const made = jscNewError(ctx, message);
     const error_value = switch (made) {
         .ok => |value| value,
-        else => return made,
+        .exception => |e| return .{ .exception = e },
+        .out_of_memory => return .out_of_memory,
     };
     // The pristine TypeError.prototype keeps `name` and `instanceof` correct even when page code has replaced the global TypeError.
     if (@import("../backend/jsc/value.zig").typeErrorPrototype(@ptrCast(ctx))) |prototype| {
@@ -703,7 +705,8 @@ fn jscParseJson(ctx: ActiveEngine.Context, input: []const u8) Result {
         const error_result = jscNewError(ctx, "invalid JSON");
         return switch (error_result) {
             .ok => |exception| .{ .exception = exception },
-            else => .out_of_memory,
+            .exception => |e| .{ .exception = e },
+            .out_of_memory => .out_of_memory,
         };
     }
     m.jsc.JSValueProtect(ctx_ref, value);

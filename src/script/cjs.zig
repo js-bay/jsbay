@@ -90,7 +90,8 @@ fn stateFromCtx(ctx: ActiveEngine.Context) ?*CjsState {
 pub fn install(instance_id: i32, loader: *const types.ModuleLoader) bool {
     if (getState(instance_id)) |_| return true; // already installed
     const ctx = engine.getContext(instance_id) orelse return false;
-    const alloc = if (instance_map.getInstance(instance_id)) |inst| inst.allocator else std.heap.c_allocator;
+    const inst = instance_map.getInstance(instance_id) orelse return false;
+    const alloc = inst.allocator;
 
     const state = alloc.create(CjsState) catch return false;
     state.* = .{
@@ -1024,10 +1025,10 @@ fn runCjsCacheBundledBody(
 
     const srckey = cache.sha256Hex(source);
     if (srckey.len == 0) return error.OutOfMemory;
-    defer gpa.free(srckey);
+    defer std.heap.c_allocator.free(srckey);
     const namekey = cache.sha256Hex(filename);
     if (namekey.len == 0) return error.OutOfMemory;
-    defer gpa.free(namekey);
+    defer std.heap.c_allocator.free(namekey);
     const inproc_key = std.fmt.allocPrint(gpa, "{s}-{s}", .{ srckey, namekey }) catch return error.OutOfMemory;
     var inproc_key_owned = true;
     defer if (inproc_key_owned) gpa.free(inproc_key);
@@ -1045,9 +1046,9 @@ fn runCjsCacheBundledBody(
     // 1. disk hit.
     if (disk_path) |path| {
         if (cache.readBytes(path)) |cached| {
+            defer std.heap.c_allocator.free(cached);
             // runCommonJS executes via the wrapper and returns a string — we need the live object, so drive the low-level path here instead.
             const fn_result = qjs_mod.qjsRunBytecodeToFn(state.ctx, cached);
-            gpa.free(cached);
             if (!fn_result.decode_failed and fn_result.err == null) {
                 if (fn_result.fn_value) |fnv| {
                     const exports_val = runWrapperWithRequire(state, fnv, require_fn, filename) catch |e| {
@@ -1060,7 +1061,7 @@ fn runCjsCacheBundledBody(
             }
             // Stale/undecodable: drop and rebuild once.
             if (fn_result.err_is_heap) {
-                if (fn_result.err) |e| gpa.free(@constCast(e));
+                if (fn_result.err) |e| std.heap.c_allocator.free(@constCast(e));
             }
             cache.deleteFile(path);
         }
@@ -1080,7 +1081,7 @@ fn runCjsCacheBundledBody(
             }
         }
         if (fn_result.err_is_heap) {
-            if (fn_result.err) |e| gpa.free(@constCast(e));
+            if (fn_result.err) |e| std.heap.c_allocator.free(@constCast(e));
         }
     }
 
@@ -1113,7 +1114,7 @@ fn runCjsCacheBundledBody(
 
     const fn_result = qjs_mod.qjsRunBytecodeToFn(state.ctx, owned);
     if (fn_result.err_is_heap) {
-        if (fn_result.err) |e| gpa.free(@constCast(e));
+        if (fn_result.err) |e| std.heap.c_allocator.free(@constCast(e));
     }
     if (fn_result.decode_failed or fn_result.err != null or fn_result.fn_value == null) {
         return error.CallFailed;

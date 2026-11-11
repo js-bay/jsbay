@@ -163,7 +163,19 @@ pub export fn jsbay_engine_create_with_options(
     if (options.struct_size >= @offsetOf(EngineCreateOptionsC, "max_heap_size") + @sizeOf(u64)) {
         config.max_heap_size = @intCast(options.max_heap_size);
     }
-    engine.createWithBackend(id, config, requested) catch return false;
+    engine.createWithBackend(id, config, requested) catch |err| {
+        if (log_handler) |lh| switch (err) {
+            error.OutOfMemory => lh(id, .err, "engine creation failed: out of memory", log_user_data),
+            error.BackendNotPacked => lh(id, .err, "engine creation failed: backend not packed", log_user_data),
+            error.ContextInitFailed => lh(id, .err, "engine creation failed: context init failed", log_user_data),
+            error.ExecutionCpuInitFailed => lh(id, .err, "engine creation failed: cpu init failed", log_user_data),
+            error.InstanceAlreadyExists => lh(id, .err, "engine creation failed: instance already exists", log_user_data),
+            error.InstanceInsertFailed => lh(id, .err, "engine creation failed: instance insert failed", log_user_data),
+            error.ResourceInitFailed => lh(id, .err, "engine creation failed: resource init failed", log_user_data),
+            error.RuntimeInitFailed => lh(id, .err, "engine creation failed: runtime init failed", log_user_data),
+        };
+        return false;
+    };
     // runtime_control is mono-only; packed-alt skips it inside createWithBackend.
     if (requested == backend.active_backend) {
         if (!runtime_control.init(id)) {
@@ -354,6 +366,7 @@ test "c_api: forced packed_alt typed value (Linux primary-tag)" {
         return error.BudgetFailed;
     };
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = null,
         .instance_id = id,
@@ -438,6 +451,7 @@ test "c_api: forced packed_alt set/call/construct/new_* (Linux primary-tag proof
         return error.BudgetFailed;
     };
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = null,
         .instance_id = id,
@@ -614,6 +628,7 @@ test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/ne
         return error.BudgetFailed;
     };
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = null,
         .instance_id = id,
@@ -792,6 +807,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         return error.BudgetFailed;
     };
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = null,
         .instance_id = id,
@@ -951,6 +967,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         return error.BudgetFailed;
     };
     instance2.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources2,
         .execution_cpu = null,
         .instance_id = id2,

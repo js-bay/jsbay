@@ -44,15 +44,7 @@ pub const OwnedValue = struct {
         return .{ .raw = v };
     }
 
-    pub fn from(v: Local) OwnedValue {
-        return .{ .raw = v };
-    }
-
     pub fn borrow(self: *const OwnedValue) Local {
-        return self.raw;
-    }
-
-    pub fn unwrap(self: OwnedValue) Local {
         return self.raw;
     }
 
@@ -60,10 +52,6 @@ pub const OwnedValue = struct {
         const val = self.raw;
         self.raw = ActiveEngine.undefinedValue();
         return val;
-    }
-
-    pub fn transfer(self: *OwnedValue) Local {
-        return self.release();
     }
 
     pub fn deinit(self: *OwnedValue, ctx: ActiveEngine.Context) void {
@@ -144,8 +132,8 @@ pub const StackFrameScope = struct {
 const GlobalCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
-    ctx: ?ActiveEngine.Context = null,
-    allocator: std.mem.Allocator = std.heap.c_allocator,
+    ctx: ActiveEngine.Context,
+    allocator: std.mem.Allocator,
     val: ActiveEngine.Value,
     /// True once the JS value has been released. Once released the Cell itself stays around (so the owning Global's pointer remains valid) until the Global is deinit'd; further `get`/`reset` are no-ops.
     released: bool = false,
@@ -153,12 +141,8 @@ const GlobalCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *GlobalCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
-        const ctx = cell.ctx orelse ctxForInstance(cell.instance_id);
-        if (ctx) |c| {
-            ActiveEngine.freeValue(c, cell.val);
-        }
+        ActiveEngine.freeValue(cell.ctx, cell.val);
         cell.released = true;
-        cell.ctx = null;
     }
 };
 
@@ -183,7 +167,7 @@ pub const WatcherData = struct {
     /// Platform-opaque handle. On weak-handle backends this is the weak ref; on refcount backends it's unused (the watcher JS object owns the lifetime).
     native_handle: ?*anyopaque = null,
     ref_count: u32 = 1,
-    allocator: std.mem.Allocator = std.heap.c_allocator,
+    allocator: std.mem.Allocator,
 
     pub fn retain(self: *WatcherData) void {
         self.ref_count += 1;
@@ -205,8 +189,8 @@ pub const WatcherData = struct {
 pub const WeakCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
-    ctx: ?ActiveEngine.Context = null,
-    allocator: std.mem.Allocator = std.heap.c_allocator,
+    ctx: ActiveEngine.Context,
+    allocator: std.mem.Allocator,
     kind: WeakKind,
     /// For primitives: the retained value. For objects: a snapshot of the initial Value used as a fast-path return when the backend says the target is still live.
     val: ActiveEngine.Value,
@@ -217,19 +201,15 @@ pub const WeakCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *WeakCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
-        const ctx_opt = cell.ctx orelse ctxForInstance(cell.instance_id);
         switch (cell.kind) {
             .primitive => {
-                if (ctx_opt) |c| ActiveEngine.freeValue(c, cell.val);
+                ActiveEngine.freeValue(cell.ctx, cell.val);
             },
             .object => {
-                // `Context` is already an optional pointer type on both backends; pass a null Context when the engine is gone so the backend can decide whether it can still release native handles.
-                const ctx: ActiveEngine.Context = ctx_opt orelse null;
-                weakBackendRelease(ctx, cell);
+                weakBackendRelease(cell.ctx, cell);
             },
         }
         cell.released = true;
-        cell.ctx = null;
     }
 };
 
@@ -250,12 +230,7 @@ fn registerEntryDirect(inst: *instance_map.EngineInstance, entry: *instance_map.
 /// Insert `entry` at the head of the engine's bookkeeping list. `entry` must already have its `reset_fn` set.
 fn registerEntry(instance_id: i32, entry: *instance_map.RefEntry) void {
     const inst = instance_map.getInstance(instance_id) orelse return;
-    inst.ref_bookkeeping.mutex.lock();
-    defer inst.ref_bookkeeping.mutex.unlock();
-    entry.prev = null;
-    entry.next = inst.ref_bookkeeping.head;
-    if (inst.ref_bookkeeping.head) |h| h.prev = entry;
-    inst.ref_bookkeeping.head = entry;
+    registerEntryDirect(inst, entry);
 }
 
 /// Unlink `entry` from the engine's bookkeeping list. Safe to call even if the engine has been torn down or the entry was already unlinked.
@@ -418,8 +393,7 @@ pub fn Global(comptime T: type) type {
         pub fn get(self: Self) ?Local {
             const cell = self.cell orelse return null;
             if (cell.released) return null;
-            const ctx = cell.ctx orelse ctxForInstance(self.instance_id) orelse return null;
-            return ActiveEngine.dupValue(ctx, cell.val);
+            return ActiveEngine.dupValue(cell.ctx, cell.val);
         }
 
         /// Release the retained value and free the underlying cell. Safe to call multiple times.
@@ -506,8 +480,7 @@ pub fn Weak(comptime T: type) type {
             const cell = self.cell orelse return true;
             if (cell.released) return true;
             if (cell.kind == .object) {
-                const ctx = cell.ctx orelse ctxForInstance(self.instance_id) orelse return true;
-                return weakBackendGetLive(ctx, cell) == null;
+                return weakBackendGetLive(cell.ctx, cell) == null;
             }
             return false;
         }
@@ -519,8 +492,7 @@ pub fn Weak(comptime T: type) type {
             switch (cell.kind) {
                 .primitive => return cell.val,
                 .object => {
-                    const ctx = cell.ctx orelse ctxForInstance(self.instance_id) orelse return null;
-                    return weakBackendGetLive(ctx, cell);
+                    return weakBackendGetLive(cell.ctx, cell);
                 },
             }
         }
@@ -552,8 +524,8 @@ pub fn Weak(comptime T: type) type {
 const RootCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
-    ctx: ?ActiveEngine.Context = null,
-    allocator: std.mem.Allocator = std.heap.c_allocator,
+    ctx: ActiveEngine.Context,
+    allocator: std.mem.Allocator,
     val: ActiveEngine.Value,
     /// Hermes-only durable identity (`HermesRootIdentity`). Null on other backends.
     identity: ?*anyopaque = null,
@@ -565,20 +537,16 @@ const RootCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *RootCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
-        const ctx = cell.ctx orelse ctxForInstance(cell.instance_id);
         if (cell.protected) {
-            if (ctx) |c| {
-                rootBackendUnprotect(c, cell.val);
-            }
+            rootBackendUnprotect(cell.ctx, cell.val);
             cell.protected = false;
         }
         if (cell.identity) |id| {
-            rootBackendIdentityFree(ctx, id);
+            rootBackendIdentityFree(cell.ctx, id);
             cell.identity = null;
         }
         cell.root_count = 0;
         cell.released = true;
-        cell.ctx = null;
     }
 };
 
@@ -633,8 +601,7 @@ pub const Rooted = struct {
         const cell = self.cell orelse return;
         if (cell.released) return;
         if (cell.root_count == 0) {
-            const ctx = cell.ctx orelse ctxForInstance(self.instance_id) orelse return;
-            const protected_val = rootBackendProtect(ctx, cell) orelse return;
+            const protected_val = rootBackendProtect(cell.ctx, cell) orelse return;
             cell.val = protected_val;
             cell.protected = true;
         }
@@ -647,10 +614,7 @@ pub const Rooted = struct {
         if (cell.released or cell.root_count == 0) return;
         cell.root_count -= 1;
         if (cell.root_count == 0 and cell.protected) {
-            const ctx = cell.ctx orelse ctxForInstance(self.instance_id);
-            if (ctx) |c| {
-                rootBackendUnprotect(c, cell.val);
-            }
+            rootBackendUnprotect(cell.ctx, cell.val);
             cell.protected = false;
             // Hermes: drop the freed wrapper address; re-root rebuilds from `identity`.
             if (comptime backend.active_backend == .hermes) {
