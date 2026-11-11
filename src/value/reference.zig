@@ -38,14 +38,37 @@ pub const Local = ActiveEngine.Value;
 
 /// Explicit wrapper representing an owned JavaScript Value whose ownership is transferred to the callee.
 pub const OwnedValue = struct {
-    value: Local,
+    raw: Local,
+
+    pub fn init(v: Local) OwnedValue {
+        return .{ .raw = v };
+    }
 
     pub fn from(v: Local) OwnedValue {
-        return .{ .value = v };
+        return .{ .raw = v };
+    }
+
+    pub fn borrow(self: *const OwnedValue) Local {
+        return self.raw;
     }
 
     pub fn unwrap(self: OwnedValue) Local {
-        return self.value;
+        return self.raw;
+    }
+
+    pub fn release(self: *OwnedValue) Local {
+        const val = self.raw;
+        self.raw = ActiveEngine.undefinedValue();
+        return val;
+    }
+
+    pub fn transfer(self: *OwnedValue) Local {
+        return self.release();
+    }
+
+    pub fn deinit(self: *OwnedValue, ctx: ActiveEngine.Context) void {
+        ActiveEngine.freeValue(ctx, self.raw);
+        self.raw = ActiveEngine.undefinedValue();
     }
 };
 

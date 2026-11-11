@@ -1654,7 +1654,7 @@ pub export fn jsbay_engine_cancel(instance_id: c_int, generation: u64) bool {
     const accepted = runtime_control.requestShutdownCancel(id);
     if (accepted) {
         native_sync.cancelForInstance(id);
-        api_async.cancelGeneration(id, generation);
+        api_async.cancelGeneration(@enumFromInt(id), generation);
     }
     return accepted;
 }
@@ -4241,7 +4241,7 @@ pub export fn jsbay_promise_create(instance_id_raw: c_int, out_request_id: ?*u64
         .ok => |value| value,
     };
     defer op.deinit();
-    switch (api_async.create(id)) {
+    switch (api_async.create(@enumFromInt(id))) {
         .status => |status| return status,
         .ok => |created| {
             request_id.* = created.request_id;
@@ -4259,7 +4259,7 @@ pub export fn jsbay_promise_settle(request_id: u64, outcome_status: c_int, value
         else => return API_INVALID_ARGUMENT,
     };
     const instance_id = api_async.instanceFor(request_id) orelse return API_STALE_VALUE;
-    var op = switch (beginApiOp(instance_id)) {
+    var op = switch (beginApiOp(instance_id.toInt())) {
         .status => |status| return status,
         .ok => |value_op| value_op,
     };

@@ -723,7 +723,7 @@ pub fn destroyRuntime(instance_id: i32) void {
     defer inspector_state.endEngineDestroy(instance_id);
 
     if (!dispatch.closeInstanceTasks(instance_id)) return;
-    @import("abi/api_async.zig").cancelForInstance(instance_id);
+    @import("abi/api_async.zig").cancelForInstance(@enumFromInt(instance_id));
     @import("js_event_loop").host_wake.drop(instance_id);
     // Drain Hide/Show/stop leases before touching the Driver (R3 getPtrs∩destroy).
     instance_map.waitForControlOps(instance_id);

@@ -14,6 +14,7 @@ pub const Finalize = *const fn (?*anyopaque) callconv(.c) void;
 
 pub const Binding = struct {
     instance_id: i32,
+    allocator: std.mem.Allocator = std.heap.c_allocator,
     callback: Callback,
     user_data: ?*anyopaque,
     finalize: ?Finalize,
@@ -52,24 +53,25 @@ pub fn install(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, cal
         return .out_of_memory;
     }
     const m = backend.ActiveEngineModule;
-    const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
-    const binding = std.heap.c_allocator.create(Binding) catch {
-        std.heap.c_allocator.free(name_z);
+    const alloc = if (@import("../runtime/instance_map.zig").getInstance(id)) |inst| inst.allocator else std.heap.c_allocator;
+    const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
+    const binding = alloc.create(Binding) catch {
+        alloc.free(name_z);
         return .out_of_memory;
     };
-    binding.* = .{ .instance_id = id, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
+    binding.* = .{ .instance_id = id, .allocator = alloc, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
     mutex.lock();
     const slot = bindings.items.len;
     if (slot > std.math.maxInt(i32)) {
         mutex.unlock();
-        std.heap.c_allocator.free(name_z);
-        std.heap.c_allocator.destroy(binding);
+        alloc.free(name_z);
+        alloc.destroy(binding);
         return .out_of_memory;
     }
     bindings.append(std.heap.c_allocator, binding) catch {
         mutex.unlock();
-        std.heap.c_allocator.free(name_z);
-        std.heap.c_allocator.destroy(binding);
+        alloc.free(name_z);
+        alloc.destroy(binding);
         return .out_of_memory;
     };
     mutex.unlock();
@@ -126,8 +128,8 @@ fn releaseJscRoot(binding: *Binding) void {
 fn destroyBinding(binding: *Binding, run_finalize: bool) void {
     releaseJscRoot(binding);
     if (run_finalize and binding.committed) if (binding.finalize) |finalize| finalize(binding.user_data);
-    std.heap.c_allocator.free(binding.name);
-    std.heap.c_allocator.destroy(binding);
+    binding.allocator.free(binding.name);
+    binding.allocator.destroy(binding);
 }
 
 fn addBinding(binding: *Binding) ?usize {
@@ -165,15 +167,16 @@ fn spikeThrowValue(ctx: backend.ActiveEngine.Context, exception: backend.ActiveE
 }
 
 fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
-    const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
-    const binding = std.heap.c_allocator.create(Binding) catch {
-        std.heap.c_allocator.free(name_z);
+    const alloc = if (@import("../runtime/instance_map.zig").getInstance(id)) |inst| inst.allocator else std.heap.c_allocator;
+    const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
+    const binding = alloc.create(Binding) catch {
+        alloc.free(name_z);
         return .out_of_memory;
     };
-    binding.* = .{ .instance_id = id, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
+    binding.* = .{ .instance_id = id, .allocator = alloc, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
     const slot = addBinding(binding) orelse {
-        std.heap.c_allocator.free(name_z);
-        std.heap.c_allocator.destroy(binding);
+        alloc.free(name_z);
+        alloc.destroy(binding);
         return .out_of_memory;
     };
     // Pack slot+1 so slot 0 is not a null user_data.
@@ -278,27 +281,28 @@ fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEn
 fn jscInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     const m = @import("../backend/jsc.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
-    const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
+    const alloc = if (@import("../runtime/instance_map.zig").getInstance(id)) |inst| inst.allocator else std.heap.c_allocator;
+    const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const js_name = @import("../backend/jsc/common.zig").jsStringFromSlice(name) orelse {
-        std.heap.c_allocator.free(name_z);
+        alloc.free(name_z);
         return .out_of_memory;
     };
     defer m.jsc.JSStringRelease(js_name);
     const function = m.jsc.JSObjectMakeFunctionWithCallback(ctx_ref, js_name, &jscTrampoline) orelse {
-        std.heap.c_allocator.free(name_z);
+        alloc.free(name_z);
         return .out_of_memory;
     };
-    const binding = std.heap.c_allocator.create(Binding) catch {
-        std.heap.c_allocator.free(name_z);
+    const binding = alloc.create(Binding) catch {
+        alloc.free(name_z);
         return .out_of_memory;
     };
     // The binding table must root the function independently of the Value returned to the C caller. A released public handle must not make an escaped global function collectible or let its address be reused.
     m.jsc.JSValueProtect(ctx_ref, function);
-    binding.* = .{ .instance_id = id, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z, .function_key = @intFromPtr(function), .jsc_ctx = ctx, .jsc_root = function };
+    binding.* = .{ .instance_id = id, .allocator = alloc, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z, .function_key = @intFromPtr(function), .jsc_ctx = ctx, .jsc_root = function };
     _ = addBinding(binding) orelse {
         releaseJscRoot(binding);
-        std.heap.c_allocator.free(name_z);
-        std.heap.c_allocator.destroy(binding);
+        alloc.free(name_z);
+        alloc.destroy(binding);
         return .out_of_memory;
     };
     const global = m.jsc.JSContextGetGlobalObject(ctx_ref);
@@ -342,8 +346,8 @@ pub fn abort(binding: *Binding) void {
     mutex.lock();
     if (binding.retired) {
         mutex.unlock();
-        std.heap.c_allocator.free(binding.name);
-        std.heap.c_allocator.destroy(binding);
+        binding.allocator.free(binding.name);
+        binding.allocator.destroy(binding);
         return;
     }
     if (!binding.alive) {

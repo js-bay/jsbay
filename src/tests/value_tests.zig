@@ -880,6 +880,16 @@ test "value: OwnedValue wrap and unwrap semantics" {
             defer backend.ActiveEngine.freeValue(ctx, num);
             const owned = value.OwnedValue.from(num);
             try testing.expect(backend.ActiveEngine.sameValue(ctx, num, owned.unwrap()));
+
+            var obj = value.OwnedValue.init(backend.ActiveEngine.newObject(ctx));
+            try testing.expect(backend.ActiveEngine.isObjectVal(ctx, obj.borrow()));
+            const released = obj.release();
+            try testing.expect(backend.ActiveEngine.isUndefined(ctx, obj.borrow()));
+            backend.ActiveEngine.freeValue(ctx, released);
+
+            var auto_freed = value.OwnedValue.init(backend.ActiveEngine.newInt32Val(ctx, 100));
+            auto_freed.deinit(ctx);
+            try testing.expect(backend.ActiveEngine.isUndefined(ctx, auto_freed.borrow()));
         }
     }.run);
 }
