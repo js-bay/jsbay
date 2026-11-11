@@ -145,6 +145,9 @@ pub fn isTargetDisconnect(name: []const u8, info: plist.Value, application: []co
 /// The loopback transport refuses a message that would overflow its queue and, for a CDP session, closes it. A reply has to stay below that limit or the client would lose the session instead of seeing an error.
 const max_frontend_bytes: usize = 3 * 1024 * 1024;
 
+/// A target that evaluates generated scripts for a long time parses an unbounded number of them, so the script metadata keeps the most recent entries and drops the oldest. An unknown script URL behaves like a script parsed before the bridge attached.
+const max_scripts = 1024;
+
 /// Adapts the loopback CDP transport to the `Frontend` interface.
 pub const TransportFrontend = struct {
     transport: *transport.Transport,
@@ -186,6 +189,8 @@ pub const Bridge = struct {
     merges: std.AutoHashMapUnmanaged(u64, Merge) = .empty,
     scope_merges: std.StringHashMapUnmanaged([]u8) = .empty,
     scripts: std.StringHashMapUnmanaged(Script) = .empty,
+    /// Script ids in parse order, so the metadata map can drop the oldest entry when it reaches its cap.
+    script_order: std.ArrayListUnmanaged([]const u8) = .empty,
     last_caller: ?CallerSite = null,
     armed_caller: ?CallerSite = null,
     /// Set by `start`, which builds the relay adapter and the CDP transport and therefore owns them.
@@ -309,6 +314,7 @@ pub const Bridge = struct {
             self.allocator.free(entry.value_ptr.url);
         }
         self.scripts.deinit(self.allocator);
+        self.script_order.deinit(self.allocator);
         replaceSite(self.allocator, &self.last_caller, null);
         replaceSite(self.allocator, &self.armed_caller, null);
         self.mutex.unlock();
@@ -964,8 +970,9 @@ fn translateParams(self: *Bridge, allocator: Allocator, method: []const u8, para
         // The bridge advertises one synthetic context; the relay addresses the only context the target has.
         _ = filtered.swapRemove("contextId");
         _ = filtered.swapRemove("uniqueContextId");
-        // CDP spells the option that keeps a throwing evaluation from pausing the target differently from the relay.
-        if (std.mem.eql(u8, method, "Runtime.evaluate")) {
+        // CDP spells the option that keeps a throwing evaluation from pausing the target differently from the relay. It applies to every command that runs JavaScript.
+        const runs_javascript = std.mem.eql(u8, method, "Runtime.evaluate") or std.mem.eql(u8, method, "Runtime.callFunctionOn") or std.mem.eql(u8, method, "Debugger.evaluateOnCallFrame");
+        if (runs_javascript) {
             const silent = switch (source.get("silent") orelse std.json.Value{ .bool = false }) {
                 .bool => |flag| flag,
                 else => false,
@@ -1034,6 +1041,13 @@ fn recordScript(self: *Bridge, params: std.json.ObjectMap) void {
         self.allocator.free(entry.value_ptr.url);
     }
     entry.value_ptr.* = script;
+    if (!entry.found_existing) self.script_order.append(self.allocator, entry.key_ptr.*) catch {};
+    while (self.script_order.items.len > max_scripts) {
+        const oldest = self.script_order.orderedRemove(0);
+        const removed = self.scripts.fetchRemove(oldest) orelse continue;
+        self.allocator.free(removed.key);
+        self.allocator.free(removed.value.url);
+    }
 }
 
 fn replaceSite(allocator: Allocator, slot: *?Bridge.CallerSite, site: ?Bridge.CallerSite) void {

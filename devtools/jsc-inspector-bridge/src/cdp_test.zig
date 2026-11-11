@@ -704,6 +704,47 @@ test "a resume the relay only reports as an event still answers the client" {
     try std.testing.expectEqual(@as(usize, 1), answers);
 }
 
+test "silent maps to the relay option for every command that runs JavaScript" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+
+    harness.bridge.onMessage(1, "{\"id\":31,\"method\":\"Runtime.callFunctionOn\",\"params\":{\"functionDeclaration\":\"function(){}\",\"silent\":true}}");
+    harness.bridge.onMessage(1, "{\"id\":32,\"method\":\"Debugger.evaluateOnCallFrame\",\"params\":{\"callFrameId\":\"frame\",\"expression\":\"1\",\"silent\":true}}");
+
+    const commands = try harness.relay.commands(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), commands.items.len);
+    for (commands.items) |command| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), command, .{});
+        const params = parsed.value.object.get("params").?.object;
+        try std.testing.expect(params.get("silent") == null);
+        try std.testing.expectEqual(true, params.get("doNotPauseOnExceptionsAndMuteConsole").?.bool);
+    }
+}
+
+test "script metadata stays bounded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+
+    var index: usize = 0;
+    while (index < 1100) : (index += 1) {
+        const event = try std.fmt.allocPrint(
+            arena.allocator(),
+            "{{\"method\":\"Debugger.scriptParsed\",\"params\":{{\"scriptId\":\"s{d}\",\"url\":\"eval-{d}.js\",\"endLine\":0}}}}",
+            .{ index, index },
+        );
+        harness.bridge.deliver(event);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1024), harness.bridge.scripts.count());
+    try std.testing.expect(harness.bridge.scripts.get("s0") == null);
+    try std.testing.expect(harness.bridge.scripts.get("s1099") != null);
+}
+
 test "reply detection compares the parsed id" {
     const allocator = std.testing.allocator;
     try std.testing.expect(cdp.isReplyTo(allocator, "{\"id\":1,\"result\":{}}", 1));

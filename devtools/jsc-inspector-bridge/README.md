@@ -69,6 +69,7 @@ The bridge adds state that CDP clients require but the relay omits:
 - `url` on paused call frames, resolved from recorded `Debugger.scriptParsed` notifications.
 - CDP scope types: relay `nestedLexical` scopes become `block`, `globalLexicalEnvironment` becomes `script`, and the innermost `closure` scope becomes `local`.
 - `result` instead of `properties` for `Runtime.getProperties`, and `exceptionDetails` for thrown evaluation results.
+- `silent` on `Runtime.evaluate`, `Runtime.callFunctionOn`, and `Debugger.evaluateOnCallFrame`, mapped to the relay option that keeps a throwing evaluation from pausing the target.
 - An empty `functionName` for the top-level script frame, which the relay reports as `global code`.
 - `Debugger.setBreakpointsActive` is sent after `Debugger.enable`, because JSC does not pause at a resolved breakpoint until the debugger activates breakpoints.
 - `Debugger.setPauseOnDebuggerStatements` is sent after `Debugger.enable`, because JSC only stops at a `debugger` statement once a frontend arms that switch. CDP has no equivalent command.
@@ -92,6 +93,7 @@ These come from the JSC target and its relay protocol rather than from the bridg
 - Console API calls are not visible. JSC reports console output to the console client the host application installs, and the relay receives nothing, so CDP frontends show no `Runtime.consoleAPICalled` events. Breakpoints, stepping, and evaluation are unaffected. A host that reports its console messages to the Web Inspector console client makes them available to the relay.
 - Block-scoped bindings are reported in a separate `block` scope. Frontends that merge block bindings into the frame's local scope show fewer names in the local scope.
 - A breakpoint offset inside a multi-line expression resolves to the start of the statement that contains it.
+- Script metadata keeps the most recent 1024 scripts of a target that parses more than that, so an older script reports no URL and keeps no breakpoint column offset, like a script parsed before the bridge attached.
 
 ## Tests
 
