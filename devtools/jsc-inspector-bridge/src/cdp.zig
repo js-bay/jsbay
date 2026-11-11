@@ -1,9 +1,4 @@
-//! CDP to WebKit Inspector Relay translation.
-//!
-//! One relay connection carries a single registered frontend sender, so the bridge owns the sender
-//! identity for the target. Every CDP session reuses it, and the bridge rewrites command ids to
-//! unique relay ids to route the matching reply back to the session that issued it. Relay
-//! notifications are copied to every attached session.
+//! CDP to WebKit Inspector Relay translation. One relay connection carries a single registered frontend sender, so the bridge owns the sender identity for the target: every CDP session reuses it, command ids are rewritten to unique relay ids so each reply reaches the session that issued it, and relay notifications are copied to every attached session.
 
 const std = @import("std");
 const wir = @import("wir.zig");
@@ -237,35 +232,36 @@ pub const Bridge = struct {
         debugger_enable,
         evaluate,
         evaluate_on_call_frame,
+        call_function_on,
         get_properties,
         other,
     };
 
     pub fn start(allocator: Allocator, io: std.Io, client: *wir.Client, target: wir.Target, port: u16) !*Bridge {
-        const wire = try allocator.create(WireRelay);
-        errdefer allocator.destroy(wire);
-        wire.* = .{ .client = client, .application = target.application };
-        const transport_owner = try allocator.create(TransportFrontend);
-        errdefer allocator.destroy(transport_owner);
-        transport_owner.* = .{ .transport = try transport.Transport.init(allocator, port) };
-        errdefer transport_owner.transport.deinit();
         _ = io;
-        const self = try init(allocator, wire.relay(), transport_owner.frontend(), target);
-        errdefer {
-            transport_owner.transport.deinit();
-            _ = allocator.destroy(transport_owner);
-            _ = allocator.destroy(wire);
-        }
+        // Each owner starts out as a local claim and moves into the bridge as soon as the bridge exists, so a failed start releases everything through exactly one path.
+        var wire: ?*WireRelay = try allocator.create(WireRelay);
+        errdefer if (wire) |owner| allocator.destroy(owner);
+        wire.?.client = client;
+        wire.?.application = target.application;
+        var frontend_owner: ?*TransportFrontend = try allocator.create(TransportFrontend);
+        errdefer if (frontend_owner) |owner| allocator.destroy(owner);
+        frontend_owner.?.transport = try transport.Transport.init(allocator, port);
+        errdefer if (frontend_owner) |owner| owner.transport.deinit();
+        const self = try init(allocator, wire.?.relay(), frontend_owner.?.frontend(), target);
+        errdefer self.deinit();
         self.relay_owner = wire;
-        self.frontend_owner = transport_owner;
-        transport_owner.transport.setProtocolJson("{}");
-        transport_owner.transport.setDiscoveryTarget(.{
+        self.frontend_owner = frontend_owner;
+        wire = null;
+        frontend_owner = null;
+        self.frontend_owner.?.transport.setProtocolJson("{}");
+        self.frontend_owner.?.transport.setDiscoveryTarget(.{
             .title = target.title,
             .kind = "node",
             .url = "",
-            .id = target.title,
+            .id = "jsbay-jsc-target",
         });
-        try transport_owner.transport.start(self, handleEvent);
+        try self.frontend_owner.?.transport.start(self, handleEvent);
         return self;
     }
 
@@ -799,6 +795,7 @@ fn kindOf(name: []const u8) Bridge.MethodKind {
     if (std.mem.eql(u8, name, "Debugger.enable")) return .debugger_enable;
     if (std.mem.eql(u8, name, "Runtime.evaluate")) return .evaluate;
     if (std.mem.eql(u8, name, "Debugger.evaluateOnCallFrame")) return .evaluate_on_call_frame;
+    if (std.mem.eql(u8, name, "Runtime.callFunctionOn")) return .call_function_on;
     if (std.mem.eql(u8, name, "Runtime.getProperties")) return .get_properties;
     return .other;
 }
@@ -884,15 +881,19 @@ fn targetsSingleLineScript(self: *Bridge, params: std.json.ObjectMap) bool {
     if (scriptIdOf(params)) |script_id| {
         if (self.scripts.get(script_id)) |script| return script.end_line == 0;
     }
-    if (params.get("url")) |url| {
-        if (url == .string) {
-            var iterator = self.scripts.iterator();
-            while (iterator.next()) |entry| {
-                if (std.mem.eql(u8, entry.value_ptr.url, url.string)) return entry.value_ptr.end_line == 0;
-            }
-        }
+    const url = switch (params.get("url") orelse return false) {
+        .string => |text| text,
+        else => return false,
+    };
+    // One URL can match several parsed scripts, for example after a reload. The column is kept only when every match is single-line, because a multi-line match would place the breakpoint at the statement under the offset rather than at the start of the line.
+    var matched = false;
+    var iterator = self.scripts.iterator();
+    while (iterator.next()) |entry| {
+        if (!std.mem.eql(u8, entry.value_ptr.url, url)) continue;
+        if (entry.value_ptr.end_line != 0) return false;
+        matched = true;
     }
-    return false;
+    return matched;
 }
 
 fn scriptIdOf(params: std.json.ObjectMap) ?[]const u8 {
@@ -939,6 +940,16 @@ fn translateParams(self: *Bridge, allocator: Allocator, method: []const u8, para
         // The bridge advertises one synthetic context; the relay addresses the only context the target has.
         _ = filtered.swapRemove("contextId");
         _ = filtered.swapRemove("uniqueContextId");
+        // CDP spells the option that keeps a throwing evaluation from pausing the target differently from the relay.
+        if (std.mem.eql(u8, method, "Runtime.evaluate")) {
+            const silent = switch (source.get("silent") orelse std.json.Value{ .bool = false }) {
+                .bool => |flag| flag,
+                else => false,
+            };
+            if (silent and source.get("doNotPauseOnExceptionsAndMuteConsole") == null) {
+                filtered.put(allocator, "doNotPauseOnExceptionsAndMuteConsole", .{ .bool = true }) catch {};
+            }
+        }
         return .{ .object = filtered };
     }
     return .{ .object = source };
@@ -1102,12 +1113,15 @@ fn normalizeStepOutPause(self: *Bridge, allocator: Allocator, params: *const std
     const at_end = line == script.end_line and (column == script.end_column or script.end_column < 0);
     const past_end = line > script.end_line;
     if (!at_end and !past_end) return;
+    // The event outlives the caller site, so it needs its own copy of both strings before the site is released.
+    const script_id = allocator.dupe(u8, armed.script_id) catch return;
+    const function_name = allocator.dupe(u8, armed.function_name) catch return;
     var rewritten = std.json.ObjectMap{};
-    rewritten.put(allocator, "scriptId", .{ .string = armed.script_id }) catch return;
+    rewritten.put(allocator, "scriptId", .{ .string = script_id }) catch return;
     rewritten.put(allocator, "lineNumber", .{ .integer = armed.line }) catch return;
     rewritten.put(allocator, "columnNumber", .{ .integer = armed.column }) catch return;
     top.object.put(allocator, "location", .{ .object = rewritten }) catch return;
-    top.object.put(allocator, "functionName", .{ .string = armed.function_name }) catch return;
+    top.object.put(allocator, "functionName", .{ .string = function_name }) catch return;
     replaceSite(self.allocator, &self.armed_caller, null);
 }
 
@@ -1243,7 +1257,7 @@ fn postProcessReply(allocator: Allocator, object: std.json.ObjectMap, kind: Brid
         .debugger_enable => {
             if (result.get("debuggerId") == null) result.put(allocator, "debuggerId", .{ .string = "jsbay-jsc-bridge" }) catch {};
         },
-        .evaluate, .evaluate_on_call_frame => {
+        .evaluate, .evaluate_on_call_frame, .call_function_on => {
             if (kind == .evaluate) result.put(allocator, "executionContextId", .{ .integer = 1 }) catch {};
             const thrown = switch (result.get("wasThrown") orelse std.json.Value{ .bool = false }) {
                 .bool => |flag| flag,

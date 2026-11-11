@@ -612,6 +612,66 @@ test "a target disconnect releases the attached client" {
     try std.testing.expectEqual(@as(usize, 0), harness.relay.countOf(.did_close));
 }
 
+test "a thrown callFunctionOn reply carries exceptionDetails and no context id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+
+    harness.bridge.onMessage(1, "{\"id\":41,\"method\":\"Runtime.callFunctionOn\",\"params\":{\"functionDeclaration\":\"function(){ throw new Error('x') }\",\"objectId\":\"obj-1\"}}");
+    try harness.replyTo(0, "{\"result\":{\"result\":{\"type\":\"object\",\"subtype\":\"error\"},\"wasThrown\":true}}");
+
+    const reply = (try harness.frontend.replyFor(arena.allocator(), 41)) orelse return error.MissingReply;
+    const result = reply.object.get("result").?.object;
+    try std.testing.expect(result.get("exceptionDetails") != null);
+    try std.testing.expect(result.get("wasThrown") == null);
+    try std.testing.expect(result.get("executionContextId") == null);
+}
+
+test "a silent evaluation asks the relay not to pause on exceptions" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+
+    harness.bridge.onMessage(1, "{\"id\":42,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"throw 1\",\"silent\":true}}");
+    harness.bridge.onMessage(1, "{\"id\":43,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"1+1\"}}");
+
+    const commands = try harness.relay.commands(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), commands.items.len);
+    var silent = try std.json.parseFromSlice(std.json.Value, arena.allocator(), commands.items[0], .{});
+    const silent_params = silent.value.object.get("params").?.object;
+    try std.testing.expectEqual(true, silent_params.get("doNotPauseOnExceptionsAndMuteConsole").?.bool);
+    try std.testing.expect(silent_params.get("silent") == null);
+    var loud = try std.json.parseFromSlice(std.json.Value, arena.allocator(), commands.items[1], .{});
+    try std.testing.expect(loud.value.object.get("params").?.object.get("doNotPauseOnExceptionsAndMuteConsole") == null);
+}
+
+test "a URL breakpoint keeps its column only when every matching script is single-line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var harness = try Harness.create(arena.allocator());
+    defer harness.deinit();
+    harness.bridge.openSession(1);
+    // Two parsed scripts share the single-line URL, and a third is multi-line under another URL.
+    harness.bridge.deliver("{\"method\":\"Debugger.scriptParsed\",\"params\":{\"scriptId\":\"11\",\"url\":\"min.js\",\"endLine\":0,\"endColumn\":900}}");
+    harness.bridge.deliver("{\"method\":\"Debugger.scriptParsed\",\"params\":{\"scriptId\":\"12\",\"url\":\"min.js\",\"endLine\":0,\"endColumn\":800}}");
+    harness.bridge.deliver("{\"method\":\"Debugger.scriptParsed\",\"params\":{\"scriptId\":\"13\",\"url\":\"mixed.js\",\"endLine\":0,\"endColumn\":700}}");
+    harness.bridge.deliver("{\"method\":\"Debugger.scriptParsed\",\"params\":{\"scriptId\":\"14\",\"url\":\"mixed.js\",\"endLine\":9,\"endColumn\":1}}");
+
+    harness.bridge.onMessage(1, "{\"id\":51,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":{\"url\":\"min.js\",\"lineNumber\":0,\"columnNumber\":20}}");
+    harness.bridge.onMessage(1, "{\"id\":52,\"method\":\"Debugger.setBreakpointByUrl\",\"params\":{\"url\":\"mixed.js\",\"lineNumber\":0,\"columnNumber\":30}}");
+
+    const commands = try harness.relay.commands(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), commands.items.len);
+    var kept = try std.json.parseFromSlice(std.json.Value, arena.allocator(), commands.items[0], .{});
+    try std.testing.expectEqual(@as(i64, 20), kept.value.object.get("params").?.object.get("columnNumber").?.integer);
+    var dropped = try std.json.parseFromSlice(std.json.Value, arena.allocator(), commands.items[1], .{});
+    try std.testing.expectEqual(@as(i64, 0), dropped.value.object.get("params").?.object.get("columnNumber").?.integer);
+}
+
 test "reply detection compares the parsed id" {
     const allocator = std.testing.allocator;
     try std.testing.expect(cdp.isReplyTo(allocator, "{\"id\":1,\"result\":{}}", 1));
