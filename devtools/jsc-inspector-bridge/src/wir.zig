@@ -306,10 +306,17 @@ fn describeFrame(allocator: Allocator, bytes: []const u8) ?[]const u8 {
         return text[0..@min(text.len, 400)];
     }
     const selector = value.get("__selector") orelse argument.get("__selector") orelse return null;
-    return switch (selector) {
-        .string => |name| name,
-        else => null,
+    const name = switch (selector) {
+        .string => |text| text,
+        else => return null,
     };
+    // Lifecycle notifications are told apart by application, so the identifier belongs in the trace.
+    const identifier = switch (argument.get("WIRApplicationIdentifierKey") orelse return name) {
+        .string => |text| text,
+        .integer => |number| return std.fmt.allocPrint(allocator, "{s} app={d}", .{ name, number }) catch name,
+        else => return name,
+    };
+    return std.fmt.allocPrint(allocator, "{s} app={s}", .{ name, identifier }) catch name;
 }
 
 fn connectUnix(path: []const u8) Error!std.posix.fd_t {
@@ -507,6 +514,21 @@ fn findPage(info: plist.Value, application: []const u8, wanted: ?[]const u8) ?Pa
         else => {},
     }
     return null;
+}
+
+test "the trace names the application of a lifecycle notification" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const envelope = plist.Value{ .dict = &.{
+        .{ .key = "__selector", .value = .{ .string = "_rpc_applicationDisconnected:" } },
+        .{ .key = "__argument", .value = .{ .dict = &.{
+            .{ .key = "WIRApplicationIdentifierKey", .value = .{ .string = "PID:41" } },
+        } } },
+    } };
+    const bytes = try plist.encode(allocator, envelope);
+    const text = describeFrame(allocator, bytes) orelse return error.MissingDescription;
+    try std.testing.expectEqualStrings("_rpc_applicationDisconnected: app=PID:41", text);
 }
 
 test "uuid4 has the expected shape" {
