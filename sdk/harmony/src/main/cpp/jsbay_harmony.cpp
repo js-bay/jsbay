@@ -54,7 +54,8 @@ struct SubmissionBinding {
     std::atomic_bool accepting{true};
 };
 struct SubmissionRecord {
-    SubmissionBinding *binding;
+    SubmissionBinding *binding = nullptr;
+    Engine *engine = nullptr;
     napi_ref callback = nullptr;
     int32_t status = JSBAY_SUBMISSION_CANCELLED;
     std::string error;
@@ -193,7 +194,8 @@ static void submissionDispatch(napi_env env, napi_value, void *, void *data) {
         }
         napi_delete_reference(env, record->callback);
     }
-    releaseEngine(record->binding->engine);
+    if (record->engine)
+        releaseEngine(record->engine);
     delete record;
 }
 static void submissionComplete(int, uint64_t, jsbay_submission_status_t status,
@@ -205,11 +207,12 @@ static void submissionComplete(int, uint64_t, jsbay_submission_status_t status,
     if (error_data && error_len)
         record->error.assign(reinterpret_cast<const char *>(error_data), error_len);
     auto *binding = record->binding;
+    auto *engine = record->engine;
     if (!binding || !binding->accepting.load(std::memory_order_acquire) ||
         napi_call_threadsafe_function(binding->tsfn, record, napi_tsfn_nonblocking) != napi_ok) {
+        if (engine)
+            releaseEngine(engine);
         delete record;
-        if (binding)
-            releaseEngine(binding->engine);
     }
     if (binding)
         (void)napi_release_threadsafe_function(binding->tsfn, napi_tsfn_release);
@@ -251,8 +254,11 @@ static napi_value wrapValue(napi_env env, Engine *e, jsbay_value_t h, bool borro
     if (!h)
         return nullptr;
     napi_value o;
-    if (napi_create_object(env, &o) != napi_ok)
+    if (napi_create_object(env, &o) != napi_ok) {
+        if (!borrowed && !e->closed)
+            (void)jsbay_value_release(h);
         return makeError(env, "cannot allocate JsBay Value wrapper");
+    }
     retainEngine(e);
     auto *v = new Value{e, h, borrowed, true};
     if (napi_wrap(
@@ -269,7 +275,7 @@ static napi_value wrapValue(napi_env env, Engine *e, jsbay_value_t h, bool borro
                 delete value;
             },
             nullptr, nullptr) != napi_ok) {
-        if (!e->closed)
+        if (!borrowed && !e->closed)
             (void)jsbay_value_release(h);
         delete v;
         releaseEngine(e);
@@ -680,10 +686,13 @@ static void shutdownLoopTask(LoopBinding *binding) {
 }
 
 static void loopDispatch(napi_env env, napi_value callback, void *context, void *) {
+    if (!env || !callback)
+        return;
     auto *binding = static_cast<LoopBinding *>(context);
+    if (!binding)
+        return;
     binding->pending.store(false, std::memory_order_release);
-    if (!env || !callback || !binding->active.load(std::memory_order_acquire) ||
-        binding->engine->closed)
+    if (!binding->active.load(std::memory_order_acquire) || binding->engine->closed)
         return;
     uint64_t generation, delay;
     bool clear_only = false;
@@ -1221,6 +1230,7 @@ static napi_value postSubmission(napi_env env, napi_callback_info info, bool fen
         return makeError(env, "postFence seal must be boolean");
     auto *record = new SubmissionRecord{};
     record->binding = engine->submissions;
+    record->engine = engine;
     if (callback_value &&
         napi_create_reference(env, callback_value, 1, &record->callback) != napi_ok) {
         delete record;
@@ -1695,6 +1705,34 @@ static napi_value toUtf8(napi_env e, napi_callback_info i) {
 static napi_value toJson(napi_env e, napi_callback_info i) {
     return textValue(e, i, true);
 }
+static napi_value textStringValue(napi_env env, napi_callback_info info, bool json) {
+    size_t n = 1;
+    napi_value a[1];
+    napi_get_cb_info(env, info, &n, a, nullptr, nullptr);
+    Value *v = nullptr;
+    if (n != 1 || !requireValue(env, a[0], &v))
+        return nullptr;
+    jsbay_bytes_t b = {nullptr, 0};
+    jsbay_value_t x = 0;
+    auto s = json ? jsbay_value_to_json(v->handle, &b, &x) : jsbay_value_to_utf8(v->handle, &b, &x);
+    if (s == JSBAY_EXCEPTION)
+        return takeResult(env, v->engine, s, 0, x);
+    if (s != JSBAY_OK)
+        return statusError(env, s);
+    napi_value str = nullptr;
+    const char *str_data = b.len ? reinterpret_cast<const char *>(b.data) : "";
+    napi_status ns = napi_create_string_utf8(env, str_data, b.len, &str);
+    jsbay_free_bytes(b);
+    if (ns != napi_ok)
+        return makeError(env, "cannot create string", JSBAY_OUT_OF_MEMORY);
+    return str;
+}
+static napi_value toStringValue(napi_env e, napi_callback_info i) {
+    return textStringValue(e, i, false);
+}
+static napi_value toJsonStringValue(napi_env e, napi_callback_info i) {
+    return textStringValue(e, i, true);
+}
 static napi_value cacheHit(napi_env env, napi_callback_info info) {
     size_t n = 1;
     napi_value a[1];
@@ -2024,6 +2062,8 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"toNumber", 0, toNumber, 0, 0, 0, napi_default, 0},
         {"toUtf8", 0, toUtf8, 0, 0, 0, napi_default, 0},
         {"toJson", 0, toJson, 0, 0, 0, napi_default, 0},
+        {"toStringValue", 0, toStringValue, 0, 0, 0, napi_default, 0},
+        {"toJsonStringValue", 0, toJsonStringValue, 0, 0, 0, napi_default, 0},
         {"cacheHit", 0, cacheHit, 0, 0, 0, napi_default, 0},
         {"requestInterrupt", 0, requestInterrupt, 0, 0, 0, napi_default, 0},
         {"requestInterruptById", 0, requestInterruptById, 0, 0, 0, napi_default, 0},

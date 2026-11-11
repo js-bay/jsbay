@@ -49,6 +49,8 @@ export interface NativeBridge {
   toNumber(value: Raw): number;
   toUtf8(value: Raw): ArrayBuffer;
   toJson(value: Raw): ArrayBuffer;
+  toStringValue(value: Raw): string;
+  toJsonStringValue(value: Raw): string;
   cacheHit(value: Raw): boolean;
   postScript(engine: Raw, source: string, filename: string, callback: (outcome: { status: number; error: string }) => void): boolean;
   postFence(engine: Raw, sealShutdown: boolean, callback: (outcome: { status: number; error: string }) => void): boolean;
