@@ -900,3 +900,19 @@ test "value: Global reference with custom allocator cleans up without leak" {
     defer backend.ActiveEngine.freeValue(ctx, retrieved);
     try testing.expect(backend.ActiveEngine.sameValue(ctx, str, retrieved));
 }
+
+test "value: Weak reference with custom allocator cleans up without leak" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const obj = backend.ActiveEngine.newObject(ctx);
+    defer backend.ActiveEngine.freeValue(ctx, obj);
+
+    var w = @import("../root.zig").reference.Weak(value.Local).init(id, obj);
+    defer w.deinit();
+
+    const live = w.get() orelse return error.WeakLookupFailed;
+    try testing.expect(backend.ActiveEngine.sameValue(ctx, obj, live));
+}

@@ -36,7 +36,7 @@ pub fn jsbay_qjsWeakAttach(ctx: jsc.JSGlobalContextRef, cell: *reference_mod.Wea
     const weak = JSWeakCreate(group, obj);
     if (weak == null) return false;
 
-    const wd = reference_mod.WatcherData.create() orelse {
+    const wd = reference_mod.WatcherData.create(cell.allocator) orelse {
         JSWeakRelease(group, weak);
         return false;
     };

@@ -160,6 +160,7 @@ pub const WatcherData = struct {
     /// Platform-opaque handle. On weak-handle backends this is the weak ref; on refcount backends it's unused (the watcher JS object owns the lifetime).
     native_handle: ?*anyopaque = null,
     ref_count: u32 = 1,
+    allocator: std.mem.Allocator = std.heap.c_allocator,
 
     pub fn retain(self: *WatcherData) void {
         self.ref_count += 1;
@@ -168,12 +169,12 @@ pub const WatcherData = struct {
     pub fn release(self: *WatcherData) void {
         std.debug.assert(self.ref_count > 0);
         self.ref_count -= 1;
-        if (self.ref_count == 0) std.heap.c_allocator.destroy(self);
+        if (self.ref_count == 0) self.allocator.destroy(self);
     }
 
-    pub fn create() ?*WatcherData {
-        const p = std.heap.c_allocator.create(WatcherData) catch return null;
-        p.* = .{};
+    pub fn create(allocator: std.mem.Allocator) ?*WatcherData {
+        const p = allocator.create(WatcherData) catch return null;
+        p.* = .{ .allocator = allocator };
         return p;
     }
 };

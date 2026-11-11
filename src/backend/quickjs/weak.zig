@@ -67,7 +67,7 @@ pub fn jsbay_qjsWeakAttach(ctx: ?*qjs.JSContext, cell: *reference_mod.WeakCell, 
         c.jsbay_qjs_JS_FreeValue(ctx, existing);
     }
 
-    const wd = reference_mod.WatcherData.create() orelse return false;
+    const wd = reference_mod.WatcherData.create(cell.allocator) orelse return false;
     // wd.ref_count = 1 (ours). We'll +1 before handing to the watcher.
 
     // Create the watcher object with our class.
