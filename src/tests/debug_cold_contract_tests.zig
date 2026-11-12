@@ -450,7 +450,7 @@ const InspectorEnabledTests3 = if (@import("build_options").inspector) struct {
         try testing.expectEqual(@as(usize, 0), cold_probe.jobHookCallbacks());
 
         // A later listener is still cold until a new client asks for async stacks. This catches stale native hook state surviving stop/restart.
-        const restarted_handle = try inspector.start(id, .{});
+        const restarted_handle = try inspector.start(id, .{ .port = 0 });
         defer inspector.stop(restarted_handle);
         cold_probe.resetJobHookCallbacks();
         const restarted = engine.evalScript(id, "Promise.resolve().then(function() {});", "restarted-job-hook.js");

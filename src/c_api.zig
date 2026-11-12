@@ -2200,11 +2200,17 @@ fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    const inst = @import("runtime/instance_map.zig").getInstance(id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
-    if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
     const lease = engine_thread.beginEval(id);
     if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    const ctx = engine.getContext(id) orelse {
+    const inst = @import("runtime/instance_map.zig").getInstance(id) orelse {
+        engine.finishEvalEntry(id, lease);
+        return .{ .status = API_INSTANCE_NOT_FOUND };
+    };
+    if (inst.loop.lastError() != null) {
+        engine.finishEvalEntry(id, lease);
+        return .{ .status = API_LOOP_FAILED };
+    }
+    const ctx = inst.monoCtx() orelse {
         engine.finishEvalEntry(id, lease);
         return .{ .status = API_INSTANCE_NOT_FOUND };
     };
@@ -2826,6 +2832,7 @@ const PackedJsOp = struct {
     ctx_addr: usize,
     lease: engine_thread.EvalLease,
     entered_js: bool,
+    allocator: std.mem.Allocator,
     execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
     fn deinit(self: *PackedJsOp) void {
@@ -2843,16 +2850,21 @@ fn beginPackedJsOpMode(instance_id: i32, tag: backend.BackendType, ctx_addr: usi
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
-        if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
-    }
     const lease = engine_thread.beginEval(instance_id);
     if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    const inst = @import("runtime/instance_map.zig").getInstance(instance_id) orelse {
+        engine.finishEvalEntry(instance_id, lease);
+        return .{ .status = API_INSTANCE_NOT_FOUND };
+    };
+    if (inst.loop.lastError() != null) {
+        engine.finishEvalEntry(instance_id, lease);
+        return .{ .status = API_LOOP_FAILED };
+    }
     if (!@import("backend_dispatch.zig").enterJsPacked(tag, ctx_addr)) {
         engine.finishEvalEntry(instance_id, lease);
         return .{ .status = API_WRONG_THREAD };
     }
-    if (!require_execution) return .{ .ok = .{ .id = instance_id, .tag = tag, .ctx_addr = ctx_addr, .lease = lease, .entered_js = true } };
+    if (!require_execution) return .{ .ok = .{ .id = instance_id, .tag = tag, .ctx_addr = ctx_addr, .lease = lease, .entered_js = true, .allocator = inst.allocator } };
     const execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse {
         @import("backend_dispatch.zig").leaveJsPacked(tag, ctx_addr);
         engine.finishEvalEntry(instance_id, lease);
@@ -2864,6 +2876,7 @@ fn beginPackedJsOpMode(instance_id: i32, tag: backend.BackendType, ctx_addr: usi
         .ctx_addr = ctx_addr,
         .lease = lease,
         .entered_js = true,
+        .allocator = inst.allocator,
         .execution = execution,
     } };
 }
@@ -3302,7 +3315,7 @@ pub export fn jsbay_value_new_json(instance_id_raw: c_int, input_arg: Utf8, out_
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueNewJson(ready.tag, ready.ctx_addr, input);
+        const result = @import("backend_dispatch.zig").valueNewJson(packed_js.allocator, ready.tag, ready.ctx_addr, input);
         if (!drainPackedJobs(&packed_js)) {
             discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
             return API_INSTANCE_NOT_FOUND;
@@ -3314,7 +3327,7 @@ pub export fn jsbay_value_new_json(instance_id_raw: c_int, input_arg: Utf8, out_
         .ok => |value| value,
     };
     defer op.deinit();
-    const result = api_backend.parseJson(op.ctx, input);
+    const result = api_backend.parseJson(op.allocator, op.ctx, input);
     if (!drainApiJobs(&op)) {
         discardBackendResult(op.ctx, result);
         return API_INSTANCE_NOT_FOUND;

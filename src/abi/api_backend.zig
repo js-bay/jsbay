@@ -136,10 +136,10 @@ pub fn instanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, construc
     };
 }
 
-pub fn parseJson(ctx: ActiveEngine.Context, input: []const u8) Result {
+pub fn parseJson(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, input: []const u8) Result {
     return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => qjsParseJson(ctx, input),
-        .jsc => jscParseJson(ctx, input),
+        .quickjs, .quickjs_ng => qjsParseJson(allocator, ctx, input),
+        .jsc => jscParseJson(allocator, ctx, input),
         .escargot => escargotOp(blk: {
             const c = @import("../backend/escargot/c_api.zig");
             break :blk c.escargot_json_parse_result(ctx, input.ptr, input.len);
@@ -437,10 +437,10 @@ fn qjsInstanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, construct
     return .{ .ok = result != 0 };
 }
 
-fn qjsParseJson(ctx: ActiveEngine.Context, input: []const u8) Result {
+fn qjsParseJson(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, input: []const u8) Result {
     const m = backend.ActiveEngineModule;
-    const bytes = std.heap.c_allocator.dupeSentinel(u8, input, 0) catch return .out_of_memory;
-    defer std.heap.c_allocator.free(bytes);
+    const bytes = allocator.dupeSentinel(u8, input, 0) catch return .out_of_memory;
+    defer allocator.free(bytes);
     const value = m.qjs.JS_ParseJSON(ctx, bytes.ptr, bytes.len, "<json>");
     if (m.c_api.jsIsException(value)) return .{ .exception = m.qjs.JS_GetException(ctx) };
     return .{ .ok = value };
@@ -694,7 +694,8 @@ fn jscInstanceOf(ctx: ActiveEngine.Context, value: ActiveEngine.Value, construct
     return jscBoolResult(ctx, jscCallIntrinsic(ctx, intrinsics.instance_of, &args));
 }
 
-fn jscParseJson(ctx: ActiveEngine.Context, input: []const u8) Result {
+fn jscParseJson(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, input: []const u8) Result {
+    _ = allocator;
     const m = @import("../backend/jsc.zig");
     const common = @import("../backend/jsc/common.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);

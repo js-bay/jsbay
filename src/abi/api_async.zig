@@ -291,29 +291,30 @@ fn runDelivery(context: ?*anyopaque) void {
     defer release(delivery.request); // map reference
     defer dropForOwner(delivery.request);
     if (taken == .cancelled) return;
-    const ctx = instance_map.getPtrs(delivery.request.instance_id.toInt()) orelse return;
+    const inst = instance_map.getInstance(delivery.request.instance_id.toInt()) orelse return;
+    const ctx = inst.monoCtx() orelse return;
     var value: ActiveEngine.Value = undefined;
     const making_error = delivery.action == .cancel or (delivery.outcome == .exception and delivery.kind != .json);
     const made: api_backend.Result = if (delivery.action == .cancel)
-        api_backend.newError(ctx.ctx, "native promise was cancelled")
+        api_backend.newError(ctx, "native promise was cancelled")
     else if (delivery.outcome == .exception and delivery.kind != .json)
-        api_backend.newError(ctx.ctx, delivery.data)
+        api_backend.newError(ctx, delivery.data)
     else switch (delivery.kind) {
-        .undefined => .{ .ok = ActiveEngine.newUndefinedVal(ctx.ctx) },
-        .utf8_string => api_backend.newString(ctx.ctx, delivery.data),
-        .bytes => api_backend.newArrayBuffer(ctx.ctx, delivery.data),
-        .json => api_backend.parseJson(ctx.ctx, delivery.data),
+        .undefined => .{ .ok = ActiveEngine.newUndefinedVal(ctx) },
+        .utf8_string => api_backend.newString(ctx, delivery.data),
+        .bytes => api_backend.newArrayBuffer(ctx, delivery.data),
+        .json => api_backend.parseJson(inst.allocator, ctx, delivery.data),
     };
     switch (made) {
         .ok => |made_value| {
             value = made_value;
-            defer ActiveEngine.freeValue(ctx.ctx, value);
+            defer ActiveEngine.freeValue(ctx, value);
             _ = if (delivery.action == .complete and delivery.outcome == .ok) delivery.request.deferred.resolve(value) else delivery.request.deferred.reject(value);
         },
         .exception => |exception| {
-            defer ActiveEngine.freeValue(ctx.ctx, exception);
+            defer ActiveEngine.freeValue(ctx, exception);
             // Error construction can itself fail without an allocated Error value. Keep cancellation and message rejections observable under that pressure.
-            const reason = if (making_error or ActiveEngine.isNull(ctx.ctx, exception) or ActiveEngine.isUndefined(ctx.ctx, exception)) delivery.request.failure else exception;
+            const reason = if (making_error or ActiveEngine.isNull(ctx, exception) or ActiveEngine.isUndefined(ctx, exception)) delivery.request.failure else exception;
             _ = delivery.request.deferred.reject(reason);
         },
         .out_of_memory => {

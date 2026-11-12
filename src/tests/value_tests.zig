@@ -1003,4 +1003,26 @@ test "value: api_backend toUtf8, toJson, and copyBuffer with testing.allocator" 
         },
         else => return error.UnexpectedResult,
     }
+
+    const parsed_valid = @import("../abi/api_backend.zig").parseJson(testing.allocator, ctx, "{\"zen\":42}");
+    switch (parsed_valid) {
+        .ok => |val| {
+            defer backend.ActiveEngine.freeValue(ctx, val);
+            const prop = @import("../abi/api_backend.zig").get(ctx, val, "zen");
+            switch (prop) {
+                .ok => |prop_val| {
+                    defer backend.ActiveEngine.freeValue(ctx, prop_val);
+                    try testing.expect(backend.ActiveEngine.isNumber(ctx, prop_val));
+                },
+                else => return error.UnexpectedResult,
+            }
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const parsed_invalid = @import("../abi/api_backend.zig").parseJson(testing.allocator, ctx, "{invalid");
+    switch (parsed_invalid) {
+        .exception => |exc| backend.ActiveEngine.freeValue(ctx, exc),
+        else => return error.UnexpectedResult,
+    }
 }

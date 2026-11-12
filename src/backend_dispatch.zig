@@ -1088,13 +1088,13 @@ fn valueInstanceOfReal(comptime tag: Backend, ctx_addr: usize, value_bytes: []co
     }
 }
 
-fn valueNewJsonReal(comptime tag: Backend, ctx_addr: usize, input: []const u8) EvalValueResult {
+fn valueNewJsonReal(comptime tag: Backend, allocator: std.mem.Allocator, ctx_addr: usize, input: []const u8) EvalValueResult {
     const E = backend.Engine(tag);
     const Mod = backend.EngineModule(tag);
     const ctx = restorePtr(E.Context, ctx_addr);
     if (comptime backend.isQuickJsApiBackend(tag)) {
-        const bytes = std.heap.c_allocator.dupeSentinel(u8, input, 0) catch return .{ .out_of_memory = true };
-        defer std.heap.c_allocator.free(bytes);
+        const bytes = allocator.dupeSentinel(u8, input, 0) catch return .{ .out_of_memory = true };
+        defer allocator.free(bytes);
         const value = Mod.qjs.JS_ParseJSON(ctx, bytes.ptr, bytes.len, "<json>");
         if (Mod.c_api.jsIsException(value)) return .{ .exception = storeErased(E, Mod.qjs.JS_GetException(ctx)) };
         return .{ .value = storeErased(E, value) };
@@ -1333,8 +1333,8 @@ pub fn valueInstanceOf(tag: Backend, ctx_addr: usize, value_bytes: []const u8, c
     return dispatchBoolValue(tag, valueInstanceOfReal, .{ ctx_addr, value_bytes, ctor_bytes });
 }
 
-pub fn valueNewJson(tag: Backend, ctx_addr: usize, input: []const u8) EvalValueResult {
-    return dispatchEvalValue(tag, valueNewJsonReal, .{ ctx_addr, input });
+pub fn valueNewJson(allocator: std.mem.Allocator, tag: Backend, ctx_addr: usize, input: []const u8) EvalValueResult {
+    return dispatchEvalValue(tag, valueNewJsonReal, .{ allocator, ctx_addr, input });
 }
 
 pub fn valueNewError(tag: Backend, ctx_addr: usize, message: []const u8) EvalValueResult {
