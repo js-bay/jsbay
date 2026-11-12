@@ -76,7 +76,8 @@ function commentRecords(file, contents) {
   const records = [];
   for (const [index, line] of contents.split(/\r?\n/).entries()) {
     const number = index + 1;
-    const lineComment = line.match(hashCommentsAllowed(file) ? /^\s*(\/\/\/?|#)\s?(.*)$/ : /^\s*(\/\/\/?)\s?(.*)$/);
+    // `//!` marks a container doc comment and `///!` does not exist, so the marker is consumed here rather than being mistaken for a structured line.
+    const lineComment = line.match(hashCommentsAllowed(file) ? /^\s*(\/\/\/?!?|#)\s?(.*)$/ : /^\s*(\/\/\/?!?)\s?(.*)$/);
     if (lineComment) {
       records.push({ number, body: lineComment[2], kind: 'line' });
     }
