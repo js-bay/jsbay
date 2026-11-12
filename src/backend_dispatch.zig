@@ -682,7 +682,7 @@ fn valueSetPropertyReal(comptime tag: Backend, ctx_addr: usize, object_bytes: []
     }
 }
 
-fn valueCallReal(comptime tag: Backend, ctx_addr: usize, func_bytes: []const u8, this_bytes: []const u8, arg_slices: []const []const u8) EvalValueResult {
+fn valueCallReal(comptime tag: Backend, allocator: std.mem.Allocator, ctx_addr: usize, func_bytes: []const u8, this_bytes: []const u8, arg_slices: []const []const u8) EvalValueResult {
     const E = backend.Engine(tag);
     const Mod = backend.EngineModule(tag);
     if (func_bytes.len != @sizeOf(E.Value) or this_bytes.len != @sizeOf(E.Value)) return .{ .out_of_memory = true };
@@ -693,8 +693,8 @@ fn valueCallReal(comptime tag: Backend, ctx_addr: usize, func_bytes: []const u8,
     const function = loadValue(E, func_bytes);
     const this_value = loadValue(E, this_bytes);
     var args = std.ArrayList(E.Value).empty;
-    defer args.deinit(std.heap.c_allocator);
-    args.ensureTotalCapacityPrecise(std.heap.c_allocator, arg_slices.len) catch return .{ .out_of_memory = true };
+    defer args.deinit(allocator);
+    args.ensureTotalCapacityPrecise(allocator, arg_slices.len) catch return .{ .out_of_memory = true };
     for (arg_slices) |a| args.appendAssumeCapacity(loadValue(E, a));
 
     if (comptime backend.isQuickJsApiBackend(tag)) {
@@ -729,8 +729,8 @@ fn valueCallReal(comptime tag: Backend, ctx_addr: usize, func_bytes: []const u8,
         const apply = value_mod.functionApply(ctx) orelse return .{ .out_of_memory = true };
         var exception: jsc.JSValueRef = null;
         var lifted_args = std.ArrayList(jsc.JSValueRef).empty;
-        defer lifted_args.deinit(std.heap.c_allocator);
-        lifted_args.ensureTotalCapacityPrecise(std.heap.c_allocator, args.items.len) catch return .{ .out_of_memory = true };
+        defer lifted_args.deinit(allocator);
+        lifted_args.ensureTotalCapacityPrecise(allocator, args.items.len) catch return .{ .out_of_memory = true };
         for (args.items) |arg| lifted_args.appendAssumeCapacity(common.liftValue(ctx_ref, arg));
         const arg_array = jsc.JSObjectMakeArray(ctx_ref, lifted_args.items.len, lifted_args.items.ptr, &exception);
         if (exception != null) {
@@ -750,7 +750,7 @@ fn valueCallReal(comptime tag: Backend, ctx_addr: usize, func_bytes: []const u8,
     }
 }
 
-fn valueConstructReal(comptime tag: Backend, ctx_addr: usize, func_bytes: []const u8, arg_slices: []const []const u8) EvalValueResult {
+fn valueConstructReal(comptime tag: Backend, allocator: std.mem.Allocator, ctx_addr: usize, func_bytes: []const u8, arg_slices: []const []const u8) EvalValueResult {
     const E = backend.Engine(tag);
     const Mod = backend.EngineModule(tag);
     if (func_bytes.len != @sizeOf(E.Value)) return .{ .out_of_memory = true };
@@ -760,8 +760,8 @@ fn valueConstructReal(comptime tag: Backend, ctx_addr: usize, func_bytes: []cons
     const ctx = restorePtr(E.Context, ctx_addr);
     const function = loadValue(E, func_bytes);
     var args = std.ArrayList(E.Value).empty;
-    defer args.deinit(std.heap.c_allocator);
-    args.ensureTotalCapacityPrecise(std.heap.c_allocator, arg_slices.len) catch return .{ .out_of_memory = true };
+    defer args.deinit(allocator);
+    args.ensureTotalCapacityPrecise(allocator, arg_slices.len) catch return .{ .out_of_memory = true };
     for (arg_slices) |a| args.appendAssumeCapacity(loadValue(E, a));
 
     if (comptime backend.isQuickJsApiBackend(tag)) {
@@ -791,8 +791,8 @@ fn valueConstructReal(comptime tag: Backend, ctx_addr: usize, func_bytes: []cons
             return .{ .exception = storeErased(E, err) };
         }
         var lifted_args = std.ArrayList(jsc.JSValueRef).empty;
-        defer lifted_args.deinit(std.heap.c_allocator);
-        lifted_args.ensureTotalCapacityPrecise(std.heap.c_allocator, args.items.len) catch return .{ .out_of_memory = true };
+        defer lifted_args.deinit(allocator);
+        lifted_args.ensureTotalCapacityPrecise(allocator, args.items.len) catch return .{ .out_of_memory = true };
         for (args.items) |arg| lifted_args.appendAssumeCapacity(common.liftValue(ctx_ref, arg));
         var exception: jsc.JSValueRef = null;
         const result = jsc.JSObjectCallAsConstructor(ctx_ref, @ptrCast(@constCast(lifted_function)), lifted_args.items.len, lifted_args.items.ptr, &exception);
@@ -859,12 +859,12 @@ pub fn valueSetProperty(tag: Backend, ctx_addr: usize, object_bytes: []const u8,
     return dispatchEvalValue(tag, valueSetPropertyReal, .{ ctx_addr, object_bytes, key, value_bytes });
 }
 
-pub fn valueCall(tag: Backend, ctx_addr: usize, func_bytes: []const u8, this_bytes: []const u8, arg_slices: []const []const u8) EvalValueResult {
-    return dispatchEvalValue(tag, valueCallReal, .{ ctx_addr, func_bytes, this_bytes, arg_slices });
+pub fn valueCall(allocator: std.mem.Allocator, tag: Backend, ctx_addr: usize, func_bytes: []const u8, this_bytes: []const u8, arg_slices: []const []const u8) EvalValueResult {
+    return dispatchEvalValue(tag, valueCallReal, .{ allocator, ctx_addr, func_bytes, this_bytes, arg_slices });
 }
 
-pub fn valueConstruct(tag: Backend, ctx_addr: usize, func_bytes: []const u8, arg_slices: []const []const u8) EvalValueResult {
-    return dispatchEvalValue(tag, valueConstructReal, .{ ctx_addr, func_bytes, arg_slices });
+pub fn valueConstruct(allocator: std.mem.Allocator, tag: Backend, ctx_addr: usize, func_bytes: []const u8, arg_slices: []const []const u8) EvalValueResult {
+    return dispatchEvalValue(tag, valueConstructReal, .{ allocator, ctx_addr, func_bytes, arg_slices });
 }
 
 pub const BoolValueResult = struct {

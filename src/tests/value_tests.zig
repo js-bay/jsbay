@@ -1025,4 +1025,59 @@ test "value: api_backend toUtf8, toJson, and copyBuffer with testing.allocator" 
         .exception => |exc| backend.ActiveEngine.freeValue(ctx, exc),
         else => return error.UnexpectedResult,
     }
+
+    try helpers.evalOk(id, "globalThis.zenFn = function(a, b) { return a + b; };");
+    try helpers.evalOk(id, "globalThis.ZenCtor = function(x) { this.x = x; };");
+
+    const global = backend.ActiveEngine.getGlobalObject(ctx);
+    defer backend.ActiveEngine.freeValue(ctx, global);
+
+    const fn_res = @import("../abi/api_backend.zig").get(ctx, global, "zenFn");
+    switch (fn_res) {
+        .ok => |fn_val| {
+            defer backend.ActiveEngine.freeValue(ctx, fn_val);
+            const arg1 = backend.ActiveEngine.newInt32Val(ctx, 10);
+            defer backend.ActiveEngine.freeValue(ctx, arg1);
+            const arg2 = backend.ActiveEngine.newInt32Val(ctx, 32);
+            defer backend.ActiveEngine.freeValue(ctx, arg2);
+            const call_args = [_]backend.ActiveEngine.Value{ arg1, arg2 };
+            const undef = backend.ActiveEngine.newUndefinedVal(ctx);
+            defer backend.ActiveEngine.freeValue(ctx, undef);
+            const call_res = @import("../abi/api_backend.zig").call(testing.allocator, ctx, fn_val, undef, &call_args);
+            switch (call_res) {
+                .ok => |val| {
+                    defer backend.ActiveEngine.freeValue(ctx, val);
+                    try testing.expect(backend.ActiveEngine.isNumber(ctx, val));
+                },
+                else => return error.UnexpectedResult,
+            }
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const ctor_res = @import("../abi/api_backend.zig").get(ctx, global, "ZenCtor");
+    switch (ctor_res) {
+        .ok => |ctor_val| {
+            defer backend.ActiveEngine.freeValue(ctx, ctor_val);
+            const ctor_arg = backend.ActiveEngine.newInt32Val(ctx, 99);
+            defer backend.ActiveEngine.freeValue(ctx, ctor_arg);
+            const construct_args = [_]backend.ActiveEngine.Value{ctor_arg};
+            const construct_res = @import("../abi/api_backend.zig").construct(testing.allocator, ctx, ctor_val, &construct_args);
+            switch (construct_res) {
+                .ok => |inst_val| {
+                    defer backend.ActiveEngine.freeValue(ctx, inst_val);
+                    const prop = @import("../abi/api_backend.zig").get(ctx, inst_val, "x");
+                    switch (prop) {
+                        .ok => |prop_val| {
+                            defer backend.ActiveEngine.freeValue(ctx, prop_val);
+                            try testing.expect(backend.ActiveEngine.isNumber(ctx, prop_val));
+                        },
+                        else => return error.UnexpectedResult,
+                    }
+                },
+                else => return error.UnexpectedResult,
+            }
+        },
+        else => return error.UnexpectedResult,
+    }
 }

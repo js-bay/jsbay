@@ -3634,9 +3634,9 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, this_buf[0..this_len]);
 
         var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
-        defer arg_storage.deinit(std.heap.c_allocator);
+        defer arg_storage.deinit(data.js.allocator);
         var arg_lens = std.ArrayList(usize).empty;
-        defer arg_lens.deinit(std.heap.c_allocator);
+        defer arg_lens.deinit(data.js.allocator);
         defer {
             var i: usize = 0;
             while (i < arg_storage.items.len) : (i += 1) {
@@ -3647,24 +3647,24 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
             if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
             var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
             const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
-            arg_storage.append(std.heap.c_allocator, buf) catch {
+            arg_storage.append(data.js.allocator, buf) catch {
                 @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 return API_OUT_OF_MEMORY;
             };
-            arg_lens.append(std.heap.c_allocator, len) catch {
+            arg_lens.append(data.js.allocator, len) catch {
                 @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 _ = arg_storage.pop();
                 return API_OUT_OF_MEMORY;
             };
         };
         var arg_slices = std.ArrayList([]const u8).empty;
-        defer arg_slices.deinit(std.heap.c_allocator);
-        arg_slices.ensureTotalCapacityPrecise(std.heap.c_allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
+        defer arg_slices.deinit(data.js.allocator);
+        arg_slices.ensureTotalCapacityPrecise(data.js.allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
         var ai: usize = 0;
         while (ai < arg_storage.items.len) : (ai += 1) {
             arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
         }
-        const result = @import("backend_dispatch.zig").valueCall(data.js.tag, data.js.ctx_addr, data.bytes(), this_buf[0..this_len], arg_slices.items);
+        const result = @import("backend_dispatch.zig").valueCall(data.js.allocator, data.js.tag, data.js.ctx_addr, data.bytes(), this_buf[0..this_len], arg_slices.items);
         if (!drainPackedJobs(&data.js)) {
             discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
             return API_INSTANCE_NOT_FOUND;
@@ -3682,19 +3682,19 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
     };
     defer ActiveEngine.freeValue(function_data.op.ctx, pinned_this);
     var values = std.ArrayList(ActiveEngine.Value).empty;
-    defer values.deinit(std.heap.c_allocator);
+    defer values.deinit(function_data.op.allocator);
     defer for (values.items) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
     if (args) |raw_args| for (raw_args[0..argc]) |handle| {
         const item = switch (pinValue(function_data.op, handle)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        values.append(std.heap.c_allocator, item) catch {
+        values.append(function_data.op.allocator, item) catch {
             ActiveEngine.freeValue(function_data.op.ctx, item);
             return API_OUT_OF_MEMORY;
         };
     };
-    const result = api_backend.call(function_data.op.ctx, function_data.value, pinned_this, values.items);
+    const result = api_backend.call(function_data.op.allocator, function_data.op.ctx, function_data.value, pinned_this, values.items);
     if (!drainApiJobs(&function_data.op)) {
         discardBackendResult(function_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
@@ -3720,9 +3720,9 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
         };
         defer data.deinit();
         var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
-        defer arg_storage.deinit(std.heap.c_allocator);
+        defer arg_storage.deinit(data.js.allocator);
         var arg_lens = std.ArrayList(usize).empty;
-        defer arg_lens.deinit(std.heap.c_allocator);
+        defer arg_lens.deinit(data.js.allocator);
         defer {
             var i: usize = 0;
             while (i < arg_storage.items.len) : (i += 1) {
@@ -3733,24 +3733,24 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
             if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
             var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
             const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
-            arg_storage.append(std.heap.c_allocator, buf) catch {
+            arg_storage.append(data.js.allocator, buf) catch {
                 @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 return API_OUT_OF_MEMORY;
             };
-            arg_lens.append(std.heap.c_allocator, len) catch {
+            arg_lens.append(data.js.allocator, len) catch {
                 @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 _ = arg_storage.pop();
                 return API_OUT_OF_MEMORY;
             };
         };
         var arg_slices = std.ArrayList([]const u8).empty;
-        defer arg_slices.deinit(std.heap.c_allocator);
-        arg_slices.ensureTotalCapacityPrecise(std.heap.c_allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
+        defer arg_slices.deinit(data.js.allocator);
+        arg_slices.ensureTotalCapacityPrecise(data.js.allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
         var ai: usize = 0;
         while (ai < arg_storage.items.len) : (ai += 1) {
             arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
         }
-        const result = @import("backend_dispatch.zig").valueConstruct(data.js.tag, data.js.ctx_addr, data.bytes(), arg_slices.items);
+        const result = @import("backend_dispatch.zig").valueConstruct(data.js.allocator, data.js.tag, data.js.ctx_addr, data.bytes(), arg_slices.items);
         if (!drainPackedJobs(&data.js)) {
             discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
             return API_INSTANCE_NOT_FOUND;
@@ -3763,19 +3763,19 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
     };
     defer function_data.deinit();
     var values = std.ArrayList(ActiveEngine.Value).empty;
-    defer values.deinit(std.heap.c_allocator);
+    defer values.deinit(function_data.op.allocator);
     defer for (values.items) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
     if (args) |raw_args| for (raw_args[0..argc]) |handle| {
         const item = switch (pinValue(function_data.op, handle)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        values.append(std.heap.c_allocator, item) catch {
+        values.append(function_data.op.allocator, item) catch {
             ActiveEngine.freeValue(function_data.op.ctx, item);
             return API_OUT_OF_MEMORY;
         };
     };
-    const result = api_backend.construct(function_data.op.ctx, function_data.value, values.items);
+    const result = api_backend.construct(function_data.op.allocator, function_data.op.ctx, function_data.value, values.items);
     if (!drainApiJobs(&function_data.op)) {
         discardBackendResult(function_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;

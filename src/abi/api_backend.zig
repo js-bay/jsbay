@@ -56,10 +56,10 @@ pub fn get(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const
     };
 }
 
-pub fn call(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+pub fn call(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsCall(ctx, function, this_value, args),
-        .jsc => jscCall(ctx, function, this_value, args),
+        .jsc => jscCall(allocator, ctx, function, this_value, args),
         .escargot => escargotCall(ctx, function, this_value, args),
         .hermes => hermesCall(ctx, function, this_value, args),
     };
@@ -87,10 +87,10 @@ pub fn set(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: [:0]const
 }
 
 /// `new function(...args)`. Non-constructors throw a TypeError.
-pub fn construct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+pub fn construct(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
     return switch (backend.active_backend) {
         .quickjs, .quickjs_ng => qjsConstruct(ctx, function, args),
-        .jsc => jscConstruct(ctx, function, args),
+        .jsc => jscConstruct(allocator, ctx, function, args),
         .escargot => escargotConstruct(ctx, function, args),
         .hermes => hermesConstruct(ctx, function, args),
     };
@@ -509,7 +509,7 @@ fn jscGet(ctx: ActiveEngine.Context, object: ActiveEngine.Value, key: []const u8
     return .{ .ok = value };
 }
 
-fn jscCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+fn jscCall(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
     const m = @import("../backend/jsc.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
     const common = @import("../backend/jsc/common.zig");
@@ -540,8 +540,8 @@ fn jscCall(ctx: ActiveEngine.Context, function: ActiveEngine.Value, this_value: 
     const apply = @import("../backend/jsc/value.zig").functionApply(ctx) orelse return .out_of_memory;
     var exception: m.jsc.JSValueRef = null;
     var lifted_args = std.ArrayList(m.jsc.JSValueRef).empty;
-    defer lifted_args.deinit(std.heap.c_allocator);
-    lifted_args.ensureTotalCapacityPrecise(std.heap.c_allocator, args.len) catch return .out_of_memory;
+    defer lifted_args.deinit(allocator);
+    lifted_args.ensureTotalCapacityPrecise(allocator, args.len) catch return .out_of_memory;
     for (args) |arg| lifted_args.appendAssumeCapacity(@import("../backend/jsc/common.zig").liftValue(ctx_ref, arg));
     const arg_array = m.jsc.JSObjectMakeArray(ctx_ref, lifted_args.items.len, lifted_args.items.ptr, &exception);
     if (exception != null) {
@@ -640,7 +640,7 @@ fn jscKeyValue(ctx: ActiveEngine.Context, key: []const u8) ?@import("../backend/
     return m.jsc.JSValueMakeString(@ptrCast(ctx), text);
 }
 
-fn jscConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
+fn jscConstruct(allocator: std.mem.Allocator, ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value) Result {
     const m = @import("../backend/jsc.zig");
     const common = @import("../backend/jsc/common.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
@@ -650,8 +650,8 @@ fn jscConstruct(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: [
         return jscTypeError(ctx, "value is not a constructor");
     }
     var lifted_args = std.ArrayList(m.jsc.JSValueRef).empty;
-    defer lifted_args.deinit(std.heap.c_allocator);
-    lifted_args.ensureTotalCapacityPrecise(std.heap.c_allocator, args.len) catch return .out_of_memory;
+    defer lifted_args.deinit(allocator);
+    lifted_args.ensureTotalCapacityPrecise(allocator, args.len) catch return .out_of_memory;
     for (args) |arg| lifted_args.appendAssumeCapacity(common.liftValue(ctx_ref, arg));
     var exception: m.jsc.JSValueRef = null;
     const value = m.jsc.JSObjectCallAsConstructor(ctx_ref, @ptrCast(@constCast(lifted_function)), lifted_args.items.len, lifted_args.items.ptr, &exception);
