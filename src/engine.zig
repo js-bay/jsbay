@@ -127,10 +127,10 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
         const instance = alloc.create(instance_map.EngineInstance) catch return error.OutOfMemory;
         errdefer alloc.destroy(instance);
 
-        const resources = @import("runtime/resource_limits.zig").Budget.create(config.resource_limits) orelse return error.ResourceInitFailed;
+        const resources = @import("runtime/resource_limits.zig").Budget.create(alloc, config.resource_limits) orelse return error.ResourceInitFailed;
         errdefer resources.deinit();
 
-        const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse return error.ExecutionCpuInitFailed;
+        const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create(alloc) orelse return error.ExecutionCpuInitFailed;
         errdefer execution_cpu.close();
 
         instance.* = .{
@@ -171,10 +171,10 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
     const instance = alloc.create(instance_map.EngineInstance) catch return error.OutOfMemory;
     errdefer alloc.destroy(instance);
 
-    const resources = @import("runtime/resource_limits.zig").Budget.create(config.resource_limits) orelse return error.ResourceInitFailed;
+    const resources = @import("runtime/resource_limits.zig").Budget.create(alloc, config.resource_limits) orelse return error.ResourceInitFailed;
     errdefer resources.deinit();
 
-    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse return error.ExecutionCpuInitFailed;
+    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create(alloc) orelse return error.ExecutionCpuInitFailed;
     errdefer execution_cpu.close();
 
     instance.* = .{
@@ -869,9 +869,9 @@ test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Lin
     backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
     const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch return error.Oom;
     errdefer std.heap.c_allocator.destroy(instance);
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse return error.BudgetFailed;
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse return error.BudgetFailed;
     errdefer resources.deinit();
-    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse return error.Oom;
+    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create(std.heap.c_allocator) orelse return error.Oom;
     errdefer execution_cpu.close();
     instance.* = .{
         .allocator = std.heap.c_allocator,

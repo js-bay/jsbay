@@ -359,7 +359,7 @@ test "c_api: forced packed_alt typed value (Linux primary-tag)" {
         loop.destroy();
         return error.Oom;
     };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
@@ -444,7 +444,7 @@ test "c_api: forced packed_alt set/call/construct/new_* (Linux primary-tag proof
         loop.destroy();
         return error.Oom;
     };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
@@ -621,7 +621,7 @@ test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/ne
         loop.destroy();
         return error.Oom;
     };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
@@ -800,7 +800,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         loop.destroy();
         return error.Oom;
     };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
@@ -960,7 +960,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         loop2.destroy();
         return error.Oom;
     };
-    const resources2 = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources2 = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles2);
         loop2.destroy();
         std.heap.c_allocator.destroy(instance2);

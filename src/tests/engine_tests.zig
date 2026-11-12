@@ -344,6 +344,30 @@ test "engine: dispatchTask queued with testing.allocator cleans up on engine des
     engine.destroy(id);
 }
 
+test "engine: per-instance budget and ledger honor configured allocator and clean up without leaks" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    const inst = instance_map.getInstance(id) orelse return error.InstanceMissing;
+    try testing.expect(inst.resources.allocator.ptr == testing.allocator.ptr);
+    if (inst.execution_cpu) |cpu| {
+        try testing.expect(cpu.allocator.ptr == testing.allocator.ptr);
+    }
+    engine.destroy(id);
+}
+
+test "engine: creation fail injection verifies error paths without leaking per-instance state" {
+    var fail_index: usize = 0;
+    while (fail_index < 6) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const id = helpers.nextInstanceId();
+        const ok = engine.create(id, .{ .allocator = failing.allocator() });
+        if (ok) {
+            engine.destroy(id);
+            break;
+        }
+    }
+}
+
 test "engine: dispatchTask reports rejection for a destroyed instance" {
     const id = helpers.nextInstanceId();
     try testing.expect(engine.create(id, .{}));
