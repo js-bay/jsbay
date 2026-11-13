@@ -116,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
-            (cd "libs/$package" && zig build test --summary all)
+            (cd "libs/$package" && zig build test --summary all --test-timeout 60s)
           done
 
       - name: Check documentation and tooling policy
@@ -365,7 +365,7 @@ jobs:
         run: |
           set -euo pipefail
           for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
-            (cd "libs/$package" && zig build test --summary all)
+            (cd "libs/$package" && zig build test --summary all --test-timeout 60s)
           done
 
       - name: Test262 runner contract (JSC host)

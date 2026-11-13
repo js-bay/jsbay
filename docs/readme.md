@@ -11,6 +11,7 @@ Public declarations are in [the installed header](../include/jsbay.h). These gui
 - [Architecture](architecture.md): package boundaries and source placement.
 - [Testing](testing.md), [QuickJS upgrades](quickjs-upgrade.md), and [performance](performance.md).
 - [state_tcas sequence diagrams](state-tcas-sequences.md): Mermaid locks from Scheduler / Driver / Engine harness stories.
+- [TLA+ specification lock and ITF trace replay](state-tcas-tla.md): formal declarations and trace replay via state_tcas.
 - [Release](release.md).
 - [Capability matrix](capability.md): Escargot/Hermes spike coverage vs QuickJS/JSC.
 - [Production gaps](production-gaps.md) and [adversarial review](adversarial-review.md).

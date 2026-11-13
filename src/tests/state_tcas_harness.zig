@@ -12,4 +12,5 @@ test {
     _ = @import("state_tcas_js_event_loop_driver_harness.zig");
     _ = @import("state_tcas_js_event_loop_driver_gap.zig");
     _ = @import("state_tcas_monitor_harness.zig");
+    _ = @import("state_tcas_tla_harness.zig");
 }

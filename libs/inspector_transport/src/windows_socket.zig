@@ -9,6 +9,9 @@ const SocketHandle = usize;
 const invalid_socket = std.math.maxInt(SocketHandle);
 const wsa_eintr = 10004;
 const wsa_e_would_block = 10035;
+const wsa_einprogress = 10036;
+const wsa_ealready = 10037;
+const wsa_eisconn = 10056;
 const wsa_e_conn_aborted = 10053;
 const wsa_e_conn_reset = 10054;
 const wsa_e_net_down = 10050;
@@ -22,6 +25,7 @@ const ipproto_tcp = 6;
 const sol_socket = 0xffff;
 const so_exclusiveaddruse = -5;
 const so_rcvbuf = 0x1002;
+const so_error = 0x1007;
 const fionbio: c_long = @bitCast(@as(u32, 0x8004667e));
 const sd_both = 2;
 const poll_read = 0x0100;
@@ -79,6 +83,7 @@ extern "ws2_32" fn bind(handle: SocketHandle, address: *const ws2.sockaddr, leng
 extern "ws2_32" fn listen(handle: SocketHandle, backlog: c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn getsockname(handle: SocketHandle, address: *ws2.sockaddr, length: *c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn setsockopt(handle: SocketHandle, level: c_int, option: c_int, value: [*]const u8, length: c_int) callconv(.winapi) c_int;
+extern "ws2_32" fn getsockopt(handle: SocketHandle, level: c_int, option: c_int, value: [*]u8, length: *c_int) callconv(.winapi) c_int;
 extern "ws2_32" fn connect(handle: SocketHandle, address: *const ws2.sockaddr, length: c_int) callconv(.winapi) c_int;
 const winsockAccept = @extern(*const fn (SocketHandle, ?*ws2.sockaddr, ?*c_int) callconv(.winapi) SocketHandle, .{ .name = "accept" });
 extern "ws2_32" fn ioctlsocket(handle: SocketHandle, command: c_long, value: *u32) callconv(.winapi) c_int;
@@ -173,6 +178,14 @@ pub const Socket = struct {
     pub fn setReceiveBuffer(self: Socket, bytes: c_int) !void {
         if (setsockopt(native(self.handle), sol_socket, so_rcvbuf, std.mem.asBytes(&bytes), @sizeOf(c_int)) != 0) return error.ReceiveBufferFailed;
     }
+
+    pub fn connectStatus(self: Socket) !void {
+        var err_code: c_int = 0;
+        var length: c_int = @sizeOf(c_int);
+        if (getsockopt(native(self.handle), sol_socket, so_error, std.mem.asBytes(&err_code).ptr, &length) != 0)
+            return error.ConnectFailed;
+        if (err_code != 0) return error.ConnectFailed;
+    }
 };
 
 pub const PollResult = struct { timed_out: bool, ready: bool, closed: bool };
@@ -238,4 +251,27 @@ pub fn connectLoopback(port: u16) !Socket {
         return error.ConnectFailed;
     }
     return .{ .handle = toHandle(handle) };
+}
+
+pub const BeginConnect = struct { socket: Socket, done: bool };
+
+/// Create a non-blocking loopback socket and start connect. `done` is true when the handshake already completed.
+pub fn beginConnectLoopback(port: u16) !BeginConnect {
+    if (!startup()) return error.ConnectFailed;
+    const handle = socket(af_inet, sock_stream, ipproto_tcp);
+    if (handle == invalid_socket) {
+        _ = WSACleanup();
+        return error.ConnectFailed;
+    }
+    var sock = Socket{ .handle = toHandle(handle) };
+    errdefer sock.close();
+    try sock.setNonBlocking(true);
+    var addr = address(port);
+    if (connect(handle, @ptrCast(&addr), @sizeOf(ws2.sockaddr.in)) == 0)
+        return .{ .socket = sock, .done = true };
+    return switch (WSAGetLastError()) {
+        wsa_e_would_block, wsa_einprogress, wsa_ealready => .{ .socket = sock, .done = false },
+        wsa_eisconn => .{ .socket = sock, .done = true },
+        else => error.ConnectFailed,
+    };
 }

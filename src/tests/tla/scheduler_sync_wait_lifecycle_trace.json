@@ -1,0 +1,48 @@
+{
+  "#meta": {
+    "format": "ITF",
+    "description": "JS event loop scheduler synchronous wait enter and exit lifecycle trace"
+  },
+  "vars": [
+    "state",
+    "saved_state",
+    "macro_q",
+    "micro_q",
+    "sync_depth"
+  ],
+  "states": [
+    {
+      "#meta": {
+        "index": 0
+      },
+      "action": "init",
+      "state": "idle",
+      "macro_q": 0,
+      "micro_q": 0,
+      "sync_depth": 0,
+      "saved_state": "idle"
+    },
+    {
+      "#meta": {
+        "index": 1
+      },
+      "action": "begin_sync_wait",
+      "state": "in_sync_wait",
+      "macro_q": 0,
+      "micro_q": 0,
+      "sync_depth": 1,
+      "saved_state": "idle"
+    },
+    {
+      "#meta": {
+        "index": 2
+      },
+      "action": "end_sync_wait",
+      "state": "idle",
+      "macro_q": 0,
+      "micro_q": 0,
+      "sync_depth": 0,
+      "saved_state": "idle"
+    }
+  ]
+}

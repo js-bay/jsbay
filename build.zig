@@ -571,6 +571,7 @@ pub fn build(b: *std.Build) void {
             "src/tests/state_tcas_js_event_loop_driver_harness.zig",
             "src/tests/state_tcas_js_event_loop_harness.zig",
             "src/tests/state_tcas_monitor_harness.zig",
+            "src/tests/state_tcas_tla_harness.zig",
         };
         for (explore_harnesses) |harness_path| {
             check_explore_gates.addArgs(&.{

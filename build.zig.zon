@@ -10,8 +10,8 @@
         .inspector_transport = .{ .path = "libs/inspector_transport" },
         .bytecode_cache = .{ .path = "libs/bytecode_cache" },
         .state_tcas = .{
-            .url = "git+https://github.com/lbb00/state_tcas.git#v0.2.1",
-            .hash = "state_tcas-0.2.1-4jw0KJ_YAgA-uWc84uqyPOmOAAIUltuIGSTVY-sAJ_Qs",
+            .url = "git+https://github.com/lbb00/state_tcas.git#v0.3.0",
+            .hash = "state_tcas-0.3.0-4jw0KJecBQDyitPr0g-qgFuicdeVa01z5WdXH1_cpCg_",
         },
     },
     .paths = .{
