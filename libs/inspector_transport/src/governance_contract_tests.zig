@@ -68,13 +68,20 @@ fn remainingPollTimeout(deadline_ms: u64) !i32 {
     return @intCast(@min(deadline_ms - now, @as(u64, std.math.maxInt(i32))));
 }
 
+fn ensureDeadline(deadline_ms: u64) !void {
+    _ = try remainingPollTimeout(deadline_ms);
+}
+
 fn waitReady(stream: Stream, event: socket.PollEvent, deadline_ms: u64) !void {
     const sock = socket.Socket{ .handle = stream.handle };
     while (true) {
         const timeout = try remainingPollTimeout(deadline_ms);
         const result = try sock.poll(event, timeout);
         if (result.timed_out) continue;
-        if (result.ready) return;
+        if (result.ready) {
+            try ensureDeadline(deadline_ms);
+            return;
+        }
         if (result.closed) return error.EndOfStream;
     }
 }
@@ -83,6 +90,7 @@ fn writeAllUntil(stream: Stream, bytes: []const u8, deadline_ms: u64) !void {
     const sock = socket.Socket{ .handle = stream.handle };
     var offset: usize = 0;
     while (offset < bytes.len) {
+        try ensureDeadline(deadline_ms);
         const written = sock.write(bytes[offset..]) catch |err| switch (err) {
             error.Interrupted => continue,
             error.WouldBlock => {
@@ -94,12 +102,14 @@ fn writeAllUntil(stream: Stream, bytes: []const u8, deadline_ms: u64) !void {
         if (written == 0) return error.WriteFailed;
         offset += written;
     }
+    try ensureDeadline(deadline_ms);
 }
 
 fn readByteUntil(stream: Stream, deadline_ms: u64) !u8 {
     const sock = socket.Socket{ .handle = stream.handle };
     var byte: [1]u8 = undefined;
     while (true) {
+        try ensureDeadline(deadline_ms);
         const n = sock.read(&byte) catch |err| switch (err) {
             error.WouldBlock => {
                 try waitReady(stream, .read, deadline_ms);
@@ -108,6 +118,7 @@ fn readByteUntil(stream: Stream, deadline_ms: u64) !u8 {
             else => return err,
         };
         if (n == 0) return error.EndOfStream;
+        try ensureDeadline(deadline_ms);
         return byte[0];
     }
 }
@@ -118,6 +129,7 @@ fn readHttpStatusUntil(alloc: std.mem.Allocator, stream: Stream, deadline_ms: u6
     var suffix: [4]u8 = undefined;
     var len: usize = 0;
     while (true) {
+        try ensureDeadline(deadline_ms);
         const byte = try readByteUntil(stream, deadline_ms);
         try bytes.append(alloc, byte);
         if (len < suffix.len) {
@@ -129,7 +141,10 @@ fn readHttpStatusUntil(alloc: std.mem.Allocator, stream: Stream, deadline_ms: u6
             suffix[2] = suffix[3];
             suffix[3] = byte;
         }
-        if (len == suffix.len and std.mem.eql(u8, &suffix, "\r\n\r\n")) return bytes.toOwnedSlice(alloc);
+        if (len == suffix.len and std.mem.eql(u8, &suffix, "\r\n\r\n")) {
+            try ensureDeadline(deadline_ms);
+            return bytes.toOwnedSlice(alloc);
+        }
     }
 }
 
@@ -159,16 +174,18 @@ fn handshakeUntil(stream: Stream, target: []const u8, deadline_ms: u64) !void {
     try writeAllUntil(stream, try upgradeRequest(&request, target), deadline_ms);
     const response = try readHttpStatusUntil(testing.allocator, stream, deadline_ms);
     defer testing.allocator.free(response);
+    try ensureDeadline(deadline_ms);
     try finishHandshake(response);
 }
 
 fn connectLoopbackUntil(port: u16, deadline_ms: u64) !Stream {
-    _ = try remainingPollTimeout(deadline_ms);
+    try ensureDeadline(deadline_ms);
     const started = try socket.beginConnectLoopback(port);
     const stream = Stream{ .handle = started.socket.handle };
     errdefer stream.close();
     if (!started.done) try waitReady(stream, .write, deadline_ms);
     try started.socket.connectStatus();
+    try ensureDeadline(deadline_ms);
     return stream;
 }
 
@@ -182,7 +199,10 @@ fn handshakeUntilAccepted(port: u16, target: []const u8, timeout_ms: u64) !Strea
             if (err == error.HandshakeTimeout) return err;
             return err;
         };
-        if (handshakeUntil(peer, target, deadline)) |_| return peer else |err| {
+        if (handshakeUntil(peer, target, deadline)) |_| {
+            try ensureDeadline(deadline);
+            return peer;
+        } else |err| {
             peer.close();
             if (err == error.HandshakeTimeout or !retryableHandshakeError(err)) return err;
         }
@@ -845,6 +865,8 @@ test "transport: shutdown completes when an HTTP peer leaves its headers unfinis
     t.deinit();
 }
 
+const fixture_poll_ms: i32 = 20;
+
 fn waitMs(ms: u64) void {
     var mutex: zev.Mutex = .{};
     defer mutex.deinit();
@@ -855,64 +877,107 @@ fn waitMs(ms: u64) void {
     _ = cond.waitTimeout(&mutex, ms);
 }
 
-fn readHttpHeadersFromSocket(sock: socket.Socket) !void {
-    var suffix: [4]u8 = undefined;
-    var len: usize = 0;
-    var byte: [1]u8 = undefined;
-    while (true) {
-        const n = try sock.read(&byte);
-        if (n == 0) return error.EndOfStream;
-        if (len < suffix.len) {
-            suffix[len] = byte[0];
-            len += 1;
-        } else {
-            suffix[0] = suffix[1];
-            suffix[1] = suffix[2];
-            suffix[2] = suffix[3];
-            suffix[3] = byte[0];
-        }
-        if (len == suffix.len and std.mem.eql(u8, &suffix, "\r\n\r\n")) return;
-    }
-}
-
 const ScriptedResponse = struct {
     delay_ms: u64 = 0,
     body: []const u8 = &.{},
 };
 
+/// Loopback fixture whose accept/read/delay loops poll with a bound so teardown can join without closing the listener to wake a blocking syscall.
 const ScriptedServer = struct {
     listener: socket.Listener,
     scripts: []const ScriptedResponse,
     thread: ?std.Thread = null,
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     fn start(self: *ScriptedServer) !void {
+        try self.listener.socket.setNonBlocking(true);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
+    fn stopped(self: *ScriptedServer) bool {
+        return self.stop.load(.seq_cst);
+    }
+
+    fn requestStop(self: *ScriptedServer) void {
+        self.stop.store(true, .seq_cst);
+    }
+
     fn join(self: *ScriptedServer) void {
+        self.requestStop();
         if (self.thread) |thread| thread.join();
         self.thread = null;
     }
 
     fn run(self: *ScriptedServer) void {
         for (self.scripts) |step| {
-            const result = self.listener.accept() catch return;
-            const handle = switch (result) {
-                .accepted => |h| h,
-                .retry => return,
-            };
+            if (self.stopped()) return;
+            const handle = self.acceptOne() catch return;
             const sock = socket.Socket{ .handle = handle };
             defer sock.close();
-            readHttpHeadersFromSocket(sock) catch return;
-            if (step.delay_ms > 0) waitMs(step.delay_ms);
+            self.readHeaders(sock) catch return;
+            if (self.stopped()) return;
+            if (step.delay_ms > 0) self.waitOrStop(step.delay_ms);
+            if (self.stopped()) return;
             if (step.body.len > 0) _ = sock.write(step.body) catch {};
+        }
+    }
+
+    fn acceptOne(self: *ScriptedServer) !socket.Handle {
+        while (true) {
+            if (self.stopped()) return error.Stopped;
+            const result = self.listener.accept() catch |err| return err;
+            switch (result) {
+                .accepted => |h| return h,
+                .retry => {
+                    const polled = self.listener.socket.poll(.read, fixture_poll_ms) catch return error.PollFailed;
+                    if (polled.closed and !polled.ready) return error.Stopped;
+                },
+            }
+        }
+    }
+
+    fn readHeaders(self: *ScriptedServer, sock: socket.Socket) !void {
+        try sock.setNonBlocking(true);
+        var suffix: [4]u8 = undefined;
+        var len: usize = 0;
+        var byte: [1]u8 = undefined;
+        while (true) {
+            if (self.stopped()) return error.Stopped;
+            const n = sock.read(&byte) catch |err| switch (err) {
+                error.WouldBlock => {
+                    const polled = sock.poll(.read, fixture_poll_ms) catch return error.PollFailed;
+                    if (polled.closed and !polled.ready) return error.EndOfStream;
+                    continue;
+                },
+                else => return err,
+            };
+            if (n == 0) return error.EndOfStream;
+            if (len < suffix.len) {
+                suffix[len] = byte[0];
+                len += 1;
+            } else {
+                suffix[0] = suffix[1];
+                suffix[1] = suffix[2];
+                suffix[2] = suffix[3];
+                suffix[3] = byte[0];
+            }
+            if (len == suffix.len and std.mem.eql(u8, &suffix, "\r\n\r\n")) return;
+        }
+    }
+
+    fn waitOrStop(self: *ScriptedServer, ms: u64) void {
+        const deadline = zev.monotonicMilliseconds() + ms;
+        while (!self.stopped()) {
+            const now = zev.monotonicMilliseconds();
+            if (now >= deadline) return;
+            waitMs(@min(deadline - now, @as(u64, @intCast(fixture_poll_ms))));
         }
     }
 };
 
 fn serveAndJoin(server: *ScriptedServer) void {
-    server.listener.close();
     server.join();
+    server.listener.close();
 }
 
 test "transport: handshakeUntilAccepted rejects a 101 that arrives after the deadline" {
@@ -991,9 +1056,11 @@ test "transport: peer cleanup only closes sockets that finished connect" {
         accepted: [2]socket.Socket = undefined,
         accepted_len: usize = 0,
         listener_closed: bool = false,
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         fn run(self: *@This()) void {
-            while (true) {
+            self.listener.socket.setNonBlocking(true) catch return;
+            while (!self.stop.load(.seq_cst)) {
                 self.mutex.lock();
                 const done = self.accepted_len == self.accepted.len;
                 self.mutex.unlock();
@@ -1007,7 +1074,10 @@ test "transport: peer cleanup only closes sockets that finished connect" {
                         self.changed.broadcast();
                         self.mutex.unlock();
                     },
-                    .retry => return,
+                    .retry => {
+                        const polled = self.listener.socket.poll(.read, fixture_poll_ms) catch return;
+                        if (polled.closed and !polled.ready) return;
+                    },
                 }
             }
         }
@@ -1038,9 +1108,10 @@ test "transport: peer cleanup only closes sockets that finished connect" {
     defer held.mutex.deinit();
     const thread = try std.Thread.spawn(.{}, Held.run, .{&held});
     defer {
+        held.stop.store(true, .seq_cst);
+        thread.join();
         held.closeHeld();
         held.closeListener();
-        thread.join();
     }
 
     var peers = PeerList{};
@@ -1053,4 +1124,57 @@ test "transport: peer cleanup only closes sockets that finished connect" {
     held.closeListener();
     try testing.expectError(error.ConnectFailed, connectLoopback(listener.port));
     try testing.expectEqual(@as(usize, 2), peers.len);
+}
+
+test "transport: continuously readable headers still honor the handshake deadline" {
+    const alloc = testing.allocator;
+    const prefix = "HTTP/1.1 101 Switching Protocols\r\nX-Large: ";
+    const suffix = "\r\n\r\n";
+    const pad = 1024 * 1024;
+    const body = try alloc.alloc(u8, prefix.len + pad + suffix.len);
+    defer alloc.free(body);
+    @memcpy(body[0..prefix.len], prefix);
+    @memset(body[prefix.len..][0..pad], 'x');
+    @memcpy(body[prefix.len + pad ..], suffix);
+
+    const listener = try socket.listenLoopback(0);
+    const scripts = [_]ScriptedResponse{.{ .body = body }};
+    var server = ScriptedServer{ .listener = listener, .scripts = &scripts };
+    try server.start();
+    defer serveAndJoin(&server);
+    const start = zev.monotonicMilliseconds();
+    try testing.expectError(error.HandshakeTimeout, handshakeUntilAccepted(listener.port, "test", 10));
+    try testing.expect(zev.monotonicMilliseconds() - start < 100);
+}
+
+test "transport: scripted server join does not wait for an unused scripted accept" {
+    const listener = try socket.listenLoopback(0);
+    var server = ScriptedServer{
+        .listener = listener,
+        .scripts = &.{
+            .{ .body = "HTTP/1.1 503 Inspector session capacity reached\r\n\r\n" },
+            .{ .body = "HTTP/1.1 101 Switching Protocols\r\n\r\n" },
+        },
+    };
+    try server.start();
+    const peer = try connectLoopback(listener.port);
+    defer peer.close();
+    try testing.expectError(error.SessionCapacity, handshake(peer, "test"));
+    const start = zev.monotonicMilliseconds();
+    serveAndJoin(&server);
+    try testing.expect(zev.monotonicMilliseconds() - start < 300);
+}
+
+test "transport: scripted server join does not wait for unread request headers" {
+    const listener = try socket.listenLoopback(0);
+    var server = ScriptedServer{
+        .listener = listener,
+        .scripts = &.{.{ .body = "HTTP/1.1 101 Switching Protocols\r\n\r\n" }},
+    };
+    try server.start();
+    const peer = try connectLoopback(listener.port);
+    defer peer.close();
+    const start = zev.monotonicMilliseconds();
+    serveAndJoin(&server);
+    try testing.expect(zev.monotonicMilliseconds() - start < 300);
 }
