@@ -8,6 +8,8 @@ const transport = @import("inspector_transport");
 const zev = @import("zev");
 const test_client = @import("test_client");
 
+const socket = @import("portable_socket");
+
 const Stream = test_client.Stream;
 const connectLoopback = test_client.connectLoopback;
 
@@ -32,41 +34,157 @@ fn readHttpStatus(alloc: std.mem.Allocator, stream: Stream) ![]u8 {
     }
 }
 
-fn isSwitchingProtocols(response: []const u8) bool {
-    return std.mem.startsWith(u8, response, "HTTP/1.1 101");
+fn httpStatusCode(response: []const u8) ?u16 {
+    const prefix = "HTTP/1.";
+    if (!std.mem.startsWith(u8, response, prefix)) return null;
+    var index = prefix.len;
+    if (index >= response.len or response[index] < '0' or response[index] > '9') return null;
+    while (index < response.len and response[index] >= '0' and response[index] <= '9') index += 1;
+    if (index >= response.len or response[index] != ' ') return null;
+    index += 1;
+    if (response.len < index + 3) return null;
+    const code = std.fmt.parseInt(u16, response[index..][0..3], 10) catch return null;
+    if (response.len > index + 3) {
+        const boundary = response[index + 3];
+        if (boundary != ' ' and boundary != '\r' and boundary != '\n') return null;
+    }
+    return code;
+}
+
+fn handshakeErrorForStatus(status: u16) anyerror {
+    return switch (status) {
+        503 => error.SessionCapacity,
+        else => error.HandshakeRejected,
+    };
+}
+
+fn retryableHandshakeError(err: anyerror) bool {
+    return err == error.SessionCapacity;
+}
+
+fn remainingPollTimeout(deadline_ms: u64) !i32 {
+    const now = zev.monotonicMilliseconds();
+    if (now >= deadline_ms) return error.HandshakeTimeout;
+    return @intCast(@min(deadline_ms - now, @as(u64, std.math.maxInt(i32))));
+}
+
+fn waitReady(stream: Stream, event: socket.PollEvent, deadline_ms: u64) !void {
+    const sock = socket.Socket{ .handle = stream.handle };
+    while (true) {
+        const timeout = try remainingPollTimeout(deadline_ms);
+        const result = try sock.poll(event, timeout);
+        if (result.timed_out) continue;
+        if (result.ready) return;
+        if (result.closed) return error.EndOfStream;
+    }
+}
+
+fn writeAllUntil(stream: Stream, bytes: []const u8, deadline_ms: u64) !void {
+    const sock = socket.Socket{ .handle = stream.handle };
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const written = sock.write(bytes[offset..]) catch |err| switch (err) {
+            error.Interrupted => continue,
+            error.WouldBlock => {
+                try waitReady(stream, .write, deadline_ms);
+                continue;
+            },
+            else => return err,
+        };
+        if (written == 0) return error.WriteFailed;
+        offset += written;
+    }
+}
+
+fn readByteUntil(stream: Stream, deadline_ms: u64) !u8 {
+    const sock = socket.Socket{ .handle = stream.handle };
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = sock.read(&byte) catch |err| switch (err) {
+            error.WouldBlock => {
+                try waitReady(stream, .read, deadline_ms);
+                continue;
+            },
+            else => return err,
+        };
+        if (n == 0) return error.EndOfStream;
+        return byte[0];
+    }
+}
+
+fn readHttpStatusUntil(alloc: std.mem.Allocator, stream: Stream, deadline_ms: u64) ![]u8 {
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(alloc);
+    var suffix: [4]u8 = undefined;
+    var len: usize = 0;
+    while (true) {
+        const byte = try readByteUntil(stream, deadline_ms);
+        try bytes.append(alloc, byte);
+        if (len < suffix.len) {
+            suffix[len] = byte;
+            len += 1;
+        } else {
+            suffix[0] = suffix[1];
+            suffix[1] = suffix[2];
+            suffix[2] = suffix[3];
+            suffix[3] = byte;
+        }
+        if (len == suffix.len and std.mem.eql(u8, &suffix, "\r\n\r\n")) return bytes.toOwnedSlice(alloc);
+    }
+}
+
+fn upgradeRequest(buffer: *[512]u8, target: []const u8) ![]u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "GET /{s} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        .{target},
+    );
+}
+
+fn finishHandshake(response: []const u8) !void {
+    const status = httpStatusCode(response) orelse return error.HandshakeRejected;
+    if (status != 101) return handshakeErrorForStatus(status);
 }
 
 fn handshake(stream: Stream, target: []const u8) !void {
     var request: [512]u8 = undefined;
-    const bytes = try std.fmt.bufPrint(
-        &request,
-        "GET /{s} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-        .{target},
-    );
-    try stream.writeAll(bytes);
+    try stream.writeAll(try upgradeRequest(&request, target));
     const response = try readHttpStatus(testing.allocator, stream);
     defer testing.allocator.free(response);
-    if (!isSwitchingProtocols(response)) return error.HandshakeRejected;
+    try finishHandshake(response);
 }
 
-fn retryableHandshakeError(err: anyerror) bool {
-    return switch (err) {
-        error.HandshakeRejected, error.EndOfStream => true,
-        else => false,
-    };
+fn handshakeUntil(stream: Stream, target: []const u8, deadline_ms: u64) !void {
+    var request: [512]u8 = undefined;
+    try writeAllUntil(stream, try upgradeRequest(&request, target), deadline_ms);
+    const response = try readHttpStatusUntil(testing.allocator, stream, deadline_ms);
+    defer testing.allocator.free(response);
+    try finishHandshake(response);
 }
 
-/// Retry a reconnect until the handshake is 101 or `timeout_ms` elapses.
+fn connectLoopbackUntil(port: u16, deadline_ms: u64) !Stream {
+    _ = try remainingPollTimeout(deadline_ms);
+    const started = try socket.beginConnectLoopback(port);
+    const stream = Stream{ .handle = started.socket.handle };
+    errdefer stream.close();
+    if (!started.done) try waitReady(stream, .write, deadline_ms);
+    try started.socket.connectStatus();
+    return stream;
+}
+
+/// Retry a reconnect until the handshake is 101 or the absolute `timeout_ms` deadline elapses.
 ///
-/// `session_closed` is fired before the last worker releases the session slot, so the first attempt after waitClosed can still receive HTTP 503.
+/// `session_closed` is fired before the last worker releases the session slot, so the first attempt after waitClosed can still receive HTTP 503. Connect, write, and response read all share one deadline; only 503 is retried.
 fn handshakeUntilAccepted(port: u16, target: []const u8, timeout_ms: u64) !Stream {
     const deadline = zev.monotonicMilliseconds() + timeout_ms;
     while (true) {
-        if (zev.monotonicMilliseconds() >= deadline) return error.HandshakeTimeout;
-        const peer = try connectLoopback(port);
-        if (handshake(peer, target)) |_| return peer else |err| {
+        const peer = connectLoopbackUntil(port, deadline) catch |err| {
+            if (err == error.HandshakeTimeout) return err;
+            return err;
+        };
+        if (handshakeUntil(peer, target, deadline)) |_| return peer else |err| {
             peer.close();
-            if (!retryableHandshakeError(err)) return err;
+            if (err == error.HandshakeTimeout or !retryableHandshakeError(err)) return err;
         }
     }
 }
@@ -137,6 +255,29 @@ const Opened = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (self.closed < want) self.changed.wait(&self.mutex);
+    }
+};
+
+/// Records only sockets that finished connect so deferred cleanup never closes an uninitialized handle.
+const PeerList = struct {
+    items: [32]Stream = undefined,
+    len: usize = 0,
+    closed: [32]bool = @splat(false),
+
+    fn add(self: *PeerList, stream: Stream) void {
+        self.items[self.len] = stream;
+        self.len += 1;
+    }
+
+    fn closeIndex(self: *PeerList, index: usize) void {
+        if (index >= self.len or self.closed[index]) return;
+        self.items[index].close();
+        self.closed[index] = true;
+    }
+
+    fn closeAll(self: *PeerList) void {
+        var i: usize = 0;
+        while (i < self.len) : (i += 1) self.closeIndex(i);
     }
 };
 
@@ -534,10 +675,12 @@ test "transport: a broadcast snapshot allocation failure releases every retained
     t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "oom-broadcast" });
     try t.start(&opened, Opened.handler);
 
-    var peers: [9]Stream = undefined;
-    for (&peers) |*peer| {
-        peer.* = try connectLoopback(t.boundPort());
-        try handshake(peer.*, "oom-broadcast");
+    var peers = PeerList{};
+    defer peers.closeAll();
+    for (0..9) |_| {
+        const peer = try connectLoopback(t.boundPort());
+        peers.add(peer);
+        try handshake(peer, "oom-broadcast");
     }
     _ = opened.wait(peers.len);
 
@@ -550,7 +693,7 @@ test "transport: a broadcast snapshot allocation failure releases every retained
     std.debug.print("GOVERNANCE_BROADCAST_RESIZE_FAILED peers={d}\n", .{peers.len});
     t.deinit();
     deinitialized = true;
-    for (peers) |peer| peer.close();
+    peers.closeAll();
     try failing.expectFullyFreed();
 }
 
@@ -564,11 +707,12 @@ test "transport: the session cap rejects the next handshake and recovers after d
     t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "session-cap" });
     try t.start(&opened, Opened.handler);
 
-    var peers: [32]Stream = undefined;
-    defer for (peers) |peer| peer.close();
-    for (&peers) |*peer| {
-        peer.* = try connectLoopback(t.boundPort());
-        try handshake(peer.*, "session-cap");
+    var peers = PeerList{};
+    defer peers.closeAll();
+    for (0..32) |_| {
+        const peer = try connectLoopback(t.boundPort());
+        peers.add(peer);
+        try handshake(peer, "session-cap");
     }
     _ = opened.wait(peers.len);
 
@@ -577,10 +721,10 @@ test "transport: the session cap rejects the next handshake and recovers after d
     try rejected.writeAll("GET /session-cap HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
     const rejection = try readHttpStatus(alloc, rejected);
     defer alloc.free(rejection);
-    try testing.expect(!std.mem.startsWith(u8, rejection, "HTTP/1.1 101"));
+    try testing.expect(httpStatusCode(rejection) != 101);
     std.debug.print("GOVERNANCE_SESSION_CAP_REJECTED\n", .{});
 
-    peers[0].close();
+    peers.closeIndex(0);
     opened.waitClosed(1);
     // waitClosed only observes session_closed, which is not a session-slot release barrier.
     const recovered = try handshakeUntilAccepted(t.boundPort(), "session-cap", 5_000);
@@ -599,20 +743,21 @@ test "transport: session_closed is not a session-slot release barrier" {
     t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "session-cap-hold" });
     try t.start(&hold, SessionClosedHold.handler);
 
-    var peers: [32]Stream = undefined;
-    defer for (peers) |peer| peer.close();
-    for (&peers) |*peer| {
-        peer.* = try connectLoopback(t.boundPort());
-        try handshake(peer.*, "session-cap-hold");
+    var peers = PeerList{};
+    defer peers.closeAll();
+    for (0..32) |_| {
+        const peer = try connectLoopback(t.boundPort());
+        peers.add(peer);
+        try handshake(peer, "session-cap-hold");
     }
     _ = hold.opened.wait(peers.len);
 
-    peers[0].close();
+    peers.closeIndex(0);
     hold.opened.waitClosed(1);
 
     const early = try connectLoopback(t.boundPort());
     defer early.close();
-    try testing.expectError(error.HandshakeRejected, handshake(early, "session-cap-hold"));
+    try testing.expectError(error.SessionCapacity, handshake(early, "session-cap-hold"));
 
     hold.release();
     const recovered = try handshakeUntilAccepted(t.boundPort(), "session-cap-hold", 5_000);
@@ -698,4 +843,214 @@ test "transport: shutdown completes when an HTTP peer leaves its headers unfinis
     try stream.writeAll("GET /json/version HTTP/1.1\r\nHost: localhost\r\n");
     std.debug.print("GOVERNANCE_PARTIAL_HTTP_SENT\n", .{});
     t.deinit();
+}
+
+fn waitMs(ms: u64) void {
+    var mutex: zev.Mutex = .{};
+    defer mutex.deinit();
+    var cond: zev.Condition = .init;
+    defer cond.deinit();
+    mutex.lock();
+    defer mutex.unlock();
+    _ = cond.waitTimeout(&mutex, ms);
+}
+
+fn readHttpHeadersFromSocket(sock: socket.Socket) !void {
+    var suffix: [4]u8 = undefined;
+    var len: usize = 0;
+    var byte: [1]u8 = undefined;
+    while (true) {
+        const n = try sock.read(&byte);
+        if (n == 0) return error.EndOfStream;
+        if (len < suffix.len) {
+            suffix[len] = byte[0];
+            len += 1;
+        } else {
+            suffix[0] = suffix[1];
+            suffix[1] = suffix[2];
+            suffix[2] = suffix[3];
+            suffix[3] = byte[0];
+        }
+        if (len == suffix.len and std.mem.eql(u8, &suffix, "\r\n\r\n")) return;
+    }
+}
+
+const ScriptedResponse = struct {
+    delay_ms: u64 = 0,
+    body: []const u8 = &.{},
+};
+
+const ScriptedServer = struct {
+    listener: socket.Listener,
+    scripts: []const ScriptedResponse,
+    thread: ?std.Thread = null,
+
+    fn start(self: *ScriptedServer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn join(self: *ScriptedServer) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+    }
+
+    fn run(self: *ScriptedServer) void {
+        for (self.scripts) |step| {
+            const result = self.listener.accept() catch return;
+            const handle = switch (result) {
+                .accepted => |h| h,
+                .retry => return,
+            };
+            const sock = socket.Socket{ .handle = handle };
+            defer sock.close();
+            readHttpHeadersFromSocket(sock) catch return;
+            if (step.delay_ms > 0) waitMs(step.delay_ms);
+            if (step.body.len > 0) _ = sock.write(step.body) catch {};
+        }
+    }
+};
+
+fn serveAndJoin(server: *ScriptedServer) void {
+    server.listener.close();
+    server.join();
+}
+
+test "transport: handshakeUntilAccepted rejects a 101 that arrives after the deadline" {
+    const listener = try socket.listenLoopback(0);
+    var server = ScriptedServer{
+        .listener = listener,
+        .scripts = &.{.{ .delay_ms = 250, .body = "HTTP/1.1 101 Switching Protocols\r\n\r\n" }},
+    };
+    try server.start();
+    defer serveAndJoin(&server);
+    const start = zev.monotonicMilliseconds();
+    try testing.expectError(error.HandshakeTimeout, handshakeUntilAccepted(listener.port, "test", 10));
+    try testing.expect(zev.monotonicMilliseconds() - start < 100);
+}
+
+test "transport: a silent handshake peer is bounded by the retry deadline" {
+    const listener = try socket.listenLoopback(0);
+    var server = ScriptedServer{
+        .listener = listener,
+        .scripts = &.{.{ .delay_ms = 250, .body = &.{} }},
+    };
+    try server.start();
+    defer serveAndJoin(&server);
+    const start = zev.monotonicMilliseconds();
+    try testing.expectError(error.HandshakeTimeout, handshakeUntilAccepted(listener.port, "test", 10));
+    try testing.expect(zev.monotonicMilliseconds() - start < 100);
+}
+
+test "transport: HTTP status 1010 is not treated as 101" {
+    const listener = try socket.listenLoopback(0);
+    var server = ScriptedServer{
+        .listener = listener,
+        .scripts = &.{.{ .body = "HTTP/1.1 1010 Invalid Status\r\n\r\n" }},
+    };
+    try server.start();
+    defer serveAndJoin(&server);
+    const peer = try connectLoopback(listener.port);
+    defer peer.close();
+    try testing.expectError(error.HandshakeRejected, handshake(peer, "test"));
+}
+
+test "transport: HTTP 404 is not retried as a handshake timeout" {
+    const listener = try socket.listenLoopback(0);
+    var server = ScriptedServer{
+        .listener = listener,
+        .scripts = &.{.{ .body = "HTTP/1.1 404 Not Found\r\n\r\n" }},
+    };
+    try server.start();
+    defer serveAndJoin(&server);
+    const start = zev.monotonicMilliseconds();
+    try testing.expectError(error.HandshakeRejected, handshakeUntilAccepted(listener.port, "test", 200));
+    try testing.expect(zev.monotonicMilliseconds() - start < 100);
+}
+
+test "transport: HTTP 503 is retried until a later 101 succeeds" {
+    const listener = try socket.listenLoopback(0);
+    var server = ScriptedServer{
+        .listener = listener,
+        .scripts = &.{
+            .{ .body = "HTTP/1.1 503 Inspector session capacity reached\r\n\r\n" },
+            .{ .body = "HTTP/1.1 101 Switching Protocols\r\n\r\n" },
+        },
+    };
+    try server.start();
+    defer serveAndJoin(&server);
+    const peer = try handshakeUntilAccepted(listener.port, "test", 1_000);
+    defer peer.close();
+}
+
+test "transport: peer cleanup only closes sockets that finished connect" {
+    const listener = try socket.listenLoopback(0);
+    const Held = struct {
+        listener: socket.Listener,
+        mutex: zev.Mutex = .{},
+        changed: zev.Condition = .init,
+        accepted: [2]socket.Socket = undefined,
+        accepted_len: usize = 0,
+        listener_closed: bool = false,
+
+        fn run(self: *@This()) void {
+            while (true) {
+                self.mutex.lock();
+                const done = self.accepted_len == self.accepted.len;
+                self.mutex.unlock();
+                if (done) return;
+                const result = self.listener.accept() catch return;
+                switch (result) {
+                    .accepted => |h| {
+                        self.mutex.lock();
+                        self.accepted[self.accepted_len] = .{ .handle = h };
+                        self.accepted_len += 1;
+                        self.changed.broadcast();
+                        self.mutex.unlock();
+                    },
+                    .retry => return,
+                }
+            }
+        }
+
+        fn waitAccepted(self: *@This(), want: usize) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (self.accepted_len < want) self.changed.wait(&self.mutex);
+        }
+
+        fn closeListener(self: *@This()) void {
+            if (self.listener_closed) return;
+            self.listener.close();
+            self.listener_closed = true;
+        }
+
+        fn closeHeld(self: *@This()) void {
+            self.mutex.lock();
+            const len = self.accepted_len;
+            var copies = self.accepted;
+            self.mutex.unlock();
+            var i: usize = 0;
+            while (i < len) : (i += 1) copies[i].close();
+        }
+    };
+    var held = Held{ .listener = listener };
+    defer held.changed.deinit();
+    defer held.mutex.deinit();
+    const thread = try std.Thread.spawn(.{}, Held.run, .{&held});
+    defer {
+        held.closeHeld();
+        held.closeListener();
+        thread.join();
+    }
+
+    var peers = PeerList{};
+    defer peers.closeAll();
+    const first = try connectLoopback(listener.port);
+    peers.add(first);
+    const second = try connectLoopback(listener.port);
+    peers.add(second);
+    held.waitAccepted(2);
+    held.closeListener();
+    try testing.expectError(error.ConnectFailed, connectLoopback(listener.port));
+    try testing.expectEqual(@as(usize, 2), peers.len);
 }

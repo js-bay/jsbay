@@ -71,6 +71,14 @@ pub const Socket = struct {
     pub fn setReceiveBuffer(self: Socket, bytes: c_int) !void {
         try std.posix.setsockopt(toFd(self.handle), std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&bytes));
     }
+
+    pub fn connectStatus(self: Socket) !void {
+        var err_code: c_int = 0;
+        var len: std.posix.socklen_t = @sizeOf(c_int);
+        if (std.posix.system.getsockopt(toFd(self.handle), std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&err_code), &len) < 0)
+            return error.ConnectFailed;
+        if (err_code != 0) return error.ConnectFailed;
+    }
 };
 
 pub const Listener = struct {
@@ -124,6 +132,31 @@ pub fn connectLoopback(port: u16) !Socket {
     };
     if (std.posix.system.connect(fd, @ptrCast(&address), @sizeOf(std.posix.sockaddr.in)) < 0) return error.ConnectFailed;
     return .{ .handle = fromFd(fd) };
+}
+
+pub const BeginConnect = struct { socket: Socket, done: bool };
+
+/// Create a non-blocking loopback socket and start connect. `done` is true when the handshake already completed.
+pub fn beginConnectLoopback(port: u16) !BeginConnect {
+    const raw = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (raw < 0) return error.SocketFailed;
+    const fd: std.posix.fd_t = @intCast(raw);
+    var sock = Socket{ .handle = fromFd(fd) };
+    errdefer sock.close();
+    try sock.setNonBlocking(true);
+    var address: std.posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7F000001),
+    };
+    const rc = std.posix.system.connect(fd, @ptrCast(&address), @sizeOf(std.posix.sockaddr.in));
+    if (rc < 0) {
+        return switch (std.posix.errno(rc)) {
+            .INTR, .AGAIN, .INPROGRESS, .ALREADY => .{ .socket = sock, .done = false },
+            .ISCONN => .{ .socket = sock, .done = true },
+            else => error.ConnectFailed,
+        };
+    }
+    return .{ .socket = sock, .done = true };
 }
 
 fn toFd(handle: Handle) std.posix.fd_t {

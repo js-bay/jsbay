@@ -9,6 +9,7 @@ pub const PollResult = backend.PollResult;
 pub const Listener = backend.Listener;
 pub const listenLoopback = backend.listenLoopback;
 pub const connectLoopback = backend.connectLoopback;
+pub const beginConnectLoopback = backend.beginConnectLoopback;
 
 pub fn handleRoundTripForTest(handle: Handle) Handle {
     if (builtin.os.tag == .windows) return backend.roundTripHandleForTest(handle);
