@@ -239,7 +239,7 @@ test "state_tcas tla: lock Scheduler model declarations" {
     try state_tcas.tla.lock(
         io,
         allocator,
-        "docs/tla/scheduler_model.tla",
+        "src/tests/tla/scheduler_model.tla",
         "scheduler_model",
         SchedulerAct,
         SchedulerState,
@@ -253,7 +253,7 @@ test "state_tcas tla: checkExtends confirms scheduler_spec extends scheduler_mod
 
     const spec_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        "docs/tla/scheduler_spec.tla",
+        "src/tests/tla/scheduler_spec.tla",
         allocator,
         .limited(1024 * 1024),
     );
@@ -268,7 +268,7 @@ test "state_tcas tla: replay ITF trace for task then checkpoint drain" {
 
     const trace_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        "docs/tla/scheduler_task_checkpoint_trace.json",
+        "src/tests/tla/scheduler_task_checkpoint_trace.json",
         allocator,
         .limited(1024 * 1024),
     );
@@ -301,7 +301,7 @@ test "state_tcas tla: replay counterexample trace expecting ActionNotEnabled dur
 
     const trace_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        "docs/tla/scheduler_sync_wait_rejection_trace.json",
+        "src/tests/tla/scheduler_sync_wait_rejection_trace.json",
         allocator,
         .limited(1024 * 1024),
     );
@@ -334,7 +334,7 @@ test "state_tcas tla: replay counterexample expecting ActionNotEnabled when drai
 
     const trace_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        "docs/tla/scheduler_checkpoint_sync_wait_rejection_trace.json",
+        "src/tests/tla/scheduler_checkpoint_sync_wait_rejection_trace.json",
         allocator,
         .limited(1024 * 1024),
     );
@@ -498,7 +498,7 @@ test "state_tcas tla: dynamic action coverage across replay traces" {
 
     const trace1_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        "docs/tla/scheduler_task_checkpoint_trace.json",
+        "src/tests/tla/scheduler_task_checkpoint_trace.json",
         allocator,
         .limited(1024 * 1024),
     );
@@ -506,7 +506,7 @@ test "state_tcas tla: dynamic action coverage across replay traces" {
 
     const trace2_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        "docs/tla/scheduler_sync_wait_lifecycle_trace.json",
+        "src/tests/tla/scheduler_sync_wait_lifecycle_trace.json",
         allocator,
         .limited(1024 * 1024),
     );

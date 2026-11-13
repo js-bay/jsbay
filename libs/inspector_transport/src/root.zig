@@ -381,6 +381,9 @@ pub const Transport = struct {
 
         self.server = try RawListener.listenIp4Loopback(self.want_port);
         self.bound_port = self.server.?.port;
+        // Configure the listener before start() returns. If this stays in acceptLoop and fails,
+        // start() would already have succeeded and clients could connect, then block forever on reads.
+        try self.server.?.listener.socket.setNonBlocking(true);
 
         self.accept_exited = false;
         self.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{self}) catch |err| {
@@ -510,8 +513,8 @@ fn acceptLoop(t: *Transport) void {
     const listener = t.server orelse return;
     const listener_fd = listener.listener.socket.handle;
 
-    // Make the listener non-blocking so we can poll with a short timeout and observe the shutdown flag frequently. This avoids a BADF panic that happens when a blocking accept() races with close() in deinit().
-    (RawSocket{ .handle = listener_fd }).setNonBlocking(true) catch return;
+    // The listener is set non-blocking in start(). Keep going even if a redundant attempt fails so the accept loop cannot silently exit after start() has already returned success.
+    (RawSocket{ .handle = listener_fd }).setNonBlocking(true) catch {};
 
     while (!t.shutdown.load(.seq_cst)) {
         const polled = (socket.Socket{ .handle = listener_fd }).poll(.read, io_poll_ms) catch return;
