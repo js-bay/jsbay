@@ -189,6 +189,13 @@ fn connectLoopbackUntil(port: u16, deadline_ms: u64) !Stream {
     return stream;
 }
 
+/// Close `peer` if the absolute deadline has already passed; otherwise transfer ownership to the caller.
+fn adoptPeerBeforeDeadline(peer: Stream, deadline_ms: u64) !Stream {
+    errdefer peer.close();
+    try ensureDeadline(deadline_ms);
+    return peer;
+}
+
 /// Retry a reconnect until the handshake is 101 or the absolute `timeout_ms` deadline elapses.
 ///
 /// `session_closed` is fired before the last worker releases the session slot, so the first attempt after waitClosed can still receive HTTP 503. Connect, write, and response read all share one deadline; only 503 is retried.
@@ -200,8 +207,7 @@ fn handshakeUntilAccepted(port: u16, target: []const u8, timeout_ms: u64) !Strea
             return err;
         };
         if (handshakeUntil(peer, target, deadline)) |_| {
-            try ensureDeadline(deadline);
-            return peer;
+            return adoptPeerBeforeDeadline(peer, deadline);
         } else |err| {
             peer.close();
             if (err == error.HandshakeTimeout or !retryableHandshakeError(err)) return err;
@@ -1177,4 +1183,37 @@ test "transport: scripted server join does not wait for unread request headers" 
     const start = zev.monotonicMilliseconds();
     serveAndJoin(&server);
     try testing.expect(zev.monotonicMilliseconds() - start < 300);
+}
+
+test "transport: a late deadline after accepting a peer closes that socket" {
+    const listener = try socket.listenLoopback(0);
+    try listener.socket.setNonBlocking(true);
+    const Acceptor = struct {
+        listener: socket.Listener,
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        sock: ?socket.Socket = null,
+        fn run(self: *@This()) void {
+            while (!self.stop.load(.seq_cst)) {
+                const result = self.listener.accept() catch return;
+                switch (result) {
+                    .accepted => |h| {
+                        self.sock = .{ .handle = h };
+                        return;
+                    },
+                    .retry => _ = self.listener.socket.poll(.read, fixture_poll_ms) catch return,
+                }
+            }
+        }
+    };
+    var acceptor = Acceptor{ .listener = listener };
+    const thread = try std.Thread.spawn(.{}, Acceptor.run, .{&acceptor});
+    defer {
+        acceptor.stop.store(true, .seq_cst);
+        thread.join();
+        if (acceptor.sock) |s| s.close();
+        listener.close();
+    }
+
+    const peer = try connectLoopback(listener.port);
+    try testing.expectError(error.HandshakeTimeout, adoptPeerBeforeDeadline(peer, 0));
 }
