@@ -256,7 +256,6 @@ pub const SchedulerTlaContext = struct {
     }
 };
 
-
 fn projectedAfter(before: ProjectedState, act: SchedulerAct) ProjectedState {
     var after = before;
     switch (act) {
@@ -729,4 +728,3 @@ test "state_tcas tla: wrong saved_state in a sync-wait trace is rejected" {
         state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace, null),
     );
 }
-

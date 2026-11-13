@@ -11,24 +11,6 @@ const test_client = @import("test_client");
 const Stream = test_client.Stream;
 const connectLoopback = test_client.connectLoopback;
 
-fn readHttpHeaders(stream: Stream) !void {
-    var suffix: [4]u8 = undefined;
-    var len: usize = 0;
-    while (true) {
-        const byte = try stream.readByte();
-        if (len < suffix.len) {
-            suffix[len] = byte;
-            len += 1;
-        } else {
-            suffix[0] = suffix[1];
-            suffix[1] = suffix[2];
-            suffix[2] = suffix[3];
-            suffix[3] = byte;
-        }
-        if (len == suffix.len and std.mem.eql(u8, &suffix, "\r\n\r\n")) return;
-    }
-}
-
 fn readHttpStatus(alloc: std.mem.Allocator, stream: Stream) ![]u8 {
     var bytes: std.ArrayList(u8) = .empty;
     errdefer bytes.deinit(alloc);
@@ -50,6 +32,10 @@ fn readHttpStatus(alloc: std.mem.Allocator, stream: Stream) ![]u8 {
     }
 }
 
+fn isSwitchingProtocols(response: []const u8) bool {
+    return std.mem.startsWith(u8, response, "HTTP/1.1 101");
+}
+
 fn handshake(stream: Stream, target: []const u8) !void {
     var request: [512]u8 = undefined;
     const bytes = try std.fmt.bufPrint(
@@ -58,7 +44,31 @@ fn handshake(stream: Stream, target: []const u8) !void {
         .{target},
     );
     try stream.writeAll(bytes);
-    try readHttpHeaders(stream);
+    const response = try readHttpStatus(testing.allocator, stream);
+    defer testing.allocator.free(response);
+    if (!isSwitchingProtocols(response)) return error.HandshakeRejected;
+}
+
+fn retryableHandshakeError(err: anyerror) bool {
+    return switch (err) {
+        error.HandshakeRejected, error.EndOfStream => true,
+        else => false,
+    };
+}
+
+/// Retry a reconnect until the handshake is 101 or `timeout_ms` elapses.
+///
+/// `session_closed` is fired before the last worker releases the session slot, so the first attempt after waitClosed can still receive HTTP 503.
+fn handshakeUntilAccepted(port: u16, target: []const u8, timeout_ms: u64) !Stream {
+    const deadline = zev.monotonicMilliseconds() + timeout_ms;
+    while (true) {
+        if (zev.monotonicMilliseconds() >= deadline) return error.HandshakeTimeout;
+        const peer = try connectLoopback(port);
+        if (handshake(peer, target)) |_| return peer else |err| {
+            peer.close();
+            if (!retryableHandshakeError(err)) return err;
+        }
+    }
 }
 
 /// Send one small masked client text frame. This intentionally exercises the public WebSocket callback path rather than calling a handler directly.
@@ -127,6 +137,28 @@ const Opened = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (self.closed < want) self.changed.wait(&self.mutex);
+    }
+};
+
+/// Holds the session_closed callback so tests can observe reconnects before the worker releases the slot.
+const SessionClosedHold = struct {
+    opened: Opened = .{},
+    hold_closed: bool = true,
+
+    fn handler(ctx: ?*anyopaque, event: transport.Event) void {
+        const self: *SessionClosedHold = @ptrCast(@alignCast(ctx.?));
+        Opened.handler(&self.opened, event);
+        if (event.kind != .session_closed) return;
+        self.opened.mutex.lock();
+        defer self.opened.mutex.unlock();
+        while (self.hold_closed) self.opened.changed.wait(&self.opened.mutex);
+    }
+
+    fn release(self: *SessionClosedHold) void {
+        self.opened.mutex.lock();
+        self.hold_closed = false;
+        self.opened.changed.broadcast();
+        self.opened.mutex.unlock();
     }
 };
 
@@ -550,10 +582,42 @@ test "transport: the session cap rejects the next handshake and recovers after d
 
     peers[0].close();
     opened.waitClosed(1);
-    const recovered = try connectLoopback(t.boundPort());
+    // waitClosed only observes session_closed, which is not a session-slot release barrier.
+    const recovered = try handshakeUntilAccepted(t.boundPort(), "session-cap", 5_000);
     defer recovered.close();
-    try handshake(recovered, "session-cap");
     _ = opened.wait(peers.len + 1);
+}
+
+test "transport: session_closed is not a session-slot release barrier" {
+    const alloc = testing.allocator;
+    var hold = SessionClosedHold{};
+    defer hold.opened.changed.deinit();
+    defer hold.opened.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
+    defer t.deinit();
+    defer hold.release();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "session-cap-hold" });
+    try t.start(&hold, SessionClosedHold.handler);
+
+    var peers: [32]Stream = undefined;
+    defer for (peers) |peer| peer.close();
+    for (&peers) |*peer| {
+        peer.* = try connectLoopback(t.boundPort());
+        try handshake(peer.*, "session-cap-hold");
+    }
+    _ = hold.opened.wait(peers.len);
+
+    peers[0].close();
+    hold.opened.waitClosed(1);
+
+    const early = try connectLoopback(t.boundPort());
+    defer early.close();
+    try testing.expectError(error.HandshakeRejected, handshake(early, "session-cap-hold"));
+
+    hold.release();
+    const recovered = try handshakeUntilAccepted(t.boundPort(), "session-cap-hold", 5_000);
+    defer recovered.close();
+    _ = hold.opened.wait(peers.len + 1);
 }
 
 test "transport: repeated concurrent sends and disconnects reclaim every worker allocation" {
