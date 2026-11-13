@@ -334,7 +334,7 @@ test "state_tcas tla: lock Scheduler model declarations" {
     );
 }
 
-test "state_tcas tla: checkExtends confirms scheduler_spec extends scheduler_model" {
+test "state_tcas tla: checkExtends and validateSpecSyntax confirm scheduler_spec integrity" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
@@ -347,6 +347,7 @@ test "state_tcas tla: checkExtends confirms scheduler_spec extends scheduler_mod
     defer allocator.free(spec_bytes);
 
     try std.testing.expect(state_tcas.tla.checkExtends(spec_bytes, "scheduler_model"));
+    try state_tcas.tla.validateSpecSyntax(allocator, spec_bytes);
 }
 
 test "state_tcas tla: replay ITF trace for task then checkpoint drain" {
@@ -601,37 +602,56 @@ test "state_tcas tla: dynamic action coverage across replay traces" {
 
     var ctx: SchedulerTlaContext = .{ .allocator = allocator };
 
-    var pic1: state_tcas.Picture = .{};
-    defer pic1.deinit(allocator);
-    _ = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace1_bytes, &pic1);
+    var pic: state_tcas.Picture = .{};
+    defer pic.deinit(allocator);
 
-    var pic2: state_tcas.Picture = .{};
-    defer pic2.deinit(allocator);
-    _ = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace2_bytes, &pic2);
+    const stats1 = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace1_bytes, &pic);
+    const stats2 = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace2_bytes, &pic);
 
-    // Collect all executed actions dynamically from the replay observations.
-    var executed: std.ArrayList(SchedulerAct) = .empty;
-    defer executed.deinit(allocator);
+    // Verify dynamic coverage of all 9 actions directly via Picture and ReplayStats (state_tcas 0.3.1).
+    try pic.verifyCoverage(SchedulerAct);
+    try stats2.verifyCoverage(SchedulerAct, &pic);
 
-    for (pic1.steps.items) |step| {
-        if (std.meta.stringToEnum(SchedulerAct, step.label)) |act| {
-            try executed.append(allocator, act);
-        }
-    }
-    for (pic2.steps.items) |step| {
-        if (std.meta.stringToEnum(SchedulerAct, step.label)) |act| {
-            try executed.append(allocator, act);
-        }
-    }
-
-    // Verify dynamic coverage of all 9 actions across the replay suite.
-    try state_tcas.tla.verifyCoverage(SchedulerAct, executed.items);
-
-    // Verify omission detection on partial set.
+    // Verify omission detection on partial Picture.
+    var partial_pic: state_tcas.Picture = .{};
+    defer partial_pic.deinit(allocator);
+    _ = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace1_bytes, &partial_pic);
     try std.testing.expectError(
         error.ActUncovered,
-        state_tcas.tla.verifyCoverage(SchedulerAct, executed.items[0..4]),
+        partial_pic.verifyCoverage(SchedulerAct),
     );
+    _ = stats1;
+}
+
+test "state_tcas tla: render ADR-015 ITF JSON trace from replay exploration" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const trace_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "docs/tla/scheduler_task_checkpoint_trace.json",
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(trace_bytes);
+
+    var ctx: SchedulerTlaContext = .{ .allocator = allocator };
+    var pic: state_tcas.Picture = .{};
+    defer pic.deinit(allocator);
+
+    _ = try state_tcas.tla.replayJsonTrace(
+        SchedulerAct,
+        &ctx,
+        allocator,
+        trace_bytes,
+        &pic,
+    );
+
+    const itf_json = try pic.renderItfJson(allocator, .{});
+    defer allocator.free(itf_json);
+
+    try std.testing.expect(std.mem.indexOf(u8, itf_json, "\"#meta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, itf_json, "\"mbt::actionTaken\"") != null);
 }
 
 test "state_tcas tla: state-only ITF infers enqueue_macro without cloning the context" {
