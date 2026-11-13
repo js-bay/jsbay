@@ -374,17 +374,36 @@ pub const Transport = struct {
         self.target_set = true;
     }
 
+    /// Test-only start failure injection. Must stay `.none` outside tests.
+    pub const StartTestInject = enum { none, nonblocking, spawn };
+    pub var testing_start_inject: StartTestInject = .none;
+
+    fn abortUnstartedListener(self: *Transport) void {
+        if (self.accept_thread != null) return;
+        if (self.server) |s| {
+            s.close();
+            self.server = null;
+        }
+        self.bound_port = 0;
+    }
+
     pub fn start(self: *Transport, ctx: ?*anyopaque, handler: EventHandler) !void {
         if (self.server != null) return error.AlreadyStarted;
         self.ctx = ctx;
         self.handler = handler;
 
         self.server = try RawListener.listenIp4Loopback(self.want_port);
+        errdefer self.abortUnstartedListener();
         self.bound_port = self.server.?.port;
         // Configure the listener before start() returns. If this stays in acceptLoop and fails, start() would already have succeeded and clients could connect, then block forever on reads.
+        if (testing_start_inject == .nonblocking) return error.NonBlockingFailed;
         try self.server.?.listener.socket.setNonBlocking(true);
 
         self.accept_exited = false;
+        if (testing_start_inject == .spawn) {
+            self.accept_exited = true;
+            return error.SystemResources;
+        }
         self.accept_thread = std.Thread.spawn(.{}, acceptLoop, .{self}) catch |err| {
             self.accept_exited = true;
             return err;

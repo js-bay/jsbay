@@ -112,3 +112,34 @@ test "Windows socket handles preserve the high bit" {
         try testing.expectEqual(expected, @import("portable_socket").handleRoundTripForTest(expected));
     }
 }
+
+fn ignoreStartEvents(_: ?*anyopaque, _: transport.Event) void {}
+
+fn expectStartRolledBack(instance: *transport.Transport, inject: transport.Transport.StartTestInject, expected: anyerror) !void {
+    transport.Transport.testing_start_inject = inject;
+    defer transport.Transport.testing_start_inject = .none;
+    try testing.expectError(expected, instance.start(null, ignoreStartEvents));
+    try testing.expect(instance.server == null);
+    try testing.expectEqual(@as(u16, 0), instance.boundPort());
+    try testing.expect(instance.accept_thread == null);
+}
+
+test "transport: a failed nonblocking setup rolls back the listener and allows retry" {
+    const instance = try transport.Transport.init(testing.allocator, 0);
+    defer instance.deinit();
+    try expectStartRolledBack(instance, .nonblocking, error.NonBlockingFailed);
+    try instance.start(null, ignoreStartEvents);
+    try testing.expect(instance.server != null);
+    try testing.expect(instance.boundPort() != 0);
+    try testing.expect(instance.accept_thread != null);
+}
+
+test "transport: a failed accept-thread spawn rolls back the listener and allows retry" {
+    const instance = try transport.Transport.init(testing.allocator, 0);
+    defer instance.deinit();
+    try expectStartRolledBack(instance, .spawn, error.SystemResources);
+    try instance.start(null, ignoreStartEvents);
+    try testing.expect(instance.server != null);
+    try testing.expect(instance.boundPort() != 0);
+    try testing.expect(instance.accept_thread != null);
+}

@@ -3,31 +3,46 @@
     "format": "ITF",
     "description": "Counterexample trace verifying queued task rejection during synchronous wait"
   },
-  "vars": ["state", "macro_q", "micro_q", "sync_depth"],
+  "vars": [
+    "state",
+    "saved_state",
+    "macro_q",
+    "micro_q",
+    "sync_depth"
+  ],
   "states": [
     {
-      "#meta": { "index": 0 },
+      "#meta": {
+        "index": 0
+      },
       "action": "init",
       "state": "idle",
       "macro_q": 0,
       "micro_q": 0,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 1 },
+      "#meta": {
+        "index": 1
+      },
       "action": "begin_sync_wait",
       "state": "in_sync_wait",
       "macro_q": 0,
       "micro_q": 0,
-      "sync_depth": 1
+      "sync_depth": 1,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 2 },
+      "#meta": {
+        "index": 2
+      },
       "action": "begin_queued_task",
       "state": "in_task",
       "macro_q": 0,
       "micro_q": 0,
-      "sync_depth": 1
+      "sync_depth": 1,
+      "saved_state": "idle"
     }
   ]
 }

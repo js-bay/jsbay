@@ -40,6 +40,7 @@ pub const SchedulerConfig = struct {
 
 pub const ProjectedState = struct {
     state: SchedulerState,
+    saved_state: SchedulerState,
     macro_q: usize,
     micro_q: usize,
     sync_depth: usize,
@@ -54,6 +55,7 @@ pub const SchedulerTlaContext = struct {
     sync_wait_depth: usize = 0,
     task_guard: ?Scheduler.Task = null,
     checkpoint_guard: ?Scheduler.Checkpoint = null,
+    saved_state: SchedulerState = .idle,
     acts_buf: [8]SchedulerAct = undefined,
     allocator: std.mem.Allocator,
 
@@ -64,6 +66,7 @@ pub const SchedulerTlaContext = struct {
         self.micro_q = 0;
         self.after_task = false;
         self.sync_wait_depth = 0;
+        self.saved_state = .idle;
         self.task_guard = null;
         self.checkpoint_guard = null;
     }
@@ -78,6 +81,7 @@ pub const SchedulerTlaContext = struct {
             self.sync_wait_stack[self.sync_wait_depth].end();
         }
         self.after_task = false;
+        self.saved_state = .idle;
     }
 
     pub fn project(self: *const @This()) ProjectedState {
@@ -95,10 +99,25 @@ pub const SchedulerTlaContext = struct {
 
         return .{
             .state = st,
+            .saved_state = self.saved_state,
             .macro_q = self.macro_q,
             .micro_q = self.micro_q,
             .sync_depth = self.sync_wait_depth,
         };
+    }
+
+    /// Infer a missing ITF action from adjacent projected states without cloning this context.
+    ///
+    /// Guard objects hold pointers back to `sched`, so a shallow copy is not a safe trial context.
+    pub fn inferAction(self: *@This(), item: std.json.Value) !?SchedulerAct {
+        const before = self.project();
+        var found: ?SchedulerAct = null;
+        for (self.enabled()) |act| {
+            if (!projectedMatchesJson(projectedAfter(before, act), item)) continue;
+            if (found != null) return null;
+            found = act;
+        }
+        return found;
     }
 
     pub fn enabled(self: *@This()) []const SchedulerAct {
@@ -209,6 +228,7 @@ pub const SchedulerTlaContext = struct {
             },
             .begin_sync_wait => {
                 if (self.sync_wait_depth >= SchedulerConfig.max_sync_depth) return error.SyncWaitOverflow;
+                if (self.sync_wait_depth == 0) self.saved_state = self.project().state;
                 self.sync_wait_stack[self.sync_wait_depth] = self.sched.beginSyncWait();
                 self.sync_wait_depth += 1;
             },
@@ -216,6 +236,7 @@ pub const SchedulerTlaContext = struct {
                 if (self.sync_wait_depth == 0) return error.SyncWaitUnderflow;
                 self.sync_wait_depth -= 1;
                 self.sync_wait_stack[self.sync_wait_depth].end();
+                if (self.sync_wait_depth == 0) self.saved_state = .idle;
             },
         }
 
@@ -234,6 +255,70 @@ pub const SchedulerTlaContext = struct {
         }
     }
 };
+
+
+fn projectedAfter(before: ProjectedState, act: SchedulerAct) ProjectedState {
+    var after = before;
+    switch (act) {
+        .enqueue_macro => after.macro_q += 1,
+        .enqueue_micro => after.micro_q += 1,
+        .begin_queued_task => {
+            after.macro_q -= 1;
+            after.state = .in_task;
+        },
+        .end_queued_task => after.state = if (after.micro_q > 0) .after_task else .idle,
+        .begin_checkpoint => after.state = .in_checkpoint,
+        .drain_micro => after.micro_q -= 1,
+        .end_checkpoint => after.state = .idle,
+        .begin_sync_wait => {
+            if (after.sync_depth == 0) after.saved_state = after.state;
+            after.sync_depth += 1;
+            after.state = .in_sync_wait;
+        },
+        .end_sync_wait => {
+            after.sync_depth -= 1;
+            after.state = if (after.sync_depth == 0) after.saved_state else .in_sync_wait;
+            if (after.sync_depth == 0) after.saved_state = .idle;
+        },
+    }
+    return after;
+}
+
+fn jsonUsize(value: std.json.Value) ?usize {
+    switch (value) {
+        .integer => |n| {
+            if (n < 0) return null;
+            return std.math.cast(usize, n);
+        },
+        .object => |obj| {
+            const raw = obj.get("#bigint") orelse return null;
+            if (raw != .string) return null;
+            return std.fmt.parseInt(usize, raw.string, 10) catch null;
+        },
+        else => return null,
+    }
+}
+
+fn projectedMatchesJson(proj: ProjectedState, item: std.json.Value) bool {
+    if (item != .object) return false;
+    const obj = item.object;
+    if (obj.get("state")) |v| {
+        if (v != .string or !std.mem.eql(u8, v.string, @tagName(proj.state))) return false;
+    }
+    if (obj.get("saved_state")) |v| {
+        if (v != .string or !std.mem.eql(u8, v.string, @tagName(proj.saved_state))) return false;
+    }
+    if (obj.get("macro_q")) |v| {
+        if (jsonUsize(v) != proj.macro_q) return false;
+    }
+    if (obj.get("micro_q")) |v| {
+        if (jsonUsize(v) != proj.micro_q) return false;
+    }
+    if (obj.get("sync_depth")) |v| {
+        if (jsonUsize(v) != proj.sync_depth) return false;
+    }
+    return true;
+}
 
 test "state_tcas tla: lock Scheduler model declarations" {
     const io = std.testing.io;
@@ -367,9 +452,9 @@ test "state_tcas tla: TraceDiverged triggered when queue counters diverge in ITF
     const allocator = std.testing.allocator;
     const divergent_trace =
         \\{
-        \\  "vars": ["state", "macro_q", "micro_q", "sync_depth"],
+        \\  "vars": ["state", "saved_state", "macro_q", "micro_q", "sync_depth"],
         \\  "states": [
-        \\    { "#meta": { "index": 0 }, "action": "init", "state": "idle", "macro_q": 99, "micro_q": 0, "sync_depth": 0 }
+        \\    { "#meta": { "index": 0 }, "action": "init", "state": "idle", "saved_state": "idle", "macro_q": 99, "micro_q": 0, "sync_depth": 0 }
         \\  ]
         \\}
     ;
@@ -549,3 +634,99 @@ test "state_tcas tla: dynamic action coverage across replay traces" {
         state_tcas.tla.verifyCoverage(SchedulerAct, executed.items[0..4]),
     );
 }
+
+test "state_tcas tla: state-only ITF infers enqueue_macro without cloning the context" {
+    const allocator = std.testing.allocator;
+    var ctx: SchedulerTlaContext = .{ .allocator = allocator };
+    defer ctx.release();
+    const trace =
+        \\{"vars":["state","saved_state","macro_q","micro_q","sync_depth"],"states":[
+        \\{"state":"idle","saved_state":"idle","macro_q":0,"micro_q":0,"sync_depth":0},
+        \\{"state":"idle","saved_state":"idle","macro_q":1,"micro_q":0,"sync_depth":0}]}
+    ;
+    const stats = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace, null);
+    try std.testing.expectEqual(@as(usize, 1), stats.actions_replayed);
+    try std.testing.expectEqual(@as(usize, 2), stats.states_verified);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().state);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().saved_state);
+    try std.testing.expectEqual(@as(usize, 1), ctx.project().macro_q);
+}
+
+test "state_tcas tla: Init rejects saved_state that is not idle" {
+    const allocator = std.testing.allocator;
+    var ctx: SchedulerTlaContext = .{ .allocator = allocator };
+    const trace =
+        \\{"vars":["state","saved_state","macro_q","micro_q","sync_depth"],"states":[
+        \\{"action":"init","state":"idle","saved_state":"in_task","macro_q":0,"micro_q":0,"sync_depth":0}]}
+    ;
+    try std.testing.expectError(
+        error.TraceDiverged,
+        state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace, null),
+    );
+}
+
+fn expectResumeFrom(origin: SchedulerState) !void {
+    var ctx: SchedulerTlaContext = .{ .allocator = std.testing.allocator };
+    defer ctx.release();
+    switch (origin) {
+        .idle => {},
+        .in_task => {
+            try ctx.step(.enqueue_macro, null);
+            try ctx.step(.begin_queued_task, null);
+        },
+        .after_task => {
+            try ctx.step(.enqueue_macro, null);
+            try ctx.step(.begin_queued_task, null);
+            try ctx.step(.enqueue_micro, null);
+            try ctx.step(.end_queued_task, null);
+        },
+        .in_checkpoint => {
+            try ctx.step(.enqueue_micro, null);
+            try ctx.step(.begin_checkpoint, null);
+        },
+        .in_sync_wait => unreachable,
+    }
+    try std.testing.expectEqual(origin, ctx.project().state);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().saved_state);
+
+    try ctx.step(.begin_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.project().state);
+    try std.testing.expectEqual(origin, ctx.project().saved_state);
+    try std.testing.expectEqual(@as(usize, 1), ctx.project().sync_depth);
+
+    try ctx.step(.begin_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.project().state);
+    try std.testing.expectEqual(origin, ctx.project().saved_state);
+    try std.testing.expectEqual(@as(usize, 2), ctx.project().sync_depth);
+
+    try ctx.step(.end_sync_wait, null);
+    try std.testing.expectEqual(SchedulerState.in_sync_wait, ctx.project().state);
+    try std.testing.expectEqual(origin, ctx.project().saved_state);
+
+    try ctx.step(.end_sync_wait, null);
+    try std.testing.expectEqual(origin, ctx.project().state);
+    try std.testing.expectEqual(SchedulerState.idle, ctx.project().saved_state);
+    try std.testing.expectEqual(@as(usize, 0), ctx.project().sync_depth);
+}
+
+test "state_tcas tla: saved_state restores task, checkpoint, and after_task across nested sync wait" {
+    try expectResumeFrom(.idle);
+    try expectResumeFrom(.in_task);
+    try expectResumeFrom(.after_task);
+    try expectResumeFrom(.in_checkpoint);
+}
+
+test "state_tcas tla: wrong saved_state in a sync-wait trace is rejected" {
+    const allocator = std.testing.allocator;
+    var ctx: SchedulerTlaContext = .{ .allocator = allocator };
+    const trace =
+        \\{"vars":["state","saved_state","macro_q","micro_q","sync_depth"],"states":[
+        \\{"action":"init","state":"idle","saved_state":"idle","macro_q":0,"micro_q":0,"sync_depth":0},
+        \\{"action":"begin_sync_wait","state":"in_sync_wait","saved_state":"in_task","macro_q":0,"micro_q":0,"sync_depth":1}]}
+    ;
+    try std.testing.expectError(
+        error.TraceDiverged,
+        state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace, null),
+    );
+}
+

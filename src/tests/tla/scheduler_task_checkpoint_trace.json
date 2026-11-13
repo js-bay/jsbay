@@ -3,71 +3,101 @@
     "format": "ITF",
     "description": "JS event loop scheduler task then microtask checkpoint drain trace"
   },
-  "vars": ["state", "macro_q", "micro_q", "sync_depth"],
+  "vars": [
+    "state",
+    "saved_state",
+    "macro_q",
+    "micro_q",
+    "sync_depth"
+  ],
   "states": [
     {
-      "#meta": { "index": 0 },
+      "#meta": {
+        "index": 0
+      },
       "action": "init",
       "state": "idle",
       "macro_q": 0,
       "micro_q": 0,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 1 },
+      "#meta": {
+        "index": 1
+      },
       "action": "enqueue_macro",
       "state": "idle",
       "macro_q": 1,
       "micro_q": 0,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 2 },
+      "#meta": {
+        "index": 2
+      },
       "action": "begin_queued_task",
       "state": "in_task",
       "macro_q": 0,
       "micro_q": 0,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 3 },
+      "#meta": {
+        "index": 3
+      },
       "action": "enqueue_micro",
       "state": "in_task",
       "macro_q": 0,
       "micro_q": 1,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 4 },
+      "#meta": {
+        "index": 4
+      },
       "action": "end_queued_task",
       "state": "after_task",
       "macro_q": 0,
       "micro_q": 1,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 5 },
+      "#meta": {
+        "index": 5
+      },
       "action": "begin_checkpoint",
       "state": "in_checkpoint",
       "macro_q": 0,
       "micro_q": 1,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 6 },
+      "#meta": {
+        "index": 6
+      },
       "action": "drain_micro",
       "state": "in_checkpoint",
       "macro_q": 0,
       "micro_q": 0,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     },
     {
-      "#meta": { "index": 7 },
+      "#meta": {
+        "index": 7
+      },
       "action": "end_checkpoint",
       "state": "idle",
       "macro_q": 0,
       "micro_q": 0,
-      "sync_depth": 0
+      "sync_depth": 0,
+      "saved_state": "idle"
     }
   ]
 }
