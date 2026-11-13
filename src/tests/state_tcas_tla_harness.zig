@@ -1,5 +1,7 @@
 //! TLA+ specification locking and Apalache ITF trace replay harness for JS event loop Scheduler.
+//!
 //! Verifies model declarations anti-drift, positive execution trace replay, negative counterexample rejection during sync wait, and dynamic action coverage.
+//!
 //! Run: `zig build test-state-tcas`
 //! Update golden: touch .state_tcas-update-tla && zig build test-state-tcas && rm -f .state_tcas-update-tla
 

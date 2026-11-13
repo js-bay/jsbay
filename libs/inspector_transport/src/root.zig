@@ -381,8 +381,7 @@ pub const Transport = struct {
 
         self.server = try RawListener.listenIp4Loopback(self.want_port);
         self.bound_port = self.server.?.port;
-        // Configure the listener before start() returns. If this stays in acceptLoop and fails,
-        // start() would already have succeeded and clients could connect, then block forever on reads.
+        // Configure the listener before start() returns. If this stays in acceptLoop and fails, start() would already have succeeded and clients could connect, then block forever on reads.
         try self.server.?.listener.socket.setNonBlocking(true);
 
         self.accept_exited = false;
