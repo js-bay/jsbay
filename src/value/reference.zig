@@ -333,7 +333,7 @@ fn rootBackendIdentityCreate(ctx: ActiveEngine.Context, v: Local) ?*anyopaque {
     };
 }
 
-fn rootBackendIdentityFree(ctx: ?ActiveEngine.Context, identity: ?*anyopaque) void {
+fn rootBackendIdentityFree(ctx: ActiveEngine.Context, identity: ?*anyopaque) void {
     const id = identity orelse return;
     if (comptime backend.active_backend == .hermes) {
         const c = @import("../backend/hermes/c_api.zig");
@@ -634,3 +634,8 @@ pub const Rooted = struct {
         self.cell = null;
     }
 };
+
+test "rootBackendIdentityFree takes the same Context as RootCell, not a nested optional" {
+    const param_types = @typeInfo(@TypeOf(rootBackendIdentityFree)).@"fn".param_types;
+    try std.testing.expectEqual(ActiveEngine.Context, param_types[0].?);
+}
