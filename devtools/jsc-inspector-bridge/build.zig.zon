@@ -1,0 +1,11 @@
+.{
+    .name = .jsbay_inspector_bridge,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0x4b02dda29f3c3979,
+    .dependencies = .{
+        .inspector_transport = .{ .path = "../../libs/inspector_transport" },
+        .zev = .{ .path = "../../libs/zev" },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md" },
+}

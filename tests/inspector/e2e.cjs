@@ -12,7 +12,7 @@ const process = require('process');
 // Arg parsing
 // -----------------------------
 function parseArgs(argv) {
-  const opts = { host: 'localhost', port: 9229, timeoutMs: 5000, debuggerFlow: false, typedConsole: false, lineBreakpoints: false, nativeDebugger: false };
+  const opts = { host: 'localhost', port: 9229, timeoutMs: 5000, debuggerFlow: false, typedConsole: false, lineBreakpoints: false, nativeDebugger: false, skipSteps: new Set() };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--host') opts.host = argv[++i];
@@ -22,9 +22,10 @@ function parseArgs(argv) {
     else if (a === '--typed-console') opts.typedConsole = true;
     else if (a === '--line-breakpoints') opts.lineBreakpoints = true;
     else if (a === '--native-debugger') opts.nativeDebugger = true;
+    else if (a === '--skip-step') opts.skipSteps.add(argv[++i]);
     else if (a === '--help' || a === '-h') {
       process.stdout.write(
-        'Usage: node tests/inspector/e2e.cjs [--host localhost] [--port 9229] [--timeout-ms 5000] [--debugger-flow] [--typed-console] [--line-breakpoints] [--native-debugger]\n'
+        'Usage: node tests/inspector/e2e.cjs [--host localhost] [--port 9229] [--timeout-ms 5000] [--debugger-flow] [--typed-console] [--line-breakpoints] [--native-debugger] [--skip-step <id>]\n'
       );
       process.exit(0);
     } else {
@@ -722,6 +723,10 @@ async function main() {
 
   // Helper to run steps consistently
   async function runStep(label, fn, failCode) {
+    if (failCode && opts.skipSteps.has(failCode)) {
+      process.stdout.write(`[skip] ${label}\n`);
+      return;
+    }
     try {
       await fn();
     } catch (err) {
