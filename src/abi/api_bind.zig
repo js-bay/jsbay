@@ -14,6 +14,7 @@ pub const Finalize = *const fn (?*anyopaque) callconv(.c) void;
 
 pub const Binding = struct {
     instance_id: i32,
+    allocator: std.mem.Allocator,
     callback: Callback,
     user_data: ?*anyopaque,
     finalize: ?Finalize,
@@ -40,36 +41,36 @@ fn statusException(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) ba
     return m.c_api.JS_EXCEPTION;
 }
 
-pub fn install(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
+pub fn install(alloc: std.mem.Allocator, id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     if (comptime backend.isJscApiBackend(backend.active_backend)) {
-        return jscInstall(id, ctx, name, callback, user_data, finalize);
+        return jscInstall(alloc, id, ctx, name, callback, user_data, finalize);
     }
     if (comptime backend.isSpikeBackend(backend.active_backend)) {
-        return spikeInstall(id, ctx, name, callback, user_data, finalize);
+        return spikeInstall(alloc, id, ctx, name, callback, user_data, finalize);
     }
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) {
-        _ = .{ id, ctx, name, callback, user_data, finalize };
+        _ = .{ alloc, id, ctx, name, callback, user_data, finalize };
         return .out_of_memory;
     }
     const m = backend.ActiveEngineModule;
-    const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
-    const binding = std.heap.c_allocator.create(Binding) catch {
-        std.heap.c_allocator.free(name_z);
+    const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
+    const binding = alloc.create(Binding) catch {
+        alloc.free(name_z);
         return .out_of_memory;
     };
-    binding.* = .{ .instance_id = id, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
+    binding.* = .{ .instance_id = id, .allocator = alloc, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
     mutex.lock();
     const slot = bindings.items.len;
     if (slot > std.math.maxInt(i32)) {
         mutex.unlock();
-        std.heap.c_allocator.free(name_z);
-        std.heap.c_allocator.destroy(binding);
+        alloc.free(name_z);
+        alloc.destroy(binding);
         return .out_of_memory;
     }
     bindings.append(std.heap.c_allocator, binding) catch {
         mutex.unlock();
-        std.heap.c_allocator.free(name_z);
-        std.heap.c_allocator.destroy(binding);
+        alloc.free(name_z);
+        alloc.destroy(binding);
         return .out_of_memory;
     };
     mutex.unlock();
@@ -126,8 +127,8 @@ fn releaseJscRoot(binding: *Binding) void {
 fn destroyBinding(binding: *Binding, run_finalize: bool) void {
     releaseJscRoot(binding);
     if (run_finalize and binding.committed) if (binding.finalize) |finalize| finalize(binding.user_data);
-    std.heap.c_allocator.free(binding.name);
-    std.heap.c_allocator.destroy(binding);
+    binding.allocator.free(binding.name);
+    binding.allocator.destroy(binding);
 }
 
 fn addBinding(binding: *Binding) ?usize {
@@ -164,16 +165,16 @@ fn spikeThrowValue(ctx: backend.ActiveEngine.Context, exception: backend.ActiveE
     return null;
 }
 
-fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
-    const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
-    const binding = std.heap.c_allocator.create(Binding) catch {
-        std.heap.c_allocator.free(name_z);
+fn spikeInstall(alloc: std.mem.Allocator, id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
+    const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
+    const binding = alloc.create(Binding) catch {
+        alloc.free(name_z);
         return .out_of_memory;
     };
-    binding.* = .{ .instance_id = id, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
+    binding.* = .{ .instance_id = id, .allocator = alloc, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z };
     const slot = addBinding(binding) orelse {
-        std.heap.c_allocator.free(name_z);
-        std.heap.c_allocator.destroy(binding);
+        alloc.free(name_z);
+        alloc.destroy(binding);
         return .out_of_memory;
     };
     // Pack slot+1 so slot 0 is not a null user_data.
@@ -199,17 +200,19 @@ fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, ca
     }
     const api_backend = @import("api_backend.zig");
     const set_res = api_backend.set(ctx, global, name_z, function);
-    if (set_res.exception) |exception| {
-        backend.ActiveEngine.freeValue(ctx, returned);
-        kill(slot);
-        return .{ .exception = exception };
+    switch (set_res) {
+        .ok => |ok_val| backend.ActiveEngine.freeValue(ctx, ok_val),
+        .exception => |exception| {
+            backend.ActiveEngine.freeValue(ctx, returned);
+            kill(slot);
+            return .{ .exception = exception };
+        },
+        .out_of_memory => {
+            backend.ActiveEngine.freeValue(ctx, returned);
+            kill(slot);
+            return .out_of_memory;
+        },
     }
-    if (set_res.out_of_memory) {
-        backend.ActiveEngine.freeValue(ctx, returned);
-        kill(slot);
-        return .out_of_memory;
-    }
-    if (set_res.value) |ok_val| backend.ActiveEngine.freeValue(ctx, ok_val);
     const published = backend.ActiveEngine.getPropertyVal(ctx, global, name_z.ptr) orelse {
         backend.ActiveEngine.freeValue(ctx, returned);
         kill(slot);
@@ -220,9 +223,11 @@ fn spikeInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, ca
         backend.ActiveEngine.freeValue(ctx, returned);
         kill(slot);
         const err = api_backend.newError(ctx, "native binding was not published");
-        if (err.exception) |exception| return .{ .exception = exception };
-        if (err.value) |ev| return .{ .exception = ev };
-        return .out_of_memory;
+        return switch (err) {
+            .ok => |ev| .{ .exception = ev },
+            .exception => |exception| .{ .exception = exception },
+            .out_of_memory => .out_of_memory,
+        };
     }
     return .{ .installed = .{ .function = returned, .binding = binding } };
 }
@@ -271,30 +276,30 @@ fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEn
     return spikeThrow(ctx, "native callback returned invalid status");
 }
 
-fn jscInstall(id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
+fn jscInstall(alloc: std.mem.Allocator, id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
     const m = @import("../backend/jsc.zig");
     const ctx_ref: m.jsc.JSContextRef = @ptrCast(ctx);
-    const name_z = std.heap.c_allocator.dupeSentinel(u8, name, 0) catch return .out_of_memory;
+    const name_z = alloc.dupeSentinel(u8, name, 0) catch return .out_of_memory;
     const js_name = @import("../backend/jsc/common.zig").jsStringFromSlice(name) orelse {
-        std.heap.c_allocator.free(name_z);
+        alloc.free(name_z);
         return .out_of_memory;
     };
     defer m.jsc.JSStringRelease(js_name);
     const function = m.jsc.JSObjectMakeFunctionWithCallback(ctx_ref, js_name, &jscTrampoline) orelse {
-        std.heap.c_allocator.free(name_z);
+        alloc.free(name_z);
         return .out_of_memory;
     };
-    const binding = std.heap.c_allocator.create(Binding) catch {
-        std.heap.c_allocator.free(name_z);
+    const binding = alloc.create(Binding) catch {
+        alloc.free(name_z);
         return .out_of_memory;
     };
     // The binding table must root the function independently of the Value returned to the C caller. A released public handle must not make an escaped global function collectible or let its address be reused.
     m.jsc.JSValueProtect(ctx_ref, function);
-    binding.* = .{ .instance_id = id, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z, .function_key = @intFromPtr(function), .jsc_ctx = ctx, .jsc_root = function };
+    binding.* = .{ .instance_id = id, .allocator = alloc, .callback = callback, .user_data = user_data, .finalize = finalize, .name = name_z, .function_key = @intFromPtr(function), .jsc_ctx = ctx, .jsc_root = function };
     _ = addBinding(binding) orelse {
         releaseJscRoot(binding);
-        std.heap.c_allocator.free(name_z);
-        std.heap.c_allocator.destroy(binding);
+        alloc.free(name_z);
+        alloc.destroy(binding);
         return .out_of_memory;
     };
     const global = m.jsc.JSContextGetGlobalObject(ctx_ref);
@@ -338,8 +343,8 @@ pub fn abort(binding: *Binding) void {
     mutex.lock();
     if (binding.retired) {
         mutex.unlock();
-        std.heap.c_allocator.free(binding.name);
-        std.heap.c_allocator.destroy(binding);
+        binding.allocator.free(binding.name);
+        binding.allocator.destroy(binding);
         return;
     }
     if (!binding.alive) {

@@ -1,5 +1,18 @@
 //! Public types shared across the engine. All C ABI types are `extern struct` / `extern enum`.
 
+const std = @import("std");
+
+/// Strongly typed engine instance identifier to communicate intent and avoid ambiguous primitive integers.
+pub const InstanceId = enum(i32) {
+    _,
+    pub fn fromInt(id: i32) InstanceId {
+        return @fromBackingInt(@intCast(id));
+    }
+    pub fn toInt(self: InstanceId) i32 {
+        return @backingInt(self);
+    }
+};
+
 pub const LogLevel = enum(c_int) {
     debug = 0,
     info = 1,
@@ -62,6 +75,11 @@ pub const ErrorObserver = *const fn (*const ErrorEvent, ?*anyopaque) callconv(.c
 
 /// Configuration for creating an engine instance.
 pub const EngineConfig = struct {
+    /// Instance-level allocator for internal engine structures. Defaults to `std.heap.c_allocator` when null.
+    /// Requirements:
+    /// 1. Thread safety: must be safe for concurrent allocations across host dispatch threads and the engine thread.
+    /// 2. Lifetime: must outlive the engine and all Global/Weak/Rooted reference cells created against this instance.
+    allocator: ?std.mem.Allocator = null,
     /// Native timer and asynchronous callback budgets; zero disables that resource.
     resource_limits: @import("runtime/resource_limits.zig").Limits = .{},
     log_handler: ?LogHandler = null,

@@ -49,17 +49,33 @@ pub fn finishEvalEntry(instance_id: i32, lease: @import("runtime/engine_thread.z
     if (engine_thread.endEvalAndTakeDeferred(lease)) destroyNow(instance_id);
 }
 
+pub const CreateError = error{
+    InstanceAlreadyExists,
+    BackendNotPacked,
+    OutOfMemory,
+    RuntimeInitFailed,
+    ContextInitFailed,
+    ResourceInitFailed,
+    ExecutionCpuInitFailed,
+    InstanceInsertFailed,
+};
+
+/// Convenience wrapper preserving boolean return for existing callers; calls createWithBackend with the active backend.
 pub fn create(instance_id: i32, config: types.EngineConfig) bool {
-    return createWithBackend(instance_id, config, backend.active_backend);
+    createWithBackend(instance_id, config, backend.active_backend) catch return false;
+    return true;
 }
 
 /// Create-time engine select. `tag` must be packed into this artifact. The pack primary uses the monomorphic ActiveEngine path; other packed tags use erased handles + `backend_dispatch`.
-pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: backend.BackendType) bool {
+pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: backend.BackendType) CreateError!void {
     @import("runtime/scheduler_gate.zig").set(.{ .enter = @import("runtime/js_scheduler.zig").backendDrainAllowed, .leave = @import("runtime/js_scheduler.zig").backendDrainFinished });
-    if (instance_map.getPtrs(instance_id) != null) return false;
-    if (!backend.isPacked(tag)) return false;
+    if (instance_map.getPtrs(instance_id) != null) return error.InstanceAlreadyExists;
+    if (!backend.isPacked(tag)) return error.BackendNotPacked;
 
-    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return false;
+    const alloc = config.allocator orelse std.heap.c_allocator;
+    const loop = event_loop.Driver.create(alloc) catch return error.OutOfMemory;
+    errdefer loop.destroy();
+
     const backend_dispatch = @import("backend_dispatch.zig");
 
     if (tag == backend.active_backend) {
@@ -72,17 +88,13 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
                 break :blk @import("backend/hermes/lifecycle.zig").newRuntimeWithMaxHeap(max_heap);
             }
             break :blk ActiveEngine.newRuntime();
-        } orelse {
-            loop.destroy();
-            return false;
-        };
+        } orelse return error.RuntimeInitFailed;
+        errdefer ActiveEngine.freeRuntime(runtime);
+
         ActiveEngine.setMaxStackSize(runtime, config.max_stack_size);
 
-        const ctx = ActiveEngine.newContext(runtime) orelse {
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            return false;
-        };
+        const ctx = ActiveEngine.newContext(runtime) orelse return error.ContextInitFailed;
+        errdefer ActiveEngine.freeContext(ctx);
 
         ActiveEngine.setContextOpaque(ctx, @ptrFromInt(@as(usize, @intCast(@as(u32, @bitCast(instance_id))))));
 
@@ -112,37 +124,27 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
         ActiveEngine.registerConsole(ctx);
         ActiveEngine.registerTimers(ctx);
 
-        const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-            ActiveEngine.freeContext(ctx);
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            return false;
-        };
-        const resources = @import("runtime/resource_limits.zig").Budget.create(config.resource_limits) orelse {
-            ActiveEngine.freeContext(ctx);
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            std.heap.c_allocator.destroy(instance);
-            return false;
-        };
-        const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse {
-            resources.deinit();
-            ActiveEngine.freeContext(ctx);
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            std.heap.c_allocator.destroy(instance);
-            return false;
-        };
+        const instance = alloc.create(instance_map.EngineInstance) catch return error.OutOfMemory;
+        errdefer alloc.destroy(instance);
+
+        const resources = @import("runtime/resource_limits.zig").Budget.create(alloc, config.resource_limits) orelse return error.ResourceInitFailed;
+        errdefer resources.deinit();
+
+        const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create(alloc) orelse return error.ExecutionCpuInitFailed;
+        errdefer execution_cpu.close();
+
         instance.* = .{
+            .allocator = alloc,
             .resources = resources,
             .execution_cpu = execution_cpu,
             .instance_id = instance_id,
             .engine_handles = .{ .mono = .{ .runtime = runtime, .ctx = ctx } },
             .loop = loop,
-            .timers = timers.TimerRegistry.init(),
+            .timers = timers.TimerRegistry.initWithAllocator(alloc),
             .log_handler = config.log_handler,
             .log_user_data = config.log_user_data,
         };
+        errdefer instance.deinitSynchronization();
 
         if (!@import("builtin").is_test) instance.timers.clock_now = loop.now();
 
@@ -155,53 +157,39 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
                 return true;
             }
         }{})) {
-            ActiveEngine.freeContext(ctx);
-            ActiveEngine.freeRuntime(runtime);
-            loop.destroy();
-            execution_cpu.close();
-            resources.deinit();
-            instance.deinitSynchronization();
-            std.heap.c_allocator.destroy(instance);
-            return false;
+            return error.InstanceInsertFailed;
         }
-        return true;
+        return;
     }
 
     // Non-primary packed backend: bare lifecycle for create/eval/destroy plus the typed Value surface.
-    const handles = backend_dispatch.createPacked(tag) orelse {
-        loop.destroy();
-        return false;
-    };
+    const handles = backend_dispatch.createPacked(tag) orelse return error.RuntimeInitFailed;
+    errdefer backend_dispatch.destroyPacked(tag, handles);
+
     backend_dispatch.finishCreate(tag, handles, instance_id, config.max_stack_size);
 
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        return false;
-    };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(config.resource_limits) orelse {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return false;
-    };
-    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse {
-        resources.deinit();
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return false;
-    };
+    const instance = alloc.create(instance_map.EngineInstance) catch return error.OutOfMemory;
+    errdefer alloc.destroy(instance);
+
+    const resources = @import("runtime/resource_limits.zig").Budget.create(alloc, config.resource_limits) orelse return error.ResourceInitFailed;
+    errdefer resources.deinit();
+
+    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create(alloc) orelse return error.ExecutionCpuInitFailed;
+    errdefer execution_cpu.close();
+
     instance.* = .{
+        .allocator = alloc,
         .resources = resources,
         .execution_cpu = execution_cpu,
         .instance_id = instance_id,
         .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
         .loop = loop,
-        .timers = timers.TimerRegistry.init(),
+        .timers = timers.TimerRegistry.initWithAllocator(alloc),
         .log_handler = config.log_handler,
         .log_user_data = config.log_user_data,
     };
+    errdefer instance.deinitSynchronization();
+
     if (!@import("builtin").is_test) instance.timers.clock_now = loop.now();
 
     // Install interrupt/time-limit control for packed-alt by instance backend (same as primary). Debugger attach remains primary-only.
@@ -212,15 +200,8 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
             return true;
         }
     }{})) {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        execution_cpu.close();
-        resources.deinit();
-        instance.deinitSynchronization();
-        std.heap.c_allocator.destroy(instance);
-        return false;
+        return error.InstanceInsertFailed;
     }
-    return true;
 }
 
 pub const EvalScriptOptions = struct {
@@ -675,12 +656,12 @@ pub fn dispatchTask(instance_id: i32, script: [*:0]const u8) bool {
             inst.task_mutex.lock();
             defer inst.task_mutex.unlock();
             if (!inst.resources.reserve(.script_task, self.script.len)) return false;
-            const owned = std.heap.c_allocator.dupeSentinel(u8, self.script, 0) catch {
+            const owned = inst.allocator.dupeSentinel(u8, self.script, 0) catch {
                 inst.resources.release(.script_task, self.script.len);
                 return false;
             };
-            inst.task_queue.push(std.heap.c_allocator, owned) catch {
-                std.heap.c_allocator.free(owned);
+            inst.task_queue.push(inst.allocator, owned) catch {
+                inst.allocator.free(owned);
                 inst.resources.release(.script_task, self.script.len);
                 return false;
             };
@@ -743,7 +724,7 @@ pub fn destroyRuntime(instance_id: i32) void {
     defer inspector_state.endEngineDestroy(instance_id);
 
     if (!dispatch.closeInstanceTasks(instance_id)) return;
-    @import("abi/api_async.zig").cancelForInstance(instance_id);
+    @import("abi/api_async.zig").cancelForInstance(types.InstanceId.fromInt(instance_id));
     @import("js_event_loop").host_wake.drop(instance_id);
     // Drain Hide/Show/stop leases before touching the Driver (R3 getPtrs∩destroy).
     instance_map.waitForControlOps(instance_id);
@@ -754,10 +735,10 @@ pub fn destroyRuntime(instance_id: i32) void {
     // Stop script dispatch before the JS context is released. A dispatch racing the admission close is serialized by the instance-map mutex.
     instance.task_mutex.lock();
     for (instance.task_queue.pendingSlice()) |task| {
-        std.heap.c_allocator.free(task);
+        instance.allocator.free(task);
         instance.resources.release(.script_task, task.len);
     }
-    instance.task_queue.clear(std.heap.c_allocator);
+    instance.task_queue.clear(instance.allocator);
     instance.task_mutex.unlock();
 
     // Release inspector sockets and the console buffer while the JS context can still free retained remote objects.
@@ -807,7 +788,7 @@ pub fn destroyRuntime(instance_id: i32) void {
     removed.resources.deinit();
     removed.loop.destroy();
     removed.deinitSynchronization();
-    std.heap.c_allocator.destroy(removed);
+    removed.allocator.destroy(removed);
 }
 
 /// Get the JS context for an instance. Used by consumers to register custom APIs.
@@ -849,13 +830,14 @@ fn runOneAsync(instance_id: i32) bool {
     const PendingScript = struct {
         script: [:0]const u8,
         resources: *@import("runtime/resource_limits.zig").Budget,
+        allocator: std.mem.Allocator,
     };
     const task = instance_map.withInstanceReturn(instance_id, struct {
         pub fn call(_: @This(), inst: *instance_map.EngineInstance) ?PendingScript {
             inst.task_mutex.lock();
             defer inst.task_mutex.unlock();
             const script = inst.task_queue.popFront() orelse return null;
-            return .{ .script = script, .resources = inst.resources };
+            return .{ .script = script, .resources = inst.resources, .allocator = inst.allocator };
         }
     }{}) orelse {
         _ = queued.end();
@@ -863,7 +845,7 @@ fn runOneAsync(instance_id: i32) bool {
     };
     const script = task.script;
     defer {
-        std.heap.c_allocator.free(script);
+        task.allocator.free(script);
         task.resources.release(.script_task, script.len);
     }
     const result = ActiveEngine.eval(ptrs.ctx, script, "<dispatch>");
@@ -881,30 +863,18 @@ test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Lin
     const tag = backend.active_backend;
     const backend_dispatch = @import("backend_dispatch.zig");
     const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    const handles = backend_dispatch.createPacked(tag) orelse {
-        loop.destroy();
-        return error.CreatePackedFailed;
-    };
+    errdefer loop.destroy();
+    const handles = backend_dispatch.createPacked(tag) orelse return error.CreatePackedFailed;
+    errdefer backend_dispatch.destroyPacked(tag, handles);
     backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        return error.Oom;
-    };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return error.BudgetFailed;
-    };
-    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create() orelse {
-        resources.deinit();
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return error.Oom;
-    };
+    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch return error.Oom;
+    errdefer std.heap.c_allocator.destroy(instance);
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse return error.BudgetFailed;
+    errdefer resources.deinit();
+    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create(std.heap.c_allocator) orelse return error.Oom;
+    errdefer execution_cpu.close();
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = execution_cpu,
         .instance_id = id,
@@ -912,15 +882,8 @@ test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Lin
         .loop = loop,
         .timers = timers.TimerRegistry.init(),
     };
-    if (!instance_map.insert(instance)) {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        execution_cpu.close();
-        resources.deinit();
-        instance.deinitSynchronization();
-        std.heap.c_allocator.destroy(instance);
-        return error.InsertFailed;
-    }
+    errdefer instance.deinitSynchronization();
+    if (!instance_map.insert(instance)) return error.InsertFailed;
     defer destroy(id);
 
     try std.testing.expect(!instance_map.getInstance(id).?.isPrimaryBackend());
@@ -959,4 +922,26 @@ test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Lin
     }
     try std.testing.expect(after.err == null);
     try std.testing.expectEqualStrings("7", after.result.?);
+}
+
+test "engine: create with testing.allocator succeeds and frees cleanly" {
+    const helpers = @import("tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try createWithBackend(id, .{ .allocator = std.testing.allocator }, backend.active_backend);
+    defer destroy(id);
+
+    const inst = instance_map.getInstance(id) orelse return error.InstanceNotFound;
+    try std.testing.expectEqual(std.testing.allocator, inst.allocator);
+    const res = evalScript(id, "1 + 1", "<alloc-test>");
+    defer helpers.freeEvalResult(res);
+    try std.testing.expect(res.err == null);
+}
+
+test "engine: create duplicate instance returns InstanceAlreadyExists error" {
+    const helpers = @import("tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try createWithBackend(id, .{}, backend.active_backend);
+    defer destroy(id);
+
+    try std.testing.expectError(error.InstanceAlreadyExists, createWithBackend(id, .{}, backend.active_backend));
 }

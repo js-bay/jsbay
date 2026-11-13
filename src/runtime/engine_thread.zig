@@ -1653,9 +1653,9 @@ fn serializeThreadValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value) ap
         backend.ActiveEngineModule.lifecycle.enterJs(ctx)
     else
         true;
-    if (!entered) return .{ .out_of_memory = true };
+    if (!entered) return .out_of_memory;
     defer if (comptime backend.isQuickJsApiBackend(backend.active_backend)) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
-    return api_backend.toUtf8(ctx, value);
+    return api_backend.toUtf8(std.heap.c_allocator, ctx, value);
 }
 
 fn adoptTypedValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value, status: c_int) Adopted {
@@ -1663,18 +1663,24 @@ fn adoptTypedValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value, status:
     const serialized = serializeThreadValue(ctx, value);
     // ToString itself may enqueue microtasks.  Drain them before the enclosing admission closes, unless that conversion asked to destroy this runtime.
     if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
-    if (serialized.out_of_memory) return .{ .status = status_out_of_memory, .result = null, .err = null };
-    if (serialized.bytes) |bytes| return if (status == status_ok)
-        .{ .status = status_ok, .result = bytes, .err = null }
-    else
-        .{ .status = status_exception, .result = null, .err = bytes };
-    if (serialized.exception) |serialization_exception| {
-        defer ActiveEngine.freeValue(ctx, serialization_exception);
-        const thrown = serializeThreadValue(ctx, serialization_exception);
-        if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
-        if (thrown.bytes) |bytes| return .{ .status = status_exception, .result = null, .err = bytes };
-        if (thrown.exception) |nested| ActiveEngine.freeValue(ctx, nested);
-        if (thrown.out_of_memory) return .{ .status = status_out_of_memory, .result = null, .err = null };
+    switch (serialized) {
+        .ok => |bytes| return if (status == status_ok)
+            .{ .status = status_ok, .result = bytes, .err = null }
+        else
+            .{ .status = status_exception, .result = null, .err = bytes },
+        .exception => |serialization_exception| {
+            defer ActiveEngine.freeValue(ctx, serialization_exception);
+            const thrown = serializeThreadValue(ctx, serialization_exception);
+            if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
+            switch (thrown) {
+                .ok => |bytes| return .{ .status = status_exception, .result = null, .err = bytes },
+                .exception => |nested| ActiveEngine.freeValue(ctx, nested),
+                .out_of_memory => return .{ .status = status_out_of_memory, .result = null, .err = null },
+                .invalid_argument => {},
+            }
+        },
+        .out_of_memory => return .{ .status = status_out_of_memory, .result = null, .err = null },
+        .invalid_argument => {},
     }
     const fallback = std.heap.c_allocator.dupe(u8, "Unable to serialize JavaScript result") catch
         return .{ .status = status_out_of_memory, .result = null, .err = null };
@@ -1869,4 +1875,34 @@ fn deadlineFrom(timeout_ms: u64) i64 {
     if (room <= 0) return now;
     const add: i64 = if (timeout_ms > @as(u64, @intCast(room))) room else @intCast(timeout_ms);
     return now + add;
+}
+
+test "adoptTypedValue adopts successful serialization" {
+    const testing = std.testing;
+    const helpers = @import("../tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const num = ActiveEngine.newInt32Val(ctx, 123);
+    const adopted = adoptTypedValue(ctx, num, status_ok);
+    defer if (adopted.result) |res| std.heap.c_allocator.free(res);
+    try testing.expectEqual(status_ok, adopted.status);
+    try testing.expectEqualStrings("123", adopted.result.?);
+}
+
+test "adoptTypedValue reports an exception value as err text" {
+    const testing = std.testing;
+    const helpers = @import("../tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const err_str = ActiveEngine.newStringVal(ctx, "manual-error");
+    const adopted = adoptTypedValue(ctx, err_str, status_exception);
+    defer if (adopted.err) |e| std.heap.c_allocator.free(e);
+    try testing.expectEqual(status_exception, adopted.status);
+    try testing.expectEqualStrings("manual-error", adopted.err.?);
 }

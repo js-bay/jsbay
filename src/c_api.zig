@@ -163,7 +163,19 @@ pub export fn jsbay_engine_create_with_options(
     if (options.struct_size >= @offsetOf(EngineCreateOptionsC, "max_heap_size") + @sizeOf(u64)) {
         config.max_heap_size = @intCast(options.max_heap_size);
     }
-    if (!engine.createWithBackend(id, config, requested)) return false;
+    engine.createWithBackend(id, config, requested) catch |err| {
+        if (log_handler) |lh| switch (err) {
+            error.OutOfMemory => lh(id, .err, "engine creation failed: out of memory", log_user_data),
+            error.BackendNotPacked => lh(id, .err, "engine creation failed: backend not packed", log_user_data),
+            error.ContextInitFailed => lh(id, .err, "engine creation failed: context init failed", log_user_data),
+            error.ExecutionCpuInitFailed => lh(id, .err, "engine creation failed: cpu init failed", log_user_data),
+            error.InstanceAlreadyExists => lh(id, .err, "engine creation failed: instance already exists", log_user_data),
+            error.InstanceInsertFailed => lh(id, .err, "engine creation failed: instance insert failed", log_user_data),
+            error.ResourceInitFailed => lh(id, .err, "engine creation failed: resource init failed", log_user_data),
+            error.RuntimeInitFailed => lh(id, .err, "engine creation failed: runtime init failed", log_user_data),
+        };
+        return false;
+    };
     // runtime_control is mono-only; packed-alt skips it inside createWithBackend.
     if (requested == backend.active_backend) {
         if (!runtime_control.init(id)) {
@@ -347,13 +359,14 @@ test "c_api: forced packed_alt typed value (Linux primary-tag)" {
         loop.destroy();
         return error.Oom;
     };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
         return error.BudgetFailed;
     };
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = null,
         .instance_id = id,
@@ -431,13 +444,14 @@ test "c_api: forced packed_alt set/call/construct/new_* (Linux primary-tag proof
         loop.destroy();
         return error.Oom;
     };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
         return error.BudgetFailed;
     };
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = null,
         .instance_id = id,
@@ -607,13 +621,14 @@ test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/ne
         loop.destroy();
         return error.Oom;
     };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
         return error.BudgetFailed;
     };
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = null,
         .instance_id = id,
@@ -785,13 +800,14 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         loop.destroy();
         return error.Oom;
     };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles);
         loop.destroy();
         std.heap.c_allocator.destroy(instance);
         return error.BudgetFailed;
     };
     instance.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources,
         .execution_cpu = null,
         .instance_id = id,
@@ -944,13 +960,14 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         loop2.destroy();
         return error.Oom;
     };
-    const resources2 = @import("runtime/resource_limits.zig").Budget.create(.{}) orelse {
+    const resources2 = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
         backend_dispatch.destroyPacked(tag, handles2);
         loop2.destroy();
         std.heap.c_allocator.destroy(instance2);
         return error.BudgetFailed;
     };
     instance2.* = .{
+        .allocator = std.heap.c_allocator,
         .resources = resources2,
         .execution_cpu = null,
         .instance_id = id2,
@@ -1654,7 +1671,7 @@ pub export fn jsbay_engine_cancel(instance_id: c_int, generation: u64) bool {
     const accepted = runtime_control.requestShutdownCancel(id);
     if (accepted) {
         native_sync.cancelForInstance(id);
-        api_async.cancelGeneration(id, generation);
+        api_async.cancelGeneration(types.InstanceId.fromInt(id), generation);
     }
     return accepted;
 }
@@ -2163,6 +2180,7 @@ const ApiOp = struct {
     ctx: ActiveEngine.Context,
     lease: engine_thread.EvalLease,
     entered_js: bool,
+    allocator: std.mem.Allocator,
     execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
     fn deinit(self: *ApiOp) void {
@@ -2182,12 +2200,17 @@ fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    if (@import("runtime/instance_map.zig").getInstance(id)) |inst| {
-        if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
-    }
     const lease = engine_thread.beginEval(id);
     if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    const ctx = engine.getContext(id) orelse {
+    const inst = @import("runtime/instance_map.zig").getInstance(id) orelse {
+        engine.finishEvalEntry(id, lease);
+        return .{ .status = API_INSTANCE_NOT_FOUND };
+    };
+    if (inst.loop.lastError() != null) {
+        engine.finishEvalEntry(id, lease);
+        return .{ .status = API_LOOP_FAILED };
+    }
+    const ctx = inst.monoCtx() orelse {
         engine.finishEvalEntry(id, lease);
         return .{ .status = API_INSTANCE_NOT_FOUND };
     };
@@ -2196,7 +2219,7 @@ fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
         engine.finishEvalEntry(id, lease);
         return .{ .status = API_WRONG_THREAD };
     }
-    if (!require_execution) return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js } };
+    if (!require_execution) return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator } };
     const execution = @import("runtime/js_scheduler.zig").beginExecution(id) orelse {
         if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
             if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
@@ -2204,7 +2227,7 @@ fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
         engine.finishEvalEntry(id, lease);
         return .{ .status = API_INSTANCE_NOT_FOUND };
     };
-    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .execution = execution } };
+    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator, .execution = execution } };
 }
 
 fn beginApiOp(id: i32) ApiOpResult {
@@ -2280,13 +2303,19 @@ fn drainApiJobs(op: *ApiOp) bool {
 }
 
 fn discardBackendResult(ctx: ActiveEngine.Context, result: api_backend.Result) void {
-    if (result.value) |value| ActiveEngine.freeValue(ctx, value);
-    if (result.exception) |exception| ActiveEngine.freeValue(ctx, exception);
+    switch (result) {
+        .ok => |value| ActiveEngine.freeValue(ctx, value),
+        .exception => |exception| ActiveEngine.freeValue(ctx, exception),
+        .out_of_memory => {},
+    }
 }
 
 fn discardBytesResult(ctx: ActiveEngine.Context, result: api_backend.BytesResult) void {
-    if (result.bytes) |bytes| std.heap.c_allocator.free(bytes);
-    if (result.exception) |exception| ActiveEngine.freeValue(ctx, exception);
+    switch (result) {
+        .ok => |bytes| std.heap.c_allocator.free(bytes),
+        .exception => |exception| ActiveEngine.freeValue(ctx, exception),
+        .out_of_memory, .invalid_argument => {},
+    }
 }
 
 fn discardTypedBytecodeResult(ctx: ActiveEngine.Context, result: typed_bytecode.Result) void {
@@ -2525,12 +2554,14 @@ pub export fn jsbay_value_new_string(instance_id: c_int, input: Utf8, out_value:
     };
     defer op.deinit();
     const result = api_backend.newString(op.ctx, bytes);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u8, len: usize, out_value: *u64) c_int {
@@ -2567,12 +2598,14 @@ pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u
     };
     defer op.deinit();
     const result = api_backend.newArrayBuffer(op.ctx, bytes);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
@@ -2669,12 +2702,14 @@ pub export fn jsbay_value_new_object(instance_id: c_int, out_value: *u64) c_int 
     };
     defer op.deinit();
     const result = api_backend.newObject(op.ctx);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 pub export fn jsbay_value_new_array(instance_id: c_int, out_value: *u64) c_int {
@@ -2703,12 +2738,14 @@ pub export fn jsbay_value_new_array(instance_id: c_int, out_value: *u64) c_int {
     };
     defer op.deinit();
     const result = api_backend.newArray(op.ctx, 0);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 // The remaining Value operations are exported here while their backend-typed exception paths are being shared by all three engines. They clear every output before reporting unsupported so FFI callers never observe stale data.
@@ -2795,6 +2832,7 @@ const PackedJsOp = struct {
     ctx_addr: usize,
     lease: engine_thread.EvalLease,
     entered_js: bool,
+    allocator: std.mem.Allocator,
     execution: ?@import("runtime/js_scheduler.zig").Execution = null,
 
     fn deinit(self: *PackedJsOp) void {
@@ -2812,16 +2850,21 @@ fn beginPackedJsOpMode(instance_id: i32, tag: backend.BackendType, ctx_addr: usi
     if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
     if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
     if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
-        if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
-    }
     const lease = engine_thread.beginEval(instance_id);
     if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+    const inst = @import("runtime/instance_map.zig").getInstance(instance_id) orelse {
+        engine.finishEvalEntry(instance_id, lease);
+        return .{ .status = API_INSTANCE_NOT_FOUND };
+    };
+    if (inst.loop.lastError() != null) {
+        engine.finishEvalEntry(instance_id, lease);
+        return .{ .status = API_LOOP_FAILED };
+    }
     if (!@import("backend_dispatch.zig").enterJsPacked(tag, ctx_addr)) {
         engine.finishEvalEntry(instance_id, lease);
         return .{ .status = API_WRONG_THREAD };
     }
-    if (!require_execution) return .{ .ok = .{ .id = instance_id, .tag = tag, .ctx_addr = ctx_addr, .lease = lease, .entered_js = true } };
+    if (!require_execution) return .{ .ok = .{ .id = instance_id, .tag = tag, .ctx_addr = ctx_addr, .lease = lease, .entered_js = true, .allocator = inst.allocator } };
     const execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse {
         @import("backend_dispatch.zig").leaveJsPacked(tag, ctx_addr);
         engine.finishEvalEntry(instance_id, lease);
@@ -2833,6 +2876,7 @@ fn beginPackedJsOpMode(instance_id: i32, tag: backend.BackendType, ctx_addr: usi
         .ctx_addr = ctx_addr,
         .lease = lease,
         .entered_js = true,
+        .allocator = inst.allocator,
         .execution = execution,
     } };
 }
@@ -3271,7 +3315,7 @@ pub export fn jsbay_value_new_json(instance_id_raw: c_int, input_arg: Utf8, out_
             .ok => |ok| ok,
         };
         defer packed_js.deinit();
-        const result = @import("backend_dispatch.zig").valueNewJson(ready.tag, ready.ctx_addr, input);
+        const result = @import("backend_dispatch.zig").valueNewJson(packed_js.allocator, ready.tag, ready.ctx_addr, input);
         if (!drainPackedJobs(&packed_js)) {
             discardPackedEvalResult(ready.tag, ready.ctx_addr, result);
             return API_INSTANCE_NOT_FOUND;
@@ -3283,17 +3327,19 @@ pub export fn jsbay_value_new_json(instance_id_raw: c_int, input_arg: Utf8, out_
         .ok => |value| value,
     };
     defer op.deinit();
-    const result = api_backend.parseJson(op.ctx, input);
+    const result = api_backend.parseJson(op.allocator, op.ctx, input);
     if (!drainApiJobs(&op)) {
         discardBackendResult(op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            const stored = apiStore(id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, out_value: *u64) c_int {
     out_value.* = 0;
@@ -3323,13 +3369,15 @@ pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, o
     };
     defer op.deinit();
     const result = api_backend.newError(op.ctx, message);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        // Constructors report an internal failure as a non-exception status; no out_exception exists on this API surface.
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(id, val, out_value),
+        .exception => |exception| {
+            // Constructors report an internal failure as a non-exception status; no out_exception exists on this API surface.
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
@@ -3370,27 +3418,30 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
         .ok => |ok| ok,
     };
     defer data.deinit();
-    const result = api_backend.toUtf8(data.op.ctx, data.value);
+    const result = api_backend.toUtf8(std.heap.c_allocator, data.op.ctx, data.value);
     if (!drainApiJobs(&data.op)) {
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.invalid_argument) return API_INVALID_ARGUMENT;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
+    switch (result) {
+        .ok => |bytes| {
+            // QuickJS exposes unpaired UTF-16 surrogates as WTF-8. The public ABI promises ordinary UTF-8, so rewrite each surrogate half to U+FFFD in place. Valid UTF-8 (including NUL and paired emoji) is untouched.
+            if (!std.unicode.utf8ValidateSlice(bytes)) {
+                std.unicode.wtf8ToUtf8Lossy(bytes, bytes) catch {
+                    std.heap.c_allocator.free(bytes);
+                    return API_INVALID_ARGUMENT;
+                };
+            }
+            out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
+            return API_OK;
+        },
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => return API_OUT_OF_MEMORY,
+        .invalid_argument => return API_INVALID_ARGUMENT,
     }
-    const bytes = result.bytes orelse return API_OUT_OF_MEMORY;
-    // QuickJS exposes unpaired UTF-16 surrogates as WTF-8. The public ABI promises ordinary UTF-8, so rewrite each surrogate half to U+FFFD in place. Valid UTF-8 (including NUL and paired emoji) is untouched.
-    if (!std.unicode.utf8ValidateSlice(bytes)) {
-        std.unicode.wtf8ToUtf8Lossy(bytes, bytes) catch {
-            std.heap.c_allocator.free(bytes);
-            return API_INVALID_ARGUMENT;
-        };
-    }
-    out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
-    return API_OK;
 }
 pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
@@ -3413,20 +3464,23 @@ pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: 
         .ok => |ok| ok,
     };
     defer data.deinit();
-    const result = api_backend.toJson(data.op.ctx, data.value);
+    const result = api_backend.toJson(std.heap.c_allocator, data.op.ctx, data.value);
     if (!drainApiJobs(&data.op)) {
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.invalid_argument) return API_INVALID_ARGUMENT;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
+    switch (result) {
+        .ok => |bytes| {
+            out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
+            return API_OK;
+        },
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => return API_OUT_OF_MEMORY,
+        .invalid_argument => return API_INVALID_ARGUMENT,
     }
-    const bytes = result.bytes orelse return API_OUT_OF_MEMORY;
-    out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
-    return API_OK;
 }
 pub export fn jsbay_value_copy_buffer(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
@@ -3449,20 +3503,23 @@ pub export fn jsbay_value_copy_buffer(value: u64, out_bytes: *Bytes, out_excepti
         .ok => |ok| ok,
     };
     defer data.deinit();
-    const result = api_backend.copyBuffer(data.op.ctx, data.value);
+    const result = api_backend.copyBuffer(std.heap.c_allocator, data.op.ctx, data.value);
     if (!drainApiJobs(&data.op)) {
         discardBytesResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.invalid_argument) return API_INVALID_ARGUMENT;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
+    switch (result) {
+        .ok => |bytes| {
+            out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
+            return API_OK;
+        },
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => return API_OUT_OF_MEMORY,
+        .invalid_argument => return API_INVALID_ARGUMENT,
     }
-    const bytes = result.bytes orelse return API_OUT_OF_MEMORY;
-    out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
-    return API_OK;
 }
 pub export fn jsbay_free_bytes(bytes: Bytes) void {
     if (bytes.data) |data| std.heap.c_allocator.free(data[0..bytes.len]);
@@ -3499,12 +3556,14 @@ pub export fn jsbay_value_get(object: u64, key_arg: Utf8, out_value: *u64, out_e
         discardBackendResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(data.op.id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(data.op.id, val, out_value),
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_exception: *u64) c_int {
     out_exception.* = 0;
@@ -3549,12 +3608,14 @@ pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_except
         discardBackendResult(object_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.exception) |exception| {
-        const stored = apiStore(object_data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    return API_OK;
+    return switch (result) {
+        .ok => API_OK,
+        .exception => |exception| {
+            const stored = apiStore(object_data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u64, argc: usize, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
@@ -3573,9 +3634,9 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, this_buf[0..this_len]);
 
         var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
-        defer arg_storage.deinit(std.heap.c_allocator);
+        defer arg_storage.deinit(data.js.allocator);
         var arg_lens = std.ArrayList(usize).empty;
-        defer arg_lens.deinit(std.heap.c_allocator);
+        defer arg_lens.deinit(data.js.allocator);
         defer {
             var i: usize = 0;
             while (i < arg_storage.items.len) : (i += 1) {
@@ -3586,24 +3647,24 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
             if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
             var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
             const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
-            arg_storage.append(std.heap.c_allocator, buf) catch {
+            arg_storage.append(data.js.allocator, buf) catch {
                 @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 return API_OUT_OF_MEMORY;
             };
-            arg_lens.append(std.heap.c_allocator, len) catch {
+            arg_lens.append(data.js.allocator, len) catch {
                 @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 _ = arg_storage.pop();
                 return API_OUT_OF_MEMORY;
             };
         };
         var arg_slices = std.ArrayList([]const u8).empty;
-        defer arg_slices.deinit(std.heap.c_allocator);
-        arg_slices.ensureTotalCapacityPrecise(std.heap.c_allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
+        defer arg_slices.deinit(data.js.allocator);
+        arg_slices.ensureTotalCapacityPrecise(data.js.allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
         var ai: usize = 0;
         while (ai < arg_storage.items.len) : (ai += 1) {
             arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
         }
-        const result = @import("backend_dispatch.zig").valueCall(data.js.tag, data.js.ctx_addr, data.bytes(), this_buf[0..this_len], arg_slices.items);
+        const result = @import("backend_dispatch.zig").valueCall(data.js.allocator, data.js.tag, data.js.ctx_addr, data.bytes(), this_buf[0..this_len], arg_slices.items);
         if (!drainPackedJobs(&data.js)) {
             discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
             return API_INSTANCE_NOT_FOUND;
@@ -3621,29 +3682,31 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
     };
     defer ActiveEngine.freeValue(function_data.op.ctx, pinned_this);
     var values = std.ArrayList(ActiveEngine.Value).empty;
-    defer values.deinit(std.heap.c_allocator);
+    defer values.deinit(function_data.op.allocator);
     defer for (values.items) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
     if (args) |raw_args| for (raw_args[0..argc]) |handle| {
         const item = switch (pinValue(function_data.op, handle)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        values.append(std.heap.c_allocator, item) catch {
+        values.append(function_data.op.allocator, item) catch {
             ActiveEngine.freeValue(function_data.op.ctx, item);
             return API_OUT_OF_MEMORY;
         };
     };
-    const result = api_backend.call(function_data.op.ctx, function_data.value, pinned_this, values.items);
+    const result = api_backend.call(function_data.op.allocator, function_data.op.ctx, function_data.value, pinned_this, values.items);
     if (!drainApiJobs(&function_data.op)) {
         discardBackendResult(function_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(function_data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(function_data.op.id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(function_data.op.id, val, out_value),
+        .exception => |exception| {
+            const stored = apiStore(function_data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: usize, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
@@ -3657,9 +3720,9 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
         };
         defer data.deinit();
         var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
-        defer arg_storage.deinit(std.heap.c_allocator);
+        defer arg_storage.deinit(data.js.allocator);
         var arg_lens = std.ArrayList(usize).empty;
-        defer arg_lens.deinit(std.heap.c_allocator);
+        defer arg_lens.deinit(data.js.allocator);
         defer {
             var i: usize = 0;
             while (i < arg_storage.items.len) : (i += 1) {
@@ -3670,24 +3733,24 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
             if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
             var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
             const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
-            arg_storage.append(std.heap.c_allocator, buf) catch {
+            arg_storage.append(data.js.allocator, buf) catch {
                 @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 return API_OUT_OF_MEMORY;
             };
-            arg_lens.append(std.heap.c_allocator, len) catch {
+            arg_lens.append(data.js.allocator, len) catch {
                 @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                 _ = arg_storage.pop();
                 return API_OUT_OF_MEMORY;
             };
         };
         var arg_slices = std.ArrayList([]const u8).empty;
-        defer arg_slices.deinit(std.heap.c_allocator);
-        arg_slices.ensureTotalCapacityPrecise(std.heap.c_allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
+        defer arg_slices.deinit(data.js.allocator);
+        arg_slices.ensureTotalCapacityPrecise(data.js.allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
         var ai: usize = 0;
         while (ai < arg_storage.items.len) : (ai += 1) {
             arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
         }
-        const result = @import("backend_dispatch.zig").valueConstruct(data.js.tag, data.js.ctx_addr, data.bytes(), arg_slices.items);
+        const result = @import("backend_dispatch.zig").valueConstruct(data.js.allocator, data.js.tag, data.js.ctx_addr, data.bytes(), arg_slices.items);
         if (!drainPackedJobs(&data.js)) {
             discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
             return API_INSTANCE_NOT_FOUND;
@@ -3700,44 +3763,53 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
     };
     defer function_data.deinit();
     var values = std.ArrayList(ActiveEngine.Value).empty;
-    defer values.deinit(std.heap.c_allocator);
+    defer values.deinit(function_data.op.allocator);
     defer for (values.items) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
     if (args) |raw_args| for (raw_args[0..argc]) |handle| {
         const item = switch (pinValue(function_data.op, handle)) {
             .status => |status| return status,
             .ok => |ok| ok,
         };
-        values.append(std.heap.c_allocator, item) catch {
+        values.append(function_data.op.allocator, item) catch {
             ActiveEngine.freeValue(function_data.op.ctx, item);
             return API_OUT_OF_MEMORY;
         };
     };
-    const result = api_backend.construct(function_data.op.ctx, function_data.value, values.items);
+    const result = api_backend.construct(function_data.op.allocator, function_data.op.ctx, function_data.value, values.items);
     if (!drainApiJobs(&function_data.op)) {
         discardBackendResult(function_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(function_data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(function_data.op.id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(function_data.op.id, val, out_value),
+        .exception => |exception| {
+            const stored = apiStore(function_data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 /// Publish a boolean backend result, or its original throw value, once the microtask checkpoint has run. A checkpoint that tears the instance down publishes nothing.
 fn finishBoolOp(op: *ApiOp, result: api_backend.BoolResult, out_flag: *bool, out_exception: *u64) c_int {
     if (!drainApiJobs(op)) {
-        if (result.exception) |exception| ActiveEngine.freeValue(op.ctx, exception);
+        switch (result) {
+            .exception => |exception| ActiveEngine.freeValue(op.ctx, exception),
+            .ok, .out_of_memory => {},
+        }
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
+    switch (result) {
+        .ok => |val| {
+            out_flag.* = val;
+            return API_OK;
+        },
+        .exception => |exception| {
+            const stored = apiStore(op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => return API_OUT_OF_MEMORY,
     }
-    out_flag.* = result.value;
-    return API_OK;
 }
 
 fn keyedBoolOp(
@@ -3825,12 +3897,14 @@ pub export fn jsbay_value_keys(object: u64, out_array: *u64, out_exception: *u64
         discardBackendResult(data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
     }
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        const stored = apiStore(data.op.id, exception, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    return apiStore(data.op.id, result.value orelse return API_OUT_OF_MEMORY, out_array);
+    return switch (result) {
+        .ok => |val| apiStore(data.op.id, val, out_array),
+        .exception => |exception| {
+            const stored = apiStore(data.op.id, exception, out_exception);
+            return if (stored == API_OK) 1 else stored;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 pub export fn jsbay_value_instance_of(value: u64, constructor: u64, out_result: *bool, out_exception: *u64) c_int {
@@ -3958,7 +4032,7 @@ pub export fn jsbay_engine_bind(instance_id_raw: c_int, name_arg: Utf8, callback
         .ok => |ok| ok,
     };
     defer op.deinit();
-    const installed = api_bind.install(id, op.ctx, name, cb, user_data, finalize);
+    const installed = api_bind.install(op.allocator, id, op.ctx, name, cb, user_data, finalize);
     switch (installed) {
         .out_of_memory => return API_OUT_OF_MEMORY,
         .exception => |exception| {
@@ -4002,12 +4076,14 @@ fn syncNewStringFromPayload(instance_id: i32, payload: []const u8, out_value: *u
     defer op.deinit();
     // UTF-8 already validated on the completer thread for STRING / EXCEPTION paths.
     const result = api_backend.newString(op.ctx, payload);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(instance_id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(instance_id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 fn syncAdoptOrCopyArrayBuffer(instance_id: i32, payload: []u8, out_value: *u64) c_int {
@@ -4039,12 +4115,14 @@ fn syncAdoptOrCopyArrayBuffer(instance_id: i32, payload: []u8, out_value: *u64) 
 
     const result = api_backend.newArrayBuffer(op.ctx, payload);
     std.heap.c_allocator.free(payload);
-    if (result.out_of_memory) return API_OUT_OF_MEMORY;
-    if (result.exception) |exception| {
-        ActiveEngine.freeValue(op.ctx, exception);
-        return API_OUT_OF_MEMORY;
-    }
-    return apiStore(instance_id, result.value orelse return API_OUT_OF_MEMORY, out_value);
+    return switch (result) {
+        .ok => |val| apiStore(instance_id, val, out_value),
+        .exception => |exception| {
+            ActiveEngine.freeValue(op.ctx, exception);
+            return API_OUT_OF_MEMORY;
+        },
+        .out_of_memory => API_OUT_OF_MEMORY,
+    };
 }
 
 fn syncTrampoline(instance_id: i32, data: ?*anyopaque, this_value: u64, argc: usize, args: ?[*]const u64, out_value: *u64, out_exception: *u64) callconv(.c) c_int {
@@ -4193,7 +4271,7 @@ pub export fn jsbay_promise_create(instance_id_raw: c_int, out_request_id: ?*u64
         .ok => |value| value,
     };
     defer op.deinit();
-    switch (api_async.create(id)) {
+    switch (api_async.create(types.InstanceId.fromInt(id))) {
         .status => |status| return status,
         .ok => |created| {
             request_id.* = created.request_id;
@@ -4211,7 +4289,7 @@ pub export fn jsbay_promise_settle(request_id: u64, outcome_status: c_int, value
         else => return API_INVALID_ARGUMENT,
     };
     const instance_id = api_async.instanceFor(request_id) orelse return API_STALE_VALUE;
-    var op = switch (beginApiOp(instance_id)) {
+    var op = switch (beginApiOp(instance_id.toInt())) {
         .status => |status| return status,
         .ok => |value_op| value_op,
     };

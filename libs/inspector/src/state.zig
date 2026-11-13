@@ -1263,7 +1263,7 @@ pub fn Module(comptime Host: type) type {
 
             pub fn performanceMeasurementTracksEffectiveSessionsAndTeardown() !void {
                 const testing = std.testing;
-                const ledger = Host.execution_cpu.Ledger.create() orelse return error.OutOfMemory;
+                const ledger = Host.execution_cpu.Ledger.create(testing.allocator) orelse return error.OutOfMemory;
                 defer ledger.close();
                 try testing.expect(ledger.retain());
                 var state = InspectorState{

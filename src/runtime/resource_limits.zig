@@ -83,6 +83,7 @@ pub const AdmissionClass = enum(u8) {
 };
 
 pub const Budget = struct {
+    allocator: std.mem.Allocator = std.heap.c_allocator,
     limits: Limits,
     /// Affects future `reserve` only (see FG headroom). Default foreground preserves single-instance hosts.
     admission_class: AdmissionClass = .foreground,
@@ -90,9 +91,9 @@ pub const Budget = struct {
     counts: [kinds]usize = @splat(0),
     bytes: usize = 0,
 
-    pub fn create(limits: Limits) ?*Budget {
-        const b = std.heap.c_allocator.create(Budget) catch return null;
-        b.* = .{ .limits = limits };
+    pub fn create(allocator: std.mem.Allocator, limits: Limits) ?*Budget {
+        const b = allocator.create(Budget) catch return null;
+        b.* = .{ .allocator = allocator, .limits = limits };
         return b;
     }
     /// Every reservation owns a reference, including work detached during teardown.
@@ -133,15 +134,17 @@ pub const Budget = struct {
         global_bytes -= bytes;
         self.refs -= 1;
         const last = self.refs == 0;
+        const alloc = self.allocator;
         mutex.unlock();
-        if (last) std.heap.c_allocator.destroy(self);
+        if (last) alloc.destroy(self);
     }
     pub fn deinit(self: *Budget) void {
         mutex.lock();
         self.refs -= 1;
         const last = self.refs == 0;
+        const alloc = self.allocator;
         mutex.unlock();
-        if (last) std.heap.c_allocator.destroy(self);
+        if (last) alloc.destroy(self);
     }
 
     pub fn admissionClass(self: *const Budget) AdmissionClass {
@@ -177,7 +180,7 @@ pub const Budget = struct {
 };
 
 test "native budgets preserve reservations across owner destruction and return global capacity" {
-    const b = Budget.create(.{ .max_timers = 1, .max_pending_bytes = 3 }) orelse return error.OutOfMemory;
+    const b = Budget.create(std.testing.allocator, .{ .max_timers = 1, .max_pending_bytes = 3 }) orelse return error.OutOfMemory;
     try std.testing.expect(b.reserve(.timer, 0));
     try std.testing.expect(!b.reserve(.timer, 0));
     try std.testing.expect(b.reserve(.tsfn_call, 3));
@@ -185,16 +188,16 @@ test "native budgets preserve reservations across owner destruction and return g
     b.deinit();
     b.release(.timer, 0);
     b.release(.tsfn_call, 3);
-    const next = Budget.create(.{}) orelse return error.OutOfMemory;
+    const next = Budget.create(std.testing.allocator, .{}) orelse return error.OutOfMemory;
     defer next.deinit();
     try std.testing.expect(next.reserve(.timer, 0));
     next.release(.timer, 0);
 }
 
 test "native budgets enforce a shared process cap across instances" {
-    const a = Budget.create(.{ .max_timers = 65536 }) orelse return error.OutOfMemory;
+    const a = Budget.create(std.testing.allocator, .{ .max_timers = 65536 }) orelse return error.OutOfMemory;
     defer a.deinit();
-    const b = Budget.create(.{}) orelse return error.OutOfMemory;
+    const b = Budget.create(std.testing.allocator, .{}) orelse return error.OutOfMemory;
     defer b.deinit();
     var reserved: usize = 0;
     defer for (0..reserved) |_| a.release(.timer, 0);
@@ -210,9 +213,9 @@ test "native budgets enforce a shared process cap across instances" {
 }
 
 test "native budgets expose usage and honor tighter Limits after setLimits" {
-    const a = Budget.create(.{ .max_timers = 2 }) orelse return error.OutOfMemory;
+    const a = Budget.create(std.testing.allocator, .{ .max_timers = 2 }) orelse return error.OutOfMemory;
     defer a.deinit();
-    const b = Budget.create(.{ .max_timers = 3 }) orelse return error.OutOfMemory;
+    const b = Budget.create(std.testing.allocator, .{ .max_timers = 3 }) orelse return error.OutOfMemory;
     defer b.deinit();
     try std.testing.expect(a.reserve(.timer, 0));
     try std.testing.expect(a.reserve(.timer, 0));
@@ -235,10 +238,10 @@ test "native budgets expose usage and honor tighter Limits after setLimits" {
 }
 
 test "native budgets: BACKGROUND cannot enter FG headroom; FOREGROUND still admits" {
-    const bg = Budget.create(.{ .max_tsfn_handles = 4096 }) orelse return error.OutOfMemory;
+    const bg = Budget.create(std.testing.allocator, .{ .max_tsfn_handles = 4096 }) orelse return error.OutOfMemory;
     defer bg.deinit();
     bg.setAdmissionClass(.background);
-    const fg = Budget.create(.{ .max_tsfn_handles = 4096 }) orelse return error.OutOfMemory;
+    const fg = Budget.create(std.testing.allocator, .{ .max_tsfn_handles = 4096 }) orelse return error.OutOfMemory;
     defer fg.deinit();
     try std.testing.expectEqual(AdmissionClass.foreground, fg.admissionClass());
 
@@ -269,9 +272,9 @@ test "native budgets: BACKGROUND cannot enter FG headroom; FOREGROUND still admi
 }
 
 test "native budgets: FG filling past headroom denies BACKGROUND" {
-    const fg = Budget.create(.{ .max_tsfn_handles = 4096 }) orelse return error.OutOfMemory;
+    const fg = Budget.create(std.testing.allocator, .{ .max_tsfn_handles = 4096 }) orelse return error.OutOfMemory;
     defer fg.deinit();
-    const bg = Budget.create(.{ .max_tsfn_handles = 4096 }) orelse return error.OutOfMemory;
+    const bg = Budget.create(std.testing.allocator, .{ .max_tsfn_handles = 4096 }) orelse return error.OutOfMemory;
     defer bg.deinit();
     bg.setAdmissionClass(.background);
 
@@ -286,7 +289,7 @@ test "native budgets: FG filling past headroom denies BACKGROUND" {
 }
 
 test "native budgets: setAdmissionClass mid-flight keeps live reservations" {
-    const b = Budget.create(.{ .max_timers = 8 }) orelse return error.OutOfMemory;
+    const b = Budget.create(std.testing.allocator, .{ .max_timers = 8 }) orelse return error.OutOfMemory;
     defer b.deinit();
     try std.testing.expect(b.reserve(.timer, 0));
     try std.testing.expect(b.reserve(.timer, 0));

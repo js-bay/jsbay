@@ -870,3 +870,214 @@ test "value: 10-arg call — all arguments accessible and summable" {
         }
     }.run);
 }
+
+test "value: OwnedValue wrap and unwrap semantics" {
+    const id = helpers.nextInstanceId();
+    try helpers.withEngine(id, .{}, struct {
+        fn run(inst: i32) !void {
+            const ctx = engine.getContext(inst) orelse return error.ContextUnavailable;
+            var num_owned = value.OwnedValue.init(ctx, backend.ActiveEngine.newInt32Val(ctx, 42));
+            defer num_owned.deinit();
+            try testing.expectEqual(@as(i32, 42), backend.ActiveEngine.toInt32(ctx, num_owned.borrow()));
+
+            var obj = value.OwnedValue.init(ctx, backend.ActiveEngine.newObject(ctx));
+            try testing.expect(backend.ActiveEngine.isObjectVal(ctx, obj.borrow()));
+            const released = obj.release();
+            try testing.expect(backend.ActiveEngine.isUndefined(ctx, obj.borrow()));
+            backend.ActiveEngine.freeValue(ctx, released);
+
+            var auto_freed = value.OwnedValue.init(ctx, backend.ActiveEngine.newInt32Val(ctx, 100));
+            auto_freed.deinit();
+            try testing.expect(backend.ActiveEngine.isUndefined(ctx, auto_freed.borrow()));
+        }
+    }.run);
+}
+
+test "value: Global reference with custom allocator cleans up without leak" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const str = backend.ActiveEngine.newStringVal(ctx, "hello-zen");
+    defer backend.ActiveEngine.freeValue(ctx, str);
+
+    var g = @import("../root.zig").reference.Global(value.Local).init(id, str);
+    defer g.deinit();
+
+    const retrieved = g.get() orelse return error.GlobalLookupFailed;
+    defer backend.ActiveEngine.freeValue(ctx, retrieved);
+    try testing.expect(backend.ActiveEngine.sameValue(ctx, str, retrieved));
+}
+
+test "value: Weak reference with custom allocator cleans up without leak" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const obj = backend.ActiveEngine.newObject(ctx);
+    defer backend.ActiveEngine.freeValue(ctx, obj);
+
+    var w = @import("../root.zig").reference.Weak(value.Local).init(id, obj);
+    defer w.deinit();
+
+    const live = w.get() orelse return error.WeakLookupFailed;
+    try testing.expect(backend.ActiveEngine.sameValue(ctx, obj, live));
+}
+
+test "value: Rooted lifecycle roots, unroots, and cleans up" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const obj = backend.ActiveEngine.newObject(ctx);
+    defer backend.ActiveEngine.freeValue(ctx, obj);
+
+    var r = @import("../root.zig").reference.Rooted.init(id, obj);
+    try testing.expect(r.isEmpty());
+    r.root();
+    try testing.expect(!r.isEmpty());
+    r.root();
+    r.unroot();
+    try testing.expect(!r.isEmpty());
+    r.unroot();
+    try testing.expect(r.isEmpty());
+    r.unroot();
+    r.deinit();
+    try testing.expect(r.isEmpty());
+}
+
+test "value: Global, Weak, and Rooted safe deinit after engine destroy" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const str = backend.ActiveEngine.newStringVal(ctx, "dangling-zen");
+    var g = @import("../root.zig").reference.Global(value.Local).init(id, str);
+    backend.ActiveEngine.freeValue(ctx, str);
+
+    const obj = backend.ActiveEngine.newObject(ctx);
+    var w = @import("../root.zig").reference.Weak(value.Local).init(id, obj);
+    var r = @import("../root.zig").reference.Rooted.init(id, obj);
+    r.root();
+    backend.ActiveEngine.freeValue(ctx, obj);
+
+    engine.destroy(id);
+
+    try testing.expect(g.get() == null);
+    try testing.expect(w.isEmpty());
+    try testing.expect(r.isEmpty());
+
+    g.deinit();
+    w.deinit();
+    r.deinit();
+}
+
+test "value: api_backend toUtf8, toJson, and copyBuffer with testing.allocator" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
+    const str = backend.ActiveEngine.newStringVal(ctx, "zen-utf8");
+    defer backend.ActiveEngine.freeValue(ctx, str);
+
+    const utf8_res = @import("../abi/api_backend.zig").toUtf8(testing.allocator, ctx, str);
+    switch (utf8_res) {
+        .ok => |bytes| {
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualStrings("zen-utf8", bytes);
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const num = backend.ActiveEngine.newInt32Val(ctx, 42);
+    defer backend.ActiveEngine.freeValue(ctx, num);
+    const json_res = @import("../abi/api_backend.zig").toJson(testing.allocator, ctx, num);
+    switch (json_res) {
+        .ok => |bytes| {
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualStrings("42", bytes);
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const parsed_valid = @import("../abi/api_backend.zig").parseJson(testing.allocator, ctx, "{\"zen\":42}");
+    switch (parsed_valid) {
+        .ok => |val| {
+            defer backend.ActiveEngine.freeValue(ctx, val);
+            const prop = @import("../abi/api_backend.zig").get(ctx, val, "zen");
+            switch (prop) {
+                .ok => |prop_val| {
+                    defer backend.ActiveEngine.freeValue(ctx, prop_val);
+                    try testing.expect(backend.ActiveEngine.isNumber(ctx, prop_val));
+                },
+                else => return error.UnexpectedResult,
+            }
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const parsed_invalid = @import("../abi/api_backend.zig").parseJson(testing.allocator, ctx, "{invalid");
+    switch (parsed_invalid) {
+        .exception => |exc| backend.ActiveEngine.freeValue(ctx, exc),
+        else => return error.UnexpectedResult,
+    }
+
+    try helpers.evalOk(id, "globalThis.zenFn = function(a, b) { return a + b; };");
+    try helpers.evalOk(id, "globalThis.ZenCtor = function(x) { this.x = x; };");
+
+    const global = backend.ActiveEngine.getGlobalObject(ctx);
+    defer backend.ActiveEngine.freeValue(ctx, global);
+
+    const fn_res = @import("../abi/api_backend.zig").get(ctx, global, "zenFn");
+    switch (fn_res) {
+        .ok => |fn_val| {
+            defer backend.ActiveEngine.freeValue(ctx, fn_val);
+            const arg1 = backend.ActiveEngine.newInt32Val(ctx, 10);
+            defer backend.ActiveEngine.freeValue(ctx, arg1);
+            const arg2 = backend.ActiveEngine.newInt32Val(ctx, 32);
+            defer backend.ActiveEngine.freeValue(ctx, arg2);
+            const call_args = [_]backend.ActiveEngine.Value{ arg1, arg2 };
+            const undef = backend.ActiveEngine.newUndefinedVal(ctx);
+            defer backend.ActiveEngine.freeValue(ctx, undef);
+            const call_res = @import("../abi/api_backend.zig").call(testing.allocator, ctx, fn_val, undef, &call_args);
+            switch (call_res) {
+                .ok => |val| {
+                    defer backend.ActiveEngine.freeValue(ctx, val);
+                    try testing.expect(backend.ActiveEngine.isNumber(ctx, val));
+                },
+                else => return error.UnexpectedResult,
+            }
+        },
+        else => return error.UnexpectedResult,
+    }
+
+    const ctor_res = @import("../abi/api_backend.zig").get(ctx, global, "ZenCtor");
+    switch (ctor_res) {
+        .ok => |ctor_val| {
+            defer backend.ActiveEngine.freeValue(ctx, ctor_val);
+            const ctor_arg = backend.ActiveEngine.newInt32Val(ctx, 99);
+            defer backend.ActiveEngine.freeValue(ctx, ctor_arg);
+            const construct_args = [_]backend.ActiveEngine.Value{ctor_arg};
+            const construct_res = @import("../abi/api_backend.zig").construct(testing.allocator, ctx, ctor_val, &construct_args);
+            switch (construct_res) {
+                .ok => |inst_val| {
+                    defer backend.ActiveEngine.freeValue(ctx, inst_val);
+                    const prop = @import("../abi/api_backend.zig").get(ctx, inst_val, "x");
+                    switch (prop) {
+                        .ok => |prop_val| {
+                            defer backend.ActiveEngine.freeValue(ctx, prop_val);
+                            try testing.expect(backend.ActiveEngine.isNumber(ctx, prop_val));
+                        },
+                        else => return error.UnexpectedResult,
+                    }
+                },
+                else => return error.UnexpectedResult,
+            }
+        },
+        else => return error.UnexpectedResult,
+    }
+}

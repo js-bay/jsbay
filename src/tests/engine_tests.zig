@@ -322,6 +322,52 @@ test "engine: dispatchTask runs on runEventLoopOnce and sets globals" {
     try testing.expectEqualStrings("123", res.result.?);
 }
 
+test "engine: dispatchTask with testing.allocator runs and frees without leak or heap corruption" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    defer engine.destroy(id);
+
+    try testing.expect(engine.dispatchTask(id, "globalThis.__zen_task__ = 789;"));
+    engine.runEventLoopOnce(id);
+
+    const res = engine.evalScript(id, "globalThis.__zen_task__", "<alloc-test>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+    try testing.expectEqualStrings("789", res.result.?);
+}
+
+test "engine: dispatchTask queued with testing.allocator cleans up on engine destroy" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+
+    try testing.expect(engine.dispatchTask(id, "globalThis.__unran__ = 999;"));
+    engine.destroy(id);
+}
+
+test "engine: per-instance budget and ledger honor configured allocator and clean up without leaks" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .allocator = testing.allocator }));
+    const inst = instance_map.getInstance(id) orelse return error.InstanceMissing;
+    try testing.expect(inst.resources.allocator.ptr == testing.allocator.ptr);
+    if (inst.execution_cpu) |cpu| {
+        try testing.expect(cpu.allocator.ptr == testing.allocator.ptr);
+    }
+    engine.destroy(id);
+}
+
+test "engine: creation fail injection verifies error paths without leaking per-instance state" {
+    var fail_index: usize = 0;
+    while (fail_index < 6) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const id = helpers.nextInstanceId();
+        const ok = engine.create(id, .{ .allocator = failing.allocator() });
+        if (ok) {
+            engine.destroy(id);
+            break;
+        }
+    }
+}
+
 test "engine: dispatchTask reports rejection for a destroyed instance" {
     const id = helpers.nextInstanceId();
     try testing.expect(engine.create(id, .{}));

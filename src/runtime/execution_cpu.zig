@@ -2,6 +2,7 @@ const std = @import("std");
 const thread_cpu = @import("../platform/thread_cpu.zig");
 
 pub const Ledger = struct {
+    allocator: std.mem.Allocator = std.heap.c_allocator,
     refs: std.atomic.Value(usize) = .init(1),
     total_ns: std.atomic.Value(u64) = .init(0),
     closing: std.atomic.Value(bool) = .init(false),
@@ -36,9 +37,9 @@ pub const Ledger = struct {
         applyPendingLedgerDisablesOnOwner(self);
     }
 
-    pub fn create() ?*Ledger {
-        const ledger = std.heap.c_allocator.create(Ledger) catch return null;
-        ledger.* = .{};
+    pub fn create(allocator: std.mem.Allocator) ?*Ledger {
+        const ledger = allocator.create(Ledger) catch return null;
+        ledger.* = .{ .allocator = allocator };
         return ledger;
     }
     pub fn retain(self: *Ledger) bool {
@@ -53,7 +54,8 @@ pub const Ledger = struct {
         release(self);
     }
     pub fn release(self: *Ledger) void {
-        if (self.refs.fetchSub(1, .acq_rel) == 1) std.heap.c_allocator.destroy(self);
+        const alloc = self.allocator;
+        if (self.refs.fetchSub(1, .acq_rel) == 1) alloc.destroy(self);
     }
     pub fn seconds(self: *const Ledger) ?f64 {
         if (!thread_cpu.isSupported() or !self.measurable.load(.acquire)) return null;
@@ -278,7 +280,7 @@ pub fn resumeAfterExternalEval(token: PauseToken) void {
 }
 
 test "execution CPU defers a transport disable until its active scope ends" {
-    const ledger = Ledger.create() orelse return error.OutOfMemory;
+    const ledger = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer ledger.close();
     ledger.enable();
     var scope = begin(ledger);
@@ -289,11 +291,11 @@ test "execution CPU defers a transport disable until its active scope ends" {
 }
 
 test "execution CPU keeps a pending transport disable below a reentered ledger frame" {
-    const ledger = Ledger.create() orelse return error.OutOfMemory;
+    const ledger = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer ledger.close();
     ledger.enable();
     var outer = begin(ledger);
-    const disabled = Ledger.create() orelse return error.OutOfMemory;
+    const disabled = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer disabled.close();
     var suppressed = begin(disabled);
     var inner = begin(ledger);
@@ -306,7 +308,7 @@ test "execution CPU keeps a pending transport disable below a reentered ledger f
 }
 
 test "execution CPU keeps an active frame measuring until the last user disables" {
-    const ledger = Ledger.create() orelse return error.OutOfMemory;
+    const ledger = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer ledger.close();
     ledger.enable();
     ledger.enable();
@@ -322,7 +324,7 @@ test "execution CPU keeps an active frame measuring until the last user disables
 }
 
 test "execution CPU scopes do not duplicate same ledger nesting" {
-    const ledger = Ledger.create() orelse return error.OutOfMemory;
+    const ledger = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer ledger.close();
     ledger.enable();
     defer ledger.disable();
@@ -336,7 +338,7 @@ test "execution CPU scopes do not duplicate same ledger nesting" {
 }
 
 test "execution CPU scopes are inert before measurement is enabled" {
-    const ledger = Ledger.create() orelse return error.OutOfMemory;
+    const ledger = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer ledger.close();
     var scope = begin(ledger);
     try thread_cpu.testing.consumeTick();
@@ -346,11 +348,11 @@ test "execution CPU scopes are inert before measurement is enabled" {
 }
 
 test "execution CPU scopes separate nested instances" {
-    const first = Ledger.create() orelse return error.OutOfMemory;
+    const first = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer first.close();
     first.enable();
     defer first.disable();
-    const second = Ledger.create() orelse return error.OutOfMemory;
+    const second = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer second.close();
     second.enable();
     defer second.disable();
@@ -367,11 +369,11 @@ test "execution CPU scopes separate nested instances" {
 }
 
 test "execution CPU scopes count a reentered ledger below a disabled instance" {
-    const first = Ledger.create() orelse return error.OutOfMemory;
+    const first = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer first.close();
     first.enable();
     defer first.disable();
-    const disabled = Ledger.create() orelse return error.OutOfMemory;
+    const disabled = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer disabled.close();
     var outer = begin(first);
     var disabled_scope = begin(disabled);
@@ -390,13 +392,13 @@ test "execution CPU scopes count a reentered ledger below a disabled instance" {
 }
 
 test "execution CPU scopes keep a disabled suppression across an external yield" {
-    const first = Ledger.create() orelse return error.OutOfMemory;
+    const first = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer first.close();
     first.enable();
     defer first.disable();
-    const disabled = Ledger.create() orelse return error.OutOfMemory;
+    const disabled = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer disabled.close();
-    const third = Ledger.create() orelse return error.OutOfMemory;
+    const third = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer third.close();
     third.enable();
     defer third.disable();
@@ -415,11 +417,11 @@ test "execution CPU scopes keep a disabled suppression across an external yield"
 }
 
 test "execution CPU scopes restore an external yield below an enabled child" {
-    const first = Ledger.create() orelse return error.OutOfMemory;
+    const first = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer first.close();
     first.enable();
     defer first.disable();
-    const child = Ledger.create() orelse return error.OutOfMemory;
+    const child = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer child.close();
     child.enable();
     defer child.disable();
@@ -436,11 +438,11 @@ test "execution CPU scopes restore an external yield below an enabled child" {
 }
 
 test "execution CPU scopes do not flush an enabled child's work to a yielded ancestor" {
-    const ancestor = Ledger.create() orelse return error.OutOfMemory;
+    const ancestor = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer ancestor.close();
     ancestor.enable();
     defer ancestor.disable();
-    const child = Ledger.create() orelse return error.OutOfMemory;
+    const child = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer child.close();
     child.enable();
     defer child.disable();
@@ -457,13 +459,13 @@ test "execution CPU scopes do not flush an enabled child's work to a yielded anc
 }
 
 test "execution CPU scopes retain disabled suppression after a yield resumes" {
-    const ancestor = Ledger.create() orelse return error.OutOfMemory;
+    const ancestor = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer ancestor.close();
     ancestor.enable();
     defer ancestor.disable();
-    const disabled = Ledger.create() orelse return error.OutOfMemory;
+    const disabled = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer disabled.close();
-    const child = Ledger.create() orelse return error.OutOfMemory;
+    const child = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer child.close();
     child.enable();
     defer child.disable();
@@ -482,13 +484,13 @@ test "execution CPU scopes retain disabled suppression after a yield resumes" {
 }
 
 test "execution CPU scopes retain a yield after a disabled scope ends" {
-    const ancestor = Ledger.create() orelse return error.OutOfMemory;
+    const ancestor = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer ancestor.close();
     ancestor.enable();
     defer ancestor.disable();
-    const disabled = Ledger.create() orelse return error.OutOfMemory;
+    const disabled = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer disabled.close();
-    const child = Ledger.create() orelse return error.OutOfMemory;
+    const child = Ledger.create(std.testing.allocator) orelse return error.OutOfMemory;
     defer child.close();
     child.enable();
     defer child.disable();

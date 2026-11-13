@@ -25,7 +25,11 @@
 //!
 //! ## Implementation note: heap-allocated handle
 //!
-//! `Global` and `Weak` are value types that may be moved/copied (e.g. by return-by-value from `init`). To keep their bookkeeping stable across such moves, the actual state lives in a heap-allocated `Cell` and the Global/Weak holds a stable pointer to it. The Cell embeds the intrusive `RefEntry` so `engine.destroy` can walk all live references and force-reset them before tearing down the JS runtime — preventing use-after- free when consumers forget to call `reset()` themselves.
+//! `Global` and `Weak` are value types that may be moved/copied (e.g. by return-by-value from `init`). To keep their bookkeeping stable across such moves, the actual state lives in a heap-allocated `Cell` and the Global/Weak holds a stable pointer to it. The Cell embeds the intrusive `RefEntry` so `engine.destroy` can walk all live references and force-reset them before tearing down the JS runtime — preventing use-after-free when consumers forget to call `reset()` themselves.
+//!
+//! ## Thread affinity
+//!
+//! All Global, Weak, and Rooted operations (init, get, reset, deinit) must be performed on the owning engine thread. Engine teardown walks the intrusive bookkeeping list to reset dangling references before runtime destruction. OwnedValue represents local scoped ownership and must not outlive its owning context.
 
 const std = @import("std");
 const backend = @import("../backend.zig");
@@ -35,6 +39,31 @@ const ActiveEngine = backend.ActiveEngine;
 
 /// Convenience alias so consumers can write `reference.Local` instead of reaching into the backend module for the Value type.
 pub const Local = ActiveEngine.Value;
+
+/// Explicit wrapper representing an owned JavaScript Value whose ownership is transferred to the callee.
+pub const OwnedValue = struct {
+    ctx: ActiveEngine.Context,
+    raw: Local,
+
+    pub fn init(ctx: ActiveEngine.Context, v: Local) OwnedValue {
+        return .{ .ctx = ctx, .raw = v };
+    }
+
+    pub fn borrow(self: *const OwnedValue) Local {
+        return self.raw;
+    }
+
+    pub fn release(self: *OwnedValue) Local {
+        const val = self.raw;
+        self.raw = ActiveEngine.undefinedValue();
+        return val;
+    }
+
+    pub fn deinit(self: *OwnedValue) void {
+        ActiveEngine.freeValue(self.ctx, self.raw);
+        self.raw = ActiveEngine.undefinedValue();
+    }
+};
 
 // ----------------------------------------------------------------------
 // Scope
@@ -108,6 +137,8 @@ pub const StackFrameScope = struct {
 const GlobalCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
+    ctx: ActiveEngine.Context,
+    allocator: std.mem.Allocator,
     val: ActiveEngine.Value,
     /// True once the JS value has been released. Once released the Cell itself stays around (so the owning Global's pointer remains valid) until the Global is deinit'd; further `get`/`reset` are no-ops.
     released: bool = false,
@@ -115,9 +146,7 @@ const GlobalCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *GlobalCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
-        if (ctxForInstance(cell.instance_id)) |ctx| {
-            ActiveEngine.freeValue(ctx, cell.val);
-        }
+        ActiveEngine.freeValue(cell.ctx, cell.val);
         cell.released = true;
     }
 };
@@ -143,6 +172,7 @@ pub const WatcherData = struct {
     /// Platform-opaque handle. On weak-handle backends this is the weak ref; on refcount backends it's unused (the watcher JS object owns the lifetime).
     native_handle: ?*anyopaque = null,
     ref_count: u32 = 1,
+    allocator: std.mem.Allocator,
 
     pub fn retain(self: *WatcherData) void {
         self.ref_count += 1;
@@ -151,12 +181,12 @@ pub const WatcherData = struct {
     pub fn release(self: *WatcherData) void {
         std.debug.assert(self.ref_count > 0);
         self.ref_count -= 1;
-        if (self.ref_count == 0) std.heap.c_allocator.destroy(self);
+        if (self.ref_count == 0) self.allocator.destroy(self);
     }
 
-    pub fn create() ?*WatcherData {
-        const p = std.heap.c_allocator.create(WatcherData) catch return null;
-        p.* = .{};
+    pub fn create(allocator: std.mem.Allocator) ?*WatcherData {
+        const p = allocator.create(WatcherData) catch return null;
+        p.* = .{ .allocator = allocator };
         return p;
     }
 };
@@ -164,6 +194,8 @@ pub const WatcherData = struct {
 pub const WeakCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
+    ctx: ActiveEngine.Context,
+    allocator: std.mem.Allocator,
     kind: WeakKind,
     /// For primitives: the retained value. For objects: a snapshot of the initial Value used as a fast-path return when the backend says the target is still live.
     val: ActiveEngine.Value,
@@ -174,15 +206,12 @@ pub const WeakCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *WeakCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
-        const ctx_opt = ctxForInstance(cell.instance_id);
         switch (cell.kind) {
             .primitive => {
-                if (ctx_opt) |c| ActiveEngine.freeValue(c, cell.val);
+                ActiveEngine.freeValue(cell.ctx, cell.val);
             },
             .object => {
-                // `Context` is already an optional pointer type on both backends; pass a null Context when the engine is gone so the backend can decide whether it can still release native handles.
-                const ctx: ActiveEngine.Context = ctx_opt orelse null;
-                weakBackendRelease(ctx, cell);
+                weakBackendRelease(cell.ctx, cell);
             },
         }
         cell.released = true;
@@ -194,9 +223,7 @@ fn ctxForInstance(instance_id: i32) ?ActiveEngine.Context {
     return ptrs.ctx;
 }
 
-/// Insert `entry` at the head of the engine's bookkeeping list. `entry` must already have its `reset_fn` set.
-fn registerEntry(instance_id: i32, entry: *instance_map.RefEntry) void {
-    const inst = instance_map.getInstance(instance_id) orelse return;
+fn registerEntryDirect(inst: *instance_map.EngineInstance, entry: *instance_map.RefEntry) void {
     inst.ref_bookkeeping.mutex.lock();
     defer inst.ref_bookkeeping.mutex.unlock();
     entry.prev = null;
@@ -306,7 +333,7 @@ fn rootBackendIdentityCreate(ctx: ActiveEngine.Context, v: Local) ?*anyopaque {
     };
 }
 
-fn rootBackendIdentityFree(ctx: ?ActiveEngine.Context, identity: ?*anyopaque) void {
+fn rootBackendIdentityFree(ctx: ActiveEngine.Context, identity: ?*anyopaque) void {
     const id = identity orelse return;
     if (comptime backend.active_backend == .hermes) {
         const c = @import("../backend/hermes/c_api.zig");
@@ -331,18 +358,23 @@ pub fn Global(comptime T: type) type {
 
         /// Create a Global that retains `v`. Duplicates the refcount / calls `JSValueProtect` so the value outlives any scope it was created in.
         pub fn init(instance_id: i32, v: Local) Self {
-            const ctx = ctxForInstance(instance_id) orelse {
+            const inst = instance_map.getInstance(instance_id) orelse {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
-            const cell = std.heap.c_allocator.create(GlobalCell) catch {
+            const ctx = inst.monoCtx() orelse {
+                return Self{ .instance_id = instance_id, .cell = null };
+            };
+            const cell = inst.allocator.create(GlobalCell) catch {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
             cell.* = .{
                 .entry = .{ .reset_fn = GlobalCell.releaseValue },
                 .instance_id = instance_id,
+                .ctx = ctx,
+                .allocator = inst.allocator,
                 .val = ActiveEngine.dupValue(ctx, v),
             };
-            registerEntry(instance_id, &cell.entry);
+            registerEntryDirect(inst, &cell.entry);
             return Self{ .instance_id = instance_id, .cell = cell };
         }
 
@@ -360,20 +392,20 @@ pub fn Global(comptime T: type) type {
         pub fn get(self: Self) ?Local {
             const cell = self.cell orelse return null;
             if (cell.released) return null;
-            const ctx = ctxForInstance(self.instance_id) orelse return null;
-            return ActiveEngine.dupValue(ctx, cell.val);
+            return ActiveEngine.dupValue(cell.ctx, cell.val);
         }
 
         /// Release the retained value and free the underlying cell. Safe to call multiple times.
         pub fn reset(self: *Self) void {
             const cell = self.cell orelse return;
+            const alloc = cell.allocator;
             if (!cell.released) {
                 // Unlink from bookkeeping first, then release value.
                 unregisterEntry(cell.instance_id, &cell.entry);
                 GlobalCell.releaseValue(&cell.entry);
             }
             // Now that the cell is no longer linked into bookkeeping and its JS value has been released, free the cell itself.
-            std.heap.c_allocator.destroy(cell);
+            alloc.destroy(cell);
             self.cell = null;
         }
 
@@ -398,10 +430,13 @@ pub fn Weak(comptime T: type) type {
         cell: ?*WeakCell = null,
 
         pub fn init(instance_id: i32, v: Local) Self {
-            const ctx = ctxForInstance(instance_id) orelse {
+            const inst = instance_map.getInstance(instance_id) orelse {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
-            const cell = std.heap.c_allocator.create(WeakCell) catch {
+            const ctx = inst.monoCtx() orelse {
+                return Self{ .instance_id = instance_id, .cell = null };
+            };
+            const cell = inst.allocator.create(WeakCell) catch {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
 
@@ -410,6 +445,8 @@ pub fn Weak(comptime T: type) type {
                 cell.* = .{
                     .entry = .{ .reset_fn = WeakCell.releaseValue },
                     .instance_id = instance_id,
+                    .ctx = ctx,
+                    .allocator = inst.allocator,
                     .kind = .object,
                     .val = v,
                 };
@@ -422,12 +459,14 @@ pub fn Weak(comptime T: type) type {
                 cell.* = .{
                     .entry = .{ .reset_fn = WeakCell.releaseValue },
                     .instance_id = instance_id,
+                    .ctx = ctx,
+                    .allocator = inst.allocator,
                     .kind = .primitive,
                     .val = ActiveEngine.dupValue(ctx, v),
                 };
             }
 
-            registerEntry(instance_id, &cell.entry);
+            registerEntryDirect(inst, &cell.entry);
             return Self{ .instance_id = instance_id, .cell = cell };
         }
 
@@ -440,8 +479,7 @@ pub fn Weak(comptime T: type) type {
             const cell = self.cell orelse return true;
             if (cell.released) return true;
             if (cell.kind == .object) {
-                const ctx = ctxForInstance(self.instance_id) orelse return true;
-                return weakBackendGetLive(ctx, cell) == null;
+                return weakBackendGetLive(cell.ctx, cell) == null;
             }
             return false;
         }
@@ -453,19 +491,19 @@ pub fn Weak(comptime T: type) type {
             switch (cell.kind) {
                 .primitive => return cell.val,
                 .object => {
-                    const ctx = ctxForInstance(self.instance_id) orelse return null;
-                    return weakBackendGetLive(ctx, cell);
+                    return weakBackendGetLive(cell.ctx, cell);
                 },
             }
         }
 
         pub fn reset(self: *Self) void {
             const cell = self.cell orelse return;
+            const alloc = cell.allocator;
             if (!cell.released) {
                 unregisterEntry(cell.instance_id, &cell.entry);
                 WeakCell.releaseValue(&cell.entry);
             }
-            std.heap.c_allocator.destroy(cell);
+            alloc.destroy(cell);
             self.cell = null;
         }
 
@@ -485,6 +523,8 @@ pub fn Weak(comptime T: type) type {
 const RootCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
+    ctx: ActiveEngine.Context,
+    allocator: std.mem.Allocator,
     val: ActiveEngine.Value,
     /// Hermes-only durable identity (`HermesRootIdentity`). Null on other backends.
     identity: ?*anyopaque = null,
@@ -496,15 +536,12 @@ const RootCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *RootCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
-        const ctx = ctxForInstance(cell.instance_id);
         if (cell.protected) {
-            if (ctx) |c| {
-                rootBackendUnprotect(c, cell.val);
-            }
+            rootBackendUnprotect(cell.ctx, cell.val);
             cell.protected = false;
         }
         if (cell.identity) |id| {
-            rootBackendIdentityFree(ctx, id);
+            rootBackendIdentityFree(cell.ctx, id);
             cell.identity = null;
         }
         cell.root_count = 0;
@@ -525,26 +562,31 @@ pub const Rooted = struct {
 
     /// Store `v` with a root count of 0. Does not protect yet.
     pub fn init(instance_id: i32, v: Local) Rooted {
-        const ctx = ctxForInstance(instance_id) orelse {
+        const inst = instance_map.getInstance(instance_id) orelse {
             return Rooted{ .instance_id = instance_id, .cell = null };
         };
-        const cell = std.heap.c_allocator.create(RootCell) catch {
+        const ctx = inst.monoCtx() orelse {
+            return Rooted{ .instance_id = instance_id, .cell = null };
+        };
+        const cell = inst.allocator.create(RootCell) catch {
             return Rooted{ .instance_id = instance_id, .cell = null };
         };
         const identity = rootBackendIdentityCreate(ctx, v);
         if (comptime backend.active_backend == .hermes) {
             if (identity == null) {
-                std.heap.c_allocator.destroy(cell);
+                inst.allocator.destroy(cell);
                 return Rooted{ .instance_id = instance_id, .cell = null };
             }
         }
         cell.* = .{
             .entry = .{ .reset_fn = RootCell.releaseValue },
             .instance_id = instance_id,
+            .ctx = ctx,
+            .allocator = inst.allocator,
             .val = v,
             .identity = identity,
         };
-        registerEntry(instance_id, &cell.entry);
+        registerEntryDirect(inst, &cell.entry);
         return Rooted{ .instance_id = instance_id, .cell = cell };
     }
 
@@ -558,8 +600,7 @@ pub const Rooted = struct {
         const cell = self.cell orelse return;
         if (cell.released) return;
         if (cell.root_count == 0) {
-            const ctx = ctxForInstance(self.instance_id) orelse return;
-            const protected_val = rootBackendProtect(ctx, cell) orelse return;
+            const protected_val = rootBackendProtect(cell.ctx, cell) orelse return;
             cell.val = protected_val;
             cell.protected = true;
         }
@@ -572,9 +613,7 @@ pub const Rooted = struct {
         if (cell.released or cell.root_count == 0) return;
         cell.root_count -= 1;
         if (cell.root_count == 0 and cell.protected) {
-            if (ctxForInstance(self.instance_id)) |ctx| {
-                rootBackendUnprotect(ctx, cell.val);
-            }
+            rootBackendUnprotect(cell.ctx, cell.val);
             cell.protected = false;
             // Hermes: drop the freed wrapper address; re-root rebuilds from `identity`.
             if (comptime backend.active_backend == .hermes) {
@@ -586,11 +625,17 @@ pub const Rooted = struct {
     /// Unlink, drop a leftover protect, and free the cell.
     pub fn deinit(self: *Rooted) void {
         const cell = self.cell orelse return;
+        const alloc = cell.allocator;
         if (!cell.released) {
             unregisterEntry(cell.instance_id, &cell.entry);
             RootCell.releaseValue(&cell.entry);
         }
-        std.heap.c_allocator.destroy(cell);
+        alloc.destroy(cell);
         self.cell = null;
     }
 };
+
+test "rootBackendIdentityFree takes the same Context as RootCell, not a nested optional" {
+    const param_types = @typeInfo(@TypeOf(rootBackendIdentityFree)).@"fn".param_types;
+    try std.testing.expectEqual(ActiveEngine.Context, param_types[0].?);
+}

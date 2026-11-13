@@ -18,6 +18,7 @@ const bytecode = @import("bytecode.zig");
 const cache = @import("cache.zig");
 const instance_map = @import("../runtime/instance_map.zig");
 const backend = @import("../backend.zig");
+const OwnedValue = @import("../value/root.zig").OwnedValue;
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -34,6 +35,7 @@ const CacheEntry = struct {
 
 const CjsState = struct {
     instance_id: i32,
+    allocator: std.mem.Allocator,
     ctx: ActiveEngine.Context,
     loader: *const types.ModuleLoader,
     /// Arena for interned canonical-id strings (keys of `cache`). Freed in bulk by `uninstall`.
@@ -44,7 +46,7 @@ const CjsState = struct {
     require_installed: bool = false,
     /// Tracks whether the global `__jsbay_cjsCache` has been registered.
     cjs_cache_installed: bool = false,
-    /// In-process bytecode cache for `__jsbay_cjsCache`: sourceHash + filenameHash → bytes. Both keys and bytes are c_allocator-owned and freed on uninstall. This lets repeat mounts of the same module body at the same source location skip re-compile without conflating filename metadata.
+    /// In-process bytecode cache for `__jsbay_cjsCache`: sourceHash + filenameHash → bytes. Both keys and bytes are allocator-owned and freed on uninstall. This lets repeat mounts of the same module body at the same source location skip re-compile without conflating filename metadata.
     bytecode_cache: std.StringHashMap([]u8),
 };
 
@@ -88,20 +90,23 @@ fn stateFromCtx(ctx: ActiveEngine.Context) ?*CjsState {
 pub fn install(instance_id: i32, loader: *const types.ModuleLoader) bool {
     if (getState(instance_id)) |_| return true; // already installed
     const ctx = engine.getContext(instance_id) orelse return false;
+    const inst = instance_map.getInstance(instance_id) orelse return false;
+    const alloc = inst.allocator;
 
-    const state = std.heap.c_allocator.create(CjsState) catch return false;
+    const state = alloc.create(CjsState) catch return false;
     state.* = .{
         .instance_id = instance_id,
+        .allocator = alloc,
         .ctx = ctx,
         .loader = loader,
-        .arena = std.heap.ArenaAllocator.init(std.heap.c_allocator),
-        .cache = std.StringHashMap(CacheEntry).init(std.heap.c_allocator),
-        .bytecode_cache = std.StringHashMap([]u8).init(std.heap.c_allocator),
+        .arena = std.heap.ArenaAllocator.init(alloc),
+        .cache = std.StringHashMap(CacheEntry).init(alloc),
+        .bytecode_cache = std.StringHashMap([]u8).init(alloc),
     };
     putState(state) catch {
         state.arena.deinit();
         state.cache.deinit();
-        std.heap.c_allocator.destroy(state);
+        alloc.destroy(state);
         return false;
     };
 
@@ -110,7 +115,7 @@ pub fn install(instance_id: i32, loader: *const types.ModuleLoader) bool {
         _ = removeState(instance_id);
         state.arena.deinit();
         state.cache.deinit();
-        std.heap.c_allocator.destroy(state);
+        alloc.destroy(state);
         return false;
     }
 
@@ -176,17 +181,18 @@ fn clearCacheState(state: *CjsState) void {
 /// Uninstall and free per-instance state. Idempotent. `engine.destroy` invokes this automatically after active JavaScript has unwound and before it frees the context. Direct callers may explicitly uninstall only on the owning thread while no JavaScript entry is active.
 pub fn uninstall(instance_id: i32) void {
     const state = removeState(instance_id) orelse return;
+    const alloc = state.allocator;
     clearCacheState(state);
     // Free in-process bytecode-cache keys and payloads, then the map itself.
     var bc_it = state.bytecode_cache.iterator();
     while (bc_it.next()) |entry| {
-        std.heap.c_allocator.free(entry.key_ptr.*);
-        std.heap.c_allocator.free(entry.value_ptr.*);
+        alloc.free(entry.key_ptr.*);
+        alloc.free(entry.value_ptr.*);
     }
     state.bytecode_cache.deinit();
     state.cache.deinit();
     state.arena.deinit();
-    std.heap.c_allocator.destroy(state);
+    alloc.destroy(state);
     // We intentionally do NOT remove the global `require` from the JS context — the context may be mid-teardown. After uninstall, `require` returns undefined for all callers because state lookup yields null.
 }
 
@@ -213,56 +219,52 @@ fn runWrappedSource(
 ) !CallResult {
     // Compose wrapper: ( function (exports, module, require, __filename, __dirname) { <source>\n} )
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.c_allocator);
-    buf.appendSlice(std.heap.c_allocator, "(function (exports, module, require, __filename, __dirname) { ") catch return error.OutOfMemory;
-    buf.appendSlice(std.heap.c_allocator, source) catch return error.OutOfMemory;
-    buf.appendSlice(std.heap.c_allocator, "\n})") catch return error.OutOfMemory;
+    defer buf.deinit(state.allocator);
+    buf.appendSlice(state.allocator, "(function (exports, module, require, __filename, __dirname) { ") catch return error.OutOfMemory;
+    buf.appendSlice(state.allocator, source) catch return error.OutOfMemory;
+    buf.appendSlice(state.allocator, "\n})") catch return error.OutOfMemory;
 
-    const wrapper_fn = try compileWrapper(state.ctx, buf.items, filename);
-    defer ActiveEngine.freeValue(state.ctx, wrapper_fn);
+    var wrapper_fn = OwnedValue.init(state.ctx, try compileWrapper(state.ctx, buf.items, filename));
+    defer wrapper_fn.deinit();
 
     // Build fresh exports + module = { exports }.
-    const exports_obj = ActiveEngine.newObject(state.ctx);
-    const module_obj = ActiveEngine.newObject(state.ctx);
+    var exports_obj = OwnedValue.init(state.ctx, ActiveEngine.newObject(state.ctx));
+    defer exports_obj.deinit();
+
+    var module_obj = OwnedValue.init(state.ctx, ActiveEngine.newObject(state.ctx));
+    defer module_obj.deinit();
+
     // Duplicate exports for the module.exports property so freeing either side independently is safe.
-    const exp_for_module = ActiveEngine.dupValue(state.ctx, exports_obj);
-    ActiveEngine.setPropertyStr(state.ctx, module_obj, "exports", exp_for_module);
+    const exp_for_module = ActiveEngine.dupValue(state.ctx, exports_obj.borrow());
+    ActiveEngine.setPropertyStr(state.ctx, module_obj.borrow(), "exports", exp_for_module);
 
-    const filename_val = ActiveEngine.newStringVal(state.ctx, filename);
-    const dirname_val = ActiveEngine.newStringVal(state.ctx, dirname);
+    var filename_val = OwnedValue.init(state.ctx, ActiveEngine.newStringVal(state.ctx, filename));
+    defer filename_val.deinit();
 
-    // The instance's global `require` is the same function — reuse it via globalThis.require rather than synthesising a bound wrapper. Nested require calls go through the global, which still has access to the cache and loader (per-instance via stateFromCtx).
-    const require_fn = getGlobalRequire(state.ctx);
-    defer ActiveEngine.freeValue(state.ctx, require_fn);
+    var dirname_val = OwnedValue.init(state.ctx, ActiveEngine.newStringVal(state.ctx, dirname));
+    defer dirname_val.deinit();
+
+    // The instance's global `require` is the same function — reuse it via globalThis.require rather than synthesising a bound wrapper.
+    var require_fn = OwnedValue.init(state.ctx, getGlobalRequire(state.ctx));
+    defer require_fn.deinit();
 
     const argv = [_]ActiveEngine.Value{
-        exports_obj,
-        module_obj,
-        require_fn,
-        filename_val,
-        dirname_val,
+        exports_obj.borrow(),
+        module_obj.borrow(),
+        require_fn.borrow(),
+        filename_val.borrow(),
+        dirname_val.borrow(),
     };
 
     const undef = ActiveEngine.undefinedValue();
-    const call_result = ActiveEngine.callFunction(state.ctx, wrapper_fn, undef, &argv) orelse {
-        // Exception already parked / consumed by callFunction; release the owned temporaries so nothing leaks.
-        ActiveEngine.freeValue(state.ctx, exports_obj);
-        ActiveEngine.freeValue(state.ctx, module_obj);
-        ActiveEngine.freeValue(state.ctx, filename_val);
-        ActiveEngine.freeValue(state.ctx, dirname_val);
+    const call_result = ActiveEngine.callFunction(state.ctx, wrapper_fn.borrow(), undef, &argv) orelse {
         return error.CallFailed;
     };
     ActiveEngine.freeValue(state.ctx, call_result);
 
     // Fetch module.exports (the wrapper may have reassigned `module.exports`).
-    const current_exports = ActiveEngine.getPropertyVal(state.ctx, module_obj, "exports") orelse
-        ActiveEngine.dupValue(state.ctx, exports_obj);
-
-    // Release locals.  `current_exports` is our return value — transfer ownership.
-    ActiveEngine.freeValue(state.ctx, exports_obj);
-    ActiveEngine.freeValue(state.ctx, module_obj);
-    ActiveEngine.freeValue(state.ctx, filename_val);
-    ActiveEngine.freeValue(state.ctx, dirname_val);
+    const current_exports = ActiveEngine.getPropertyVal(state.ctx, module_obj.borrow(), "exports") orelse
+        ActiveEngine.dupValue(state.ctx, exports_obj.borrow());
 
     return .{ .exports = current_exports };
 }
@@ -1019,14 +1021,14 @@ fn runCjsCacheBundledBody(
     cache_dir: []const u8,
 ) CjsCacheCbError!@import("../backend.zig").ActiveEngineModule.qjs.JSValue {
     const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-    const gpa = std.heap.c_allocator;
+    const gpa = state.allocator;
 
     const srckey = cache.sha256Hex(source);
     if (srckey.len == 0) return error.OutOfMemory;
-    defer gpa.free(srckey);
+    defer std.heap.c_allocator.free(srckey);
     const namekey = cache.sha256Hex(filename);
     if (namekey.len == 0) return error.OutOfMemory;
-    defer gpa.free(namekey);
+    defer std.heap.c_allocator.free(namekey);
     const inproc_key = std.fmt.allocPrint(gpa, "{s}-{s}", .{ srckey, namekey }) catch return error.OutOfMemory;
     var inproc_key_owned = true;
     defer if (inproc_key_owned) gpa.free(inproc_key);
@@ -1044,9 +1046,9 @@ fn runCjsCacheBundledBody(
     // 1. disk hit.
     if (disk_path) |path| {
         if (cache.readBytes(path)) |cached| {
+            defer std.heap.c_allocator.free(cached);
             // runCommonJS executes via the wrapper and returns a string — we need the live object, so drive the low-level path here instead.
             const fn_result = qjs_mod.qjsRunBytecodeToFn(state.ctx, cached);
-            gpa.free(cached);
             if (!fn_result.decode_failed and fn_result.err == null) {
                 if (fn_result.fn_value) |fnv| {
                     const exports_val = runWrapperWithRequire(state, fnv, require_fn, filename) catch |e| {
@@ -1059,7 +1061,7 @@ fn runCjsCacheBundledBody(
             }
             // Stale/undecodable: drop and rebuild once.
             if (fn_result.err_is_heap) {
-                if (fn_result.err) |e| gpa.free(@constCast(e));
+                if (fn_result.err) |e| std.heap.c_allocator.free(@constCast(e));
             }
             cache.deleteFile(path);
         }
@@ -1079,7 +1081,7 @@ fn runCjsCacheBundledBody(
             }
         }
         if (fn_result.err_is_heap) {
-            if (fn_result.err) |e| gpa.free(@constCast(e));
+            if (fn_result.err) |e| std.heap.c_allocator.free(@constCast(e));
         }
     }
 
@@ -1099,7 +1101,7 @@ fn runCjsCacheBundledBody(
         // A prior in-process decode failed. Keep its owned key, replace only the stale payload, and release this temporary duplicate key.
         gpa.free(inproc_key);
         inproc_key_owned = false;
-        std.heap.c_allocator.free(inproc_entry.value_ptr.*);
+        gpa.free(inproc_entry.value_ptr.*);
     } else {
         inproc_key_owned = false;
     }
@@ -1112,7 +1114,7 @@ fn runCjsCacheBundledBody(
 
     const fn_result = qjs_mod.qjsRunBytecodeToFn(state.ctx, owned);
     if (fn_result.err_is_heap) {
-        if (fn_result.err) |e| gpa.free(@constCast(e));
+        if (fn_result.err) |e| std.heap.c_allocator.free(@constCast(e));
     }
     if (fn_result.decode_failed or fn_result.err != null or fn_result.fn_value == null) {
         return error.CallFailed;
@@ -1134,44 +1136,39 @@ fn runWrapperWithRequire(
     require_fn: @import("../backend.zig").ActiveEngineModule.qjs.JSValue,
     filename: []const u8,
 ) CjsCacheCbError!@import("../backend.zig").ActiveEngineModule.qjs.JSValue {
-    const exports_obj = ActiveEngine.newObject(state.ctx);
-    const module_obj = ActiveEngine.newObject(state.ctx);
-    const exp_for_module = ActiveEngine.dupValue(state.ctx, exports_obj);
-    ActiveEngine.setPropertyStr(state.ctx, module_obj, "exports", exp_for_module);
+    var exports_obj = OwnedValue.init(state.ctx, ActiveEngine.newObject(state.ctx));
+    defer exports_obj.deinit();
+
+    var module_obj = OwnedValue.init(state.ctx, ActiveEngine.newObject(state.ctx));
+    defer module_obj.deinit();
+
+    const exp_for_module = ActiveEngine.dupValue(state.ctx, exports_obj.borrow());
+    ActiveEngine.setPropertyStr(state.ctx, module_obj.borrow(), "exports", exp_for_module);
 
     const dirname = dirnameOf(filename);
-    const filename_val = ActiveEngine.newStringVal(state.ctx, filename);
-    const dirname_val = ActiveEngine.newStringVal(state.ctx, dirname);
+    var filename_val = OwnedValue.init(state.ctx, ActiveEngine.newStringVal(state.ctx, filename));
+    defer filename_val.deinit();
 
-    // `ActiveEngine.Value` is the raw JSValue on the QuickJS backend; dup the argv entries so freeing the locals below is balanced, exactly like `runWrappedSource` does.
+    var dirname_val = OwnedValue.init(state.ctx, ActiveEngine.newStringVal(state.ctx, dirname));
+    defer dirname_val.deinit();
+
     const argv = [_]ActiveEngine.Value{
-        ActiveEngine.dupValue(state.ctx, exports_obj),
-        ActiveEngine.dupValue(state.ctx, module_obj),
-        ActiveEngine.dupValue(state.ctx, require_fn),
-        filename_val,
-        dirname_val,
+        exports_obj.borrow(),
+        module_obj.borrow(),
+        require_fn,
+        filename_val.borrow(),
+        dirname_val.borrow(),
     };
-    defer {
-        ActiveEngine.freeValue(state.ctx, argv[0]);
-        ActiveEngine.freeValue(state.ctx, argv[1]);
-        ActiveEngine.freeValue(state.ctx, argv[2]);
-        ActiveEngine.freeValue(state.ctx, argv[3]);
-        ActiveEngine.freeValue(state.ctx, argv[4]);
-    }
 
     const undef = ActiveEngine.undefinedValue();
     const call_result = ActiveEngine.callFunction(state.ctx, wrapper_fn, undef, &argv) orelse {
-        ActiveEngine.freeValue(state.ctx, exports_obj);
-        ActiveEngine.freeValue(state.ctx, module_obj);
         return error.CallFailed;
     };
     ActiveEngine.freeValue(state.ctx, call_result);
 
-    const current_exports = ActiveEngine.getPropertyVal(state.ctx, module_obj, "exports") orelse
-        ActiveEngine.dupValue(state.ctx, exports_obj);
+    const current_exports = ActiveEngine.getPropertyVal(state.ctx, module_obj.borrow(), "exports") orelse
+        ActiveEngine.dupValue(state.ctx, exports_obj.borrow());
 
-    ActiveEngine.freeValue(state.ctx, exports_obj);
-    ActiveEngine.freeValue(state.ctx, module_obj);
     return current_exports;
 }
 
