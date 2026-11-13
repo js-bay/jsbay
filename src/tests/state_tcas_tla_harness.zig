@@ -629,7 +629,7 @@ test "state_tcas tla: render ADR-015 ITF JSON trace from replay exploration" {
 
     const trace_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
-        "docs/tla/scheduler_task_checkpoint_trace.json",
+        "src/tests/tla/scheduler_task_checkpoint_trace.json",
         allocator,
         .limited(1024 * 1024),
     );
