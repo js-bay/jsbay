@@ -9,15 +9,15 @@
 //!   * `quickjs_ng/console.zig`        — `jsConsoleLog` callback.
 //!   * `quickjs_ng/timers.zig`         — setTimeout/Interval/clearTimer.
 //! * `quickjs_ng/exception.zig` — getAndFormatException, jsonStringify, valueToString.
-//!   * `quickjs_ng/datetime.zig`       — Date + BigInt helpers.
-//!   * `quickjs_ng/collections.zig`    — Map/Set + iteration.
+//!   * `quickjs_ng/datetime.zig`       — Date + BigInt helpers (shared leaf from `quickjs_common/datetime.zig`).
+//!   * `quickjs_ng/collections.zig`    — Map/Set + iteration (shared leaf from `quickjs_common/collections.zig`).
 //!   * `quickjs_ng/dataview.zig`       — DataView ctor/info.
 //!   * `quickjs_ng/external.zig`       — opaque external pointers.
 //!   * `quickjs_ng/module.zig`         — ES module loader.
 //!   * `quickjs_ng/bytecode.zig`       — bytecode compile / run.
 //!   * `quickjs_ng/errors.zig`         — structured Error API.
 //!   * `quickjs_ng/runtime_control.zig`— interrupt + GC + memory snapshot.
-//!   * `quickjs_ng/buffers.zig`        — zero-copy ArrayBuffer / Uint8Array view.
+//!   * `quickjs_ng/buffers.zig`        — zero-copy ArrayBuffer / Uint8Array view (shared leaf from `quickjs_common/buffers.zig`).
 //!   * `quickjs_ng/weak.zig`           — true-weak (`reference.Weak(T)`) support.
 //!   * `quickjs_ng/weakcb.zig`         — napi_wrap-style finalizer attachment.
 //!   * `quickjs_ng/cjs.zig`            — CommonJS eval-to-value.
