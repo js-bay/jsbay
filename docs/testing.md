@@ -135,3 +135,28 @@ zig build test-state-tcas-engine -Dbackend=quickjs_ng --summary all
 ```
 
 CI runs `zig build test-state-tcas` on the Linux governance job (Scheduler/Driver suite + explore gates). Engine harnesses ride `test-engine` via `all_tests.zig`.
+
+The host tooling suite requires `zip` and `unzip` for actual ZIP/HAR packaging fixtures, in addition to the shell, archive and file tools used by the staging scripts. The fixture resolves the host ZIP encoder before applying its test-local PATH and binds that executable into the fixture; it does not emulate an archive encoder. Both TAR and ZIP staging must accept the production-shaped fixture and reject conformance-only content.
+
+## SDK ABI source gate subset
+
+`zig build tool -- check-c-abi` compares SDK declarations with `include/jsbay.h`;
+it is a closed source-shape check, not Kotlin/.NET execution or a general parser.
+Kotlin `Status` requires exactly `val code: Int`; `SubmissionStatus`,
+`ShutdownPhase`, and `AdmissionClass` require exactly `val native: Int`.
+The single constructor property must have no default and every entry must pass
+one explicit canonical nonnegative decimal Int literal. Omitted arguments are
+never interpreted as ordinals. `ValueKind` alone uses bare entries in ordinal
+order, matching `Value.kind()`'s `ValueKind.entries[kind]` lookup; constructor
+arguments and additional members are not supported for that enum.
+
+The Kotlin declarations must be unique top-level enums in `io.jsbay`, without
+extra modifiers, annotations, interfaces, imports or type aliases. Entry bodies,
+extra properties, init blocks, secondary constructors, numeric expressions and
+alternate literal forms are rejected. After the entries, only the current exact
+conversion companion helper (or no members) is supported. Comments and ordinary
+string decoys do not select declarations. Previously documented unsupported
+string/interpolation and escaped-name forms still fail closed. Changes outside
+this subset require an intentional gate update and review; passing it does not
+prove arbitrary surrounding Kotlin code safe. C# enums remain a separate policy
+with their language-defined implicit numbering and existing native layout gate.

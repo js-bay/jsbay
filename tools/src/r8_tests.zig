@@ -15,7 +15,10 @@ test "R8 CLI accepts renamed or merged consumers and rejects unchanged or unrela
     for ([_][]const u8{ "ConsumerMain", "JavaConsumer" }) |name| try fixture.dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(a, "io/jsbay/consumer/{s}.class", .{name}), .data = "class" });
     var zipped = try sdk.run(a, io, &.{ "zip", "-q", "-r", "consumer.jar", "io" }, path);
     defer zipped.deinit();
-    try std.testing.expect(zipped.succeeded());
+    if (!zipped.succeeded()) {
+        std.debug.print("zip failed:\n{s}{s}\n", .{ zipped.result.stdout, zipped.result.stderr });
+        return error.TestUnexpectedResult;
+    }
     const cases = [_]struct { mapping: []const u8, pass: bool }{
         .{ .mapping = "io.jsbay.consumer.ConsumerMain -> io.jsbay.consumer.ConsumerMain:\nio.jsbay.consumer.JavaConsumer -> a.b:\n", .pass = true },
         .{ .mapping = "io.jsbay.consumer.ConsumerMain -> io.jsbay.consumer.ConsumerMain:\n    1:1:void io.jsbay.consumer.JavaConsumer.run():0:0 -> main\n", .pass = true },

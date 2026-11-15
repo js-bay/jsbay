@@ -1378,3 +1378,251 @@ test "c_api: set_event_handler receives interrupt telemetry" {
     try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
     try testing.expect(c_api.jsbay_engine_set_event_handler(id, null, null));
 }
+
+test "c_api: library_backend and capabilities match compile-time backend" {
+    const tag = c_api.jsbay_library_backend();
+    switch (backend.active_backend) {
+        .quickjs_ng => try std.testing.expectEqual(@as(c_int, @backingInt(c_api.BackendC.quickjs_ng)), tag),
+        .quickjs => try std.testing.expectEqual(@as(c_int, @backingInt(c_api.BackendC.quickjs)), tag),
+        .jsc => try std.testing.expectEqual(@as(c_int, @backingInt(c_api.BackendC.jsc)), tag),
+        .escargot => try std.testing.expectEqual(@as(c_int, @backingInt(c_api.BackendC.escargot)), tag),
+        .hermes => try std.testing.expectEqual(@as(c_int, @backingInt(c_api.BackendC.hermes)), tag),
+    }
+
+    try std.testing.expect(!c_api.jsbay_library_capabilities(null));
+    var too_small = c_api.EngineCapabilitiesC{ .struct_size = 0 };
+    try std.testing.expect(!c_api.jsbay_library_capabilities(&too_small));
+
+    var caps = c_api.EngineCapabilitiesC{ .struct_size = @sizeOf(c_api.EngineCapabilitiesC) };
+    try std.testing.expect(c_api.jsbay_library_capabilities(&caps));
+    try std.testing.expectEqual(backend.libraryBackendC(), caps.backend);
+    try std.testing.expectEqual(backend.libraryCapabilityFlags(), caps.flags);
+
+    const F = c_api.CapabilityFlags;
+    // Interrupt/deadline exist for QJS/JSC mid-script cancel; Escargot/Hermes refuse requestInterrupt so the bit stays clear.
+    if (backend.isSpikeBackend(backend.active_backend)) {
+        try std.testing.expect((caps.flags & F.interrupt_deadline) == 0);
+    } else {
+        try std.testing.expect((caps.flags & F.interrupt_deadline) != 0);
+    }
+    if (backend.isQuickJsApiBackend(backend.active_backend)) {
+        try std.testing.expect((caps.flags & F.heap_stack_limit) != 0);
+        try std.testing.expect((caps.flags & F.heap_usage_snapshot) != 0);
+        try std.testing.expect((caps.flags & F.explicit_bytecode) != 0);
+        if (@import("build_options").bytecode_cache) {
+            try std.testing.expect((caps.flags & F.persistent_bytecode_cache) != 0);
+        } else {
+            try std.testing.expect((caps.flags & F.persistent_bytecode_cache) == 0);
+        }
+        try std.testing.expect((caps.flags & F.safari_web_inspector) == 0);
+    } else {
+        try std.testing.expect((caps.flags & F.heap_stack_limit) == 0);
+        try std.testing.expect((caps.flags & F.heap_usage_snapshot) == 0);
+        try std.testing.expect((caps.flags & F.explicit_bytecode) == 0);
+        try std.testing.expect((caps.flags & F.persistent_bytecode_cache) == 0);
+        try std.testing.expectEqual(backend.active_backend == .jsc, (caps.flags & F.safari_web_inspector) != 0);
+    }
+    if (backend.active_backend != .jsc and @import("build_options").inspector) {
+        try std.testing.expect((caps.flags & F.cdp_source_debugger) != 0);
+    } else {
+        try std.testing.expect((caps.flags & F.cdp_source_debugger) == 0);
+    }
+}
+
+test "c_api: create_with_options primary packed succeeds; non-packed fails" {
+
+    // Default / primary tag → full create.
+    {
+        const id = helpers.nextInstanceId();
+        var opts = c_api.EngineCreateOptionsC{
+            .struct_size = @sizeOf(c_api.EngineCreateOptionsC),
+            .backend = .primary,
+        };
+        try std.testing.expect(c_api.jsbay_engine_create_with_options(id, &opts));
+        defer c_api.jsbay_engine_destroy(id);
+    }
+    {
+        const id = helpers.nextInstanceId();
+        var opts = c_api.EngineCreateOptionsC{
+            .struct_size = @sizeOf(c_api.EngineCreateOptionsC),
+            .backend = backend.libraryBackendC(),
+        };
+        try std.testing.expect(c_api.jsbay_engine_create_with_options(id, &opts));
+        defer c_api.jsbay_engine_destroy(id);
+    }
+
+    try std.testing.expect(!c_api.jsbay_engine_create_with_options(helpers.nextInstanceId(), null));
+    var too_small = c_api.EngineCreateOptionsC{ .struct_size = 0, .backend = .primary };
+    try std.testing.expect(!c_api.jsbay_engine_create_with_options(helpers.nextInstanceId(), &too_small));
+
+    // Pick a backend that is not packed in this artifact.
+    const candidates = [_]c_api.BackendC{ .quickjs_ng, .quickjs, .jsc };
+    var found_unpacked = false;
+    for (candidates) |cand| {
+        const tag = backend.backendFromC(@backingInt(cand)).?;
+        if (backend.isPacked(tag)) continue;
+        found_unpacked = true;
+        var opts = c_api.EngineCreateOptionsC{
+            .struct_size = @sizeOf(c_api.EngineCreateOptionsC),
+            .backend = cand,
+        };
+        try std.testing.expect(!c_api.jsbay_engine_create_with_options(helpers.nextInstanceId(), &opts));
+        break;
+    }
+    // With a single packed engine, at least one of the three tags is unpacked.
+    try std.testing.expect(found_unpacked);
+
+    // Unknown backend enum value.
+    var bogus = c_api.EngineCreateOptionsC{
+        .struct_size = @sizeOf(c_api.EngineCreateOptionsC),
+        .backend = @fromBackingInt(@intCast(99)),
+    };
+    try std.testing.expect(!c_api.jsbay_engine_create_with_options(helpers.nextInstanceId(), &bogus));
+}
+
+test "c_api: engine version reports package backend and stable pointers" {
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(c_api.VersionInfo, "struct_size"));
+    try std.testing.expectEqual(@alignOf(?[*:0]const u8), @offsetOf(c_api.VersionInfo, "version"));
+    try std.testing.expectEqual(@offsetOf(c_api.VersionInfo, "version") + @sizeOf(?[*:0]const u8), @offsetOf(c_api.VersionInfo, "commit"));
+    try std.testing.expectEqual(@offsetOf(c_api.VersionInfo, "commit") + @sizeOf(?[*:0]const u8), @offsetOf(c_api.VersionInfo, "backend"));
+    var info = c_api.VersionInfo{ .struct_size = @sizeOf(c_api.VersionInfo) };
+    try std.testing.expect(c_api.jsbay_engine_version(&info));
+    const version = info.version orelse return error.MissingVersion;
+    const commit = info.commit orelse return error.MissingCommit;
+    const backend_name = info.backend orelse return error.MissingBackend;
+    try std.testing.expectEqualStrings(@import("build_options").package_version, std.mem.span(version));
+    try std.testing.expectEqualStrings(@import("build_options").git_commit, std.mem.span(commit));
+    try std.testing.expectEqualStrings(@import("build_options").backend_name, std.mem.span(backend_name));
+    try std.testing.expectEqualStrings(@tagName(backend.active_backend), std.mem.span(backend_name));
+
+    var again = c_api.VersionInfo{ .struct_size = @sizeOf(c_api.VersionInfo) };
+    try std.testing.expect(c_api.jsbay_engine_version(&again));
+    try std.testing.expect(info.version == again.version);
+    try std.testing.expect(info.commit == again.commit);
+    try std.testing.expect(info.backend == again.backend);
+
+    var too_small = c_api.VersionInfo{ .struct_size = 0 };
+    try std.testing.expect(!c_api.jsbay_engine_version(&too_small));
+    try std.testing.expect(!c_api.jsbay_engine_version(null));
+}
+
+const ValueScopeJsProbe = struct {
+    instance_id: c_int,
+    create_status: c_int = -1,
+    get_status: c_int = -1,
+    exception_type_status: c_int = -1,
+    exception_release_status: c_int = -1,
+    object_release_status: c_int = -1,
+    recovery_status: c_int = -1,
+    recovery_number_status: c_int = -1,
+    exception_kind: c_int = -1,
+    recovery_number: f64 = 0,
+
+    fn callback(user_data: ?*anyopaque) callconv(.c) void {
+        const self: *ValueScopeJsProbe = @ptrCast(@alignCast(user_data.?));
+        const source = "Object.defineProperty({}, 'failing', { get() { throw new Error('scope getter'); } })";
+        const filename = "<value-scope-getter>";
+        var object: u64 = 0;
+        var exception: u64 = 0;
+        self.create_status = c_api.jsbay_engine_evaluate(self.instance_id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &object, &exception);
+        if (self.create_status == @as(c_int, 0)) {
+            const key = "failing";
+            var property: u64 = 0;
+            self.get_status = c_api.jsbay_value_get(object, .{ .data = key.ptr, .len = key.len }, &property, &exception);
+            if (exception != 0) {
+                self.exception_type_status = c_api.jsbay_value_type(exception, &self.exception_kind);
+                self.exception_release_status = c_api.jsbay_value_release(exception);
+                exception = 0;
+            }
+            if (property != 0) _ = c_api.jsbay_value_release(property);
+            self.object_release_status = c_api.jsbay_value_release(object);
+        }
+        if (exception != 0) _ = c_api.jsbay_value_release(exception);
+
+        const recovery_source = "6 * 7";
+        const recovery_filename = "<value-scope-recovery>";
+        var result: u64 = 0;
+        exception = 0;
+        self.recovery_status = c_api.jsbay_engine_evaluate(self.instance_id, .{ .data = recovery_source.ptr, .len = recovery_source.len }, .{ .data = recovery_filename.ptr, .len = recovery_filename.len }, null, &result, &exception);
+        if (self.recovery_status == @as(c_int, 0)) self.recovery_number_status = c_api.jsbay_value_to_number(result, &self.recovery_number);
+        if (result != 0) _ = c_api.jsbay_value_release(result);
+        if (exception != 0) _ = c_api.jsbay_value_release(exception);
+    }
+};
+
+const ValueScopeWrongThreadProbe = struct {
+    instance_id: c_int,
+    status: c_int = -1,
+    called: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn callback(user_data: ?*anyopaque) callconv(.c) void {
+        const self: *ValueScopeWrongThreadProbe = @ptrCast(@alignCast(user_data.?));
+        self.called.store(true, .release);
+    }
+
+    fn run(self: *ValueScopeWrongThreadProbe) void {
+        self.status = c_api.jsbay_engine_with_value_scope(self.instance_id, callback, self);
+    }
+};
+
+test "c_api: value scope continues after a throwing getter" {
+    const id = @import("test_helpers.zig").nextInstanceId();
+    try std.testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+
+    var probe = ValueScopeJsProbe{ .instance_id = id };
+    try std.testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_with_value_scope(id, ValueScopeJsProbe.callback, &probe));
+    try std.testing.expectEqual(@as(c_int, 0), probe.create_status);
+    try std.testing.expectEqual(@as(c_int, 1), probe.get_status);
+    try std.testing.expectEqual(@as(c_int, 0), probe.exception_type_status);
+    try std.testing.expectEqual(@as(c_int, 5), probe.exception_kind);
+    try std.testing.expectEqual(@as(c_int, 0), probe.exception_release_status);
+    try std.testing.expectEqual(@as(c_int, 0), probe.object_release_status);
+    try std.testing.expectEqual(@as(c_int, 0), probe.recovery_status);
+    try std.testing.expectEqual(@as(c_int, 0), probe.recovery_number_status);
+    try std.testing.expectEqual(@as(f64, 42), probe.recovery_number);
+}
+
+test "c_api: value scope rejects null callback, missing instance, and wrong thread" {
+    const id = @import("test_helpers.zig").nextInstanceId();
+    try std.testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+
+    try std.testing.expectEqual(@as(c_int, 2), c_api.jsbay_engine_with_value_scope(id, null, null));
+
+    var missing_called = false;
+    const MissingProbe = struct {
+        fn callback(user_data: ?*anyopaque) callconv(.c) void {
+            const called: *bool = @ptrCast(@alignCast(user_data.?));
+            called.* = true;
+        }
+    };
+    try std.testing.expectEqual(@as(c_int, 4), c_api.jsbay_engine_with_value_scope(id + 100000, MissingProbe.callback, &missing_called));
+    try std.testing.expect(!missing_called);
+
+    var wrong_thread = ValueScopeWrongThreadProbe{ .instance_id = id };
+    const thread = try std.Thread.spawn(.{}, ValueScopeWrongThreadProbe.run, .{&wrong_thread});
+    thread.join();
+    try std.testing.expectEqual(@as(c_int, 3), wrong_thread.status);
+    try std.testing.expect(!wrong_thread.called.load(.acquire));
+}
+
+test "c_api: resource limit helpers reject bad struct_size and null set" {
+    const id = helpers.nextInstanceId();
+    var bad = c_api.ResourceLimitsC{
+        .struct_size = 4,
+        .max_timers = 1,
+        .max_tsfn_handles = 1,
+        .max_pending_calls = 1,
+        .max_pending_bytes = 1,
+        .max_pending_tasks = 1,
+    };
+    try std.testing.expect(!c_api.jsbay_engine_create_with_limits(id, null, null, &bad));
+    try std.testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+    try std.testing.expect(!c_api.jsbay_engine_set_resource_limits(id, null));
+    var usage = c_api.ResourceUsageC{ .struct_size = 4, .timers = 0, .tsfn_handles = 0, .pending_calls = 0, .native_tasks = 0, .script_tasks = 0, .pending_bytes = 0, .max_timers = 0, .max_tsfn_handles = 0, .max_pending_calls = 0, .max_pending_bytes = 0, .max_pending_tasks = 0 };
+    try std.testing.expect(!c_api.jsbay_engine_get_resource_usage(id, &usage));
+    var global = c_api.ResourceGlobalUsageC{ .struct_size = 4, .timers = 0, .tsfn_handles = 0, .pending_calls = 0, .native_tasks = 0, .script_tasks = 0, .pending_bytes = 0, .max_timers = 0, .max_tsfn_handles = 0, .max_pending_calls = 0, .max_native_tasks = 0, .max_script_tasks = 0, .max_pending_bytes = 0 };
+    try std.testing.expect(!c_api.jsbay_resource_global_usage(&global));
+}

@@ -60,56 +60,6 @@ pub export fn jsbay_library_capabilities(out_caps: ?*EngineCapabilitiesC) bool {
     return true;
 }
 
-test "c_api: library_backend and capabilities match compile-time backend" {
-    const tag = jsbay_library_backend();
-    switch (backend.active_backend) {
-        .quickjs_ng => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.quickjs_ng)), tag),
-        .quickjs => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.quickjs)), tag),
-        .jsc => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.jsc)), tag),
-        .escargot => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.escargot)), tag),
-        .hermes => try std.testing.expectEqual(@as(c_int, @backingInt(BackendC.hermes)), tag),
-    }
-
-    try std.testing.expect(!jsbay_library_capabilities(null));
-    var too_small = EngineCapabilitiesC{ .struct_size = 0 };
-    try std.testing.expect(!jsbay_library_capabilities(&too_small));
-
-    var caps = EngineCapabilitiesC{ .struct_size = @sizeOf(EngineCapabilitiesC) };
-    try std.testing.expect(jsbay_library_capabilities(&caps));
-    try std.testing.expectEqual(backend.libraryBackendC(), caps.backend);
-    try std.testing.expectEqual(backend.libraryCapabilityFlags(), caps.flags);
-
-    const F = CapabilityFlags;
-    // Interrupt/deadline exist for QJS/JSC mid-script cancel; Escargot/Hermes refuse requestInterrupt so the bit stays clear.
-    if (backend.isSpikeBackend(backend.active_backend)) {
-        try std.testing.expect((caps.flags & F.interrupt_deadline) == 0);
-    } else {
-        try std.testing.expect((caps.flags & F.interrupt_deadline) != 0);
-    }
-    if (backend.isQuickJsApiBackend(backend.active_backend)) {
-        try std.testing.expect((caps.flags & F.heap_stack_limit) != 0);
-        try std.testing.expect((caps.flags & F.heap_usage_snapshot) != 0);
-        try std.testing.expect((caps.flags & F.explicit_bytecode) != 0);
-        if (@import("build_options").bytecode_cache) {
-            try std.testing.expect((caps.flags & F.persistent_bytecode_cache) != 0);
-        } else {
-            try std.testing.expect((caps.flags & F.persistent_bytecode_cache) == 0);
-        }
-        try std.testing.expect((caps.flags & F.safari_web_inspector) == 0);
-    } else {
-        try std.testing.expect((caps.flags & F.heap_stack_limit) == 0);
-        try std.testing.expect((caps.flags & F.heap_usage_snapshot) == 0);
-        try std.testing.expect((caps.flags & F.explicit_bytecode) == 0);
-        try std.testing.expect((caps.flags & F.persistent_bytecode_cache) == 0);
-        try std.testing.expectEqual(backend.active_backend == .jsc, (caps.flags & F.safari_web_inspector) != 0);
-    }
-    if (backend.active_backend != .jsc and @import("build_options").inspector) {
-        try std.testing.expect((caps.flags & F.cdp_source_debugger) != 0);
-    } else {
-        try std.testing.expect((caps.flags & F.cdp_source_debugger) == 0);
-    }
-}
-
 const multi_pack = @import("multi_pack.zig");
 
 pub const EngineCreateOptionsC = extern struct {
@@ -213,58 +163,6 @@ test "c_api: available_backends matches packed bits" {
         try std.testing.expectEqual(n, reported);
         try std.testing.expect(one[0] != .primary);
     }
-}
-
-test "c_api: create_with_options primary packed succeeds; non-packed fails" {
-    const helpers = @import("tests/test_helpers.zig");
-
-    // Default / primary tag → full create.
-    {
-        const id = helpers.nextInstanceId();
-        var opts = EngineCreateOptionsC{
-            .struct_size = @sizeOf(EngineCreateOptionsC),
-            .backend = .primary,
-        };
-        try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
-        defer jsbay_engine_destroy(id);
-    }
-    {
-        const id = helpers.nextInstanceId();
-        var opts = EngineCreateOptionsC{
-            .struct_size = @sizeOf(EngineCreateOptionsC),
-            .backend = backend.libraryBackendC(),
-        };
-        try std.testing.expect(jsbay_engine_create_with_options(id, &opts));
-        defer jsbay_engine_destroy(id);
-    }
-
-    try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), null));
-    var too_small = EngineCreateOptionsC{ .struct_size = 0, .backend = .primary };
-    try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), &too_small));
-
-    // Pick a backend that is not packed in this artifact.
-    const candidates = [_]BackendC{ .quickjs_ng, .quickjs, .jsc };
-    var found_unpacked = false;
-    for (candidates) |cand| {
-        const tag = backend.backendFromC(@backingInt(cand)).?;
-        if (backend.isPacked(tag)) continue;
-        found_unpacked = true;
-        var opts = EngineCreateOptionsC{
-            .struct_size = @sizeOf(EngineCreateOptionsC),
-            .backend = cand,
-        };
-        try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), &opts));
-        break;
-    }
-    // With a single packed engine, at least one of the three tags is unpacked.
-    try std.testing.expect(found_unpacked);
-
-    // Unknown backend enum value.
-    var bogus = EngineCreateOptionsC{
-        .struct_size = @sizeOf(EngineCreateOptionsC),
-        .backend = @fromBackingInt(@intCast(99)),
-    };
-    try std.testing.expect(!jsbay_engine_create_with_options(helpers.nextInstanceId(), &bogus));
 }
 
 test "c_api: create_with_options non-primary packed create eval destroy" {
@@ -1248,32 +1146,6 @@ pub export fn jsbay_engine_version(out: ?*VersionInfo) bool {
     return true;
 }
 
-test "c_api: engine version reports package backend and stable pointers" {
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(VersionInfo, "struct_size"));
-    try std.testing.expectEqual(@alignOf(?[*:0]const u8), @offsetOf(VersionInfo, "version"));
-    try std.testing.expectEqual(@offsetOf(VersionInfo, "version") + @sizeOf(?[*:0]const u8), @offsetOf(VersionInfo, "commit"));
-    try std.testing.expectEqual(@offsetOf(VersionInfo, "commit") + @sizeOf(?[*:0]const u8), @offsetOf(VersionInfo, "backend"));
-    var info = VersionInfo{ .struct_size = @sizeOf(VersionInfo) };
-    try std.testing.expect(jsbay_engine_version(&info));
-    const version = info.version orelse return error.MissingVersion;
-    const commit = info.commit orelse return error.MissingCommit;
-    const backend_name = info.backend orelse return error.MissingBackend;
-    try std.testing.expectEqualStrings(@import("build_options").package_version, std.mem.span(version));
-    try std.testing.expectEqualStrings(@import("build_options").git_commit, std.mem.span(commit));
-    try std.testing.expectEqualStrings(@import("build_options").backend_name, std.mem.span(backend_name));
-    try std.testing.expectEqualStrings(@tagName(backend.active_backend), std.mem.span(backend_name));
-
-    var again = VersionInfo{ .struct_size = @sizeOf(VersionInfo) };
-    try std.testing.expect(jsbay_engine_version(&again));
-    try std.testing.expect(info.version == again.version);
-    try std.testing.expect(info.commit == again.commit);
-    try std.testing.expect(info.backend == again.backend);
-
-    var too_small = VersionInfo{ .struct_size = 0 };
-    try std.testing.expect(!jsbay_engine_version(&too_small));
-    try std.testing.expect(!jsbay_engine_version(null));
-}
-
 pub export fn jsbay_engine_create(
     instance_id: c_int,
     log_handler: ?types.LogHandler,
@@ -1354,65 +1226,6 @@ const ValueScopeDestroyProbe = struct {
     }
 };
 
-const ValueScopeJsProbe = struct {
-    instance_id: c_int,
-    create_status: c_int = -1,
-    get_status: c_int = -1,
-    exception_type_status: c_int = -1,
-    exception_release_status: c_int = -1,
-    object_release_status: c_int = -1,
-    recovery_status: c_int = -1,
-    recovery_number_status: c_int = -1,
-    exception_kind: c_int = -1,
-    recovery_number: f64 = 0,
-
-    fn callback(user_data: ?*anyopaque) callconv(.c) void {
-        const self: *ValueScopeJsProbe = @ptrCast(@alignCast(user_data.?));
-        const source = "Object.defineProperty({}, 'failing', { get() { throw new Error('scope getter'); } })";
-        const filename = "<value-scope-getter>";
-        var object: u64 = 0;
-        var exception: u64 = 0;
-        self.create_status = jsbay_engine_evaluate(self.instance_id, .{ .data = source.ptr, .len = source.len }, .{ .data = filename.ptr, .len = filename.len }, null, &object, &exception);
-        if (self.create_status == API_OK) {
-            const key = "failing";
-            var property: u64 = 0;
-            self.get_status = jsbay_value_get(object, .{ .data = key.ptr, .len = key.len }, &property, &exception);
-            if (exception != 0) {
-                self.exception_type_status = jsbay_value_type(exception, &self.exception_kind);
-                self.exception_release_status = jsbay_value_release(exception);
-                exception = 0;
-            }
-            if (property != 0) _ = jsbay_value_release(property);
-            self.object_release_status = jsbay_value_release(object);
-        }
-        if (exception != 0) _ = jsbay_value_release(exception);
-
-        const recovery_source = "6 * 7";
-        const recovery_filename = "<value-scope-recovery>";
-        var result: u64 = 0;
-        exception = 0;
-        self.recovery_status = jsbay_engine_evaluate(self.instance_id, .{ .data = recovery_source.ptr, .len = recovery_source.len }, .{ .data = recovery_filename.ptr, .len = recovery_filename.len }, null, &result, &exception);
-        if (self.recovery_status == API_OK) self.recovery_number_status = jsbay_value_to_number(result, &self.recovery_number);
-        if (result != 0) _ = jsbay_value_release(result);
-        if (exception != 0) _ = jsbay_value_release(exception);
-    }
-};
-
-const ValueScopeWrongThreadProbe = struct {
-    instance_id: c_int,
-    status: c_int = -1,
-    called: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn callback(user_data: ?*anyopaque) callconv(.c) void {
-        const self: *ValueScopeWrongThreadProbe = @ptrCast(@alignCast(user_data.?));
-        self.called.store(true, .release);
-    }
-
-    fn run(self: *ValueScopeWrongThreadProbe) void {
-        self.status = jsbay_engine_with_value_scope(self.instance_id, callback, self);
-    }
-};
-
 test "c_api: value scope batches typed calls without moving the stack anchor" {
     const id = @import("tests/test_helpers.zig").nextInstanceId();
     try std.testing.expect(jsbay_engine_create(id, null, null));
@@ -1441,48 +1254,6 @@ test "c_api: value scope holds destruction until callback returns" {
     try std.testing.expect(probe.context_alive_in_callback);
     try std.testing.expectEqual(API_INSTANCE_NOT_FOUND, probe.post_destroy_status);
     try std.testing.expect(engine.getContext(id) == null);
-}
-
-test "c_api: value scope continues after a throwing getter" {
-    const id = @import("tests/test_helpers.zig").nextInstanceId();
-    try std.testing.expect(jsbay_engine_create(id, null, null));
-    defer jsbay_engine_destroy(id);
-
-    var probe = ValueScopeJsProbe{ .instance_id = id };
-    try std.testing.expectEqual(API_OK, jsbay_engine_with_value_scope(id, ValueScopeJsProbe.callback, &probe));
-    try std.testing.expectEqual(API_OK, probe.create_status);
-    try std.testing.expectEqual(API_EXCEPTION, probe.get_status);
-    try std.testing.expectEqual(API_OK, probe.exception_type_status);
-    try std.testing.expectEqual(@as(c_int, 5), probe.exception_kind);
-    try std.testing.expectEqual(API_OK, probe.exception_release_status);
-    try std.testing.expectEqual(API_OK, probe.object_release_status);
-    try std.testing.expectEqual(API_OK, probe.recovery_status);
-    try std.testing.expectEqual(API_OK, probe.recovery_number_status);
-    try std.testing.expectEqual(@as(f64, 42), probe.recovery_number);
-}
-
-test "c_api: value scope rejects null callback, missing instance, and wrong thread" {
-    const id = @import("tests/test_helpers.zig").nextInstanceId();
-    try std.testing.expect(jsbay_engine_create(id, null, null));
-    defer jsbay_engine_destroy(id);
-
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_engine_with_value_scope(id, null, null));
-
-    var missing_called = false;
-    const MissingProbe = struct {
-        fn callback(user_data: ?*anyopaque) callconv(.c) void {
-            const called: *bool = @ptrCast(@alignCast(user_data.?));
-            called.* = true;
-        }
-    };
-    try std.testing.expectEqual(API_INSTANCE_NOT_FOUND, jsbay_engine_with_value_scope(id + 100000, MissingProbe.callback, &missing_called));
-    try std.testing.expect(!missing_called);
-
-    var wrong_thread = ValueScopeWrongThreadProbe{ .instance_id = id };
-    const thread = try std.Thread.spawn(.{}, ValueScopeWrongThreadProbe.run, .{&wrong_thread});
-    thread.join();
-    try std.testing.expectEqual(API_WRONG_THREAD, wrong_thread.status);
-    try std.testing.expect(!wrong_thread.called.load(.acquire));
 }
 
 test "c_api: engine creation keeps recursion below native stack limits" {
@@ -2175,154 +1946,46 @@ const API_OUT_OF_MEMORY: c_int = 6;
 const API_UNSUPPORTED: c_int = 7;
 const API_LOOP_FAILED: c_int = 8;
 
-const ApiOp = struct {
-    id: i32,
-    ctx: ActiveEngine.Context,
-    lease: engine_thread.EvalLease,
-    entered_js: bool,
-    allocator: std.mem.Allocator,
-    execution: ?@import("runtime/js_scheduler.zig").Execution = null,
+const value_operation = @import("abi/value_operation.zig").Operations(Bytes, .{
+    .API_OK = API_OK,
+    .API_EXCEPTION = API_EXCEPTION,
+    .API_INVALID_ARGUMENT = API_INVALID_ARGUMENT,
+    .API_WRONG_THREAD = API_WRONG_THREAD,
+    .API_INSTANCE_NOT_FOUND = API_INSTANCE_NOT_FOUND,
+    .API_STALE_VALUE = API_STALE_VALUE,
+    .API_OUT_OF_MEMORY = API_OUT_OF_MEMORY,
+    .API_UNSUPPORTED = API_UNSUPPORTED,
+    .API_LOOP_FAILED = API_LOOP_FAILED,
+});
 
-    fn deinit(self: *ApiOp) void {
-        if (self.execution) |*execution| @import("runtime/js_scheduler.zig").checkpointAfterExecution(execution, self.ctx);
-        self.execution = null;
-        // Raw typed operations below use backend C APIs directly.  Keep the QuickJS stack anchor around the entire admission lease, including re-entrant getter/toString/native-callback execution.
-        if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
-            if (self.entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(self.ctx);
-        }
-        engine.finishEvalEntry(self.id, self.lease);
-    }
-};
+const ApiOp = value_operation.ApiOp;
 
-const ApiOpResult = union(enum) { ok: ApiOp, status: c_int };
+const ApiOpResult = value_operation.ApiOpResult;
 
-fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
-    if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
-    if (@import("runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
-    if (!api_value.isOwner(id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    const lease = engine_thread.beginEval(id);
-    if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    const inst = @import("runtime/instance_map.zig").getInstance(id) orelse {
-        engine.finishEvalEntry(id, lease);
-        return .{ .status = API_INSTANCE_NOT_FOUND };
-    };
-    if (inst.loop.lastError() != null) {
-        engine.finishEvalEntry(id, lease);
-        return .{ .status = API_LOOP_FAILED };
-    }
-    const ctx = inst.monoCtx() orelse {
-        engine.finishEvalEntry(id, lease);
-        return .{ .status = API_INSTANCE_NOT_FOUND };
-    };
-    const entered_js = if (comptime backend.isQuickJsApiBackend(backend.active_backend)) backend.ActiveEngineModule.lifecycle.enterJs(ctx) else true;
-    if (!entered_js) {
-        engine.finishEvalEntry(id, lease);
-        return .{ .status = API_WRONG_THREAD };
-    }
-    if (!require_execution) return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator } };
-    const execution = @import("runtime/js_scheduler.zig").beginExecution(id) orelse {
-        if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
-            if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
-        }
-        engine.finishEvalEntry(id, lease);
-        return .{ .status = API_INSTANCE_NOT_FOUND };
-    };
-    return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator, .execution = execution } };
-}
+const beginApiOpMode = value_operation.beginApiOpMode;
 
-fn beginApiOp(id: i32) ApiOpResult {
-    return beginApiOpMode(id, true);
-}
+const beginApiOp = value_operation.beginApiOp;
 
-fn beginCleanupApiOp(id: i32) ApiOpResult {
-    return beginApiOpMode(id, false);
-}
+const beginCleanupApiOp = value_operation.beginCleanupApiOp;
 
-fn apiContext(instance_id: i32) union(enum) { ok: ActiveEngine.Context, status: c_int } {
-    const ptrs = @import("runtime/instance_map.zig").getPtrs(instance_id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
-    if (!api_value.isOwner(instance_id)) return .{ .status = API_WRONG_THREAD };
-    return .{ .ok = ptrs.ctx };
-}
+const apiContext = value_operation.apiContext;
 
 /// Resolve a public handle while keeping the runtime admitted for the whole operation.  A handle lookup alone is not sufficient: a callback may ask to destroy its engine and otherwise leave the remainder of this API call with a freed context.
-const ValueOp = struct {
-    op: ApiOp,
-    value: ActiveEngine.Value,
+const ValueOp = value_operation.ValueOp;
 
-    fn deinit(self: *ValueOp) void {
-        ActiveEngine.freeValue(self.op.ctx, self.value);
-        self.op.deinit();
-    }
-};
+const beginValueOp = value_operation.beginValueOp;
 
-fn beginValueOp(handle: u64) union(enum) { ok: ValueOp, status: c_int } {
-    const entry = api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
-    var op = switch (beginApiOp(entry.instance_id)) {
-        .status => |status| return .{ .status = status },
-        .ok => |value| value,
-    };
-    // Re-read while admitted, then pin a backend reference. A getter/toString can re-enter the C ABI and release the public handle being operated on.
-    const live = api_value.get(handle) orelse {
-        op.deinit();
-        return .{ .status = API_STALE_VALUE };
-    };
-    if (live.instance_id != op.id) {
-        op.deinit();
-        return .{ .status = API_STALE_VALUE };
-    }
-    return .{ .ok = .{ .op = op, .value = ActiveEngine.dupValue(op.ctx, live.value) } };
-}
+const pinValue = value_operation.pinValue;
 
-fn pinValue(op: ApiOp, handle: u64) union(enum) { ok: ActiveEngine.Value, status: c_int } {
-    const entry = api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
-    if (entry.instance_id != op.id) return .{ .status = API_STALE_VALUE };
-    return .{ .ok = ActiveEngine.dupValue(op.ctx, entry.value) };
-}
+const apiStore = value_operation.apiStore;
 
-fn apiStore(instance_id: i32, value: ActiveEngine.Value, out: *u64) c_int {
-    out.* = 0;
-    // A getter/native callback may request destroy while raw backend work is re-entered. Never publish a value that is invalid as soon as this C call returns; retain the backend ownership only long enough to release it.
-    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
-        if (@import("runtime/instance_map.zig").getPtrs(instance_id)) |ptrs| ActiveEngine.freeValue(ptrs.ctx, value);
-        return API_INSTANCE_NOT_FOUND;
-    }
-    out.* = api_value.putOwned(instance_id, value) orelse {
-        if (@import("runtime/instance_map.zig").getPtrs(instance_id)) |ptrs| ActiveEngine.freeValue(ptrs.ctx, value);
-        return API_OUT_OF_MEMORY;
-    };
-    return API_OK;
-}
+const drainApiJobs = value_operation.drainApiJobs;
 
-fn drainApiJobs(op: *ApiOp) bool {
-    const map = @import("runtime/instance_map.zig");
-    if (op.execution) |*execution| {
-        if (!map.isTeardownPending(op.id)) @import("runtime/js_scheduler.zig").checkpointAfterExecution(execution, op.ctx) else execution.end();
-        op.execution = null;
-    }
-    return !map.isTeardownPending(op.id);
-}
+const discardBackendResult = value_operation.discardBackendResult;
 
-fn discardBackendResult(ctx: ActiveEngine.Context, result: api_backend.Result) void {
-    switch (result) {
-        .ok => |value| ActiveEngine.freeValue(ctx, value),
-        .exception => |exception| ActiveEngine.freeValue(ctx, exception),
-        .out_of_memory => {},
-    }
-}
+const discardBytesResult = value_operation.discardBytesResult;
 
-fn discardBytesResult(ctx: ActiveEngine.Context, result: api_backend.BytesResult) void {
-    switch (result) {
-        .ok => |bytes| std.heap.c_allocator.free(bytes),
-        .exception => |exception| ActiveEngine.freeValue(ctx, exception),
-        .out_of_memory, .invalid_argument => {},
-    }
-}
-
-fn discardTypedBytecodeResult(ctx: ActiveEngine.Context, result: typed_bytecode.Result) void {
-    if (result.bytes) |bytes| typed_bytecode.freeBytes(bytes);
-    if (result.value) |value| ActiveEngine.freeValue(ctx, value);
-    if (result.exception) |exception| ActiveEngine.freeValue(ctx, exception);
-}
+const discardTypedBytecodeResult = value_operation.discardTypedBytecodeResult;
 
 pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
     out_value.* = 0;
@@ -2412,9 +2075,7 @@ fn apiNewSimple(instance_id_raw: c_int, out_value: *u64, comptime make: anytype)
     return apiStore(instance_id, make(op.ctx), out_value);
 }
 
-fn packedNewFromResult(instance_id: i32, result: @import("backend_dispatch.zig").EvalValueResult, tag: backend.BackendType, ctx_addr: usize, out_value: *u64) c_int {
-    return packedPublish(instance_id, tag, ctx_addr, result, out_value, null);
-}
+const packedNewFromResult = value_operation.packedNewFromResult;
 
 pub export fn jsbay_value_undefined(instance_id: c_int, out_value: *u64) c_int {
     out_value.* = 0;
@@ -2818,76 +2479,18 @@ const host_string_values = struct {
     }
 };
 
-fn packedHandlesOf(instance_id: i32) ?@import("backend_dispatch.zig").Handles {
-    const inst = @import("runtime/instance_map.zig").getInstance(instance_id) orelse return null;
-    return switch (inst.engine_handles) {
-        .packed_alt => |a| .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr },
-        .mono => null,
-    };
-}
+const packedHandlesOf = value_operation.packedHandlesOf;
 
-const PackedJsOp = struct {
-    id: i32,
-    tag: backend.BackendType,
-    ctx_addr: usize,
-    lease: engine_thread.EvalLease,
-    entered_js: bool,
-    allocator: std.mem.Allocator,
-    execution: ?@import("runtime/js_scheduler.zig").Execution = null,
-
-    fn deinit(self: *PackedJsOp) void {
-        if (self.execution) |*execution| @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(execution);
-        self.execution = null;
-        if (self.entered_js) @import("backend_dispatch.zig").leaveJsPacked(self.tag, self.ctx_addr);
-        engine.finishEvalEntry(self.id, self.lease);
-    }
-};
+const PackedJsOp = value_operation.PackedJsOp;
 
 /// Admission lease for packed-alt value ops that may execute JavaScript (mirrors beginApiOp / beginValueOp).
-const PackedJsOpResult = union(enum) { ok: PackedJsOp, status: c_int };
+const PackedJsOpResult = value_operation.PackedJsOpResult;
 
-fn beginPackedJsOpMode(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, require_execution: bool) PackedJsOpResult {
-    if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
-    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
-    if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    const lease = engine_thread.beginEval(instance_id);
-    if (!lease.allowed) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    const inst = @import("runtime/instance_map.zig").getInstance(instance_id) orelse {
-        engine.finishEvalEntry(instance_id, lease);
-        return .{ .status = API_INSTANCE_NOT_FOUND };
-    };
-    if (inst.loop.lastError() != null) {
-        engine.finishEvalEntry(instance_id, lease);
-        return .{ .status = API_LOOP_FAILED };
-    }
-    if (!@import("backend_dispatch.zig").enterJsPacked(tag, ctx_addr)) {
-        engine.finishEvalEntry(instance_id, lease);
-        return .{ .status = API_WRONG_THREAD };
-    }
-    if (!require_execution) return .{ .ok = .{ .id = instance_id, .tag = tag, .ctx_addr = ctx_addr, .lease = lease, .entered_js = true, .allocator = inst.allocator } };
-    const execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse {
-        @import("backend_dispatch.zig").leaveJsPacked(tag, ctx_addr);
-        engine.finishEvalEntry(instance_id, lease);
-        return .{ .status = API_INSTANCE_NOT_FOUND };
-    };
-    return .{ .ok = .{
-        .id = instance_id,
-        .tag = tag,
-        .ctx_addr = ctx_addr,
-        .lease = lease,
-        .entered_js = true,
-        .allocator = inst.allocator,
-        .execution = execution,
-    } };
-}
+const beginPackedJsOpMode = value_operation.beginPackedJsOpMode;
 
-fn beginPackedJsOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) PackedJsOpResult {
-    return beginPackedJsOpMode(instance_id, tag, ctx_addr, true);
-}
+const beginPackedJsOp = value_operation.beginPackedJsOp;
 
-fn beginPackedCleanupOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) PackedJsOpResult {
-    return beginPackedJsOpMode(instance_id, tag, ctx_addr, false);
-}
+const beginPackedCleanupOp = value_operation.beginPackedCleanupOp;
 
 pub const ValueScopeCallback = ?*const fn (?*anyopaque) callconv(.c) void;
 
@@ -2917,181 +2520,32 @@ pub export fn jsbay_engine_with_value_scope(instance_id: c_int, callback: ValueS
     return API_OK;
 }
 
-const PackedValueOp = struct {
-    js: PackedJsOp,
-    value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined,
-    value_len: usize = 0,
-
-    fn bytes(self: *const PackedValueOp) []const u8 {
-        return self.value_buf[0..self.value_len];
-    }
-
-    fn deinit(self: *PackedValueOp) void {
-        if (self.value_len != 0) {
-            @import("backend_dispatch.zig").timerFreeValue(self.js.tag, self.js.ctx_addr, self.bytes());
-            self.value_len = 0;
-        }
-        self.js.deinit();
-    }
-};
+const PackedValueOp = value_operation.PackedValueOp;
 
 /// Pin a packed handle's backend value for the op lifetime (mirrors beginValueOp for primary).
-fn beginPackedValueOp(handle: u64) union(enum) { ok: PackedValueOp, status: c_int } {
-    const entry = packed_api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
-    if (!api_value.isOwner(entry.instance_id)) {
-        return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(entry.instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    }
-    var js = switch (beginPackedJsOp(entry.instance_id, entry.tag, entry.ctx_addr)) {
-        .status => |status| return .{ .status = status },
-        .ok => |ok| ok,
-    };
-    // Re-read while admitted, then pin. A toPrimitive / getter can re-enter and release the public handle.
-    const live = packed_api_value.get(handle) orelse {
-        js.deinit();
-        return .{ .status = API_STALE_VALUE };
-    };
-    if (live.instance_id != js.id or live.tag != js.tag) {
-        js.deinit();
-        return .{ .status = API_STALE_VALUE };
-    }
-    var op: PackedValueOp = .{ .js = js, .value_len = 0 };
-    op.value_len = @import("backend_dispatch.zig").timerDupValue(live.tag, live.ctx_addr, live.bytes(), op.value_buf[0..]) orelse {
-        op.js.deinit();
-        return .{ .status = API_STALE_VALUE };
-    };
-    return .{ .ok = op };
-}
+const beginPackedValueOp = value_operation.beginPackedValueOp;
 
-fn drainPackedJobs(js: *PackedJsOp) bool {
-    const map = @import("runtime/instance_map.zig");
-    if (js.execution) |*execution| {
-        if (!map.isTeardownPending(js.id)) @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(execution) else execution.end();
-        js.execution = null;
-    }
-    return !map.isTeardownPending(js.id);
-}
+const drainPackedJobs = value_operation.drainPackedJobs;
 
-fn discardPackedEvalResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").EvalValueResult) void {
-    if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, v.slice());
-    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-}
+const discardPackedEvalResult = value_operation.discardPackedEvalResult;
 
-fn discardPackedBytesResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BytesValueResult) void {
-    if (result.bytes) |b| std.heap.c_allocator.free(b);
-    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-}
+const discardPackedBytesResult = value_operation.discardPackedBytesResult;
 
-fn discardPackedBoolResult(tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BoolValueResult) void {
-    if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-}
+const discardPackedBoolResult = value_operation.discardPackedBoolResult;
 
-fn packedTagOf(instance_id: i32) ?backend.BackendType {
-    const inst = @import("runtime/instance_map.zig").getInstance(instance_id) orelse return null;
-    return switch (inst.engine_handles) {
-        .packed_alt => |a| a.tag,
-        .mono => null,
-    };
-}
+const packedTagOf = value_operation.packedTagOf;
 
-fn packedStore(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, erased: @import("backend_dispatch.zig").ErasedValue, out: *u64) c_int {
-    out.* = 0;
-    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
-        @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, erased.slice());
-        return API_INSTANCE_NOT_FOUND;
-    }
-    out.* = packed_api_value.putOwned(instance_id, tag, ctx_addr, erased.slice()) orelse {
-        @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, erased.slice());
-        return API_OUT_OF_MEMORY;
-    };
-    return API_OK;
-}
+const packedStore = value_operation.packedStore;
 
-fn packedPublish(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").EvalValueResult, out_value: *u64, out_exception: ?*u64) c_int {
-    if (out_exception) |exc| exc.* = 0;
-    if (result.out_of_memory) {
-        if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, v.slice());
-        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-        return API_OUT_OF_MEMORY;
-    }
-    if (result.exception) |exc| {
-        if (out_exception) |slot| {
-            const stored = packedStore(instance_id, tag, ctx_addr, exc, slot);
-            return if (stored == API_OK) 1 else stored;
-        }
-        @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, exc.slice());
-        return API_OUT_OF_MEMORY;
-    }
-    if (result.value) |value| return packedStore(instance_id, tag, ctx_addr, value, out_value);
-    // set-style ops succeed with empty result
-    out_value.* = 0;
-    return API_OK;
-}
+const packedPublish = value_operation.packedPublish;
 
-fn packedPublishBool(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BoolValueResult, out_flag: *bool, out_exception: *u64) c_int {
-    out_exception.* = 0;
-    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
-        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-        return API_INSTANCE_NOT_FOUND;
-    }
-    if (result.out_of_memory) {
-        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-        return API_OUT_OF_MEMORY;
-    }
-    if (result.exception) |exc| {
-        const stored = packedStore(instance_id, tag, ctx_addr, exc, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    out_flag.* = result.value;
-    return API_OK;
-}
+const packedPublishBool = value_operation.packedPublishBool;
 
-fn packedPublishBytes(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, result: @import("backend_dispatch.zig").BytesValueResult, out_bytes: *Bytes, out_exception: *u64) c_int {
-    out_exception.* = 0;
-    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
-        if (result.bytes) |b| std.heap.c_allocator.free(b);
-        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-        return API_INSTANCE_NOT_FOUND;
-    }
-    if (result.out_of_memory) {
-        if (result.bytes) |b| std.heap.c_allocator.free(b);
-        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-        return API_OUT_OF_MEMORY;
-    }
-    if (result.invalid_argument) {
-        if (result.bytes) |b| std.heap.c_allocator.free(b);
-        if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-        return API_INVALID_ARGUMENT;
-    }
-    if (result.exception) |exc| {
-        if (result.bytes) |b| std.heap.c_allocator.free(b);
-        const stored = packedStore(instance_id, tag, ctx_addr, exc, out_exception);
-        return if (stored == API_OK) 1 else stored;
-    }
-    const bytes = result.bytes orelse return API_OUT_OF_MEMORY;
-    out_bytes.* = .{ .data = bytes.ptr, .len = bytes.len };
-    return API_OK;
-}
+const packedPublishBytes = value_operation.packedPublishBytes;
 
-fn packedDupBytes(handle: u64, expect_instance: i32, expect_tag: backend.BackendType, out: []u8) ?usize {
-    const entry = packed_api_value.get(handle) orelse return null;
-    if (entry.instance_id != expect_instance or entry.tag != expect_tag) return null;
-    return @import("backend_dispatch.zig").timerDupValue(entry.tag, entry.ctx_addr, entry.bytes(), out);
-}
+const packedDupBytes = value_operation.packedDupBytes;
 
-fn packedInstanceReady(instance_id: i32) union(enum) {
-    ok: struct { tag: backend.BackendType, ctx_addr: usize },
-    status: c_int,
-} {
-    if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
-    if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
-    if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-    const tag = packedTagOf(instance_id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
-    const handles = packedHandlesOf(instance_id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
-    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
-        if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
-    }
-    return .{ .ok = .{ .tag = tag, .ctx_addr = handles.ctx_addr } };
-}
+const packedInstanceReady = value_operation.packedInstanceReady;
 
 fn evaluatePackedAlt(instance_id: i32, source: []const u8, filename: []const u8, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
@@ -3791,26 +3245,7 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
 }
 
 /// Publish a boolean backend result, or its original throw value, once the microtask checkpoint has run. A checkpoint that tears the instance down publishes nothing.
-fn finishBoolOp(op: *ApiOp, result: api_backend.BoolResult, out_flag: *bool, out_exception: *u64) c_int {
-    if (!drainApiJobs(op)) {
-        switch (result) {
-            .exception => |exception| ActiveEngine.freeValue(op.ctx, exception),
-            .ok, .out_of_memory => {},
-        }
-        return API_INSTANCE_NOT_FOUND;
-    }
-    switch (result) {
-        .ok => |val| {
-            out_flag.* = val;
-            return API_OK;
-        },
-        .exception => |exception| {
-            const stored = apiStore(op.id, exception, out_exception);
-            return if (stored == API_OK) 1 else stored;
-        },
-        .out_of_memory => return API_OUT_OF_MEMORY,
-    }
-}
+const finishBoolOp = value_operation.finishBoolOp;
 
 fn keyedBoolOp(
     comptime backendOp: fn (ActiveEngine.Context, ActiveEngine.Value, [:0]const u8) api_backend.BoolResult,
@@ -4559,27 +3994,6 @@ test "c_api: independent instance budgets coexist under the process cap" {
     limits_b.max_timers = 1;
     try std.testing.expect(jsbay_engine_set_resource_limits(b, &limits_b));
     try helpers.evalErr(b, "setTimeout(()=>{},2147483647)");
-}
-
-test "c_api: resource limit helpers reject bad struct_size and null set" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    var bad = ResourceLimitsC{
-        .struct_size = 4,
-        .max_timers = 1,
-        .max_tsfn_handles = 1,
-        .max_pending_calls = 1,
-        .max_pending_bytes = 1,
-        .max_pending_tasks = 1,
-    };
-    try std.testing.expect(!jsbay_engine_create_with_limits(id, null, null, &bad));
-    try std.testing.expect(jsbay_engine_create(id, null, null));
-    defer jsbay_engine_destroy(id);
-    try std.testing.expect(!jsbay_engine_set_resource_limits(id, null));
-    var usage = ResourceUsageC{ .struct_size = 4, .timers = 0, .tsfn_handles = 0, .pending_calls = 0, .native_tasks = 0, .script_tasks = 0, .pending_bytes = 0, .max_timers = 0, .max_tsfn_handles = 0, .max_pending_calls = 0, .max_pending_bytes = 0, .max_pending_tasks = 0 };
-    try std.testing.expect(!jsbay_engine_get_resource_usage(id, &usage));
-    var global = ResourceGlobalUsageC{ .struct_size = 4, .timers = 0, .tsfn_handles = 0, .pending_calls = 0, .native_tasks = 0, .script_tasks = 0, .pending_bytes = 0, .max_timers = 0, .max_tsfn_handles = 0, .max_pending_calls = 0, .max_native_tasks = 0, .max_script_tasks = 0, .max_pending_bytes = 0 };
-    try std.testing.expect(!jsbay_resource_global_usage(&global));
 }
 
 test "c_api: admission class defaults to FOREGROUND and mid-flight set keeps usage" {

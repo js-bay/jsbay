@@ -32,7 +32,7 @@ comptime {
         _ = @import("internal_thread_safety_tests.zig");
         _ = @import("debugger_tests.zig");
     }
-    if (!spike and build_options.inspector_transport) {
+    if (!spike and (build_options.inspector_transport or !build_options.inspector)) {
         _ = @import("debug_cold_contract_tests.zig");
     }
     if (!spike) {
@@ -50,6 +50,12 @@ comptime {
     }
     _ = @import("console_format_tests.zig");
     if (backend.isQuickJsApiBackend(backend.active_backend)) {
+        _ = @import("../backend/quickjs_common/errors.zig");
+        _ = @import("../backend/quickjs_common/external.zig");
+        _ = @import("../backend/quickjs_common/host_abi.zig");
+        _ = @import("../backend/quickjs_common/host_keys.zig");
+        _ = @import("../backend/quickjs_common/jobs.zig");
+        _ = @import("../backend/quickjs_common/weakcb.zig");
         _ = @import("class_id_tests.zig");
         _ = @import("native_handle_handle_tests.zig");
         _ = @import("native_handle_lifecycle_tests.zig");

@@ -102,7 +102,7 @@ jobs:
         run: |
           set -euo pipefail
           zig build test-fmt --summary all
-          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache commonjs; do
             (cd "libs/$package" && zig build test-fmt --summary all)
           done
 
@@ -115,7 +115,7 @@ jobs:
       - name: Test independent packages
         run: |
           set -euo pipefail
-          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache commonjs; do
             (cd "libs/$package" && zig build test --summary all --test-timeout 60s)
           done
 
@@ -354,7 +354,7 @@ jobs:
         run: |
           set -euo pipefail
           zig build test-fmt --summary all
-          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache commonjs; do
             (cd "libs/$package" && zig build test-fmt --summary all)
           done
 
@@ -364,7 +364,7 @@ jobs:
       - name: Test independent packages
         run: |
           set -euo pipefail
-          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache commonjs; do
             (cd "libs/$package" && zig build test --summary all --test-timeout 60s)
           done
 

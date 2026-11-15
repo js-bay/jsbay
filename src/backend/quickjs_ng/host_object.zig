@@ -7,6 +7,7 @@ const sync = @import("zev");
 const host_value = @import("../../abi/host_value.zig");
 const c = @import("c_api.zig");
 const qjs = c.qjs;
+const writeEnumerationOrder = @import("../quickjs_common/host_keys.zig").writeEnumerationOrder;
 
 pub const GetFn = *const fn (instance_id: i32, user_data: ?*anyopaque, name: []const u8, out: *host_value.HostValue) ?[*:0]const u8;
 pub const SetFn = *const fn (instance_id: i32, user_data: ?*anyopaque, name: []const u8, value: host_value.HostValue) ?[*:0]const u8;
@@ -53,50 +54,6 @@ fn throwPlainError(ctx: ?*qjs.JSContext, msg: [*:0]const u8) qjs.JSValue {
         qjs.JS_PROP_WRITABLE | qjs.JS_PROP_CONFIGURABLE,
     );
     return qjs.JS_Throw(ctx, err);
-}
-
-/// Canonical array index: decimal form of an integer in `0 .. 2^32-2`.
-fn canonicalArrayIndex(name: []const u8) ?u32 {
-    if (name.len == 0 or name.len > 10) return null;
-    if (name[0] == '0') return if (name.len == 1) 0 else null;
-    var n: u64 = 0;
-    for (name) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        n = n * 10 + (ch - '0');
-    }
-    if (n >= 0xFFFF_FFFF) return null;
-    return @intCast(n);
-}
-
-/// Integer indices ascending, then every other name in input order. QuickJS keeps exotic own-keys in callback order, so the sort has to happen here.
-fn writeEnumerationOrder(names: []const []const u8, order: []usize) void {
-    var n: usize = 0;
-    for (names, 0..) |name, i| {
-        if (canonicalArrayIndex(name) != null) {
-            order[n] = i;
-            n += 1;
-        }
-    }
-    var i: usize = 1;
-    while (i < n) : (i += 1) {
-        const key = order[i];
-        const key_num = canonicalArrayIndex(names[key]).?;
-        var j: usize = i;
-        while (j > 0) {
-            const prev = order[j - 1];
-            const prev_num = canonicalArrayIndex(names[prev]).?;
-            if (prev_num < key_num or (prev_num == key_num and prev < key)) break;
-            order[j] = prev;
-            j -= 1;
-        }
-        order[j] = key;
-    }
-    for (names, 0..) |name, idx| {
-        if (canonicalArrayIndex(name) == null) {
-            order[n] = idx;
-            n += 1;
-        }
-    }
 }
 
 fn hostToJs(ctx: ?*qjs.JSContext, hv: host_value.HostValue) qjs.JSValue {

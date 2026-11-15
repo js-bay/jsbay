@@ -4,9 +4,11 @@ JS Bay presents one Zig and C-facing runtime API over QuickJS, QuickJS-NG, and J
 
 ## Package boundaries
 
-The root package depends on `libs/zev`, `libs/js_event_loop`, `libs/inspector`, `libs/inspector_transport`, and `libs/bytecode_cache`. Each builds and tests independently. `inspector_transport` may depend on `inspector`, never the reverse; `bytecode_cache` has no JavaScript-engine dependency. Their generic APIs and standalone usage belong in their package READMEs. This document only records how the engine integrates them.
+The root package depends on `libs/zev`, `libs/js_event_loop`, `libs/inspector`, `libs/inspector_transport`, `libs/bytecode_cache`, and `libs/commonjs`. Each builds and tests independently. `inspector_transport` may depend on `inspector`, never the reverse; `bytecode_cache` and `commonjs` have no JavaScript-engine dependency. Their generic APIs and standalone usage belong in their package READMEs. This document only records how the engine integrates them.
 
 `libs/inspector` defines CDP state and the transport interface. `src/inspector/` supplies this engine's operations. `libs/inspector_transport` is an optional loopback HTTP/WebSocket transport and does not define Inspector semantics.
+
+`libs/commonjs` owns canonical IDs, loading transactions, cyclic partial exports, instance caching and cache-reference release through narrow loader/execution/reference operations. `src/script/cjs/` owns actual VM wrapper execution, per-module require closures, native registration, bytecode policy, admission and teardown timing. It does not pass an engine-wide Host/backend/instance map into the package. See [the standalone contract](../libs/commonjs/readme.md). This is a local package extraction, not external publication.
 
 ## Runtime model
 
@@ -37,6 +39,14 @@ All new implementation files belong to one of these directories.
 | `script/` | Evaluation, modules, bytecode, and persistent-cache integration. |
 | `tests/` | Root-package Zig tests. Consumer and platform tests are in the repository-level `tests/`. |
 
-The supported backend tags are `quickjs_ng`, `quickjs`, and `jsc`. A backend facade at `src/backend/<name>.zig` selects and exports the implementation below `src/backend/<name>/`. Shared QuickJS-family C support belongs in `src/backend/quickjs_common/`; it must not acquire a JSC dependency.
+The supported backend tags are `quickjs_ng`, `quickjs`, and `jsc`. A backend facade at `src/backend/<name>.zig` selects and exports the implementation below `src/backend/<name>/`. Shared QuickJS-family C and Zig support belongs in `src/backend/quickjs_common/`; it must not acquire a JSC dependency.
 
 Do not add root-level forwarding files or move engine implementation into a standalone package merely to shorten imports. Directory placement follows ownership and dependency boundaries, not file size.
+
+## QuickJS-family sharing
+
+The QuickJS and QuickJS-NG facades specialize shared algorithms with their own native API namespace. Buffers, collections, dates, bytecode, CommonJS evaluation, ES module loading, external values, host function marshalling, job hooks, symbols, timers, weak finalizer callbacks, DataView windows, typed error construction and host-object own-key ordering share implementation without sharing native declarations. DataView and Error predicates stay in the facades because their native signatures differ. Diagnostic console serialization is shared in `src/inspector/backends/quickjs_console.zig`; normal console formatting remains backend policy.
+
+Each facade creates one specialization. External class IDs and mutexes, host binding slots, runtime cleanup maps, weak callback counters and error-construction thread-local depth are declared inside the specialization, not in the shared file namespace. Callback and payload types stay tied to the supplied C API. Instance lookup, host-value types, native handles, async stacks, timer scheduling, exception formatting and execution admission are explicit collaborators where used; no shared helper selects an active backend or receives an engine-wide Host.
+
+Native declarations, lifecycle/admission, value dispatch, rejection coordination, host-object exotic methods, weak references and runtime-limit adapters remain backend-owned. They contain native ABI or policy differences: process-wide versus per-runtime class IDs; native versus installed microtasks; array, equality and constructor predicates; rejection callback boolean representation and uncatchable errors; property-descriptor field types; strict-equality entry points; and unlimited-memory sentinel normalization. These are not cross-engine implementations. Bytecode fingerprints include both the backend adapter and shared bytecode implementation.

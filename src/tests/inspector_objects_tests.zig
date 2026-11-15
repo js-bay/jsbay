@@ -81,14 +81,21 @@ fn readHttpHeaders(alloc: std.mem.Allocator, stream: TestStream) ![]u8 {
     return list.toOwnedSlice(alloc);
 }
 
-fn readAtLeast(stream: TestStream, buf: []u8, need: usize) !usize {
+/// Preserve partial progress until the absolute frame deadline; readiness never implies the entire TCP frame is available.
+fn readExactlyUntil(stream: TestStream, buf: []u8, deadline: i64) !void {
     var got: usize = 0;
-    while (got < need) {
-        const n = try stream.read(buf[got..]);
+    while (got < buf.len) {
+        const remaining = deadline - io.monotonicMilliseconds();
+        if (remaining <= 0) return error.FrameTimeout;
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&fds, @intCast(@min(remaining, std.math.maxInt(i32)))) == 0) return error.FrameTimeout;
+        const n = stream.read(buf[got..]) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
         if (n == 0) return error.EndOfStream;
         got += n;
     }
-    return got;
 }
 
 fn writeMaskedText(stream: TestStream, text: []const u8) !void {
@@ -129,38 +136,35 @@ const Frame = struct {
     payload: []u8,
 };
 
-fn readFrameTimed(
-    alloc: std.mem.Allocator,
-    stream: TestStream,
-    timeout_ms: u64,
-) !?Frame {
-    const start = io.milliTimestamp();
+fn readFrameTimed(alloc: std.mem.Allocator, stream: TestStream, timeout_ms: u64) !?Frame {
+    return readFrameUntil(alloc, stream, timeout_ms, io.monotonicMilliseconds() + @as(i64, @intCast(timeout_ms)));
+}
+
+/// Idle polling yields to the owner pump; once a frame starts, its remaining bytes share the reply deadline. An incomplete frame at that deadline is terminal, not a discarded/retried frame.
+fn readFrameUntil(alloc: std.mem.Allocator, stream: TestStream, idle_ms: u64, deadline: i64) !?Frame {
     var hdr: [2]u8 = undefined;
-    while (true) {
-        const elapsed: u64 = @intCast(io.milliTimestamp() - start);
-        if (elapsed >= timeout_ms) return null;
-        const n = stream.read(hdr[0..1]) catch {
-            return null;
-        };
-        if (n == 1) break;
-        io.sleepMs(5);
-    }
-    _ = try readAtLeast(stream, hdr[1..], 1);
+    const idle_deadline = @min(deadline, io.monotonicMilliseconds() + @as(i64, @intCast(idle_ms)));
+    readExactlyUntil(stream, hdr[0..1], idle_deadline) catch |err| switch (err) {
+        error.FrameTimeout => return null,
+        else => return err,
+    };
+    try readExactlyUntil(stream, hdr[1..], deadline);
     const opcode: u8 = hdr[0] & 0x0F;
     const masked = (hdr[1] & 0x80) != 0;
     var plen: u64 = hdr[1] & 0x7F;
     if (plen == 126) {
         var ext: [2]u8 = undefined;
-        _ = try readAtLeast(stream, &ext, 2);
+        try readExactlyUntil(stream, &ext, deadline);
         plen = std.mem.readInt(u16, &ext, .big);
     } else if (plen == 127) {
         var ext: [8]u8 = undefined;
-        _ = try readAtLeast(stream, &ext, 8);
+        try readExactlyUntil(stream, &ext, deadline);
         plen = std.mem.readInt(u64, &ext, .big);
     }
     try testing.expect(!masked);
     const payload = try alloc.alloc(u8, @as(usize, @intCast(plen)));
-    if (plen > 0) _ = try readAtLeast(stream, payload, payload.len);
+    errdefer alloc.free(payload);
+    try readExactlyUntil(stream, payload, deadline);
     return .{ .opcode = opcode, .payload = payload };
 }
 
@@ -186,10 +190,10 @@ fn waitForReply(
     needle: []const u8,
     timeout_ms: u64,
 ) !?Frame {
-    const deadline = io.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (io.milliTimestamp() < deadline) {
+    const deadline = io.monotonicMilliseconds() + @as(i64, @intCast(timeout_ms));
+    while (io.monotonicMilliseconds() < deadline) {
         _ = dispatch.tickInstance(instance_id);
-        const frame_opt = try readFrameTimed(alloc, stream, 50);
+        const frame_opt = try readFrameUntil(alloc, stream, 50, deadline);
         if (frame_opt) |frame| {
             if (frame.opcode == 0x1 and std.mem.indexOf(u8, frame.payload, needle) != null) {
                 return frame;
@@ -792,4 +796,67 @@ test "inspector: getProperties on primitive string objectId is rejected" {
     defer alloc.free(reply.payload);
     try testing.expect(std.mem.indexOf(u8, reply.payload, "\"code\":-32000") != null);
     try testing.expectEqual(@as(usize, 1), countOf(reply.payload, "\"id\":1"));
+}
+
+extern "c" fn socketpair(domain: c_int, kind: c_int, protocol: c_int, pair: *[2]std.posix.fd_t) c_int;
+
+fn frameTestPair() ![2]TestStream {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketFailed;
+    const pair = [2]TestStream{ .{ .handle = fds[0] }, .{ .handle = fds[1] } };
+    errdefer for (pair) |stream| stream.close();
+    var timeout = std.posix.timeval{ .sec = 0, .usec = 50_000 };
+    try std.posix.setsockopt(pair[0].handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+    return pair;
+}
+
+test "inspector frame helper: delayed payload remains one complete frame" {
+    const pair = try frameTestPair();
+    defer pair[0].close();
+    defer pair[1].close();
+    try pair[1].writeAll(&.{ 0x81, 4, 'a' });
+    const writer = try std.Thread.spawn(.{}, struct {
+        fn run(stream: TestStream) void {
+            io.sleepMs(150);
+            stream.writeAll("bcd") catch {};
+        }
+    }.run, .{pair[1]});
+    defer writer.join();
+    const frame = (try readFrameTimed(testing.allocator, pair[0], 500)) orelse return error.MissingFrame;
+    defer testing.allocator.free(frame.payload);
+    try testing.expectEqualStrings("abcd", frame.payload);
+}
+
+test "inspector frame helper: truncated payload releases its allocation" {
+    const pair = try frameTestPair();
+    defer pair[0].close();
+    try pair[1].writeAll(&.{ 0x81, 4, 'a' });
+    pair[1].close();
+    try testing.expectError(error.EndOfStream, readFrameTimed(testing.allocator, pair[0], 500));
+}
+
+test "inspector frame helper: idle timeout differs from incomplete-frame deadline" {
+    const pair = try frameTestPair();
+    defer pair[0].close();
+    defer pair[1].close();
+    try testing.expectEqual(@as(?Frame, null), try readFrameTimed(testing.allocator, pair[0], 20));
+    try pair[1].writeAll(&.{ 0x81, 4, 'a' });
+    try testing.expectError(error.FrameTimeout, readFrameTimed(testing.allocator, pair[0], 20));
+}
+
+test "inspector frame helper: extended lengths preserve following frames and OOM ownership" {
+    const pair = try frameTestPair();
+    defer pair[0].close();
+    defer pair[1].close();
+    // Both extended-length encodings exercise exact reads without consuming the next frame.
+    try pair[1].writeAll(&.{ 0x81, 126, 0, 3, 'a', 'b', 'c', 0x81, 127, 0, 0, 0, 0, 0, 0, 0, 1, 'd' });
+    const first = (try readFrameTimed(testing.allocator, pair[0], 500)).?;
+    defer testing.allocator.free(first.payload);
+    const second = (try readFrameTimed(testing.allocator, pair[0], 500)).?;
+    defer testing.allocator.free(second.payload);
+    try testing.expectEqualStrings("abc", first.payload);
+    try testing.expectEqualStrings("d", second.payload);
+    try pair[1].writeAll(&.{ 0x81, 1, 'x' });
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, readFrameTimed(failing.allocator(), pair[0], 500));
 }
