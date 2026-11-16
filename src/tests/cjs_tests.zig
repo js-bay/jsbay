@@ -1108,7 +1108,7 @@ test "cjs: root and absent module context keep the fallback referrer" {
     try testing.expect(context.legacy_referrer);
 }
 
-test "R2 regression: inherited exports setter reenters require before placeholder" {
+test "cjs: module exports initialization bypasses inherited setters" {
     var context = CjsLoaderCtx.init(testing.allocator);
     defer context.deinit();
     try context.modules.put("a", "globalThis.bodyCount++; if (!Object.hasOwn(module, 'exports') || module.exports !== exports) throw new Error('environment'); exports.ok=true;");
