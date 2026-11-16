@@ -67,6 +67,7 @@ fn executable(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, name: [
 
 fn pathEnv(allocator: std.mem.Allocator, tools: []const u8) ![]u8 {
     // Keep this libc-free: `zig build test-tools` does not link libc on CI.
+    //
     // tools/ must stay first so fixture stubs win over host binaries.
     return std.fmt.allocPrint(allocator, "PATH={s}:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin", .{tools});
 }

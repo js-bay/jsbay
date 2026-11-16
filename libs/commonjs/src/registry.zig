@@ -264,7 +264,7 @@ test "cjs registry: hits retain a typed value and failed execution rolls back th
     for (ctx.cells[0..ctx.used]) |cell| try std.testing.expectEqual(@as(usize, 0), cell.refs);
 }
 
-test "cjs registry: clear resets arena storage without protecting in-flight keys" {
+test "cjs registry: idle clear recycles arena storage" {
     const allocator = std.testing.allocator;
     var registry = Registry(TestOps).init(allocator);
     defer registry.deinitStorage();
@@ -273,7 +273,7 @@ test "cjs registry: clear resets arena storage without protecting in-flight keys
     const old_address = @intFromPtr(old_key.ptr);
     registry.clear(&ctx);
     const replacement = try registry.arena.allocator().dupe(u8, "canonical-b");
-    // Compare addresses only, never dereference an invalidated key or run a module transaction after active clear.
+    // Idle clear invalidates old keys; compare addresses without dereferencing the old slice.
     try std.testing.expectEqual(old_address, @intFromPtr(replacement.ptr));
     try std.testing.expectEqualStrings("canonical-b", replacement);
 }

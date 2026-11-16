@@ -64,7 +64,7 @@ pub fn create(comptime c: type, comptime exception: type) type {
 
         /// Construct `new Map(JSON.parse(json))`. Returns JS_EXCEPTION on error.
         pub fn qjsNewMapFromJson(ctx: ?*qjs.JSContext, json: []const u8) qjs.JSValue {
-            // QuickJS' JSON lexer reads one byte past `buf_len` (lookahead), so the buffer must be NUL-terminated even though the API takes an explicit length. Callers may hand us a bare slice from `c_allocator.dupe`, which is NOT NUL-terminated — read-past-end then sees uninitialised malloc bytes, and on Linux/glibc that occasionally lands on a non-whitespace character, producing a phantom "SyntaxError: unexpected data at the end". Defensively copy into a sentinel-terminated buffer.
+            // JS_ParseJSON requires a sentinel for lexer lookahead even with an explicit length. Copy borrowed slices into NUL-terminated storage before parsing.
             const buf = std.heap.c_allocator.dupeSentinel(u8, json, 0) catch return c.JS_EXCEPTION;
             defer std.heap.c_allocator.free(buf);
             const parsed = qjs.JS_ParseJSON(ctx, buf.ptr, buf.len, "<map-json>");
@@ -102,7 +102,7 @@ pub fn create(comptime c: type, comptime exception: type) type {
 
         // ============================================================================ Native iteration + builder helpers for Map and Set.
         //
-        // These support `value.NativeArgs.mapForEach` / `setForEach` / `mapSize` / `setSize`, plus the free-function builder surface (`newMap`, `newSet`, `mapSet`, `setAdd`). They iterate via the standard JS iterator protocol (`val.entries()` / `val.values()` → `.next()` → `{done, value}`), producing raw JSValue references the caller gets to inspect per entry without flattening through JSON. The existing JSON-based helpers above (qjsMapSetToJson / qjsNewMapFromJson / qjsNewSetFromJson) are untouched and remain the fast path for simple JSON-safe contents.
+        // These support `value.NativeArgs.mapForEach` / `setForEach` / `mapSize` / `setSize`, plus the free-function builder surface (`newMap`, `newSet`, `mapSet`, `setAdd`). They iterate via the standard JS iterator protocol (`val.entries()` / `val.values()` → `.next()` → `{done, value}`), producing raw JSValue references the caller gets to inspect per entry without flattening through JSON. The JSON-based helpers above (qjsMapSetToJson / qjsNewMapFromJson / qjsNewSetFromJson) provide a separate path for simple JSON-safe contents.
         // ============================================================================
 
         /// Callback invoked once per Map entry by `qjsMapForEach`. Return true to keep iterating, false to stop. `key` / `value` are *borrowed* JSValue references owned by the iteration driver — do not free them from the callback and do not retain them past the call without JS_DupValue.

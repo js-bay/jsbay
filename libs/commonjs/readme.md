@@ -1,6 +1,6 @@
 # commonjs
 
-An engine-independent local Zig package for CommonJS loading transactions and instance caching. Version 0.1.0; Zig 0.17.0 or newer. It has no dependencies, VM headers, engine root directory, native bridge, or network requirement. This extraction does not publish a package to an external registry.
+An engine-independent local Zig package for CommonJS loading transactions and instance caching. Version 0.1.0; Zig 0.17.0 or newer. It has no dependencies, VM headers, engine root directory, native bridge, or network requirement. It is a repository-local package, not an external registry release.
 
 ```sh
 cd libs/commonjs

@@ -431,8 +431,7 @@ test "cjs: runCommonJS transfers a heap decode error and empty bytecode stays a 
     try testing.expect(!empty.err_is_heap);
     try testing.expectEqualStrings("stale or corrupt bytecode", empty.err.?);
 
-    // Non-empty invalid bytecode takes the heap-formatted decoder path. Read and free the
-    // returned message once; do not reconstruct a use-after-free.
+    // Non-empty invalid bytecode takes the heap-formatted decoder path. Read and free the returned message once; do not reconstruct a use-after-free.
     const invalid = cjs.runCommonJS(id, "not valid QuickJS bytecode", "invalid-bytecode.js");
     defer freeCjsCacheResult(invalid);
     try testing.expect(invalid.decode_failed);
@@ -514,7 +513,7 @@ test "cjs: global __jsbay_cjsCache returns live exports with caller require" {
     try testing.expectEqual(@as(i64, 42), ans);
 }
 
-test "cjs: __jsbay_cjsCache reuses process bytecode cache per source and keeps object identity" {
+test "cjs: __jsbay_cjsCache returns object exports for repeated and distinct sources" {
     var ctx = CjsLoaderCtx.init(testing.allocator);
     defer ctx.deinit();
 
@@ -894,8 +893,8 @@ test "cjs: evalAsCjs, bytecode, and injected cache preserve undefined and getter
     , "[\"undefined\",true,\"exports getter\"]");
 }
 
-// Adversarial review: throw values need not be Error objects, and a getter may return undefined, delete itself, or recover on a later execution.
-test "cjs: adversarial final exports reads preserve thrown identity and retry" {
+// Thrown values need not be Error objects. A final exports getter may return undefined, throw an arbitrary value, or succeed on a later execution; deleting the property also yields undefined.
+test "cjs: final exports getters preserve thrown identity and allow retries" {
     var context = CjsLoaderCtx.init(testing.allocator);
     defer context.deinit();
     try context.modules.put("g", "globalThis.runs++; Object.defineProperty(module, 'exports', { get() { globalThis.reads++; if (runs < 3) throw marker; return undefined; } });");
@@ -985,8 +984,7 @@ test "cjs: cycles observe reassignment without rewriting earlier exports aliases
     try helpers.expectEvalEquals(id, "JSON.stringify([require('b')===original,original.ready,original.late,require('a')===require('c'),require('a')!==original,require('u')===undefined,cycleUndefined===undefined])", "[true,true,true,true,true,true,true]");
 }
 
-// A host-returning API owns the exception; unlike a native JS callback, it
-// must not leave a parked exception behind after converting it to EvalResult.
+// A host-returning API owns the exception; unlike a native JS callback, it must not leave a parked exception behind after converting it to EvalResult.
 test "cjs: host text and bytecode failures consume pending getter exceptions" {
     if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
     var context = CjsLoaderCtx.init(testing.allocator);

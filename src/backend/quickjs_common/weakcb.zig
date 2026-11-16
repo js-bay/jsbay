@@ -2,7 +2,7 @@
 //!
 //! Strategy: reuse the existing `native_handle` class for holders. Every engine instance already registers native_handle exactly once per runtime, and the class's finalizer dispatches through `HandleData.finalize_fn` — so we can piggyback without adding another class id to the global static-id pool. This sidesteps QJS class-id-collision bugs that arise when multiple modules register their own classes across recycled runtimes.
 //!
-//! Each `attachFinalizer` creates a fresh NativeHandle with finalize_fn set to a trampoline that runs the user callback, then parks the holder as a writable property on `target` under a unique key. Because nothing else references the holder, it becomes unreachable exactly when the target does; the NativeHandle class finalizer then invokes our trampoline.
+//! Each `attachFinalizer` creates a NativeHandle holder whose class finalizer invokes the user callback through a trampoline. The holder is stored on `target` as a non-writable, non-enumerable, non-configurable own data property under a unique string key. The key and holder are observable through `Reflect.ownKeys` and property access. Finalization follows holder collection or runtime teardown, not target reachability alone; separately retaining the holder can delay the callback beyond target collection.
 
 const std = @import("std");
 
@@ -45,7 +45,7 @@ pub fn create(comptime c: type, comptime native_handle_mod: type) type {
             std.heap.c_allocator.destroy(box);
         }
 
-        /// Attach `(user_data, on_finalize)` to `target` so that when `target` is garbage collected, `on_finalize(user_data)` runs. Returns false if `target` is not a JS object or the holder cannot be attached.
+        /// Attach a finalizer-bearing holder to `target`. Its finalizer calls `on_finalize(user_data)` during holder collection or runtime teardown; independently retaining the observable holder can postpone the callback beyond target collection. Returns false for non-objects, proxies, or attachment failure.
         pub fn qjsWeakAttachFinalizer(
             ctx: ?*qjs.JSContext,
             target: qjs.JSValue,
@@ -61,7 +61,7 @@ pub fn create(comptime c: type, comptime native_handle_mod: type) type {
             const box = std.heap.c_allocator.create(QjsWeakBox) catch return false;
             box.* = .{ .user_data = user_data, .on_finalize = on_finalize };
 
-            // Build the holder via native_handle. The class's finalizer runs our trampoline with `ptr` (our box) once the holder becomes unreachable.
+            // Build the holder via native_handle. During holder finalization, the class invokes our trampoline with `ptr` (our box).
             const holder = native_handle_mod.create(ctx, .{
                 .ptr = @ptrCast(box),
                 .finalize_fn = qjsWeakNativeHandleTrampoline,

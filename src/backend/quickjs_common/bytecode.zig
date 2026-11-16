@@ -1,6 +1,6 @@
 //! Bytecode cache support.
 //!
-//! Expose QuickJS's portable bytecode serialization so consumers can compile a script once and run the resulting bytes many times, skipping the parse step on hot startup paths. Pairs:
+//! Expose QuickJS's engine/build-specific bytecode serialization so consumers can compile a script once and run the resulting bytes many times, skipping the parse step on hot startup paths. Pairs:
 //!
 //! qjsCompileBytecode(ctx, source, filename) -> bytes (c_allocator-owned) qjsRunBytecode(ctx, bytes) -> EvalResult
 //!
@@ -34,7 +34,7 @@ pub fn create(comptime c: type, comptime exception: type, comptime lifecycle: ty
             err: ?[]const u8 = null,
         };
 
-        /// Compile `source` to portable bytecode bytes. Returned bytes are a c_allocator-owned slice; caller frees with `qjsFreeBytecode` or plain `std.heap.c_allocator.free`.
+        /// Compile `source` to bytecode for a compatible engine build and target. Returned bytes are a c_allocator-owned slice; caller frees with `qjsFreeBytecode` or plain `std.heap.c_allocator.free`.
         pub fn qjsCompileBytecode(
             ctx: ?*qjs.JSContext,
             source: []const u8,

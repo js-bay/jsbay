@@ -1,4 +1,4 @@
-//! DataView support (see ../value.zig).
+//! DataView support (see src/value/root.zig).
 //!
 //! DataView identity and window metadata come from the patched native C API.
 

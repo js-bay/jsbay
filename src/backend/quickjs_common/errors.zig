@@ -1,4 +1,4 @@
-//! Structured error API helpers (see ../errors.zig).
+//! Structured error API helpers (see src/value/errors.zig).
 //!
 //! These thin wrappers around QuickJS's JS_New*Error / JS_IsError APIs let the backend-neutral `errors.zig` module build and introspect typed Error instances without exposing cImport internals to its callers.
 

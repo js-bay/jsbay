@@ -1,4 +1,4 @@
-//! Integration tests for Wave 8a: rich object inspection (objectId-based remote object handles, Runtime.getProperties, Runtime.callFunctionOn, Runtime.releaseObject{,Group}).
+//! Object inspection integration tests: objectId-based remote handles, Runtime.getProperties, Runtime.callFunctionOn, and Runtime.releaseObject{,Group}.
 //!
 //! Style matches `inspector_tests.zig`: spin up an engine, start the inspector, drive a minimal WebSocket client, and pump `dispatch.tickInstance` while waiting for responses because the evaluate/getProperties/callFunctionOn handlers marshal onto the JS thread via dispatch.postTask.
 

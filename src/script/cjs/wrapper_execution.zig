@@ -93,9 +93,9 @@ pub fn newModule(ctx: ActiveEngine.Context, exports: ActiveEngine.Value) error{O
     return module;
 }
 
-/// Final `module.exports` after the wrapper returns. Distinguishes a successful JS `undefined` (and a missing property, which reads as `undefined`) from an accessor exception. Shared `getPropertyVal` conflates those cases, so this read stays CJS-specific and leaves that helper unchanged.
+/// Final `module.exports` after wrapper execution. QuickJS-family and JSC reads distinguish a successful or missing-property `undefined` from an accessor exception; these CJS-specific paths preserve exceptions instead of using the optional-property helper.
 ///
-/// On exception this returns `error.CallFailed` and keeps the backend's pending exception in the same state a wrapper-body throw already uses (QuickJS and QuickJS-NG: parked in `ctx`, not consumed via `JS_GetException`).
+/// QuickJS-family accessor exceptions remain parked in `ctx` without `JS_GetException`; JSC exceptions go to the supplied exception sink. Both paths return `error.CallFailed`.
 pub fn readFinalExports(
     ctx: ActiveEngine.Context,
     module_obj: ActiveEngine.Value,
@@ -133,7 +133,7 @@ pub fn readFinalExports(
         jsc.JSValueProtect(ctx_ref, val);
         return val;
     }
-    // Hermes and Escargot are outside this fix's validation matrix. Keep the historical optional-property fallback so untested ownership conventions are not changed here.
+    // Hermes and Escargot use the optional-property helper: return its value when present, otherwise duplicate the initial exports value. This path has no separate error result for accessor failure.
     return ActiveEngine.getPropertyVal(ctx, module_obj, "exports") orelse
         ActiveEngine.dupValue(ctx, fallback_exports);
 }

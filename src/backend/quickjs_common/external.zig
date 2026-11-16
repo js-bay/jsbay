@@ -1,4 +1,4 @@
-//! External value support (napi_create_external / v8::External parity).
+//! Opaque external values for native pointers.
 //!
 //! Wraps a raw native pointer as an opaque JS object. Uses a dedicated QuickJS class so JS_GetOpaque(val, class_id) returns null for anything that isn't one of ours — giving a clean isExternal / getExternal predicate.
 
@@ -12,7 +12,7 @@ pub fn create(comptime c: type) type {
 
         pub const QjsExternalFinalizer = *const fn (*anyopaque) callconv(.c) void;
 
-        /// Internal storage for an External object. Allocated via js_mallocz so that QuickJS frees it automatically when the runtime tears down if the finalizer somehow doesn't run. The finalizer itself calls js_free_rt to release the box on normal collection.
+        /// External-object payload allocated with js_mallocz. The class finalizer invokes the optional native-pointer callback and releases this box with js_free_rt; the allocator alone does not guarantee cleanup.
         const QjsExternalBox = extern struct {
             ptr: ?*anyopaque,
             finalizer: ?QjsExternalFinalizer,

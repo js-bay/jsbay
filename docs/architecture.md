@@ -1,6 +1,6 @@
 # Architecture
 
-JS Bay presents one Zig and C-facing runtime API over QuickJS, QuickJS-NG, and JavaScriptCore. `src/backend.zig` selects one backend at compile time; it is not a runtime plug-in system. `src/root.zig` is the public Zig entry point, and `src/engine.zig` owns instance creation, evaluation, event-loop progress, and destruction.
+JS Bay presents one Zig and C-facing runtime API over QuickJS, QuickJS-NG, and JavaScriptCore. Build options select statically linked backends and a primary backend in `src/backend.zig`; multi-engine packs select a packed backend at instance creation, not by loading runtime plug-ins. `src/root.zig` is the public Zig entry point, and `src/engine.zig` owns instance creation, evaluation, event-loop progress, and destruction.
 
 ## Package boundaries
 
@@ -8,7 +8,7 @@ The root package depends on `libs/zev`, `libs/js_event_loop`, `libs/inspector`, 
 
 `libs/inspector` defines CDP state and the transport interface. `src/inspector/` supplies this engine's operations. `libs/inspector_transport` is an optional loopback HTTP/WebSocket transport and does not define Inspector semantics.
 
-`libs/commonjs` owns canonical IDs, loading transactions, cyclic partial exports, instance caching and cache-reference release through narrow loader/execution/reference operations. `src/script/cjs/` owns actual VM wrapper execution, per-module require closures, native registration, bytecode policy, admission and teardown timing. It does not pass an engine-wide Host/backend/instance map into the package. See [the standalone contract](../libs/commonjs/readme.md). This is a local package extraction, not external publication.
+`libs/commonjs` owns canonical IDs, loading transactions, cyclic partial exports, instance caching and cache-reference release through narrow loader/execution/reference operations. `src/script/cjs/` owns actual VM wrapper execution, per-module require closures, native registration, bytecode policy, admission and teardown timing. It does not pass an engine-wide Host/backend/instance map into the package. See [the standalone contract](../libs/commonjs/readme.md). The package is repository-local, not an external registry release.
 
 ## Runtime model
 
@@ -20,10 +20,11 @@ The JavaScript event loop owns its native loop, monotonic clock, waiting, and wa
 
 ## Source layout
 
-`src/` keeps only these entry files at its root:
+Root-level `src/` files are public facades or build/test entry points, including:
 
 ```text
-root.zig  engine.zig  backend.zig  types.zig  c_api.zig  internal_tools.zig  test262_host.zig
+root.zig  engine.zig  backend.zig  backend_dispatch.zig  types.zig  c_api.zig
+internal_tools.zig  multi_pack.zig  test262_host.zig  cjs_component_tests.zig
 ```
 
 All new implementation files belong to one of these directories.

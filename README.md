@@ -4,7 +4,7 @@
 
 # JS Bay
 
-JS Bay is a Zig package and typed C ABI for embedding QuickJS-NG, QuickJS, or JavaScriptCore. Select the backend at build time; the C API and platform SDKs keep the same instance, value, timer, and callback model.
+JS Bay is a Zig package and typed C ABI for embedding QuickJS-NG, QuickJS, or JavaScriptCore. Choose statically linked backends at build time; multi-engine packs select a backend at instance creation. The C API and platform SDKs share the same instance, value, timer, and callback model.
 
 ### Supported engines
 
@@ -30,7 +30,7 @@ Use Zig 0.17 and clone vendor submodules:
 ```sh
 git submodule update --init --recursive
 zig build -Dbackend=quickjs_ng
-zig build test
+zig build test -Dbackend=quickjs_ng
 ```
 
 Unconfigured `zig build` defaults to QuickJS. The quick start above selects QuickJS-NG explicitly. Supported backend tags are `quickjs_ng`, `quickjs`, and `jsc`. JavaScriptCore requires an Apple target. Experimental Escargot / Hermes spikes also live as submodules (`vendor/escargot`, `vendor/hermes`); see below.
@@ -87,7 +87,7 @@ Start with the [documentation index](docs/readme.md). The most commonly needed g
 
 The same gate compares 58 Kotlin/C# status, value-kind, submission, shutdown and admission constants against the translated public header, plus five C# sequential native struct declarations against host C sizes, alignment and field offsets. These source checks are not Kotlin/.NET execution or foreign-target marshaling validation. Unsupported declaration shapes require reviewing the narrow checker, not generating SDKs.
 
-The existing Node and Harmony native consumers both read `tests/fixtures/napi-buffer-boundaries.json`: element widths, visible offsets, empty windows and copy isolation in both directions. Non-empty cases retain the destination while mutating the source before readback, then mutate the destination and check the retained source; empty cases establish window handling, not aliasing evidence. Harmony's Node N-API host harness exercises the real bridge, not the Harmony SDK or device lifecycle. The Buffer case is specific to that Node host; these small vectors do not fabricate oversized allocations to claim overflow coverage.
+The Node and Harmony native consumers both read `tests/fixtures/napi-buffer-boundaries.json`: element widths, visible offsets, empty windows and copy isolation in both directions. Non-empty cases retain the destination while mutating the source before readback, then mutate the destination and check the retained source; empty cases establish window handling, not aliasing evidence. Harmony's Node N-API host harness exercises the real bridge, not the Harmony SDK or device lifecycle. The Buffer case is specific to that Node host; these small vectors do not fabricate oversized allocations to claim overflow coverage.
 
 ## License
 
@@ -95,4 +95,4 @@ JS Bay is licensed under the [MIT License](LICENSE). Bundled artifacts and sourc
 
 ## Independent local packages
 
-The six local libraries are `zev`, `js_event_loop`, `inspector`, `inspector_transport`, `bytecode_cache`, and [`commonjs`](libs/commonjs/readme.md). Each has its own build/test entry point. Run `zig build test-packages --summary all` for the six package suites, or test one from its `libs/<name>` directory. Generic CommonJS loader/registry tests live in `libs/commonjs`; engine-level CJS behavior remains in `src/tests/cjs_tests.zig`. This separation does not publish a package externally or change the CJS facade APIs. See [architecture boundaries](docs/architecture.md).
+The six local libraries are `zev`, `js_event_loop`, `inspector`, `inspector_transport`, `bytecode_cache`, and [`commonjs`](libs/commonjs/readme.md). Each has its own build/test entry point. Run `zig build test-packages --summary all` for the six package suites, or test one from its `libs/<name>` directory. Generic CommonJS loader/registry tests live in `libs/commonjs`; engine-level CJS behavior remains in `src/tests/cjs_tests.zig`. These are repository-local packages; CJS facade APIs remain engine-owned. See [architecture boundaries](docs/architecture.md).

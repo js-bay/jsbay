@@ -160,14 +160,10 @@ fn checkCAbi(args: []const []const u8) !u8 {
     }
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
-    // Prefer the system compilers. Android NDK setup often puts a target-clang
-    // named `cc` ahead on PATH, which breaks these host syntax-only probes.
+    // Prefer the system compilers. Android NDK setup often puts a target-clang named `cc` ahead on PATH, which breaks these host C/C++ probes.
     const cc: []const u8 = if (builtin.os.tag == .windows) "cc" else "/usr/bin/cc";
     const cxx: []const u8 = if (builtin.os.tag == .windows) "c++" else "/usr/bin/c++";
-    // Explicit host compiler selection; Zig supplies genuine Clang C/C++
-    // frontends. Compile into the ignored cache rather than syntax-only: Zig's
-    // driver injects -c, which conflicts with -fsyntax-only under -Werror.
-    // This checks code generation too, with the same strict warning flags.
+    // Explicit host compiler selection; Zig supplies genuine Clang C/C++ frontends. Compile into the ignored cache rather than syntax-only: Zig's driver injects -c, which conflicts with -fsyntax-only under -Werror. This checks code generation too, with the same strict warning flags.
     try sdk_abi.check(std.heap.page_allocator, threaded.io());
     const consumers = [_][]const u8{ "tests/c_consumer.c", "tests/bytecode_consumer.c", "tests/native_sync_consumer.c", "tests/async_promise_consumer.c", "tests/host_wake_consumer.c" };
     var compiler_env = std.process.Environ.Map.init(std.heap.page_allocator);

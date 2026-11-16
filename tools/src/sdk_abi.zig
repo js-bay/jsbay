@@ -158,10 +158,7 @@ fn checkKotlinPackage(source: []const u8) !void {
 }
 
 fn checkEnum(allocator: std.mem.Allocator, input: []const u8, comptime declaration: []const u8, comptime members: []const Pair, comptime prefix: []const u8, comptime kotlin: bool) !void {
-    // Lex the whole file before selecting a declaration. Decoy text in comments
-    // and literals must never qualify, and duplicate real declarations fail closed.
-    // Unsupported Unicode line terminators must not hide active code in a
-    // comment; ordinary Unicode prose inside comments/literals stays harmless.
+    // Lex the whole file before selecting a declaration. Decoy text in comments and literals must never qualify, and duplicate real declarations fail closed. Unsupported Unicode line terminators must not hide active code in a comment; ordinary Unicode prose inside comments/literals stays harmless.
     inline for (.{ "\xc2\x85", "\xe2\x80\xa8", "\xe2\x80\xa9" }) |newline| {
         if (std.mem.indexOf(u8, input, newline) != null) return error.PolicyFailure;
     }
@@ -191,8 +188,7 @@ fn checkEnum(allocator: std.mem.Allocator, input: []const u8, comptime declarati
     if (!kotlin and signature.len != 0 and !std.mem.eql(u8, signature, ": int")) return error.PolicyFailure;
     const raw = try body(source, declaration);
     if (kotlin) return checkKotlinEnum(source, at, signature, raw, declaration, members, prefix);
-    // C# has language-defined implicit numbering; Kotlin constructor arguments
-    // were checked separately. C# member attributes may contain commas.
+    // C# has language-defined implicit numbering; Kotlin constructor arguments were checked separately. C# member attributes may contain commas.
     const entries = raw;
     var clean: std.ArrayList(u8) = .empty;
     defer clean.deinit(allocator);
@@ -232,9 +228,7 @@ fn fieldLayout(name: []const u8) !FieldLayout {
     return error.PolicyFailure;
 }
 
-// Tokenize the narrow C# source subset instead of looking through raw comments
-// for attributes/declarations. Literals stay opaque; directives, escaped names and
-// interpolated/verbatim/raw literals require an explicit gate review.
+// Tokenize supported Kotlin/C# declaration shapes while keeping comments and literals opaque. Enum mode permits narrowly recognized C# directives and simple interpolation; escaped identifiers and unsupported literal forms fail closed.
 const CsTokens = struct {
     source: []const u8,
     cursor: usize = 0,
@@ -290,8 +284,7 @@ const CsTokens = struct {
             while (self.cursor < self.source.len) {
                 const byte = self.source[self.cursor];
                 self.cursor += 1;
-                // Kotlin expression interpolation has nested language syntax;
-                // unsupported here rather than misidentifying its quotes as code.
+                // Kotlin expression interpolation has nested language syntax; unsupported here rather than misidentifying its quotes as code.
                 if (self.kotlin and byte == '$' and self.cursor < self.source.len and self.source[self.cursor] == '{') return error.PolicyFailure;
                 if (interpolated and byte == '{') {
                     // Only simple identifier/member interpolation is supported. Expressions containing nested quotes/braces fail closed.
@@ -362,8 +355,7 @@ fn checkLayout(source: []const u8, comptime name: []const u8, comptime T: type, 
             if (std.mem.eql(u8, try lookahead.next() orelse return error.PolicyFailure, name)) {
                 if (found) return error.PolicyFailure; // partial/duplicate declarations are unsupported
                 found = true;
-                // Include all metadata/modifiers since the previous declaration
-                // boundary; an attribute in a comment or on another type cannot qualify.
+                // Include all metadata/modifiers since the previous declaration boundary; an attribute in a comment or on another type cannot qualify.
                 var declaration = CsTokens{ .source = source[boundary..] };
                 try checkStruct(&declaration, name, T, fields);
             }

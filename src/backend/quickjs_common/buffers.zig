@@ -92,7 +92,7 @@ pub fn create(comptime c: type) type {
             return c.JS_NewTypedArray(ctx, 3, &argv, c.QJS_TYPED_ARRAY_UINT8);
         }
 
-        /// Read-only view over an ArrayBuffer or TypedArray's underlying bytes. Returns null for other value shapes. The pointer is live while the JS value is reachable.
+        /// Return a borrowed visible byte window for an ArrayBuffer or typed-array view. Keep the value alive and do not detach or resize its backing storage while using the pointer.
         pub fn qjsGetBufferView(ctx: ?*qjs.JSContext, val: qjs.JSValue) ?struct { ptr: [*]u8, len: usize } {
             if (c.JS_IsArrayBuffer(ctx, val)) {
                 var size: usize = 0;

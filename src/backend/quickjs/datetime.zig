@@ -1,4 +1,4 @@
-//! Date / BigInt support (see ../value.zig).
+//! Date / BigInt support (see src/value/root.zig).
 //!
 //! QuickJS instantiation of the shared leaf in `src/backend/quickjs_common/datetime.zig`. Public names stay on this path so existing imports keep working.
 

@@ -4,8 +4,7 @@ const std = @import("std");
 /// Borrowed source bytes, valid after load returns until the caller copies them.
 pub const LoadResult = extern struct { source: [*]const u8, source_len: usize };
 pub const LoaderVTable = extern struct {
-    /// Optional canonicalization; null result means identity. Inputs are borrowed
-    /// NUL-terminated strings. Non-null output is copied before free_resolved.
+    /// Optional canonicalization; null result means identity. Inputs are borrowed NUL-terminated strings. Non-null output is copied before free_resolved.
     resolve: ?*const fn (?*anyopaque, [*:0]const u8, [*:0]const u8) callconv(.c) ?[*:0]u8 = null,
     load: *const fn (?*anyopaque, [*:0]const u8, *LoadResult) callconv(.c) bool,
     /// Null means the host retains ownership (for example static output).

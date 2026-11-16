@@ -43,13 +43,12 @@ fn parseBackendName(name: []const u8) ?Backend {
 const ResolvedBackends = struct {
     /// Engines linked into this artifact (explicit -Dbackends=… or single -Dbackend=…).
     list: []const Backend,
-    /// Temporary monomorphic default for the shared layer (first packed / -Dbackend=).
+    /// Monomorphic backend for shared layers: the first packed backend or `-Dbackend=`.
     primary: Backend,
     bits: u32,
 };
 
-/// Resolve pack set. `-Dbackends=` is the multi-pack selector (no implicit quickjs_ng).
-/// `-Dbackend=` remains the single-engine shorthand (default quickjs to match product builds).
+/// Resolve pack set. `-Dbackends=` is the multi-pack selector (no implicit quickjs_ng). `-Dbackend=` remains the single-engine shorthand (default quickjs to match product builds).
 fn resolveBackends(b: *std.Build, os: std.Target.Os.Tag) ResolvedBackends {
     const backends_str = b.option([]const u8, "backends", "Comma-separated engines to pack into one artifact (e.g. quickjs_ng,jsc). Do not pass with -Dbackend.");
     const backend_opt = b.option(Backend, "backend", "Single JS engine backend shorthand (quickjs_ng, quickjs, jsc, escargot, or hermes). Do not pass with -Dbackends.");
@@ -256,8 +255,7 @@ pub fn build(b: *std.Build) void {
     const state_tcas_dep = b.dependency("state_tcas", .{ .target = target, .optimize = optimize });
     const state_tcas = state_tcas_dep.module("state_tcas");
 
-    // The checked-in gitlinks are copied into the build cache before patching, leaving both the submodule checkout and an imported source snapshot intact.
-    // Prepare QuickJS tree if any packed engine needs it (first QJS-family wins for translate-c).
+    // The checked-in gitlinks are copied into the build cache before patching, leaving both the submodule checkout and an imported source snapshot intact. Prepare QuickJS tree if any packed engine needs it (first QJS-family wins for translate-c).
     var qjs_family: ?Backend = null;
     for (packed_backends) |tag| {
         if (tag == .quickjs_ng or tag == .quickjs) {
@@ -774,9 +772,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // --- Pauseable DevTools owner-thread C embed sample ---
-    // Dedicated owner pthread: create → inspector_start → run_loop → destroy.
-    // Main/client only calls stop_loop. Prefer -Dbackend=quickjs_ng for Debugger.
-    // `--self-test` is the automated smoke; interactive mode waits for stdin.
+    // Dedicated owner pthread: create → inspector_start → run_loop → destroy. Main/client only calls stop_loop. Prefer -Dbackend=quickjs_ng for Debugger. `--self-test` is the automated smoke; interactive mode waits for stdin.
     if (inspector_enabled and inspector_transport_enabled) {
         const embed_module = b.createModule(.{
             .target = target,
@@ -827,7 +823,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // --- JSC Safari-attachable inspector demo ---
-    // Uses JavaScriptCore's built-in WebKit Inspector. Only meaningful on JSC + Darwin; under QJS or non-Apple targets we skip the entire step so `zig build` stays green.
+    // Uses JavaScriptCore's built-in WebKit Inspector. The executable requires JSC and Darwin; other configurations do not build this Apple-framework demo.
     if (backend == .jsc and (os == .macos or os == .ios)) {
         const safari_module = b.createModule(.{
             .root_source_file = b.path("examples/jsc_safari_demo.zig"),
@@ -1012,8 +1008,7 @@ fn addOneBackendSources(
 }
 
 fn addEscargotSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8) void {
-    // EscargotPublic C bridge + libescargot (g++/local-exec TLS).
-    // Zig's linkSystemLibrary("stdc++") is special-cased to libc++ — link libstdc++.a by path.
+    // EscargotPublic C bridge + libescargot (g++/local-exec TLS). Zig's linkSystemLibrary("stdc++") is special-cased to libc++ — link libstdc++.a by path.
     const install: std.Build.LazyPath = if (std.fs.path.isAbsolute(install_prefix)) .{ .cwd_relative = install_prefix } else b.path(install_prefix);
     m.addIncludePath(install.path(b, "include"));
     m.addIncludePath(b.path("src/backend/escargot"));
@@ -1101,7 +1096,7 @@ fn addQuickJsCSources(
         .safe => "-O2",
         .fast, .small => "-O3",
     };
-    // Harsh-father ASan: instrument QuickJS C + wrappers; final consumer must link -fsanitize=address.
+    // ASan instruments QuickJS C and wrappers; the final consumer must link -fsanitize=address.
     const c_flags: []const []const u8 = blk: {
         if (asan and gc_stress)
             break :blk &.{ b.fmt("-DCONFIG_VERSION=\"{s}\"", .{version}), "-DFORCE_GC_AT_MALLOC=1", "-fwrapv", "-w", c_opt, "-fsanitize=address", "-fno-omit-frame-pointer" };

@@ -237,7 +237,7 @@ test "c_api: packed-alt typed evaluate number + retain/release (real non-primary
     }
 }
 
-test "c_api: forced packed_alt typed value (Linux primary-tag)" {
+test "c_api: forced packed_alt typed value for the primary backend" {
     // Build EngineInstance.packed_alt for the pack primary without a second real engine.
     const helpers = @import("tests/test_helpers.zig");
     const instance_map = @import("runtime/instance_map.zig");
@@ -323,7 +323,7 @@ test "c_api: forced packed_alt typed value (Linux primary-tag)" {
     try std.testing.expectEqualStrings("hi", bytes.data.?[0..bytes.len]);
 }
 
-test "c_api: forced packed_alt set/call/construct/new_* (Linux primary-tag proof)" {
+test "c_api: forced packed_alt set/call/construct/new_* for the primary backend" {
     const helpers = @import("tests/test_helpers.zig");
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
@@ -1287,16 +1287,11 @@ test "c_api: engine creation keeps recursion below native stack limits" {
 pub export fn jsbay_engine_destroy(instance_id: c_int) void {
     if (host_wake.isNotifying()) return;
     const id: i32 = @intCast(instance_id);
-    // Owner-thread destroy is the common path (release values first, then destroy). A non-owner
-    // may also destroy: it closes admission and joins teardown so "destroy then Worker.terminate"
-    // does not kill an owner still inside run_loop or deferred cleanup. Attached-loop detach
-    // stays on the owner when this is the owner thread; destroyRuntime detaches after loop
-    // scopes have drained when destroy runs elsewhere.
+    // Owner-thread destroy is the common path (release values first, then destroy). A non-owner may also destroy: it closes admission and joins teardown so "destroy then Worker.terminate" does not kill an owner still inside run_loop or deferred cleanup. Attached-loop detach stays on the owner when this is the owner thread; destroyRuntime detaches after loop scopes have drained when destroy runs elsewhere.
     if (api_value.isOwner(id)) {
         engine.detachLoop(id);
     } else if (!api_value.hasOwner(id) and engine.getContext(id) == null) {
-        // No live public instance. Still enter engine.destroy so a racer can join a deferred
-        // teardown whose owners were already dropped.
+        // No live public instance. Still enter engine.destroy so a racer can join a deferred teardown whose owners were already dropped.
         engine.destroy(id);
         return;
     }
@@ -1381,8 +1376,7 @@ pub export fn jsbay_engine_run_loop(instance_id: c_int) c_int {
 }
 
 pub export fn jsbay_engine_stop_loop(instance_id: c_int) bool {
-    // Control-plane lease: refuse teardown_pending and keep Driver alive until this returns.
-    // requestStop only touches Driver state (no Host callbacks); still operate outside the registry mutex.
+    // Control-plane lease: refuse teardown_pending and keep Driver alive until this returns. requestStop only touches Driver state (no Host callbacks); still operate outside the registry mutex.
     const lease = @import("runtime/instance_map.zig").beginControlPlane(@intCast(instance_id)) orelse return false;
     defer lease.end();
     lease.ptrs.loop.requestStop();
@@ -1391,7 +1385,7 @@ pub export fn jsbay_engine_stop_loop(instance_id: c_int) bool {
 
 /// Thread-safe keep-alive pause. Soft-cancels a pending platform schedule (Host.cancel must remain reusable) without detaching or clearing timers/tasks/VM state.
 pub export fn jsbay_engine_suspend(instance_id: c_int) bool {
-    // R2/R3: control-plane lease refuses teardown; never hold the instance-map mutex across Host.cancel.
+    // Control-plane lease refuses teardown; never hold the instance-map mutex across Host.cancel.
     const lease = @import("runtime/instance_map.zig").beginControlPlane(@intCast(instance_id)) orelse return false;
     defer lease.end();
     lease.ptrs.loop.suspendScheduling();
@@ -1400,7 +1394,7 @@ pub export fn jsbay_engine_suspend(instance_id: c_int) bool {
 
 /// Thread-safe resume after `jsbay_engine_suspend`. Re-schedules attached work for monotonic catch-up; does not recreate the engine.
 pub export fn jsbay_engine_resume(instance_id: c_int) bool {
-    // R2/R3: resume may Host.schedule; lease keeps Driver alive off the registry mutex.
+    // Resume may call Host.schedule; the lease keeps Driver alive outside the registry mutex.
     const lease = @import("runtime/instance_map.zig").beginControlPlane(@intCast(instance_id)) orelse return false;
     defer lease.end();
     lease.ptrs.loop.resumeScheduling();
@@ -2409,7 +2403,7 @@ pub export fn jsbay_value_new_array(instance_id: c_int, out_value: *u64) c_int {
     };
 }
 
-// The remaining Value operations are exported here while their backend-typed exception paths are being shared by all three engines. They clear every output before reporting unsupported so FFI callers never observe stale data.
+// Shared validation and output-storage helpers for C value operations.
 fn noEmbeddedNul(bytes: []const u8) bool {
     return std.mem.indexOfScalar(u8, bytes, 0) == null;
 }
@@ -2419,7 +2413,7 @@ fn duplicateKey(key: []const u8) ?[:0]u8 {
     return std.heap.c_allocator.dupeSentinel(u8, key, 0) catch null;
 }
 
-/// Host-owned UTF-8 results (legacy); packed-alt evaluate now publishes typed packed_api_value handles.
+/// Host-owned UTF-8 result storage; packed-alt evaluation publishes typed packed_api_value handles.
 const host_string_values = struct {
     var mutex: @import("zev").Mutex = .{};
     var map = std.AutoHashMap(u64, Entry).init(std.heap.c_allocator);
@@ -4032,8 +4026,7 @@ test "c_api: admission class defaults to FOREGROUND and mid-flight set keeps usa
     try std.testing.expectEqual(@as(u32, @intCast(resource_global_usage_legacy_size)), legacy.struct_size);
 }
 
-// Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`.
-// Never part of the published product ABI. See tests/process-isolation/ and docs/host-isolation.md.
+// Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`. Never part of the published product ABI. See tests/process-isolation/ and docs/host-isolation.md.
 comptime {
     if (@import("build_options").fault_injection) {
         const fault = struct {

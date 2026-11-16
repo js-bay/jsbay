@@ -1,4 +1,4 @@
-//! Date / BigInt support shared by the QuickJS and QuickJS-NG backends (see ../value.zig).
+//! Date / BigInt support shared by the QuickJS and QuickJS-NG backends (see src/value/root.zig).
 //!
 //! Instantiate once per backend against that backend's `c_api.zig`:
 //! `const datetime = @import("../quickjs_common/datetime.zig").create(@import("c_api.zig"));`

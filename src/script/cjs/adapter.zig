@@ -124,7 +124,7 @@ pub fn install(instance_id: i32, loader: *const types.ModuleLoader) bool {
     }
 
     state.require_installed = true;
-    // Also register the bytecode-cached CommonJS helper so the host runtime can replace its `new Function("module","exports","require", source)` cold-compile with a cached replay. Registration is best-effort: failing it must not block require().install (some backends/contexts don't support it); the app-runtime degrades back to `new Function`.
+    // Register the bytecode-cached CommonJS helper on supported backends. Registration is best-effort and does not determine whether the global require installation succeeds.
     state.cjs_cache_installed = registerGlobalCjsCache(ctx);
     return true;
 }
@@ -333,8 +333,7 @@ pub fn runCommonJS(instance_id: i32, bytes: []const u8, filename: []const u8) Cj
     }
 }
 
-// JSC getter exceptions are explicitly protected while crossing Zig error
-// unions; host-returning APIs release them rather than leaving a stale capture.
+// JSC getter exceptions are explicitly protected while crossing Zig error unions; host-returning APIs release them rather than leaving a stale capture.
 fn captureException(ctx: ActiveEngine.Context, value: ActiveEngine.Value) void {
     if (comptime backend.active_backend == .jsc) {
         const state = stateFromCtx(ctx) orelse return;
@@ -362,7 +361,7 @@ fn exportsToCjsCache(state: *CjsState, call: CallResult) CjsCacheResult {
 
 /// Bytecode-cache a CommonJS module body, mirroring `cache.evalCached`'s content-keyed persistence + atomic-write contract but for the CJS wrapper path. `source` must be a deterministic module body (same bytes ⇒ same module); keying is content + filename + caller version + the library build fingerprint, exactly like `cache.evalCached`.
 ///
-/// Hit ⇒ run cached bytecode through `runCommonJS`; miss ⇒ compile wrapper via `compileCommonJS`, persist, run. `version` is the engine-version string used for invalidation (see `cache.evalCached`). On any cache or compile failure this degrades to a plain `evalAsCjs` so it can never break module loading — `cache_hit` reports the path taken.
+/// A disk hit runs cached bytecode through `runCommonJS`; a miss or decode failure compiles the wrapper, persists it best-effort, then runs it. `version` is the caller's invalidation string (see `cache.evalCached`). Disabled or unsupported cache paths and compilation failures use `evalAsCjs`; source errors still propagate. Runtime exceptions are returned without executing the module again, and `cache_hit` is true for a decoded disk hit even when execution throws.
 pub fn evalCachedCjs(
     instance_id: i32,
     source: []const u8,
@@ -538,7 +537,7 @@ fn qjsModuleRequireCb(
     defer qjs_mod.jsbay_qjs_JS_FreeCString(ctx, spec_cstr);
     const spec = std.mem.span(spec_cstr);
 
-    // The second argument is supplied by the per-module JS closure. Root calls without it retain the historical <cjs> resolution context.
+    // The per-module JS closure supplies the canonical referrer as the second argument. Root calls without it use the <cjs> resolution context.
     const referrer_cstr = if (argc >= 2 and qjs_mod.jsbay_qjs_JS_IsString(argv[1]) != 0)
         qjs_mod.jsbay_qjs_JS_ToCString(ctx, argv[1]) orelse return qjs_mod.JS_EXCEPTION
     else
@@ -640,8 +639,7 @@ fn jscThrowRequireError(
                     state.pending_exception = null;
                     const result = jsc_mod.jsc.JSValueMakeUndefined(ctx_ref);
                     exception[0] = value;
-                    // No potentially allocating JSC operation follows release;
-                    // the callback out-param hands the value back to JSC.
+                    // No potentially allocating JSC operation follows release; the callback out-param hands the value back to JSC.
                     ActiveEngine.freeValue(ctx, value);
                     return result;
                 }
@@ -749,13 +747,13 @@ fn stringifyValue(ctx: ActiveEngine.Context, val: ActiveEngine.Value) ?[]const u
 
 // -------------------------------------------------------------------------- Global `__jsbay_cjsCache` registration — bytecode-cached CommonJS --------------------------------------------------------------------------
 
-/// Register a JS-callable global `__jsbay_cjsCache(source, requireFn, filename, cacheDir?)` on the QuickJS context. The host's `loadModuleExports` uses this INSTEAD of `new Function("module","exports", "require", source)` so a widget/system-app body that costs hundreds of milliseconds to compile is compiled once and replayed from bytecode.
+/// Register `__jsbay_cjsCache(source, requireFn, filename, cacheDir?)` on QuickJS-family contexts. It caches compiled wrappers, not module instances; each invocation executes a wrapper with fresh exports and module objects.
 ///
 /// Unlike `evalCachedCjs` (which returns a string and uses the engine's global `require`), this callback:
-/// * preserves the caller's injected `require` (the widget runtime's restricted `requireSharedWidgetModule`) by passing the JS `requireFn` straight into the wrapper's argument list;
-/// * returns the *live* `module.exports` JS value, so the mount path keeps real object identity + functions (a JSON round-trip would drop them).
+/// * passes the caller-provided `requireFn` directly into the wrapper, preserving the injected resolution and access policy;
+/// * returns the live `module.exports` value without JSON serialization, preserving exported objects and functions.
 ///
-/// Persistence: when `cacheDir` is provided, bytes are stored under a shared cache key containing both the source and filename hashes. Without it (or on any cache failure) the callback degrades to a per-process cache keyed by the same pair, then finally to a plain wrapper compile.
+/// When enabled and `cacheDir` is provided, persisted keys include source and filename hashes, cache version, and the build fingerprint. Missing or undecodable entries fall through to the in-process compiled-byte cache and then compilation. Wrapper exceptions propagate without another invocation.
 fn registerGlobalCjsCache(ctx: ActiveEngine.Context) bool {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
