@@ -679,7 +679,8 @@ extern "C" HermesValue hermes_new_float64(JsbayHermesContext *c, double v) {
 extern "C" HermesValue hermes_new_string(JsbayHermesContext *c, const char *utf8, size_t len) {
     if (!c || !c->rt) return nullptr;
     try {
-        return retainMove(c, jsi::Value(jsi::String::createFromUtf8(*c->rt, std::string(utf8 ? utf8 : "", len))));
+        return retainMove(c, jsi::Value(jsi::String::createFromUtf8(
+            *c->rt, reinterpret_cast<const uint8_t *>(utf8 ? utf8 : ""), len)));
     } catch (...) { return nullptr; }
 }
 extern "C" HermesValue hermes_new_object(JsbayHermesContext *c) {
@@ -953,7 +954,8 @@ extern "C" char *hermes_json_stringify(JsbayHermesContext *c, HermesValue v) {
 extern "C" HermesValue hermes_json_parse(JsbayHermesContext *c, const char *utf8, size_t len) {
     if (!c || !c->rt || !c->pristine_json_parse) return nullptr;
     try {
-        auto s = jsi::String::createFromUtf8(*c->rt, std::string(utf8 ? utf8 : "", len));
+        auto s = jsi::String::createFromUtf8(
+            *c->rt, reinterpret_cast<const uint8_t *>(utf8 ? utf8 : ""), len);
         return retainMove(c, c->pristine_json_parse->call(*c->rt, s));
     } catch (...) { return nullptr; }
 }
@@ -1974,7 +1976,8 @@ extern "C" HermesValue hermes_new_error(JsbayHermesContext *c, int kind, const c
     }
     try {
         // Length-aware: preserve embedded NUL in the message bytes (C-string ctor would truncate).
-        auto msg = jsi::String::createFromUtf8(*c->rt, std::string(message ? message : "", message_len));
+        auto msg = jsi::String::createFromUtf8(
+            *c->rt, reinterpret_cast<const uint8_t *>(message ? message : ""), message_len);
         auto Ctor = c->rt->global().getPropertyAsFunction(*c->rt, ctor);
         if (kind == 8) {
             // AggregateError(errors, message)
@@ -2051,7 +2054,8 @@ extern "C" HermesOpResult hermes_json_parse_result(JsbayHermesContext *c, const 
     HermesOpResult out{nullptr, nullptr};
     if (!c || !c->rt || !c->pristine_json_parse) return out;
     try {
-        auto s = jsi::String::createFromUtf8(*c->rt, std::string(utf8 ? utf8 : "", len));
+        auto s = jsi::String::createFromUtf8(
+            *c->rt, reinterpret_cast<const uint8_t *>(utf8 ? utf8 : ""), len);
         return hopOk(c, c->pristine_json_parse->call(*c->rt, s));
     } catch (const jsi::JSError &e) {
         return hopFail(c, jsi::Value(*c->rt, e.value()));
@@ -2750,7 +2754,7 @@ static jsi::Value hostValueToJsi(jsi::Runtime &rt, const HermesHostValue &hv) {
     if (hv.tag == 1) return jsi::Value(hv.number);
     if (hv.tag == 2) {
         const char *p = hv.ptr ? hv.ptr : "";
-        return jsi::String::createFromUtf8(rt, std::string(p, hv.len));
+        return jsi::String::createFromUtf8(rt, reinterpret_cast<const uint8_t *>(p), hv.len);
     }
     return jsi::Value::undefined();
 }
@@ -2894,7 +2898,8 @@ extern "C" HermesValue hermes_host_object_create(JsbayHermesContext *c, int32_t 
                 for (size_t i = 0; i < order.size(); i++) {
                     size_t idx = order[i];
                     size_t len = lens ? lens[idx] : std::strlen(names[idx]);
-                    arr.setValueAtIndex(runtime, i, jsi::String::createFromUtf8(runtime, std::string(names[idx], len)));
+                    arr.setValueAtIndex(runtime, i, jsi::String::createFromUtf8(
+                        runtime, reinterpret_cast<const uint8_t *>(names[idx] ? names[idx] : ""), len));
                 }
                 return arr;
             });
