@@ -3,12 +3,14 @@ const builtin = @import("builtin");
 const repository = @import("repository.zig");
 const ios_stdlib = @import("ios_stdlib.zig");
 const apple_archive = @import("apple_archive.zig");
+const sdk_abi = @import("sdk_abi.zig");
 pub const test_tool_path = if (@import("builtin").is_test) @import("tool_options").executable else "";
 
 const Exit = error{ Usage, InvalidInput, PolicyFailure, ExternalFailure };
 
 test {
     _ = repository;
+    _ = sdk_abi;
     _ = @import("contracts.zig");
     _ = @import("package_contracts.zig");
     _ = @import("apple_archive.zig");
@@ -137,6 +139,7 @@ fn readLe16(slice: []const u8) ?usize {
 
 fn checkCAbi(args: []const []const u8) !u8 {
     var nm: []const u8 = "nm";
+    var zig_compiler: ?[]const u8 = null;
     var library: ?[]const u8 = null;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
@@ -145,20 +148,38 @@ fn checkCAbi(args: []const []const u8) !u8 {
             index += 1;
             if (index >= args.len) return error.Usage;
             nm = args[index];
+        } else if (std.mem.eql(u8, arg, "--zig")) {
+            index += 1;
+            if (index >= args.len) return error.Usage;
+            zig_compiler = args[index];
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            return error.Usage;
         } else if (library == null) {
             library = arg;
         } else return error.Usage;
     }
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
-    // Prefer the system compilers. Android NDK setup often puts a target-clang
-    // named `cc` ahead on PATH, which breaks these host syntax-only probes.
+    // Prefer the system compilers. Android NDK setup often puts a target-clang named `cc` ahead on PATH, which breaks these host C/C++ probes.
     const cc: []const u8 = if (builtin.os.tag == .windows) "cc" else "/usr/bin/cc";
     const cxx: []const u8 = if (builtin.os.tag == .windows) "c++" else "/usr/bin/c++";
+    // Explicit host compiler selection; Zig supplies genuine Clang C/C++ frontends. Compile into the ignored cache rather than syntax-only: Zig's driver injects -c, which conflicts with -fsyntax-only under -Werror. This checks code generation too, with the same strict warning flags.
+    try sdk_abi.check(std.heap.page_allocator, threaded.io());
     const consumers = [_][]const u8{ "tests/c_consumer.c", "tests/bytecode_consumer.c", "tests/native_sync_consumer.c", "tests/async_promise_consumer.c", "tests/host_wake_consumer.c" };
+    var compiler_env = std.process.Environ.Map.init(std.heap.page_allocator);
+    defer compiler_env.deinit();
+    if (zig_compiler != null) {
+        try compiler_env.put("ZIG_GLOBAL_CACHE_DIR", ".zig-cache/abi-probes");
+        try std.Io.Dir.cwd().createDirPath(threaded.io(), ".zig-cache/abi-probes");
+    }
     for (consumers) |consumer| {
-        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
-        try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer });
+        if (zig_compiler) |zig| {
+            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ zig, "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-c", "-o", ".zig-cache/abi-probes/probe.o", "-I", "include", consumer }, if (zig_compiler != null) &compiler_env else null);
+            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ zig, "c++", "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-c", "-o", ".zig-cache/abi-probes/probe.o", "-I", "include", consumer }, if (zig_compiler != null) &compiler_env else null);
+        } else {
+            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer }, if (zig_compiler != null) &compiler_env else null);
+            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer }, if (zig_compiler != null) &compiler_env else null);
+        }
     }
     const lib = library orelse return 0;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -309,8 +330,8 @@ fn runOutput(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8)
     return error.ExternalFailure;
 }
 
-fn requireExternal(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
-    const result = std.process.run(allocator, io, .{ .argv = argv, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(16 * 1024 * 1024) }) catch |err| {
+fn requireExternal(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, environ_map: ?*const std.process.Environ.Map) !void {
+    const result = std.process.run(allocator, io, .{ .argv = argv, .environ_map = environ_map, .stdout_limit = .limited(16 * 1024 * 1024), .stderr_limit = .limited(16 * 1024 * 1024) }) catch |err| {
         std.debug.print("external command failed: {s}\n", .{argv[0]});
         return err;
     };

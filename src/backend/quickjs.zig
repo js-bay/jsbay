@@ -9,15 +9,15 @@
 //!   * `quickjs/console.zig`        — `jsConsoleLog` callback.
 //!   * `quickjs/timers.zig`         — setTimeout/Interval/clearTimer.
 //! * `quickjs/exception.zig` — getAndFormatException, jsonStringify, valueToString.
-//!   * `quickjs/datetime.zig`       — Date + BigInt helpers.
-//!   * `quickjs/collections.zig`    — Map/Set + iteration.
+//!   * `quickjs/datetime.zig`       — Date + BigInt helpers (shared leaf from `quickjs_common/datetime.zig`).
+//!   * `quickjs/collections.zig`    — Map/Set + iteration (shared leaf from `quickjs_common/collections.zig`).
 //!   * `quickjs/dataview.zig`       — DataView ctor/info.
 //!   * `quickjs/external.zig`       — opaque external pointers.
 //!   * `quickjs/module.zig`         — ES module loader.
 //!   * `quickjs/bytecode.zig`       — bytecode compile / run.
 //!   * `quickjs/errors.zig`         — structured Error API.
 //!   * `quickjs/runtime_control.zig`— interrupt + GC + memory snapshot.
-//!   * `quickjs/buffers.zig`        — zero-copy ArrayBuffer / Uint8Array view.
+//!   * `quickjs/buffers.zig`        — zero-copy ArrayBuffer / Uint8Array view (shared leaf from `quickjs_common/buffers.zig`).
 //!   * `quickjs/weak.zig`           — true-weak (`reference.Weak(T)`) support.
 //!   * `quickjs/weakcb.zig`         — napi_wrap-style finalizer attachment.
 //!   * `quickjs/cjs.zig`            — CommonJS eval-to-value.

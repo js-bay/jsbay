@@ -293,11 +293,41 @@ fn onlySessionId(state: *inspector_state.InspectorState) !u64 {
 }
 
 fn waitForSessionRemoval(state: *inspector_state.InspectorState, session_id: u64) !void {
-    var spins: usize = 0;
-    while (spins < 10_000 and sessionPresent(state, session_id)) : (spins += 1) {
-        std.Thread.yield() catch {};
-    }
+    const time = @import("../platform/io.zig");
+    try waitForSessionRemovalUntil(state, session_id, time.monotonicMilliseconds() + 3000);
+}
+
+fn waitForSessionRemovalUntil(state: *inspector_state.InspectorState, session_id: u64, deadline: i64) !void {
+    const time = @import("../platform/io.zig");
+    // EOF/queued frames are processed by another thread. Yield counts are not elapsed-time bounds and can expire before that worker is scheduled. Do not pump owner tasks here: the queued-await tests require them to remain queued.
+    while (sessionPresent(state, session_id) and time.monotonicMilliseconds() < deadline) time.sleepMs(1);
     try testing.expect(!sessionPresent(state, session_id));
+}
+
+fn waitForOnlySessionIdUntil(state: *inspector_state.InspectorState, deadline: i64) !u64 {
+    const time = @import("../platform/io.zig");
+    // session_opened is delivered by the transport worker after the client handshake returns. A snapshot of sessions.len is not a readiness bound.
+    while (time.monotonicMilliseconds() < deadline) {
+        state.mutex.lock();
+        const n = state.sessions.items.len;
+        if (n > 1) {
+            state.mutex.unlock();
+            return error.TestUnexpectedResult;
+        }
+        if (n == 1) {
+            const id = state.sessions.items[0].id;
+            state.mutex.unlock();
+            return id;
+        }
+        state.mutex.unlock();
+        time.sleepMs(1);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn waitForOnlySessionId(state: *inspector_state.InspectorState) !u64 {
+    const time = @import("../platform/io.zig");
+    return waitForOnlySessionIdUntil(state, time.monotonicMilliseconds() + 3000);
 }
 
 fn cApiHostileThrowCoercesReason() !bool {
@@ -1268,7 +1298,7 @@ test "cdp regression: a closed session cannot revive queued Performance measurem
     defer session.deinit();
     const state = inspector_state.stateByInstance(session.id) orelse return error.TestUnexpectedResult;
     const ledger = state.execution_cpu_ledger orelse return error.TestUnexpectedResult;
-    const session_id = try onlySessionId(state);
+    const session_id = try waitForOnlySessionId(state);
 
     var host = PerformanceBoundaryHost{};
     var thread: ?std.Thread = null;
@@ -1905,4 +1935,150 @@ test "cdp regression: disconnected queued awaits cannot consume the next session
     const response = try pumpResponse(&session, try send(&session, "Runtime.awaitPromise", settled_params, 1302), 1302);
     try testing.expect(responseIsSuccess(response, 1302));
     try testing.expect(std.mem.indexOf(u8, response, "new-session-await") != null);
+}
+
+// Test-only adapter: hold a real WebSocket EOF event before the inspector's callback, modeling an unscheduled transport worker without changing runtime code.
+const EventDeliveryGate = struct {
+    inner: *inspector.Transport,
+    kind: inspector.EventKind = .session_closed,
+    event_ctx: ?*anyopaque = null,
+    handler: inspector.EventHandler = undefined,
+    entered: std.atomic.Value(bool) = .init(false),
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn receive(ctx: ?*anyopaque, event: inspector.Event) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (event.kind == self.kind) {
+            self.entered.store(true, .seq_cst);
+            while (!self.release.load(.seq_cst)) std.Thread.yield() catch {};
+        }
+        self.handler(self.event_ctx, event);
+    }
+    fn start(ctx: *anyopaque, event_ctx: ?*anyopaque, handler: inspector.EventHandler) !void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.event_ctx = event_ctx;
+        self.handler = handler;
+        try self.inner.start(self, receive);
+    }
+    fn deinit(ctx: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.release.store(true, .seq_cst);
+        self.inner.deinit();
+    }
+    fn sendText(ctx: *anyopaque, id: inspector.SessionId, text: []const u8) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.inner.sendText(id, text);
+    }
+    fn broadcast(ctx: *anyopaque, text: []const u8) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.inner.broadcastText(text);
+    }
+    fn close(ctx: *anyopaque, id: inspector.SessionId) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.inner.closeSession(id);
+    }
+    fn target(ctx: *anyopaque, value: inspector.DiscoveryTarget) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.inner.setDiscoveryTarget(value);
+    }
+    fn port(ctx: *anyopaque) u16 {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return self.inner.boundPort();
+    }
+    const vtable: inspector.Transport.VTable = .{
+        .start = start,
+        .deinit = deinit,
+        .send_text = sendText,
+        .broadcast_text = broadcast,
+        .close_session = close,
+        .set_discovery_target = target,
+        .bound_port = port,
+    };
+};
+
+test "cdp regression: session-removal readiness waits for delayed EOF delivery and expires" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+    const endpoint = try @import("inspector_transport").Transport.init(std.heap.c_allocator, 0);
+    var gate = EventDeliveryGate{ .inner = endpoint.asTransport() };
+    var transport = inspector.Transport{ .ctx = &gate, .vtable = &EventDeliveryGate.vtable };
+    const handle = try inspector.startWithTransport(id, &transport, .{ .target_id = "close-gate" });
+    defer inspector.stop(handle);
+    // Release before inspector.stop even on assertion failure; stop joins workers.
+    defer gate.release.store(true, .seq_cst);
+    const stream = try wire.connect(inspector.boundPort(handle));
+    var stream_open = true;
+    defer if (stream_open) stream.close();
+    try wire.doWsHandshake(alloc, stream, "close-gate");
+    var session = Session{ .alloc = alloc, .id = id, .handle = handle, .stream = stream, .reader = wire.FrameReader.init(stream) };
+    defer session.got.deinit(alloc);
+    defer session.reader.deinit(alloc);
+    const before = try send(&session, "Runtime.getIsolateId", "", 1);
+    try testing.expect(try waitResponseNoTick(&session, before, 1));
+    const state = inspector_state.stateByInstance(id) orelse return error.TestUnexpectedResult;
+    const old_id = try onlySessionId(state);
+    const pending = try evaluatePromise(&session, 2, "new Promise(function(){})");
+    defer alloc.free(pending);
+    const params = try std.fmt.allocPrint(alloc, "{{\"promiseObjectId\":\"{s}\"}}", .{pending});
+    defer alloc.free(params);
+    for (0..64) |n| _ = try send(&session, "Runtime.awaitPromise", params, @intCast(n + 10));
+    stream.close();
+    stream_open = false;
+    const time = @import("../platform/io.zig");
+    const deadline = time.monotonicMilliseconds() + 3000;
+    while (!gate.entered.load(.seq_cst) and time.monotonicMilliseconds() < deadline) time.sleepMs(1);
+    try testing.expect(gate.entered.load(.seq_cst));
+    // An expired deadline must not report success for a still-present session.
+    try testing.expectError(error.TestUnexpectedResult, waitForSessionRemovalUntil(state, old_id, time.monotonicMilliseconds() + 5));
+    try testing.expect(sessionPresent(state, old_id));
+    const Release = struct {
+        fn run(value: *EventDeliveryGate) void {
+            @import("../platform/io.zig").sleepMs(150);
+            value.release.store(true, .seq_cst);
+        }
+    };
+    const worker = try std.Thread.spawn(.{}, Release.run, .{&gate});
+    defer worker.join();
+    try waitForSessionRemoval(state, old_id);
+}
+
+test "cdp regression: onlySessionId requires a session-opened readiness wait" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+    const endpoint = try @import("inspector_transport").Transport.init(std.heap.c_allocator, 0);
+    var gate = EventDeliveryGate{ .inner = endpoint.asTransport(), .kind = .session_opened };
+    var transport = inspector.Transport{ .ctx = &gate, .vtable = &EventDeliveryGate.vtable };
+    const handle = try inspector.startWithTransport(id, &transport, .{ .target_id = "open-gate" });
+    defer inspector.stop(handle);
+    defer gate.release.store(true, .seq_cst);
+    const stream = try wire.connect(inspector.boundPort(handle));
+    defer stream.close();
+    try wire.doWsHandshake(alloc, stream, "open-gate");
+    const state = inspector_state.stateByInstance(id) orelse return error.TestUnexpectedResult;
+    const time = @import("../platform/io.zig");
+    const deadline = time.monotonicMilliseconds() + 3000;
+    while (!gate.entered.load(.seq_cst) and time.monotonicMilliseconds() < deadline) time.sleepMs(1);
+    try testing.expect(gate.entered.load(.seq_cst));
+    // The handshake has completed and production has the open event, but delivery is still gated. A snapshot onlySessionId is not a session-lifetime contract.
+    try testing.expectError(error.TestUnexpectedResult, onlySessionId(state));
+    try testing.expectEqual(@as(usize, 0), inspector_state.sessionCount(state));
+    try testing.expectError(error.TestUnexpectedResult, waitForOnlySessionIdUntil(state, time.monotonicMilliseconds() + 5));
+    try testing.expectEqual(@as(usize, 0), inspector_state.sessionCount(state));
+    const Release = struct {
+        fn run(value: *EventDeliveryGate) void {
+            @import("../platform/io.zig").sleepMs(150);
+            value.release.store(true, .seq_cst);
+        }
+    };
+    const worker = try std.Thread.spawn(.{}, Release.run, .{&gate});
+    defer worker.join();
+    const session_id = try waitForOnlySessionId(state);
+    try testing.expect(sessionPresent(state, session_id));
+    try testing.expectEqual(session_id, try onlySessionId(state));
 }

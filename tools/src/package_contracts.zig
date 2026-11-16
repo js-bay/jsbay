@@ -272,6 +272,10 @@ test "published package includes every engine patch build input" {
     try testing.expect(unpacked.succeeded());
     const artifact = try path(allocator, extracted, &.{hash});
     try testing.expect(try exists(io, allocator, artifact, &.{"build.zig"}));
+    // The sixth local package must survive Zig's public package inventory, not merely work in a developer's checkout.
+    for ([_][]const u8{ "LICENSE", "readme.md", "build.zig", "build.zig.zon", "src/root.zig", "src/registry.zig", "src/loader.zig", "src/tests.zig" }) |input| {
+        try testing.expect(try exists(io, allocator, artifact, &.{ "libs", "commonjs", input }));
+    }
 
     const build = try read(allocator, io, cwd, &.{"build.zig"});
     var lines = std.mem.splitScalar(u8, build, '\n');
@@ -345,4 +349,72 @@ test "cache fingerprint changes for the wrapper and pinned QuickJS-NG input" {
     try writeFile(io, opcode, opcode_before);
     try testing.expectEqualStrings(original, try fingerprint(allocator, io, fixture, shadow, wrapper, source));
     try testing.expectEqualStrings(source_before, try Dir.cwd().readFileAlloc(io, source_path, allocator, .limited(1024 * 1024)));
+}
+
+test "commonjs package owns loading and cache behavior without engine imports" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(allocator, io);
+    const package = try path(allocator, cwd, &.{ "libs", "commonjs" });
+    for ([_][]const u8{ "build.zig", "build.zig.zon", "LICENSE", "readme.md", "src/root.zig", "src/registry.zig", "src/loader.zig", "src/tests.zig" }) |required| {
+        try testing.expect(try exists(io, allocator, package, &.{required}));
+    }
+    const manifest = try read(allocator, io, package, &.{"build.zig.zon"});
+    try expectContains(manifest, ".minimum_zig_version = \"0.17.0\"");
+    try expectContains(manifest, ".dependencies = .{}");
+    try expectNotContains(manifest, "../");
+    const listing = try sources(allocator, io, cwd, try path(allocator, package, &.{"src"}));
+    var names = std.mem.splitScalar(u8, listing, '\n');
+    while (names.next()) |name| {
+        if (name.len == 0) continue;
+        const text = try Dir.cwd().readFileAlloc(io, name, allocator, .limited(16 * 1024 * 1024));
+        for ([_][]const u8{ "@cImport", "@cInclude", "@embedFile", "instance_map", "Host.engine", "ActiveEngine" }) |forbidden| try expectNotContains(text, forbidden);
+        var imports = text;
+        while (std.mem.indexOf(u8, imports, "@import(\"")) |start| {
+            imports = imports[start + "@import(\"".len ..];
+            const end = std.mem.indexOfScalar(u8, imports, '"') orelse return error.InvalidImport;
+            const imported = imports[0..end];
+            if (!std.mem.eql(u8, imported, "std") and !std.mem.eql(u8, imported, "builtin")) {
+                const resolved = try std.fs.path.resolve(allocator, &.{ std.fs.path.dirname(name).?, imported });
+                const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{package});
+                try testing.expect(std.mem.startsWith(u8, resolved, prefix));
+            }
+            imports = imports[end + 1 ..];
+        }
+    }
+    const adapter = try read(allocator, io, cwd, &.{ "src", "script", "cjs", "adapter.zig" });
+    try expectContains(adapter, "@import(\"commonjs\")");
+    try expectContains(adapter, "commonjs.Registry(ValueOps)");
+    try testing.expect(!try exists(io, allocator, cwd, &.{ "src", "script", "cjs", "module_registry.zig" }));
+
+    // Copy only the package's distributable inputs, never caches, siblings, parent sources or symlinks. A fresh global cache prevents cache masking.
+    const isolated = try makeTemp(allocator, io, "commonjs-isolated");
+    defer Dir.cwd().deleteTree(io, isolated) catch {};
+    var package_dir = try Dir.cwd().openDir(io, package, .{ .iterate = true });
+    defer package_dir.close(io);
+    var walker = try package_dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (std.mem.startsWith(u8, entry.path, ".zig-cache")) continue;
+        try testing.expect(entry.kind == .directory or entry.kind == .file);
+    }
+    for ([_][]const u8{ "build.zig", "build.zig.zon", "LICENSE", "readme.md", "src" }) |input| {
+        try copyTree(allocator, io, cwd, try path(allocator, package, &.{input}), try path(allocator, isolated, &.{input}));
+    }
+    var env = try testing.environ.createMap(allocator);
+    defer env.deinit();
+    try env.put("ZIG_GLOBAL_CACHE_DIR", try path(allocator, isolated, &.{"global-cache"}));
+    var output = sdk.Output{ .result = try std.process.run(allocator, io, .{
+        .argv = &.{ "zig", "build", "test", "-Dtarget=native", "--summary", "all" },
+        .cwd = .{ .path = isolated },
+        .environ_map = &env,
+        .stdout_limit = .limited(16 * 1024 * 1024),
+        .stderr_limit = .limited(16 * 1024 * 1024),
+    }), .allocator = allocator };
+    defer output.deinit();
+    if (!output.succeeded()) std.debug.print("isolated commonjs tests failed:\n{s}\n{s}", .{ output.result.stdout, output.result.stderr });
+    try testing.expect(output.succeeded());
+    try expectContains(output.result.stderr, "tests passed");
 }

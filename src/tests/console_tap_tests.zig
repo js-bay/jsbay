@@ -296,3 +296,56 @@ fn spinUntil(flag: *const std.atomic.Value(bool), timeout_ms: i64) bool {
     }
     return true;
 }
+
+const NestedCapture = struct {
+    ordinary_calls: usize = 0,
+    tap_calls: usize = 0,
+    valid: bool = true,
+
+    fn log(_: i32, _: types.LogLevel, _: [*:0]const u8, opaque_ptr: ?*anyopaque) callconv(.c) void {
+        const self: *NestedCapture = @ptrCast(@alignCast(opaque_ptr.?));
+        self.ordinary_calls += 1;
+    }
+
+    fn tap(opaque_ptr: ?*anyopaque, id: i32, _: types.LogLevel, message: [*:0]const u8) callconv(.c) void {
+        const self: *NestedCapture = @ptrCast(@alignCast(opaque_ptr.?));
+        const view = console_tap.currentArgView() orelse {
+            self.valid = false;
+            return;
+        };
+        self.tap_calls += 1;
+        self.valid = self.valid and self.ordinary_calls == self.tap_calls and view.argc == 1 and view.argv != null and view.ctx != null;
+        if (std.mem.eql(u8, std.mem.span(message), "outer")) {
+            self.valid = self.valid and std.mem.eql(u8, view.cdp_type, "log");
+            helpers.evalOk(id, "console.warn('inner')") catch {
+                self.valid = false;
+            };
+            const restored = console_tap.currentArgView() orelse {
+                self.valid = false;
+                return;
+            };
+            self.valid = self.valid and restored.argv == view.argv and restored.frames.ptr == view.frames.ptr and std.mem.eql(u8, restored.cdp_type, "log");
+        } else {
+            self.valid = self.valid and std.mem.eql(u8, view.cdp_type, "warning") and std.mem.eql(u8, std.mem.span(message), "inner");
+        }
+    }
+};
+
+test "console_tap: nested QuickJS diagnostic capture restores borrowed TLS and delivers logs first" {
+    if (comptime !@import("build_options").inspector or !@import("../backend.zig").isQuickJsApiBackend(@import("../backend.zig").active_backend)) return error.SkipZigTest;
+    var capture = NestedCapture{};
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .log_handler = NestedCapture.log, .log_user_data = &capture }));
+    defer engine.destroy(id);
+    console_tap.set(id, &capture, NestedCapture.tap);
+    defer console_tap.clear(id);
+    const previous = console_tap.currentArgView();
+    defer console_tap.setArgView(previous);
+    console_tap.setArgView(.{ .ctx = null, .argc = 17, .argv = null, .cdp_type = "prior" });
+    try helpers.evalOk(id, "console.log('outer')");
+    try testing.expect(capture.valid);
+    try testing.expectEqual(@as(usize, 2), capture.tap_calls);
+    const restored = console_tap.currentArgView() orelse return error.MissingPriorArgView;
+    try testing.expectEqual(@as(usize, 17), restored.argc);
+    try testing.expectEqualStrings("prior", restored.cdp_type);
+}

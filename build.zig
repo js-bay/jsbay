@@ -43,13 +43,12 @@ fn parseBackendName(name: []const u8) ?Backend {
 const ResolvedBackends = struct {
     /// Engines linked into this artifact (explicit -Dbackends=… or single -Dbackend=…).
     list: []const Backend,
-    /// Temporary monomorphic default for the shared layer (first packed / -Dbackend=).
+    /// Monomorphic backend for shared layers: the first packed backend or `-Dbackend=`.
     primary: Backend,
     bits: u32,
 };
 
-/// Resolve pack set. `-Dbackends=` is the multi-pack selector (no implicit quickjs_ng).
-/// `-Dbackend=` remains the single-engine shorthand (default quickjs to match product builds).
+/// Resolve pack set. `-Dbackends=` is the multi-pack selector (no implicit quickjs_ng). `-Dbackend=` remains the single-engine shorthand (default quickjs to match product builds).
 fn resolveBackends(b: *std.Build, os: std.Target.Os.Tag) ResolvedBackends {
     const backends_str = b.option([]const u8, "backends", "Comma-separated engines to pack into one artifact (e.g. quickjs_ng,jsc). Do not pass with -Dbackend.");
     const backend_opt = b.option(Backend, "backend", "Single JS engine backend shorthand (quickjs_ng, quickjs, jsc, escargot, or hermes). Do not pass with -Dbackends.");
@@ -137,14 +136,23 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Repository-maintenance commands always run on the build host.  They must never inherit `-Dtarget`, because Apple/Android artifacts are not executable by the machine orchestrating their build.
+    const abi_header = b.addTranslateC(.{
+        .root_source_file = b.path("include/jsbay.h"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    const public_abi = abi_header.createModule();
     const tool = b.addExecutable(.{
         .name = "jsbay-tool",
         .root_module = b.createModule(.{
             .root_source_file = b.path("tools/src/main.zig"),
+            .link_libc = true,
             .target = b.graph.host,
             .optimize = .Debug,
         }),
     });
+    tool.root_module.addImport("public_abi", public_abi);
     const install_tool = b.addInstallArtifact(tool, .{});
     b.getInstallStep().dependOn(&install_tool.step);
     b.step("install-tool", "Install the host-native repository tool").dependOn(&install_tool.step);
@@ -153,11 +161,14 @@ pub fn build(b: *std.Build) void {
     b.step("tool", "Run a host-native repository tool").dependOn(&tool_run.step);
     const tool_test_options = b.addOptions();
     tool_test_options.addOptionPath("executable", tool.getEmittedBin());
+    tool_test_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     const tool_test_module = b.createModule(.{
         .root_source_file = b.path("tools/src/main.zig"),
         .target = b.graph.host,
         .optimize = .Debug,
     });
+    tool_test_module.link_libc = true;
+    tool_test_module.addImport("public_abi", public_abi);
     tool_test_module.addOptions("tool_options", tool_test_options);
     const tool_tests = b.addTest(.{ .root_module = tool_test_module });
     const run_tool_tests = b.addRunArtifact(tool_tests);
@@ -239,11 +250,12 @@ pub fn build(b: *std.Build) void {
     const inspector_transport = inspector_transport_dep.module("inspector_transport");
     const bytecode_cache_dep = b.dependency("bytecode_cache", .{ .target = target, .optimize = optimize });
     const bytecode_cache = bytecode_cache_dep.module("bytecode_cache");
+    const commonjs_dep = b.dependency("commonjs", .{ .target = target, .optimize = optimize });
+    const commonjs = commonjs_dep.module("commonjs");
     const state_tcas_dep = b.dependency("state_tcas", .{ .target = target, .optimize = optimize });
     const state_tcas = state_tcas_dep.module("state_tcas");
 
-    // The checked-in gitlinks are copied into the build cache before patching, leaving both the submodule checkout and an imported source snapshot intact.
-    // Prepare QuickJS tree if any packed engine needs it (first QJS-family wins for translate-c).
+    // The checked-in gitlinks are copied into the build cache before patching, leaving both the submodule checkout and an imported source snapshot intact. Prepare QuickJS tree if any packed engine needs it (first QJS-family wins for translate-c).
     var qjs_family: ?Backend = null;
     for (packed_backends) |tag| {
         if (tag == .quickjs_ng or tag == .quickjs) {
@@ -332,8 +344,7 @@ pub fn build(b: *std.Build) void {
         .strip = if (apple_package) true else null,
         .error_tracing = if (apple_package) false else null,
     });
-    lib_module.addOptions("build_options", build_options);
-    if (qjs_mod) |qjs| lib_module.addImport("qjs", qjs);
+    wireImports(lib_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, qjs_mod);
     if (target.result.abi.isAndroid()) {
         if (android_sysroot) |sysroot| {
             const api = target.result.os.version_range.linux.android;
@@ -373,11 +384,6 @@ pub fn build(b: *std.Build) void {
         lib_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sysroot}) });
     }
 
-    lib_module.addImport("zev", zev);
-    lib_module.addImport("js_event_loop", js_event_loop);
-    lib_module.addImport("inspector", inspector);
-    lib_module.addImport("inspector_transport", inspector_transport);
-    lib_module.addImport("bytecode_cache", bytecode_cache);
     addPlatformCompatSources(b, lib_module);
     addBackendSources(b, lib_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
 
@@ -404,13 +410,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mod.addOptions("build_options", build_options);
-    mod.addImport("zev", zev);
-    mod.addImport("js_event_loop", js_event_loop);
-    mod.addImport("inspector", inspector);
-    mod.addImport("inspector_transport", inspector_transport);
-    mod.addImport("bytecode_cache", bytecode_cache);
-    if (qjs_mod) |qjs| mod.addImport("qjs", qjs);
+    wireImports(mod, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, qjs_mod);
     if (qjs_root) |root| mod.addIncludePath(root);
 
     // Demos and benchmarks use this repository-private implementation module. It stays out of the public `jsbay` module so product consumers use the typed C ABI or the documented Zig expert modules instead.
@@ -420,13 +420,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    internal_tools_module.addOptions("build_options", build_options);
-    internal_tools_module.addImport("zev", zev);
-    internal_tools_module.addImport("js_event_loop", js_event_loop);
-    internal_tools_module.addImport("inspector", inspector);
-    internal_tools_module.addImport("inspector_transport", inspector_transport);
-    internal_tools_module.addImport("bytecode_cache", bytecode_cache);
-    if (qjs_mod) |qjs| internal_tools_module.addImport("qjs", qjs);
+    wireImports(internal_tools_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, qjs_mod);
     if (qjs_root) |root| internal_tools_module.addIncludePath(root);
 
     // --- Unit tests ---
@@ -436,14 +430,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    test_module.addOptions("build_options", build_options);
-    test_module.addImport("zev", zev);
-    test_module.addImport("js_event_loop", js_event_loop);
-    test_module.addImport("inspector", inspector);
-    test_module.addImport("inspector_transport", inspector_transport);
-    test_module.addImport("bytecode_cache", bytecode_cache);
+    wireImports(test_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, qjs_mod);
     test_module.addImport("state_tcas", state_tcas);
-    if (qjs_mod) |qjs| test_module.addImport("qjs", qjs);
 
     if (apple_sysroot) |sysroot| {
         test_module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sysroot}) });
@@ -479,6 +467,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-state-tcas-engine", "Run state_tcas harnesses over ActiveEngine + host dispatch / JS queues").dependOn(&run_state_tcas_engine.step);
 
     if (!stress_tests) {
+        const package_test_step = b.step("test-packages", "Run all six independent local package suites");
         const zev_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = zev_dep.path("src/tests.zig"),
@@ -489,7 +478,9 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = if (test_filter) |filter| &.{filter} else &.{},
         });
-        test_step.dependOn(&b.addRunArtifact(zev_tests).step);
+        const run_zev_package = b.addRunArtifact(zev_tests);
+        test_step.dependOn(&run_zev_package.step);
+        package_test_step.dependOn(&run_zev_package.step);
         const js_event_loop_tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = js_event_loop_dep.path("src/tests.zig"),
             .target = target,
@@ -500,7 +491,9 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zev", .module = zev },
             },
         }), .filters = if (test_filter) |filter| &.{filter} else &.{} });
-        test_step.dependOn(&b.addRunArtifact(js_event_loop_tests).step);
+        const run_js_event_loop_package = b.addRunArtifact(js_event_loop_tests);
+        test_step.dependOn(&run_js_event_loop_package.step);
+        package_test_step.dependOn(&run_js_event_loop_package.step);
         const inspector_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = inspector_dep.path("src/tests.zig"),
@@ -511,7 +504,9 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = if (test_filter) |filter| &.{filter} else &.{},
         });
-        test_step.dependOn(&b.addRunArtifact(inspector_tests).step);
+        const run_inspector_package = b.addRunArtifact(inspector_tests);
+        test_step.dependOn(&run_inspector_package.step);
+        package_test_step.dependOn(&run_inspector_package.step);
         const transport_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = inspector_transport_dep.path("src/tests.zig"),
@@ -527,7 +522,9 @@ pub fn build(b: *std.Build) void {
             }),
             .filters = if (test_filter) |filter| &.{filter} else &.{},
         });
-        test_step.dependOn(&b.addRunArtifact(transport_tests).step);
+        const run_transport_package = b.addRunArtifact(transport_tests);
+        test_step.dependOn(&run_transport_package.step);
+        package_test_step.dependOn(&run_transport_package.step);
         const bytecode_cache_tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = bytecode_cache_dep.path("src/tests.zig"),
             .target = target,
@@ -535,7 +532,18 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{.{ .name = "bytecode_cache", .module = bytecode_cache }},
         }), .filters = if (test_filter) |filter| &.{filter} else &.{} });
-        test_step.dependOn(&b.addRunArtifact(bytecode_cache_tests).step);
+        const run_bytecode_cache_package = b.addRunArtifact(bytecode_cache_tests);
+        test_step.dependOn(&run_bytecode_cache_package.step);
+        package_test_step.dependOn(&run_bytecode_cache_package.step);
+
+        const commonjs_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = commonjs_dep.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }), .filters = if (test_filter) |filter| &.{filter} else &.{} });
+        const run_commonjs_package = b.addRunArtifact(commonjs_tests);
+        test_step.dependOn(&run_commonjs_package.step);
+        package_test_step.dependOn(&run_commonjs_package.step);
 
         // state_tcas: calendar / toy ducks / real Scheduler+Driver (Timer/Notifier) / Safety-Liveness. Independent of ActiveEngine vendors so it can green without QuickJS checkout. Driver.testing pulls zev.Loop; import zev like js_event_loop package tests.
         const state_tcas_harness = b.addTest(.{
@@ -623,13 +631,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .pic = true,
         });
-        contract_module.addOptions("build_options", build_options);
-        contract_module.addImport("qjs", qjs_mod.?);
-        contract_module.addImport("zev", zev);
-        contract_module.addImport("js_event_loop", js_event_loop);
-        contract_module.addImport("inspector", inspector);
-        contract_module.addImport("inspector_transport", inspector_transport);
-        contract_module.addImport("bytecode_cache", bytecode_cache);
+        wireImports(contract_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, qjs_mod);
         addPlatformCompatSources(b, contract_module);
         addBackendSources(b, contract_module, packed_backends, false, os, instrumented_root, true, heap_snapshot, false, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
         contract_module.linkSystemLibrary("m", .{});
@@ -657,13 +659,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    conformance_module.addOptions("build_options", build_options);
-    conformance_module.addImport("zev", zev);
-    conformance_module.addImport("js_event_loop", js_event_loop);
-    conformance_module.addImport("inspector", inspector);
-    conformance_module.addImport("inspector_transport", inspector_transport);
-    conformance_module.addImport("bytecode_cache", bytecode_cache);
-    if (qjs_mod) |qjs| conformance_module.addImport("qjs", qjs);
+    wireImports(conformance_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, qjs_mod);
     addPlatformCompatSources(b, conformance_module);
     addBackendSources(b, conformance_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
     const conformance_library = b.addLibrary(.{
@@ -719,13 +715,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     bench_module.addImport("jsbay_tools", internal_tools_module);
-    bench_module.addOptions("build_options", build_options);
-    bench_module.addImport("zev", zev);
-    bench_module.addImport("js_event_loop", js_event_loop);
-    bench_module.addImport("inspector", inspector);
-    bench_module.addImport("inspector_transport", inspector_transport);
-    bench_module.addImport("bytecode_cache", bytecode_cache);
-    if (qjs_mod) |qjs| bench_module.addImport("qjs", qjs);
+    wireImports(bench_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, qjs_mod);
 
     addPlatformCompatSources(b, bench_module);
     addBackendSources(b, bench_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
@@ -751,13 +741,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     demo_module.addImport("jsbay_tools", internal_tools_module);
-    demo_module.addOptions("build_options", build_options);
-    demo_module.addImport("zev", zev);
-    demo_module.addImport("js_event_loop", js_event_loop);
-    demo_module.addImport("inspector", inspector);
-    demo_module.addImport("inspector_transport", inspector_transport);
-    demo_module.addImport("bytecode_cache", bytecode_cache);
-    if (qjs_mod) |qjs| demo_module.addImport("qjs", qjs);
+    wireImports(demo_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, qjs_mod);
 
     addPlatformCompatSources(b, demo_module);
     addBackendSources(b, demo_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
@@ -788,9 +772,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // --- Pauseable DevTools owner-thread C embed sample ---
-    // Dedicated owner pthread: create → inspector_start → run_loop → destroy.
-    // Main/client only calls stop_loop. Prefer -Dbackend=quickjs_ng for Debugger.
-    // `--self-test` is the automated smoke; interactive mode waits for stdin.
+    // Dedicated owner pthread: create → inspector_start → run_loop → destroy. Main/client only calls stop_loop. Prefer -Dbackend=quickjs_ng for Debugger. `--self-test` is the automated smoke; interactive mode waits for stdin.
     if (inspector_enabled and inspector_transport_enabled) {
         const embed_module = b.createModule(.{
             .target = target,
@@ -841,7 +823,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // --- JSC Safari-attachable inspector demo ---
-    // Uses JavaScriptCore's built-in WebKit Inspector. Only meaningful on JSC + Darwin; under QJS or non-Apple targets we skip the entire step so `zig build` stays green.
+    // Uses JavaScriptCore's built-in WebKit Inspector. The executable requires JSC and Darwin; other configurations do not build this Apple-framework demo.
     if (backend == .jsc and (os == .macos or os == .ios)) {
         const safari_module = b.createModule(.{
             .root_source_file = b.path("examples/jsc_safari_demo.zig"),
@@ -855,12 +837,7 @@ pub fn build(b: *std.Build) void {
             safari_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sysroot}) });
         }
         safari_module.addImport("jsbay_tools", internal_tools_module);
-        safari_module.addOptions("build_options", build_options);
-        safari_module.addImport("zev", zev);
-        safari_module.addImport("js_event_loop", js_event_loop);
-        safari_module.addImport("inspector", inspector);
-        safari_module.addImport("inspector_transport", inspector_transport);
-        safari_module.addImport("bytecode_cache", bytecode_cache);
+        wireImports(safari_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, null);
         safari_module.linkFramework("JavaScriptCore", .{});
         safari_module.linkFramework("Foundation", .{});
         safari_module.linkFramework("CoreFoundation", .{});
@@ -1031,8 +1008,7 @@ fn addOneBackendSources(
 }
 
 fn addEscargotSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8) void {
-    // EscargotPublic C bridge + libescargot (g++/local-exec TLS).
-    // Zig's linkSystemLibrary("stdc++") is special-cased to libc++ — link libstdc++.a by path.
+    // EscargotPublic C bridge + libescargot (g++/local-exec TLS). Zig's linkSystemLibrary("stdc++") is special-cased to libc++ — link libstdc++.a by path.
     const install: std.Build.LazyPath = if (std.fs.path.isAbsolute(install_prefix)) .{ .cwd_relative = install_prefix } else b.path(install_prefix);
     m.addIncludePath(install.path(b, "include"));
     m.addIncludePath(b.path("src/backend/escargot"));
@@ -1120,7 +1096,7 @@ fn addQuickJsCSources(
         .safe => "-O2",
         .fast, .small => "-O3",
     };
-    // Harsh-father ASan: instrument QuickJS C + wrappers; final consumer must link -fsanitize=address.
+    // ASan instruments QuickJS C and wrappers; the final consumer must link -fsanitize=address.
     const c_flags: []const []const u8 = blk: {
         if (asan and gc_stress)
             break :blk &.{ b.fmt("-DCONFIG_VERSION=\"{s}\"", .{version}), "-DFORCE_GC_AT_MALLOC=1", "-fwrapv", "-w", c_opt, "-fsanitize=address", "-fno-omit-frame-pointer" };
@@ -1209,6 +1185,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("src/backend/quickjs/quickjs_shim.h"));
             hash.update(@embedFile("src/backend/quickjs/qjs_wrapper_quickjs.c"));
             hash.update(@embedFile("src/backend/quickjs/bytecode.zig"));
+            hash.update(@embedFile("src/backend/quickjs_common/bytecode.zig"));
         },
         .quickjs_ng => {
             hashQuickJsSources(&hash, "vendor/quickjs-ng", true);
@@ -1230,6 +1207,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
             hash.update(@embedFile("src/backend/quickjs_ng/qjs_wrapper_ng.c"));
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
+            hash.update(@embedFile("src/backend/quickjs_common/bytecode.zig"));
         },
         .jsc => {},
         .escargot, .hermes => {},
@@ -1274,4 +1252,16 @@ fn ohosLibTriple(arch: std.Target.Cpu.Arch) []const u8 {
         .arm => "arm-linux-ohos",
         else => @panic("unsupported OpenHarmony architecture"),
     };
+}
+
+/// Only identical module imports belong here. Sources, target/link setup, test dependencies and private tooling imports remain explicit at their call sites.
+fn wireImports(module: *std.Build.Module, options: *std.Build.Step.Options, zev: *std.Build.Module, event_loop: *std.Build.Module, inspector: *std.Build.Module, transport: *std.Build.Module, bytecode_cache: *std.Build.Module, commonjs: *std.Build.Module, qjs: ?*std.Build.Module) void {
+    module.addOptions("build_options", options);
+    module.addImport("zev", zev);
+    module.addImport("js_event_loop", event_loop);
+    module.addImport("inspector", inspector);
+    module.addImport("inspector_transport", transport);
+    module.addImport("bytecode_cache", bytecode_cache);
+    module.addImport("commonjs", commonjs);
+    if (qjs) |mod| module.addImport("qjs", mod);
 }

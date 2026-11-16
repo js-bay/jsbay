@@ -8,7 +8,7 @@ const qjs = c.qjs;
 
 const exception = @import("exception.zig");
 const types = @import("../../types.zig");
-const console_tap = @import("../../inspector/console_tap.zig");
+const diagnostic = @import("../../inspector/backends/quickjs_console.zig").create(c);
 const console_format = @import("../console_format.zig");
 const console_log = @import("../console_log.zig");
 const console_timers = @import("../console_timers.zig");
@@ -116,36 +116,7 @@ fn publish(
 
     console_log.deliver(id, level, c_msg);
 
-    if (comptime @import("build_options").inspector) {
-        var tap = console_tap.begin(id);
-        if (!tap.isActive()) return;
-
-        const console_stack_frame_cap = 16;
-        var raw_frames: [console_stack_frame_cap]qjs.JSDebugFrameInfo = undefined;
-        var copied: [console_stack_frame_cap]console_tap.CallFrame = undefined;
-        @import("../../tests/debug_cold_probe.zig").noteDebugStackCopy();
-        const frame_count: usize = @intCast(qjs.JS_CopyDebugStack(ctx, &raw_frames, raw_frames.len));
-        for (raw_frames[0..frame_count], 0..) |*frame, i| {
-            copied[i] = .{
-                .function_name = std.mem.span(@as([*:0]const u8, @ptrCast(&frame.name))),
-                .url = std.mem.span(@as([*:0]const u8, @ptrCast(&frame.filename))),
-                .line = if (frame.line > 0) frame.line - 1 else 0,
-                .column = if (frame.column > 0) frame.column - 1 else 0,
-                .script_tag = frame.script_tag,
-            };
-        }
-        const arg_count: usize = if (argc > 0) @intCast(argc) else 0;
-        const previous_args = console_tap.currentArgView();
-        console_tap.setArgView(.{
-            .ctx = if (ctx) |p| @ptrCast(p) else null,
-            .argc = arg_count,
-            .argv = if (arg_count > 0) @ptrCast(argv) else null,
-            .cdp_type = cdp_type,
-            .frames = copied[0..frame_count],
-        });
-        defer console_tap.setArgView(previous_args);
-        tap.finish(id, level, c_msg);
-    }
+    diagnostic.publishDiagnostic(id, ctx, argc, argv, level, cdp_type, c_msg);
 }
 
 pub fn jsConsoleLog(ctx: ?*qjs.JSContext, _this: qjs.JSValue, argc: c_int, argv: [*c]qjs.JSValue, magic: c_int) callconv(.c) qjs.JSValue {

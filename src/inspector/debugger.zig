@@ -18,19 +18,10 @@ pub const PauseInfo = struct {
     url: []const u8,
 };
 
-pub const ScriptInfo = struct {
-    id: u32,
-    url: []const u8,
-    source: []const u8,
-    end_line: i32,
-    end_column: i32,
-    hash: []const u8,
-    source_map_url: []const u8,
-};
-
-/// The debugger journal is a bounded diagnostic cache, not a source archive. The newest source is retained whole even when it alone exceeds the byte budget, so Debugger.getScriptSource never receives a fabricated truncation.
-pub const max_retained_scripts: usize = 256;
-pub const max_retained_source_bytes: usize = 8 * 1024 * 1024;
+const source_journal = @import("source_journal.zig");
+pub const ScriptInfo = source_journal.ScriptInfo;
+pub const max_retained_scripts = source_journal.max_retained_scripts;
+pub const max_retained_source_bytes = source_journal.max_retained_source_bytes;
 
 pub const PauseHook = *const fn (instance_id: i32, info: PauseInfo) void;
 pub const ScriptHook = *const fn (instance_id: i32, info: ScriptInfo) void;
@@ -50,26 +41,8 @@ const Breakpoint = struct {
     condition: []u8 = &.{},
 };
 
-const Script = struct {
-    id: u32,
-    url: []u8,
-    source: []u8,
-    end_line: i32,
-    end_column: i32,
-    hash: [16]u8,
-    source_map_url: []u8,
-    // Journal storage is FIFO, but a source can be evaluated again after a newer revision with the same URL has been recorded.
-    last_note_generation: u64 = 0,
-    // Native bytecode locations are retained independently of source text, which cannot distinguish executable statements from comments or whitespace.
-    break_locations: std.ArrayList(SourceLocation) = .empty,
-    break_locations_collected: bool = false,
-    break_locations_truncated: bool = false,
-};
-
-const SourceLocation = struct {
-    line: i32,
-    column: i32,
-};
+const Script = source_journal.Script;
+const SourceLocation = source_journal.SourceLocation;
 
 const blackbox_cache_capacity: usize = 64;
 
@@ -109,16 +82,10 @@ const Binding = struct {
     paused_reason: PauseReason = .breakpoint,
     mode: StepMode = .run,
     next_breakpoint_id: u32 = 1,
-    next_script_id: u32 = 1,
-    next_note_generation: u64 = 1,
     mutex: sync.Mutex = .{},
     breakpoints: std.ArrayList(Breakpoint) = .empty,
-    scripts: std.ArrayList(Script) = .empty,
-    script_bytes: usize = 0,
-    // Compiler callbacks publish each successful compilation into the bounded journal.
-    active_script_id: u32 = 0,
-    // The native collector ends with a filename-less completion callback. Remember the entry chosen by its location callbacks until that marker.
-    collecting_script_id: u32 = 0,
+    // Journal data and breakpoint policy share this Binding's mutex.
+    journal: source_journal.Journal = .{ .allocator = std.heap.c_allocator },
     paused_script_tag: u64 = 0,
     paused_url: [512]u8 = undefined,
     paused_url_len: usize = 0,
@@ -348,8 +315,8 @@ pub fn coolDown(instance_id: i32) void {
     binding.break_requested.store(0, .seq_cst);
     disarmExecution(binding);
     // Keep the bounded journal until engine teardown so bytecode that outlives a DevTools session retains its compiler identity after reconnect.
-    binding.active_script_id = 0;
-    binding.collecting_script_id = 0;
+    binding.journal.active_script_id = 0;
+    binding.journal.collecting_script_id = 0;
     binding.paused_script_tag = 0;
 }
 
@@ -545,58 +512,15 @@ pub fn noteScript(instance_id: i32, url: []const u8, source: []const u8) void {
 fn registerScript(instance_id: i32, url: []const u8, source: []const u8) u32 {
     const binding = lookup(instance_id) orelse return 0;
     if (url.len == 0) return 0;
-    const map_text = sourceMapUrl(source);
-    const ends = scriptEnd(source);
-    var published: ?ScriptInfo = null;
+    const prepared = source_journal.prepare(url, source);
     binding.mutex.lock();
-    const note_generation = binding.next_note_generation;
-    if (note_generation == 0) {
-        binding.mutex.unlock();
-        return 0;
-    }
-    binding.next_note_generation +%= 1;
-    const id = binding.next_script_id;
-    if (id == 0) {
-        binding.mutex.unlock();
-        return 0;
-    }
-    binding.next_script_id +%= 1;
-    const url_copy = std.heap.c_allocator.dupe(u8, url) catch {
-        binding.mutex.unlock();
-        return 0;
-    };
-    const source_copy = std.heap.c_allocator.dupe(u8, source) catch {
-        std.heap.c_allocator.free(url_copy);
-        binding.mutex.unlock();
-        return 0;
-    };
-    const map_copy = std.heap.c_allocator.dupe(u8, map_text) catch {
-        std.heap.c_allocator.free(url_copy);
-        std.heap.c_allocator.free(source_copy);
-        binding.mutex.unlock();
-        return 0;
-    };
-    var stored = Script{ .id = id, .url = url_copy, .source = source_copy, .end_line = ends.line, .end_column = ends.column, .hash = undefined, .source_map_url = map_copy, .last_note_generation = note_generation };
-    formatHash(source, &stored.hash);
-    binding.scripts.append(std.heap.c_allocator, stored) catch {
-        freeScript(stored);
-        binding.mutex.unlock();
-        return 0;
-    };
-    binding.active_script_id = id;
-    binding.script_bytes += scriptStorageBytes(stored);
-    while (binding.scripts.items.len > 1 and (binding.scripts.items.len > max_retained_scripts or binding.script_bytes > max_retained_source_bytes)) {
-        const evicted = binding.scripts.orderedRemove(0);
-        binding.script_bytes -= scriptStorageBytes(evicted);
-        freeScript(evicted);
-    }
-    published = cloneScriptInfo(std.heap.c_allocator, binding.scripts.items[binding.scripts.items.len - 1]) catch null;
+    const registration = binding.journal.registerLocked(prepared);
     binding.mutex.unlock();
-    if (published) |info| {
+    if (registration.published) |info| {
         defer freeScriptInfo(info);
         if (script_hook.load(.seq_cst)) |hook| hook(instance_id, info);
     }
-    return id;
+    return registration.id;
 }
 
 /// Latest script id registered for `url`, or 0 when the url is unknown.
@@ -604,12 +528,7 @@ pub fn scriptIdForUrl(instance_id: i32, url: []const u8) u32 {
     const binding = lookup(instance_id) orelse return 0;
     binding.mutex.lock();
     defer binding.mutex.unlock();
-    var index = binding.scripts.items.len;
-    while (index > 0) {
-        index -= 1;
-        if (std.mem.eql(u8, binding.scripts.items[index].url, url)) return binding.scripts.items[index].id;
-    }
-    return 0;
+    return binding.journal.idForUrlLocked(url);
 }
 
 /// Resolves an evaluator-provided compilation tag. Unlike URL lookup this never guesses after a journal eviction or a tag from another unit.
@@ -626,16 +545,7 @@ pub fn snapshotScripts(instance_id: i32) []ScriptInfo {
     const binding = lookup(instance_id) orelse return &.{};
     binding.mutex.lock();
     defer binding.mutex.unlock();
-    if (binding.scripts.items.len == 0) return &.{};
-    const out = std.heap.c_allocator.alloc(ScriptInfo, binding.scripts.items.len) catch return &.{};
-    for (binding.scripts.items, 0..) |script, i| {
-        out[i] = cloneScriptInfo(std.heap.c_allocator, script) catch {
-            for (out[0..i]) |info| freeScriptInfo(info);
-            std.heap.c_allocator.free(out);
-            return &.{};
-        };
-    }
-    return out;
+    return binding.journal.snapshotLocked();
 }
 
 /// Returns an independently owned script. Release with freeScriptInfo.
@@ -643,20 +553,15 @@ pub fn scriptById(instance_id: i32, id: u32) ?ScriptInfo {
     const binding = lookup(instance_id) orelse return null;
     binding.mutex.lock();
     defer binding.mutex.unlock();
-    for (binding.scripts.items) |script| {
-        if (script.id != id) continue;
-        return cloneScriptInfo(std.heap.c_allocator, script) catch null;
-    }
-    return null;
+    return binding.journal.snapshotByIdLocked(id);
 }
 
 pub fn freeScriptInfo(info: ScriptInfo) void {
-    freeScriptInfoWithAllocator(std.heap.c_allocator, info);
+    source_journal.freeScriptInfo(std.heap.c_allocator, info);
 }
 
 pub fn freeScriptSnapshot(scripts: []ScriptInfo) void {
-    for (scripts) |script| freeScriptInfo(script);
-    if (scripts.len != 0) std.heap.c_allocator.free(scripts);
+    source_journal.freeScriptSnapshot(std.heap.c_allocator, scripts);
 }
 
 /// Locations use 1-based lines and a 0 column. The caller frees the slice.
@@ -673,7 +578,7 @@ pub fn locationsFor(instance_id: i32, url: []const u8, line: i32) []BreakLocatio
     }
     if (breakpoint_id == 0) return &.{};
     var list: std.ArrayList(BreakLocation) = .empty;
-    for (binding.scripts.items) |script| {
+    for (binding.journal.scripts.items) |script| {
         if (!std.mem.eql(u8, script.url, url)) continue;
         const breakpoint = for (binding.breakpoints.items) |bp| {
             if (bp.id == breakpoint_id) break bp;
@@ -695,7 +600,7 @@ pub fn breakpointsOnScript(instance_id: i32, script_id: u32) []BreakLocation {
     binding.mutex.lock();
     defer binding.mutex.unlock();
     var found: ?Script = null;
-    for (binding.scripts.items) |script| {
+    for (binding.journal.scripts.items) |script| {
         if (script.id == script_id) {
             found = script;
             break;
@@ -730,7 +635,7 @@ pub fn locationsForId(instance_id: i32, id: u32) []BreakLocation {
     }
     const bp = found orelse return &.{};
     var list: std.ArrayList(BreakLocation) = .empty;
-    for (binding.scripts.items) |script| {
+    for (binding.journal.scripts.items) |script| {
         if (!urlPatternMatch(bp, script.url)) continue;
         const resolved = resolveBreakpoint(script, bp) orelse continue;
         list.append(std.heap.c_allocator, .{
@@ -755,7 +660,7 @@ pub fn possibleBreakpoints(
     const binding = lookup(instance_id) orelse return error.ScriptUnknown;
     binding.mutex.lock();
     defer binding.mutex.unlock();
-    for (binding.scripts.items) |script| {
+    for (binding.journal.scripts.items) |script| {
         if (script.id != script_id) continue;
         if (script.break_locations_truncated) return error.LocationsTruncated;
         if (!script.break_locations_collected) return error.LocationsUnavailable;
@@ -1120,72 +1025,9 @@ fn destroyBinding(binding: *Binding) void {
     binding.blackbox.deinit(std.heap.c_allocator);
     clearBlackboxCacheLocked(binding);
     binding.blackbox_cache.deinit(std.heap.c_allocator);
-    for (binding.scripts.items) |script| {
-        freeScript(script);
-    }
-    binding.scripts.deinit(std.heap.c_allocator);
+    binding.journal.deinit();
     binding.mutex.deinit();
     std.heap.c_allocator.destroy(binding);
-}
-
-fn scriptStorageBytes(script: Script) usize {
-    return script.url.len + script.source.len + script.hash.len + script.source_map_url.len;
-}
-
-fn freeScript(script: Script) void {
-    std.heap.c_allocator.free(script.url);
-    std.heap.c_allocator.free(script.source);
-    std.heap.c_allocator.free(script.source_map_url);
-    var owned = script;
-    owned.break_locations.deinit(std.heap.c_allocator);
-}
-
-fn cloneScriptInfo(allocator: std.mem.Allocator, script: Script) !ScriptInfo {
-    const url = try allocator.dupe(u8, script.url);
-    errdefer allocator.free(url);
-    const source = try allocator.dupe(u8, script.source);
-    errdefer allocator.free(source);
-    const hash = try allocator.dupe(u8, &script.hash);
-    errdefer allocator.free(hash);
-    const source_map_url = try allocator.dupe(u8, script.source_map_url);
-    return .{
-        .id = script.id,
-        .url = url,
-        .source = source,
-        .end_line = script.end_line,
-        .end_column = script.end_column,
-        .hash = hash,
-        .source_map_url = source_map_url,
-    };
-}
-
-fn freeScriptInfoWithAllocator(allocator: std.mem.Allocator, info: ScriptInfo) void {
-    allocator.free(@constCast(info.url));
-    allocator.free(@constCast(info.source));
-    allocator.free(@constCast(info.hash));
-    allocator.free(@constCast(info.source_map_url));
-}
-
-test "debugger: script info clone releases every partial allocation on OOM" {
-    var url = [_]u8{ 'o', 'o', 'm', '.', 'j', 's' };
-    var source = [_]u8{ 'l', 'e', 't', ' ', 'a', 'n', 's', 'w', 'e', 'r', ' ', '=', ' ', '4', '2', ';' };
-    var source_map_url = [_]u8{ 'o', 'o', 'm', '.', 'j', 's', '.', 'm', 'a', 'p' };
-    var script = Script{
-        .id = 1,
-        .url = &url,
-        .source = &source,
-        .end_line = 0,
-        .end_column = 16,
-        .hash = undefined,
-        .source_map_url = &source_map_url,
-    };
-    formatHash(script.source, &script.hash);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
-        fn run(allocator: std.mem.Allocator, input: Script) !void {
-            const info = try cloneScriptInfo(allocator, input);
-            defer freeScriptInfoWithAllocator(allocator, info);
-        }
-    }.run, .{script});
 }
 
 test "debugger: blackbox cache invalidates and evicts without changing matches" {
@@ -1300,7 +1142,7 @@ fn breakpointHit(binding: *Binding, url: []const u8, line: i32, column: i32, dep
 
 fn scriptByUrlLocked(binding: *Binding, url: []const u8) ?Script {
     var found: ?Script = null;
-    for (binding.scripts.items) |script| {
+    for (binding.journal.scripts.items) |script| {
         if (std.mem.eql(u8, script.url, url)) found = script;
     }
     return found;
@@ -1543,46 +1385,25 @@ fn breakLocationTrampoline(
     if (!binding.source_collection_owned.load(.seq_cst)) return;
     binding.mutex.lock();
     if (complete != 0) {
-        const script = scriptByTagLocked(binding, script_tag) orelse {
+        const script_id = binding.journal.completeLocationsLocked(script_tag, truncated != 0) orelse {
             binding.mutex.unlock();
             return;
         };
-        script.break_locations_collected = true;
-        script.break_locations_truncated = truncated != 0;
-        const script_id = script.id;
         binding.mutex.unlock();
         if (break_locations_hook.load(.seq_cst)) |hook| hook(binding.instance_id, script_id);
         return;
     }
     defer binding.mutex.unlock();
     _ = filename;
-    const script = scriptByTagLocked(binding, script_tag) orelse return;
-    if (line <= 0 or script.break_locations_truncated) return;
-    if (script.break_locations_collected) {
-        script.break_locations.clearRetainingCapacity();
-        script.break_locations_collected = false;
-    }
-    const column0: i32 = if (column > 0) column - 1 else 0;
-    if (script.break_locations.items.len > 0) {
-        const last = script.break_locations.items[script.break_locations.items.len - 1];
-        if (last.line == line and last.column == column0) return;
-    }
-    script.break_locations.append(std.heap.c_allocator, .{ .line = line, .column = column0 }) catch {
-        script.break_locations_truncated = true;
-    };
+    binding.journal.recordLocationLocked(script_tag, line, column);
 }
 
 fn scriptByIdLocked(binding: *Binding, id: u32) ?*Script {
-    if (id == 0) return null;
-    for (binding.scripts.items) |*script| {
-        if (script.id == id) return script;
-    }
-    return null;
+    return binding.journal.findByIdLocked(id);
 }
 
 fn scriptByTagLocked(binding: *Binding, tag: u64) ?*Script {
-    if (tag == 0 or tag > std.math.maxInt(u32)) return null;
-    return scriptByIdLocked(binding, @intCast(tag));
+    return binding.journal.findByTagLocked(tag);
 }
 
 fn dupeSourceUrl(instance_id: i32, tag: u64, fallback: []const u8) ![]u8 {
@@ -1757,40 +1578,4 @@ fn enterPause(
         io.sleepMs(1);
     }
     binding.suppress.store(0, .seq_cst);
-}
-
-fn scriptEnd(source: []const u8) struct { line: i32, column: i32 } {
-    var line: i32 = 0;
-    var column: i32 = 0;
-    for (source) |byte| {
-        if (byte == '\n') {
-            line += 1;
-            column = 0;
-        } else {
-            column += 1;
-        }
-    }
-    return .{ .line = line, .column = column };
-}
-
-fn sourceMapUrl(source: []const u8) []const u8 {
-    const marker = "sourceMappingURL=";
-    const at = std.mem.lastIndexOf(u8, source, marker) orelse return "";
-    var rest = source[at + marker.len ..];
-    if (std.mem.indexOfScalar(u8, rest, '\n')) |end| rest = rest[0..end];
-    if (std.mem.indexOfScalar(u8, rest, '\r')) |end| rest = rest[0..end];
-    return std.mem.trim(u8, rest, " \t");
-}
-
-fn formatHash(source: []const u8, out: *[16]u8) void {
-    var hash: u64 = 0xcbf29ce484222325;
-    for (source) |byte| {
-        hash ^= byte;
-        hash *%= 0x100000001b3;
-    }
-    const hex = "0123456789abcdef";
-    for (0..16) |i| {
-        const shift: u6 = @intCast((15 - i) * 4);
-        out[i] = hex[@as(usize, @intCast((hash >> shift) & 0xf))];
-    }
 }

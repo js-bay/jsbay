@@ -1,0 +1,19 @@
+[
+  {"name": "Int8Array-offset", "type": "Int8Array", "bytes": [0, 1, 2, 3], "byteOffset": 1, "length": 2, "expected": [1, 2]},
+  {"name": "Uint8Array-offset", "type": "Uint8Array", "bytes": [0, 1, 2, 3], "byteOffset": 1, "length": 2, "expected": [1, 2]},
+  {"name": "Uint8ClampedArray-offset", "type": "Uint8ClampedArray", "bytes": [0, 1, 2, 3], "byteOffset": 1, "length": 2, "expected": [1, 2]},
+  {"name": "Int16Array-offset", "type": "Int16Array", "bytes": [0, 1, 2, 3, 4, 5, 6, 7], "byteOffset": 2, "length": 2, "expected": [2, 3, 4, 5]},
+  {"name": "Uint16Array-offset", "type": "Uint16Array", "bytes": [0, 1, 2, 3, 4, 5, 6, 7], "byteOffset": 2, "length": 2, "expected": [2, 3, 4, 5]},
+  {"name": "Int32Array-offset", "type": "Int32Array", "bytes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "byteOffset": 4, "length": 2, "expected": [4, 5, 6, 7, 8, 9, 10, 11]},
+  {"name": "Uint32Array-offset", "type": "Uint32Array", "bytes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "byteOffset": 4, "length": 2, "expected": [4, 5, 6, 7, 8, 9, 10, 11]},
+  {"name": "Float32Array-offset", "type": "Float32Array", "bytes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], "byteOffset": 4, "length": 2, "expected": [4, 5, 6, 7, 8, 9, 10, 11]},
+  {"name": "Float64Array-offset", "type": "Float64Array", "bytes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "byteOffset": 8, "length": 2, "expected": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]},
+  {"name": "BigInt64Array-offset", "type": "BigInt64Array", "bytes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "byteOffset": 8, "length": 2, "expected": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]},
+  {"name": "BigUint64Array-offset", "type": "BigUint64Array", "bytes": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "byteOffset": 8, "length": 2, "expected": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]},
+  {"name": "dataview-offset", "type": "DataView", "bytes": [1, 2, 3, 4, 5], "byteOffset": 1, "length": 3, "expected": [2, 3, 4]},
+  {"name": "node-buffer-offset", "type": "Buffer", "bytes": [8, 9, 10, 11], "byteOffset": 1, "length": 2, "expected": [9, 10]},
+  {"name": "arraybuffer", "type": "ArrayBuffer", "bytes": [0, 7, 255], "byteOffset": 0, "length": 3, "expected": [0, 7, 255]},
+  {"name": "empty-view-at-end", "type": "Uint8Array", "bytes": [1, 2], "byteOffset": 2, "length": 0, "expected": []},
+  {"name": "empty-dataview-at-end", "type": "DataView", "bytes": [1, 2], "byteOffset": 2, "length": 0, "expected": []},
+  {"name": "empty-arraybuffer", "type": "ArrayBuffer", "bytes": [], "byteOffset": 0, "length": 0, "expected": []}
+]

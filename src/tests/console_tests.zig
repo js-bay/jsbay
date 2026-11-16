@@ -457,3 +457,36 @@ test "console: formatting does not depend on script-visible JSON" {
     try testing.expect(std.mem.indexOf(u8, message, "\"a\":1") != null);
     try testing.expect(std.mem.indexOf(u8, message, "HACKED") == null);
 }
+
+const InspectorDisabled = if (!@import("build_options").inspector and backend.isQuickJsApiBackend(backend.active_backend)) struct {
+    fn unexpectedTap(opaque_ptr: ?*anyopaque, _: i32, _: types.LogLevel, _: [*:0]const u8) callconv(.c) void {
+        const calls: *usize = @ptrCast(@alignCast(opaque_ptr.?));
+        calls.* += 1;
+    }
+
+    test "console: disabled Inspector preserves ordinary logs without diagnostic capture" {
+        const tap = @import("../inspector/console_tap.zig");
+        const probe = @import("debug_cold_probe.zig");
+        g_log_capture = LogCapture.init();
+        defer g_log_capture.deinit();
+        const id = helpers.nextInstanceId();
+        try testing.expect(engine.create(id, .{ .log_handler = captureLog }));
+        defer engine.destroy(id);
+        var tap_calls: usize = 0;
+        tap.set(id, &tap_calls, unexpectedTap);
+        defer tap.clear(id);
+        probe.resetDebugStackCopies();
+        try helpers.evalOk(id, "console.log('ordinary'); console.warn('warning')");
+        try testing.expectEqual(@as(usize, 2), g_log_capture.count());
+        try testing.expectEqual(@as(usize, 0), tap_calls);
+        try testing.expectEqual(@as(usize, 0), probe.debugStackCopies());
+        const debugger = @import("../inspector/debugger.zig");
+        const snapshot = debugger.snapshotScripts(id);
+        defer debugger.freeScriptSnapshot(snapshot);
+        try testing.expectEqual(@as(usize, 0), snapshot.len);
+    }
+} else struct {};
+
+comptime {
+    _ = InspectorDisabled;
+}

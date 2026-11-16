@@ -14,13 +14,8 @@ pub const Result = struct {
 };
 
 const source_url_cache_envelope = backend.isQuickJsApiBackend(backend.active_backend) and @import("build_options").inspector;
-const cache_envelope_magic = "JBSURL01";
-const cache_envelope_header_len = cache_envelope_magic.len + @sizeOf(u32);
-
-const CacheArtifact = struct {
-    bytecode: []const u8,
-    effective_url: []const u8,
-};
+const identity_cache = @import("../inspector/source_identity_cache.zig");
+const CacheArtifact = identity_cache.Artifact;
 
 pub fn evaluate(ctx: ActiveEngine.Context, source: []const u8, filename: []const u8, cache_dir: []const u8, version: []const u8) Result {
     const result = switch (backend.active_backend) {
@@ -52,7 +47,7 @@ fn evaluateQuickJs(ctx: ActiveEngine.Context, source: []const u8, filename: []co
     if (path) |file| {
         if (cache.readBytes(file)) |bytes| {
             defer gpa.free(bytes);
-            const artifact: ?CacheArtifact = if (comptime source_url_cache_envelope) decodeCacheArtifact(bytes) else .{ .bytecode = bytes, .effective_url = filename };
+            const artifact: ?CacheArtifact = if (comptime source_url_cache_envelope) identity_cache.decode(bytes) else .{ .bytecode = bytes, .effective_url = filename };
             if (artifact) |entry| {
                 const compiled = qjs.JS_ReadObject(ctx, entry.bytecode.ptr, entry.bytecode.len, 1);
                 if (!c.jsIsException(compiled)) {
@@ -108,42 +103,10 @@ fn evaluateQuickJs(ctx: ActiveEngine.Context, source: []const u8, filename: []co
     return quickJsResult(ctx, qjs.JS_Eval(ctx, source_z.ptr, source_z.len, filename_z.ptr, qjs.JS_EVAL_TYPE_GLOBAL), false);
 }
 
-fn decodeCacheArtifact(bytes: []const u8) ?CacheArtifact {
-    if (bytes.len < cache_envelope_header_len + 1) return null;
-    if (!std.mem.eql(u8, bytes[0..cache_envelope_magic.len], cache_envelope_magic)) return null;
-    const url_len: usize = std.mem.readInt(u32, bytes[cache_envelope_magic.len..cache_envelope_header_len], .little);
-    if (url_len == 0 or url_len > bytes.len - cache_envelope_header_len) return null;
-    const url_end = cache_envelope_header_len + url_len;
-    if (url_end == bytes.len) return null;
-    const effective_url = bytes[cache_envelope_header_len..url_end];
-    if (std.mem.indexOfScalar(u8, effective_url, 0) != null) return null;
-    return .{ .effective_url = effective_url, .bytecode = bytes[url_end..] };
-}
-
 fn writeCacheArtifact(path: []const u8, effective_url: []const u8, bytecode: []const u8) void {
-    if (effective_url.len == 0 or effective_url.len > std.math.maxInt(u32) or bytecode.len == 0) return;
-    if (std.mem.indexOfScalar(u8, effective_url, 0) != null) return;
-    const total = std.math.add(usize, cache_envelope_header_len, effective_url.len) catch return;
-    const size = std.math.add(usize, total, bytecode.len) catch return;
-    const artifact = std.heap.c_allocator.alloc(u8, size) catch return;
+    const artifact = identity_cache.encode(std.heap.c_allocator, effective_url, bytecode) orelse return;
     defer std.heap.c_allocator.free(artifact);
-    @memcpy(artifact[0..cache_envelope_magic.len], cache_envelope_magic);
-    std.mem.writeInt(u32, artifact[cache_envelope_magic.len..cache_envelope_header_len], @intCast(effective_url.len), .little);
-    @memcpy(artifact[cache_envelope_header_len..total], effective_url);
-    @memcpy(artifact[total..], bytecode);
     cache.writeBytes(path, artifact);
-}
-
-test "typed eval: source URL cache envelope rejects malformed metadata" {
-    const testing = std.testing;
-    try testing.expect(decodeCacheArtifact("raw-bytecode") == null);
-    try testing.expect(decodeCacheArtifact(cache_envelope_magic ++ "\x00\x00\x00\x00bytecode") == null);
-    try testing.expect(decodeCacheArtifact(cache_envelope_magic ++ "\x05\x00\x00\x00url") == null);
-    try testing.expect(decodeCacheArtifact(cache_envelope_magic ++ "\x03\x00\x00\x00a\x00bbytecode") == null);
-    try testing.expect(decodeCacheArtifact(cache_envelope_magic ++ "\x03\x00\x00\x00url") == null);
-    const valid = decodeCacheArtifact(cache_envelope_magic ++ "\x03\x00\x00\x00urlbytecode") orelse return error.ExpectedCacheArtifact;
-    try testing.expectEqualStrings("url", valid.effective_url);
-    try testing.expectEqualStrings("bytecode", valid.bytecode);
 }
 
 fn quickJsResult(ctx: ActiveEngine.Context, value: ActiveEngine.Value, hit: bool) Result {

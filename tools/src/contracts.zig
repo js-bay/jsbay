@@ -284,3 +284,82 @@ test "export-public-source CLI excludes history and rejects a dirty tree" {
     }
     try testing.expectError(error.FileNotFound, Dir.cwd().access(io, dirty_archive, .{}));
 }
+
+test "check-c-abi rejects SDK storage drift and a C++-only header mismatch" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const fixture = try makeTemp(a, io, "jsbay-abi-contract");
+    defer Dir.cwd().deleteTree(io, fixture) catch {};
+    const files = [_][]const u8{
+        "include/jsbay.h",            "include/jsbay_bytecode.h",                             "include/jsbay_sync.h",                                     "include/jsbay_async.h",
+        "tests/c_consumer.c",         "tests/bytecode_consumer.c",                            "tests/native_sync_consumer.c",                             "tests/async_promise_consumer.c",
+        "tests/host_wake_consumer.c", "sdk/android/jsbay/src/main/kotlin/io/jsbay/Status.kt", "sdk/android/jsbay/src/main/kotlin/io/jsbay/Submission.kt", "sdk/android/jsbay/src/main/kotlin/io/jsbay/AdmissionClass.kt",
+        "sdk/dotnet/JsBay/Status.cs", "sdk/dotnet/JsBay/Engine.cs",                           "sdk/dotnet/JsBay/Native.cs",
+    };
+    for (files) |file| {
+        const dest = try std.fs.path.join(a, &.{ fixture, file });
+        try Dir.cwd().createDirPath(io, std.fs.path.dirname(dest).?);
+        const contents = try Dir.cwd().readFileAlloc(io, file, a, .limited(1024 * 1024));
+        try writeFile(io, dest, contents);
+    }
+    const tool = try toolPath(a, io);
+    const zig = @import("tool_options").zig_executable;
+    var good = try runTool(a, io, tool, fixture, &.{ "check-c-abi", "--zig", zig });
+    defer good.deinit();
+    try testing.expect(good.succeeded());
+    const native_path = try std.fs.path.join(a, &.{ fixture, "sdk/dotnet/JsBay/Native.cs" });
+    const native = try Dir.cwd().readFileAlloc(io, native_path, a, .limited(1024 * 1024));
+    const constructor_end = "            Length = length;\n        }";
+    for ([_][]const u8{ "public readonly ulong Extra = 0;", "public ulong Extra { get; } = 0;" }) |extra| {
+        const changed = try std.mem.replaceOwned(u8, a, native, constructor_end, try std.fmt.allocPrint(a, "{s}\n        {s}", .{ constructor_end, extra }));
+        try testing.expect(!std.mem.eql(u8, native, changed));
+        try writeFile(io, native_path, changed);
+        var sdk_bad = try runTool(a, io, tool, fixture, &.{"check-c-abi"});
+        defer sdk_bad.deinit();
+        try testing.expect(!sdk_bad.succeeded());
+        // main maps PolicyFailure to exit 1 without printing the error name.
+        try testing.expect(switch (sdk_bad.result.term) {
+            .exited => |code| code == 1,
+            else => false,
+        });
+    }
+    try writeFile(io, native_path, native);
+    // Exercise the real CLI: Kotlin constructor codes must not be guessed from enum position, and unsupported constructor/body shapes must fail closed.
+    const status_path = try std.fs.path.join(a, &.{ fixture, "sdk/android/jsbay/src/main/kotlin/io/jsbay/Status.kt" });
+    const status_source = try Dir.cwd().readFileAlloc(io, status_path, a, .limited(1024 * 1024));
+    const defaulted = try std.mem.replaceOwned(u8, a, status_source, "val code: Int,", "val code: Int = 99,");
+    const mutations = [_][]const u8{
+        try std.mem.replaceOwned(u8, a, defaulted, "OK(0),", "OK,"),
+        try std.mem.replaceOwned(u8, a, status_source, "OK(0),", "OK,"),
+        try std.mem.replaceOwned(u8, a, status_source, "val code: Int,", "val code: Long,"),
+        try std.mem.replaceOwned(u8, a, status_source, "val code: Int,", "var code: Int,"),
+        try std.mem.replaceOwned(u8, a, status_source, "val code: Int,", "val renamed: Int,"),
+        try std.mem.replaceOwned(u8, a, status_source, "companion object {", "init { error(\"unsupported\") } companion object {"),
+        try std.mem.replaceOwned(u8, a, status_source, "enum class ValueKind {", "enum class ValueKind(val code: Int = 99) {"),
+    };
+    for (mutations) |changed| {
+        try testing.expect(!std.mem.eql(u8, status_source, changed));
+        try writeFile(io, status_path, changed);
+        var rejected = try runTool(a, io, tool, fixture, &.{"check-c-abi"});
+        defer rejected.deinit();
+        try testing.expect(switch (rejected.result.term) {
+            .exited => |code| code == 1,
+            else => false,
+        });
+    }
+    const commented = try std.mem.replaceOwned(u8, a, status_source, "val code: Int,", "val /* native code */ code: Int,");
+    try writeFile(io, status_path, commented);
+    var harmless = try runTool(a, io, tool, fixture, &.{"check-c-abi"});
+    defer harmless.deinit();
+    try testing.expect(harmless.succeeded());
+    try writeFile(io, status_path, status_source);
+    const header = try std.fs.path.join(a, &.{ fixture, "include/jsbay.h" });
+    const original = try Dir.cwd().readFileAlloc(io, header, a, .limited(1024 * 1024));
+    try writeFile(io, header, try std.mem.concat(a, u8, &.{ original, "\n#ifdef __cplusplus\n#error intentional_cpp_probe_mismatch\n#endif\n" }));
+    var bad = try runTool(a, io, tool, fixture, &.{ "check-c-abi", "--zig", zig });
+    defer bad.deinit();
+    try testing.expect(!bad.succeeded());
+    try testing.expect(contains(bad, "intentional_cpp_probe_mismatch"));
+}

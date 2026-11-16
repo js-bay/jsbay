@@ -44,11 +44,19 @@ fn notContains(haystack: []const u8, needle: []const u8) !void {
 fn mustRun(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, argv: []const []const u8) !sdk.Output {
     var output = try sdk.run(allocator, io, argv, cwd);
     if (!output.succeeded()) {
-        std.debug.print("command failed: {s}\n{s}", .{ output.result.stdout, output.result.stderr });
+        std.debug.print("command failed:", .{});
+        for (argv) |arg| std.debug.print(" {s}", .{arg});
+        std.debug.print("\n{s}{s}", .{ output.result.stdout, output.result.stderr });
         output.deinit();
         return error.CommandFailed;
     }
     return output;
+}
+
+fn expectSucceeded(output: sdk.Output, label: []const u8) !void {
+    if (output.succeeded()) return;
+    std.debug.print("{s} failed:\n{s}{s}\n", .{ label, output.result.stdout, output.result.stderr });
+    return error.TestUnexpectedResult;
 }
 
 fn executable(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, name: []const u8, contents: []const u8) !void {
@@ -59,6 +67,7 @@ fn executable(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, name: [
 
 fn pathEnv(allocator: std.mem.Allocator, tools: []const u8) ![]u8 {
     // Keep this libc-free: `zig build test-tools` does not link libc on CI.
+    //
     // tools/ must stay first so fixture stubs win over host binaries.
     return std.fmt.allocPrint(allocator, "PATH={s}:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin", .{tools});
 }
@@ -403,7 +412,7 @@ test "test_package_apple_release_archives_swift_package_and_preserves_output_on_
     const archive = try join(a, fixture, &.{"package.zip"});
     var packaged = try sdk.run(a, io, &.{ tool, "package-apple-release", "0.1.0", "quickjs_ng", "abc123", archive }, fixture);
     defer packaged.deinit();
-    try testing.expect(packaged.succeeded());
+    try expectSucceeded(packaged, "package-apple-release");
     var members = try mustRun(a, io, fixture, &.{ "unzip", "-Z1", archive });
     defer members.deinit();
     for ([_][]const u8{ "Package.swift", "Sources/JsBaySDK/JsBaySDK.swift", "Sources/JsBayObjC/JSBay.m", "Frameworks/JsBay.xcframework/Info.plist", "LICENSE", "THIRD_PARTY_NOTICES.md", "VERSION", "COMMIT", "backend" }) |path| try contains(members.result.stdout, try std.fmt.allocPrint(a, "{s}/{s}", .{ name, path }));
@@ -540,22 +549,47 @@ test "test_local_harmony_staging_accepts_tar_and_zip_and_rejects_fixture" {
     try executable(a, io, repo, try join(a, repo, &.{"tool"}), "#!/bin/sh\nset -eu\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\ncase \"$*\" in\n  *assembleHar*)\n    for package in hvigor hvigor-ohos-plugin; do\n      test -L \"$root/sdk/harmony/node_modules/@ohos/$package\"\n      test -L \"$root/tests/harmony-sdk/fixture/node_modules/@ohos/$package\"\n    done\n    work=$(mktemp -d); trap 'rm -rf \"$work\"' EXIT\n    mkdir -p \"$work/package/libs/arm64-v8a\" \"$work/package/ets\" \"$work/package/src/main/ets\"\n    : > \"$work/package/libs/arm64-v8a/libjsbay_harmony.so\"; : > \"$work/package/ets/modules.abc\"; : > \"$work/package/src/main/ets/JsBay.d.ets\"; : > \"$work/package/src/main/ets/index.d.ets\"\n    [ \"${HAR_FIXTURE:-}\" = 1 ] && : > \"$work/package/src/main/ets/ConformanceFixture.ets\"\n    har=\"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\"; mkdir -p \"$(dirname \"$har\")\"; rm -f \"$har\"\n    if [ \"${HAR_FORMAT:-tar}\" = zip ]; then (cd \"$work\" && zip -qr \"$har\" package); else tar -czf \"$har\" -C \"$work\" package; fi\n    ;;\n  *clean*) rm -f \"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\" ;;\nesac\n");
     try executable(a, io, repo, try join(a, repo, &.{"node"}), "#!/bin/sh\ncase \"$*\" in\n  *hvigor-ohos-plugin*) printf '%s\\n' \"$FAKE_PACKAGE_ROOT/@ohos/hvigor-ohos-plugin/package.json\" ;;\n  *) printf '%s\\n' \"$FAKE_PACKAGE_ROOT/@ohos/hvigor/package.json\" ;;\nesac\n");
     try executable(a, io, repo, try join(a, repo, &.{"link-check"}), "#!/bin/sh\nset -eu\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\nfor package in hvigor hvigor-ohos-plugin; do\n  test -L \"$root/sdk/harmony/node_modules/@ohos/$package\"\n  test -L \"$root/tests/harmony-sdk/fixture/node_modules/@ohos/$package\"\ndone\n");
-    try executable(a, io, repo, try join(a, repo, &.{"zig-ar"}), "#!/bin/sh\nexec zig ar \"$@\"\n");
+    var zig_which = try mustRun(a, io, repo, &.{ "sh", "-c", "command -v zig" });
+    defer zig_which.deinit();
+    const zig_path = std.mem.trim(u8, zig_which.result.stdout, " \t\r\n");
+    if (zig_path.len == 0) return error.MissingZig;
+    const zig_dir = std.fs.path.dirname(zig_path) orelse "/usr/bin";
+    try executable(a, io, repo, try join(a, repo, &.{"zig-ar"}), try std.fmt.allocPrint(a, "#!/bin/sh\nexec '{s}' ar \"$@\"\n", .{zig_path}));
+    // The staging script requires `file` or $FILE to classify the core object. This fixture is host-tool complete, like AR/HVIGORW.
+    try executable(a, io, repo, try join(a, repo, &.{"file-stub"}), "#!/bin/sh\necho 'ELF 64-bit LSB relocatable, ARM aarch64'\n");
+    // Bind the actual archive tool into the fixture PATH without replacing ZIP encoding.
+    var zip_which = try mustRun(a, io, repo, &.{ "sh", "-c", "command -v zip" });
+    defer zip_which.deinit();
+    const zip_path = std.mem.trim(u8, zip_which.result.stdout, " \t\r\n");
+    if (!std.fs.path.isAbsolute(zip_path)) return error.MissingZip;
+    const fixture_zip = try join(a, repo, &.{"zip"});
+    var zip_link = try mustRun(a, io, repo, &.{ "ln", "-s", zip_path, fixture_zip });
+    defer zip_link.deinit();
+    var zip_target = try mustRun(a, io, repo, &.{ "readlink", fixture_zip });
+    defer zip_target.deinit();
+    try testing.expectEqualStrings(zip_path, std.mem.trim(u8, zip_target.result.stdout, " \t\r\n"));
     const script = try join(a, repo, &.{ "scripts", "stage-harmony-har.sh" });
-    const env = [_][]const u8{ "env", try std.fmt.allocPrint(a, "DEVECO_SDK_HOME={s}", .{repo}), try std.fmt.allocPrint(a, "HVIGORW={s}/tool", .{repo}), try std.fmt.allocPrint(a, "OHPM={s}/link-check", .{repo}), try std.fmt.allocPrint(a, "NODE_BIN={s}/node", .{repo}), try std.fmt.allocPrint(a, "NODE_PATH={s}/packages", .{repo}), try std.fmt.allocPrint(a, "FAKE_PACKAGE_ROOT={s}/packages", .{repo}), try std.fmt.allocPrint(a, "JSBAY_LIBRARY={s}", .{core}), try std.fmt.allocPrint(a, "AR={s}/zig-ar", .{repo}), "JSBAY_BACKEND=quickjs_ng", script };
-    var tar = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], env[10], try join(a, repo, &.{"tar-stage"}), "1.2.3" }, repo);
+    const env = [_][]const u8{ "env", try std.fmt.allocPrint(a, "PATH={s}:{s}:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin", .{ repo, zig_dir }), try std.fmt.allocPrint(a, "DEVECO_SDK_HOME={s}", .{repo}), try std.fmt.allocPrint(a, "HVIGORW={s}/tool", .{repo}), try std.fmt.allocPrint(a, "OHPM={s}/link-check", .{repo}), try std.fmt.allocPrint(a, "NODE_BIN={s}/node", .{repo}), try std.fmt.allocPrint(a, "NODE_PATH={s}/packages", .{repo}), try std.fmt.allocPrint(a, "FAKE_PACKAGE_ROOT={s}/packages", .{repo}), try std.fmt.allocPrint(a, "JSBAY_LIBRARY={s}", .{core}), try std.fmt.allocPrint(a, "AR={s}/zig-ar", .{repo}), try std.fmt.allocPrint(a, "FILE={s}/file-stub", .{repo}), "JSBAY_BACKEND=quickjs_ng", script };
+    var tar = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], env[10], env[11], env[12], try join(a, repo, &.{"tar-stage"}), "1.2.3" }, repo);
     defer tar.deinit();
-    try testing.expect(tar.succeeded());
+    try expectSucceeded(tar, "stage-harmony-har tar");
     Dir.cwd().access(io, try join(a, repo, &.{ "tar-stage", "jsbay-1.2.3-harmony-quickjs_ng-arm64-v8a.har" }), .{}) catch return error.MissingTarAsset;
     Dir.cwd().access(io, try join(a, repo, &.{ "tar-stage", "SHA256SUMS" }), .{}) catch return error.MissingSums;
     try testing.expectError(error.FileNotFound, Dir.cwd().access(io, try join(a, repo, &.{ "sdk", "harmony", ".cxx", "stale" }), .{}));
     try testing.expectError(error.FileNotFound, Dir.cwd().access(io, try join(a, repo, &.{ "sdk", "harmony", "oh_modules", "stale" }), .{}));
     try testing.expectError(error.FileNotFound, Dir.cwd().access(io, try join(a, repo, &.{ "sdk", "harmony", "node_modules" }), .{}));
     try testing.expectError(error.FileNotFound, Dir.cwd().access(io, try join(a, repo, &.{ "tests", "harmony-sdk", "fixture", "node_modules" }), .{}));
-    var zip = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], "HAR_FORMAT=zip", env[8], env[9], env[10], try join(a, repo, &.{"zip-stage"}), "1.2.3" }, repo);
+    var zip = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], "HAR_FORMAT=zip", env[10], env[11], env[12], try join(a, repo, &.{"zip-stage"}), "1.2.3" }, repo);
     defer zip.deinit();
-    try testing.expect(zip.succeeded());
-    var bad = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], "HAR_FIXTURE=1", env[8], env[9], env[10], try join(a, repo, &.{"fixture-stage"}), "1.2.3" }, repo);
+    try expectSucceeded(zip, "stage-harmony-har zip");
+    const zip_asset = try read(a, io, repo, &.{ "zip-stage", "jsbay-1.2.3-harmony-quickjs_ng-arm64-v8a.har" });
+    try testing.expect(std.mem.startsWith(u8, zip_asset, "PK\x03\x04"));
+    try Dir.cwd().access(io, try join(a, repo, &.{ "zip-stage", "SHA256SUMS" }), .{});
+    var zip_bad = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], "HAR_FORMAT=zip", "HAR_FIXTURE=1", env[10], env[11], env[12], try join(a, repo, &.{"zip-fixture-stage"}), "1.2.3" }, repo);
+    defer zip_bad.deinit();
+    try testing.expect(!zip_bad.succeeded());
+    try contains(zip_bad.result.stderr, "ConformanceFixture");
+    var bad = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], "HAR_FIXTURE=1", env[10], env[11], env[12], try join(a, repo, &.{"fixture-stage"}), "1.2.3" }, repo);
     defer bad.deinit();
     try testing.expect(!bad.succeeded());
     try contains(bad.result.stderr, "ConformanceFixture");
@@ -568,9 +602,9 @@ test "test_local_harmony_staging_accepts_tar_and_zip_and_rejects_fixture" {
             defer link.deinit();
         }
     }
-    var existing = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], env[10], try join(a, repo, &.{"existing-stage"}), "1.2.3" }, repo);
+    var existing = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], env[10], env[11], env[12], try join(a, repo, &.{"existing-stage"}), "1.2.3" }, repo);
     defer existing.deinit();
-    try testing.expect(existing.succeeded());
+    try expectSucceeded(existing, "stage-harmony-har existing");
     for ([_][]const u8{ "sdk/harmony", "tests/harmony-sdk/fixture" }) |project| {
         for ([_][]const u8{ "hvigor", "hvigor-ohos-plugin" }) |package| {
             try Dir.cwd().access(io, try join(a, repo, &.{ project, "node_modules", "@ohos", package, "package.json" }), .{});

@@ -1,6 +1,6 @@
 //! Multi-engine pack: create-time backend select helpers.
 //!
-//! Shared layers stay monomorphic on `build_options.backend` (pack primary / first entry). This module owns packed-engine bare create/destroy. Dual-engine packs are verified on Apple with `-Dbackends=quickjs_ng,jsc`. Linux single-pack builds still cover create-time select through primary `createWithBackend` and forced primary-tag packed_alt tests.
+//! Shared layers are monomorphic on `build_options.backend` (the pack primary / first entry). This module creates and destroys bare packed engines; pack membership is fixed by the build, while backend selection occurs at instance creation.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -9,25 +9,8 @@ const backend_mod = @import("backend.zig");
 pub const Backend = backend_mod.BackendType;
 const Engine = backend_mod.Engine;
 
-const PackedBit = struct {
-    const quickjs_ng: u32 = 1 << 0;
-    const quickjs: u32 = 1 << 1;
-    const jsc: u32 = 1 << 2;
-    const escargot: u32 = 1 << 3;
-    const hermes: u32 = 1 << 4;
-};
-
-pub fn isPacked(tag: Backend) bool {
-    const bits: u32 = if (@hasDecl(build_options, "packed_backend_bits")) build_options.packed_backend_bits else 0;
-    return switch (tag) {
-        .quickjs_ng => (bits & PackedBit.quickjs_ng) != 0,
-        .quickjs => (bits & PackedBit.quickjs) != 0,
-        .jsc => (bits & PackedBit.jsc) != 0,
-        // Single-backend spike selections set their packed bit via `-Dbackend=`; include them in enumeration. Multi-engine packs still cannot include these (build.zig rejects them in `-Dbackends=`).
-        .escargot => (bits & PackedBit.escargot) != 0,
-        .hermes => (bits & PackedBit.hermes) != 0,
-    };
-}
+/// Use the same packed-bit authority as dispatch and primary creation.
+pub const isPacked = backend_mod.isPacked;
 
 pub fn packedCount() usize {
     var n: usize = 0;
@@ -183,5 +166,14 @@ test "multi_pack: dual create real quickjs_ng and jsc when both packed" {
         // Prove both engines are usable in-process, not merely constructible.
         try verifyArithmetic(.quickjs_ng, a);
         try verifyArithmetic(.jsc, b);
+    }
+}
+
+test "multi_pack: predicate agrees with build bit contract for every backend" {
+    const tags = [_]Backend{ .quickjs_ng, .quickjs, .jsc, .escargot, .hermes };
+    for (tags, 0..) |tag, index| {
+        const expected = (backend_mod.packed_backend_bits & (@as(u32, 1) << @intCast(index))) != 0;
+        try std.testing.expectEqual(expected, isPacked(tag));
+        try std.testing.expectEqual(backend_mod.isPacked(tag), isPacked(tag));
     }
 }

@@ -203,7 +203,7 @@ jobs:
       - name: Independent packages on ARM64 (quickjs_ng)
         run: |
           set -euo pipefail
-          for package in zev js_event_loop inspector inspector_transport bytecode_cache; do
+          for package in zev js_event_loop inspector inspector_transport bytecode_cache commonjs; do
             (cd "libs/$package" && zig build test --summary all)
           done
 

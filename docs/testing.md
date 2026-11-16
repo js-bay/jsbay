@@ -17,7 +17,7 @@ The reusable [`mobile-tests.yml`](../.github/workflows/mobile-tests.yml) still o
 
 [`sdk-quality.yml`](../.github/workflows/sdk-quality.yml) is dispatch-only for official Harmony lint on a provisioned runner; portable and Apple SDK quality checks run inside CI's platform jobs.
 
-Repository-tool and the five independent package suites run once per Linux/macOS PR host, rather than once per backend. Backend steps use `test-engine`, which excludes those package suites. The daily Linux ARM64 job adds package execution for that architecture. Harmony host facade tests already execute the native host consumer, so CI invokes the facade entry once.
+Repository-tool and the six independent package suites run once per Linux/macOS PR host, rather than once per backend. Backend steps use `test-engine`, which excludes those package suites. The daily Linux ARM64 job adds package execution for that architecture. Harmony host facade tests already execute the native host consumer, so CI invokes the facade entry once.
 
 Desktop runners have explicit OS and architecture labels. Windows disables the optional POSIX HTTP/WebSocket transport while retaining engine, timer, thread and self-driven loop tests. Its public consumers include C, Zig and .NET. Apple Swift/Objective-C consumers run on ARM64 macOS; Intel macOS extension jobs cover the engine and desktop consumers. Inspector E2E, idle wake and signal shutdown use Node.js 24 on Linux/macOS, including its global WebSocket implementation.
 
@@ -63,11 +63,7 @@ bash tests/process-isolation/run.sh
 
 Run the command with the pull request base revision locally. CI uses `origin/${{ github.base_ref }}` for pull requests and `HEAD^` for main pushes.
 
-`tests/process-isolation/run.sh` builds a fault-injection archive (test-only
-`-Dfault-injection=true`) and proves a Zig/native abort kills only the child
-process. Android hardware and iOS Simulator runners do the same on-device / in-sim;
-Harmony may SKIP exec under SELinux without a HAP. Default product builds must
-leave that option off.
+`tests/process-isolation/run.sh` builds a fault-injection archive (test-only `-Dfault-injection=true`) and proves a Zig/native abort kills only the child process. Android hardware and iOS Simulator runners do the same on-device / in-sim; Harmony may SKIP exec under SELinux without a HAP. Default product builds must leave that option off.
 
 The root test command includes independent package suites. Use the package directory to run one package alone. The `tests/` directory lists consumer, SDK, and command-driver entry points.
 
@@ -92,7 +88,7 @@ JSBAY_LIBRARY="$PWD/zig-out/node-core/lib/libjsbay.a" NODE_INCLUDE="$NODE_INCLUD
 
 The helper builds both its fault-injection addon and the production CMake addon. It runs ordinary, lifecycle, Promise, and package consumers against both; fault and conversion-fault consumers run only against the former, and the production consumer checks that test hooks are absent.
 
-The [SDK build guide](../sdk/node/README.md) shows how to create the archive and set `NODE_INCLUDE`. Without `JSBAY_LIBRARY`, the helper builds QuickJS-NG itself. Without `TSC`, it runs the native consumers but does not check TypeScript declarations. The helper runs the basic consumer, an independently authored lifecycle and value-conversion consumer, and a fault-injection consumer. These cover actual timer callbacks, idle exit, garbage collection, Worker shutdown, late host completions, hostile thenables, failed callback registration, wrapper allocation, and guest-catchable host exceptions.
+The [SDK build guide](../sdk/node/README.md) shows how to create the archive and set `NODE_INCLUDE`. Without `JSBAY_LIBRARY`, the helper builds QuickJS-NG itself. Without `TSC`, it runs the native consumers but does not check TypeScript declarations. The helper runs the basic consumer, a lifecycle and value-conversion consumer, and a fault-injection consumer. These cover actual timer callbacks, idle exit, garbage collection, Worker shutdown, late host completions, hostile thenables, failed callback registration, wrapper allocation, and guest-catchable host exceptions.
 
 The helper compiles `JSBAY_NODE_TESTING` to expose fault controls and native resource counts. Normal CMake builds omit those controls, so run the basic and independent consumers against production artifacts; the fault consumer requires the test build. An injected failure tests cleanup at a chosen boundary and is not evidence that every system-memory-exhaustion path was exercised. The Linux engine CI jobs configure Node.js and TypeScript consumer checks for both QuickJS backends. The macOS job runs Node SDK consumers for QuickJS-NG and JSC without the TypeScript check. Workflow configuration alone does not prove that a run passed.
 
@@ -135,3 +131,11 @@ zig build test-state-tcas-engine -Dbackend=quickjs_ng --summary all
 ```
 
 CI runs `zig build test-state-tcas` on the Linux governance job (Scheduler/Driver suite + explore gates). Engine harnesses ride `test-engine` via `all_tests.zig`.
+
+The host tooling suite requires `zip` and `unzip` for actual ZIP/HAR packaging fixtures, in addition to the shell, archive and file tools used by the staging scripts. The fixture resolves the host ZIP encoder before applying its test-local PATH and binds that executable into the fixture; it does not emulate an archive encoder. Both TAR and ZIP staging must accept the production-shaped fixture and reject conformance-only content.
+
+## SDK ABI source gate subset
+
+`zig build tool -- check-c-abi` compares SDK declarations with `include/jsbay.h`; it is a closed source-shape check, not Kotlin/.NET execution or a general parser. Kotlin `Status` requires exactly `val code: Int`; `SubmissionStatus`, `ShutdownPhase`, and `AdmissionClass` require exactly `val native: Int`. The single constructor property must have no default and every entry must pass one explicit canonical nonnegative decimal Int literal. Omitted arguments are never interpreted as ordinals. `ValueKind` alone uses bare entries in ordinal order, matching `Value.kind()`'s `ValueKind.entries[kind]` lookup; constructor arguments and additional members are not supported for that enum.
+
+The Kotlin declarations must be unique top-level enums in `io.jsbay`, without extra modifiers, annotations, interfaces, imports or type aliases. Entry bodies, extra properties, init blocks, secondary constructors, numeric expressions and alternate literal forms are rejected. After the entries, only the current exact conversion companion helper (or no members) is supported. Comments and ordinary string decoys do not select declarations. Raw/multiline strings, Kotlin `${...}` expression interpolation, escaped declaration names, and unsupported Unicode declaration syntax fail closed. Changes outside this subset require an intentional gate update and review; passing it does not prove arbitrary surrounding Kotlin code safe. C# enums use a separate policy with language-defined implicit numbering; sequential native structs have a separate host-layout gate.
