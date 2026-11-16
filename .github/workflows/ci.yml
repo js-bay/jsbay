@@ -124,6 +124,9 @@ jobs:
           zig build tool -- check-docs
           zig build tool -- check-tooling
 
+      - name: Test buffer fixture programs and pinned-source downloads
+        run: node --test tests/napi-buffer-vectors.test.cjs tests/test262-download.test.mjs
+
       - name: Check first-party comment prose
         run: |
           set -euo pipefail

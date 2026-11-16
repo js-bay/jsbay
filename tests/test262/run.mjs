@@ -4,6 +4,7 @@ import { resolve, dirname, sep, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { downloadSource } from './download.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const options = { manifest: resolve(root, 'tests/test262/manifest.json'), backend: 'quickjs_ng' };
@@ -44,9 +45,7 @@ try {
       bytes = await readFile(actual);
     } catch (error) {
       if (options['source-root'] || error.code !== 'ENOENT') throw error;
-      const response = await fetch(`https://raw.githubusercontent.com/tc39/test262/${manifest.revision}/${path}`, { signal: AbortSignal.timeout(30000) });
-      if (!response.ok) throw Error(`Download ${path}: ${response.status}`);
-      bytes = Buffer.from(await response.arrayBuffer());
+      bytes = await downloadSource(`https://raw.githubusercontent.com/tc39/test262/${manifest.revision}/${path}`);
       if (digest(bytes) !== entry.sha256) throw Error(`Source digest mismatch: ${path}`);
       await mkdir(dirname(destination), { recursive: true });
       const temporary = `${destination}.${process.pid}.tmp`;

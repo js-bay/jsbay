@@ -46,8 +46,7 @@ fn callWrapper(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []
         var exception: jsc.JSValueRef = null;
         const result = jsc.JSObjectCallAsFunction(ctx_ref, @constCast(function), null, args.len, @ptrCast(args.ptr), &exception);
         if (exception != null) {
-            // A nested require may rethrow a captured getter exception. Preserve
-            // its identity again as it unwinds through this outer wrapper.
+            // A nested require may rethrow a captured getter exception. Preserve its identity again as it unwinds through this outer wrapper.
             exception_sink(ctx, exception);
             return error.CallFailed;
         }
@@ -72,15 +71,12 @@ pub fn newModule(ctx: ActiveEngine.Context, exports: ActiveEngine.Value) error{O
     errdefer ActiveEngine.freeValue(ctx, module);
     if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
         const m = backend.ActiveEngineModule;
-        // Define an own data property with the intrinsic C API: assignment can
-        // invoke an inherited setter before the registry has its loading entry.
-        // The C API consumes the duplicate on success AND failure.
+        // Define an own data property with the intrinsic C API: assignment can invoke an inherited setter before the registry has its loading entry. The C API consumes the duplicate on success AND failure.
         if (m.qjs.JS_DefinePropertyValueStr(ctx, module, "exports", ActiveEngine.dupValue(ctx, exports), m.qjs.JS_PROP_C_W_E) < 0) return error.OutOfMemory;
     } else if (comptime backend.active_backend == .jsc) {
         const jsc = @import("../../backend/jsc.zig").jsc;
         const ctx_ref: jsc.JSContextRef = @ptrCast(ctx);
-        // JSC's set API is not DefineOwnProperty. Temporarily detach only this
-        // fresh, unpublished object's prototype, never the global prototype.
+        // JSC's set API is not DefineOwnProperty. Temporarily detach only this fresh, unpublished object's prototype, never the global prototype.
         const prototype = jsc.JSObjectGetPrototype(ctx_ref, @constCast(module));
         jsc.JSValueProtect(ctx_ref, prototype);
         defer jsc.JSValueUnprotect(ctx_ref, prototype);
@@ -97,14 +93,9 @@ pub fn newModule(ctx: ActiveEngine.Context, exports: ActiveEngine.Value) error{O
     return module;
 }
 
-/// Final `module.exports` after the wrapper returns. Distinguishes a successful
-/// JS `undefined` (and a missing property, which reads as `undefined`) from an
-/// accessor exception. Shared `getPropertyVal` conflates those cases, so this
-/// read stays CJS-specific and leaves that helper unchanged.
+/// Final `module.exports` after the wrapper returns. Distinguishes a successful JS `undefined` (and a missing property, which reads as `undefined`) from an accessor exception. Shared `getPropertyVal` conflates those cases, so this read stays CJS-specific and leaves that helper unchanged.
 ///
-/// On exception this returns `error.CallFailed` and keeps the backend's pending
-/// exception in the same state a wrapper-body throw already uses (QuickJS and
-/// QuickJS-NG: parked in `ctx`, not consumed via `JS_GetException`).
+/// On exception this returns `error.CallFailed` and keeps the backend's pending exception in the same state a wrapper-body throw already uses (QuickJS and QuickJS-NG: parked in `ctx`, not consumed via `JS_GetException`).
 pub fn readFinalExports(
     ctx: ActiveEngine.Context,
     module_obj: ActiveEngine.Value,
@@ -115,9 +106,7 @@ pub fn readFinalExports(
         const qjs_mod = backend.ActiveEngineModule;
         const val = qjs_mod.qjs.JS_GetPropertyStr(ctx, module_obj, "exports");
         if (qjs_mod.jsIsException(val)) {
-            // `JS_EXCEPTION` is a tag, not a heap object. Freeing the sentinel is
-            // a no-op and must not call `JS_GetException`, which would clear the
-            // parked getter error that `qjsThrowRequireError` propagates.
+            // `JS_EXCEPTION` is a tag, not a heap object. Freeing the sentinel is a no-op and must not call `JS_GetException`, which would clear the parked getter error that `qjsThrowRequireError` propagates.
             qjs_mod.jsbay_qjs_JS_FreeValue(ctx, val);
             return error.CallFailed;
         }
@@ -136,8 +125,7 @@ pub fn readFinalExports(
         var exc: jsc.JSValueRef = null;
         const val = jsc.JSObjectGetProperty(ctx_ref, @constCast(module_obj), js_key, &exc);
         if (exc != null) {
-            // JSC has no parked-context exception. Preserve the value before
-            // returning through the Zig error union to the native callback.
+            // JSC has no parked-context exception. Preserve the value before returning through the Zig error union to the native callback.
             exception_sink(ctx, exc);
             return error.CallFailed;
         }
@@ -145,9 +133,7 @@ pub fn readFinalExports(
         jsc.JSValueProtect(ctx_ref, val);
         return val;
     }
-    // Hermes and Escargot are outside this fix's validation matrix. Keep the
-    // historical optional-property fallback so untested ownership conventions
-    // are not changed here.
+    // Hermes and Escargot are outside this fix's validation matrix. Keep the historical optional-property fallback so untested ownership conventions are not changed here.
     return ActiveEngine.getPropertyVal(ctx, module_obj, "exports") orelse
         ActiveEngine.dupValue(ctx, fallback_exports);
 }

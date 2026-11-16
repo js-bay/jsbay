@@ -1,5 +1,4 @@
-//! Adapt the existing public engine loader to the package's narrow loader.
-//! The temporary bridge/vtable and loader are borrowed only during require().
+//! Adapt the existing public engine loader to the package's narrow loader. The temporary bridge/vtable and loader are borrowed only during require().
 const commonjs = @import("commonjs");
 const types = @import("../../types.zig");
 

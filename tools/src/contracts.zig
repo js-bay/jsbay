@@ -326,8 +326,7 @@ test "check-c-abi rejects SDK storage drift and a C++-only header mismatch" {
         });
     }
     try writeFile(io, native_path, native);
-    // Exercise the real CLI: Kotlin constructor codes must not be guessed from
-    // enum position, and unsupported constructor/body shapes must fail closed.
+    // Exercise the real CLI: Kotlin constructor codes must not be guessed from enum position, and unsupported constructor/body shapes must fail closed.
     const status_path = try std.fs.path.join(a, &.{ fixture, "sdk/android/jsbay/src/main/kotlin/io/jsbay/Status.kt" });
     const status_source = try Dir.cwd().readFileAlloc(io, status_path, a, .limited(1024 * 1024));
     const defaulted = try std.mem.replaceOwned(u8, a, status_source, "val code: Int,", "val code: Int = 99,");

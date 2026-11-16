@@ -1,5 +1,4 @@
-//! Engine-independent CommonJS canonical IDs, loading transactions and instance
-//! cache. The embedding host supplies execution, references and serialization.
+//! Engine-independent CommonJS canonical IDs, loading transactions and instance cache. The embedding host supplies execution, references and serialization.
 const loader = @import("loader.zig");
 const registry = @import("registry.zig");
 pub const Loader = loader.Loader;

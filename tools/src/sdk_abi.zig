@@ -1,7 +1,4 @@
-//! Narrow source drift checks for the current Kotlin/C# native boundary.
-//! Numeric and host C layout authority is the public header, not copied numbers.
-//! This is not a language parser or an SDK runtime/foreign-target layout test:
-//! unsupported declaration shapes fail closed and require reviewing this gate.
+//! Narrow source drift checks for the current Kotlin/C# native boundary. Numeric and host C layout authority is the public header, not copied numbers. This is not a language parser or an SDK runtime/foreign-target layout test: unsupported declaration shapes fail closed and require reviewing this gate.
 const std = @import("std");
 const c = @import("public_abi");
 const Pair = [2][]const u8;
@@ -41,9 +38,7 @@ fn body(source: []const u8, declaration: []const u8) ![]const u8 {
     return error.PolicyFailure;
 }
 
-// Kotlin constructor arguments are native codes, NOT enum ordinals. Only
-// ValueKind is ordinal-based (Value.kind indexes ValueKind.entries directly).
-// The supported constructor/property/companion grammar is deliberately closed.
+// Kotlin constructor arguments are native codes, NOT enum ordinals. Only ValueKind is ordinal-based (Value.kind indexes ValueKind.entries directly). The supported constructor/property/companion grammar is deliberately closed.
 fn kotlinPrefix(source: []const u8) !void {
     var tokens = CsTokens{ .source = source, .kotlin = true };
     var token = try tokens.next();
@@ -52,8 +47,7 @@ fn kotlinPrefix(source: []const u8) !void {
         token = try tokens.next();
         if (token != null and std.mem.eql(u8, token.?, ";")) token = try tokens.next();
     }
-    // Harmless top-level constant string decoys are allowed. Other declaration
-    // modifiers, annotations, imports and aliases require an explicit review.
+    // Harmless top-level constant string decoys are allowed. Other declaration modifiers, annotations, imports and aliases require an explicit review.
     while (token) |first| {
         var modifier = first;
         if (std.mem.eql(u8, modifier, "private")) modifier = try tokens.next() orelse return error.PolicyFailure;
@@ -76,8 +70,7 @@ fn kotlinBoundary(source: []const u8, at: usize) !void {
     var boundary: usize = 0;
     var found = false;
     while (try tokens.next()) |token| {
-        // A file-local alias/import could change what the supposedly primitive
-        // Int constructor means, including when the alias follows the enum.
+        // A file-local alias/import could change what the supposedly primitive Int constructor means, including when the alias follows the enum.
         if (std.mem.eql(u8, token, "typealias") or std.mem.eql(u8, token, "import")) return error.PolicyFailure;
         const offset = @intFromPtr(token.ptr) - @intFromPtr(source.ptr);
         if (offset == at) {
@@ -101,8 +94,7 @@ fn kotlinBoundary(source: []const u8, at: usize) !void {
             if (brackets == 0) return error.PolicyFailure;
             brackets -= 1;
         }
-        // Do not let a semicolon hide an unsupported modifier/typealias prefix.
-        // Only complete prior top-level bodies establish a new boundary.
+        // Do not let a semicolon hide an unsupported modifier/typealias prefix. Only complete prior top-level bodies establish a new boundary.
     }
     if (!found or braces != 0 or parens != 0 or brackets != 0) return error.PolicyFailure;
 }
@@ -141,8 +133,7 @@ fn checkKotlinEnum(source: []const u8, at: usize, signature: []const u8, raw: []
     if (!std.mem.eql(u8, next, ";")) return error.PolicyFailure;
     if (try tokens.next() == null) return;
     if (ordinal_only) return error.PolicyFailure;
-    // No init blocks, extra properties, entry subclasses, secondary constructors
-    // or arbitrary members can alter code/native or the conversion helpers.
+    // No init blocks, extra properties, entry subclasses, secondary constructors or arbitrary members can alter code/native or the conversion helpers.
     const tail = comptime if (std.mem.eql(u8, declaration, "enum class Status"))
         "companion object { fun of(code: Int) = entries.firstOrNull { it.code == code } ?: INVALID_ARGUMENT }"
     else if (std.mem.eql(u8, declaration, "enum class SubmissionStatus"))
@@ -303,8 +294,7 @@ const CsTokens = struct {
                 // unsupported here rather than misidentifying its quotes as code.
                 if (self.kotlin and byte == '$' and self.cursor < self.source.len and self.source[self.cursor] == '{') return error.PolicyFailure;
                 if (interpolated and byte == '{') {
-                    // Only simple identifier/member interpolation is supported.
-                    // Expressions containing nested quotes/braces fail closed.
+                    // Only simple identifier/member interpolation is supported. Expressions containing nested quotes/braces fail closed.
                     while (self.cursor < self.source.len and self.source[self.cursor] != '}') : (self.cursor += 1) {
                         const b = self.source[self.cursor];
                         if (!std.ascii.isAlphanumeric(b) and b != '_' and b != '.' and b != ' ') return error.PolicyFailure;
@@ -354,16 +344,14 @@ fn checkStruct(tokens: *CsTokens, comptime name: []const u8, comptime T: type, c
         offset += layout.size;
         max_alignment = @max(max_alignment, layout.alignment);
     }
-    // Only the current constructor is supported. Consume its entire declaration
-    // and body, then require the struct to end: no hidden fields/auto-properties.
+    // Only the current constructor is supported. Consume its entire declaration and body, then require the struct to end: no hidden fields/auto-properties.
     if (comptime std.mem.eql(u8, name, "Utf8")) try tokens.sequence("internal Utf8(IntPtr data, nuint length) { Data = data; Length = length; }");
     try tokens.expect("}");
     if (std.mem.alignForward(usize, offset, max_alignment) != @sizeOf(T) or max_alignment != @alignOf(T)) return error.PolicyFailure;
 }
 
 fn checkLayout(source: []const u8, comptime name: []const u8, comptime T: type, comptime fields: []const Pair) !void {
-    // C# also treats Unicode line separators as newlines. This deliberately
-    // ASCII-only subset must not hide declarations inside such comments.
+    // C# also treats Unicode line separators as newlines. This deliberately ASCII-only subset must not hide declarations inside such comments.
     for (source) |byte| if (byte >= 128) return error.PolicyFailure;
     var tokens = CsTokens{ .source = source };
     var boundary: usize = 0;

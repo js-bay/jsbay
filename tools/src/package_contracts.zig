@@ -272,8 +272,7 @@ test "published package includes every engine patch build input" {
     try testing.expect(unpacked.succeeded());
     const artifact = try path(allocator, extracted, &.{hash});
     try testing.expect(try exists(io, allocator, artifact, &.{"build.zig"}));
-    // The sixth local package must survive Zig's public package inventory, not
-    // merely work in a developer's checkout.
+    // The sixth local package must survive Zig's public package inventory, not merely work in a developer's checkout.
     for ([_][]const u8{ "LICENSE", "readme.md", "build.zig", "build.zig.zon", "src/root.zig", "src/registry.zig", "src/loader.zig", "src/tests.zig" }) |input| {
         try testing.expect(try exists(io, allocator, artifact, &.{ "libs", "commonjs", input }));
     }
@@ -390,8 +389,7 @@ test "commonjs package owns loading and cache behavior without engine imports" {
     try expectContains(adapter, "commonjs.Registry(ValueOps)");
     try testing.expect(!try exists(io, allocator, cwd, &.{ "src", "script", "cjs", "module_registry.zig" }));
 
-    // Copy only the package's distributable inputs, never caches, siblings,
-    // parent sources or symlinks. A fresh global cache prevents cache masking.
+    // Copy only the package's distributable inputs, never caches, siblings, parent sources or symlinks. A fresh global cache prevents cache masking.
     const isolated = try makeTemp(allocator, io, "commonjs-isolated");
     defer Dir.cwd().deleteTree(io, isolated) catch {};
     var package_dir = try Dir.cwd().openDir(io, package, .{ .iterate = true });

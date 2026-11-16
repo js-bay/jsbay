@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict')
 const addon = require('../../sdk/node')
 const bufferVectors = require('../fixtures/napi-buffer-boundaries.json')
+const { createHostVector, guestVectorProgram } = require('../fixtures/napi-buffer-vectors.cjs')
 
 async function main() {
   const engine = addon.Engine.create({ instanceId: 4111 })
@@ -14,12 +15,11 @@ async function main() {
     assert.deepEqual([...new Uint8Array(binary)], [3, 4, 5])
     engine.bind('copyView', () => new DataView(Uint8Array.from([1, 7, 9]).buffer, 1, 2))
     assert.deepEqual([...new Uint8Array(engine.evaluate('copyView()'))], [7, 9])
-    // Shared data only; each SDK keeps its own invocation and ownership checks.
+    // Each SDK keeps its own native invocation and ownership checks.
+    let vectorJson
+    engine.bind('boundaryVectorJson', () => vectorJson)
     for (const [index, vector] of bufferVectors.entries()) {
-      const bytes = Uint8Array.from(vector.bytes)
-      const view = vector.type === 'ArrayBuffer' ? bytes.buffer
-        : vector.type === 'Buffer' ? Buffer.from(bytes.buffer, vector.byteOffset, vector.length)
-          : new globalThis[vector.type](bytes.buffer, vector.byteOffset, vector.length)
+      const { bytes, view } = createHostVector(vector)
       const name = `boundaryVector${index}`
       engine.bind(name, () => view)
       // Retain the guest result before mutating the host, without copying it back yet.
@@ -29,17 +29,16 @@ async function main() {
       assert.deepEqual(engine.evaluate('Array.from(new Uint8Array(__boundaryHostBuffer))'), vector.expected, `${vector.name}: host-to-guest source isolation`)
       engine.evaluate('new Uint8Array(__boundaryHostBuffer).fill(17); undefined')
       assert.ok(bytes.every(byte => byte === 255), `${vector.name}: host-to-guest destination isolation`)
-      const guestType = vector.type === 'Buffer' ? 'Uint8Array' : vector.type
-      const expression = guestType === 'ArrayBuffer' ? 'bytes.buffer'
-        : `new ${guestType}(bytes.buffer, ${vector.byteOffset}, ${vector.length})`
-      const guest = engine.evaluate(`(() => { const bytes = globalThis.__boundaryGuestBytes = Uint8Array.from(${JSON.stringify(vector.bytes)}); return ${expression}; })()`)
+      vectorJson = JSON.stringify(vector)
+      engine.evaluate('globalThis.__boundaryVectorJson = boundaryVectorJson(); undefined')
+      const guest = engine.evaluate(guestVectorProgram)
       assert.ok(guest instanceof ArrayBuffer, `${vector.name}: guest-to-host ArrayBuffer result contract`)
       const copied = new Uint8Array(guest)
       engine.evaluate('__boundaryGuestBytes.fill(254); undefined')
       assert.deepEqual([...copied], vector.expected, `${vector.name}: guest-to-host source isolation`)
       copied.fill(253)
       assert.equal(engine.evaluate('__boundaryGuestBytes.every(byte => byte === 254)'), true, `${vector.name}: guest-to-host destination isolation`)
-      engine.evaluate('delete globalThis.__boundaryHostBuffer; delete globalThis.__boundaryGuestBytes; undefined')
+      engine.evaluate('delete globalThis.__boundaryHostBuffer; delete globalThis.__boundaryGuestBytes; delete globalThis.__boundaryVectorJson; undefined')
     }
     engine.bind('copyNumber', value => value)
     assert.ok(Number.isNaN(engine.evaluate('copyNumber(NaN)')))

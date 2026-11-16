@@ -1,6 +1,7 @@
 'use strict'
 
 const bufferVectors = require('../fixtures/napi-buffer-boundaries.json')
+const { createHostVector, guestVectorProgram } = require('../fixtures/napi-buffer-vectors.cjs')
 
 /* Executes against the same C++ N-API bridge as Harmony. Node supplies only the N-API host; it does not replace or mock any bridge or core behavior. */
 const native = require(process.env.JSBAY_HARMONY_NODE)
@@ -295,10 +296,7 @@ try {
 
   // The same cases run through this bridge's handle API, not Node SDK helpers.
   for (const vector of bufferVectors) {
-    const bytes = Uint8Array.from(vector.bytes)
-    const view = vector.type === 'ArrayBuffer' ? bytes.buffer
-      : vector.type === 'Buffer' ? Buffer.from(bytes.buffer, vector.byteOffset, vector.length)
-        : new globalThis[vector.type](bytes.buffer, vector.byteOffset, vector.length)
+    const { bytes, view } = createHostVector(vector)
     const value = native.newArrayBuffer(engine, view)
     try {
       const globalValue = native.global(engine)
@@ -318,10 +316,13 @@ try {
       const cleanup = native.evaluate(engine, 'delete globalThis.__boundaryHostBuffer; undefined', 'boundary-cleanup.js')
       release(cleanup)
     }
-    const guestType = vector.type === 'Buffer' ? 'Uint8Array' : vector.type
-    const expression = guestType === 'ArrayBuffer' ? 'bytes.buffer'
-      : `new ${guestType}(bytes.buffer, ${vector.byteOffset}, ${vector.length})`
-    const guest = native.evaluate(engine, `(() => { const bytes = globalThis.__boundaryGuestBytes = Uint8Array.from(${JSON.stringify(vector.bytes)}); return ${expression}; })()`, 'boundary-vector.js')
+    const vectorJson = native.newString(engine, JSON.stringify(vector))
+    try {
+      const globalValue = native.global(engine)
+      try { native.set(globalValue, '__boundaryVectorJson', vectorJson) }
+      finally { release(globalValue) }
+    } finally { release(vectorJson) }
+    const guest = native.evaluate(engine, guestVectorProgram, 'boundary-vector.js')
     try {
       const destination = native.copyBuffer(guest)
       expect(destination instanceof ArrayBuffer, `${vector.name}: guest-to-host ArrayBuffer result contract`)
@@ -334,7 +335,7 @@ try {
       expect(Array.from(new Uint8Array(unchanged)).every(byte => byte === 254), `${vector.name}: guest-to-host destination isolation`)
     } finally {
       release(guest)
-      const cleanup = native.evaluate(engine, 'delete globalThis.__boundaryGuestBytes; undefined', 'boundary-cleanup.js')
+      const cleanup = native.evaluate(engine, 'delete globalThis.__boundaryGuestBytes; delete globalThis.__boundaryVectorJson; undefined', 'boundary-cleanup.js')
       release(cleanup)
     }
   }

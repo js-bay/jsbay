@@ -100,8 +100,7 @@ pub fn create(comptime c: type, comptime exception: type) type {
             return qjs.JS_CallConstructor(ctx, ctor, 1, &argv);
         }
 
-        // ============================================================================
-        // Native iteration + builder helpers for Map and Set.
+        // ============================================================================ Native iteration + builder helpers for Map and Set.
         //
         // These support `value.NativeArgs.mapForEach` / `setForEach` / `mapSize` / `setSize`, plus the free-function builder surface (`newMap`, `newSet`, `mapSet`, `setAdd`). They iterate via the standard JS iterator protocol (`val.entries()` / `val.values()` → `.next()` → `{done, value}`), producing raw JSValue references the caller gets to inspect per entry without flattening through JSON. The existing JSON-based helpers above (qjsMapSetToJson / qjsNewMapFromJson / qjsNewSetFromJson) are untouched and remain the fast path for simple JSON-safe contents.
         // ============================================================================

@@ -1,7 +1,6 @@
 //! Date / BigInt support (see ../value.zig).
 //!
-//! QuickJS instantiation of the shared leaf in `src/backend/quickjs_common/datetime.zig`.
-//! Public names stay on this path so existing imports keep working.
+//! QuickJS instantiation of the shared leaf in `src/backend/quickjs_common/datetime.zig`. Public names stay on this path so existing imports keep working.
 
 const impl = @import("../quickjs_common/datetime.zig").create(@import("c_api.zig"));
 

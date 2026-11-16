@@ -894,8 +894,7 @@ test "cjs: evalAsCjs, bytecode, and injected cache preserve undefined and getter
     , "[\"undefined\",true,\"exports getter\"]");
 }
 
-// Adversarial review: throw values need not be Error objects, and a getter may
-// return undefined, delete itself, or recover on a later execution.
+// Adversarial review: throw values need not be Error objects, and a getter may return undefined, delete itself, or recover on a later execution.
 test "cjs: adversarial final exports reads preserve thrown identity and retry" {
     var context = CjsLoaderCtx.init(testing.allocator);
     defer context.deinit();
@@ -965,8 +964,7 @@ test "cjs: module require captures canonical referrer through nesting and cache 
     cjs.clearCache(id);
     try helpers.expectEvalEquals(id, "JSON.stringify([savedEval('./dep.js'),savedBytecode('./dep.js')])", "[11,22]");
     try helpers.expectEvalEquals(id, "__jsbay_cjsCache(\"module.exports=require('./dep.js');\", a.saved, 'other/bundle.js')", "11");
-    // Injected require is a policy boundary: do not replace it with the global
-    // loader or append hidden referrer arguments to caller-owned functions.
+    // Injected require is a policy boundary: do not replace it with the global loader or append hidden referrer arguments to caller-owned functions.
     try helpers.expectEvalEquals(id, "__jsbay_cjsCache('module.exports=require;', function(spec){return arguments.length+spec;}, 'pkg/injected.js')('x')", "1x");
 }
 
@@ -1142,8 +1140,7 @@ test "cjs: VM allocation failure cannot cache a sentinel module environment" {
     const exports = try environment.newExports(ctx);
     defer backend.ActiveEngine.freeValue(ctx, exports);
     const rt = m.qjs.JS_GetRuntime(ctx);
-    // QuickJS can satisfy new objects from its freelist without malloc. Hold
-    // those successes until a real allocation is forced, and release every one.
+    // QuickJS can satisfy new objects from its freelist without malloc. Hold those successes until a real allocation is forced, and release every one.
     var held: [4096]backend.ActiveEngine.Value = undefined;
     var used: usize = 0;
     defer for (held[0..used]) |value| backend.ActiveEngine.freeValue(ctx, value);

@@ -1,7 +1,6 @@
 //! Map / Set support for `value.zig`.
 //!
-//! QuickJS instantiation of the shared leaf in `src/backend/quickjs_common/collections.zig`.
-//! Public names stay on this path so existing imports keep working.
+//! QuickJS instantiation of the shared leaf in `src/backend/quickjs_common/collections.zig`. Public names stay on this path so existing imports keep working.
 
 const impl = @import("../quickjs_common/collections.zig").create(@import("c_api.zig"), @import("exception.zig"));
 

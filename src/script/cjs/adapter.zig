@@ -23,9 +23,7 @@ const OwnedValue = @import("../../value/root.zig").OwnedValue;
 
 const ActiveEngine = backend.ActiveEngine;
 
-// --------------------------------------------------------------------------
-// Per-instance state
-// --------------------------------------------------------------------------
+// -------------------------------------------------------------------------- Per-instance state --------------------------------------------------------------------------
 
 const loader_bridge = @import("loader_bridge.zig");
 const commonjs = @import("commonjs");
@@ -87,9 +85,7 @@ fn stateFromCtx(ctx: ActiveEngine.Context) ?*CjsState {
     return getState(id);
 }
 
-// --------------------------------------------------------------------------
-// Public API
-// --------------------------------------------------------------------------
+// -------------------------------------------------------------------------- Public API --------------------------------------------------------------------------
 
 /// Install a global `require(specifier)` on the instance, tied to the given module loader. Idempotent — subsequent calls on the same instance are no-ops and return `true`.
 ///
@@ -194,9 +190,7 @@ pub fn uninstall(instance_id: i32) void {
     // We intentionally do NOT remove the global `require` from the JS context — the context may be mid-teardown. After uninstall, native callbacks report that the state is not installed.
 }
 
-// --------------------------------------------------------------------------
-// require() core
-// --------------------------------------------------------------------------
+// -------------------------------------------------------------------------- require() core --------------------------------------------------------------------------
 
 const RequireError = commonjs.ExecutionError;
 const CallResult = wrapper_execution.CallResult;
@@ -251,9 +245,7 @@ fn compileWrapper(
     }
 }
 
-// --------------------------------------------------------------------------
-// Global `require` registration
-// --------------------------------------------------------------------------
+// -------------------------------------------------------------------------- Global `require` registration --------------------------------------------------------------------------
 
 /// Wrap a module body in the same `(function (exports, module, require, __filename, __dirname) { ... })` form `runWrappedSource` compiles. Returns the wrapper source in a caller-owned buffer.
 fn wrapModuleSource(alloc: std.mem.Allocator, source: []const u8) ![]u8 {
@@ -265,9 +257,7 @@ fn runModuleFn(state: *CjsState, wrapper_fn: ActiveEngine.Value, filename: []con
     return wrapper_execution.invoke(state.ctx, wrapper_fn, .{ .module_local = getModuleRequire }, filename, dirname, null, captureException);
 }
 
-// --------------------------------------------------------------------------
-// Cached CommonJS evaluation (bytecode-compiled module bodies)
-// --------------------------------------------------------------------------
+// -------------------------------------------------------------------------- Cached CommonJS evaluation (bytecode-compiled module bodies) --------------------------------------------------------------------------
 
 pub const CjsCacheResult = struct {
     /// JSON-stringified `module.exports`, matching `evalAsCjs`'s contract.
@@ -482,13 +472,10 @@ fn registerGlobalRequire(ctx: ActiveEngine.Context) bool {
     }
 }
 
-/// Each wrapper receives a JS-owned closure, so saved require functions keep
-/// their canonical filename even across nested evaluation and cache eviction.
-/// The injected-require path deliberately bypasses this factory.
+/// Each wrapper receives a JS-owned closure, so saved require functions keep their canonical filename even across nested evaluation and cache eviction. The injected-require path deliberately bypasses this factory.
 fn getModuleRequire(ctx: ActiveEngine.Context, filename: []const u8) error{ Compile, CallFailed }!ActiveEngine.Value {
     const state = stateFromCtx(ctx) orelse return error.CallFailed;
-    // Compile the constant factory once per installation, not on every bytecode
-    // cache replay. Its lifetime is independent of the module instance cache.
+    // Compile the constant factory once per installation, not on every bytecode cache replay. Its lifetime is independent of the module instance cache.
     const factory = state.require_factory orelse factory: {
         const value = compileWrapper(ctx, "(function(nativeRequire, referrer) { return function require(specifier) { return nativeRequire(specifier, referrer); }; })", "<cjs-require>") catch return error.Compile;
         state.require_factory = value;
@@ -502,8 +489,7 @@ fn getModuleRequire(ctx: ActiveEngine.Context, filename: []const u8) error{ Comp
     return ActiveEngine.callFunction(ctx, factory, ActiveEngine.undefinedValue(), &args) orelse error.CallFailed;
 }
 
-// This callback is captured privately, not read back from mutable globalThis.
-// Creating a function transfers no raw state/arena pointer into JavaScript.
+// This callback is captured privately, not read back from mutable globalThis. Creating a function transfers no raw state/arena pointer into JavaScript.
 fn newNativeRequire(ctx: ActiveEngine.Context) ActiveEngine.Value {
     switch (backend.active_backend) {
         .quickjs, .quickjs_ng => {
@@ -521,9 +507,7 @@ fn newNativeRequire(ctx: ActiveEngine.Context) ActiveEngine.Value {
     }
 }
 
-// --------------------------------------------------------------------------
-// Native require callbacks (one per backend ABI)
-// --------------------------------------------------------------------------
+// -------------------------------------------------------------------------- Native require callbacks (one per backend ABI) --------------------------------------------------------------------------
 
 fn qjsRequireCb(
     ctx: ?*backend.ActiveEngineModule.qjs.JSContext,
@@ -554,8 +538,7 @@ fn qjsModuleRequireCb(
     defer qjs_mod.jsbay_qjs_JS_FreeCString(ctx, spec_cstr);
     const spec = std.mem.span(spec_cstr);
 
-    // The second argument is supplied by the per-module JS closure. Root
-    // calls without it retain the historical <cjs> resolution context.
+    // The second argument is supplied by the per-module JS closure. Root calls without it retain the historical <cjs> resolution context.
     const referrer_cstr = if (argc >= 2 and qjs_mod.jsbay_qjs_JS_IsString(argv[1]) != 0)
         qjs_mod.jsbay_qjs_JS_ToCString(ctx, argv[1]) orelse return qjs_mod.JS_EXCEPTION
     else
@@ -737,9 +720,7 @@ fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: D
     }
 }
 
-// --------------------------------------------------------------------------
-// Shared require implementation (backend-neutral)
-// --------------------------------------------------------------------------
+// -------------------------------------------------------------------------- Shared require implementation (backend-neutral) --------------------------------------------------------------------------
 
 const DoRequireError = commonjs.RequireError;
 
@@ -766,9 +747,7 @@ fn stringifyValue(ctx: ActiveEngine.Context, val: ActiveEngine.Value) ?[]const u
     return ActiveEngine.valueToStringVal(ctx, val);
 }
 
-// --------------------------------------------------------------------------
-// Global `__jsbay_cjsCache` registration — bytecode-cached CommonJS
-// --------------------------------------------------------------------------
+// -------------------------------------------------------------------------- Global `__jsbay_cjsCache` registration — bytecode-cached CommonJS --------------------------------------------------------------------------
 
 /// Register a JS-callable global `__jsbay_cjsCache(source, requireFn, filename, cacheDir?)` on the QuickJS context. The host's `loadModuleExports` uses this INSTEAD of `new Function("module","exports", "require", source)` so a widget/system-app body that costs hundreds of milliseconds to compile is compiled once and replayed from bytecode.
 ///

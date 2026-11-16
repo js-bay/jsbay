@@ -299,17 +299,14 @@ fn waitForSessionRemoval(state: *inspector_state.InspectorState, session_id: u64
 
 fn waitForSessionRemovalUntil(state: *inspector_state.InspectorState, session_id: u64, deadline: i64) !void {
     const time = @import("../platform/io.zig");
-    // EOF/queued frames are processed by another thread. Yield counts are not
-    // elapsed-time bounds and can expire before that worker is scheduled. Do not
-    // pump owner tasks here: the queued-await tests require them to remain queued.
+    // EOF/queued frames are processed by another thread. Yield counts are not elapsed-time bounds and can expire before that worker is scheduled. Do not pump owner tasks here: the queued-await tests require them to remain queued.
     while (sessionPresent(state, session_id) and time.monotonicMilliseconds() < deadline) time.sleepMs(1);
     try testing.expect(!sessionPresent(state, session_id));
 }
 
 fn waitForOnlySessionIdUntil(state: *inspector_state.InspectorState, deadline: i64) !u64 {
     const time = @import("../platform/io.zig");
-    // session_opened is delivered by the transport worker after the client handshake
-    // returns. A snapshot of sessions.len is not a readiness bound.
+    // session_opened is delivered by the transport worker after the client handshake returns. A snapshot of sessions.len is not a readiness bound.
     while (time.monotonicMilliseconds() < deadline) {
         state.mutex.lock();
         const n = state.sessions.items.len;
@@ -1940,8 +1937,7 @@ test "cdp regression: disconnected queued awaits cannot consume the next session
     try testing.expect(std.mem.indexOf(u8, response, "new-session-await") != null);
 }
 
-// Test-only adapter: hold a real WebSocket EOF event before the inspector's
-// callback, modeling an unscheduled transport worker without changing runtime code.
+// Test-only adapter: hold a real WebSocket EOF event before the inspector's callback, modeling an unscheduled transport worker without changing runtime code.
 const EventDeliveryGate = struct {
     inner: *inspector.Transport,
     kind: inspector.EventKind = .session_closed,
@@ -2069,8 +2065,7 @@ test "cdp regression: onlySessionId requires a session-opened readiness wait" {
     const deadline = time.monotonicMilliseconds() + 3000;
     while (!gate.entered.load(.seq_cst) and time.monotonicMilliseconds() < deadline) time.sleepMs(1);
     try testing.expect(gate.entered.load(.seq_cst));
-    // The handshake has completed and production has the open event, but delivery is
-    // still gated. A snapshot onlySessionId is not a session-lifetime contract.
+    // The handshake has completed and production has the open event, but delivery is still gated. A snapshot onlySessionId is not a session-lifetime contract.
     try testing.expectError(error.TestUnexpectedResult, onlySessionId(state));
     try testing.expectEqual(@as(usize, 0), inspector_state.sessionCount(state));
     try testing.expectError(error.TestUnexpectedResult, waitForOnlySessionIdUntil(state, time.monotonicMilliseconds() + 5));

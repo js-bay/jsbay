@@ -1259,8 +1259,7 @@ fn ohosLibTriple(arch: std.Target.Cpu.Arch) []const u8 {
     };
 }
 
-/// Only identical module imports belong here. Sources, target/link setup, test
-/// dependencies and private tooling imports remain explicit at their call sites.
+/// Only identical module imports belong here. Sources, target/link setup, test dependencies and private tooling imports remain explicit at their call sites.
 fn wireImports(module: *std.Build.Module, options: *std.Build.Step.Options, zev: *std.Build.Module, event_loop: *std.Build.Module, inspector: *std.Build.Module, transport: *std.Build.Module, bytecode_cache: *std.Build.Module, commonjs: *std.Build.Module, qjs: ?*std.Build.Module) void {
     module.addOptions("build_options", options);
     module.addImport("zev", zev);

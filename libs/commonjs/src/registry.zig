@@ -65,8 +65,7 @@ pub fn Registry(comptime Ops: type) type {
             // Step 3: load via the user vtable.
             const loaded = loader_bridge.loadSource(source_allocator, loader, canonical.id) catch return error.OutOfMemory;
             defer if (loaded) |src| source_allocator.free(src);
-            // A host loader may finish a nested require of this very ID. Adopt
-            // that transaction, even if this outer callback returned no source.
+            // A host loader may finish a nested require of this very ID. Adopt that transaction, even if this outer callback returned no source.
             if (self.entries.get(canonical.id)) |cached| {
                 return if (cached.loading) Ops.readExports(ctx, cached.exports) catch return error.CallFailed else Ops.retain(ctx, cached.exports);
             }
@@ -75,8 +74,7 @@ pub fn Registry(comptime Ops: type) type {
             // Step 4: intern canonical id so it outlives this call as the cache key.
             const interned_id = self.arena.allocator().dupe(u8, canonical.id) catch return error.OutOfMemory;
 
-            // The loading cache holds the live module object. Cycles read its
-            // current exports (including reassignment), not a detached snapshot.
+            // The loading cache holds the live module object. Cycles read its current exports (including reassignment), not a detached snapshot.
             const initial_exports = try Ops.newExports(ctx);
             defer Ops.release(ctx, initial_exports);
             if (self.entries.get(canonical.id)) |cached| {
@@ -84,8 +82,7 @@ pub fn Registry(comptime Ops: type) type {
             }
             const module = try Ops.newModule(ctx, initial_exports);
             defer Ops.release(ctx, module);
-            // Constructors may also finish a nested transaction. Never replace
-            // it with a second loading module (or drop its cache-owned retain).
+            // Constructors may also finish a nested transaction. Never replace it with a second loading module (or drop its cache-owned retain).
             if (self.entries.get(canonical.id)) |cached| {
                 return if (cached.loading) Ops.readExports(ctx, cached.exports) catch return error.CallFailed else Ops.retain(ctx, cached.exports);
             }
