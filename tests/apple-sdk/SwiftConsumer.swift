@@ -49,6 +49,14 @@ struct SwiftConsumer {
       fatalError("buffer copy-out isolation")
     }
     guard try engine.arrayBuffer(Data()).bytes().isEmpty else { fatalError("empty buffer") }
+    let noCopyInput = Data([7, 8, 9, 10])
+    let noCopyBuf = try engine.arrayBufferNoCopy(noCopyInput)
+    guard try noCopyBuf.bytes() == Data([7, 8, 9, 10]) else {
+      fatalError("no-copy buffer payload mismatch")
+    }
+    guard try engine.arrayBufferNoCopy(Data()).bytes().isEmpty else {
+      fatalError("empty no-copy buffer")
+    }
     guard
       try engine.evaluate("new DataView(new Uint8Array([8,9,0,255,7]).buffer,2,2)").bytes()
         == Data([0, 255])
@@ -334,8 +342,26 @@ struct SwiftConsumer {
     else {
       fatalError("Swift postFence admission")
     }
+    let bgSignal = DispatchSemaphore(value: 0)
+    var bgSubmitted = false
+    var bgPostGcOk = false
+    DispatchQueue.global().async {
+      do {
+        bgSubmitted = try submissionEngine.postScript(
+          "globalThis.__swiftBgSubmission = 100", filename: "submission-bg.js",
+          completion: { submissionOutcomes.append($0.status) })
+        bgPostGcOk = try submissionEngine.postGc()
+      } catch {
+        fatalError("Background postScript/postGc threw: \(error)")
+      }
+      bgSignal.signal()
+    }
+    bgSignal.wait()
+    guard bgSubmitted && bgPostGcOk else {
+      fatalError("Swift background postScript/postGc rejected")
+    }
     RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
-    guard submissionOutcomes == [.completed, .exception, .completed] else {
+    guard submissionOutcomes == [.completed, .exception, .completed, .completed] else {
       fatalError("Swift FIFO submission outcomes: \(submissionOutcomes)")
     }
     guard

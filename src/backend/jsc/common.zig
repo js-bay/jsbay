@@ -65,12 +65,17 @@ pub fn instanceIdFromCtx(ctx: jsc.JSGlobalContextRef) i32 {
 pub fn jsStringFromSlice(s: []const u8) jsc.JSStringRef {
     // JSStringCreateWithUTF8CString stops at the first 0. UTF-16 with an explicit length keeps embedded 0x00. JSC copies the units, so the temporary buffer does not outlive this call.
     if (fail_next_typed_string_for_testing.swap(false, .acq_rel)) return null;
-    const utf16 = std.unicode.utf8ToUtf16LeAlloc(std.heap.c_allocator, s) catch return null;
-    defer std.heap.c_allocator.free(utf16);
-    if (utf16.len == 0) {
+    if (s.len == 0) {
         const dummy = [_]jsc.JSChar{0};
         return jsc.JSStringCreateWithCharacters(&dummy, 0);
     }
+    if (s.len <= 256) {
+        var stack_buf: [256]jsc.JSChar = undefined;
+        const count = std.unicode.utf8ToUtf16Le(&stack_buf, s) catch return null;
+        return jsc.JSStringCreateWithCharacters(&stack_buf, count);
+    }
+    const utf16 = std.unicode.utf8ToUtf16LeAlloc(std.heap.c_allocator, s) catch return null;
+    defer std.heap.c_allocator.free(utf16);
     return jsc.JSStringCreateWithCharacters(utf16.ptr, utf16.len);
 }
 
@@ -203,4 +208,45 @@ pub fn liftSentinel(ctx_ref: jsc.JSContextRef, val: jsc.JSValueRef) jsc.JSValueR
 pub fn liftValue(ctx_ref: jsc.JSContextRef, val: jsc.JSValueRef) jsc.JSValueRef {
     if (val == null) return jsc.JSValueMakeUndefined(ctx_ref);
     return liftSentinel(ctx_ref, val);
+}
+
+test "jsStringFromSlice stack fast-path and embedded null roundtrip" {
+    // Empty string
+    const empty = jsStringFromSlice("");
+    try std.testing.expect(empty != null);
+    defer jsc.JSStringRelease(empty);
+    try std.testing.expectEqual(@as(usize, 0), jsc.JSStringGetLength(empty));
+
+    // Stack path with embedded null (<= 256 bytes)
+    const embedded_nul = "prefix\x00suffix";
+    const s_nul = jsStringFromSlice(embedded_nul);
+    try std.testing.expect(s_nul != null);
+    defer jsc.JSStringRelease(s_nul);
+    try std.testing.expectEqual(embedded_nul.len, jsc.JSStringGetLength(s_nul));
+    const roundtrip_nul = jsStringToOwnedAlloc(std.testing.allocator, s_nul);
+    try std.testing.expect(roundtrip_nul != null);
+    defer std.testing.allocator.free(roundtrip_nul.?);
+    try std.testing.expectEqualStrings(embedded_nul, roundtrip_nul.?);
+
+    // Stack path with UTF-8 multi-byte characters
+    const utf8_sample = "hello 🌍 world";
+    const s_utf8 = jsStringFromSlice(utf8_sample);
+    try std.testing.expect(s_utf8 != null);
+    defer jsc.JSStringRelease(s_utf8);
+    const roundtrip_utf8 = jsStringToOwnedAlloc(std.testing.allocator, s_utf8);
+    try std.testing.expect(roundtrip_utf8 != null);
+    defer std.testing.allocator.free(roundtrip_utf8.?);
+    try std.testing.expectEqualStrings(utf8_sample, roundtrip_utf8.?);
+
+    // Heap fallback path (> 256 bytes)
+    var large_buf: [300]u8 = undefined;
+    @memset(&large_buf, 'x');
+    const s_large = jsStringFromSlice(&large_buf);
+    try std.testing.expect(s_large != null);
+    defer jsc.JSStringRelease(s_large);
+    try std.testing.expectEqual(@as(usize, 300), jsc.JSStringGetLength(s_large));
+
+    // Invalid UTF-8 should safely return null
+    const invalid_utf8 = [_]u8{ 0xFF, 0xFE, 0xFD };
+    try std.testing.expect(jsStringFromSlice(&invalid_utf8) == null);
 }

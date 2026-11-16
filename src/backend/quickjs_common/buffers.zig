@@ -22,6 +22,7 @@ pub fn create(comptime c: type) type {
         ) callconv(.c) void;
 
         const QjsBufferBox = struct {
+            original_ptr: [*]u8,
             len: usize,
             user_finalizer: ?QjsBufferFinalizer,
             user_data: ?*anyopaque,
@@ -37,13 +38,11 @@ pub fn create(comptime c: type) type {
             if (size != 0) return null;
             const raw = opaque_ptr orelse return null;
             const box: *QjsBufferBox = @ptrCast(@alignCast(raw));
+            defer std.heap.c_allocator.destroy(box);
             if (box.user_finalizer) |fin| {
-                if (ptr) |p| {
-                    const byte_ptr: [*]u8 = @ptrCast(p);
-                    fin(box.user_data, byte_ptr, box.len);
-                }
+                const byte_ptr: [*]u8 = if (ptr) |p| @ptrCast(p) else box.original_ptr;
+                fin(box.user_data, byte_ptr, box.len);
             }
-            std.heap.c_allocator.destroy(box);
             return null;
         }
 
@@ -60,7 +59,12 @@ pub fn create(comptime c: type) type {
                 if (finalizer) |fin| fin(user_data, bytes, len);
                 return qjs.JS_ThrowOutOfMemory(ctx);
             };
-            box.* = .{ .len = len, .user_finalizer = finalizer, .user_data = user_data };
+            box.* = .{
+                .original_ptr = bytes,
+                .len = len,
+                .user_finalizer = finalizer,
+                .user_data = user_data,
+            };
             const val = c.JS_NewArrayBuffer(
                 ctx,
                 bytes,

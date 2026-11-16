@@ -182,6 +182,69 @@ pub fn postFence(instance_id: i32, generation: u64, seal_shutdown: bool, callbac
     return submit(submission, runFence);
 }
 
+const GcTask = struct {
+    instance_id: i32,
+};
+
+fn runGcTask(ctx: ?*anyopaque) void {
+    const raw = ctx orelse return;
+    const task: *GcTask = @ptrCast(@alignCast(raw));
+    defer std.heap.c_allocator.destroy(task);
+    if (instance_map.getInstance(task.instance_id)) |inst| {
+        inst.gc_pending.store(false, .release);
+    }
+    if (runtime_control.shutdownStatus(task.instance_id)) |shutdown| {
+        if (shutdown.phase == .cancelled) return;
+    }
+    _ = runtime_control.runGc(task.instance_id);
+}
+
+fn cancelGcTask(ctx: ?*anyopaque) void {
+    const raw = ctx orelse return;
+    const task: *GcTask = @ptrCast(@alignCast(raw));
+    defer std.heap.c_allocator.destroy(task);
+    if (instance_map.getInstance(task.instance_id)) |inst| {
+        inst.gc_pending.store(false, .release);
+    }
+}
+
+fn canAdmitGc(ctx: ?*anyopaque) bool {
+    const raw = ctx orelse return false;
+    const task: *GcTask = @ptrCast(@alignCast(raw));
+    return runtime_control.canSubmit(task.instance_id);
+}
+
+/// Generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests are debounced.
+pub fn postGc(instance_id: i32, generation: u64) bool {
+    const inst = instance_map.getInstance(instance_id) orelse return false;
+    if (inst.generation != generation) return false;
+    if (!runtime_control.canSubmit(instance_id)) return false;
+    if (inst.gc_pending.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
+        return true;
+    }
+    const task = std.heap.c_allocator.create(GcTask) catch {
+        inst.gc_pending.store(false, .release);
+        return false;
+    };
+    task.* = .{ .instance_id = instance_id };
+    const token: dispatch.InstanceToken = .{ .instance_id = instance_id, .generation = generation };
+    const accepted = dispatch.postTaskWithToken(token, .{
+        .ctx = @ptrCast(task),
+        .run = runGcTask,
+        .cancel = cancelGcTask,
+        .complete = null,
+        .completion_ctx = null,
+        .resource_kind = .script_task,
+        .resource_bytes = @sizeOf(GcTask),
+        .admission_check = canAdmitGc,
+    });
+    if (!accepted) {
+        inst.gc_pending.store(false, .release);
+        std.heap.c_allocator.destroy(task);
+    }
+    return accepted;
+}
+
 const testing = std.testing;
 
 const Probe = struct {

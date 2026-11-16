@@ -19,6 +19,7 @@ pub const JscBufferFinalizer = *const fn (
 ) callconv(.c) void;
 
 const JscBufferBox = struct {
+    original_ptr: [*]u8,
     len: usize,
     user_finalizer: ?JscBufferFinalizer,
     user_data: ?*anyopaque,
@@ -30,13 +31,11 @@ fn jscBufferDeallocatorTrampoline(
 ) callconv(.c) void {
     const raw = deallocator_ctx orelse return;
     const box: *JscBufferBox = @ptrCast(@alignCast(raw));
+    defer std.heap.c_allocator.destroy(box);
     if (box.user_finalizer) |fin| {
-        if (bytes) |b| {
-            const byte_ptr: [*]u8 = @ptrCast(b);
-            fin(box.user_data, byte_ptr, box.len);
-        }
+        const byte_ptr: [*]u8 = if (bytes) |b| @ptrCast(b) else box.original_ptr;
+        fin(box.user_data, byte_ptr, box.len);
     }
-    std.heap.c_allocator.destroy(box);
 }
 
 /// Wrap `bytes[0..len]` as an ArrayBuffer without copying. `finalizer`, if non-null, fires with `(user_data, bytes, len)` when the ArrayBuffer is collected (or immediately if JSC refuses the allocation). Returns null on failure. The returned object has been JSValueProtect'd.
@@ -51,7 +50,12 @@ pub fn jscNewArrayBufferFromBytes(
         if (finalizer) |fin| fin(user_data, bytes, len);
         return null;
     };
-    box.* = .{ .len = len, .user_finalizer = finalizer, .user_data = user_data };
+    box.* = .{
+        .original_ptr = bytes,
+        .len = len,
+        .user_finalizer = finalizer,
+        .user_data = user_data,
+    };
 
     var exc: jsc.JSValueRef = null;
     const result = jsc.JSObjectMakeArrayBufferWithBytesNoCopy(

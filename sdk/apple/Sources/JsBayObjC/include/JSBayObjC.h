@@ -207,6 +207,8 @@ typedef void (^JSBaySyncStarter)(JSBayValue *thisValue, NSArray<JSBayValue *> *a
 - (nullable JSBayValue *)stringValue:(NSString *)value error:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)arrayBufferValue:(NSData *)value
                                     error:(NSError *_Nullable *_Nullable)error;
+- (nullable JSBayValue *)arrayBufferValueNoCopy:(NSData *)value
+                                          error:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)objectValue:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)arrayValue:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)jsonValue:(NSString *)value error:(NSError *_Nullable *_Nullable)error;
@@ -243,6 +245,7 @@ typedef void (^JSBaySyncStarter)(JSBayValue *thisValue, NSArray<JSBayValue *> *a
 - (BOOL)postFenceSealingShutdown:(BOOL)sealShutdown
                       completion:(nullable JSBaySubmissionCompletion)completion
                            error:(NSError *_Nullable *_Nullable)error;
+- (BOOL)postGc:(NSError *_Nullable *_Nullable)error;
 - (BOOL)beginShutdownWithGraceMilliseconds:(uint64_t)milliseconds
                                      error:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayShutdownStatus *)shutdownStatus;

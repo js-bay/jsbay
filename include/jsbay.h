@@ -199,6 +199,8 @@ typedef void (*jsbay_submission_callback_t)(int instance_id, uint64_t generation
 bool jsbay_engine_post_script(int instance_id, uint64_t generation, jsbay_utf8_t source, jsbay_utf8_t filename, jsbay_submission_callback_t callback, void *user_data);
 /* A fence has no JS body and completes after every preceding submission checkpoint. seal_shutdown seals only after the fence was admitted; its completion changes a sealed shutdown to drained, or reports cancelled when the deadline has expired. */
 bool jsbay_engine_post_fence(int instance_id, uint64_t generation, bool seal_shutdown, jsbay_submission_callback_t callback, void *user_data);
+/* Thread-safe generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests queued before the turn runs are debounced. Returns false if the instance is missing or already closing/cancelled. */
+bool jsbay_engine_post_gc(int instance_id, uint64_t generation);
 
 typedef enum {
     JSBAY_SHUTDOWN_OPEN = 0,
@@ -304,7 +306,10 @@ jsbay_status_t jsbay_value_null(int instance_id, jsbay_value_t *out_value);
 jsbay_status_t jsbay_value_new_bool(int instance_id, bool input, jsbay_value_t *out_value);
 jsbay_status_t jsbay_value_new_number(int instance_id, double input, jsbay_value_t *out_value);
 jsbay_status_t jsbay_value_new_string(int instance_id, jsbay_utf8_t input, jsbay_value_t *out_value);
+typedef void (*jsbay_bytes_deallocator_t)(void *user_data, void *bytes, size_t len);
 jsbay_status_t jsbay_value_new_array_buffer(int instance_id, const uint8_t *data, size_t len, jsbay_value_t *out_value);
+/* Wrap caller-owned bytes as an ArrayBuffer without copying. If deallocator is non-NULL, it is guaranteed to be invoked exactly once: either when the ArrayBuffer is collected, or immediately during this call if instance is invalid, wrong thread, out of memory, or arguments are invalid. bytes must not be NULL when len > 0. When len == 0, deallocator (if non-NULL) fires immediately and an empty ArrayBuffer is returned. Owner thread only. */
+jsbay_status_t jsbay_value_new_array_buffer_no_copy(int instance_id, void *bytes, size_t len, jsbay_bytes_deallocator_t deallocator, void *user_data, jsbay_value_t *out_value);
 jsbay_status_t jsbay_value_new_json(int instance_id, jsbay_utf8_t input, jsbay_value_t *out_value, jsbay_value_t *out_exception);
 jsbay_status_t jsbay_value_new_error(int instance_id, jsbay_utf8_t message, jsbay_value_t *out_value);
 jsbay_status_t jsbay_value_new_object(int instance_id, jsbay_value_t *out_value);

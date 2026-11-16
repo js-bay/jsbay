@@ -174,6 +174,17 @@ int jsbay_objc_sdk_probe(void) {
               @"binary copy-out isolation");
         Check([[[engine arrayBufferValue:[NSData data] error:&error] dataValue:&error] length] == 0,
               @"empty buffer mismatch");
+        NSData *immutableData = [NSData dataWithBytes:inputBytes length:sizeof(inputBytes)];
+        JSBayValue *noCopyBuffer = [engine arrayBufferValueNoCopy:immutableData error:&error];
+        Check([[noCopyBuffer dataValue:&error] isEqualToData:expectedBytes],
+              @"no-copy buffer payload mismatch");
+        Check([[[engine arrayBufferValueNoCopy:[NSData data]
+                                         error:&error] dataValue:&error] length] == 0,
+              @"empty no-copy buffer mismatch");
+        NSError *mutError = nil;
+        JSBayValue *mutRejected = [engine arrayBufferValueNoCopy:input error:&mutError];
+        Check(mutRejected == nil && mutError.code == JSBayErrorInvalidArgument,
+              @"mutable data rejection");
         JSBayValue *view = [engine evaluate:@"new Uint8Array([8,9,0,255,7]).subarray(2,4)"
                                    filename:@"view.js"
                                       cache:nil
@@ -581,10 +592,28 @@ int jsbay_objc_sdk_probe(void) {
                                 }
                                      error:&error],
               error.localizedDescription);
+        dispatch_semaphore_t bgSignal = dispatch_semaphore_create(0);
+        __block BOOL bgSubmitted = NO;
+        __block BOOL bgPostGcOk = NO;
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSError *bgError = nil;
+            bgSubmitted =
+                [submission postScript:@"globalThis.__objcBgSubmission = 100"
+                              filename:@"submission-bg.js"
+                            completion:^(JSBaySubmissionStatus status, NSData *errorData) {
+                                (void)errorData;
+                                [submissionOutcomes addObject:@(status)];
+                            }
+                                 error:&bgError];
+            bgPostGcOk = [submission postGc:&bgError];
+            dispatch_semaphore_signal(bgSignal);
+        });
+        dispatch_semaphore_wait(bgSignal, DISPATCH_TIME_FOREVER);
+        Check(bgSubmitted && bgPostGcOk, @"Objective-C background postScript/postGc");
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
         Check([submissionOutcomes isEqualToArray:@[
                   @(JSBaySubmissionStatusCompleted), @(JSBaySubmissionStatusException),
-                  @(JSBaySubmissionStatusCompleted)
+                  @(JSBaySubmissionStatusCompleted), @(JSBaySubmissionStatusCompleted)
               ]],
               @"Objective-C FIFO submission outcomes");
         double submissionValue = 0;
