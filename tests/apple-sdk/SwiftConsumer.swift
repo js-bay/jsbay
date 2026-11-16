@@ -49,12 +49,13 @@ struct SwiftConsumer {
       fatalError("buffer copy-out isolation")
     }
     guard try engine.arrayBuffer(Data()).bytes().isEmpty else { fatalError("empty buffer") }
-    let noCopyInput = Data([7, 8, 9, 10])
+    let noCopyBytes: [UInt8] = [7, 8, 9, 10]
+    let noCopyInput = NSMutableData(bytes: noCopyBytes, length: noCopyBytes.count)
     let noCopyBuf = try engine.arrayBufferNoCopy(noCopyInput)
     guard try noCopyBuf.bytes() == Data([7, 8, 9, 10]) else {
       fatalError("no-copy buffer payload mismatch")
     }
-    guard try engine.arrayBufferNoCopy(Data()).bytes().isEmpty else {
+    guard try engine.arrayBufferNoCopy(NSMutableData()).bytes().isEmpty else {
       fatalError("empty no-copy buffer")
     }
     guard

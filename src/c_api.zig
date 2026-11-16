@@ -1721,7 +1721,8 @@ pub export fn jsbay_engine_run_gc(instance_id: c_int) bool {
 /// Generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests are debounced.
 pub export fn jsbay_engine_post_gc(instance_id: c_int, generation: u64) bool {
     const id: i32 = @intCast(instance_id);
-    return submission.postGc(id, generation);
+    _ = submission.postGc(id, generation) catch return false;
+    return true;
 }
 
 const engine_events = @import("runtime/engine_events.zig");
@@ -2302,12 +2303,19 @@ pub export fn jsbay_value_new_array_buffer_no_copy(
         .ok => |ok| ok,
     };
     defer op.deinit();
+    const reserved = api_value.reserveHandle() orelse {
+        if (deallocator) |dealloc| dealloc(user_data, data, len);
+        return API_OUT_OF_MEMORY;
+    };
     const byte_ptr: [*]u8 = @ptrCast(data.?);
     const fin: ?value_buffers.BufferFinalizer = if (deallocator) |d| @ptrCast(d) else null;
     const maybe_val = value_buffers.newArrayBufferFromBytes(id, byte_ptr, len, fin, user_data);
     if (maybe_val) |val| {
-        return apiStore(id, val, out_value);
+        reserved.commit(id, val);
+        out_value.* = reserved.handle;
+        return API_OK;
     } else {
+        reserved.cancel();
         return API_OUT_OF_MEMORY;
     }
 }

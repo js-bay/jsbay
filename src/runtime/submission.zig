@@ -183,13 +183,14 @@ pub fn postFence(instance_id: i32, generation: u64, seal_shutdown: bool, callbac
 }
 
 const GcTask = struct {
+    allocator: std.mem.Allocator,
     instance_id: i32,
 };
 
 fn runGcTask(ctx: ?*anyopaque) void {
     const raw = ctx orelse return;
     const task: *GcTask = @ptrCast(@alignCast(raw));
-    defer std.heap.c_allocator.destroy(task);
+    defer task.allocator.destroy(task);
     if (instance_map.getInstance(task.instance_id)) |inst| {
         inst.gc_pending.store(false, .release);
     }
@@ -202,7 +203,7 @@ fn runGcTask(ctx: ?*anyopaque) void {
 fn cancelGcTask(ctx: ?*anyopaque) void {
     const raw = ctx orelse return;
     const task: *GcTask = @ptrCast(@alignCast(raw));
-    defer std.heap.c_allocator.destroy(task);
+    defer task.allocator.destroy(task);
     if (instance_map.getInstance(task.instance_id)) |inst| {
         inst.gc_pending.store(false, .release);
     }
@@ -214,19 +215,28 @@ fn canAdmitGc(ctx: ?*anyopaque) bool {
     return runtime_control.canSubmit(task.instance_id);
 }
 
-/// Generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests are debounced.
-pub fn postGc(instance_id: i32, generation: u64) bool {
-    const inst = instance_map.getInstance(instance_id) orelse return false;
-    if (inst.generation != generation) return false;
-    if (!runtime_control.canSubmit(instance_id)) return false;
-    if (inst.gc_pending.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
-        return true;
-    }
-    const task = std.heap.c_allocator.create(GcTask) catch {
-        inst.gc_pending.store(false, .release);
+pub const PostGcError = error{
+    InstanceNotFound,
+    StaleGeneration,
+    ShutdownInProgress,
+    OutOfMemory,
+    QueueRejected,
+};
+
+/// Generation-scoped asynchronous GC request posted to the engine event loop with an explicit allocator. Redundant requests are debounced.
+pub fn postGcWithAllocator(allocator: std.mem.Allocator, instance_id: i32, generation: u64) PostGcError!bool {
+    const lease = instance_map.beginControlPlane(instance_id) orelse return error.InstanceNotFound;
+    defer lease.end();
+    if (lease.inst.generation != generation) return error.StaleGeneration;
+    if (!runtime_control.canSubmit(instance_id)) return error.ShutdownInProgress;
+    if (lease.inst.gc_pending.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
         return false;
+    }
+    const task = allocator.create(GcTask) catch {
+        lease.inst.gc_pending.store(false, .release);
+        return error.OutOfMemory;
     };
-    task.* = .{ .instance_id = instance_id };
+    task.* = .{ .allocator = allocator, .instance_id = instance_id };
     const token: dispatch.InstanceToken = .{ .instance_id = instance_id, .generation = generation };
     const accepted = dispatch.postTaskWithToken(token, .{
         .ctx = @ptrCast(task),
@@ -239,10 +249,16 @@ pub fn postGc(instance_id: i32, generation: u64) bool {
         .admission_check = canAdmitGc,
     });
     if (!accepted) {
-        inst.gc_pending.store(false, .release);
-        std.heap.c_allocator.destroy(task);
+        lease.inst.gc_pending.store(false, .release);
+        allocator.destroy(task);
+        return error.QueueRejected;
     }
-    return accepted;
+    return true;
+}
+
+/// Generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests are debounced.
+pub fn postGc(instance_id: i32, generation: u64) PostGcError!bool {
+    return postGcWithAllocator(std.heap.c_allocator, instance_id, generation);
 }
 
 const testing = std.testing;

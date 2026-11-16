@@ -207,7 +207,7 @@ typedef void (^JSBaySyncStarter)(JSBayValue *thisValue, NSArray<JSBayValue *> *a
 - (nullable JSBayValue *)stringValue:(NSString *)value error:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)arrayBufferValue:(NSData *)value
                                     error:(NSError *_Nullable *_Nullable)error;
-- (nullable JSBayValue *)arrayBufferValueNoCopy:(NSData *)value
+- (nullable JSBayValue *)arrayBufferValueNoCopy:(NSMutableData *)value
                                           error:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)objectValue:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)arrayValue:(NSError *_Nullable *_Nullable)error;

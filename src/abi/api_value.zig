@@ -100,6 +100,31 @@ pub fn putOwned(instance_id: i32, value: ActiveEngine.Value) ?u64 {
     return handle;
 }
 
+pub const ReservedHandle = struct {
+    handle: u64,
+
+    pub fn commit(self: ReservedHandle, instance_id: i32, value: ActiveEngine.Value) void {
+        mutex.lock();
+        defer mutex.unlock();
+        values.putAssumeCapacity(self.handle, .{ .instance_id = instance_id, .value = value });
+    }
+
+    pub fn cancel(self: ReservedHandle) void {
+        _ = self;
+    }
+};
+
+/// Reserve a handle and publication capacity in advance so publishing can never fail with out-of-memory.
+pub fn reserveHandle() ?ReservedHandle {
+    mutex.lock();
+    defer mutex.unlock();
+    if (next_handle == 0 or next_handle > std.math.maxInt(i64)) return null;
+    values.ensureUnusedCapacity(1) catch return null;
+    const handle = next_handle;
+    next_handle += 1;
+    return .{ .handle = handle };
+}
+
 /// Publish a callback-local view without acquiring a backend reference.  The trampoline revokes it before returning to JavaScript; callers can retain it to obtain an ordinary owned handle.
 pub fn putBorrowed(instance_id: i32, value: ActiveEngine.Value) ?u64 {
     mutex.lock();

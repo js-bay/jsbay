@@ -678,9 +678,11 @@ public final class Engine {
     self.loopBinding = nil
     Engine.liveLock.unlock()
 
-    if let binding {
-      Unmanaged<LoopBinding>.fromOpaque(binding).takeUnretainedValue().shutdown()
-      Unmanaged<LoopBinding>.fromOpaque(binding).release()
+    defer {
+      if let binding {
+        Unmanaged<LoopBinding>.fromOpaque(binding).takeUnretainedValue().shutdown()
+        Unmanaged<LoopBinding>.fromOpaque(binding).release()
+      }
     }
     try requireOK(jsbay_engine_detach_loop(id))
     jsbay_engine_destroy(id)
@@ -735,19 +737,18 @@ public final class Engine {
       }
     }
   }
-  public func arrayBufferNoCopy(_ input: Data) throws -> Value {
+  public func arrayBufferNoCopy(_ input: NSMutableData) throws -> Value {
     try requireOpen()
-    guard !input.isEmpty else { return try arrayBuffer(input) }
-    let nsData = input as NSData
-    let retained = Unmanaged.passRetained(nsData).toOpaque()
+    guard input.length > 0 else { return try arrayBuffer(Data()) }
+    let retained = Unmanaged.passRetained(input).toOpaque()
     var out: UInt64 = 0
     let status = jsbay_value_new_array_buffer_no_copy(
       id,
-      UnsafeMutableRawPointer(mutating: nsData.bytes),
-      nsData.length,
+      input.mutableBytes,
+      input.length,
       { userData, _, _ in
         guard let userData else { return }
-        Unmanaged<NSData>.fromOpaque(userData).release()
+        Unmanaged<NSMutableData>.fromOpaque(userData).release()
       },
       retained,
       &out

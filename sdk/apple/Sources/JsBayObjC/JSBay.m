@@ -1093,11 +1093,11 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
     _loopUserData = NULL;
     [lock unlock];
 
+    jsbay_status_t status = jsbay_engine_detach_loop(_identifier);
     if (loopUser) {
         [(__bridge JSBayLoopBinding *)loopUser shutdown];
         CFBridgingRelease(loopUser);
     }
-    jsbay_status_t status = jsbay_engine_detach_loop(_identifier);
     jsbay_engine_destroy(_identifier);
     if (status != JSBAY_OK) {
         if (error)
@@ -1263,10 +1263,10 @@ static void JSBayArrayBufferDeallocator(void *userData, void *bytes, size_t len)
     if (userData)
         CFBridgingRelease(userData);
 }
-- (JSBayValue *)arrayBufferValueNoCopy:(NSData *)input error:(NSError **)error {
+- (JSBayValue *)arrayBufferValueNoCopy:(NSMutableData *)input error:(NSError **)error {
     if (![self requireOpen:error])
         return nil;
-    if (!input || [input isKindOfClass:[NSMutableData class]]) {
+    if (!input || ![input isKindOfClass:[NSMutableData class]]) {
         if (error)
             *error = JSBayStatusError(JSBAY_INVALID_ARGUMENT);
         return nil;
@@ -1276,7 +1276,7 @@ static void JSBayArrayBufferDeallocator(void *userData, void *bytes, size_t len)
     void *user = (void *)CFBridgingRetain(input);
     uint64_t value = 0;
     jsbay_status_t status = jsbay_value_new_array_buffer_no_copy(
-        _identifier, (void *)input.bytes, input.length, JSBayArrayBufferDeallocator, user, &value);
+        _identifier, input.mutableBytes, input.length, JSBayArrayBufferDeallocator, user, &value);
     if (status == JSBAY_OK)
         return [self ownedValue:value];
     if (error)

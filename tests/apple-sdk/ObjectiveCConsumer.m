@@ -174,17 +174,21 @@ int jsbay_objc_sdk_probe(void) {
               @"binary copy-out isolation");
         Check([[[engine arrayBufferValue:[NSData data] error:&error] dataValue:&error] length] == 0,
               @"empty buffer mismatch");
-        NSData *immutableData = [NSData dataWithBytes:inputBytes length:sizeof(inputBytes)];
-        JSBayValue *noCopyBuffer = [engine arrayBufferValueNoCopy:immutableData error:&error];
+        NSMutableData *mutableNoCopy = [NSMutableData dataWithBytes:inputBytes
+                                                             length:sizeof(inputBytes)];
+        JSBayValue *noCopyBuffer = [engine arrayBufferValueNoCopy:mutableNoCopy error:&error];
         Check([[noCopyBuffer dataValue:&error] isEqualToData:expectedBytes],
               @"no-copy buffer payload mismatch");
-        Check([[[engine arrayBufferValueNoCopy:[NSData data]
+        Check([[[engine arrayBufferValueNoCopy:[NSMutableData data]
                                          error:&error] dataValue:&error] length] == 0,
               @"empty no-copy buffer mismatch");
-        NSError *mutError = nil;
-        JSBayValue *mutRejected = [engine arrayBufferValueNoCopy:input error:&mutError];
-        Check(mutRejected == nil && mutError.code == JSBayErrorInvalidArgument,
-              @"mutable data rejection");
+        NSError *immutError = nil;
+        JSBayValue *immutRejected = [engine
+            arrayBufferValueNoCopy:(NSMutableData *)[NSData dataWithBytes:inputBytes
+                                                                   length:sizeof(inputBytes)]
+                             error:&immutError];
+        Check(immutRejected == nil && immutError.code == JSBayErrorInvalidArgument,
+              @"immutable data rejection");
         JSBayValue *view = [engine evaluate:@"new Uint8Array([8,9,0,255,7]).subarray(2,4)"
                                    filename:@"view.js"
                                       cache:nil
