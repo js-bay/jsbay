@@ -608,7 +608,7 @@ test "state_tcas tla: dynamic action coverage across replay traces" {
     const stats1 = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace1_bytes, &pic);
     const stats2 = try state_tcas.tla.replayJsonTrace(SchedulerAct, &ctx, allocator, trace2_bytes, &pic);
 
-    // Verify dynamic coverage of all 9 actions directly via Picture and ReplayStats (state_tcas 0.3.1).
+    // Verify dynamic coverage of all 9 actions directly via Picture and ReplayStats.
     try pic.verifyCoverage(SchedulerAct);
     try stats2.verifyCoverage(SchedulerAct, &pic);
 
