@@ -6,8 +6,7 @@ public enum DedicatedEngineThreadError: Error {
   case javascript(JsExceptionDetails)
 }
 
-/// Marks data-only results that can safely leave a dedicated Engine thread.
-/// Custom conformances promise that the value contains no live Engine or Value handles.
+/// Marks data-only results that can safely leave a dedicated Engine thread. Custom conformances promise that the value contains no live Engine or Value handles.
 public protocol EngineThreadResult: Sendable {}
 
 extension Bool: EngineThreadResult {}
@@ -199,8 +198,7 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
     }
   }
 
-  /// Stops accepting work, runs previously queued tasks, closes the Engine, and stops its run loop.
-  /// Calling close from an owner-thread task schedules shutdown after work already in the queue and returns immediately.
+  /// Stops accepting work, runs previously queued tasks, closes the Engine, and stops its run loop. Calling close from an owner-thread task schedules shutdown after work already in the queue and returns immediately.
   func close() throws {
     lock.lock()
     switch state {

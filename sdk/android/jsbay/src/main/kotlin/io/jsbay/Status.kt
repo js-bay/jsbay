@@ -66,7 +66,7 @@ class JsBayException
             return if (stack.substringBefore('\n').contains(details.message)) {
                 stack
             } else {
-                "${details.message}\n$stack"
+                details.message + "\n" + stack
             }
         }
 
