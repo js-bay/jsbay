@@ -1721,7 +1721,14 @@ pub export fn jsbay_engine_run_gc(instance_id: c_int) bool {
 /// Generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests are debounced.
 pub export fn jsbay_engine_post_gc(instance_id: c_int, generation: u64) bool {
     const id: i32 = @intCast(instance_id);
-    _ = submission.postGc(id, generation) catch return false;
+    _ = submission.postGc(id, generation) catch |err| switch (err) {
+        error.InstanceNotFound,
+        error.StaleGeneration,
+        error.ShutdownInProgress,
+        error.OutOfMemory,
+        error.QueueRejected,
+        => return false,
+    };
     return true;
 }
 
