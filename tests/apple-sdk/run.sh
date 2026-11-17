@@ -46,7 +46,7 @@ xcrun --sdk "$PLATFORM" swiftc "${SWIFT_FLAGS[@]}" -emit-library -static -emit-m
 if [ "$PLATFORM" = macosx ]; then
     xcrun --sdk "$PLATFORM" swiftc "${SWIFT_FLAGS[@]}" "${BACKEND_FLAGS[@]}" -parse-as-library \
         -I"$OUTPUT" "$ROOT/tests/apple-sdk/SwiftConsumer.swift" "$OUTPUT/libJsBaySDK.a" "$ARCHIVE" \
-        -framework JavaScriptCore -Xlinker -lm -o "$OUTPUT/swift-consumer"
+        -framework Foundation -framework JavaScriptCore -Xlinker -lm -o "$OUTPUT/swift-consumer"
     "$OUTPUT/swift-consumer"
     xcrun --sdk "$PLATFORM" clang "${CLANG_FLAGS[@]}" "${BACKEND_FLAGS[@]}" \
         "$ROOT/sdk/apple/Sources/JsBayObjC/JSBay.m" "$ROOT/tests/apple-sdk/ObjectiveCConsumer.m" \

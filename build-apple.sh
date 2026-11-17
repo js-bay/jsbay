@@ -170,15 +170,15 @@ link_consumer_probes() {
     mkdir -p "$probe_dir"
 
     xcrun --sdk macosx clang -arch arm64 -isysroot "$MACOS_SDK" -I"$(dirname "$mac_archive")/Headers" \
-        "$CONSUMER_PROBE" "$mac_archive" -lm -framework JavaScriptCore -o "$probe_dir/macos-consumer"
+        "$CONSUMER_PROBE" "$mac_archive" -lm -framework Foundation -framework JavaScriptCore -o "$probe_dir/macos-consumer"
     "$probe_dir/macos-consumer"
 
     xcrun --sdk iphoneos clang -target arm64-apple-ios13.0 -isysroot "$IOS_SDK" -I"$(dirname "$ios_archive")/Headers" \
-        "$CONSUMER_PROBE" "$ios_archive" -lm -framework JavaScriptCore -o "$probe_dir/ios-device-consumer"
+        "$CONSUMER_PROBE" "$ios_archive" -lm -framework Foundation -framework JavaScriptCore -o "$probe_dir/ios-device-consumer"
 
     xcrun --sdk iphonesimulator clang -target x86_64-apple-ios13.0-simulator -isysroot "$IOS_SIM_SDK" \
         -I"$(dirname "$sim_archive")/Headers" "$CONSUMER_PROBE" "$sim_archive" \
-        -lm -framework JavaScriptCore -o "$probe_dir/ios-simulator-x86_64-consumer"
+        -lm -framework Foundation -framework JavaScriptCore -o "$probe_dir/ios-simulator-x86_64-consumer"
 
     local app="$probe_dir/JsBayAppleConsumer.app"
 

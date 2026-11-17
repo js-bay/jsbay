@@ -233,7 +233,10 @@ function invoke<T>(operation: () => T): T {
   try {
     return operation();
   } catch (cause) {
-    if (cause instanceof JsException || cause instanceof JsBayStatusError) {
+    if (cause instanceof JsException) {
+      throw cause;
+    }
+    if (cause instanceof JsBayStatusError) {
       throw cause;
     }
     const raw = (cause as NativeThrown).value;
