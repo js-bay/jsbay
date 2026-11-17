@@ -53,3 +53,4 @@ vendor/icu-android-build-x86_64/
 vendor/icu-android-prefix-x86_64/
 vendor/icu-host-build-for-android/
 vendor/icu-src/
+build-harmony/
