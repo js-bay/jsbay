@@ -174,6 +174,61 @@ int jsbay_objc_sdk_probe(void) {
               @"binary copy-out isolation");
         Check([[[engine arrayBufferValue:[NSData data] error:&error] dataValue:&error] length] == 0,
               @"empty buffer mismatch");
+        NSData *noCopyData = [NSData dataWithBytes:inputBytes length:sizeof(inputBytes)];
+        JSBayValue *noCopyBuffer = [engine arrayBufferValueNoCopy:noCopyData error:&error];
+        Check([[noCopyBuffer dataValue:&error] isEqualToData:expectedBytes],
+              @"no-copy buffer payload mismatch");
+        Check([[[engine arrayBufferValueNoCopy:[NSData data]
+                                         error:&error] dataValue:&error] length] == 0,
+              @"empty no-copy buffer mismatch");
+        uint8_t *rawBytes = malloc(4);
+        rawBytes[0] = 7;
+        rawBytes[1] = 8;
+        rawBytes[2] = 9;
+        rawBytes[3] = 10;
+        __block BOOL rawFreed = NO;
+        JSBayValue *rawNoCopy =
+            [engine arrayBufferValueWithBytesNoCopy:rawBytes
+                                             length:4
+                                        deallocator:^(void *_Nullable b, NSUInteger l) {
+                                            (void)l;
+                                            if (b)
+                                                free(b);
+                                            rawFreed = YES;
+                                        }
+                                              error:&error];
+        uint8_t expectedRaw[] = {7, 8, 9, 10};
+        Check([[rawNoCopy dataValue:&error] isEqualToData:[NSData dataWithBytes:expectedRaw
+                                                                         length:4]],
+              @"raw bytes no-copy mismatch");
+        (void)rawFreed;
+        __block BOOL zeroFreed = NO;
+        void *zeroPtr = malloc(1);
+        JSBayValue *zeroNoCopy =
+            [engine arrayBufferValueWithBytesNoCopy:zeroPtr
+                                             length:0
+                                        deallocator:^(void *_Nullable b, NSUInteger l) {
+                                            (void)l;
+                                            if (b)
+                                                free(b);
+                                            zeroFreed = YES;
+                                        }
+                                              error:&error];
+        Check(zeroNoCopy != nil && zeroFreed && [[zeroNoCopy dataValue:&error] length] == 0,
+              @"zero length raw bytes no-copy deallocation");
+        __block BOOL nullFreed = NO;
+        NSError *nullError = nil;
+        JSBayValue *nullNoCopy =
+            [engine arrayBufferValueWithBytesNoCopy:NULL
+                                             length:5
+                                        deallocator:^(void *_Nullable b, NSUInteger l) {
+                                            (void)b;
+                                            (void)l;
+                                            nullFreed = YES;
+                                        }
+                                              error:&nullError];
+        Check(nullNoCopy == nil && nullFreed && nullError.code == JSBayErrorInvalidArgument,
+              @"null bytes raw no-copy deallocation");
         JSBayValue *view = [engine evaluate:@"new Uint8Array([8,9,0,255,7]).subarray(2,4)"
                                    filename:@"view.js"
                                       cache:nil
@@ -581,10 +636,28 @@ int jsbay_objc_sdk_probe(void) {
                                 }
                                      error:&error],
               error.localizedDescription);
+        dispatch_semaphore_t bgSignal = dispatch_semaphore_create(0);
+        __block BOOL bgSubmitted = NO;
+        __block BOOL bgPostGcOk = NO;
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSError *bgError = nil;
+            bgSubmitted =
+                [submission postScript:@"globalThis.__objcBgSubmission = 100"
+                              filename:@"submission-bg.js"
+                            completion:^(JSBaySubmissionStatus status, NSData *errorData) {
+                                (void)errorData;
+                                [submissionOutcomes addObject:@(status)];
+                            }
+                                 error:&bgError];
+            bgPostGcOk = [submission postGc:&bgError];
+            dispatch_semaphore_signal(bgSignal);
+        });
+        dispatch_semaphore_wait(bgSignal, DISPATCH_TIME_FOREVER);
+        Check(bgSubmitted && bgPostGcOk, @"Objective-C background postScript/postGc");
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
         Check([submissionOutcomes isEqualToArray:@[
                   @(JSBaySubmissionStatusCompleted), @(JSBaySubmissionStatusException),
-                  @(JSBaySubmissionStatusCompleted)
+                  @(JSBaySubmissionStatusCompleted), @(JSBaySubmissionStatusCompleted)
               ]],
               @"Objective-C FIFO submission outcomes");
         double submissionValue = 0;

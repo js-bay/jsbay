@@ -25,6 +25,8 @@ const js_scheduler = @import("../runtime/js_scheduler.zig");
 const helpers = @import("test_helpers.zig");
 const value = @import("../value/root.zig");
 const sync = @import("zev");
+const submission = @import("../runtime/submission.zig");
+const instance_map = @import("../runtime/instance_map.zig");
 
 // ─── Shared JS-side recorder (native callback; does not drain microtasks) ────
 
@@ -806,4 +808,280 @@ test "state_tcas engine: rebuild cost split create vs replay" {
     try testing.expect(avg_boot > 0);
     try testing.expect(avg_full > 0);
     try testing.expectEqual(script.len, log_len);
+}
+
+test "state_tcas engine: asynchronous GC debouncing and lifecycle (Safety+Liveness)" {
+    const GcLifecycleProbe = struct {
+        id: i32,
+        saw_starvation: bool = false,
+        saw_leak: bool = false,
+
+        fn safetyOk(ctx: *@This()) !void {
+            if (ctx.saw_starvation or ctx.saw_leak) return error.SafetyViolation;
+        }
+
+        fn isEnabled(ctx: *@This()) bool {
+            const inst = instance_map.getInstance(ctx.id) orelse return false;
+            return inst.gc_state.load(.acquire) != .idle;
+        }
+
+        fn isGoal(ctx: *@This()) bool {
+            const inst = instance_map.getInstance(ctx.id) orelse return false;
+            return inst.gc_state.load(.acquire) == .idle;
+        }
+    };
+
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            var probe = GcLifecycleProbe{ .id = id };
+            var saf = state_tcas.monitor.Safety(*GcLifecycleProbe){ .ctx = &probe, .checkFn = GcLifecycleProbe.safetyOk };
+            var liv = state_tcas.monitor.Liveness(*GcLifecycleProbe){
+                .ctx = &probe,
+                .enabledFn = GcLifecycleProbe.isEnabled,
+                .goalFn = GcLifecycleProbe.isGoal,
+            };
+
+            const token = dispatch.captureInstanceToken(id) orelse return error.NoToken;
+            const inst = instance_map.getInstance(id) orelse return error.NoInstance;
+
+            try testing.expectEqual(instance_map.GcSubmissionState.idle, inst.gc_state.load(.acquire));
+            try saf.observe();
+
+            const first = try submission.postGcWithAllocator(testing.allocator, id, token.generation);
+            try testing.expect(first);
+            try testing.expectEqual(instance_map.GcSubmissionState.queued, inst.gc_state.load(.acquire));
+            try saf.observe();
+            liv.note();
+
+            const second = try submission.postGcWithAllocator(testing.allocator, id, token.generation);
+            try testing.expect(!second);
+            try testing.expectEqual(instance_map.GcSubmissionState.queued, inst.gc_state.load(.acquire));
+            try saf.observe();
+
+            _ = dispatch.tickInstance(id);
+
+            if (inst.gc_state.load(.acquire) != .idle) {
+                probe.saw_starvation = true;
+            }
+            try saf.observe();
+            liv.note();
+            try liv.finish();
+
+            const third = try submission.postGcWithAllocator(testing.allocator, id, token.generation);
+            try testing.expect(third);
+            try testing.expectEqual(instance_map.GcSubmissionState.queued, inst.gc_state.load(.acquire));
+            _ = dispatch.tickInstance(id);
+            try testing.expectEqual(instance_map.GcSubmissionState.idle, inst.gc_state.load(.acquire));
+        }
+    }.run);
+}
+
+test "state_tcas engine: DFS explores concurrent GC submission state machine with Safety" {
+    const GcAct = enum {
+        t1_start,
+        t1_coalesce,
+        t1_admit,
+        t1_fail,
+        t2_start,
+        t2_coalesce,
+        t2_admit,
+        t2_fail,
+        host_drain,
+    };
+
+    const ThreadPhase = enum {
+        idle,
+        submitting,
+        coalesced,
+        submitted,
+        failed,
+    };
+
+    const GcSnapshot = struct {
+        gc_state: instance_map.GcSubmissionState,
+        queue_len: usize,
+        t1: ThreadPhase,
+        t2: ThreadPhase,
+        host_drained: bool,
+    };
+
+    const GcExploreModel = struct {
+        gc_state: instance_map.GcSubmissionState = .idle,
+        queue_len: usize = 0,
+        t1: ThreadPhase = .idle,
+        t2: ThreadPhase = .idle,
+        host_drained: bool = false,
+        stack: [64]GcSnapshot = undefined,
+        sp: usize = 0,
+
+        fn snapshot(self: *const @This()) GcSnapshot {
+            return .{
+                .gc_state = self.gc_state,
+                .queue_len = self.queue_len,
+                .t1 = self.t1,
+                .t2 = self.t2,
+                .host_drained = self.host_drained,
+            };
+        }
+
+        fn restore(self: *@This(), s: GcSnapshot) void {
+            self.gc_state = s.gc_state;
+            self.queue_len = s.queue_len;
+            self.t1 = s.t1;
+            self.t2 = s.t2;
+            self.host_drained = s.host_drained;
+        }
+
+        pub fn fillEnabled(self: *const @This(), out: *[9]GcAct) usize {
+            var n: usize = 0;
+            if (self.t1 == .idle) {
+                if (self.gc_state == .idle) {
+                    out[n] = .t1_start;
+                    n += 1;
+                } else if (self.gc_state == .queued) {
+                    out[n] = .t1_coalesce;
+                    n += 1;
+                }
+            } else if (self.t1 == .submitting) {
+                out[n] = .t1_admit;
+                n += 1;
+                out[n] = .t1_fail;
+                n += 1;
+            }
+
+            if (self.t2 == .idle) {
+                if (self.gc_state == .idle) {
+                    out[n] = .t2_start;
+                    n += 1;
+                } else if (self.gc_state == .queued) {
+                    out[n] = .t2_coalesce;
+                    n += 1;
+                }
+            } else if (self.t2 == .submitting) {
+                out[n] = .t2_admit;
+                n += 1;
+                out[n] = .t2_fail;
+                n += 1;
+            }
+
+            if (self.queue_len > 0) {
+                out[n] = .host_drain;
+                n += 1;
+            }
+            return n;
+        }
+
+        pub fn step(self: *@This(), act: GcAct) !void {
+            self.stack[self.sp] = self.snapshot();
+            self.sp += 1;
+            switch (act) {
+                .t1_start => {
+                    self.gc_state = .submitting;
+                    self.t1 = .submitting;
+                },
+                .t1_coalesce => {
+                    self.t1 = .coalesced;
+                },
+                .t1_admit => {
+                    self.queue_len += 1;
+                    self.gc_state = .queued;
+                    self.t1 = .submitted;
+                },
+                .t1_fail => {
+                    self.gc_state = .idle;
+                    self.t1 = .failed;
+                },
+                .t2_start => {
+                    self.gc_state = .submitting;
+                    self.t2 = .submitting;
+                },
+                .t2_coalesce => {
+                    self.t2 = .coalesced;
+                },
+                .t2_admit => {
+                    self.queue_len += 1;
+                    self.gc_state = .queued;
+                    self.t2 = .submitted;
+                },
+                .t2_fail => {
+                    self.gc_state = .idle;
+                    self.t2 = .failed;
+                },
+                .host_drain => {
+                    self.queue_len -= 1;
+                    self.gc_state = .idle;
+                    self.host_drained = true;
+                },
+            }
+        }
+
+        pub fn undo(self: *@This(), act: GcAct) void {
+            _ = act;
+            self.sp -= 1;
+            self.restore(self.stack[self.sp]);
+        }
+
+        pub fn safetyOk(ctx: *@This()) !void {
+            if (ctx.queue_len == 0 and ctx.gc_state == .queued) {
+                return error.SafetyViolation;
+            }
+            if ((ctx.t1 == .coalesced or ctx.t2 == .coalesced) and ctx.queue_len == 0 and !ctx.host_drained) {
+                return error.SafetyViolation;
+            }
+            if (ctx.t1 == .submitting and ctx.t2 == .submitting) {
+                return error.SafetyViolation;
+            }
+            if (ctx.queue_len > 1) {
+                return error.SafetyViolation;
+            }
+        }
+
+        pub fn isEnabled(ctx: *@This()) bool {
+            return ctx.t1 != .idle or ctx.t2 != .idle or ctx.queue_len > 0;
+        }
+
+        pub fn isGoal(ctx: *@This()) bool {
+            return (ctx.t1 == .submitted or ctx.t1 == .coalesced or ctx.t1 == .failed) and
+                (ctx.t2 == .submitted or ctx.t2 == .coalesced or ctx.t2 == .failed) and
+                ctx.queue_len == 0 and ctx.gc_state == .idle;
+        }
+    };
+
+    var model = GcExploreModel{};
+    var saf = state_tcas.monitor.Safety(*GcExploreModel){ .ctx = &model, .checkFn = GcExploreModel.safetyOk };
+    var liv = state_tcas.monitor.Liveness(*GcExploreModel){
+        .ctx = &model,
+        .enabledFn = GcExploreModel.isEnabled,
+        .goalFn = GcExploreModel.isGoal,
+    };
+
+    const Legal = struct {
+        inner: *GcExploreModel,
+        saf: *state_tcas.monitor.Safety(*GcExploreModel),
+        liv: *state_tcas.monitor.Liveness(*GcExploreModel),
+        acts_buf: [9]GcAct = undefined,
+
+        pub fn enabled(self: *@This()) []const GcAct {
+            const n = self.inner.fillEnabled(&self.acts_buf);
+            return self.acts_buf[0..n];
+        }
+
+        pub fn step(self: *@This(), act: GcAct) !void {
+            try self.inner.step(act);
+            try self.saf.observe();
+            self.liv.note();
+        }
+
+        pub fn undo(self: *@This(), act: GcAct) void {
+            self.inner.undo(act);
+        }
+    };
+
+    var legal = Legal{ .inner = &model, .saf = &saf, .liv = &liv };
+    var stats: state_tcas.explore.Stats = .{};
+    try state_tcas.explore.dfs(GcAct, &legal, 256, &stats);
+    try liv.finish();
+    try std.testing.expect(liv.reached);
+    try std.testing.expect(stats.visits > 1);
+    try std.testing.expect(stats.expansions > 0);
 }

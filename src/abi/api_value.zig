@@ -4,6 +4,7 @@ const std = @import("std");
 const sync = @import("zev");
 const backend = @import("../backend.zig");
 const instance_map = @import("../runtime/instance_map.zig");
+const OwnedValue = @import("../value/root.zig").OwnedValue;
 
 const Owner = struct { thread_id: u64 };
 const ActiveEngine = backend.ActiveEngine;
@@ -12,6 +13,7 @@ pub const Entry = struct {
     instance_id: i32,
     value: ActiveEngine.Value,
     borrowed: bool = false,
+    reserved: bool = false,
 };
 
 var mutex: sync.Mutex = .{};
@@ -48,7 +50,7 @@ pub fn dropInstance(instance_id: i32) void {
         mutex.unlock();
         const removed = entry orelse break;
         // Callback-local handles borrow the VM's stack values and carry no backend reference.  They are normally revoked by the trampoline; teardown defensively removes a leaked one without freeing it.
-        if (!removed.value.borrowed) {
+        if (!removed.value.borrowed and !removed.value.reserved) {
             if (instance_map.getPtrs(instance_id)) |ptrs| ActiveEngine.freeValue(ptrs.ctx, removed.value.value);
         }
     }
@@ -80,13 +82,17 @@ pub fn hasOwner(instance_id: i32) bool {
 pub fn instanceFor(value: u64) ?i32 {
     mutex.lock();
     defer mutex.unlock();
-    return (values.get(value) orelse return null).instance_id;
+    const entry = values.get(value) orelse return null;
+    if (entry.reserved) return null;
+    return entry.instance_id;
 }
 
 pub fn get(value: u64) ?Entry {
     mutex.lock();
     defer mutex.unlock();
-    return values.get(value);
+    const entry = values.get(value) orelse return null;
+    if (entry.reserved) return null;
+    return entry;
 }
 
 /// Store an owned backend value. The caller transfers its reference here.
@@ -98,6 +104,46 @@ pub fn putOwned(instance_id: i32, value: ActiveEngine.Value) ?u64 {
     next_handle += 1;
     values.put(handle, .{ .instance_id = instance_id, .value = value }) catch return null;
     return handle;
+}
+
+pub const ReserveHandleError = error{
+    HandleExhausted,
+    OutOfMemory,
+};
+
+pub const ReservedHandle = struct {
+    handle: u64,
+
+    pub fn commit(self: ReservedHandle, owned: *OwnedValue) void {
+        const value = owned.release();
+        mutex.lock();
+        defer mutex.unlock();
+        if (values.getPtr(self.handle)) |entry| {
+            entry.value = value;
+            entry.reserved = false;
+        }
+    }
+
+    pub fn cancel(self: ReservedHandle) void {
+        mutex.lock();
+        defer mutex.unlock();
+        _ = values.remove(self.handle);
+    }
+};
+
+/// Reserve a handle and actual table slot in advance so publishing can never fail with out-of-memory or capacity race.
+pub fn reserveHandle(instance_id: i32) ReserveHandleError!ReservedHandle {
+    mutex.lock();
+    defer mutex.unlock();
+    if (next_handle == 0 or next_handle > std.math.maxInt(i64)) return error.HandleExhausted;
+    const handle = next_handle;
+    values.put(handle, .{
+        .instance_id = instance_id,
+        .value = ActiveEngine.nullValue(),
+        .reserved = true,
+    }) catch return error.OutOfMemory;
+    next_handle += 1;
+    return .{ .handle = handle };
 }
 
 /// Publish a callback-local view without acquiring a backend reference.  The trampoline revokes it before returning to JavaScript; callers can retain it to obtain an ordinary owned handle.
@@ -123,7 +169,7 @@ pub fn takeOwned(value: u64) ?Entry {
     mutex.lock();
     defer mutex.unlock();
     const entry = values.get(value) orelse return null;
-    if (entry.borrowed) return null;
+    if (entry.borrowed or entry.reserved) return null;
     return (values.fetchRemove(value) orelse return null).value;
 }
 
@@ -156,10 +202,11 @@ pub fn retain(value: u64) ?u64 {
 
 pub fn release(value: u64) bool {
     mutex.lock();
-    if ((values.get(value) orelse {
+    const existing = values.get(value) orelse {
         mutex.unlock();
         return false;
-    }).borrowed) {
+    };
+    if (existing.borrowed or existing.reserved) {
         mutex.unlock();
         return false;
     }
@@ -168,4 +215,55 @@ pub fn release(value: u64) bool {
     const removed = entry orelse return false;
     if (instance_map.getPtrs(removed.value.instance_id)) |ptrs| ActiveEngine.freeValue(ptrs.ctx, removed.value.value);
     return true;
+}
+
+test "api_value: handle reservation, commit, cancel, and access invariants" {
+    const instance_id: i32 = 98_765;
+
+    // 1. Reserve handle
+    const reserved = try reserveHandle(instance_id);
+    try std.testing.expect(reserved.handle != 0);
+
+    // Invariant: Uncommitted reserved handle cannot be retrieved via get()
+    try std.testing.expect(get(reserved.handle) == null);
+
+    // Invariant: Uncommitted reserved handle cannot be queried via instanceFor()
+    try std.testing.expect(instanceFor(reserved.handle) == null);
+
+    // Invariant: Uncommitted reserved handle cannot be released via release()
+    try std.testing.expect(!release(reserved.handle));
+
+    // Invariant: Uncommitted reserved handle cannot be taken via takeOwned()
+    try std.testing.expect(takeOwned(reserved.handle) == null);
+
+    // Commit handle
+    var owned = OwnedValue.init(undefined, ActiveEngine.nullValue());
+    reserved.commit(&owned);
+
+    // After commit, get() returns the entry and is not reserved
+    const entry = get(reserved.handle);
+    try std.testing.expect(entry != null);
+    try std.testing.expect(!entry.?.reserved);
+    try std.testing.expectEqual(instance_id, entry.?.instance_id);
+
+    // takeOwned succeeds after commit
+    const taken = takeOwned(reserved.handle);
+    try std.testing.expect(taken != null);
+    try std.testing.expectEqual(instance_id, taken.?.instance_id);
+
+    // After takeOwned, handle is completely gone
+    try std.testing.expect(get(reserved.handle) == null);
+
+    // 2. Cancellation removes the reserved placeholder
+    const reserved2 = try reserveHandle(instance_id);
+    try std.testing.expect(reserved2.handle != 0);
+    reserved2.cancel();
+    try std.testing.expect(get(reserved2.handle) == null);
+    try std.testing.expect(takeOwned(reserved2.handle) == null);
+
+    // 3. dropInstance with concurrent reserved handles safely skips placeholders
+    const reserved3 = try reserveHandle(instance_id);
+    dropInstance(instance_id);
+    reserved3.cancel();
+    try std.testing.expect(get(reserved3.handle) == null);
 }

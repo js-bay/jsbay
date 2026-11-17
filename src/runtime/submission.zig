@@ -182,6 +182,103 @@ pub fn postFence(instance_id: i32, generation: u64, seal_shutdown: bool, callbac
     return submit(submission, runFence);
 }
 
+const GcTask = struct {
+    allocator: std.mem.Allocator,
+    instance_id: i32,
+    inst: *instance_map.EngineInstance,
+};
+
+fn runGcTask(ctx: ?*anyopaque) void {
+    const raw = ctx orelse return;
+    const task: *GcTask = @ptrCast(@alignCast(raw));
+    defer task.allocator.destroy(task);
+    task.inst.gc_state.store(.idle, .release);
+    if (runtime_control.shutdownStatus(task.instance_id)) |shutdown| {
+        if (shutdown.phase == .cancelled) return;
+    }
+    _ = runtime_control.runGc(task.instance_id);
+}
+
+fn cancelGcTask(ctx: ?*anyopaque) void {
+    const raw = ctx orelse return;
+    const task: *GcTask = @ptrCast(@alignCast(raw));
+    defer task.allocator.destroy(task);
+    task.inst.gc_state.store(.idle, .release);
+}
+
+fn onAdmitGc(ctx: ?*anyopaque) void {
+    const raw = ctx orelse return;
+    const task: *GcTask = @ptrCast(@alignCast(raw));
+    task.inst.gc_state.store(.queued, .release);
+}
+
+fn canAdmitGc(ctx: ?*anyopaque) bool {
+    const raw = ctx orelse return false;
+    const task: *GcTask = @ptrCast(@alignCast(raw));
+    return runtime_control.canSubmit(task.instance_id);
+}
+
+pub const PostGcError = error{
+    InstanceNotFound,
+    StaleGeneration,
+    ShutdownInProgress,
+    OutOfMemory,
+    QueueRejected,
+};
+
+/// Generation-scoped asynchronous GC request posted to the engine event loop with an explicit allocator. Redundant requests are debounced.
+pub fn postGcWithAllocator(allocator: std.mem.Allocator, instance_id: i32, generation: u64) PostGcError!bool {
+    const lease = instance_map.beginControlPlane(instance_id) orelse return error.InstanceNotFound;
+    defer lease.end();
+    if (lease.inst.generation != generation) return error.StaleGeneration;
+    if (!runtime_control.canSubmit(instance_id)) return error.ShutdownInProgress;
+
+    while (true) {
+        switch (lease.inst.gc_state.load(.acquire)) {
+            .queued => return false,
+            .idle => {
+                if (lease.inst.gc_state.cmpxchgWeak(.idle, .submitting, .acquire, .monotonic)) |_| {
+                    continue;
+                }
+                break;
+            },
+            .submitting => {
+                std.Thread.yield() catch {};
+                continue;
+            },
+        }
+    }
+
+    const task = allocator.create(GcTask) catch {
+        lease.inst.gc_state.store(.idle, .release);
+        return error.OutOfMemory;
+    };
+    task.* = .{ .allocator = allocator, .instance_id = instance_id, .inst = lease.inst };
+    const token: dispatch.InstanceToken = .{ .instance_id = instance_id, .generation = generation };
+    const accepted = dispatch.postTaskWithToken(token, .{
+        .ctx = @ptrCast(task),
+        .run = runGcTask,
+        .cancel = cancelGcTask,
+        .complete = null,
+        .completion_ctx = null,
+        .resource_kind = .script_task,
+        .resource_bytes = @sizeOf(GcTask),
+        .admission_check = canAdmitGc,
+        .on_admitted = onAdmitGc,
+    });
+    if (!accepted) {
+        lease.inst.gc_state.store(.idle, .release);
+        allocator.destroy(task);
+        return error.QueueRejected;
+    }
+    return true;
+}
+
+/// Generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests are debounced.
+pub fn postGc(instance_id: i32, generation: u64) PostGcError!bool {
+    return postGcWithAllocator(std.heap.c_allocator, instance_id, generation);
+}
+
 const testing = std.testing;
 
 const Probe = struct {
@@ -398,4 +495,43 @@ test "submission: cancelled sealing fence does not mark shutdown drained" {
 test "submission: source copy releases earlier allocations when filename copy fails" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
     try testing.expectError(error.OutOfMemory, Submission.fromSourceWithAllocator(failing.allocator(), 58_304, 1, "source", "filename", null, null));
+}
+
+test "submission: asynchronous GC task debouncing and lifecycle" {
+    const instance_id: i32 = 58_315;
+    try testing.expect(engine.create(instance_id, .{}));
+    defer engine.destroy(instance_id);
+    const token = dispatch.captureInstanceToken(instance_id) orelse return error.MissingToken;
+
+    const posted = try postGcWithAllocator(testing.allocator, instance_id, token.generation);
+    try testing.expect(posted);
+
+    const debounced = try postGcWithAllocator(testing.allocator, instance_id, token.generation);
+    try testing.expect(!debounced);
+
+    engine.runEventLoopOnce(instance_id);
+
+    const posted_after = try postGcWithAllocator(testing.allocator, instance_id, token.generation);
+    try testing.expect(posted_after);
+    engine.runEventLoopOnce(instance_id);
+}
+
+test "submission: postGcWithAllocator error propagation" {
+    const instance_id: i32 = 58_316;
+
+    // 1. InstanceNotFound
+    try testing.expectError(error.InstanceNotFound, postGcWithAllocator(testing.allocator, 999_998, 1));
+
+    // 2. StaleGeneration
+    try testing.expect(engine.create(instance_id, .{}));
+    defer engine.destroy(instance_id);
+    const token = dispatch.captureInstanceToken(instance_id) orelse return error.MissingToken;
+
+    try testing.expectError(error.StaleGeneration, postGcWithAllocator(testing.allocator, instance_id, token.generation + 10));
+
+    // 3. ShutdownInProgress (sealed shutdown rejects submissions)
+    try testing.expect(runtime_control.beginShutdown(instance_id, 1_000));
+    try testing.expect(runtime_control.sealShutdown(instance_id));
+    try testing.expectError(error.ShutdownInProgress, postGcWithAllocator(testing.allocator, instance_id, token.generation));
+    _ = runtime_control.requestShutdownCancel(instance_id);
 }

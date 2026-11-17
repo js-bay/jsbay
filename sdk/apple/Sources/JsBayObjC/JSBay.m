@@ -19,6 +19,7 @@ NSErrorUserInfoKey const JSBayExceptionValueKey = @"JSBayExceptionValue";
 @property(nonatomic, strong) NSMutableArray<JSBayCallbackScope *> *scopes;
 - (nullable JSBayValue *)ownedValue:(uint64_t)handle;
 - (BOOL)requireOpen:(NSError **)error;
+- (BOOL)requireOpenCrossThread:(NSError **)error;
 - (BOOL)requireSame:(JSBayValue *)value error:(NSError **)error;
 - (nullable JSBayValue *)valueResult:(jsbay_status_t)status
                                value:(uint64_t)value
@@ -1032,6 +1033,18 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
     _open = YES;
     return self;
 }
+- (BOOL)requireOpenCrossThread:(NSError **)error {
+    NSLock *lock = JSBayEngineStateLock();
+    [lock lock];
+    BOOL isOpen = self.open;
+    [lock unlock];
+    if (!isOpen) {
+        if (error)
+            *error = JSBayStatusError(JSBAY_INSTANCE_NOT_FOUND);
+        return NO;
+    }
+    return YES;
+}
 - (BOOL)requireOpen:(NSError **)error {
     if (!_open) {
         if (error)
@@ -1069,26 +1082,28 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
             *error = JSBayStatusError(JSBAY_WRONG_THREAD);
         return NO;
     }
-    jsbay_status_t status = jsbay_engine_detach_loop(_identifier);
-    if (status != JSBAY_OK) {
-        if (error)
-            *error = JSBayStatusError(status);
-        return NO;
-    }
     NSLock *lock = JSBayEngineStateLock();
     [lock lock];
     if (!self.open) {
         [lock unlock];
         return YES;
     }
-    if (_loopUserData) {
-        [(__bridge JSBayLoopBinding *)_loopUserData shutdown];
-        CFBridgingRelease(_loopUserData);
-        _loopUserData = NULL;
-    }
     self.open = NO;
+    void *loopUser = _loopUserData;
+    _loopUserData = NULL;
     [lock unlock];
+
+    jsbay_status_t status = jsbay_engine_detach_loop(_identifier);
+    if (loopUser) {
+        [(__bridge JSBayLoopBinding *)loopUser shutdown];
+        CFBridgingRelease(loopUser);
+    }
     jsbay_engine_destroy(_identifier);
+    if (status != JSBAY_OK) {
+        if (error)
+            *error = JSBayStatusError(status);
+        return NO;
+    }
     return YES;
 }
 - (JSBayValue *)ownedValue:(uint64_t)handle {
@@ -1236,6 +1251,76 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
     uint64_t value = 0;
     jsbay_status_t status =
         jsbay_value_new_array_buffer(_identifier, input.bytes, input.length, &value);
+    if (status == JSBAY_OK)
+        return [self ownedValue:value];
+    if (error)
+        *error = JSBayStatusError(status);
+    return nil;
+}
+static void JSBayMallocFreeDeallocator(void *userData, void *bytes, size_t len) {
+    (void)userData;
+    (void)len;
+    if (bytes)
+        free(bytes);
+}
+- (JSBayValue *)arrayBufferValueNoCopy:(NSData *)input error:(NSError **)error {
+    if (![self requireOpen:error])
+        return nil;
+    if (!input) {
+        if (error)
+            *error = JSBayStatusError(JSBAY_INVALID_ARGUMENT);
+        return nil;
+    }
+    if (input.length == 0)
+        return [self arrayBufferValue:input error:error];
+    void *fixed = malloc(input.length);
+    if (!fixed) {
+        if (error)
+            *error = JSBayStatusError(JSBAY_OUT_OF_MEMORY);
+        return nil;
+    }
+    memcpy(fixed, input.bytes, input.length);
+    uint64_t value = 0;
+    jsbay_status_t status = jsbay_value_new_array_buffer_no_copy(
+        _identifier, fixed, input.length, JSBayMallocFreeDeallocator, NULL, &value);
+    if (status == JSBAY_OK)
+        return [self ownedValue:value];
+    if (error)
+        *error = JSBayStatusError(status);
+    return nil;
+}
+static void JSBayBlockDeallocatorTrampoline(void *userData, void *bytes, size_t len) {
+    if (userData) {
+        JSBayBytesDeallocator block = (__bridge_transfer JSBayBytesDeallocator)userData;
+        block(bytes, len);
+    }
+}
+- (JSBayValue *)arrayBufferValueWithBytesNoCopy:(nullable void *)bytes
+                                         length:(NSUInteger)length
+                                    deallocator:(nullable JSBayBytesDeallocator)deallocator
+                                          error:(NSError **)error {
+    if (![self requireOpen:error]) {
+        if (deallocator)
+            deallocator(bytes, length);
+        return nil;
+    }
+    if (length == 0) {
+        if (deallocator)
+            deallocator(bytes, 0);
+        return [self arrayBufferValue:[NSData data] error:error];
+    }
+    if (!bytes) {
+        if (deallocator)
+            deallocator(bytes, length);
+        if (error)
+            *error = JSBayStatusError(JSBAY_INVALID_ARGUMENT);
+        return nil;
+    }
+    void *user = deallocator ? (void *)CFBridgingRetain([deallocator copy]) : NULL;
+    uint64_t value = 0;
+    jsbay_status_t status = jsbay_value_new_array_buffer_no_copy(
+        _identifier, bytes, length, deallocator ? JSBayBlockDeallocatorTrampoline : NULL, user,
+        &value);
     if (status == JSBAY_OK)
         return [self ownedValue:value];
     if (error)
@@ -1497,7 +1582,7 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
           filename:(NSString *)filename
         completion:(JSBaySubmissionCompletion)completion
              error:(NSError **)error {
-    if (![self requireOpen:error])
+    if (![self requireOpenCrossThread:error])
         return NO;
     NSData *sourceData, *filenameData;
     jsbay_utf8_t sourceText, filenameText;
@@ -1517,7 +1602,7 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
 - (BOOL)postFenceSealingShutdown:(BOOL)sealShutdown
                       completion:(JSBaySubmissionCompletion)completion
                            error:(NSError **)error {
-    if (![self requireOpen:error])
+    if (![self requireOpenCrossThread:error])
         return NO;
     void *user =
         completion ? (void *)CFBridgingRetain([[JSBaySubmissionBinding alloc] init]) : NULL;
@@ -1528,6 +1613,11 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
     if (!accepted && user)
         CFBridgingRelease(user);
     return accepted;
+}
+- (BOOL)postGc:(NSError **)error {
+    if (![self requireOpenCrossThread:error])
+        return NO;
+    return jsbay_engine_post_gc(_identifier, _generation);
 }
 - (BOOL)beginShutdownWithGraceMilliseconds:(uint64_t)milliseconds error:(NSError **)error {
     if (!milliseconds)

@@ -22,6 +22,7 @@ const native_sync = @import("js_event_loop").native_sync;
 const host_wake = @import("js_event_loop").host_wake;
 const submission = @import("runtime/submission.zig");
 const api_async = @import("abi/api_async.zig");
+const value_buffers = @import("value/buffers.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -1717,6 +1718,20 @@ pub export fn jsbay_engine_run_gc(instance_id: c_int) bool {
     return runtime_control.runGc(id);
 }
 
+/// Generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests are debounced.
+pub export fn jsbay_engine_post_gc(instance_id: c_int, generation: u64) bool {
+    const id: i32 = @intCast(instance_id);
+    _ = submission.postGc(id, generation) catch |err| switch (err) {
+        error.InstanceNotFound,
+        error.StaleGeneration,
+        error.ShutdownInProgress,
+        error.OutOfMemory,
+        error.QueueRejected,
+        => return false,
+    };
+    return true;
+}
+
 const engine_events = @import("runtime/engine_events.zig");
 
 /// Owner-thread telemetry handler registration. Pass null handler to clear.
@@ -2261,6 +2276,59 @@ pub export fn jsbay_value_new_array_buffer(instance_id: c_int, data: ?[*]const u
         },
         .out_of_memory => API_OUT_OF_MEMORY,
     };
+}
+
+pub const BytesDeallocatorFn = ?*const fn (user_data: ?*anyopaque, bytes: ?*anyopaque, len: usize) callconv(.c) void;
+
+pub export fn jsbay_value_new_array_buffer_no_copy(
+    instance_id: c_int,
+    data: ?*anyopaque,
+    len: usize,
+    deallocator: BytesDeallocatorFn,
+    user_data: ?*anyopaque,
+    out_value: *u64,
+) c_int {
+    out_value.* = 0;
+    if (len == 0) {
+        if (deallocator) |dealloc| dealloc(user_data, data, 0);
+        return jsbay_value_new_array_buffer(instance_id, null, 0, out_value);
+    }
+    if (data == null) {
+        if (deallocator) |dealloc| dealloc(user_data, data, len);
+        return API_INVALID_ARGUMENT;
+    }
+    const id: i32 = @intCast(instance_id);
+    if (packedTagOf(id) != null) {
+        if (deallocator) |dealloc| dealloc(user_data, data, len);
+        return API_UNSUPPORTED;
+    }
+    var op = switch (beginApiOp(id)) {
+        .status => |status| {
+            if (deallocator) |dealloc| dealloc(user_data, data, len);
+            return status;
+        },
+        .ok => |ok| ok,
+    };
+    defer op.deinit();
+    const reserved = api_value.reserveHandle(id) catch |err| {
+        if (deallocator) |dealloc| dealloc(user_data, data, len);
+        return switch (err) {
+            error.OutOfMemory => API_OUT_OF_MEMORY,
+            error.HandleExhausted => API_OUT_OF_MEMORY,
+        };
+    };
+    const byte_ptr: [*]u8 = @ptrCast(data.?);
+    const fin: ?value_buffers.BufferFinalizer = if (deallocator) |d| @ptrCast(d) else null;
+    const maybe_val = value_buffers.newArrayBufferFromBytes(id, byte_ptr, len, fin, user_data);
+    if (maybe_val) |val| {
+        var owned = value_mod.OwnedValue.init(op.ctx, val);
+        reserved.commit(&owned);
+        out_value.* = reserved.handle;
+        return API_OK;
+    } else {
+        reserved.cancel();
+        return API_OUT_OF_MEMORY;
+    }
 }
 
 pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
@@ -4024,6 +4092,93 @@ test "c_api: admission class defaults to FOREGROUND and mid-flight set keeps usa
     legacy.struct_size = @intCast(resource_global_usage_legacy_size);
     try std.testing.expect(jsbay_resource_global_usage(&legacy));
     try std.testing.expectEqual(@as(u32, @intCast(resource_global_usage_legacy_size)), legacy.struct_size);
+}
+
+const NoCopyTestState = struct {
+    dealloc_calls: usize = 0,
+    last_user_data: ?*anyopaque = null,
+    last_bytes: ?*anyopaque = null,
+    last_len: usize = 0,
+
+    fn dealloc(ud: ?*anyopaque, b: ?*anyopaque, l: usize) callconv(.c) void {
+        const state: *NoCopyTestState = @ptrCast(@alignCast(ud orelse return));
+        state.dealloc_calls += 1;
+        state.last_user_data = ud;
+        state.last_bytes = b;
+        state.last_len = l;
+    }
+};
+
+test "c_api: jsbay_value_new_array_buffer_no_copy lifecycle and failure guarantees" {
+    const helpers = @import("tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+
+    // 1. Normal buffer
+    var state = NoCopyTestState{};
+    var payload = [_]u8{ 11, 22, 33, 44 };
+    var out_val: u64 = 0;
+    const status = jsbay_value_new_array_buffer_no_copy(id, &payload, payload.len, NoCopyTestState.dealloc, &state, &out_val);
+    try std.testing.expectEqual(API_OK, status);
+    try std.testing.expect(out_val != 0);
+
+    var copied: Bytes = .{ .data = null, .len = 0 };
+    var exception: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_copy_buffer(out_val, &copied, &exception));
+    defer jsbay_free_bytes(copied);
+    try std.testing.expectEqualSlices(u8, &payload, copied.data.?[0..copied.len]);
+
+    // Release value and destroy engine to ensure collection across all backends
+    try std.testing.expectEqual(API_OK, jsbay_value_release(out_val));
+    _ = jsbay_engine_run_gc(id);
+    jsbay_engine_destroy(id);
+    try std.testing.expectEqual(@as(usize, 1), state.dealloc_calls);
+    try std.testing.expectEqual(payload.len, state.last_len);
+
+    const id2 = helpers.nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id2, null, null));
+    defer jsbay_engine_destroy(id2);
+
+    // 2. len == 0 fires deallocator immediately and returns an empty ArrayBuffer
+    var state_zero = NoCopyTestState{};
+    var out_zero: u64 = 0;
+    const status_zero = jsbay_value_new_array_buffer_no_copy(id2, null, 0, NoCopyTestState.dealloc, &state_zero, &out_zero);
+    try std.testing.expectEqual(API_OK, status_zero);
+    try std.testing.expect(out_zero != 0);
+    try std.testing.expectEqual(@as(usize, 1), state_zero.dealloc_calls);
+    defer _ = jsbay_value_release(out_zero);
+
+    // 3. len > 0 with data == null fires deallocator immediately and returns INVALID_ARGUMENT
+    var state_bad = NoCopyTestState{};
+    var out_bad: u64 = 0;
+    const status_bad = jsbay_value_new_array_buffer_no_copy(id2, null, 10, NoCopyTestState.dealloc, &state_bad, &out_bad);
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, status_bad);
+    try std.testing.expectEqual(@as(u64, 0), out_bad);
+    try std.testing.expectEqual(@as(usize, 1), state_bad.dealloc_calls);
+
+    // 4. Missing instance fires deallocator immediately and returns INSTANCE_NOT_FOUND
+    var state_missing = NoCopyTestState{};
+    var out_missing: u64 = 0;
+    const status_missing = jsbay_value_new_array_buffer_no_copy(999999, &payload, payload.len, NoCopyTestState.dealloc, &state_missing, &out_missing);
+    try std.testing.expectEqual(API_INSTANCE_NOT_FOUND, status_missing);
+    try std.testing.expectEqual(@as(u64, 0), out_missing);
+    try std.testing.expectEqual(@as(usize, 1), state_missing.dealloc_calls);
+}
+
+test "c_api: jsbay_engine_post_gc accepts and coalesces" {
+    const helpers = @import("tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    defer jsbay_engine_destroy(id);
+
+    const snapshot = @import("runtime/instance_map.zig").getInstance(id).?;
+    try std.testing.expect(jsbay_engine_post_gc(id, snapshot.generation));
+    // Concurrent/repeated calls coalesce and return true
+    try std.testing.expect(jsbay_engine_post_gc(id, snapshot.generation));
+
+    // Stale generation or missing instance rejects
+    try std.testing.expect(!jsbay_engine_post_gc(id, snapshot.generation + 1));
+    try std.testing.expect(!jsbay_engine_post_gc(999999, 0));
 }
 
 // Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`. Never part of the published product ABI. See tests/process-isolation/ and docs/host-isolation.md.

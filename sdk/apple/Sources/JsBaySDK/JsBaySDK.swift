@@ -672,21 +672,19 @@ public final class Engine {
       Engine.liveLock.unlock()
       return
     }
-    Engine.liveLock.unlock()
-    try requireOK(jsbay_engine_detach_loop(id))
-    Engine.liveLock.lock()
-    guard isOpen else {
-      Engine.liveLock.unlock()
-      return
-    }
-    if let loopBinding {
-      Unmanaged<LoopBinding>.fromOpaque(loopBinding).takeUnretainedValue().shutdown()
-      Unmanaged<LoopBinding>.fromOpaque(loopBinding).release()
-      self.loopBinding = nil
-    }
     isOpen = false
     Engine.live.removeValue(forKey: id)
+    let binding = self.loopBinding
+    self.loopBinding = nil
     Engine.liveLock.unlock()
+
+    defer {
+      if let binding {
+        Unmanaged<LoopBinding>.fromOpaque(binding).takeUnretainedValue().shutdown()
+        Unmanaged<LoopBinding>.fromOpaque(binding).release()
+      }
+    }
+    try requireOK(jsbay_engine_detach_loop(id))
     jsbay_engine_destroy(id)
   }
 
@@ -738,6 +736,74 @@ public final class Engine {
           id, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count, out)
       }
     }
+  }
+  public func arrayBufferNoCopy(_ input: Data) throws -> Value {
+    try requireOpen()
+    guard !input.isEmpty else { return try arrayBuffer(input) }
+    let count = input.count
+    guard let fixed = malloc(count) else { throw JsBayError.status(JsBayStatus.outOfMemory) }
+    input.copyBytes(to: fixed.assumingMemoryBound(to: UInt8.self), count: count)
+    var out: UInt64 = 0
+    let status = jsbay_value_new_array_buffer_no_copy(
+      id,
+      fixed,
+      count,
+      { _, bytes, _ in
+        if let bytes { free(bytes) }
+      },
+      nil,
+      &out
+    )
+    try requireOK(status)
+    return ownedValue(out)
+  }
+
+  public func arrayBufferNoCopy(
+    bytes: UnsafeMutableRawPointer,
+    count: Int,
+    deallocator: (@Sendable (UnsafeMutableRawPointer, Int) -> Void)? = nil
+  ) throws -> Value {
+    do {
+      try requireOpen()
+    } catch {
+      deallocator?(bytes, count)
+      throw error
+    }
+    guard count >= 0 else {
+      deallocator?(bytes, count)
+      throw JsBayError.status(JsBayStatus.invalidArgument)
+    }
+    guard count > 0 else {
+      deallocator?(bytes, 0)
+      return try arrayBuffer(Data())
+    }
+    final class DeallocBox: @unchecked Sendable {
+      let dealloc: (@Sendable (UnsafeMutableRawPointer, Int) -> Void)?
+      init(_ d: (@Sendable (UnsafeMutableRawPointer, Int) -> Void)?) { self.dealloc = d }
+    }
+    let user: UnsafeMutableRawPointer? =
+      if let deallocator {
+        Unmanaged.passRetained(DeallocBox(deallocator)).toOpaque()
+      } else {
+        nil
+      }
+    var out: UInt64 = 0
+    let status = jsbay_value_new_array_buffer_no_copy(
+      id,
+      bytes,
+      count,
+      { userData, b, len in
+        guard let userData else { return }
+        let box = Unmanaged<DeallocBox>.fromOpaque(userData).takeRetainedValue()
+        if let b {
+          box.dealloc?(b, len)
+        }
+      },
+      user,
+      &out
+    )
+    try requireOK(status)
+    return ownedValue(out)
   }
   public func object() throws -> Value { try simpleValue { jsbay_value_new_object(id, $0) } }
   public func array() throws -> Value { try simpleValue { jsbay_value_new_array(id, $0) } }
@@ -974,7 +1040,7 @@ public final class Engine {
     _ source: String, filename: String = "<submission>",
     completion: ((SubmissionResult) -> Void)? = nil
   ) throws -> Bool {
-    try requireOpen()
+    try requireOpenCrossThread()
     return try withUTF8(source) { sourceText in
       try withUTF8(filename) { filenameText in
         try postSubmission(completion) { callback, userData in
@@ -988,10 +1054,16 @@ public final class Engine {
   @discardableResult public func postFence(
     sealShutdown: Bool = false, completion: ((SubmissionResult) -> Void)? = nil
   ) throws -> Bool {
-    try requireOpen()
+    try requireOpenCrossThread()
     return try postSubmission(completion) { callback, userData in
       jsbay_engine_post_fence(id, generation, sealShutdown, callback, userData)
     }
+  }
+
+  /// Asynchronously posts a garbage collection task to the engine event loop.
+  @discardableResult public func postGc() throws -> Bool {
+    try requireOpenCrossThread()
+    return jsbay_engine_post_gc(id, generation)
   }
 
   @discardableResult public func beginShutdown(graceMilliseconds: UInt64) throws -> Bool {
@@ -1185,6 +1257,12 @@ public final class Engine {
 
   fileprivate func requireOwner() throws {
     guard pthread_equal(owner, pthread_self()) != 0 else { throw JsBayError.wrongThread }
+  }
+  fileprivate func requireOpenCrossThread() throws {
+    Engine.liveLock.lock()
+    let open = isOpen
+    Engine.liveLock.unlock()
+    guard open else { throw JsBayError.engineClosed }
   }
   fileprivate func requireOpen() throws {
     guard isOpen else { throw JsBayError.engineClosed }
