@@ -185,15 +185,14 @@ pub fn postFence(instance_id: i32, generation: u64, seal_shutdown: bool, callbac
 const GcTask = struct {
     allocator: std.mem.Allocator,
     instance_id: i32,
+    inst: *instance_map.EngineInstance,
 };
 
 fn runGcTask(ctx: ?*anyopaque) void {
     const raw = ctx orelse return;
     const task: *GcTask = @ptrCast(@alignCast(raw));
     defer task.allocator.destroy(task);
-    if (instance_map.getInstance(task.instance_id)) |inst| {
-        inst.gc_state.store(.idle, .release);
-    }
+    task.inst.gc_state.store(.idle, .release);
     if (runtime_control.shutdownStatus(task.instance_id)) |shutdown| {
         if (shutdown.phase == .cancelled) return;
     }
@@ -204,9 +203,13 @@ fn cancelGcTask(ctx: ?*anyopaque) void {
     const raw = ctx orelse return;
     const task: *GcTask = @ptrCast(@alignCast(raw));
     defer task.allocator.destroy(task);
-    if (instance_map.getInstance(task.instance_id)) |inst| {
-        inst.gc_state.store(.idle, .release);
-    }
+    task.inst.gc_state.store(.idle, .release);
+}
+
+fn onAdmitGc(ctx: ?*anyopaque) void {
+    const raw = ctx orelse return;
+    const task: *GcTask = @ptrCast(@alignCast(raw));
+    task.inst.gc_state.store(.queued, .release);
 }
 
 fn canAdmitGc(ctx: ?*anyopaque) bool {
@@ -250,7 +253,7 @@ pub fn postGcWithAllocator(allocator: std.mem.Allocator, instance_id: i32, gener
         lease.inst.gc_state.store(.idle, .release);
         return error.OutOfMemory;
     };
-    task.* = .{ .allocator = allocator, .instance_id = instance_id };
+    task.* = .{ .allocator = allocator, .instance_id = instance_id, .inst = lease.inst };
     const token: dispatch.InstanceToken = .{ .instance_id = instance_id, .generation = generation };
     const accepted = dispatch.postTaskWithToken(token, .{
         .ctx = @ptrCast(task),
@@ -261,13 +264,13 @@ pub fn postGcWithAllocator(allocator: std.mem.Allocator, instance_id: i32, gener
         .resource_kind = .script_task,
         .resource_bytes = @sizeOf(GcTask),
         .admission_check = canAdmitGc,
+        .on_admitted = onAdmitGc,
     });
     if (!accepted) {
         lease.inst.gc_state.store(.idle, .release);
         allocator.destroy(task);
         return error.QueueRejected;
     }
-    lease.inst.gc_state.store(.queued, .release);
     return true;
 }
 
@@ -492,4 +495,23 @@ test "submission: cancelled sealing fence does not mark shutdown drained" {
 test "submission: source copy releases earlier allocations when filename copy fails" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 2 });
     try testing.expectError(error.OutOfMemory, Submission.fromSourceWithAllocator(failing.allocator(), 58_304, 1, "source", "filename", null, null));
+}
+
+test "submission: asynchronous GC task debouncing and lifecycle" {
+    const instance_id: i32 = 58_315;
+    try testing.expect(engine.create(instance_id, .{}));
+    defer engine.destroy(instance_id);
+    const token = dispatch.captureInstanceToken(instance_id) orelse return error.MissingToken;
+
+    const posted = try postGcWithAllocator(testing.allocator, instance_id, token.generation);
+    try testing.expect(posted);
+
+    const debounced = try postGcWithAllocator(testing.allocator, instance_id, token.generation);
+    try testing.expect(!debounced);
+
+    engine.runEventLoopOnce(instance_id);
+
+    const posted_after = try postGcWithAllocator(testing.allocator, instance_id, token.generation);
+    try testing.expect(posted_after);
+    engine.runEventLoopOnce(instance_id);
 }
