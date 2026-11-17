@@ -42,6 +42,12 @@ pub const EngineHandles = union(enum) {
     },
 };
 
+pub const GcSubmissionState = enum(u8) {
+    idle = 0,
+    submitting = 1,
+    queued = 2,
+};
+
 pub const EngineInstance = struct {
     /// Called after registry removal and all admitted users have drained.
     pub fn deinitSynchronization(self: *EngineInstance) void {
@@ -98,7 +104,7 @@ pub const EngineInstance = struct {
     /// In-flight cross-thread control-plane ops (suspend/resume/stop/is_suspended). Destroy waits before freeing the Driver.
     active_control_ops: usize = 0,
     /// Coalesces concurrent cross-thread post_gc requests before the scheduled run executes.
-    gc_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    gc_state: std.atomic.Value(GcSubmissionState) = std.atomic.Value(GcSubmissionState).init(.idle),
     // Extension points for host apps
     log_handler: ?types.LogHandler = null,
     log_user_data: ?*anyopaque = null,

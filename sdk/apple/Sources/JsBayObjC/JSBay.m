@@ -1257,26 +1257,70 @@ static void JSBaySyncStart(int instance, void *userData, uint64_t requestID, uin
         *error = JSBayStatusError(status);
     return nil;
 }
-static void JSBayArrayBufferDeallocator(void *userData, void *bytes, size_t len) {
-    (void)bytes;
+static void JSBayMallocFreeDeallocator(void *userData, void *bytes, size_t len) {
+    (void)userData;
     (void)len;
-    if (userData)
-        CFBridgingRelease(userData);
+    if (bytes)
+        free(bytes);
 }
-- (JSBayValue *)arrayBufferValueNoCopy:(NSMutableData *)input error:(NSError **)error {
+- (JSBayValue *)arrayBufferValueNoCopy:(NSData *)input error:(NSError **)error {
     if (![self requireOpen:error])
         return nil;
-    if (!input || ![input isKindOfClass:[NSMutableData class]]) {
+    if (!input) {
         if (error)
             *error = JSBayStatusError(JSBAY_INVALID_ARGUMENT);
         return nil;
     }
     if (input.length == 0)
         return [self arrayBufferValue:input error:error];
-    void *user = (void *)CFBridgingRetain(input);
+    void *fixed = malloc(input.length);
+    if (!fixed) {
+        if (error)
+            *error = JSBayStatusError(JSBAY_OUT_OF_MEMORY);
+        return nil;
+    }
+    memcpy(fixed, input.bytes, input.length);
     uint64_t value = 0;
     jsbay_status_t status = jsbay_value_new_array_buffer_no_copy(
-        _identifier, input.mutableBytes, input.length, JSBayArrayBufferDeallocator, user, &value);
+        _identifier, fixed, input.length, JSBayMallocFreeDeallocator, NULL, &value);
+    if (status == JSBAY_OK)
+        return [self ownedValue:value];
+    if (error)
+        *error = JSBayStatusError(status);
+    return nil;
+}
+static void JSBayBlockDeallocatorTrampoline(void *userData, void *bytes, size_t len) {
+    if (userData) {
+        JSBayBytesDeallocator block = (__bridge_transfer JSBayBytesDeallocator)userData;
+        block(bytes, len);
+    }
+}
+- (JSBayValue *)arrayBufferValueWithBytesNoCopy:(void *)bytes
+                                         length:(NSUInteger)length
+                                    deallocator:(nullable JSBayBytesDeallocator)deallocator
+                                          error:(NSError **)error {
+    if (![self requireOpen:error]) {
+        if (deallocator)
+            deallocator(bytes, length);
+        return nil;
+    }
+    if (length == 0) {
+        if (deallocator)
+            deallocator(bytes, 0);
+        return [self arrayBufferValue:[NSData data] error:error];
+    }
+    if (!bytes) {
+        if (deallocator)
+            deallocator(bytes, length);
+        if (error)
+            *error = JSBayStatusError(JSBAY_INVALID_ARGUMENT);
+        return nil;
+    }
+    void *user = deallocator ? (void *)CFBridgingRetain([deallocator copy]) : NULL;
+    uint64_t value = 0;
+    jsbay_status_t status = jsbay_value_new_array_buffer_no_copy(
+        _identifier, bytes, length, deallocator ? JSBayBlockDeallocatorTrampoline : NULL, user,
+        &value);
     if (status == JSBAY_OK)
         return [self ownedValue:value];
     if (error)

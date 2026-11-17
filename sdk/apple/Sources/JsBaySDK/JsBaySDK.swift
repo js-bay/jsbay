@@ -737,20 +737,60 @@ public final class Engine {
       }
     }
   }
-  public func arrayBufferNoCopy(_ input: NSMutableData) throws -> Value {
+  public func arrayBufferNoCopy(_ input: Data) throws -> Value {
     try requireOpen()
-    guard input.length > 0 else { return try arrayBuffer(Data()) }
-    let retained = Unmanaged.passRetained(input).toOpaque()
+    guard !input.isEmpty else { return try arrayBuffer(input) }
+    let count = input.count
+    guard let fixed = malloc(count) else { throw JsBayError.status(JsBayStatus.outOfMemory) }
+    input.copyBytes(to: fixed.assumingMemoryBound(to: UInt8.self), count: count)
     var out: UInt64 = 0
     let status = jsbay_value_new_array_buffer_no_copy(
       id,
-      input.mutableBytes,
-      input.length,
-      { userData, _, _ in
-        guard let userData else { return }
-        Unmanaged<NSMutableData>.fromOpaque(userData).release()
+      fixed,
+      count,
+      { _, bytes, _ in
+        if let bytes { free(bytes) }
       },
-      retained,
+      nil,
+      &out
+    )
+    try requireOK(status)
+    return ownedValue(out)
+  }
+
+  public func arrayBufferNoCopy(
+    bytes: UnsafeMutableRawPointer,
+    count: Int,
+    deallocator: (@Sendable (UnsafeMutableRawPointer, Int) -> Void)? = nil
+  ) throws -> Value {
+    try requireOpen()
+    guard count > 0 else {
+      deallocator?(bytes, 0)
+      return try arrayBuffer(Data())
+    }
+    final class DeallocBox: @unchecked Sendable {
+      let dealloc: (@Sendable (UnsafeMutableRawPointer, Int) -> Void)?
+      init(_ d: (@Sendable (UnsafeMutableRawPointer, Int) -> Void)?) { self.dealloc = d }
+    }
+    let user: UnsafeMutableRawPointer? =
+      if let deallocator {
+        Unmanaged.passRetained(DeallocBox(deallocator)).toOpaque()
+      } else {
+        nil
+      }
+    var out: UInt64 = 0
+    let status = jsbay_value_new_array_buffer_no_copy(
+      id,
+      bytes,
+      count,
+      { userData, b, len in
+        guard let userData else { return }
+        let box = Unmanaged<DeallocBox>.fromOpaque(userData).takeRetainedValue()
+        if let b {
+          box.dealloc?(b, len)
+        }
+      },
+      user,
       &out
     )
     try requireOK(status)

@@ -174,21 +174,32 @@ int jsbay_objc_sdk_probe(void) {
               @"binary copy-out isolation");
         Check([[[engine arrayBufferValue:[NSData data] error:&error] dataValue:&error] length] == 0,
               @"empty buffer mismatch");
-        NSMutableData *mutableNoCopy = [NSMutableData dataWithBytes:inputBytes
-                                                             length:sizeof(inputBytes)];
-        JSBayValue *noCopyBuffer = [engine arrayBufferValueNoCopy:mutableNoCopy error:&error];
+        NSData *noCopyData = [NSData dataWithBytes:inputBytes length:sizeof(inputBytes)];
+        JSBayValue *noCopyBuffer = [engine arrayBufferValueNoCopy:noCopyData error:&error];
         Check([[noCopyBuffer dataValue:&error] isEqualToData:expectedBytes],
               @"no-copy buffer payload mismatch");
-        Check([[[engine arrayBufferValueNoCopy:[NSMutableData data]
+        Check([[[engine arrayBufferValueNoCopy:[NSData data]
                                          error:&error] dataValue:&error] length] == 0,
               @"empty no-copy buffer mismatch");
-        NSError *immutError = nil;
-        JSBayValue *immutRejected = [engine
-            arrayBufferValueNoCopy:(NSMutableData *)[NSData dataWithBytes:inputBytes
-                                                                   length:sizeof(inputBytes)]
-                             error:&immutError];
-        Check(immutRejected == nil && immutError.code == JSBayErrorInvalidArgument,
-              @"immutable data rejection");
+        uint8_t *rawBytes = malloc(4);
+        rawBytes[0] = 7;
+        rawBytes[1] = 8;
+        rawBytes[2] = 9;
+        rawBytes[3] = 10;
+        __block BOOL rawFreed = NO;
+        JSBayValue *rawNoCopy = [engine arrayBufferValueWithBytesNoCopy:rawBytes
+                                                                 length:4
+                                                            deallocator:^(void *b, NSUInteger l) {
+                                                                (void)l;
+                                                                free(b);
+                                                                rawFreed = YES;
+                                                            }
+                                                                  error:&error];
+        uint8_t expectedRaw[] = {7, 8, 9, 10};
+        Check([[rawNoCopy dataValue:&error] isEqualToData:[NSData dataWithBytes:expectedRaw
+                                                                         length:4]],
+              @"raw bytes no-copy mismatch");
+        (void)rawFreed;
         JSBayValue *view = [engine evaluate:@"new Uint8Array([8,9,0,255,7]).subarray(2,4)"
                                    filename:@"view.js"
                                       cache:nil

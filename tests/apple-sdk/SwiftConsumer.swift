@@ -49,15 +49,28 @@ struct SwiftConsumer {
       fatalError("buffer copy-out isolation")
     }
     guard try engine.arrayBuffer(Data()).bytes().isEmpty else { fatalError("empty buffer") }
-    let noCopyBytes: [UInt8] = [7, 8, 9, 10]
-    let noCopyInput = NSMutableData(bytes: noCopyBytes, length: noCopyBytes.count)
-    let noCopyBuf = try engine.arrayBufferNoCopy(noCopyInput)
+    let noCopyBuf = try engine.arrayBufferNoCopy(Data([7, 8, 9, 10]))
     guard try noCopyBuf.bytes() == Data([7, 8, 9, 10]) else {
       fatalError("no-copy buffer payload mismatch")
     }
-    guard try engine.arrayBufferNoCopy(NSMutableData()).bytes().isEmpty else {
+    guard try engine.arrayBufferNoCopy(Data()).bytes().isEmpty else {
       fatalError("empty no-copy buffer")
     }
+    let rawPtr = UnsafeMutableRawPointer.allocate(byteCount: 4, alignment: 1)
+    let rawBytes: [UInt8] = [11, 12, 13, 14]
+    rawPtr.copyMemory(from: rawBytes, byteCount: 4)
+    final class RawFlag: @unchecked Sendable {
+      var freed = false
+    }
+    let flag = RawFlag()
+    let rawBuf = try engine.arrayBufferNoCopy(bytes: rawPtr, count: 4) { ptr, _ in
+      ptr.deallocate()
+      flag.freed = true
+    }
+    guard try rawBuf.bytes() == Data([11, 12, 13, 14]) else {
+      fatalError("raw no-copy buffer payload mismatch")
+    }
+    _ = flag
     guard
       try engine.evaluate("new DataView(new Uint8Array([8,9,0,255,7]).buffer,2,2)").bytes()
         == Data([0, 255])

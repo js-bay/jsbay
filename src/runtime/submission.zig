@@ -192,7 +192,7 @@ fn runGcTask(ctx: ?*anyopaque) void {
     const task: *GcTask = @ptrCast(@alignCast(raw));
     defer task.allocator.destroy(task);
     if (instance_map.getInstance(task.instance_id)) |inst| {
-        inst.gc_pending.store(false, .release);
+        inst.gc_state.store(.idle, .release);
     }
     if (runtime_control.shutdownStatus(task.instance_id)) |shutdown| {
         if (shutdown.phase == .cancelled) return;
@@ -205,7 +205,7 @@ fn cancelGcTask(ctx: ?*anyopaque) void {
     const task: *GcTask = @ptrCast(@alignCast(raw));
     defer task.allocator.destroy(task);
     if (instance_map.getInstance(task.instance_id)) |inst| {
-        inst.gc_pending.store(false, .release);
+        inst.gc_state.store(.idle, .release);
     }
 }
 
@@ -229,11 +229,25 @@ pub fn postGcWithAllocator(allocator: std.mem.Allocator, instance_id: i32, gener
     defer lease.end();
     if (lease.inst.generation != generation) return error.StaleGeneration;
     if (!runtime_control.canSubmit(instance_id)) return error.ShutdownInProgress;
-    if (lease.inst.gc_pending.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {
-        return false;
+
+    while (true) {
+        switch (lease.inst.gc_state.load(.acquire)) {
+            .queued => return false,
+            .idle => {
+                if (lease.inst.gc_state.cmpxchgWeak(.idle, .submitting, .acquire, .monotonic)) |_| {
+                    continue;
+                }
+                break;
+            },
+            .submitting => {
+                std.Thread.yield() catch {};
+                continue;
+            },
+        }
     }
+
     const task = allocator.create(GcTask) catch {
-        lease.inst.gc_pending.store(false, .release);
+        lease.inst.gc_state.store(.idle, .release);
         return error.OutOfMemory;
     };
     task.* = .{ .allocator = allocator, .instance_id = instance_id };
@@ -249,10 +263,11 @@ pub fn postGcWithAllocator(allocator: std.mem.Allocator, instance_id: i32, gener
         .admission_check = canAdmitGc,
     });
     if (!accepted) {
-        lease.inst.gc_pending.store(false, .release);
+        lease.inst.gc_state.store(.idle, .release);
         allocator.destroy(task);
         return error.QueueRejected;
     }
+    lease.inst.gc_state.store(.queued, .release);
     return true;
 }
 

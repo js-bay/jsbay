@@ -12,6 +12,7 @@ pub const Entry = struct {
     instance_id: i32,
     value: ActiveEngine.Value,
     borrowed: bool = false,
+    reserved: bool = false,
 };
 
 var mutex: sync.Mutex = .{};
@@ -48,7 +49,7 @@ pub fn dropInstance(instance_id: i32) void {
         mutex.unlock();
         const removed = entry orelse break;
         // Callback-local handles borrow the VM's stack values and carry no backend reference.  They are normally revoked by the trampoline; teardown defensively removes a leaked one without freeing it.
-        if (!removed.value.borrowed) {
+        if (!removed.value.borrowed and !removed.value.reserved) {
             if (instance_map.getPtrs(instance_id)) |ptrs| ActiveEngine.freeValue(ptrs.ctx, removed.value.value);
         }
     }
@@ -86,7 +87,9 @@ pub fn instanceFor(value: u64) ?i32 {
 pub fn get(value: u64) ?Entry {
     mutex.lock();
     defer mutex.unlock();
-    return values.get(value);
+    const entry = values.get(value) orelse return null;
+    if (entry.reserved) return null;
+    return entry;
 }
 
 /// Store an owned backend value. The caller transfers its reference here.
@@ -100,27 +103,41 @@ pub fn putOwned(instance_id: i32, value: ActiveEngine.Value) ?u64 {
     return handle;
 }
 
+pub const ReserveHandleError = error{
+    HandleExhausted,
+    OutOfMemory,
+};
+
 pub const ReservedHandle = struct {
     handle: u64,
 
-    pub fn commit(self: ReservedHandle, instance_id: i32, value: ActiveEngine.Value) void {
+    pub fn commit(self: ReservedHandle, value: ActiveEngine.Value) void {
         mutex.lock();
         defer mutex.unlock();
-        values.putAssumeCapacity(self.handle, .{ .instance_id = instance_id, .value = value });
+        if (values.getPtr(self.handle)) |entry| {
+            entry.value = value;
+            entry.reserved = false;
+        }
     }
 
     pub fn cancel(self: ReservedHandle) void {
-        _ = self;
+        mutex.lock();
+        defer mutex.unlock();
+        _ = values.remove(self.handle);
     }
 };
 
-/// Reserve a handle and publication capacity in advance so publishing can never fail with out-of-memory.
-pub fn reserveHandle() ?ReservedHandle {
+/// Reserve a handle and actual table slot in advance so publishing can never fail with out-of-memory or capacity race.
+pub fn reserveHandle(instance_id: i32) ReserveHandleError!ReservedHandle {
     mutex.lock();
     defer mutex.unlock();
-    if (next_handle == 0 or next_handle > std.math.maxInt(i64)) return null;
-    values.ensureUnusedCapacity(1) catch return null;
+    if (next_handle == 0 or next_handle > std.math.maxInt(i64)) return error.HandleExhausted;
     const handle = next_handle;
+    values.put(handle, .{
+        .instance_id = instance_id,
+        .value = ActiveEngine.nullValue(),
+        .reserved = true,
+    }) catch return error.OutOfMemory;
     next_handle += 1;
     return .{ .handle = handle };
 }
@@ -148,7 +165,7 @@ pub fn takeOwned(value: u64) ?Entry {
     mutex.lock();
     defer mutex.unlock();
     const entry = values.get(value) orelse return null;
-    if (entry.borrowed) return null;
+    if (entry.borrowed or entry.reserved) return null;
     return (values.fetchRemove(value) orelse return null).value;
 }
 

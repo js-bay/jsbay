@@ -2303,15 +2303,18 @@ pub export fn jsbay_value_new_array_buffer_no_copy(
         .ok => |ok| ok,
     };
     defer op.deinit();
-    const reserved = api_value.reserveHandle() orelse {
+    const reserved = api_value.reserveHandle(id) catch |err| {
         if (deallocator) |dealloc| dealloc(user_data, data, len);
-        return API_OUT_OF_MEMORY;
+        return switch (err) {
+            error.OutOfMemory => API_OUT_OF_MEMORY,
+            error.HandleExhausted => API_OUT_OF_MEMORY,
+        };
     };
     const byte_ptr: [*]u8 = @ptrCast(data.?);
     const fin: ?value_buffers.BufferFinalizer = if (deallocator) |d| @ptrCast(d) else null;
     const maybe_val = value_buffers.newArrayBufferFromBytes(id, byte_ptr, len, fin, user_data);
     if (maybe_val) |val| {
-        reserved.commit(id, val);
+        reserved.commit(val);
         out_value.* = reserved.handle;
         return API_OK;
     } else {
