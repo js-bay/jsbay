@@ -320,7 +320,8 @@ pub fn Module(comptime Host: type) type {
 
         fn sendByValueError(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64, err: anyerror) void {
             switch (err) {
-                error.ByValueCycle, error.ByValueDepth => json_writer.sendError(state, session_id, request_id, -32000, "Object reference chain is too long"),
+                error.ByValueCycle => json_writer.sendErrorWithData(state, session_id, request_id, -32000, "Object reference chain is too long", "cycle"),
+                error.ByValueDepth => json_writer.sendErrorWithData(state, session_id, request_id, -32000, "Object reference chain is too long", "depth"),
                 error.UnsupportedByValue => json_writer.sendError(state, session_id, request_id, -32000, "Object couldn't be returned by value"),
                 else => json_writer.sendError(state, session_id, request_id, -32603, "Internal error"),
             }

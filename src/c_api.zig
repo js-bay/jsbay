@@ -241,6 +241,7 @@ test "c_api: packed-alt typed evaluate number + retain/release (real non-primary
 test "c_api: forced packed_alt typed value for the primary backend" {
     // Build EngineInstance.packed_alt for the pack primary without a second real engine.
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
     const timers = @import("runtime/timers.zig");
@@ -326,6 +327,7 @@ test "c_api: forced packed_alt typed value for the primary backend" {
 
 test "c_api: forced packed_alt set/call/construct/new_* for the primary backend" {
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
     const timers = @import("runtime/timers.zig");
@@ -503,6 +505,7 @@ test "c_api: packed-alt set/call/new when real non-primary packed" {
 
 test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/new_error" {
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
     const timers = @import("runtime/timers.zig");
@@ -682,6 +685,7 @@ test "c_api: packed-alt to_bool/has/json/buffer when real non-primary packed" {
 
 test "c_api: packed-alt adversarial get exception / bind / empty options / destroy stale" {
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
     const timers = @import("runtime/timers.zig");

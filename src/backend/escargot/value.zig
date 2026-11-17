@@ -55,6 +55,15 @@ pub fn isConstructor(ctx: Context, v: Value) bool {
 pub fn sameValue(ctx: Context, a: Value, b: Value) bool {
     return c_api.escargot_strict_equal(ctx, a, b);
 }
+
+/// Heap ValueRef* is stable object identity (retain returns the same pointer).
+/// A null handle is not an object; 0 is reserved as "unnamed".
+pub fn objectIdentity(_: Context, v: Value) ?u64 {
+    if (v == null) return null;
+    const p = @intFromPtr(v);
+    return if (p == 0) null else p;
+}
+
 pub fn strictEqual(ctx: Context, a: Value, b: Value) bool {
     return c_api.escargot_strict_equal(ctx, a, b);
 }

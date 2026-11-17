@@ -25,6 +25,20 @@ pub fn nextInstanceId() i32 {
     return g_next_id.fetchAdd(1, .seq_cst);
 }
 
+/// Forced packed_alt proofs require the build primary to be a pack member (QuickJS or JSC).
+/// `createPacked` does not instantiate mono spikes such as Hermes; skipping here is that API
+/// refusal, not a hidden pack-path regression. Packed primaries must still run the proofs.
+pub fn skipUnlessPrimaryPacked() error{SkipZigTest}!void {
+    const dispatch = @import("../backend_dispatch.zig");
+    // Use createPacked's real admit set, not packed_backend_bits: a mono -Dbackend=hermes build still sets the Hermes packed bit, but createPacked(.hermes) is always null.
+    if (dispatch.admitsPacked(backend.active_backend)) return;
+    std.debug.print(
+        "skip packed_alt proof: createPacked does not instantiate primary {s}; only packed QuickJS/JSC are admitted (docs/capability.md: Hermes is not a multi-engine pack)\n",
+        .{@tagName(backend.active_backend)},
+    );
+    return error.SkipZigTest;
+}
+
 /// Fixture that owns an engine instance for the lifetime of a test closure.
 pub fn withEngine(instance_id: i32, config: types.EngineConfig, comptime test_fn: fn (i32) anyerror!void) !void {
     if (!engine.create(instance_id, config)) return error.EngineCreateFailed;

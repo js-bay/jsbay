@@ -58,8 +58,22 @@ fn createReal(comptime tag: Backend) ?Handles {
     };
 }
 
+/// Whether `createPacked` can instantiate `tag`.
+///
+/// `multi_pack.isPacked` / `packed_backend_bits` is set for any monomorphic `-Dbackend=`
+/// primary, including Hermes and Escargot. The instantiate loop below only admits packed
+/// QuickJS and JSC; spike tags always get null here. Tests that force a packed_alt for the
+/// primary must key off this predicate, not the raw packed bit, or they would skip real
+/// QuickJS/JSC proofs or fail on Hermes for a documented refusal.
+pub fn admitsPacked(tag: Backend) bool {
+    return switch (tag) {
+        .quickjs_ng, .quickjs, .jsc => multi_pack.isPacked(tag),
+        .escargot, .hermes => false,
+    };
+}
+
 pub fn createPacked(tag: Backend) ?Handles {
-    if (!multi_pack.isPacked(tag)) return null;
+    if (!admitsPacked(tag)) return null;
     inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
         if (cand == tag) {
             if (comptime multi_pack.isPacked(cand)) return createReal(cand);
@@ -214,7 +228,7 @@ pub fn timerCallNoArgsObserved(tag: Backend, ctx_addr: usize, callback_bytes: []
                 const E = backend.Engine(cand);
                 if (callback_bytes.len != @sizeOf(E.Value)) return null;
                 const ctx = restorePtr(E.Context, ctx_addr);
-                if (comptime backend.isQuickJsApiBackend(cand)) {
+                if (comptime backend.isQuickJsApiBackend(cand) or backend.isHermesBackend(cand)) {
                     return E.callFunctionNoArgsObserved(ctx, loadValue(E, callback_bytes), instance_id);
                 }
                 return E.callFunctionNoArgs(ctx, loadValue(E, callback_bytes));
@@ -1374,4 +1388,9 @@ test "backend_dispatch: refused when tag not packed" {
     // On a single-pack Linux NG build, jsc is not packed.
     if (comptime multi_pack.isPacked(.jsc)) return error.SkipZigTest;
     try std.testing.expect(createPacked(.jsc) == null);
+}
+
+test "backend_dispatch: createPacked does not admit Hermes" {
+    // Production API: createPacked only instantiates packed QuickJS/JSC engines. Hermes is a mono -Dbackend=hermes spike (docs/capability.md: not a multi-engine pack). This remains true even when the primary backend is Hermes and the packed-bit for .hermes is unset.
+    try std.testing.expect(createPacked(.hermes) == null);
 }

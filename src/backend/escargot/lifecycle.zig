@@ -18,10 +18,15 @@ pub fn newContext(rt: Runtime) ?Context {
 }
 
 pub fn freeContext(ctx: Context) void {
+    // Safe when destroy runs on a thread other than runtime_new's caller.
+    c_api.escargot_thread_enter();
+    defer c_api.escargot_thread_leave();
     c_api.escargot_context_free(ctx);
 }
 
 pub fn freeRuntime(rt: Runtime) void {
+    c_api.escargot_thread_enter();
+    defer c_api.escargot_thread_leave();
     c_api.escargot_runtime_free(rt);
 }
 

@@ -111,6 +111,18 @@
     {
       "path": "harness/compareArray.js",
       "sha256": "3330423fe116cd96db70077d194471319ae9767ba1c8e2f73d7c133c5204509d"
+    },
+    {
+      "path": "test/built-ins/Promise/resolve/S25.4.4.5_A3.1_T1.js",
+      "sha256": "eb2a24625be6272a8a7ebcf04a4e41d4bdd5b0ff169c437cd2750f3d68646626"
+    },
+    {
+      "path": "test/built-ins/Promise/resolve/arg-poisoned-then.js",
+      "sha256": "1ee1dd4fcc8acce312224923967d0361dcc0a2a54b80dcb22907b5d80aee383f"
+    },
+    {
+      "path": "harness/promiseHelper.js",
+      "sha256": "76cf933b2a7069dc22fcff70d6d4f082ab777b3485e08b79ab4d6a18aef9df9c"
     }
   ],
   "tests": [
@@ -331,6 +343,26 @@
       ],
       "includes": [],
       "async": false
+    },
+    {
+      "path": "test/built-ins/Promise/resolve/S25.4.4.5_A3.1_T1.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [
+        "promiseHelper.js"
+      ],
+      "async": true
+    },
+    {
+      "path": "test/built-ins/Promise/resolve/arg-poisoned-then.js",
+      "variants": [
+        "sloppy",
+        "strict"
+      ],
+      "includes": [],
+      "async": true
     }
   ]
 }

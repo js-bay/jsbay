@@ -63,6 +63,9 @@ pub fn processPendingJobs(ctx: Context) void {
     const opaque_ptr = c_api.hermes_context_get_opaque(ctx);
     const instance_id: i32 = if (opaque_ptr) |p| @bitCast(@as(u32, @truncate(@intFromPtr(p)))) else 0;
     if (instance_id != 0 and shouldStopPendingJobDrain(instance_id)) return;
+    const runtime_control = @import("../../runtime/runtime_control.zig");
+    if (instance_id != 0) runtime_control.armHermesDeadlineWatch(instance_id);
+    defer if (instance_id != 0) runtime_control.disarmHermesDeadlineWatch(instance_id);
     c_api.hermes_process_pending_jobs(ctx);
 }
 

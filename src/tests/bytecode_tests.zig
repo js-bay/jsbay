@@ -307,3 +307,40 @@ test "bytecode: the same compiled bytes run again in the same and in another eng
         }
     }.run);
 }
+
+// Same-pin Hermes HBC version mismatch is an internal decode failure, not a JS
+// exception. The expected version is read from the artifact this runtime just
+// compiled; it is never hard-coded (not 96, not 100).
+test "bytecode: same-pin HBC version mismatch reports decode_failed=true" {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
+
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            const src = "globalThis.__hbc_mismatch_ran = (globalThis.__hbc_mismatch_ran || 0) + 1; 1";
+            const cr = bytecode.compile(id, src, "<hbc-version-mismatch>");
+            defer bytecode.freeCompileResult(cr);
+            try testing.expect(cr.err == null);
+            const bytes = cr.bytes orelse return error.NoBytes;
+            try testing.expect(bytes.len >= 12);
+
+            const kHbcMagic: u64 = 0x1F1903C103BC1FC6;
+            const magic = std.mem.readInt(u64, bytes[0..8], .little);
+            try testing.expectEqual(kHbcMagic, magic);
+
+            const patched = try testing.allocator.dupe(u8, bytes);
+            defer testing.allocator.free(patched);
+            const compiled_version = std.mem.readInt(u32, patched[8..12], .little);
+            std.mem.writeInt(u32, patched[8..12], compiled_version +% 1, .little);
+            try testing.expect(std.mem.readInt(u32, patched[8..12], .little) != compiled_version);
+
+            const res = bytecode.runBytecode(id, patched);
+            defer helpers.freeEvalResult(res);
+            try testing.expect(res.err != null);
+            try testing.expect(res.decode_failed);
+            // Stale header must not have executed the payload.
+            try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__hbc_mismatch_ran || 0"));
+            // Instance remains usable.
+            try helpers.expectEvalEquals(id, "1+1", "2");
+        }
+    }.run);
+}

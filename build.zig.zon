@@ -66,6 +66,8 @@
         "vendor/quickjs-ng-location-precision.patch",
         "vendor/quickjs-ng-error-stack-header.patch",
         "vendor/quickjs-ng-debug-eval-cache.patch",
+        "vendor/quickjs-ng-unresolve-modules.patch",
+        "vendor/quickjs-ng-pending-tla-module.patch",
         "vendor/quickjs-script-tags.patch",
         "vendor/hermes-cdp-frame-url.patch",
         "vendor/hermes-cdp-cancel-pending.patch",

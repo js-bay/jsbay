@@ -227,7 +227,15 @@ test "error observer: synchronous evaluation and interrupted timer stay quiet" {
     try helpers.evalErr(id, "throw { marker: 101 };");
     try testing.expectEqual(@as(u32, 0), log.count);
     try helpers.evalOk(id, "setTimeout(function () { throw { marker: 102 }; }, 0);");
-    try testing.expect(c_api.jsbay_engine_request_interrupt(id));
+    const interrupt_accepted = c_api.jsbay_engine_request_interrupt(id);
+    if (comptime backend.isHermesBackend(backend.active_backend) or backend.isEscargotBackend(backend.active_backend)) {
+        // Documented spike contract: requestInterrupt returns false and does not set the mid-script bit.
+        //
+        // A host-defer bit still pauses typed observer reports for this turn.
+        try testing.expect(!interrupt_accepted);
+    } else {
+        try testing.expect(interrupt_accepted);
+    }
     engine.runEventLoopOnce(id);
     try testing.expectEqual(@as(u32, 0), log.count);
     try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
@@ -338,6 +346,42 @@ test "error observer: interrupted unhandled rejection is reported after recovery
     try helpers.evalOk(id, "void 0;");
     try testing.expectEqual(@as(u32, 1), log.count);
     try testing.expectEqual(types.ErrorKind.unhandled_rejection, log.kind);
+}
+
+test "execution: expired time limit does not drain an unbounded batch of leftover short jobs" {
+    // Product contract for QJS/NG processPendingJobsImpl: an already-expired
+    // execution deadline must still enter leftover jobs so a queued
+    // `queueMicrotask(() => { while (true) {} })` can be aborted in this turn
+    // (do not delete the existing while(true) tests), but it must not keep
+    // starting new short jobs without bound. This is a drain-boundary test,
+    // not a change to the public time-limit API.
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    const id = helpers.nextInstanceId();
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+
+    try helpers.evalOk(id,
+        \\globalThis.n = 0;
+        \\setTimeout(function () {
+        \\  const end = Date.now() + 40;
+        \\  while (Date.now() < end) {}
+        \\}, 0);
+        \\setTimeout(function () {
+        \\  var i = 0;
+        \\  while (i < 10000) {
+        \\    queueMicrotask(function () { globalThis.n = (globalThis.n || 0) + 1; });
+        \\    i++;
+        \\  }
+        \\}, 0);
+    );
+    try testing.expect(c_api.jsbay_engine_set_execution_time_limit(id, 20));
+    engine.runEventLoopOnce(id);
+    // A second turn covers helpers that process only one due macrotask per call.
+    engine.runEventLoopOnce(id);
+    // Clear the limit before the probe eval so a leftover-expired interrupt cannot abort the read. expectEvalEquals captures n during eval, then processPendingJobs may drain any remaining short jobs after the value is already recorded.
+    try testing.expect(c_api.jsbay_engine_set_execution_time_limit(id, 0));
+    try helpers.expectEvalEquals(id, "String(globalThis.n < 100)", "true");
+    try helpers.evalOk(id, "void 0;");
 }
 
 test "error observer: interrupt during a batch preserves unreported rejections" {

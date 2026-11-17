@@ -333,7 +333,7 @@ pub fn runCommonJS(instance_id: i32, bytes: []const u8, filename: []const u8) Cj
     }
 }
 
-// JSC getter exceptions are explicitly protected while crossing Zig error unions; host-returning APIs release them rather than leaving a stale capture.
+// JSC, Hermes, and Escargot getter exceptions are retained while crossing Zig error unions; host-returning APIs release them rather than leaving a stale capture.
 fn captureException(ctx: ActiveEngine.Context, value: ActiveEngine.Value) void {
     if (comptime backend.active_backend == .jsc) {
         const state = stateFromCtx(ctx) orelse return;
@@ -341,11 +341,22 @@ fn captureException(ctx: ActiveEngine.Context, value: ActiveEngine.Value) void {
         const previous = state.pending_exception;
         state.pending_exception = retained;
         if (previous) |old| ActiveEngine.freeValue(ctx, old);
+        return;
+    }
+    if (comptime backend.isHermesBackend(backend.active_backend) or backend.isEscargotBackend(backend.active_backend)) {
+        // Result APIs already transferred ownership of the thrown value (including a retained undefined).
+        const state = stateFromCtx(ctx) orelse {
+            ActiveEngine.freeValue(ctx, value);
+            return;
+        };
+        const previous = state.pending_exception;
+        state.pending_exception = value;
+        if (previous) |old| ActiveEngine.freeValue(ctx, old);
     }
 }
 
 fn discardCapturedException(ctx: ActiveEngine.Context) void {
-    if (comptime backend.active_backend == .jsc) {
+    if (comptime backend.active_backend == .jsc or backend.isHermesBackend(backend.active_backend) or backend.isEscargotBackend(backend.active_backend)) {
         if (stateFromCtx(ctx)) |state| {
             if (state.pending_exception) |exception| ActiveEngine.freeValue(ctx, exception);
             state.pending_exception = null;
@@ -708,6 +719,25 @@ fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: D
             return null;
         },
         error.CallFailed => {
+            if (comptime backend.isHermesBackend(backend.active_backend)) {
+                if (stateFromCtx(ctx)) |state| {
+                    if (state.pending_exception) |value| {
+                        state.pending_exception = null;
+                        // Rethrow the original JS value (Error, marker object, or undefined), not a stand-in string.
+                        @import("../../backend/hermes/c_api.zig").hermes_throw_value(ctx, value);
+                        return null;
+                    }
+                }
+            }
+            if (comptime backend.isEscargotBackend(backend.active_backend)) {
+                if (stateFromCtx(ctx)) |state| {
+                    if (state.pending_exception) |value| {
+                        state.pending_exception = null;
+                        @import("../../backend/escargot/c_api.zig").escargot_throw_value(ctx, value);
+                        return null;
+                    }
+                }
+            }
             _ = ActiveEngine.throwError(ctx, "require: module threw during evaluation");
             return null;
         },

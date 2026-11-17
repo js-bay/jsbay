@@ -107,6 +107,7 @@ pub const EscargotBackend = struct {
     pub const isObjectVal = value_mod.isObjectVal;
     pub const isArray = value_mod.isArray;
     pub const sameValue = value_mod.sameValue;
+    pub const objectIdentity = value_mod.objectIdentity;
     pub const strictEqual = value_mod.strictEqual;
     pub const toBool = value_mod.toBool;
     pub const toInt32 = value_mod.toInt32;

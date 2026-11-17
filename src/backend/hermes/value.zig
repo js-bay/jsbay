@@ -55,6 +55,13 @@ pub fn isConstructor(ctx: Context, v: Value) bool {
 pub fn sameValue(ctx: Context, a: Value, b: Value) bool {
     return c_api.hermes_strict_equal(ctx, a, b);
 }
+
+/// Stable JS object identity across retainMove / get / call handle boxes. 0 is a documented failure/non-object sentinel from hermes_object_identity.
+pub fn objectIdentity(ctx: Context, v: Value) ?u64 {
+    const id = c_api.hermes_object_identity(ctx, v);
+    return if (id == 0) null else id;
+}
+
 pub fn strictEqual(ctx: Context, a: Value, b: Value) bool {
     return c_api.hermes_strict_equal(ctx, a, b);
 }
@@ -169,6 +176,28 @@ pub fn callFunction(ctx: Context, fn_val: Value, this_val: Value, args: []const 
     }
     return v;
 }
+/// Call with no args and deliver a thrown JS value to the typed error observer before formatting diagnostics.
+pub fn callFunctionNoArgsObserved(ctx: Context, fn_val: Value, instance_id: i32) ?[]const u8 {
+    const this_val = c_api.hermes_get_global(ctx);
+    defer c_api.hermes_free_value(ctx, this_val);
+    const result = c_api.hermes_call_result(ctx, fn_val, this_val, null, 0);
+    defer if (result.value != null) c_api.hermes_free_value(ctx, result.value);
+    if (result.exception != null) {
+        @import("exception.zig").reportAsyncUncaught(ctx, instance_id, result.exception);
+        var len: usize = 0;
+        const ptr = c_api.hermes_value_to_utf8_n(ctx, result.exception, &len);
+        c_api.hermes_free_value(ctx, result.exception);
+        if (ptr) |bytes| {
+            defer std.c.free(bytes);
+            return std.heap.c_allocator.dupe(u8, bytes[0..len]) catch {
+                return "JavaScript error";
+            };
+        }
+        return std.heap.c_allocator.dupe(u8, "JavaScript error") catch "JavaScript error";
+    }
+    return null;
+}
+
 /// Call with no args; returns owned error text if the call threw, else null.
 pub fn callFunctionNoArgs(ctx: Context, fn_val: Value) ?[]const u8 {
     var err: ?[*:0]u8 = null;
