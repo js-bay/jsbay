@@ -2,10 +2,9 @@
 set -euo pipefail
 
 test_root=$(cd "$(dirname "$0")/../.." && pwd)
-: "${DEVECO_SDK_HOME:?set DEVECO_SDK_HOME to the DevEco SDK directory}"
+source "$test_root/scripts/harmony-toolchain.sh"
+harmony_toolchain_resolve
 : "${JSBAY_LIBRARY:?set JSBAY_LIBRARY to the matching OpenHarmony libjsbay.a}"
-: "${HVIGORW:?set HVIGORW to the DevEco hvigorw executable}"
-: "${OHPM:?set OHPM to the Harmony ohpm executable}"
 
 # Hvigor compiles every ArkTS source in the HAR. Copy the device-callable conformance fixture into that source set for this build only, so this script proves it typechecks with the real ArkTS checker without shipping test code.
 fixture_sources=()

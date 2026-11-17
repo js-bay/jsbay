@@ -524,9 +524,9 @@ test "test_local_harmony_staging_accepts_tar_and_zip_and_rejects_fixture" {
     const fixture = try temp(a, io, "jsbay-harmony-stage");
     defer Dir.cwd().deleteTree(io, fixture) catch {};
     const repo = try join(a, fixture, &.{"repo"});
-    var setup = try mustRun(a, io, fixture, &.{ "mkdir", "-p", try join(a, repo, &.{"scripts"}), try join(a, repo, &.{ "tests", "harmony-sdk", "fixture" }), try join(a, repo, &.{ "sdk", "harmony", "src", "main", "ets" }), try join(a, repo, &.{ "sdk", "harmony", "examples" }), try join(a, repo, &.{ "sdk", "harmony", ".cxx" }), try join(a, repo, &.{ "sdk", "harmony", "oh_modules" }), try join(a, repo, &.{ "packages", "@ohos", "hvigor" }), try join(a, repo, &.{ "packages", "@ohos", "hvigor-ohos-plugin" }) });
+    var setup = try mustRun(a, io, fixture, &.{ "mkdir", "-p", try join(a, repo, &.{"scripts"}), try join(a, repo, &.{ "default", "openharmony", "native" }), try join(a, repo, &.{ "tests", "harmony-sdk", "fixture" }), try join(a, repo, &.{ "sdk", "harmony", "src", "main", "ets" }), try join(a, repo, &.{ "sdk", "harmony", "examples" }), try join(a, repo, &.{ "sdk", "harmony", ".cxx" }), try join(a, repo, &.{ "sdk", "harmony", "oh_modules" }), try join(a, repo, &.{ "packages", "@ohos", "hvigor" }), try join(a, repo, &.{ "packages", "@ohos", "hvigor-ohos-plugin" }) });
     defer setup.deinit();
-    for ([_][]const []const u8{ &.{ try join(a, cwd, &.{ "scripts", "stage-harmony-har.sh" }), try join(a, repo, &.{ "scripts", "stage-harmony-har.sh" }) }, &.{ try join(a, cwd, &.{ "tests", "harmony-sdk", "build_har.sh" }), try join(a, repo, &.{ "tests", "harmony-sdk", "build_har.sh" }) } }) |copy| {
+    for ([_][]const []const u8{ &.{ try join(a, cwd, &.{ "scripts", "stage-harmony-har.sh" }), try join(a, repo, &.{ "scripts", "stage-harmony-har.sh" }) }, &.{ try join(a, cwd, &.{ "scripts", "harmony-toolchain.sh" }), try join(a, repo, &.{ "scripts", "harmony-toolchain.sh" }) }, &.{ try join(a, cwd, &.{ "tests", "harmony-sdk", "build_har.sh" }), try join(a, repo, &.{ "tests", "harmony-sdk", "build_har.sh" }) } }) |copy| {
         var out = try mustRun(a, io, fixture, &.{ "cp", copy[0], copy[1] });
         defer out.deinit();
     }
@@ -546,7 +546,7 @@ test "test_local_harmony_staging_accepts_tar_and_zip_and_rejects_fixture" {
     try write(io, object, "\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\xb7\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00");
     var ar = try mustRun(a, io, repo, &.{ "zig", "ar", "rcs", core, object });
     defer ar.deinit();
-    try executable(a, io, repo, try join(a, repo, &.{"tool"}), "#!/bin/sh\nset -eu\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\ncase \"$*\" in\n  *assembleHar*)\n    for package in hvigor hvigor-ohos-plugin; do\n      test -L \"$root/sdk/harmony/node_modules/@ohos/$package\"\n      test -L \"$root/tests/harmony-sdk/fixture/node_modules/@ohos/$package\"\n    done\n    work=$(mktemp -d); trap 'rm -rf \"$work\"' EXIT\n    mkdir -p \"$work/package/libs/arm64-v8a\" \"$work/package/ets\" \"$work/package/src/main/ets\"\n    : > \"$work/package/libs/arm64-v8a/libjsbay_harmony.so\"; : > \"$work/package/ets/modules.abc\"; : > \"$work/package/src/main/ets/JsBay.d.ets\"; : > \"$work/package/src/main/ets/index.d.ets\"\n    [ \"${HAR_FIXTURE:-}\" = 1 ] && : > \"$work/package/src/main/ets/ConformanceFixture.ets\"\n    har=\"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\"; mkdir -p \"$(dirname \"$har\")\"; rm -f \"$har\"\n    if [ \"${HAR_FORMAT:-tar}\" = zip ]; then (cd \"$work\" && zip -qr \"$har\" package); else tar -czf \"$har\" -C \"$work\" package; fi\n    ;;\n  *clean*) rm -f \"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\" ;;\nesac\n");
+    try executable(a, io, repo, try join(a, repo, &.{"tool"}), "#!/bin/sh\nset -eu\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\ncase \"$*\" in\n  *assembleHar*)\n    for package in hvigor hvigor-ohos-plugin; do\n      test -L \"$root/sdk/harmony/node_modules/@ohos/$package\"\n      test -L \"$root/tests/harmony-sdk/fixture/node_modules/@ohos/$package\"\n    done\n    work=$(mktemp -d); trap 'rm -rf \"$work\"' EXIT\n    mkdir -p \"$work/package/libs/arm64-v8a\" \"$work/package/ets\" \"$work/package/src/main/ets\"\n    : > \"$work/package/libs/arm64-v8a/libjsbay_harmony.so\"; : > \"$work/package/ets/modules.abc\"; : > \"$work/package/src/main/ets/JsBay.d.ets\"; : > \"$work/package/src/main/ets/index.d.ets\"\n    [ \"${HAR_FIXTURE:-}\" = 1 ] && : > \"$work/package/src/main/ets/Qualityconformance.d.ets\"\n    har=\"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\"; mkdir -p \"$(dirname \"$har\")\"; rm -f \"$har\"\n    if [ \"${HAR_FORMAT:-tar}\" = zip ]; then (cd \"$work\" && zip -qr \"$har\" package); else tar -czf \"$har\" -C \"$work\" package; fi\n    ;;\n  *clean*) rm -f \"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\" ;;\nesac\n");
     try executable(a, io, repo, try join(a, repo, &.{"node"}), "#!/bin/sh\ncase \"$*\" in\n  *hvigor-ohos-plugin*) printf '%s\\n' \"$FAKE_PACKAGE_ROOT/@ohos/hvigor-ohos-plugin/package.json\" ;;\n  *) printf '%s\\n' \"$FAKE_PACKAGE_ROOT/@ohos/hvigor/package.json\" ;;\nesac\n");
     try executable(a, io, repo, try join(a, repo, &.{"link-check"}), "#!/bin/sh\nset -eu\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\nfor package in hvigor hvigor-ohos-plugin; do\n  test -L \"$root/sdk/harmony/node_modules/@ohos/$package\"\n  test -L \"$root/tests/harmony-sdk/fixture/node_modules/@ohos/$package\"\ndone\n");
     var zig_which = try mustRun(a, io, repo, &.{ "sh", "-c", "command -v zig" });
@@ -588,11 +588,11 @@ test "test_local_harmony_staging_accepts_tar_and_zip_and_rejects_fixture" {
     var zip_bad = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], "HAR_FORMAT=zip", "HAR_FIXTURE=1", env[10], env[11], env[12], try join(a, repo, &.{"zip-fixture-stage"}), "1.2.3" }, repo);
     defer zip_bad.deinit();
     try testing.expect(!zip_bad.succeeded());
-    try contains(zip_bad.result.stderr, "ConformanceFixture");
+    try contains(zip_bad.result.stderr, "Quality");
     var bad = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], "HAR_FIXTURE=1", env[10], env[11], env[12], try join(a, repo, &.{"fixture-stage"}), "1.2.3" }, repo);
     defer bad.deinit();
     try testing.expect(!bad.succeeded());
-    try contains(bad.result.stderr, "ConformanceFixture");
+    try contains(bad.result.stderr, "Quality");
     for ([_][]const u8{ "sdk/harmony", "tests/harmony-sdk/fixture" }) |project| {
         const scope = try join(a, repo, &.{ project, "node_modules", "@ohos" });
         var mkdir = try mustRun(a, io, repo, &.{ "mkdir", "-p", scope });

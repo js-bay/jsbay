@@ -336,6 +336,60 @@ test "runtime_control: clearing lifecycle stop preserves user interrupt and dead
     }.run);
 }
 
+test "execution windows: one manual deadline spans multiple VM entries and nested budgets" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            try testing.expect(rc.setExecutionTimeLimit(id, 60_000));
+            defer _ = rc.setExecutionTimeLimit(id, 0);
+            const frame_deadline = rc.executionDeadlineMillis(id).?;
+            try testing.expect(rc.setExecutionBudget(id, 120_000));
+            defer _ = rc.setExecutionBudget(id, 0);
+
+            for (0..3) |_| {
+                const before_entry = io.monotonicMilliseconds();
+                while (io.monotonicMilliseconds() == before_entry) std.atomic.spinLoopHint();
+                try helpers.expectEvalEquals(id, "6 * 7", "42");
+                try testing.expectEqual(frame_deadline, rc.executionDeadlineMillis(id).?);
+                try testing.expectEqual(frame_deadline, rc.effectiveExecutionDeadlineMillis(id).?);
+                try testing.expect(rc.beginExecutionBudget(id));
+                defer rc.endExecutionBudget(id);
+                try testing.expect(rc.beginExecutionBudget(id));
+                defer rc.endExecutionBudget(id);
+                try testing.expectEqual(frame_deadline, rc.effectiveExecutionDeadlineMillis(id).?);
+            }
+        }
+    }.run);
+}
+
+test "execution windows: per-entry budgets reset independently of the manual deadline" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            try testing.expect(rc.setExecutionTimeLimit(id, 120_000));
+            defer _ = rc.setExecutionTimeLimit(id, 0);
+            const frame_deadline = rc.executionDeadlineMillis(id).?;
+            try testing.expect(rc.setExecutionBudget(id, 60_000));
+            defer _ = rc.setExecutionBudget(id, 0);
+
+            try testing.expect(rc.beginExecutionBudget(id));
+            const entry_deadline = rc.effectiveExecutionDeadlineMillis(id).?;
+            try testing.expect(entry_deadline < frame_deadline);
+            try testing.expect(rc.setExecutionBudget(id, 180_000));
+            try testing.expect(rc.beginExecutionBudget(id));
+            try testing.expectEqual(entry_deadline, rc.effectiveExecutionDeadlineMillis(id).?);
+            rc.endExecutionBudget(id);
+            rc.endExecutionBudget(id);
+            try testing.expectEqual(frame_deadline, rc.effectiveExecutionDeadlineMillis(id).?);
+
+            try testing.expect(rc.beginExecutionBudget(id));
+            defer rc.endExecutionBudget(id);
+            try testing.expectEqual(frame_deadline, rc.effectiveExecutionDeadlineMillis(id).?);
+            try testing.expect(rc.setExecutionTimeLimit(id, 0));
+            try testing.expect(rc.executionDeadlineMillis(id) == null);
+            try testing.expect(rc.effectiveExecutionDeadlineMillis(id).? > frame_deadline);
+        }
+    }.run);
+}
+
 // ---------------------------------------------------------------------------
 // 8. An interrupt unwinds through script-level try/catch/finally, promise executors, and microtask jobs.
 //

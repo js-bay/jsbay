@@ -8,6 +8,88 @@ struct SwiftConsumer {
     let engine = try Engine(id: 81_001, allowMainRunLoopAttach: true)
     defer { try? engine.close() }
     do {
+      _ = try engine.evaluate(
+        "function namedFailure(){throw new Error('failure')} namedFailure()", filename: "details.js"
+      )
+      fatalError("expected JavaScript exception")
+    } catch let error as JsException {
+      let details = try error.details()
+      guard details.stackTraceString?.contains("namedFailure") == true,
+        details.stackTraceString?.contains("details.js") == true
+      else {
+        fatalError("exception details must preserve stack and filename")
+      }
+      guard try error.value.get("message").string() == "failure" else {
+        fatalError("non-consuming exception details must preserve the thrown value")
+      }
+      _ = try error.detailsAndClose()
+      do {
+        _ = try error.value.string()
+        fatalError("consuming exception details must close the thrown value")
+      } catch let closed as JsBayError {
+        guard closed.statusCode == JsBayStatus.staleValue else { throw closed }
+      }
+      do {
+        _ = try error.details()
+        fatalError("exception details must reject a consumed value")
+      } catch let closed as JsBayError {
+        guard closed.statusCode == JsBayStatus.staleValue else { throw closed }
+      }
+    }
+    do {
+      _ = try engine.evaluate("throw {message:'display marker', stack:'frameOne\\nframeTwo'}")
+      fatalError("expected exception with a separate message and stack")
+    } catch let error as JsException {
+      guard try error.describeDetailedAndClose() == "display marker\nframeOne\nframeTwo" else {
+        fatalError("detailed display must preserve a message missing from the stack")
+      }
+    }
+    do {
+      _ = try engine.evaluate(
+        "throw {message:'repeated marker', stack:'Error: repeated marker\\nframe'}")
+      fatalError("expected exception with message in the first stack line")
+    } catch let error as JsException {
+      guard try error.describeDetailedAndClose() == "Error: repeated marker\nframe" else {
+        fatalError("detailed display must not duplicate a message already in the stack")
+      }
+    }
+    do {
+      _ = try engine.evaluate(
+        "throw {message:'alias', sourceURL:'alias.js', line:4, column:2}", filename: "alias.js")
+      fatalError("expected JavaScript location exception")
+    } catch let error as JsException {
+      let details = try error.details()
+      guard details.fileName == "alias.js", details.lineNumber == 4, details.columnNumber == 2
+      else {
+        fatalError("exception details must support source location aliases")
+      }
+      try error.value.close()
+    }
+    do {
+      _ = try engine.evaluate(
+        "throw {message:'invalid', line:1.5, column:2147483648}", filename: "invalid-location.js")
+      fatalError("expected invalid location exception")
+    } catch let error as JsException {
+      let details = try error.details()
+      guard details.lineNumber == nil, details.columnNumber == nil else {
+        fatalError("invalid source locations must be omitted")
+      }
+      try error.value.close()
+    }
+    do {
+      _ = try engine.evaluate(
+        "throw {message:'failure', stack:{toString(){throw 8}}}",
+        filename: "throwing-stack-conversion.js")
+      fatalError("expected throwing stack conversion")
+    } catch let error as JsException {
+      let details = try error.details()
+      guard details.stackTraceString == nil, try error.value.get("message").string() == "failure"
+      else {
+        fatalError("throwing stack conversion must preserve the original exception")
+      }
+      try error.value.close()
+    }
+    do {
       _ = try Engine(id: 81_090)
       fatalError("main run loop attach must be refused without opt-in")
     } catch let error as JsBayError {
@@ -278,11 +360,21 @@ struct SwiftConsumer {
       guard error.statusCode == JsBayStatus.staleValue else { throw error }
     }
     _ = try engine.bind("swiftBorrowedDescription") { thisValue, _ in
+      let originalKind = try thisValue.type()
       do {
         _ = try engine.exception(thisValue).describeAndClose()
         fatalError("borrowed exception description succeeded")
       } catch let error as JsBayError {
         guard error.statusCode == JsBayStatus.invalidArgument else { throw error }
+      }
+      do {
+        _ = try engine.exception(thisValue).detailsAndClose()
+        fatalError("borrowed exception details consumption succeeded")
+      } catch let error as JsBayError {
+        guard error.statusCode == JsBayStatus.invalidArgument else { throw error }
+      }
+      guard try thisValue.type() == originalKind else {
+        fatalError("rejected borrowed exception consumption invalidated the callback value")
       }
       return try engine.undefined()
     }
@@ -547,6 +639,32 @@ struct SwiftConsumer {
 
     let other = try Engine(id: 81_003, allowMainRunLoopAttach: true)
     defer { try? other.close() }
+    var wrongThreadException: JsException?
+    do {
+      _ = try engine.evaluate("throw new Error('wrong thread details')")
+      fatalError("expected exception for wrong-thread details check")
+    } catch let error as JsException {
+      wrongThreadException = error
+    }
+    guard let wrongThreadException else { fatalError("missing JavaScript exception") }
+    let wrongThreadDetailsDone = DispatchSemaphore(value: 0)
+    var rejectedWrongThreadDetails = false
+    DispatchQueue.global().async {
+      defer { wrongThreadDetailsDone.signal() }
+      do {
+        _ = try wrongThreadException.details()
+      } catch let error as JsBayError {
+        rejectedWrongThreadDetails = error.statusCode == JsBayStatus.wrongThread
+      } catch {}
+    }
+    _ = wrongThreadDetailsDone.wait(timeout: .now() + 5)
+    guard rejectedWrongThreadDetails else {
+      fatalError("exception details accepted a foreign thread")
+    }
+    guard try wrongThreadException.value.get("message").string() == "wrong thread details" else {
+      fatalError("wrong-thread details failure changed the original exception")
+    }
+    try wrongThreadException.value.close()
     let wrongThreadDone = DispatchSemaphore(value: 0)
     var rejectedWrongThread = false
     DispatchQueue.global().async {

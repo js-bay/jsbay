@@ -41,6 +41,7 @@ if [ "$BACKEND" = jsc ]; then BACKEND_FLAGS=(-DJSBAY_NO_BYTECODE_CACHE); fi
 
 xcrun --sdk "$PLATFORM" swiftc "${SWIFT_FLAGS[@]}" -emit-library -static -emit-module \
     -module-name JsBaySDK "$ROOT/sdk/apple/Sources/JsBaySDK/JsBaySDK.swift" \
+    "$ROOT/sdk/apple/Sources/JsBaySDK/DedicatedEngineThread.swift" \
     -emit-module-path "$OUTPUT/JsBaySDK.swiftmodule" -o "$OUTPUT/libJsBaySDK.a"
 
 if [ "$PLATFORM" = macosx ]; then
@@ -48,6 +49,16 @@ if [ "$PLATFORM" = macosx ]; then
         -I"$OUTPUT" "$ROOT/tests/apple-sdk/SwiftConsumer.swift" "$OUTPUT/libJsBaySDK.a" "$ARCHIVE" \
         -framework Foundation -framework JavaScriptCore -Xlinker -lm -o "$OUTPUT/swift-consumer"
     "$OUTPUT/swift-consumer"
+    if [ "$BACKEND" != jsc ]; then
+        xcrun --sdk "$PLATFORM" swiftc "${SWIFT_FLAGS[@]}" "${BACKEND_FLAGS[@]}" -parse-as-library \
+            -I"$OUTPUT" "$ROOT/tests/apple-sdk/ExceptionOwnershipConsumer.swift" "$OUTPUT/libJsBaySDK.a" "$ARCHIVE" \
+            -framework Foundation -framework JavaScriptCore -Xlinker -lm -o "$OUTPUT/exception-ownership-consumer"
+        "$OUTPUT/exception-ownership-consumer"
+    fi
+    xcrun --sdk "$PLATFORM" swiftc "${SWIFT_FLAGS[@]}" -parse-as-library \
+        -I"$OUTPUT" "$ROOT/tests/apple-sdk/DedicatedEngineThreadConsumer.swift" "$OUTPUT/libJsBaySDK.a" "$ARCHIVE" \
+        -framework Foundation -framework JavaScriptCore -Xlinker -lm -o "$OUTPUT/dedicated-engine-thread-consumer"
+    "$OUTPUT/dedicated-engine-thread-consumer"
     xcrun --sdk "$PLATFORM" clang "${CLANG_FLAGS[@]}" "${BACKEND_FLAGS[@]}" \
         "$ROOT/sdk/apple/Sources/JsBayObjC/JSBay.m" "$ROOT/tests/apple-sdk/ObjectiveCConsumer.m" \
         "$ARCHIVE" -framework Foundation -framework JavaScriptCore -lm -o "$OUTPUT/objc-consumer"
