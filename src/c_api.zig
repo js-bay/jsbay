@@ -2314,7 +2314,8 @@ pub export fn jsbay_value_new_array_buffer_no_copy(
     const fin: ?value_buffers.BufferFinalizer = if (deallocator) |d| @ptrCast(d) else null;
     const maybe_val = value_buffers.newArrayBufferFromBytes(id, byte_ptr, len, fin, user_data);
     if (maybe_val) |val| {
-        reserved.commit(val);
+        var owned = value_mod.OwnedValue.init(op.ctx, val);
+        reserved.commit(&owned);
         out_value.* = reserved.handle;
         return API_OK;
     } else {

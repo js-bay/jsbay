@@ -4,6 +4,7 @@ const std = @import("std");
 const sync = @import("zev");
 const backend = @import("../backend.zig");
 const instance_map = @import("../runtime/instance_map.zig");
+const OwnedValue = @import("../value/root.zig").OwnedValue;
 
 const Owner = struct { thread_id: u64 };
 const ActiveEngine = backend.ActiveEngine;
@@ -113,7 +114,8 @@ pub const ReserveHandleError = error{
 pub const ReservedHandle = struct {
     handle: u64,
 
-    pub fn commit(self: ReservedHandle, value: ActiveEngine.Value) void {
+    pub fn commit(self: ReservedHandle, owned: *OwnedValue) void {
+        const value = owned.release();
         mutex.lock();
         defer mutex.unlock();
         if (values.getPtr(self.handle)) |entry| {
@@ -235,8 +237,8 @@ test "api_value: handle reservation, commit, cancel, and access invariants" {
     try std.testing.expect(takeOwned(reserved.handle) == null);
 
     // Commit handle
-    const val = ActiveEngine.nullValue();
-    reserved.commit(val);
+    var owned = OwnedValue.init(undefined, ActiveEngine.nullValue());
+    reserved.commit(&owned);
 
     // After commit, get() returns the entry and is not reserved
     const entry = get(reserved.handle);
