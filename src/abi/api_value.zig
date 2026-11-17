@@ -81,7 +81,9 @@ pub fn hasOwner(instance_id: i32) bool {
 pub fn instanceFor(value: u64) ?i32 {
     mutex.lock();
     defer mutex.unlock();
-    return (values.get(value) orelse return null).instance_id;
+    const entry = values.get(value) orelse return null;
+    if (entry.reserved) return null;
+    return entry.instance_id;
 }
 
 pub fn get(value: u64) ?Entry {
@@ -198,10 +200,11 @@ pub fn retain(value: u64) ?u64 {
 
 pub fn release(value: u64) bool {
     mutex.lock();
-    if ((values.get(value) orelse {
+    const existing = values.get(value) orelse {
         mutex.unlock();
         return false;
-    }).borrowed) {
+    };
+    if (existing.borrowed or existing.reserved) {
         mutex.unlock();
         return false;
     }
@@ -210,4 +213,55 @@ pub fn release(value: u64) bool {
     const removed = entry orelse return false;
     if (instance_map.getPtrs(removed.value.instance_id)) |ptrs| ActiveEngine.freeValue(ptrs.ctx, removed.value.value);
     return true;
+}
+
+test "api_value: handle reservation, commit, cancel, and access invariants" {
+    const instance_id: i32 = 98_765;
+
+    // 1. Reserve handle
+    const reserved = try reserveHandle(instance_id);
+    try std.testing.expect(reserved.handle != 0);
+
+    // Invariant: Uncommitted reserved handle cannot be retrieved via get()
+    try std.testing.expect(get(reserved.handle) == null);
+
+    // Invariant: Uncommitted reserved handle cannot be queried via instanceFor()
+    try std.testing.expect(instanceFor(reserved.handle) == null);
+
+    // Invariant: Uncommitted reserved handle cannot be released via release()
+    try std.testing.expect(!release(reserved.handle));
+
+    // Invariant: Uncommitted reserved handle cannot be taken via takeOwned()
+    try std.testing.expect(takeOwned(reserved.handle) == null);
+
+    // Commit handle
+    const val = ActiveEngine.nullValue();
+    reserved.commit(val);
+
+    // After commit, get() returns the entry and is not reserved
+    const entry = get(reserved.handle);
+    try std.testing.expect(entry != null);
+    try std.testing.expect(!entry.?.reserved);
+    try std.testing.expectEqual(instance_id, entry.?.instance_id);
+
+    // takeOwned succeeds after commit
+    const taken = takeOwned(reserved.handle);
+    try std.testing.expect(taken != null);
+    try std.testing.expectEqual(instance_id, taken.?.instance_id);
+
+    // After takeOwned, handle is completely gone
+    try std.testing.expect(get(reserved.handle) == null);
+
+    // 2. Cancellation removes the reserved placeholder
+    const reserved2 = try reserveHandle(instance_id);
+    try std.testing.expect(reserved2.handle != 0);
+    reserved2.cancel();
+    try std.testing.expect(get(reserved2.handle) == null);
+    try std.testing.expect(takeOwned(reserved2.handle) == null);
+
+    // 3. dropInstance with concurrent reserved handles safely skips placeholders
+    const reserved3 = try reserveHandle(instance_id);
+    dropInstance(instance_id);
+    reserved3.cancel();
+    try std.testing.expect(get(reserved3.handle) == null);
 }

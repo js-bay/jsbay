@@ -202,7 +202,7 @@ typedef void (^JSBaySyncStarter)(JSBayValue *thisValue, NSArray<JSBayValue *> *a
 - (nullable JSBayValue *)globalValue:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)undefinedValue:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)nullValue:(NSError *_Nullable *_Nullable)error;
-typedef void (^JSBayBytesDeallocator)(void *bytes, NSUInteger length);
+typedef void (^JSBayBytesDeallocator)(void *_Nullable bytes, NSUInteger length);
 
 - (nullable JSBayValue *)boolValue:(BOOL)value error:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)numberValue:(double)value error:(NSError *_Nullable *_Nullable)error;
@@ -211,7 +211,7 @@ typedef void (^JSBayBytesDeallocator)(void *bytes, NSUInteger length);
                                     error:(NSError *_Nullable *_Nullable)error;
 - (nullable JSBayValue *)arrayBufferValueNoCopy:(NSData *)value
                                           error:(NSError *_Nullable *_Nullable)error;
-- (nullable JSBayValue *)arrayBufferValueWithBytesNoCopy:(void *)bytes
+- (nullable JSBayValue *)arrayBufferValueWithBytesNoCopy:(nullable void *)bytes
                                                   length:(NSUInteger)length
                                              deallocator:(nullable JSBayBytesDeallocator)deallocator
                                                    error:(NSError *_Nullable *_Nullable)error;

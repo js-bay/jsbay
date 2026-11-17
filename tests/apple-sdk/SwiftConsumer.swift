@@ -71,6 +71,52 @@ struct SwiftConsumer {
       fatalError("raw no-copy buffer payload mismatch")
     }
     _ = flag
+    final class ZeroFlag: @unchecked Sendable {
+      var freed = false
+    }
+    let zeroFlag = ZeroFlag()
+    let zeroPtr = UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1)
+    let zeroBuf = try engine.arrayBufferNoCopy(bytes: zeroPtr, count: 0) { ptr, _ in
+      ptr.deallocate()
+      zeroFlag.freed = true
+    }
+    guard try zeroBuf.bytes().isEmpty && zeroFlag.freed else {
+      fatalError("zero-length raw no-copy deallocation contract")
+    }
+    final class NegFlag: @unchecked Sendable {
+      var freed = false
+    }
+    let negFlag = NegFlag()
+    let negPtr = UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1)
+    do {
+      _ = try engine.arrayBufferNoCopy(bytes: negPtr, count: -1) { ptr, _ in
+        ptr.deallocate()
+        negFlag.freed = true
+      }
+      fatalError("negative-length raw no-copy should throw")
+    } catch {
+      guard negFlag.freed else {
+        fatalError("negative-length raw no-copy deallocation contract")
+      }
+    }
+    let closedEngine = try Engine(id: 88_776, allowMainRunLoopAttach: true)
+    try closedEngine.close()
+    final class ClosedFlag: @unchecked Sendable {
+      var freed = false
+    }
+    let closedFlag = ClosedFlag()
+    let closedPtr = UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1)
+    do {
+      _ = try closedEngine.arrayBufferNoCopy(bytes: closedPtr, count: 4) { ptr, _ in
+        ptr.deallocate()
+        closedFlag.freed = true
+      }
+      fatalError("closed engine raw no-copy should throw")
+    } catch {
+      guard closedFlag.freed else {
+        fatalError("closed engine raw no-copy deallocation contract")
+      }
+    }
     guard
       try engine.evaluate("new DataView(new Uint8Array([8,9,0,255,7]).buffer,2,2)").bytes()
         == Data([0, 255])

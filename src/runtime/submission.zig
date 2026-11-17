@@ -515,3 +515,23 @@ test "submission: asynchronous GC task debouncing and lifecycle" {
     try testing.expect(posted_after);
     engine.runEventLoopOnce(instance_id);
 }
+
+test "submission: postGcWithAllocator error propagation" {
+    const instance_id: i32 = 58_316;
+
+    // 1. InstanceNotFound
+    try testing.expectError(error.InstanceNotFound, postGcWithAllocator(testing.allocator, 999_998, 1));
+
+    // 2. StaleGeneration
+    try testing.expect(engine.create(instance_id, .{}));
+    defer engine.destroy(instance_id);
+    const token = dispatch.captureInstanceToken(instance_id) orelse return error.MissingToken;
+
+    try testing.expectError(error.StaleGeneration, postGcWithAllocator(testing.allocator, instance_id, token.generation + 10));
+
+    // 3. ShutdownInProgress (sealed shutdown rejects submissions)
+    try testing.expect(runtime_control.beginShutdown(instance_id, 1_000));
+    try testing.expect(runtime_control.sealShutdown(instance_id));
+    try testing.expectError(error.ShutdownInProgress, postGcWithAllocator(testing.allocator, instance_id, token.generation));
+    _ = runtime_control.requestShutdownCancel(instance_id);
+}

@@ -187,19 +187,48 @@ int jsbay_objc_sdk_probe(void) {
         rawBytes[2] = 9;
         rawBytes[3] = 10;
         __block BOOL rawFreed = NO;
-        JSBayValue *rawNoCopy = [engine arrayBufferValueWithBytesNoCopy:rawBytes
-                                                                 length:4
-                                                            deallocator:^(void *b, NSUInteger l) {
-                                                                (void)l;
-                                                                free(b);
-                                                                rawFreed = YES;
-                                                            }
-                                                                  error:&error];
+        JSBayValue *rawNoCopy =
+            [engine arrayBufferValueWithBytesNoCopy:rawBytes
+                                             length:4
+                                        deallocator:^(void *_Nullable b, NSUInteger l) {
+                                            (void)l;
+                                            if (b)
+                                                free(b);
+                                            rawFreed = YES;
+                                        }
+                                              error:&error];
         uint8_t expectedRaw[] = {7, 8, 9, 10};
         Check([[rawNoCopy dataValue:&error] isEqualToData:[NSData dataWithBytes:expectedRaw
                                                                          length:4]],
               @"raw bytes no-copy mismatch");
         (void)rawFreed;
+        __block BOOL zeroFreed = NO;
+        void *zeroPtr = malloc(1);
+        JSBayValue *zeroNoCopy =
+            [engine arrayBufferValueWithBytesNoCopy:zeroPtr
+                                             length:0
+                                        deallocator:^(void *_Nullable b, NSUInteger l) {
+                                            (void)l;
+                                            if (b)
+                                                free(b);
+                                            zeroFreed = YES;
+                                        }
+                                              error:&error];
+        Check(zeroNoCopy != nil && zeroFreed && [[zeroNoCopy dataValue:&error] length] == 0,
+              @"zero length raw bytes no-copy deallocation");
+        __block BOOL nullFreed = NO;
+        NSError *nullError = nil;
+        JSBayValue *nullNoCopy =
+            [engine arrayBufferValueWithBytesNoCopy:NULL
+                                             length:5
+                                        deallocator:^(void *_Nullable b, NSUInteger l) {
+                                            (void)b;
+                                            (void)l;
+                                            nullFreed = YES;
+                                        }
+                                              error:&nullError];
+        Check(nullNoCopy == nil && nullFreed && nullError.code == JSBayErrorInvalidArgument,
+              @"null bytes raw no-copy deallocation");
         JSBayValue *view = [engine evaluate:@"new Uint8Array([8,9,0,255,7]).subarray(2,4)"
                                    filename:@"view.js"
                                       cache:nil

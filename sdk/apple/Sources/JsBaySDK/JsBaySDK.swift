@@ -763,7 +763,16 @@ public final class Engine {
     count: Int,
     deallocator: (@Sendable (UnsafeMutableRawPointer, Int) -> Void)? = nil
   ) throws -> Value {
-    try requireOpen()
+    do {
+      try requireOpen()
+    } catch {
+      deallocator?(bytes, count)
+      throw error
+    }
+    guard count >= 0 else {
+      deallocator?(bytes, count)
+      throw JsBayError.status(JsBayStatus.invalidArgument)
+    }
     guard count > 0 else {
       deallocator?(bytes, 0)
       return try arrayBuffer(Data())

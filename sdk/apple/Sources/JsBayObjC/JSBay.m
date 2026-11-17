@@ -1295,7 +1295,7 @@ static void JSBayBlockDeallocatorTrampoline(void *userData, void *bytes, size_t 
         block(bytes, len);
     }
 }
-- (JSBayValue *)arrayBufferValueWithBytesNoCopy:(void *)bytes
+- (JSBayValue *)arrayBufferValueWithBytesNoCopy:(nullable void *)bytes
                                          length:(NSUInteger)length
                                     deallocator:(nullable JSBayBytesDeallocator)deallocator
                                           error:(NSError **)error {
