@@ -1,14 +1,22 @@
 # JsBaySDK
 
-The Apple release zip is a Swift package snapshot. Its single top-level directory contains `Package.swift`, `Sources/`, `Frameworks/JsBay.xcframework`, and license files. A maintainer can publish that directory as a new Git repository with a version tag; no development repository history is needed. After the package repository is available, add its Git URL in Xcode under **File → Add Package Dependencies** and select `JsBaySDK` for Swift or `JsBayObjC` for Objective-C. Apple release packages default to `jsc`; `quickjs` and `quickjs_ng` builds are separate packages and need separate Git URLs. Until a public package repository exists, consumers can add the extracted directory as a local Swift package.
+Apple SwiftPM products are released from the main repository. Add that repository once in Xcode under **File → Add Package Dependencies**, then select the product for one engine.
+
+| Engine | Swift product and import | Objective-C product and import |
+| --- | --- | --- |
+| `quickjs` | `JsBayQuickJSSDK` / `import JsBayQuickJSSDK` | `JsBayQuickJSObjC` / `@import JsBayQuickJSObjC;` |
+| `quickjs_ng` | `JsBayQuickJSNGSDK` / `import JsBayQuickJSNGSDK` | `JsBayQuickJSNGObjC` / `@import JsBayQuickJSNGObjC;` |
+| `jsc` | `JsBayJavaScriptCoreSDK` / `import JsBayJavaScriptCoreSDK` | `JsBayJavaScriptCoreObjC` / `@import JsBayJavaScriptCoreObjC;` |
+
+Each product uses the same public API and includes its own engine binary. Choose one engine product per app because the C and Objective-C APIs export the same symbol names. SwiftPM resolves all three binary targets, so selecting one product still downloads all three XCFramework archives; product selection controls linking, not downloads.
 
 From this repository, `./build-apple.sh` (or `JSBAY_APPLE_BACKEND`) selects the engine. The intended product default is `jsc`. Override with `./build-apple.sh quickjs` or `./build-apple.sh quickjs_ng` when you need those variants. Packaging scripts should resolve the checkout from their own path (or an explicit `JSBAY_SOURCE_ROOT`); do not bake in a machine-specific directory.
 
-When declaring the dependency in another `Package.swift`, use the package identity SwiftPM resolves from the chosen repository URL in each `.product(..., package: ...)` entry. The two backend repository names can therefore require different `package:` values even though both expose the `JsBaySDK` and `JsBayObjC` products.
+When declaring the dependency in another `Package.swift`, use the package identity SwiftPM resolves from the main repository URL in each `.product(..., package: ...)` entry. The product name selects the engine and language interface.
 
-For direct static-library or XCFramework integration, link `JavaScriptCore`, `Foundation`, and `libm` (`-lm`). The Swift package declares these dependencies for both SDK products. `JavaScriptCore` is also required by the JSC backend; QuickJS-family packages still use the same public package link settings.
+For direct static-library or XCFramework integration, link `JavaScriptCore`, `Foundation`, and `libm` (`-lm`). The Swift package declares these dependencies for every SDK product. `JavaScriptCore` is also required by the JSC backend; QuickJS-family products still use the same public package link settings.
 
-`JsBaySDK` is the Swift façade for the public `jsbay.h` Value API. Add the packaged Swift package, create an `Engine` on the thread that will execute JavaScript, and keep all `Value` operations on that same thread. The SDK attaches its automatic driver to that thread's `CFRunLoop`; JavaScript timers run when the host runs that loop and applications never call `tick` or compute deadlines. `runLoop()` temporarily uses the core blocking loop and restores the automatic driver when it returns. `stopLoop()`, `requestInterrupt()`, `beginShutdown`, `shutdownStatus`, and `cancel` are safe from another thread.
+Each engine's Swift product exposes the same façade for the public `jsbay.h` Value API. Create an `Engine` on the thread that will execute JavaScript, and keep all `Value` operations on that same thread. The SDK attaches its automatic driver to that thread's `CFRunLoop`; JavaScript timers run when the host runs that loop and applications never call `tick` or compute deadlines. `runLoop()` temporarily uses the core blocking loop and restores the automatic driver when it returns. `stopLoop()`, `requestInterrupt()`, `beginShutdown`, `shutdownStatus`, and `cancel` are safe from another thread.
 
 `DedicatedEngineThread.start(id:)` creates an Engine on a private thread and provides `runOnOwner`, asynchronous `run`, and `post` for serialized work. Work closures run on the owner thread and must close every `Value` they create before returning an `EngineThreadResult`; use `performOnOwner`, asynchronous `perform`, or `postVoid` when no result is needed. Built-in conformances cover common scalar and Foundation data types, snapshots, and collections of safe results. A custom data-only result type can conform explicitly; that conformance promises it contains no live `Engine` or `Value` handles. Custom errors returned across the thread boundary must also contain only data; do not wrap a live `JsException`, `Engine`, or `Value` in another error. JavaScript exceptions crossing from an owner-thread job to a caller thread become `DedicatedEngineThreadError.javascript` with copied `JsExceptionDetails`; nested calls that run inline on the owner thread preserve the original `JsException`. The live thrown Value is consumed on its owner thread when converted. Call `close()` when finished; dropping the owner off its thread closes the Engine and waits for the thread to stop, while dropping it from an owner-thread task schedules shutdown and returns to avoid waiting on itself.
 
@@ -65,15 +73,7 @@ the original `NSError` and `JSBayExceptionValueKey` entry point available.
 `Engine.CacheOptions` is optional. It records whether a call used a warm cache
 in `didHit`; a cache read/write failure still evaluates the source once.
 
-Objective-C hosts link the `JsBayObjC` product and import `JSBayObjC.h` (not `jsbay.h`; the ObjC umbrella uses a distinct filename so case-insensitive disks do not collide with the C ABI header). Its
-`JSBayEngine` and `JSBayValue` expose the same synchronous owner-thread model
-and explicit `close:` ownership. A native block returns a `JSBayValue` or sets
-an `NSError`; to throw a live JavaScript value, put it in the error's
-`JSBayExceptionValueKey`. Errors produced by JavaScript use that same key, so
-callers can inspect the original thrown value rather than a stringified copy.
-`NSError.code` uses the same status table. Engine and owned Value `close` are
-idempotent; closing a borrowed callback Value is rejected as `INVALID_ARGUMENT`,
-and the wrapper is `STALE_VALUE` after its callback returns.
+Objective-C hosts select the engine's `JsBay...ObjC` product and import its matching module shown above. The public umbrella header is `JSBayObjC.h` (not `jsbay.h`; the ObjC umbrella uses a distinct filename so case-insensitive disks do not collide with the C ABI header). Its `JSBayEngine` and `JSBayValue` expose the same synchronous owner-thread model and explicit `close:` ownership. A native block returns a `JSBayValue` or sets an `NSError`; to throw a live JavaScript value, put it in the error's `JSBayExceptionValueKey`. Errors produced by JavaScript use that same key, so callers can inspect the original thrown value rather than a stringified copy. `NSError.code` uses the same status table. Engine and owned Value `close` are idempotent; closing a borrowed callback Value is rejected as `INVALID_ARGUMENT`, and the wrapper is `STALE_VALUE` after its callback returns.
 
 Every SDK text input must be well-formed Unicode. Swift `String` already has
 that invariant. Objective-C validates each `NSString` before it crosses the C
@@ -83,10 +83,7 @@ to source, filenames, cache options, property keys, binding names, strings,
 error messages, and JSON. JavaScript text returned from the engine is always
 well-formed UTF-8; an unpaired JavaScript surrogate is represented as U+FFFD.
 
-The XCFramework device slice supports iOS 13. The arm64 Simulator slice starts
-at iOS 14 because that is the minimum runtime emitted by the Apple toolchain;
-the x86_64 Simulator slice remains iOS 13. The packaging gate reads every
-Mach-O member's actual deployment version before publishing the framework.
+The package's macOS slice supports arm64 only; x86_64 macOS consumers are not supported. The XCFramework device slice supports iOS 13. The arm64 Simulator slice starts at iOS 14 because that is the minimum runtime emitted by the Apple toolchain; the x86_64 Simulator slice remains iOS 13. The packaging gate reads every Mach-O member's actual deployment version before publishing the framework.
 
 Objective-C callers create `JSBayEngine` with `initWithIdentifier:error:` and `JSBayCacheOptions` with `initWithDirectory:version:`. Values come from an engine; sync completions come from a sync starter block. These types disable inherited `init` and `new` because those methods cannot supply the required state.
 

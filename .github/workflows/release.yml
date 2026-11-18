@@ -1,18 +1,20 @@
-# JS Bay release — L1 desktop static libs + L2 Apple/Android when buildable. Tiers and exclusions: docs/testing.md#ci. Never upload empty XCFramework / fake .so.
+# JS Bay release — build artifacts for inspection or explicitly publish a complete release from CI.
 # Aggressive aggregation: one L1 job per runner image; Apple L2 backends run sequentially in one macos job.
 # assemble + publish stay separate (artifact gate / contents:write).
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version label for artifact names (e.g. 0.1.0); defaults to tag or run id"
-        required: false
+        description: "Release version; must match build.zig.zon (e.g. 0.1.0)"
+        required: true
         type: string
+      publish:
+        description: "Publish a complete release after every build and consumer check succeeds"
+        required: true
+        type: boolean
+        default: false
       build_android:
         description: "Build Android jniLibs (needs NDK setup on Ubuntu)"
         required: false
@@ -28,7 +30,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -914,7 +916,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-android:
     name: L2 Android SDK (${{ matrix.backend }})
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_android }}
+    if: ${{ inputs.build_android }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -988,6 +990,7 @@ jobs:
           cd sdk/android
           env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" "$gradle" --no-daemon \
             -PjsbayVersion="${{ steps.ver.outputs.label }}" \
+            -PjsbayBackend="${{ matrix.backend }}" \
             -PjsbayJniLibs="$GITHUB_WORKSPACE/build-android/jniLibs" \
             :jsbay:assembleRelease
           aar=jsbay/build/outputs/aar/jsbay-release.aar
@@ -1010,32 +1013,41 @@ jobs:
           set -euo pipefail
           ver="${{ steps.ver.outputs.label }}"
           backend="${{ matrix.backend }}"
+          case "$backend" in quickjs) artifact=jsbayquickjs ;; quickjs_ng) artifact=jsbayquickjsng ;; esac
           repo="$GITHUB_WORKSPACE/build-android/maven-repo"
           rm -rf "$repo"
           cd sdk/android
           env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" "$RUNNER_TEMP/gradle-8.9/bin/gradle" --no-daemon \
             -PjsbayJniLibs="$GITHUB_WORKSPACE/build-android/jniLibs" \
             -PjsbayVersion="$ver" \
+            -PjsbayBackend="$backend" \
             -PjsbayMavenRepo="$repo" \
             :jsbay:publishReleasePublicationToStagingRepository
-          module="$repo/io/jsbay/js-bay-android/$ver"
-          test -s "$module/js-bay-android-$ver.aar"
-          test -s "$module/js-bay-android-$ver.pom"
-          test -s "$module/js-bay-android-$ver.module"
-          cmp "$module/js-bay-android-$ver.aar" jsbay/build/outputs/aar/jsbay-release.aar
-          unzip -p "$module/js-bay-android-$ver.aar" META-INF/LICENSE | cmp - "$GITHUB_WORKSPACE/LICENSE"
-          unzip -p "$module/js-bay-android-$ver.aar" META-INF/THIRD_PARTY_NOTICES.md | cmp - "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md"
-          grep -F 'org.jetbrains.kotlin' "$module/js-bay-android-$ver.pom"
-          grep -F 'kotlin-stdlib' "$module/js-bay-android-$ver.pom"
-          zig build --build-file "$GITHUB_WORKSPACE/build.zig" tool -- check-maven "$module" "$ver"
+          module="$repo/io/jsbay/$artifact/$ver"
+          test -s "$module/$artifact-$ver.aar"
+          test -s "$module/$artifact-$ver.pom"
+          test -s "$module/$artifact-$ver.module"
+          cmp "$module/$artifact-$ver.aar" jsbay/build/outputs/aar/jsbay-release.aar
+          unzip -p "$module/$artifact-$ver.aar" META-INF/LICENSE | cmp - "$GITHUB_WORKSPACE/LICENSE"
+          unzip -p "$module/$artifact-$ver.aar" META-INF/THIRD_PARTY_NOTICES.md | cmp - "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md"
+          grep -F 'org.jetbrains.kotlin' "$module/$artifact-$ver.pom"
+          grep -F 'kotlin-stdlib' "$module/$artifact-$ver.pom"
+          zig build --build-file "$GITHUB_WORKSPACE/build.zig" tool -- check-maven "$module" "$ver" "$backend"
           mkdir -p "$GITHUB_WORKSPACE/build-android/aar"
           raw_aar="$GITHUB_WORKSPACE/build-android/aar/jsbay-${ver}-android-${backend}.aar"
-          cp "$module/js-bay-android-$ver.aar" "$raw_aar"
-          cmp "$raw_aar" "$module/js-bay-android-$ver.aar"
+          cp "$module/$artifact-$ver.aar" "$raw_aar"
+          cmp "$raw_aar" "$module/$artifact-$ver.aar"
           cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md" "$repo/"
           archive="jsbay-${ver}-android-${backend}-maven.zip"
           ( cd "$repo" && zip -qr "$GITHUB_WORKSPACE/$archive" io LICENSE THIRD_PARTY_NOTICES.md )
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Test Android Maven retry safety
+        env:
+          VERSION: ${{ steps.ver.outputs.label }}
+          BACKEND: ${{ matrix.backend }}
+          ARCHIVE: ${{ steps.maven.outputs.archive }}
+        run: node tests/android-sdk/maven-deploy-retry-test.mjs "$ARCHIVE" "$VERSION" "$BACKEND"
 
       - name: Test Android Maven consumer
         shell: bash
@@ -1045,7 +1057,7 @@ jobs:
           mkdir -p "$repo"
           unzip -q "${{ steps.maven.outputs.archive }}" -d "$repo"
           env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" \
-            bash tests/android-sdk/maven-consumer.sh "$repo" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle"
+            bash tests/android-sdk/maven-consumer.sh "$repo" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle" "${{ matrix.backend }}"
 
       - name: Enable KVM for packaged Android acceptance
         run: |
@@ -1059,7 +1071,7 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash tests/ci/release-android-consumer.sh "${{ steps.maven.outputs.archive }}" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle"
+          script: bash tests/ci/release-android-consumer.sh "${{ steps.maven.outputs.archive }}" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle" "${{ matrix.backend }}"
 
       - name: Upload Android Maven repository
         uses: actions/upload-artifact@v6
@@ -1132,22 +1144,22 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Assemble assets under read-only permissions. A separate tag-only job is the only place that receives contents: write to create a GitHub Release.
+  # Assemble assets under read-only permissions before any release tag or package is published.
   # ---------------------------------------------------------------------------
   assemble-release-assets:
     name: Assemble checked release assets
     needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android]
-    # A tag is a complete release: both L2 jobs must succeed. Dispatch can explicitly opt out of either L2 tier, in which case that job is skipped.
+    # Build-only runs may skip either L2 tier; release publication validates that both were selected and succeeded.
     if: >-
       ${{ always() &&
           needs.build-libs-linux.result == 'success' &&
           needs.build-libs-linux-arm.result == 'success' &&
           needs.build-libs-macos.result == 'success' &&
           needs.build-libs-macos-intel.result == 'success' &&
-          ((github.event_name == 'push' && needs.build-apple.result == 'success' && needs.build-android.result == 'success') ||
-           (github.event_name == 'workflow_dispatch' &&
-            ((inputs.build_apple && needs.build-apple.result == 'success') || (!inputs.build_apple && needs.build-apple.result == 'skipped')) &&
-            ((inputs.build_android && needs.build-android.result == 'success') || (!inputs.build_android && needs.build-android.result == 'skipped')))) }}
+          ((inputs.build_apple && needs.build-apple.result == 'success') ||
+           (!inputs.build_apple && needs.build-apple.result == 'skipped')) &&
+          ((inputs.build_android && needs.build-android.result == 'success') ||
+           (!inputs.build_android && needs.build-android.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout reviewed source snapshot
@@ -1178,6 +1190,19 @@ jobs:
           zig build tool -- export-public-source "$archive"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
+      - name: Pack and test Zig source dependency
+        id: zig_package
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          archive="$RUNNER_TEMP/jsbay-${version}-zig.tar.gz"
+          bash tests/ci/pack-zig-source.sh "${{ steps.source.outputs.archive }}" "$archive"
+          bash tests/ci/release-zig-consumer.sh "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
       - name: Download all archives
         uses: actions/download-artifact@v4
         with:
@@ -1195,6 +1220,7 @@ jobs:
           mkdir -p release-assets
           find dist -type f \( -name 'jsbay-*.tar.gz' -o -name 'jsbay-*.zip' -o -name 'jsbay-*.aar' \) -exec cp {} release-assets/ \;
           cp "${{ steps.source.outputs.archive }}" release-assets/
+          cp "${{ steps.zig_package.outputs.archive }}" release-assets/
           cd release-assets
           ls -la
           zig build --build-file "$GITHUB_WORKSPACE/build.zig" tool -- check-release-assets \
@@ -1216,10 +1242,175 @@ jobs:
           path: release-assets/
           if-no-files-found: error
 
-  publish:
-    name: GitHub Release
+
+  prepare-swift-package-release-assets:
+    name: Prepare and test the single Swift package
     needs: [assemble-release-assets]
-    if: ${{ needs.assemble-release-assets.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ always() && inputs.build_apple && needs.assemble-release-assets.result == 'success' }}
+    runs-on: macos-26
+    steps:
+      - name: Checkout source snapshot
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - name: Download checked release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: jsbay-release-assets
+          path: release-assets
+      - name: Prepare and validate single Swift package
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/swift-package-release"
+          bash scripts/prepare-swift-package-release.sh release-assets "$VERSION" "$SOURCE_SHA" "$output"
+          for archive in \
+            "jsbay-${VERSION}-apple-quickjs-JsBayQuickJS.xcframework.zip" \
+            "jsbay-${VERSION}-apple-quickjs_ng-JsBayQuickJSNG.xcframework.zip" \
+            "jsbay-${VERSION}-apple-jsc-JsBayJavaScriptCore.xcframework.zip"; do
+            test -s "release-assets/$archive"
+          done
+          bash tests/apple-sdk/single-package-consumer.sh release-assets "$VERSION" "$SOURCE_SHA" "$output"
+          test -s "$output/Package.swift"
+          cd release-assets
+          : > SHA256SUMS
+          for archive in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar; do
+            [ -f "$archive" ] || continue
+            shasum -a 256 "$archive" >> SHA256SUMS
+          done
+      - name: Upload final checked release assets
+        uses: actions/upload-artifact@v6
+        with:
+          name: jsbay-final-release-assets
+          path: release-assets/
+          if-no-files-found: error
+      - name: Upload generated Swift package metadata
+        uses: actions/upload-artifact@v6
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release/
+          if-no-files-found: error
+
+  validate-release-request:
+    name: Validate release request and reserve no existing version
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source snapshot for authenticated remote tag check
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+      - name: Validate complete release selection and unused tag
+        env:
+          VERSION: ${{ inputs.version }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "${{ inputs.build_apple }}" = true || { echo 'Publishing requires the Apple build' >&2; exit 1; }
+          test "${{ inputs.build_android }}" = true || { echo 'Publishing requires the Android build' >&2; exit 1; }
+          test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN is required for publishing' >&2; exit 1; }
+          resolved="$(zig build tool -- release-version "$VERSION" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          test "$resolved" = "$VERSION"
+          tag="v$VERSION"
+          existing="$(git ls-remote --refs origin "refs/tags/$tag")"
+          if [ -n "$existing" ] && [ "$RUN_ATTEMPT" = 1 ]; then
+            echo "Release tag already exists: $tag" >&2
+            exit 1
+          fi
+
+  publish-android-packages:
+    name: Publish Android package (${{ matrix.backend }})
+    needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release, create-draft-release]
+    if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.create-draft-release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs_ng, quickjs]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+      - uses: actions/download-artifact@v4
+        with:
+          name: jsbay-release-assets
+          path: release-assets
+      - name: Publish the checked Maven package
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKEND: ${{ matrix.backend }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          bash scripts/publish-android-maven.sh \
+            "release-assets/jsbay-${version}-android-${BACKEND}-maven.zip" \
+            "$version" "$BACKEND" "https://maven.pkg.github.com/$GITHUB_REPOSITORY" github
+
+  prepare-swift-package-release:
+    name: Stage immutable Swift package commit
+    needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release-assets]
+    if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release-assets.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source snapshot
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Download generated Swift package metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release
+      - name: Verify generated Swift package metadata
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/swift-package-release"
+          test -s "$output/Package.swift"
+      - name: Commit package metadata and create version tag
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+          JSBAY_PACKAGE_REF: refs/heads/jsbay-package-staging-${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/swift-package-release"
+          bash scripts/create-swift-package-tag.sh "$output" "$VERSION" "$SOURCE_SHA"
+
+  create-draft-release:
+    name: Create draft release with checked assets
+    needs: [assemble-release-assets, prepare-swift-package-release, build-node-packages]
+    if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.build-node-packages.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -1227,33 +1418,94 @@ jobs:
       - name: Download checked archives
         uses: actions/download-artifact@v4
         with:
-          name: jsbay-release-assets
+          name: jsbay-final-release-assets
           path: release-assets
 
-      - name: Create GitHub Release
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-        uses: softprops/action-gh-release@v2
+      - uses: actions/checkout@v7
         with:
-          tag_name: ${{ github.ref_name }}
-          name: JS Bay ${{ github.ref_name }}
-          body: |
-            **JS Bay** (`jsbay`) release built with Zig 0.17.0.
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release
+      - name: Create or verify draft release without replacing assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: node scripts/github-release.mjs draft "$VERSION" "jsbay-package-staging-$GITHUB_RUN_ID" release-assets "$RUNNER_TEMP/swift-package-release"
 
-            ### L1 — desktop static libraries
-            `jsbay-<ver>-<os>-<arch>-<backend>.tar.gz` with `lib/libjsbay.a`, public headers, `LICENSE`, `THIRD_PARTY_NOTICES.md`, plus `VERSION`, `COMMIT`, and `backend` text files. Linux ships `quickjs_ng` and `quickjs`; macOS ships `quickjs_ng`, `quickjs`, and `jsc`. C ABI entry points are declared in `include/jsbay.h`.
+  build-node-packages:
+    needs: [validate-release-request]
+    if: ${{ always() && (!inputs.publish || needs.validate-release-request.result == 'success') }}
+    uses: ./.github/workflows/npm-packages.yml
+    with:
+      operation: build
+      tag: v${{ inputs.version }}
+      commit_sha: ${{ github.sha }}
 
-            ### L2 — platform packages
-            - **Apple:** `jsbay-<ver>-apple-<backend>-JsBay.xcframework.zip` for `jsc` (product default; matches `./build-apple.sh` / `JSBAY_APPLE_BACKEND`), `quickjs`, and `quickjs_ng`. `quickjs` / `quickjs_ng` are alternate packages, not the default host choice. Each zip is a Git-ready Swift package: extract the top-level directory, publish it as a fresh Git repository, and tag it. Xcode consumers add that repository URL. Distinct backends need distinct repository URLs.
-            - **Android:** `quickjs_ng` and `quickjs` each ship `jsbay-<ver>-android-<backend>-maven.zip` (Maven repo with AAR/POM/Gradle metadata and Kotlin stdlib), a standalone `.aar`, and `jsbay-<ver>-android-jniLibs-<backend>.tar.gz` for C hosts. Each maven zip uses `io.jsbay:js-bay-android:<ver>` for that backend alone — host one backend zip per Maven root.
-            - **Harmony:** stage `jsbay-<ver>-harmony-<backend>-arm64-v8a.har` locally with `QUICKJS_BACKEND=quickjs_ng|quickjs scripts/stage-harmony-har.sh <stage-dir> <ver>`. GitHub-hosted runners do not yet have a verified DevEco SDK 12/Hvigor/ohpm path, so this release does not upload a HAR.
+  publish-node-packages:
+    needs: [create-draft-release, build-node-packages, publish-android-packages]
+    if: ${{ always() && inputs.publish && needs.create-draft-release.result == 'success' && needs.build-node-packages.result == 'success' && needs.publish-android-packages.result == 'success' }}
+    uses: ./.github/workflows/npm-packages.yml
+    with:
+      operation: publish
+      tag: v${{ inputs.version }}
+      commit_sha: ${{ github.sha }}
+      artifact_id: ${{ needs.build-node-packages.outputs.artifact_id }}
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-            ### Source snapshot
-            `jsbay-<ver>-source.tar.gz` is created from the reviewed release commit. It contains no Git metadata or repository history. Tag versions must equal `build.zig.zon`.
+  publish-release:
+    name: Publish GitHub Release
+    needs: [create-draft-release, publish-node-packages]
+    if: ${{ always() && inputs.publish && needs.create-draft-release.result == 'success' && needs.publish-node-packages.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: jsbay-final-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release
+      - name: Verify assets and publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          stage_ref="refs/heads/jsbay-package-staging-$GITHUB_RUN_ID"
+          stage_sha="$(git ls-remote --refs origin "$stage_ref" | cut -f1)"
+          test -n "$stage_sha"
+          tag_ref="refs/tags/v$VERSION"
+          existing_sha="$(git ls-remote origin "$tag_ref" "$tag_ref^{}" | awk 'END {print $1}')"
+          test -z "$existing_sha" || test "$existing_sha" = "$stage_sha"
+          node scripts/github-release.mjs publish "$VERSION" "jsbay-package-staging-$GITHUB_RUN_ID" release-assets "$RUNNER_TEMP/swift-package-release"
+          tag_sha="$(git ls-remote origin "$tag_ref" "$tag_ref^{}" | awk 'END {print $1}')"
+          test "$tag_sha" = "$stage_sha"
 
-            ### Not in this Release (L3 / deferred)
-            Windows `.lib`/`.dll` (inspector still POSIX), demo/bench binaries, docs site zip. See `docs/testing.md#ci`.
-
-            Verify with `SHA256SUMS`.
-          files: release-assets/*
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+  verify-published-swift:
+    name: Verify published Swift package downloads
+    needs: [publish-release]
+    if: ${{ always() && inputs.publish && needs.publish-release.result == 'success' }}
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release
+      - name: Download and run all published Swift and Objective-C products
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash tests/apple-sdk/remote-package-consumer.sh "$RUNNER_TEMP/swift-package-release" "$VERSION"

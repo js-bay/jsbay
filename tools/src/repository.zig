@@ -206,7 +206,7 @@ fn releaseAssets(c: Context, args: []const []const u8) !void {
     if (args.len != 4 or !safeLabel(args[1])) return error.Usage;
     for (args[2..]) |arg| if (!std.mem.eql(u8, arg, "true") and !std.mem.eql(u8, arg, "false")) return error.Usage;
     var expected: std.StringHashMap(void) = .init(c.allocator());
-    const base = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz" };
+    const base = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz", "zig.tar.gz" };
     for (base) |name| try expected.put(try c.fmt("jsbay-{s}-{s}", .{ args[1], name }), {});
     if (std.mem.eql(u8, args[2], "true")) for ([_][]const u8{ "apple-quickjs_ng-JsBay.xcframework.zip", "apple-quickjs-JsBay.xcframework.zip", "apple-jsc-JsBay.xcframework.zip" }) |name| {
         try expected.put(try c.fmt("jsbay-{s}-{s}", .{ args[1], name }), {});
@@ -466,12 +466,21 @@ fn harmonyFacade(c: Context, args: []const []const u8) !void {
 }
 
 fn checkMaven(c: Context, args: []const []const u8) !void {
-    if (args.len != 2 or !safeLabel(args[1])) return error.Usage;
+    if (args.len != 3 or !safeLabel(args[1])) return error.Usage;
+    const artifact = if (std.mem.eql(u8, args[2], "quickjs"))
+        "jsbayquickjs"
+    else if (std.mem.eql(u8, args[2], "quickjs_ng"))
+        "jsbayquickjsng"
+    else
+        return error.Usage;
     const File = struct { name: []const u8, size: u64, md5: []const u8, sha1: []const u8, sha256: []const u8, sha512: []const u8 };
     const Metadata = struct { variants: []const struct { files: []const File = &.{} } };
-    const name = try c.fmt("js-bay-android-{s}.aar", .{args[1]});
-    const bytes = try c.read(try c.fmt("{s}/{s}", .{ args[0], name }));
-    const text = try c.read(try c.fmt("{s}/js-bay-android-{s}.module", .{ args[0], args[1] }));
+    const name = try c.fmt("{s}-{s}.aar", .{ artifact, args[1] });
+    const aar = try c.fmt("{s}/{s}", .{ args[0], name });
+    const bytes = try c.read(aar);
+    const marker = std.mem.trim(u8, try c.command(&.{ "unzip", "-p", aar, "assets/jsbay-backend.txt" }, null), " \t\r\n");
+    if (!std.mem.eql(u8, marker, args[2])) return error.MavenBackendMismatch;
+    const text = try c.read(try c.fmt("{s}/{s}-{s}.module", .{ args[0], artifact, args[1] }));
     const parsed = try std.json.parseFromSlice(Metadata, c.allocator(), text, .{ .ignore_unknown_fields = true });
     var found = false;
     for (parsed.value.variants) |variant| for (variant.files) |file| {

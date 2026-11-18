@@ -1,4 +1,4 @@
-import { Engine } from '@js-bay/node'
+import { Engine } from '@jsbay/node'
 
 const engine = Engine.create()
 engine.close()

@@ -1,3 +1,3 @@
-import { Engine } from '@js-bay/node'
+import { Engine } from '@jsbay/node'
 
 void Engine
