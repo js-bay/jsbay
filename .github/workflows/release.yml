@@ -1536,7 +1536,7 @@ jobs:
     environment: release
     permissions:
       actions: read
-      contents: read
+      contents: write
     outputs:
       recovery_draft_id: ${{ steps.recovery.outputs.draft_id }}
     steps:
