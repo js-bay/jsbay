@@ -43,7 +43,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.version }}
+  group: release-${{ inputs.version }}-${{ inputs.verify_only && 'verify' || 'publish' }}
   cancel-in-progress: false
 
 jobs:
