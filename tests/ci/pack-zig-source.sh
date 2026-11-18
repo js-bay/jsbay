@@ -15,4 +15,5 @@ test -s "$work/build.zig.zon"
 test -s "$work/build.zig"
 test ! -e "$work/.git"
 tar -C "$work" -czf "$output_archive" .
-tar -tzf "$output_archive" | rg -q '^\./build\.zig\.zon$'
+tar -tzf "$output_archive" > "$work/archive-members.txt"
+rg -q '^\./build\.zig\.zon$' "$work/archive-members.txt"
