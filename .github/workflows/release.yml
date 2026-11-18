@@ -1307,6 +1307,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
+          submodules: recursive
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
@@ -1326,10 +1327,17 @@ jobs:
             echo "Release tag already exists: $tag" >&2
             exit 1
           fi
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
       - name: Verify npm publication credentials are configured
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN is required in the release environment' >&2; exit 1; }
+        run: |
+          set -euo pipefail
+          test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN is required in the release environment' >&2; exit 1; }
+          npm whoami --registry https://registry.npmjs.org > /dev/null
 
   publish-android-packages:
     name: Publish Android package (${{ matrix.backend }})

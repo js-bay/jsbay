@@ -606,6 +606,9 @@ test "test_dispatch_publishes_only_after_explicit_opt_in" {
     try notContains(release, "github.event_name == 'push'");
     try notContains(release, "startsWith(github.ref, 'refs/tags/v')");
     try contains(release, "node scripts/github-release.mjs publish");
+    const validation = release[std.mem.indexOf(u8, release, "  validate-release-request:\n") orelse return error.MissingValidationJob ..];
+    const validation_end = std.mem.indexOf(u8, validation, "\n  publish-android-packages:") orelse return error.MissingAndroidPublishJob;
+    try contains(validation[0..validation_end], "          submodules: recursive\n");
 }
 
 test "test_harmony_device_acceptance_uses_sdk12_target" {
