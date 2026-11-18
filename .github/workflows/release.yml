@@ -1296,6 +1296,7 @@ jobs:
 
   validate-release-request:
     name: Validate release request and reserve no existing version
+    environment: release
     if: ${{ inputs.publish }}
     runs-on: ubuntu-24.04
     permissions:
@@ -1312,13 +1313,11 @@ jobs:
       - name: Validate complete release selection and unused tag
         env:
           VERSION: ${{ inputs.version }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           test "${{ inputs.build_apple }}" = true || { echo 'Publishing requires the Apple build' >&2; exit 1; }
           test "${{ inputs.build_android }}" = true || { echo 'Publishing requires the Android build' >&2; exit 1; }
-          test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN is required for publishing' >&2; exit 1; }
           resolved="$(zig build tool -- release-version "$VERSION" "$GITHUB_REF" "$GITHUB_RUN_ID")"
           test "$resolved" = "$VERSION"
           tag="v$VERSION"
@@ -1327,12 +1326,17 @@ jobs:
             echo "Release tag already exists: $tag" >&2
             exit 1
           fi
+      - name: Verify npm publication credentials are configured
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN is required in the release environment' >&2; exit 1; }
 
   publish-android-packages:
     name: Publish Android package (${{ matrix.backend }})
     needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release, create-draft-release]
     if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.create-draft-release.result == 'success' }}
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: read
       packages: write
@@ -1375,6 +1379,7 @@ jobs:
     needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release-assets]
     if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release-assets.result == 'success' }}
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write
     steps:
@@ -1412,18 +1417,18 @@ jobs:
     needs: [assemble-release-assets, prepare-swift-package-release, build-node-packages]
     if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.build-node-packages.result == 'success' }}
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
       - name: Download checked archives
         uses: actions/download-artifact@v4
         with:
           name: jsbay-final-release-assets
           path: release-assets
-
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
         with:
           name: jsbay-swift-package
@@ -1450,14 +1455,13 @@ jobs:
       operation: publish
       tag: v${{ inputs.version }}
       artifact_id: ${{ needs.build-node-packages.outputs.artifact_id }}
-    secrets:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-release:
     name: Publish GitHub Release
     needs: [create-draft-release, publish-node-packages]
     if: ${{ always() && inputs.publish && needs.create-draft-release.result == 'success' && needs.publish-node-packages.result == 'success' }}
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write
     steps:

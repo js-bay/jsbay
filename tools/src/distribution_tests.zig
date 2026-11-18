@@ -484,6 +484,51 @@ test "test_release_workflow_stages_package_commit_before_publishing" {
     try testing.expect(helper_guard < tag_push);
 }
 
+test "test_release_downloads_assets after checkout and builds portable Linux npm libraries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const npm = try read(a, io, cwd, &.{ ".github", "workflows", "npm-packages.yml" });
+    const draft_start = std.mem.indexOf(u8, release, "  create-draft-release:\n") orelse return error.MissingDraftReleaseJob;
+    const draft_end = std.mem.indexOf(u8, release[draft_start + 1 ..], "\n  build-node-packages:") orelse return error.MissingBuildNodeJob;
+    const draft = release[draft_start .. draft_start + 1 + draft_end];
+    const checkout = std.mem.indexOf(u8, draft, "uses: actions/checkout@v7") orelse return error.MissingDraftCheckout;
+    const download = std.mem.indexOf(u8, draft, "name: jsbay-final-release-assets") orelse return error.MissingReleaseAssetDownload;
+    try testing.expect(checkout < download);
+    try contains(npm, "if [[ \"$PLATFORM\" == linux ]]; then\n            zig_args+=(\"-Dcpu=baseline\")\n          fi");
+}
+
+test "publication jobs require the release environment" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const npm = try read(a, io, cwd, &.{ ".github", "workflows", "npm-packages.yml" });
+    const jobs = [_][2][]const u8{
+        .{ "validate-release-request", "publish-android-packages" },
+        .{ "publish-android-packages", "prepare-swift-package-release" },
+        .{ "prepare-swift-package-release", "create-draft-release" },
+        .{ "create-draft-release", "build-node-packages" },
+        .{ "publish-release", "verify-published-swift" },
+    };
+    for (jobs) |job| {
+        const marker = try std.fmt.allocPrint(a, "  {s}:\n", .{job[0]});
+        const next = try std.fmt.allocPrint(a, "\n  {s}:\n", .{job[1]});
+        const start = std.mem.indexOf(u8, release, marker) orelse return error.MissingReleaseJob;
+        const rest = release[start + marker.len ..];
+        const end = std.mem.indexOf(u8, rest, next) orelse return error.MissingReleaseJob;
+        try contains(rest[0..end], "    environment: release\n");
+    }
+    const start = std.mem.indexOf(u8, npm, "  publish-packages:\n") orelse return error.MissingNpmPublishJob;
+    try contains(npm[start..], "    environment: release\n");
+    try notContains(release, "NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
+}
+
 test "test_release_asset_inventory_rejects_missing_and_extra_archives" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

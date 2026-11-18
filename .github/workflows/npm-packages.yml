@@ -15,9 +15,6 @@ on:
         description: Artifact ID returned by the build operation
         required: false
         type: string
-    secrets:
-      NPM_TOKEN:
-        required: false
     outputs:
       artifact_id:
         description: Artifact containing the verified npm tarballs
@@ -166,6 +163,8 @@ jobs:
             zig_args+=("-Dtarget=$ZIG_TARGET")
             zig_args+=("-Dapple-sysroot=$sysroot")
             cmake_args+=(-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0)
+          elif [[ "$PLATFORM" == linux ]]; then
+            zig_args+=("-Dcpu=baseline")
           fi
           zig build "${zig_args[@]}"
           node_root="$(dirname "$(dirname "$(command -v node)")")"
@@ -279,6 +278,7 @@ jobs:
     name: Publish verified npm packages
     if: inputs.operation == 'publish'
     runs-on: ubuntu-24.04
+    environment: release
     steps:
       - uses: actions/checkout@v7
         with:
