@@ -7,6 +7,11 @@ OUT="${ANDROID_TEST_OUT:-${TMPDIR:-/tmp}/jsbay-android-host}"
 JDK_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@17}"
 GRADLE_LIB="${KOTLIN_GRADLE_LIB:-$(find "$HOME/.gradle/wrapper/dists/gradle-8.7-bin" -path '*/gradle-8.7/lib' -type d | head -1)}"
 test -x "$JDK_HOME/bin/java" && test -n "$GRADLE_LIB"
+if [[ $(uname -s) == Darwin ]]; then
+    source "$ROOT/tests/android-sdk/ubsan-jvm-env.sh"
+    jsbay_configure_jvm_ubsan_options
+    JAVA_HOME="$JDK_HOME" bash "$ROOT/tests/android-sdk/ubsan-jvm-signal-test.sh"
+fi
 mkdir -p "$OUT/classes"
 "$JDK_HOME/bin/javac" -encoding UTF-8 -d "$OUT/classes" "$ROOT"/tests/android-sdk/android/os/Handler.java "$ROOT"/tests/android-sdk/android/os/Looper.java "$ROOT"/tests/android-sdk/android/os/HandlerThread.java
 "$JDK_HOME/bin/java" -cp "$GRADLE_LIB/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -classpath "$OUT/classes:$GRADLE_LIB/kotlin-stdlib-1.9.22.jar:$GRADLE_LIB/annotations-24.0.1.jar" -d "$OUT/classes" "$ROOT"/sdk/android/jsbay/src/main/kotlin/io/jsbay/*.kt "$ROOT"/tests/android-sdk/KotlinConsumer.kt
