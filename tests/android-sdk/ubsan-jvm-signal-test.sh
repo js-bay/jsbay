@@ -55,6 +55,7 @@ EOF
 
 cat > "$temporary/signal_probe.c" <<'EOF'
 #include <jni.h>
+
 #include <limits.h>
 
 static jint jsbay_test_ping(JNIEnv *env, jclass type) {
