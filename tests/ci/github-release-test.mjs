@@ -26,11 +26,15 @@ test('draft retries preserve assets and publication verifies every checksum', ()
     let data = JSON.parse(readFileSync(state)); assert.equal(data.release.assets.length, 4); assert.equal(data.release.draft, true);
     assert.equal(run('verify').stdout.trim(), String(data.release.id));
     assert.equal(JSON.parse(readFileSync(state)).release.draft, true);
+    assert.match(run('verify-published').stderr, /release is still a draft/);
     assert.notEqual(run('publish', String(data.release.id + 1)).status, 0);
     data.release.assets[0].digest = 'sha256:incorrect'; writeFileSync(state, JSON.stringify(data));
     assert.notEqual(run('verify').status, 0); assert.notEqual(run('publish').status, 0); assert.equal(JSON.parse(readFileSync(state)).release.draft, true);
     data.release.assets[0].digest = `sha256:${createHash('sha256').update(readFileSync(join(assets, data.release.assets[0].name))).digest('hex')}`; writeFileSync(state, JSON.stringify(data));
     assert.equal(run('publish', String(data.release.id)).status, 0); assert.equal(run('publish').status, 0); assert.notEqual(run('draft').status, 0); assert.notEqual(run('verify').status, 0);
+    const published = readFileSync(state, 'utf8');
+    assert.equal(run('verify-published').status, 0);
+    assert.equal(readFileSync(state, 'utf8'), published);
     writeFileSync(join(pkg, 'Package.swift'), 'wrong'); assert.notEqual(run('publish').status, 0);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

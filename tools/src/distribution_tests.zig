@@ -523,6 +523,7 @@ test "publication jobs require the release environment" {
         const rest = release[start + marker.len ..];
         const end = std.mem.indexOf(u8, rest, next) orelse return error.MissingReleaseJob;
         try contains(rest[0..end], "    environment: release\n");
+        try contains(rest[0..end], "!inputs.verify_only");
     }
     try notContains(release, "NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
 }
@@ -597,7 +598,7 @@ test "test_dispatch_publishes_only_after_explicit_opt_in" {
     const android_job = release[std.mem.indexOf(u8, release, "  publish-android-packages:\n") orelse return error.MissingAndroidPublishJob ..];
     try contains(release, "permissions:\n  contents: read");
     try contains(release, "publish:\n        description:");
-    try contains(release, "if: ${{ inputs.publish && !inputs.recovery_run_id }}");
+    try contains(release, "if: ${{ inputs.publish && !inputs.verify_only && !inputs.recovery_run_id }}");
     try contains(tag_job, "permissions:\n      contents: write");
     try contains(tag_job, "bash scripts/create-swift-package-tag.sh");
     try contains(android_job, "needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release, create-draft-release]");
@@ -607,6 +608,37 @@ test "test_dispatch_publishes_only_after_explicit_opt_in" {
     const validation = release[std.mem.indexOf(u8, release, "  validate-release-request:\n") orelse return error.MissingValidationJob ..];
     const validation_end = std.mem.indexOf(u8, validation, "\n  publish-android-packages:") orelse return error.MissingAndroidPublishJob;
     try contains(validation[0..validation_end], "          submodules: recursive\n");
+}
+
+test "public consumer jobs run after recovery and verify-only without publishing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const jobs = [_][2][]const u8{
+        .{ "verify-published-npm", "verify-published-zig" },
+        .{ "verify-published-zig", "verify-release-recovery" },
+        .{ "verify-published-swift", "verify-published-android" },
+        .{ "verify-published-android", "" },
+    };
+    for (jobs) |job| {
+        const marker = try std.fmt.allocPrint(a, "  {s}:\n", .{job[0]});
+        const start = std.mem.indexOf(u8, release, marker) orelse return error.MissingReleaseJob;
+        const rest = release[start + marker.len ..];
+        const end = if (job[1].len == 0) rest.len else blk: {
+            const next = try std.fmt.allocPrint(a, "\n  {s}:\n", .{job[1]});
+            break :blk std.mem.indexOf(u8, rest, next) orelse return error.MissingReleaseJob;
+        };
+        const body = rest[0..end];
+        try contains(body, "always() && !cancelled()");
+        try contains(body, "inputs.verify_only && needs.verify-public-release.result == 'success'");
+        try contains(body, "!inputs.verify_only && needs.publish-release.result == 'success'");
+        try notContains(body, "environment: release");
+        try notContains(body, "contents: write");
+        try notContains(body, "packages: write");
+    }
 }
 
 test "test_harmony_device_acceptance_uses_sdk12_target" {

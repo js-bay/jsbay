@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-operation=${1:?verify or publish required}
+operation=${1:?verify, verify-published or publish required}
 version=${2:?release version required}
 source_sha=${3:?source commit required}
 run_id=${4:?original release run ID required}
@@ -9,7 +9,7 @@ assets=${5:?release assets directory required}
 package_dir=${6:?Swift package directory required}
 release_id=${7:-}
 root=$(cd "$(dirname "$0")/.." && pwd)
-[[ $operation == verify || $operation == publish ]]
+[[ $operation == verify || $operation == verify-published || $operation == publish ]]
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
 [[ $source_sha =~ ^[a-f0-9]{40}$ && $run_id =~ ^[1-9][0-9]*$ ]]
 
@@ -23,8 +23,13 @@ if [[ $source_version != "$version" ]]; then
 fi
 
 stage="jsbay-package-staging-$run_id"
-sha=$(JSBAY_PACKAGE_REF="refs/heads/$stage" bash "$root/scripts/create-swift-package-tag.sh" "$package_dir" "$version" "$source_sha" verify-only)
 tag="refs/tags/v$version"
+if [[ $operation == verify-published ]]; then
+  JSBAY_PACKAGE_REF="$tag" bash "$root/scripts/create-swift-package-tag.sh" "$package_dir" "$version" "$source_sha" verify-only
+  node "$root/scripts/github-release.mjs" "$operation" "$version" "$stage" "$assets" "$package_dir"
+  exit 0
+fi
+sha=$(JSBAY_PACKAGE_REF="refs/heads/$stage" bash "$root/scripts/create-swift-package-tag.sh" "$package_dir" "$version" "$source_sha" verify-only)
 tag_commit() {
   git ls-remote origin "$tag" "$tag^{}" | awk 'END { print $1 }'
 }

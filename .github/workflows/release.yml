@@ -15,6 +15,11 @@ on:
         required: true
         type: boolean
         default: false
+      verify_only:
+        description: "Install and test an already published version using its original run and artifact IDs"
+        required: false
+        type: boolean
+        default: false
       build_android:
         description: "Build Android jniLibs (needs NDK setup on Ubuntu)"
         required: false
@@ -26,7 +31,7 @@ on:
         type: boolean
         default: true
       recovery_run_id:
-        description: "Original Release run ID to resume after Android publication"
+        description: "Original Release run ID for recovery or verify-only mode"
         required: false
         type: string
       recovery_artifact_ids:
@@ -47,7 +52,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-libs-linux:
     name: L1 linux-x86_64
-    if: ${{ !inputs.recovery_run_id }}
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -197,7 +202,7 @@ jobs:
 
   build-libs-linux-arm:
     name: L1 linux-aarch64
-    if: ${{ !inputs.recovery_run_id }}
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     steps:
@@ -347,7 +352,7 @@ jobs:
 
   build-libs-macos:
     name: L1 macos-aarch64
-    if: ${{ !inputs.recovery_run_id }}
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -559,7 +564,7 @@ jobs:
 
   build-libs-macos-intel:
     name: L1 macos-x86_64
-    if: ${{ !inputs.recovery_run_id }}
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: macos-26-intel
     timeout-minutes: 90
     steps:
@@ -774,7 +779,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-apple:
     name: L2 Apple XCFramework
-    if: ${{ !inputs.recovery_run_id && inputs.build_apple }}
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id && inputs.build_apple }}
     runs-on: macos-26
     timeout-minutes: 150
     steps:
@@ -928,7 +933,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-android:
     name: L2 Android SDK (${{ matrix.backend }})
-    if: ${{ !inputs.recovery_run_id && inputs.build_android }}
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id && inputs.build_android }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -1163,7 +1168,7 @@ jobs:
     needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android]
     # Build-only runs may skip either L2 tier; release publication validates that both were selected and succeeded.
     if: >-
-      ${{ always() &&
+      ${{ always() && !inputs.verify_only &&
           needs.build-libs-linux.result == 'success' &&
           needs.build-libs-linux-arm.result == 'success' &&
           needs.build-libs-macos.result == 'success' &&
@@ -1258,7 +1263,7 @@ jobs:
   prepare-swift-package-release-assets:
     name: Prepare and test the single Swift package
     needs: [assemble-release-assets]
-    if: ${{ always() && inputs.build_apple && needs.assemble-release-assets.result == 'success' }}
+    if: ${{ always() && !inputs.verify_only && inputs.build_apple && needs.assemble-release-assets.result == 'success' }}
     runs-on: macos-26
     steps:
       - name: Checkout source snapshot
@@ -1309,7 +1314,7 @@ jobs:
   validate-release-request:
     name: Validate release request and reserve no existing version
     environment: release
-    if: ${{ inputs.publish && !inputs.recovery_run_id }}
+    if: ${{ inputs.publish && !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -1354,7 +1359,7 @@ jobs:
   publish-android-packages:
     name: Publish Android package (${{ matrix.backend }})
     needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release, create-draft-release]
-    if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.create-draft-release.result == 'success' }}
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.create-draft-release.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -1397,7 +1402,7 @@ jobs:
   prepare-swift-package-release:
     name: Stage immutable Swift package commit
     needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release-assets]
-    if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release-assets.result == 'success' }}
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release-assets.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -1435,7 +1440,7 @@ jobs:
   create-draft-release:
     name: Create draft release with checked assets
     needs: [assemble-release-assets, prepare-swift-package-release, build-node-packages]
-    if: ${{ always() && inputs.publish && needs.assemble-release-assets.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.build-node-packages.result == 'success' }}
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.assemble-release-assets.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.build-node-packages.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -1461,14 +1466,18 @@ jobs:
 
   build-node-packages:
     needs: [validate-release-request]
-    if: ${{ always() && !inputs.recovery_run_id && (!inputs.publish || needs.validate-release-request.result == 'success') }}
+    if: ${{ always() && !inputs.verify_only && !inputs.recovery_run_id && (!inputs.publish || needs.validate-release-request.result == 'success') }}
     uses: ./.github/workflows/npm-packages.yml
     with:
       tag: v${{ inputs.version }}
 
   verify-published-npm:
     name: Verify public npm package installs
-    needs: [publish-release]
+    needs: [publish-release, verify-public-release]
+    if: >-
+      ${{ always() && !cancelled() &&
+          ((inputs.verify_only && needs.verify-public-release.result == 'success') ||
+           (!inputs.verify_only && needs.publish-release.result == 'success')) }}
     uses: ./.github/workflows/npm-packages.yml
     with:
       tag: v${{ inputs.version }}
@@ -1476,7 +1485,11 @@ jobs:
 
   verify-published-zig:
     name: Verify public Zig package installs
-    needs: [publish-release]
+    needs: [publish-release, verify-public-release]
+    if: >-
+      ${{ always() && !cancelled() &&
+          ((inputs.verify_only && needs.verify-public-release.result == 'success') ||
+           (!inputs.verify_only && needs.publish-release.result == 'success')) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -1485,6 +1498,8 @@ jobs:
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
+          cache-build: false
+          cache-toolchain: false
       - name: Fetch the published Zig package and run both engines
         env:
           VERSION: ${{ inputs.version }}
@@ -1492,7 +1507,7 @@ jobs:
 
   verify-release-recovery:
     name: Find original release artifacts
-    if: ${{ inputs.recovery_run_id != '' }}
+    if: ${{ inputs.verify_only || inputs.recovery_run_id != '' }}
     runs-on: ubuntu-24.04
     permissions:
       actions: read
@@ -1512,23 +1527,62 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
+          package-manager-cache: false
       - name: Verify original run, Android jobs and artifact ownership
         id: original
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PUBLISH: ${{ inputs.publish }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
           ORIGINAL_RUN: ${{ inputs.recovery_run_id }}
           ORIGINAL_ARTIFACTS: ${{ inputs.recovery_artifact_ids }}
         run: |
           set -euo pipefail
-          test "$PUBLISH" = true || { echo 'Recovery requires Publish a complete release' >&2; exit 1; }
+          if [[ "$VERIFY_ONLY" == true ]]; then
+            test "$PUBLISH" = false || { echo 'Verify-only mode requires Publish a complete release to be disabled' >&2; exit 1; }
+            test -n "$ORIGINAL_RUN" && test -n "$ORIGINAL_ARTIFACTS" || { echo 'Verify-only mode requires the original release run and artifact IDs' >&2; exit 1; }
+          else
+            test "$PUBLISH" = true || { echo 'Recovery requires Publish a complete release' >&2; exit 1; }
+          fi
           node scripts/verify-release-recovery.mjs resolve "$ORIGINAL_RUN" "$ORIGINAL_ARTIFACTS" >> "$GITHUB_OUTPUT"
+
+  verify-public-release:
+    name: Verify the published tag and release assets
+    needs: [verify-release-recovery]
+    if: ${{ inputs.verify_only && !inputs.publish }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Verify the original source, public tag and release attachments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          ORIGINAL_RUN: ${{ inputs.recovery_run_id }}
+          SOURCE_SHA: ${{ needs.verify-release-recovery.outputs.source_sha }}
+          SWIFT_ID: ${{ needs.verify-release-recovery.outputs.swift_id }}
+          SWIFT_DIGEST: ${{ needs.verify-release-recovery.outputs.swift_digest }}
+          ASSETS_ID: ${{ needs.verify-release-recovery.outputs.assets_id }}
+          ASSETS_DIGEST: ${{ needs.verify-release-recovery.outputs.assets_digest }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-recovery.mjs download "$SWIFT_ID" "$SWIFT_DIGEST" "$RUNNER_TEMP/swift-package-release"
+          node scripts/verify-release-recovery.mjs download "$ASSETS_ID" "$ASSETS_DIGEST" release-assets
+          bash scripts/verify-staged-release.sh verify-published "$VERSION" "$SOURCE_SHA" "$ORIGINAL_RUN" release-assets "$RUNNER_TEMP/swift-package-release"
 
   publish-node-packages:
     name: Publish verified npm packages
     needs: [create-draft-release, build-node-packages, publish-android-packages, verify-release-recovery]
     if: >-
-      ${{ always() && inputs.publish &&
+      ${{ always() && inputs.publish && !inputs.verify_only &&
           ((inputs.recovery_run_id && needs.verify-release-recovery.result == 'success') ||
            (!inputs.recovery_run_id && needs.create-draft-release.result == 'success' &&
             needs.build-node-packages.result == 'success' && needs.publish-android-packages.result == 'success')) }}
@@ -1583,7 +1637,7 @@ jobs:
   publish-release:
     name: Publish GitHub Release
     needs: [create-draft-release, publish-node-packages, verify-release-recovery]
-    if: ${{ always() && inputs.publish && needs.publish-node-packages.result == 'success' && (inputs.recovery_run_id || needs.create-draft-release.result == 'success') }}
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.publish-node-packages.result == 'success' && (inputs.recovery_run_id || needs.create-draft-release.result == 'success') }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -1630,8 +1684,11 @@ jobs:
 
   verify-published-swift:
     name: Verify published Swift package downloads
-    needs: [publish-release, verify-release-recovery]
-    if: ${{ always() && inputs.publish && needs.publish-release.result == 'success' }}
+    needs: [publish-release, verify-release-recovery, verify-public-release]
+    if: >-
+      ${{ always() && !cancelled() &&
+          ((inputs.verify_only && needs.verify-public-release.result == 'success') ||
+           (!inputs.verify_only && needs.publish-release.result == 'success')) }}
     runs-on: macos-26
     permissions:
       actions: read
@@ -1667,8 +1724,11 @@ jobs:
 
   verify-published-android:
     name: Install published Android packages on ART
-    needs: [publish-release]
-    if: ${{ always() && inputs.publish && needs.publish-release.result == 'success' }}
+    needs: [publish-release, verify-public-release]
+    if: >-
+      ${{ always() && !cancelled() &&
+          ((inputs.verify_only && needs.verify-public-release.result == 'success') ||
+           (!inputs.verify_only && needs.publish-release.result == 'success')) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read

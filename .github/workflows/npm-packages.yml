@@ -135,6 +135,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
+          package-manager-cache: ${{ !inputs.verify_published }}
 
       - name: Install and run the public npm package
         if: ${{ inputs.verify_published }}

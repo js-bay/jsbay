@@ -5,7 +5,7 @@ import { basename, join } from 'node:path';
 
 const [operation, version, target, directory, packageDir, expectedReleaseId] = process.argv.slice(2);
 const repository = process.env.GITHUB_REPOSITORY;
-if (!['draft', 'verify', 'publish'].includes(operation) || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version ?? '') || !/^jsbay-package-staging-[0-9]+$/.test(target ?? '') || !directory || !packageDir || !/^[\w.-]+\/[\w.-]+$/.test(repository ?? '') || (expectedReleaseId && !/^[1-9]\d*$/.test(expectedReleaseId))) throw new Error('invalid release arguments');
+if (!['draft', 'verify', 'verify-published', 'publish'].includes(operation) || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version ?? '') || !/^jsbay-package-staging-[0-9]+$/.test(target ?? '') || !directory || !packageDir || !/^[\w.-]+\/[\w.-]+$/.test(repository ?? '') || (expectedReleaseId && !/^[1-9]\d*$/.test(expectedReleaseId))) throw new Error('invalid release arguments');
 const tag = `v${version}`;
 const endpoint = `repos/${repository}/releases`;
 const api = (...args) => JSON.parse(execFileSync('gh', ['api', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }));
@@ -58,5 +58,6 @@ if (operation === 'draft') {
     if (!release.draft) throw new Error('the original release is already published');
     console.log(release.id);
   }
+  if (operation === 'verify-published' && release.draft) throw new Error('the original release is still a draft');
   if (operation === 'publish' && release.draft) api('--method', 'PATCH', `${endpoint}/${release.id}`, '-F', 'draft=false');
 }
