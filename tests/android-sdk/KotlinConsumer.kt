@@ -11,6 +11,76 @@ import io.jsbay.Value
 import io.jsbay.ValueKind
 import java.io.File
 
+/**
+ * Drain the current thread's Looper for [milliseconds] of wall-clock time.
+ *
+ * Host tests compile against tests/android-sdk/android/os/Looper.java, which
+ * exposes advanceBy. Official device scripts compile against the real
+ * android.jar, which has no such method. This helper calls advanceBy when
+ * present (same semantics as the stub) and otherwise pumps the platform
+ * MessageQueue until a delayed sentinel runs, so LoopDriver callbacks fire.
+ *
+ * After the window, already-due work is flushed — including delay-0 callbacks
+ * re-armed while a previous due turn ran — so a finite FIFO still completes
+ * when one turn overruns the window (TCG). isIdle is true only when the queue
+ * is empty or the head is still in the future, so later timers are not waited
+ * out and the Looper is not quit. The post-window flush is capped
+ * ([MAX_DUE_FLUSH_MESSAGES]) so a Host.schedule(0) livelock cannot spin this
+ * helper without bound. Hitting the cap with work still queued is an error,
+ * not a silent under-run.
+ */
+private const val MAX_DUE_FLUSH_MESSAGES = 256
+
+private fun advanceCurrentLooper(milliseconds: Long) {
+    require(milliseconds >= 0) { "milliseconds" }
+    val looper = android.os.Looper.myLooper() ?: error("Kotlin consumer requires a prepared Looper")
+    try {
+        looper.javaClass.getMethod("advanceBy", Long::class.javaPrimitiveType).invoke(looper, milliseconds)
+        return
+    } catch (_: NoSuchMethodException) {
+        // Real android.os.Looper.
+    } catch (error: java.lang.reflect.InvocationTargetException) {
+        throw (error.targetException ?: error)
+    }
+    // Real Looper has no advanceBy. Pump MessageQueue.next() for the requested window, then flush already-due work up to MAX_DUE_FLUSH_MESSAGES.
+    val handler = android.os.Handler(looper)
+    val deadlineUptime = android.os.SystemClock.uptimeMillis() + milliseconds
+    val windowElapsed = java.util.concurrent.atomic.AtomicBoolean(milliseconds == 0L)
+    if (milliseconds > 0) {
+        handler.postDelayed({ windowElapsed.set(true) }, milliseconds)
+    }
+    val next = android.os.MessageQueue::class.java.getDeclaredMethod("next").apply { isAccessible = true }
+    val recycle =
+        try {
+            android.os.Message::class.java.getDeclaredMethod("recycleUnchecked").apply { isAccessible = true }
+        } catch (_: NoSuchMethodException) {
+            android.os.Message::class.java.getMethod("recycle")
+        }
+    var dueFlushed = 0
+    while (true) {
+        if (windowElapsed.get()) {
+            if (looper.queue.isIdle) break
+            check(dueFlushed < MAX_DUE_FLUSH_MESSAGES) {
+                "advanceCurrentLooper due-flush cap ($MAX_DUE_FLUSH_MESSAGES) reached with work still queued"
+            }
+        }
+        val msg = (next.invoke(looper.queue) as android.os.Message?) ?: break
+        if (msg.target != null) {
+            msg.target.dispatchMessage(msg)
+        }
+        try {
+            recycle.invoke(msg)
+        } catch (_: Throwable) {
+        }
+        if (android.os.SystemClock.uptimeMillis() >= deadlineUptime) {
+            windowElapsed.set(true)
+        }
+        if (windowElapsed.get()) {
+            dueFlushed += 1
+        }
+    }
+}
+
 private fun expectJsError(
     name: String,
     message: String,
@@ -20,8 +90,10 @@ private fun expectJsError(
         action()
         error(message)
     } catch (error: JsBayException) {
-        check(error.status == Status.EXCEPTION && error.value != null) { "$message: ${error.status}" }
-        error.value.use { thrown ->
+        // Local binding: Kotlin will not smart-cast JsBayException.value (Value?) when the SDK typings come from an AAR / other module.
+        val thrownValue = error.value
+        check(error.status == Status.EXCEPTION && thrownValue != null) { "$message: ${error.status}" }
+        thrownValue.use { thrown ->
             thrown.get("name").use { actual -> check(actual.string() == name) { "$message: ${actual.string()}" } }
         }
     }
@@ -666,6 +738,51 @@ fun runKotlinConsumer() {
         }
     }
     check(closeLate!!.tryResolveString("1") == Status.STALE_VALUE) { "Kotlin close rejects late completion" }
+    run {
+        val looper = android.os.Looper.myLooper() ?: error("Kotlin due-flush tests require a prepared Looper")
+        val handler = android.os.Handler(looper)
+        val ran = java.util.concurrent.atomic.AtomicInteger(0)
+        val chain = 64
+        repeat(chain) { handler.post { ran.incrementAndGet() } }
+        advanceCurrentLooper(0)
+        check(ran.get() == chain) { "Kotlin due-flush completes a finite delay-0 chain: ${ran.get()}" }
+        val hasAdvanceBy =
+            try {
+                looper.javaClass.getMethod("advanceBy", Long::class.javaPrimitiveType)
+                true
+            } catch (_: NoSuchMethodException) {
+                false
+            }
+        // The iteration cap is the device MessageQueue pump only. The host stub still uses advanceBy and is not the unbounded-flush path.
+        if (!hasAdvanceBy) {
+            val keepGoing = java.util.concurrent.atomic.AtomicBoolean(true)
+            val livelock = java.util.concurrent.atomic.AtomicInteger(0)
+            val tick =
+                object : Runnable {
+                    override fun run() {
+                        livelock.incrementAndGet()
+                        if (keepGoing.get()) {
+                            handler.post(this)
+                        }
+                    }
+                }
+            handler.post(tick)
+            try {
+                advanceCurrentLooper(0)
+                error("advanceCurrentLooper should reject a delay-0 livelock at the due-flush cap")
+            } catch (error: IllegalStateException) {
+                check(error.message.orEmpty().contains("due-flush cap")) {
+                    "Kotlin due-flush cap error: ${error.message}"
+                }
+            } finally {
+                keepGoing.set(false)
+                handler.removeCallbacksAndMessages(null)
+            }
+            check(livelock.get() == MAX_DUE_FLUSH_MESSAGES) {
+                "Kotlin due-flush cap dispatched ${livelock.get()}, expected $MAX_DUE_FLUSH_MESSAGES"
+            }
+        }
+    }
     Engine(7104).use { submitted ->
         val outcomes = mutableListOf<SubmissionResult>()
         check(submitted.postScript("globalThis.__submitted = 40 + 2", "submission-ok.js") { outcomes += it }) {
@@ -675,9 +792,7 @@ fun runKotlinConsumer() {
             "Kotlin exception submission admission"
         }
         check(submitted.postFence(completion = { outcomes += it })) { "Kotlin postFence admission" }
-        android.os.Looper
-            .myLooper()
-            .advanceBy(100)
+        advanceCurrentLooper(100)
         check(
             outcomes.map { it.status } ==
                 listOf(SubmissionStatus.COMPLETED, SubmissionStatus.EXCEPTION, SubmissionStatus.COMPLETED),
@@ -687,9 +802,7 @@ fun runKotlinConsumer() {
         submitted.evaluate("__submitted", "submission-result.js").use { check(it.number() == 42.0) }
         check(submitted.beginShutdown(1_000)) { "Kotlin beginShutdown admission" }
         check(submitted.postFence(sealShutdown = true) { outcomes += it }) { "Kotlin sealing fence admission" }
-        android.os.Looper
-            .myLooper()
-            .advanceBy(100)
+        advanceCurrentLooper(100)
         check(submitted.shutdownStatus()?.phase == ShutdownPhase.DRAINED) { "Kotlin shutdown drains through fence" }
         check(!submitted.postScript("1", "submission-rejected.js")) { "Kotlin sealed shutdown rejects new scripts" }
     }
@@ -714,9 +827,7 @@ fun runKotlinConsumer() {
                         check(busy.beginShutdown(20)) { "Kotlin foreign-thread beginShutdown admission" }
                     }
                 controller.start()
-                android.os.Looper
-                    .myLooper()
-                    .advanceBy(200)
+                advanceCurrentLooper(200)
                 controller.join()
             }
         check(outcomes.singleOrNull()?.status == SubmissionStatus.CANCELLED) {

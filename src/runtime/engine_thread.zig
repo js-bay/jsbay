@@ -1118,6 +1118,15 @@ fn instanceStillLive(instance_id: i32) bool {
 
 /// Stop the engine thread, wake blocked waiters, and drop thread bookkeeping. Used when destroy runs on a thread other than the engine thread, before the event-loop waiter or JS runtime is torn down.
 pub fn beforeDestroy(instance_id: i32) void {
+    // engine.destroy from a foreign thread (tests: close between reserve and commit)
+    // reaches here with no library-owned engine thread. Escargot TLS/GC is per OS
+    // thread; initialize it before shutdown or runtime free.
+    if (comptime backend.active_backend == .escargot) {
+        if (@hasDecl(ActiveEngine, "threadEnter")) ActiveEngine.threadEnter();
+    }
+    defer if (comptime backend.active_backend == .escargot) {
+        if (@hasDecl(ActiveEngine, "threadLeave")) ActiveEngine.threadLeave();
+    };
     // threadStop's deferred-destroy path enters here without going through engine.destroyNow, so close public JS admission before detaching State.
     instance_map.markTeardownPending(instance_id);
     const gate = destroyGate(instance_id);

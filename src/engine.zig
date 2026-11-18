@@ -700,6 +700,13 @@ fn deferredDestroyTask(ctx: ?*anyopaque) void {
 }
 
 fn destroyNow(instance_id: i32) void {
+    // Foreign-thread destroy (no engine thread) still touches the VM. Escargot requires Globals::initializeThread on every OS thread or TLS/GC string access can SIGSEGV.
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        if (@hasDecl(ActiveEngine, "threadEnter")) ActiveEngine.threadEnter();
+    }
+    defer if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        if (@hasDecl(ActiveEngine, "threadLeave")) ActiveEngine.threadLeave();
+    };
     // From this point teardown may detach the engine-thread State before it reaches destroyRuntime. Close public JS admission first so it cannot recreate that State against a runtime being dismantled.
     instance_map.markTeardownPending(instance_id);
     // Mirror stop_loop so a blocking run sees both the teardown latch and the driver's stop bit. shouldStop already watches teardown_pending; requestStop covers hosts that only observe the driver flag and wakes the waiter promptly.
@@ -717,18 +724,25 @@ fn destroyNow(instance_id: i32) void {
     destroyRuntime(instance_id);
 }
 
-/// Free the scheduler and JS runtime for an instance. The caller has already stopped the engine thread, or is that thread and has left the JS call.
-pub fn destroyRuntime(instance_id: i32) void {
-    const inspector_state = @import("inspector/root.zig").state;
-    if (!inspector_state.beginEngineDestroy(instance_id)) return;
-    defer inspector_state.endEngineDestroy(instance_id);
-
-    if (!dispatch.closeInstanceTasks(instance_id)) return;
-    @import("abi/api_async.zig").cancelForInstance(types.InstanceId.fromInt(instance_id));
-    @import("js_event_loop").host_wake.drop(instance_id);
-    // Drain Hide/Show/stop leases before touching the Driver (R3 getPtrs∩destroy).
-    instance_map.waitForControlOps(instance_id);
+/// Run loop.detach through context/runtime free on the JS owner thread.
+///
+/// `endControlPlane` calls this when the last control lease drops after teardown has started.
+///
+/// `js_teardown_in_progress` stays published until this function returns, so both already-blocked and late `waitForControlOps` callers remain in the wait protocol for the whole cleanup.
+///
+/// `js_teardown_done` is stored only after `releaseJsResources` returns, so a destroyer cannot `allocator.destroy` the instance mid-cleanup.
+///
+/// Idempotent (does not double-free). Does not remove the instance; `destroyRuntime` still owns mutex/wake lifetime for the waiter.
+pub fn finishOwnerThreadJsTeardown(instance_id: i32) void {
     const instance = instance_map.getInstance(instance_id) orelse return;
+    if (comptime @import("builtin").is_test) instance_map.testing.parkOwnerCleanupIfHooked();
+    if (instance.js_teardown_done.load(.acquire)) return;
+    releaseJsResources(instance, true);
+    instance.js_teardown_done.store(true, .release);
+}
+
+fn releaseJsResources(instance: *instance_map.EngineInstance, free_vm: bool) void {
+    const instance_id = instance.instance_id;
     instance.loop.detach();
     // No NativeTask or TSFN callback admitted before closure may still be using this context when runtime teardown starts.
     dispatch.waitForInstanceTasks(instance_id);
@@ -763,20 +777,62 @@ pub fn destroyRuntime(instance_id: i32) void {
 
     @import("backend/console_timers.zig").deinitInstance(instance_id);
 
-    // 4. Free JS context and runtime
+    // 4. Free JS context and runtime (or leak the VM if free_vm is false).
     debugger_mod.detach(instance_id);
-    switch (instance.engine_handles) {
-        .mono => |m| {
-            if (m.ctx != null and m.runtime != null) {
-                ActiveEngine.runGc(m.runtime);
-                ActiveEngine.freeContext(m.ctx);
-                ActiveEngine.runGc(m.runtime);
-                ActiveEngine.freeRuntime(m.runtime);
-            }
-        },
-        .packed_alt => |a| @import("backend_dispatch.zig").destroyPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }),
+    if (free_vm) {
+        switch (instance.engine_handles) {
+            .mono => |m| {
+                if (m.ctx != null and m.runtime != null) {
+                    ActiveEngine.runGc(m.runtime);
+                    ActiveEngine.freeContext(m.ctx);
+                    ActiveEngine.runGc(m.runtime);
+                    ActiveEngine.freeRuntime(m.runtime);
+                }
+            },
+            .packed_alt => |a| @import("backend_dispatch.zig").destroyPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }),
+        }
     }
+    clearEngineHandles(instance);
     @import("inspector/async_stack.zig").deinitInstance(instance_id);
+}
+
+fn clearEngineHandles(instance: *instance_map.EngineInstance) void {
+    switch (instance.engine_handles) {
+        .mono => {
+            instance.engine_handles = .{ .mono = .{ .runtime = null, .ctx = null } };
+        },
+        .packed_alt => |a| {
+            instance.engine_handles = .{ .packed_alt = .{ .tag = a.tag, .runtime_addr = 0, .ctx_addr = 0 } };
+        },
+    }
+}
+
+/// Free the scheduler and JS runtime for an instance. The caller has already stopped the engine thread, or is that thread and has left the JS call.
+pub fn destroyRuntime(instance_id: i32) void {
+
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        if (@hasDecl(ActiveEngine, "threadEnter")) ActiveEngine.threadEnter();
+    }
+    defer if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        if (@hasDecl(ActiveEngine, "threadLeave")) ActiveEngine.threadLeave();
+    };
+    const inspector_state = @import("inspector/root.zig").state;
+    if (!inspector_state.beginEngineDestroy(instance_id)) return;
+    defer inspector_state.endEngineDestroy(instance_id);
+
+    if (!dispatch.closeInstanceTasks(instance_id)) return;
+    @import("abi/api_async.zig").cancelForInstance(types.InstanceId.fromInt(instance_id));
+    @import("js_event_loop").host_wake.drop(instance_id);
+    // Drain Hide/Show/stop leases before touching the Driver (R3 getPtrs∩destroy).
+    instance_map.waitForControlOps(instance_id);
+    const instance = instance_map.getInstance(instance_id) orelse return;
+    // After waitForControlOps, owner cleanup has either finished (done=true) or never started. Claim with swap so only one thread enters release.
+    if (!instance.js_teardown_done.swap(true, .acq_rel)) {
+        const on_owner = instance.js_owner_tid == std.Thread.getCurrentId();
+        // Escargot: never `delete ctx` off the creating thread (threadEnter is not enough). If the last lease did not drop on the owner, skip VM free (leak) rather than SEGV.
+        const free_vm = if (comptime backend.isEscargotBackend(backend.active_backend)) on_owner else true;
+        releaseJsResources(instance, free_vm);
+    }
 
     // 5. Free the TimerRegistry and instance
     var timer_reg = instance.timers;
@@ -859,6 +915,7 @@ test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Lin
     // Force the erase/dispatch path even for the pack primary so Linux single-pack CI proves
     // EngineInstance.packed_alt without needing a second real engine (JSC is Apple-only).
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const id = helpers.nextInstanceId();
     const tag = backend.active_backend;
     const backend_dispatch = @import("backend_dispatch.zig");

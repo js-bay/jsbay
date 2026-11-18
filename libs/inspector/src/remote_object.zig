@@ -108,6 +108,8 @@ pub fn Module(comptime Host: type) type {
         const ByValueFrame = struct {
             value: ActiveEngine.Value,
             depth: usize,
+            /// 0 means unnamed (use sameValue only). Set on object/array enter.
+            identity: u64 = 0,
             node: union(enum) {
                 enter,
                 array: struct {
@@ -123,6 +125,27 @@ pub fn Module(comptime Host: type) type {
             } = .enter,
         };
 
+        /// Stable JS object identity for the returnByValue path-ancestor set.
+        /// Hermes retainMove / get / call allocate a new handle box, so hashing
+        /// raw Value bytes is not object identity. Prefer ActiveEngine.objectIdentity
+        /// (Hermes WeakMap id, Escargot ValueRef*, QuickJS JSValue bits). `null`
+        /// means the engine could not name the object, including a 0 sentinel;
+        /// callers must fall back to sameValue against path ancestors.
+        fn byValueIdentity(ctx: ActiveEngine.Context, value: ActiveEngine.Value) ?u64 {
+            if (comptime @hasDecl(ActiveEngine, "objectIdentity")) {
+                return ActiveEngine.objectIdentity(ctx, value);
+            }
+            return null;
+        }
+
+        fn ancestorHasSameValue(ctx: ActiveEngine.Context, frames: []const ByValueFrame, top: usize, value: ActiveEngine.Value) bool {
+            var i: usize = 0;
+            while (i < top) : (i += 1) {
+                if (ActiveEngine.sameValue(ctx, frames[i].value, value)) return true;
+            }
+            return false;
+        }
+
         fn writeByValueJson(
             state: *InspectorState,
             ctx: ActiveEngine.Context,
@@ -130,7 +153,9 @@ pub fn Module(comptime Host: type) type {
             value: ActiveEngine.Value,
         ) !void {
             var frames: std.ArrayList(ByValueFrame) = .empty;
+            var ancestors = std.AutoHashMap(u64, void).init(state.allocator);
             defer {
+                ancestors.deinit();
                 while (frames.items.len != 0) freeByValueFrame(ctx, frames.pop().?);
                 frames.deinit(state.allocator);
             }
@@ -178,17 +203,22 @@ pub fn Module(comptime Host: type) type {
                             continue;
                         }
                         if (!ActiveEngine.isObjectVal(ctx, frame_value) and !ActiveEngine.isFunction(ctx, frame_value)) return error.UnsupportedByValue;
-                        for (frames.items[0..top]) |ancestor| {
-                            switch (ancestor.node) {
-                                .array, .object => if (ActiveEngine.sameValue(ctx, ancestor.value, frame_value)) return error.ByValueCycle,
-                                .enter => {},
-                            }
+                        // Path-cycle check: use an O(1) ancestor set keyed by real object identity.
+                        //
+                        // If the engine cannot name the object, walk ancestors with sameValue so an unidentifiable object still participates in the cycle check.
+                        const identity = byValueIdentity(ctx, frame_value);
+                        if (identity) |id| {
+                            if (ancestors.contains(id)) return error.ByValueCycle;
+                        } else if (ancestorHasSameValue(ctx, frames.items, top, frame_value)) {
+                            return error.ByValueCycle;
                         }
+                        frames.items[top].identity = if (identity) |id| id else 0;
 
                         if (ActiveEngine.isArray(ctx, frame_value)) {
                             const len = ActiveEngine.getLength(ctx, frame_value) orelse return error.InternalByValue;
                             try writer.writeByte('[');
                             frames.items[top].node = .{ .array = .{ .next = 0, .len = len } };
+                            if (identity) |id| ancestors.put(id, {}) catch return error.InternalByValue;
                             continue;
                         }
 
@@ -206,11 +236,14 @@ pub fn Module(comptime Host: type) type {
                             break :blk .{ .keys = keys, .len = len };
                         };
                         frames.items[top].node = .{ .object = .{ .keys = keys_and_len.keys, .next = 0, .len = keys_and_len.len, .wrote_one = false } };
+                        if (identity) |id| ancestors.put(id, {}) catch return error.InternalByValue;
                     },
                     .array => |array| {
                         if (array.next == array.len) {
                             try writer.writeByte(']');
-                            freeByValueFrame(ctx, frames.pop().?);
+                            const finished = frames.pop().?;
+                            if (finished.identity != 0) _ = ancestors.remove(finished.identity);
+                            freeByValueFrame(ctx, finished);
                             continue;
                         }
                         if (array.next != 0) try writer.writeByte(',');
@@ -234,7 +267,9 @@ pub fn Module(comptime Host: type) type {
                     .object => |object| {
                         if (object.next == object.len) {
                             try writer.writeByte('}');
-                            freeByValueFrame(ctx, frames.pop().?);
+                            const finished = frames.pop().?;
+                            if (finished.identity != 0) _ = ancestors.remove(finished.identity);
+                            freeByValueFrame(ctx, finished);
                             continue;
                         }
                         const parent_value = frames.items[top].value;

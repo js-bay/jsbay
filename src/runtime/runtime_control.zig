@@ -62,6 +62,34 @@ var registry: std.AutoHashMap(i32, *InterruptState) =
     std.AutoHashMap(i32, *InterruptState).init(std.heap.c_allocator);
 var registry_mutex: sync.Mutex = .{};
 
+// Count of in-flight host trampolines per instance. Not part of InterruptState: that extern layout is shared with backend trampolines and must not gain fields.
+var host_callback_depth: std.AutoHashMap(i32, u32) =
+    std.AutoHashMap(i32, u32).init(std.heap.c_allocator);
+
+/// Entered around a spike (Hermes/Escargot) host-function trampoline.
+pub fn beginHostCallback(instance_id: i32) void {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const gop = host_callback_depth.getOrPut(instance_id) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    gop.value_ptr.* += 1;
+}
+
+pub fn endHostCallback(instance_id: i32) void {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const d = host_callback_depth.getPtr(instance_id) orelse return;
+    std.debug.assert(d.* != 0);
+    d.* -= 1;
+    if (d.* == 0) _ = host_callback_depth.remove(instance_id);
+}
+
+fn isHostCallbackActive(instance_id: i32) bool {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    return (host_callback_depth.get(instance_id) orelse 0) != 0;
+}
+
 fn takeState(instance_id: i32) ?*InterruptState {
     registry_mutex.lock();
     defer registry_mutex.unlock();
@@ -154,6 +182,9 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
 
 /// Remove the interrupt trampoline and free the state. Call before `engine.destroy`. Idempotent — returns false if the instance was never initialized (or already torn down).
 pub fn deinit(instance_id: i32) bool {
+    registry_mutex.lock();
+    _ = host_callback_depth.remove(instance_id);
+    registry_mutex.unlock();
     const inst_opt = instance_map.getInstance(instance_id);
 
     const state = takeState(instance_id) orelse return false;
@@ -201,8 +232,8 @@ pub fn deinit(instance_id: i32) bool {
 
 fn hermesTriggerTimeout(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Control-plane lease: refuse teardown_pending and keep destroyRuntime waiting so asyncTriggerTimeout cannot touch a freed Hermes runtime.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    // Lifecycle lease: admitted after teardown_pending so destroy/stop can still fire asyncTriggerTimeout. destroyRuntime waits on the lease before freeing the runtime.
+    const lease = instance_map.beginLifecycleControlPlane(instance_id) orelse return;
     defer lease.end();
     const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
@@ -211,8 +242,8 @@ fn hermesTriggerTimeout(instance_id: i32) void {
 
 fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Lease across watch/unwatch so clear_interrupt cannot race destroyRuntime freeing the Hermes runtime while the map entry still exists.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    // Lifecycle lease: softRearm after a host destroy/stop must still watch while teardown is already marked.
+    const lease = instance_map.beginLifecycleControlPlane(instance_id) orelse return;
     defer lease.end();
     const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
@@ -226,12 +257,28 @@ fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
 
 fn hermesDrainAsyncTimeout(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Same lease as watch/trigger: drain touches native Hermes timeout state that destroyRuntime frees.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    // Lifecycle lease, idle only. Must not run from a host trampoline: drain uses a nested evaluateJavaScript and will hang inside an active eval.
+    const lease = instance_map.beginLifecycleControlPlane(instance_id) orelse return;
     defer lease.end();
     const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
     her.c_api_mod.hermes_runtime_drain_async_timeout(rt);
+}
+
+/// Arm a non-sticky IHermes watch for the remaining execution deadline around a job/microtask drain.
+///
+/// Unwatch and drain afterwards so an expired watch cannot poison later evals.
+pub fn armHermesDeadlineWatch(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const rem = remainingEffectiveExecutionLimitMillis(instance_id) orelse return;
+    hermesWatchTimeLimit(instance_id, if (rem == 0) 1 else rem);
+}
+
+pub fn disarmHermesDeadlineWatch(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    hermesWatchTimeLimit(instance_id, 0);
+    if (isHostCallbackActive(instance_id)) return;
+    hermesDrainAsyncTimeout(instance_id);
 }
 
 /// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from requestStopInterrupt (destroy/stop) therefore kills finite work after a host callback (`hostDestroy(); 42`). Call from the host trampoline on the way back into JS: clear sticky bits on every eval-active instance on this thread (nested destroy can arm outer frames too), then arm a short watch so loops still abort soon.
@@ -244,7 +291,11 @@ pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
 
 fn rearmOneHermesStop(instance_id: i32) void {
     if (!isStopRequested(instance_id)) return;
-    hermesDrainAsyncTimeout(instance_id);
+    // Do not call hermesDrainAsyncTimeout here. That helper runs a nested evaluateJavaScript
+    // to clear a sticky Timeout AsyncBreak; doing so from the host trampoline (already inside
+    // an eval) hangs the engine thread and then live.close()/destroy. requestStopInterrupt
+    // skips the sticky trigger while this eval is on the stack; a short watch aborts a
+    // follow-on loop without killing finite work such as `hostDestroy(); 42`.
     hermesWatchTimeLimit(instance_id, 25);
 }
 
@@ -265,10 +316,12 @@ pub fn supportsMidScriptUserInterrupt() bool {
 /// Request mid-script interrupt when the backend supports it. Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed). Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
     if (!supportsMidScriptUserInterrupt()) {
-        // Refuse to claim mid-script stop. Do not set the user bit (avoids false isInterruptRequested).
+        // Refuse mid-script stop: do not set the user bit (engine_thread/spike honesty: requestInterrupt returns false and isInterruptRequested stays false). Still record a host-defer bit so typed error-observer flush can pause remaining events, matching the existing observer contract without claiming a mid-script abort.
         registry_mutex.lock();
         defer registry_mutex.unlock();
-        _ = registry.get(instance_id) orelse return false;
+        const state = registry.get(instance_id) orelse return false;
+        const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+        _ = p.fetchOr(4, .monotonic);
         return false;
     }
     registry_mutex.lock();
@@ -287,7 +340,8 @@ pub fn clearInterrupt(instance_id: i32) bool {
         return false;
     };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
-    _ = p.fetchAnd(~@as(u8, 1), .monotonic);
+    // Clear the mid-script user bit and the spike host-defer bit; leave the lifecycle stop bit.
+    _ = p.fetchAnd(~@as(u8, 1 | 4), .monotonic);
     registry_mutex.unlock();
     // Unwatch only — do not evaluate here (may race a live mid-script eval).
     // Sticky Timeout AsyncBreak from stop/destroy is drained in clearStopInterrupt after join.
@@ -305,7 +359,17 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchOr(2, .monotonic);
     registry_mutex.unlock();
-    hermesTriggerTimeout(instance_id);
+    // Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout while a
+    // host trampoline is on the stack would abort finite work after the callback
+    // (`holdEval(); 42`, `hostDestroy(); 42`). It would also tempt softRearm to peel
+    // the bit with a nested evaluateJavaScript, which hangs. Skip the sticky trigger
+    // only while a host callback is in flight; the trampoline then arms a short watch.
+    // External stop/destroy of a tight `while (true) {}` (no host frame) still triggers
+    // immediately. "Eval active on this thread" is not the right test: an external
+    // destroy thread is never inside the eval, but may arrive during holdEval().
+    if (!isHostCallbackActive(instance_id)) {
+        hermesTriggerTimeout(instance_id);
+    }
     return true;
 }
 
@@ -517,6 +581,19 @@ pub fn isInterruptRequested(instance_id: i32) bool {
     };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     const requested = (p.load(.monotonic) & 1) != 0;
+    registry_mutex.unlock();
+    return requested;
+}
+
+/// Host-side observer/flush deferral recorded by requestInterrupt on spikes that cannot abort mid-script JS.
+pub fn isHostDeferRequested(instance_id: i32) bool {
+    registry_mutex.lock();
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
+    const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+    const requested = (p.load(.monotonic) & 4) != 0;
     registry_mutex.unlock();
     return requested;
 }

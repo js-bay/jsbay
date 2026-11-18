@@ -193,7 +193,7 @@ pub fn build(b: *std.Build) void {
     const stress_tests = b.option(bool, "stress-tests", "Run tests whose names include stress, including high-load event-loop and timer tests") orelse false;
     // Test-only: exports jsbay_test_trigger_native_fault. NEVER enable for publish / library-only ReleaseFast product builds.
     const fault_injection = b.option(bool, "fault-injection", "Export test-only native fault probe (jsbay_test_trigger_native_fault); default OFF") orelse false;
-    const asan = b.option(bool, "asan", "Compile QuickJS/NG C sources with -fsanitize=address for harsh ASan consumers") orelse false;
+    const asan = b.option(bool, "asan", "Instrument QuickJS/NG C with -fsanitize=address; on host linux-x86_64, also link GCC libasan (Zig 0.17 ships no ASan RT)") orelse false;
     const apple_package = b.option(bool, "apple-package", "Build a stripped Apple XCFramework library without Zig error tracing") orelse false;
     const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const android_sysroot = b.option([]const u8, "android-sysroot", "NDK sysroot whose usr/include provides Bionic headers");
@@ -448,6 +448,11 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    if (asan) {
+        // Do not set detect_leaks=0 or halt_on_error=0: a silent ASan/UBSan pass is not a pass.
+        run_unit_tests.setEnvironmentVariable("ASAN_OPTIONS", "halt_on_error=1:abort_on_error=0:detect_leaks=1");
+        run_unit_tests.setEnvironmentVariable("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1");
+    }
     const test_step = b.step("test", "Run js-bay unit tests");
     test_step.dependOn(&run_unit_tests.step);
     b.step("test-engine", "Run engine tests without independent package suites").dependOn(&run_unit_tests.step);
@@ -920,6 +925,8 @@ fn preparePatchedQuickJsNg(b: *std.Build, tool: *std.Build.Step.Compile) std.Bui
     run.addFileArg(b.path("vendor/quickjs-ng-debug-step.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-debug-eval-cache.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-unresolve-modules.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-pending-tla-module.patch"));
     return out;
 }
 
@@ -1096,7 +1103,10 @@ fn addQuickJsCSources(
         .safe => "-O2",
         .fast, .small => "-O3",
     };
-    // ASan instruments QuickJS C and wrappers; the final consumer must link -fsanitize=address.
+    // ASan instruments QuickJS C and wrappers. Zig 0.17's bundled Clang does not ship
+    // libclang_rt.asan, so host linux-x86_64 consumers are linked against GCC libasan
+    // (ABI __asan_version_mismatch_check_v8). Other targets still require the consumer
+    // to link a matching ASan runtime; -Dasan is never silently ignored.
     const c_flags: []const []const u8 = blk: {
         if (asan and gc_stress)
             break :blk &.{ b.fmt("-DCONFIG_VERSION=\"{s}\"", .{version}), "-DFORCE_GC_AT_MALLOC=1", "-fwrapv", "-w", c_opt, "-fsanitize=address", "-fno-omit-frame-pointer" };
@@ -1113,6 +1123,40 @@ fn addQuickJsCSources(
         });
     }
     m.addIncludePath(qjs_root);
+    if (asan and hostLinuxX64CanLinkGccAsan(m)) linkHostLinuxAsanRuntime(b, m);
+}
+
+
+fn hostLinuxX64CanLinkGccAsan(m: *std.Build.Module) bool {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return false;
+    const target = m.resolved_target orelse return false;
+    const r = target.result;
+    if (r.os.tag != .linux or r.cpu.arch != .x86_64) return false;
+    if (r.abi.isAndroid() or r.abi == .ohos or r.abi == .ohoseabi) return false;
+    return true;
+}
+
+/// Zig 0.17 / Clang 22 emit ASan hooks but do not ship an ASan runtime. Resolve GCC's libasan.so (SONAME libasan.so.8) via `gcc -print-file-name` and link it.
+///
+/// Missing toolchain is a hard build failure, never a silent disable.
+fn linkHostLinuxAsanRuntime(b: *std.Build, m: *std.Build.Module) void {
+    const printed = b.run(&.{ "gcc", "-print-file-name=libasan.so" });
+    const asan_so = std.mem.trim(u8, printed, " \t\r\n");
+    if (asan_so.len == 0 or std.mem.eql(u8, asan_so, "libasan.so") or !std.fs.path.isAbsolute(asan_so)) {
+        std.process.fatal("-Dasan=true: gcc -print-file-name=libasan.so did not yield an absolute library path (got '{s}'). Install GCC libasan (e.g. Debian libasan8) or a Clang-matching compiler-rt; refusing to silently disable ASan.", .{asan_so});
+    }
+    const dir = std.fs.path.dirname(asan_so) orelse std.process.fatal("-Dasan=true: cannot take dirname of '{s}'", .{asan_so});
+    // Static archive + preinit so libasan does not end up after libc in DT_NEEDED ("ASan runtime does not come first in initial library list"). Dynamic libasan.so.8 remains a documented LD_PRELOAD fallback, not used here.
+    const preinit = b.fmt("{s}/libasan_preinit.o", .{dir});
+    const archive = b.fmt("{s}/libasan.a", .{dir});
+    m.addObjectFile(.{ .cwd_relative = preinit });
+    m.addObjectFile(.{ .cwd_relative = archive });
+    m.addLibraryPath(.{ .cwd_relative = dir });
+    m.linkSystemLibrary("gcc_s", .{
+        .needed = true,
+        .use_pkg_config = .no,
+    });
 }
 
 fn addPlatformCompatSources(b: *std.Build, m: *std.Build.Module) void {
@@ -1205,6 +1249,8 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-ng-debug-step.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-debug-eval-cache.patch"));
             hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-unresolve-modules.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-pending-tla-module.patch"));
             hash.update(@embedFile("src/backend/quickjs_ng/qjs_wrapper_ng.c"));
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
             hash.update(@embedFile("src/backend/quickjs_common/bytecode.zig"));

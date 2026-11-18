@@ -468,6 +468,21 @@ pub fn sameValue(ctx: Context, a: Value, b: Value) bool {
 }
 
 /// `new Array(len)`. Index holes stay absent and read back as `undefined`. Caller owns the returned value. Null on exception.
+///
+/// The JSValue bit pattern *is* the object (not a unique handle box). A 0 pattern is treated as unnamed so the caller can fall back to sameValue.
+pub fn objectIdentity(_: Context, v: Value) ?u64 {
+    var copy = v;
+    const bytes = std.mem.asBytes(&copy);
+    if (bytes.len >= 8) {
+        const id = std.mem.readInt(u64, bytes[0..8], .little);
+        return if (id == 0) null else id;
+    }
+    var id: u64 = 0;
+    for (bytes, 0..) |b, k| id |= @as(u64, b) << @intCast(8 * k);
+    return if (id == 0) null else id;
+}
+
+
 pub fn newArray(ctx: Context, len: u32) ?Value {
     const arr = qjs.JS_NewArray(ctx);
     if (c.jsIsException(arr)) {

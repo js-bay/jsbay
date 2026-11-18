@@ -26,6 +26,7 @@ pub fn Module(comptime Host: type) type {
         const sendJson = json_writer.sendJson;
         const sendInvalidParams = json_writer.sendInvalidParams;
         const sendError = json_writer.sendError;
+        const sendErrorWithData = json_writer.sendErrorWithData;
         const sendObjectNotFound = json_writer.sendObjectNotFound;
         const sendEvalException = remote_object.sendEvalException;
         const sendSimpleRemoteObject = remote_object.sendSimpleRemoteObject;
@@ -456,7 +457,8 @@ pub fn Module(comptime Host: type) type {
 
         fn sendByValueError(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64, err: anyerror) void {
             switch (err) {
-                error.ByValueCycle, error.ByValueDepth => sendError(state, session_id, request_id, -32000, "Object reference chain is too long"),
+                error.ByValueCycle => sendErrorWithData(state, session_id, request_id, -32000, "Object reference chain is too long", "cycle"),
+                error.ByValueDepth => sendErrorWithData(state, session_id, request_id, -32000, "Object reference chain is too long", "depth"),
                 error.UnsupportedByValue => sendError(state, session_id, request_id, -32000, "Object couldn't be returned by value"),
                 else => sendError(state, session_id, request_id, -32603, "Internal error"),
             }

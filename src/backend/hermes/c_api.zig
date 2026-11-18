@@ -248,6 +248,22 @@ pub extern fn hermes_set_rejection_tracker(
     userdata: ?*anyopaque,
 ) bool;
 
+pub const ErrorObserverFn = *const fn (
+    instance_id: i32,
+    kind: i32,
+    promise: Value,
+    reason: Value,
+    userdata: ?*anyopaque,
+) callconv(.c) bool;
+pub const ShouldDeferFn = *const fn (instance_id: i32) callconv(.c) bool;
+pub extern fn hermes_set_error_observer(
+    ctx: ?*Context,
+    instance_id: i32,
+    fn_ptr: ?ErrorObserverFn,
+    should_defer: ?ShouldDeferFn,
+    userdata: ?*anyopaque,
+) bool;
+
 pub const HostProgressFn = *const fn (userdata: ?*anyopaque) callconv(.c) void;
 
 pub extern fn hermes_set_host_progress(

@@ -34,6 +34,7 @@ const TestLoaderCtx = struct {
     allocator: std.mem.Allocator,
     modules: std.StringHashMap([]const u8),
     resolve_calls: u32 = 0,
+    load_calls: u32 = 0,
     reentrant_instance: ?i32 = null,
     reentrant_task_ran: bool = false,
 
@@ -71,6 +72,7 @@ fn testLoaderLoad(
 ) callconv(.c) bool {
     const ctx: *TestLoaderCtx = @ptrCast(@alignCast(ud.?));
     const key = std.mem.span(id);
+    ctx.load_calls += 1;
     const src = ctx.modules.get(key) orelse return false;
     if (ctx.reentrant_instance) |instance_id| {
         std.debug.assert(dispatch.postTask(instance_id, .{ .ctx = ctx, .run = TestLoaderCtx.runQueued }));
@@ -1130,8 +1132,10 @@ test "modules: diamond import-then-export keeps a shared originating binding" {
 
     const keeps_shared_binding = comptime switch (backend.active_backend) {
         // Hermes leaf-origin WeakMap; bellard QuickJS and JSC follow import provenance for star ambiguity.
-        .hermes, .quickjs, .jsc => true,
-        // Spec-shaped LocalExportEntries identity: exporter module, so the diamond is ambiguous.
+        // Escargot's native ModuleLoader matches that leaf-origin/shared-binding behavior
+        // (API35 device: hasOwnProperty("value") is true, same as diamond star/named tests).
+        .hermes, .quickjs, .jsc, .escargot => true,
+        // Spec-shaped LocalExportEntries identity: exporter module, so the diamond is ambiguous (quickjs_ng).
         else => false,
     };
     if (keeps_shared_binding) {
@@ -2002,4 +2006,137 @@ test "modules: missing named import is rejected before importer body" {
     try testing.expect(std.mem.indexOf(u8, err, "missing") != null);
     // Importer body must not run after a failed named-import link.
     try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__ran__ === 1 ? 1 : 0"));
+}
+
+// ---- NG pin verification (S1 / S2). These follow the public engine + ModuleLoader path. ----
+
+fn isQuickJsNgBackend() bool {
+    return comptime backend.active_backend == .quickjs_ng;
+}
+
+/// Advance the host loop until `script` stringifies to `expected`, or `turns` is exhausted.
+fn settleUntilEquals(id: i32, script: []const u8, expected: []const u8, turns: u32) !bool {
+    var turn: u32 = 0;
+    while (turn < turns) : (turn += 1) {
+        _ = engine.testing.advance(id, 0);
+        const state = try helpers.evalString(testing.allocator, id, script);
+        defer testing.allocator.free(state);
+        if (std.mem.eql(u8, state, expected)) return true;
+    }
+    return false;
+}
+
+// S1: a imports b then a missing id; b imports a. Four dynamic imports (a,b,a,b) must each reject.
+// This is the public-host shape of upstream tests/module-failed-resolution.js on the patched NG pin.
+// The test asserts observable host results and survival; a sanitizer fault is a failed run, not a passing expect.
+test "modules: ng-pin-validation failed-resolution cycle stays failed across four dynamic imports" {
+    if (!isQuickJsNgBackend()) return error.SkipZigTest;
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    // b is listed before the missing specifier so the cycle pointer is recorded before resolve fails.
+    try ctx.modules.put("a",
+        \\import 'b';
+        \\import 'missing';
+        \\export const a = 1;
+    );
+    try ctx.modules.put("b",
+        \\import 'a';
+        \\export const b = 1;
+    );
+
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    defer engine.destroy(id);
+
+    const res = engine.evalModule(id,
+        \\globalThis.__s1 = { stage: 'start', results: [] };
+        \\async function load(name) {
+        \\  try {
+        \\    await import(name);
+        \\    return 'loaded';
+        \\  } catch (e) {
+        \\    return 'failed';
+        \\  }
+        \\}
+        \\(async () => {
+        \\  globalThis.__s1.results.push(await load('a'));
+        \\  globalThis.__s1.results.push(await load('b'));
+        \\  globalThis.__s1.results.push(await load('a'));
+        \\  globalThis.__s1.results.push(await load('b'));
+        \\  globalThis.__s1.stage = 'done';
+        \\})().catch((e) => {
+        \\  globalThis.__s1.stage = 'entry-rejected';
+        \\  globalThis.__s1.error = String(e);
+        \\});
+    , "<s1-entry>");
+    defer helpers.freeEvalResult(res);
+    try testing.expect(res.err == null);
+
+    const settled = try settleUntilEquals(id, "String(globalThis.__s1.stage)", "done", 80);
+    if (!settled) {
+        const stage = try helpers.evalString(testing.allocator, id, "String(globalThis.__s1.stage)");
+        defer testing.allocator.free(stage);
+        std.debug.print("S1 did not reach done; stage={s} load_calls={d}\n", .{ stage, ctx.load_calls });
+    }
+    try testing.expect(settled);
+    try helpers.expectEvalEquals(id, "globalThis.__s1.results.join(',')", "failed,failed,failed,failed");
+    try helpers.expectEvalEquals(id, "String(1 + 1)", "2");
+    // The missing id and both sides of the cycle must have been presented to load at least once.
+    try testing.expect(ctx.load_calls >= 3);
+    std.debug.print("S1 completed; load_calls={d}\n", .{ctx.load_calls});
+}
+
+fn runPendingTlaThenDestroy(keep_global: bool) !void {
+    var ctx = TestLoaderCtx.init(testing.allocator);
+    defer ctx.deinit();
+    const loader = types.ModuleLoader{ .vtable = &test_vtable, .user_data = &ctx };
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{ .module_loader = &loader }));
+    var destroyed = false;
+    defer if (!destroyed) engine.destroy(id);
+
+    const src: []const u8 = if (keep_global)
+        \\globalThis.__s2 = 'before';
+        \\globalThis.p = new Promise(() => {});
+        \\await globalThis.p;
+        \\globalThis.__s2 = 'after';
+    else
+        \\globalThis.__s2 = 'before';
+        \\await new Promise(() => {});
+        \\globalThis.__s2 = 'after';
+    ;
+
+    const res = engine.evalModule(id, src, "<s2-entry>");
+    // evalModule must have returned to the host before destroy is attempted.
+    defer helpers.freeEvalResult(res);
+    std.debug.print("S2 evalModule returned keep_global={s} err={s}\n", .{
+        if (keep_global) "true" else "false",
+        if (res.err) |e| e else "null",
+    });
+    try testing.expect(res.err == null);
+    std.debug.print("S2 after err check keep_global={s}\n", .{if (keep_global) "true" else "false"});
+    try helpers.expectEvalEquals(id, "String(globalThis.__s2)", "before");
+    std.debug.print("S2 stage is before; calling destroy keep_global={s}\n", .{if (keep_global) "true" else "false"});
+    engine.destroy(id);
+    destroyed = true;
+    std.debug.print("S2 destroy returned keep_global={s}\n", .{if (keep_global) "true" else "false"});
+
+    // The process and engine registry must still accept a new instance after that destroy.
+    const id2 = helpers.nextInstanceId();
+    try testing.expect(engine.create(id2, .{}));
+    defer engine.destroy(id2);
+    try helpers.expectEvalEquals(id2, "String(1 + 1)", "2");
+}
+
+// S2: never-settling top-level await must not block the synchronous evalModule return; destroy follows that return.
+// keep_global=true matches the upstream api-test module_pending_await fixture (globalThis.p retains the promise).
+test "modules: ng-pin-validation pending top-level await eval returns before destroy" {
+    if (!isQuickJsNgBackend()) return error.SkipZigTest;
+    try runPendingTlaThenDestroy(true);
+}
+
+test "modules: ng-pin-validation pending top-level await without global promise then destroy" {
+    if (!isQuickJsNgBackend()) return error.SkipZigTest;
+    try runPendingTlaThenDestroy(false);
 }

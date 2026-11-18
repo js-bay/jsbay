@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <pthread.h>
 
 using namespace Escargot;
 
@@ -380,8 +381,16 @@ extern "C" void escargot_globals_ensure(void) { ensureGlobals(); }
 
 // Depth of nested enter/leave on this OS thread. Threaded Escargot keeps TLS/GC state per thread; runtime_new enters so VMInstanceRef::create is safe on any caller thread, and runtime_free leaves once the VM is destroyed. engine_thread also enter/leaves.
 static thread_local int g_escargot_thread_depth = 0;
+static void escargotTrace(const char *msg) {
+    const char *e = std::getenv("JSBAY_ESCARGOT_TRACE");
+    if (!e || !*e) return;
+    fprintf(stderr, "escargot-trace tid=%lu %s\n", (unsigned long)pthread_self(), msg);
+    fflush(stderr);
+}
+
 
 extern "C" void escargot_thread_enter(void) {
+    escargotTrace("thread_enter");
     // ENABLE_THREADING: g_globalsInited is thread_local; each OS thread that touches Escargot must initializeThread (Shell/cctest pattern). No-op when vendor is non-threaded (supportsThreading()==false).
     if (!Globals::supportsThreading()) return;
     if (g_escargot_thread_depth == 0 && !Globals::isInitialized()) {
@@ -391,6 +400,7 @@ extern "C" void escargot_thread_enter(void) {
 }
 
 extern "C" void escargot_thread_leave(void) {
+    escargotTrace("thread_leave");
     if (!Globals::supportsThreading()) return;
     if (g_escargot_thread_depth <= 0) return;
     if (--g_escargot_thread_depth == 0 && Globals::isInitialized()) {
@@ -418,6 +428,7 @@ extern "C" EscargotRuntime *escargot_runtime_new(void) {
 }
 
 extern "C" void escargot_runtime_free(EscargotRuntime *rt) {
+    escargotTrace("runtime_free");
     if (!rt) return;
     // Destroy the VM while this thread's Escargot TLS/GC is still initialized.
     delete rt;
@@ -462,10 +473,14 @@ extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
 }
 
 extern "C" void escargot_context_free(EscargotContext *ctx) {
+    escargotTrace("context_free");
     if (!ctx) return;
 #ifdef ESCARGOT_DEBUGGER
+    escargotTrace("context_free debugger_detach");
     escargot_debugger_detach(ctx);
+    escargotTrace("context_free debugger_detach done");
 #endif
+    escargotTrace("context_free clear pending");
     ctx->pending_throw.clear();
     ctx->pending_throw_set = false;
     if (ctx->pending_throw_value) {
@@ -491,8 +506,11 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
         ctx->protect.clear();
     }
     // Drop PersistentRefs then GC so BackingStore deleters can run.
+    escargotTrace("context_free gc1");
     Memory::gc();
+    escargotTrace("context_free gc2");
     Memory::gc();
+    escargotTrace("context_free gc done");
     // Force any remaining no-copy buffer finalizers (engine teardown contract).
     std::vector<NoCopyPack *> leftover;
     {
@@ -521,6 +539,7 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
         std::lock_guard<std::mutex> lock(ctx->finals_mu);
         leftover_finals.swap(ctx->pending_finals);
     }
+    escargotTrace("context_free finals");
     for (auto *pf : leftover_finals) {
         if (!pf) continue;
         if (!pf->fired) {
@@ -530,7 +549,9 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
         delete pf;
     }
 
+    escargotTrace("context_free delete ctx");
     delete ctx;
+    escargotTrace("context_free done");
 }
 
 extern "C" void escargot_context_set_opaque(EscargotContext *ctx, void *opaque) {
@@ -706,6 +727,7 @@ extern "C" EscargotValue escargot_debugger_eval_frame(EscargotContext *, int, co
 
 extern "C" EscargotEvalResult escargot_eval(EscargotContext *c, const char *src, size_t src_len,
                                             const char *filename, size_t filename_len) {
+    escargotTrace("eval");
     EscargotEvalResult out{};
     if (!c || !c->ctx.get() || !src) {
         escargotEvalSetErrStr(out, "invalid context");
@@ -816,9 +838,9 @@ extern "C" bool escargot_is_function(EscargotContext *, EscargotValue v) {
     return v && (asVal(v)->isFunctionObject() || asVal(v)->isCallable());
 }
 
+// ES IsConstructor: use ValueRef::isConstructible so Proxy/BoundFunction with [[Construct]] are reported without reading `prototype` (a get trap may throw). FunctionObject-only checks miss constructible Proxies.
 extern "C" bool escargot_is_constructor(EscargotContext *, EscargotValue v) {
-    if (!v || !asVal(v)->isFunctionObject()) return false;
-    return asVal(v)->asFunctionObject()->isConstructor();
+    return v && asVal(v)->isConstructible();
 }
 
 // ECMAScript ToBoolean. Objects/symbols are always true; 0/NaN/-0, "", 0n, null, undefined are false.
@@ -1949,7 +1971,8 @@ extern "C" EscargotValue escargot_new_error(EscargotContext *c, int kind, const 
 
 static EscargotOpResult opFail(EscargotContextOpaque *c, ValueRef *exc) {
     EscargotOpResult out{nullptr, nullptr};
-    if (exc) out.exception = retain(c, exc);
+    // A null ValueRef is the undefined sentinel. `throw undefined` must still produce a non-null exception handle so Zig result APIs do not treat it as "no throw".
+    out.exception = retain(c, exc ? exc : ValueRef::createUndefined());
     return out;
 }
 static EscargotOpResult opOk(EscargotContextOpaque *c, ValueRef *v) {
@@ -1959,7 +1982,7 @@ static EscargotOpResult opOk(EscargotContextOpaque *c, ValueRef *v) {
 }
 static EscargotBoolOpResult boolFail(EscargotContextOpaque *c, ValueRef *exc) {
     EscargotBoolOpResult out{false, nullptr};
-    if (exc) out.exception = retain(c, exc);
+    out.exception = retain(c, exc ? exc : ValueRef::createUndefined());
     return out;
 }
 static EscargotBoolOpResult boolOk(bool v) {
@@ -2722,11 +2745,13 @@ extern "C" void escargot_uninstall_module_loader(EscargotContext *ctx) {
 static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *source,
                                            StringRef *fname, const std::string &cache_key) {
     EscargotEvalResult out{};
+    escargotTrace("initializeScript module");
     auto parsed = c->ctx.get()->scriptParser()->initializeScript(source, fname, true);
     if (!parsed.isSuccessful()) {
         std::string __em;
         if (auto *__sr = parsed.parseErrorMessage) __em = __sr->toStdUTF8String();
         if (__em.empty()) __em = "module parse error";
+        escargotTrace(("initializeScript parse error: " + __em).c_str());
         escargotEvalSetErrStr(out, __em);
         return out;
     }
@@ -2741,6 +2766,7 @@ static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *
         std::string __em;
         if (auto *__sr = er.resultOrErrorToString(c->ctx.get())) __em = __sr->toStdUTF8String();
         if (__em.empty()) __em = "module evaluation error";
+        escargotTrace(("evalModuleScript execute error: " + __em).c_str());
         escargotEvalSetErrStr(out, __em);
         return out;
     }

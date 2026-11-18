@@ -30,7 +30,7 @@ Host `vendor/{escargot,hermes,icu}-install` trees are **linux glibc** — do not
 - Hermes device/emulator `LD_LIBRARY_PATH` must include x86_64 `libhermes_{bridge,vm}.so`, `libjsi.so`, and x86_64 `libc++_shared.so` (not an i686 copy).
 - `jsbay_engine_create_with_options` is force-exported from library-only builds via `@export` in `src/root.zig`.
 - Zig 0.17 `process.run` does not PATH-search relative `cc`/`c++`; `tools/src/main.zig` `resolvePathCmd` uses absolute compiler paths for `check-c-abi`.
-- Full gated `unit_tests` on a TCG emulator is not part of the smoke path; host linux gated counts live in `docs/capability.md` / `docs/production-gaps.md`.
+- Full gated `unit_tests` on a TCG emulator is not part of the smoke path; host linux gated counts live in `docs/capability.md` / `docs/production-gaps.md`. The official in-tree device replay (NDK `--libc`, Escargot emutls + `__zig_probe_stack`, `docs/state-tcas-*.md` push) is documented in `docs/android-unit-tests.md` and implemented under `scripts/android-unit-tests/`.
 
 ## Verify (smoke)
 

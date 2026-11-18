@@ -246,10 +246,20 @@ fn shouldStopPendingJobDrain(instance_id: i32) bool {
     return if (runtime_control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
 }
 
+/// Stop/destroy and explicit requestInterrupt must not enter another job.
+/// An already-expired execution deadline or budget must not, by itself, skip
+/// JS_ExecutePendingJob: that leaves a queued `queueMicrotask(() => { while (true) {} })`
+/// on the job list. runEventLoopOnce then returns, a later eval may clear the
+/// limit, and the leftover job hangs forever with no interrupt armed.
+fn shouldRefuseJobDrain(instance_id: i32) bool {
+    const runtime_control = @import("../../runtime/runtime_control.zig");
+    return runtime_control.isInterruptRequested(instance_id) or runtime_control.isStopRequested(instance_id);
+}
+
 pub fn processPendingJobsImpl(ctx: ?*qjs.JSContext) void {
     if (ctx == null) return;
     const instance_id: i32 = @bitCast(@as(u32, @truncate(@intFromPtr(qjs.JS_GetContextOpaque(ctx)))));
-    if (shouldStopPendingJobDrain(instance_id)) return;
+    if (shouldRefuseJobDrain(instance_id)) return;
     if (!@import("../../runtime/scheduler_gate.zig").allows(@ptrCast(ctx))) return;
     defer @import("../../runtime/scheduler_gate.zig").finished(@ptrCast(ctx));
     if (!enterJs(ctx)) return;
@@ -263,9 +273,18 @@ pub fn processPendingJobsImpl(ctx: ?*qjs.JSContext) void {
     }
     const rt = qjs.JS_GetRuntime(ctx);
     var ctx1: ?*qjs.JSContext = null;
+    // Always enter the first leftover job even if the deadline is already 0,
+    // so a queued `while (true) {}` is aborted by the interrupt trampoline in
+    // this turn instead of leaking into a later unlimited eval. After that,
+    // shouldStopPendingJobDrain (expired deadline/budget, or stop/interrupt)
+    // ends the loop so a batch of short leftover microtasks cannot run unbounded.
+    var started_a_job = false;
     while (true) {
-        if (shouldStopPendingJobDrain(instance_id)) break;
+        if (shouldRefuseJobDrain(instance_id)) break;
+        if (started_a_job and shouldStopPendingJobDrain(instance_id)) break;
         const status = qjs.JS_ExecutePendingJob(rt, &ctx1);
+        if (status == 0) break;
+        started_a_job = true;
         if (status > 0) continue;
         if (status < 0 and ctx1 != null) {
             const opaque_id = qjs.JS_GetContextOpaque(ctx1);
@@ -277,7 +296,7 @@ pub fn processPendingJobsImpl(ctx: ?*qjs.JSContext) void {
                 @import("../../inspector/root.zig").exceptions.reportUncaught(failed_instance_id, message, "");
             }
             c.jsbay_qjs_JS_FreeValue(ctx1, exc);
-            if (shouldStopPendingJobDrain(failed_instance_id)) break;
+            if (shouldRefuseJobDrain(failed_instance_id)) break;
             continue;
         }
         break;
@@ -304,6 +323,7 @@ pub const QuickJsNgBackend = struct {
     pub const isObjectVal = value_mixin.isObjectVal;
     pub const isArray = value_mixin.isArray;
     pub const sameValue = value_mixin.sameValue;
+    pub const objectIdentity = value_mixin.objectIdentity;
     pub const toBool = value_mixin.toBool;
     pub const toInt32 = value_mixin.toInt32;
     pub const toFloat64 = value_mixin.toFloat64;
