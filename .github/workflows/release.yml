@@ -25,6 +25,14 @@ on:
         required: false
         type: boolean
         default: true
+      recovery_run_id:
+        description: "Original Release run ID to resume after Android publication"
+        required: false
+        type: string
+      recovery_artifact_ids:
+        description: "Original artifact IDs in npm, Swift package, final release assets order (comma-separated)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -39,6 +47,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-libs-linux:
     name: L1 linux-x86_64
+    if: ${{ !inputs.recovery_run_id }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -188,6 +197,7 @@ jobs:
 
   build-libs-linux-arm:
     name: L1 linux-aarch64
+    if: ${{ !inputs.recovery_run_id }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     steps:
@@ -337,6 +347,7 @@ jobs:
 
   build-libs-macos:
     name: L1 macos-aarch64
+    if: ${{ !inputs.recovery_run_id }}
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -548,6 +559,7 @@ jobs:
 
   build-libs-macos-intel:
     name: L1 macos-x86_64
+    if: ${{ !inputs.recovery_run_id }}
     runs-on: macos-26-intel
     timeout-minutes: 90
     steps:
@@ -762,7 +774,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-apple:
     name: L2 Apple XCFramework
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_apple }}
+    if: ${{ !inputs.recovery_run_id && inputs.build_apple }}
     runs-on: macos-26
     timeout-minutes: 150
     steps:
@@ -916,7 +928,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-android:
     name: L2 Android SDK (${{ matrix.backend }})
-    if: ${{ inputs.build_android }}
+    if: ${{ !inputs.recovery_run_id && inputs.build_android }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -1297,7 +1309,7 @@ jobs:
   validate-release-request:
     name: Validate release request and reserve no existing version
     environment: release
-    if: ${{ inputs.publish }}
+    if: ${{ inputs.publish && !inputs.recovery_run_id }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -1449,73 +1461,246 @@ jobs:
 
   build-node-packages:
     needs: [validate-release-request]
-    if: ${{ always() && (!inputs.publish || needs.validate-release-request.result == 'success') }}
+    if: ${{ always() && !inputs.recovery_run_id && (!inputs.publish || needs.validate-release-request.result == 'success') }}
     uses: ./.github/workflows/npm-packages.yml
     with:
-      operation: build
       tag: v${{ inputs.version }}
+
+  verify-published-npm:
+    name: Verify public npm package installs
+    needs: [publish-release]
+    uses: ./.github/workflows/npm-packages.yml
+    with:
+      tag: v${{ inputs.version }}
+      verify_published: true
+
+  verify-published-zig:
+    name: Verify public Zig package installs
+    needs: [publish-release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+      - name: Fetch the published Zig package and run both engines
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash tests/ci/release-zig-consumer.sh "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/jsbay-$VERSION-zig.tar.gz"
+
+  verify-release-recovery:
+    name: Find original release artifacts
+    if: ${{ inputs.recovery_run_id != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_sha: ${{ steps.original.outputs.source_sha }}
+      npm_id: ${{ steps.original.outputs.npm_id }}
+      npm_digest: ${{ steps.original.outputs.npm_digest }}
+      swift_id: ${{ steps.original.outputs.swift_id }}
+      swift_digest: ${{ steps.original.outputs.swift_digest }}
+      assets_id: ${{ steps.original.outputs.assets_id }}
+      assets_digest: ${{ steps.original.outputs.assets_digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Verify original run, Android jobs and artifact ownership
+        id: original
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH: ${{ inputs.publish }}
+          ORIGINAL_RUN: ${{ inputs.recovery_run_id }}
+          ORIGINAL_ARTIFACTS: ${{ inputs.recovery_artifact_ids }}
+        run: |
+          set -euo pipefail
+          test "$PUBLISH" = true || { echo 'Recovery requires Publish a complete release' >&2; exit 1; }
+          node scripts/verify-release-recovery.mjs resolve "$ORIGINAL_RUN" "$ORIGINAL_ARTIFACTS" >> "$GITHUB_OUTPUT"
 
   publish-node-packages:
-    needs: [create-draft-release, build-node-packages, publish-android-packages]
-    if: ${{ always() && inputs.publish && needs.create-draft-release.result == 'success' && needs.build-node-packages.result == 'success' && needs.publish-android-packages.result == 'success' }}
-    uses: ./.github/workflows/npm-packages.yml
-    with:
-      operation: publish
-      tag: v${{ inputs.version }}
-      artifact_id: ${{ needs.build-node-packages.outputs.artifact_id }}
-
-  publish-release:
-    name: Publish GitHub Release
-    needs: [create-draft-release, publish-node-packages]
-    if: ${{ always() && inputs.publish && needs.create-draft-release.result == 'success' && needs.publish-node-packages.result == 'success' }}
+    name: Publish verified npm packages
+    needs: [create-draft-release, build-node-packages, publish-android-packages, verify-release-recovery]
+    if: >-
+      ${{ always() && inputs.publish &&
+          ((inputs.recovery_run_id && needs.verify-release-recovery.result == 'success') ||
+           (!inputs.recovery_run_id && needs.create-draft-release.result == 'success' &&
+            needs.build-node-packages.result == 'success' && needs.publish-android-packages.result == 'success')) }}
     runs-on: ubuntu-24.04
     environment: release
     permissions:
+      actions: read
+      contents: read
+    outputs:
+      recovery_draft_id: ${{ steps.recovery.outputs.draft_id }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.recovery_run_id }}
+        with:
+          artifact-ids: ${{ needs.build-node-packages.outputs.artifact_id }}
+          path: npm-release
+          merge-multiple: true
+      - name: Download original artifacts and verify the existing draft
+        id: recovery
+        if: ${{ inputs.recovery_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          ORIGINAL_RUN: ${{ inputs.recovery_run_id }}
+          SOURCE_SHA: ${{ needs.verify-release-recovery.outputs.source_sha }}
+          NPM_ID: ${{ needs.verify-release-recovery.outputs.npm_id }}
+          NPM_DIGEST: ${{ needs.verify-release-recovery.outputs.npm_digest }}
+          SWIFT_ID: ${{ needs.verify-release-recovery.outputs.swift_id }}
+          SWIFT_DIGEST: ${{ needs.verify-release-recovery.outputs.swift_digest }}
+          ASSETS_ID: ${{ needs.verify-release-recovery.outputs.assets_id }}
+          ASSETS_DIGEST: ${{ needs.verify-release-recovery.outputs.assets_digest }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-recovery.mjs download "$NPM_ID" "$NPM_DIGEST" npm-release
+          node scripts/verify-release-recovery.mjs download "$SWIFT_ID" "$SWIFT_DIGEST" "$RUNNER_TEMP/swift-package-release"
+          node scripts/verify-release-recovery.mjs download "$ASSETS_ID" "$ASSETS_DIGEST" release-assets
+          draft_id=$(bash scripts/verify-staged-release.sh verify "$VERSION" "$SOURCE_SHA" "$ORIGINAL_RUN" release-assets "$RUNNER_TEMP/swift-package-release")
+          [[ "$draft_id" =~ ^[1-9][0-9]*$ ]]
+          echo "draft_id=$draft_id" >> "$GITHUB_OUTPUT"
+      - name: Verify and publish the original npm tarballs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.verify-release-recovery.outputs.source_sha || github.sha }}
+        run: node scripts/publish-npm-release.mjs npm-release "$VERSION" "$SOURCE_SHA" publish
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [create-draft-release, publish-node-packages, verify-release-recovery]
+    if: ${{ always() && inputs.publish && needs.publish-node-packages.result == 'success' && (inputs.recovery_run_id || needs.create-draft-release.result == 'success') }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      actions: read
       contents: write
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
+        if: ${{ !inputs.recovery_run_id }}
         with:
           name: jsbay-final-release-assets
           path: release-assets
       - uses: actions/download-artifact@v4
+        if: ${{ !inputs.recovery_run_id }}
         with:
           name: jsbay-swift-package
           path: ${{ runner.temp }}/swift-package-release
+      - name: Download original Swift metadata and release assets
+        if: ${{ inputs.recovery_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFT_ID: ${{ needs.verify-release-recovery.outputs.swift_id }}
+          SWIFT_DIGEST: ${{ needs.verify-release-recovery.outputs.swift_digest }}
+          ASSETS_ID: ${{ needs.verify-release-recovery.outputs.assets_id }}
+          ASSETS_DIGEST: ${{ needs.verify-release-recovery.outputs.assets_digest }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-recovery.mjs download "$SWIFT_ID" "$SWIFT_DIGEST" "$RUNNER_TEMP/swift-package-release"
+          node scripts/verify-release-recovery.mjs download "$ASSETS_ID" "$ASSETS_DIGEST" release-assets
       - name: Verify assets and publish the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.verify-release-recovery.outputs.source_sha || github.sha }}
+          ORIGINAL_RUN: ${{ inputs.recovery_run_id || github.run_id }}
+          RECOVERY_RUN: ${{ inputs.recovery_run_id }}
+          DRAFT_ID: ${{ needs.publish-node-packages.outputs.recovery_draft_id }}
         run: |
           set -euo pipefail
-          stage_ref="refs/heads/jsbay-package-staging-$GITHUB_RUN_ID"
-          stage_sha="$(git ls-remote --refs origin "$stage_ref" | cut -f1)"
-          test -n "$stage_sha"
-          tag_ref="refs/tags/v$VERSION"
-          existing_sha="$(git ls-remote origin "$tag_ref" "$tag_ref^{}" | awk 'END {print $1}')"
-          test -z "$existing_sha" || test "$existing_sha" = "$stage_sha"
-          node scripts/github-release.mjs publish "$VERSION" "jsbay-package-staging-$GITHUB_RUN_ID" release-assets "$RUNNER_TEMP/swift-package-release"
-          tag_sha="$(git ls-remote origin "$tag_ref" "$tag_ref^{}" | awk 'END {print $1}')"
-          test "$tag_sha" = "$stage_sha"
+          if [[ -n "$RECOVERY_RUN" ]]; then test -n "$DRAFT_ID"; fi
+          bash scripts/verify-staged-release.sh publish "$VERSION" "$SOURCE_SHA" "$ORIGINAL_RUN" release-assets "$RUNNER_TEMP/swift-package-release" "$DRAFT_ID"
 
   verify-published-swift:
     name: Verify published Swift package downloads
-    needs: [publish-release]
+    needs: [publish-release, verify-release-recovery]
     if: ${{ always() && inputs.publish && needs.publish-release.result == 'success' }}
     runs-on: macos-26
     permissions:
+      actions: read
       contents: read
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
       - uses: actions/download-artifact@v4
+        if: ${{ !inputs.recovery_run_id }}
         with:
           name: jsbay-swift-package
           path: ${{ runner.temp }}/swift-package-release
+      - name: Download the original Swift package metadata
+        if: ${{ inputs.recovery_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFT_ID: ${{ needs.verify-release-recovery.outputs.swift_id }}
+          SWIFT_DIGEST: ${{ needs.verify-release-recovery.outputs.swift_digest }}
+        run: node scripts/verify-release-recovery.mjs download "$SWIFT_ID" "$SWIFT_DIGEST" "$RUNNER_TEMP/swift-package-release"
       - name: Download and run all published Swift and Objective-C products
         env:
           VERSION: ${{ inputs.version }}
-        run: bash tests/apple-sdk/remote-package-consumer.sh "$RUNNER_TEMP/swift-package-release" "$VERSION"
+        run: |
+          set -euo pipefail
+          udid="$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | .value[] | select(.isAvailable == true) | select(.name | startswith("iPhone"))] | .[0].udid // empty')"
+          test -n "$udid" || { echo 'No iOS Simulator available' >&2; exit 1; }
+          if ! xcrun simctl boot "$udid"; then
+            xcrun simctl list devices booted -j | jq -e --arg udid "$udid" '[.devices[][] | select(.udid == $udid)] | length == 1' >/dev/null
+          fi
+          xcrun simctl bootstatus "$udid" -b
+          JSBAY_IOS_SIM_UDID="$udid" bash tests/apple-sdk/remote-package-consumer.sh "$RUNNER_TEMP/swift-package-release" "$VERSION"
+
+  verify-published-android:
+    name: Install published Android packages on ART
+    needs: [publish-release]
+    if: ${{ always() && inputs.publish && needs.publish-release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4.0.4
+      - name: Install Android SDK and Gradle
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install Maven packages and run consumers
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash tests/android-sdk/run-maven-remote-consumer.sh "$VERSION" "$RUNNER_TEMP/gradle-8.9/bin/gradle"

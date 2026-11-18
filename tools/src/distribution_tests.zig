@@ -508,12 +508,12 @@ test "publication jobs require the release environment" {
     const io = testing.io;
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
-    const npm = try read(a, io, cwd, &.{ ".github", "workflows", "npm-packages.yml" });
     const jobs = [_][2][]const u8{
         .{ "validate-release-request", "publish-android-packages" },
         .{ "publish-android-packages", "prepare-swift-package-release" },
         .{ "prepare-swift-package-release", "create-draft-release" },
         .{ "create-draft-release", "build-node-packages" },
+        .{ "publish-node-packages", "publish-release" },
         .{ "publish-release", "verify-published-swift" },
     };
     for (jobs) |job| {
@@ -524,8 +524,6 @@ test "publication jobs require the release environment" {
         const end = std.mem.indexOf(u8, rest, next) orelse return error.MissingReleaseJob;
         try contains(rest[0..end], "    environment: release\n");
     }
-    const start = std.mem.indexOf(u8, npm, "  publish-packages:\n") orelse return error.MissingNpmPublishJob;
-    try contains(npm[start..], "    environment: release\n");
     try notContains(release, "NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
 }
 
@@ -599,13 +597,13 @@ test "test_dispatch_publishes_only_after_explicit_opt_in" {
     const android_job = release[std.mem.indexOf(u8, release, "  publish-android-packages:\n") orelse return error.MissingAndroidPublishJob ..];
     try contains(release, "permissions:\n  contents: read");
     try contains(release, "publish:\n        description:");
-    try contains(release, "if: ${{ inputs.publish }}");
+    try contains(release, "if: ${{ inputs.publish && !inputs.recovery_run_id }}");
     try contains(tag_job, "permissions:\n      contents: write");
     try contains(tag_job, "bash scripts/create-swift-package-tag.sh");
     try contains(android_job, "needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release, create-draft-release]");
     try notContains(release, "github.event_name == 'push'");
     try notContains(release, "startsWith(github.ref, 'refs/tags/v')");
-    try contains(release, "node scripts/github-release.mjs publish");
+    try contains(release, "bash scripts/verify-staged-release.sh publish");
     const validation = release[std.mem.indexOf(u8, release, "  validate-release-request:\n") orelse return error.MissingValidationJob ..];
     const validation_end = std.mem.indexOf(u8, validation, "\n  publish-android-packages:") orelse return error.MissingAndroidPublishJob;
     try contains(validation[0..validation_end], "          submodules: recursive\n");

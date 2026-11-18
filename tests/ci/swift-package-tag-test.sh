@@ -108,9 +108,22 @@ test "$(git --git-dir="$remote" rev-parse 'refs/tags/v1.2.4^{commit}')" = "$mali
 
 stage_version=1.2.5
 stage_ref=refs/heads/jsbay-package-staging-test
+verify_stage() {
+  (cd "$clone" && JSBAY_PACKAGE_REF="$stage_ref" bash "$root/scripts/create-swift-package-tag.sh" "$output" "$stage_version" "$1" verify-only)
+}
+if verify_stage "$source_sha"; then
+  echo 'verification accepted a missing staging ref' >&2
+  exit 1
+fi
+test -z "$(git --git-dir="$remote" show-ref --verify "$stage_ref" || true)"
 (cd "$clone" && JSBAY_PACKAGE_REF="$stage_ref" bash "$root/scripts/create-swift-package-tag.sh" "$output" "$stage_version" "$source_sha")
 test -z "$(git --git-dir="$remote" show-ref --verify refs/tags/v1.2.5 || true)"
 stage_commit=$(git --git-dir="$remote" rev-parse "$stage_ref^{commit}")
 test "$(git --git-dir="$remote" rev-parse "$stage_commit^")" = "$source_sha"
+test "$(verify_stage "$source_sha")" = "$stage_commit"
+if verify_stage "$other_source"; then
+  echo 'verification accepted a staging ref from another source commit' >&2
+  exit 1
+fi
 (cd "$clone" && JSBAY_PACKAGE_REF="$stage_ref" bash "$root/scripts/create-swift-package-tag.sh" "$output" "$stage_version" "$source_sha")
 test "$(git --git-dir="$remote" rev-parse "$stage_ref^{commit}")" = "$stage_commit"

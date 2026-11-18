@@ -4,6 +4,8 @@ set -euo pipefail
 package_dir=${1:?generated Swift package directory required}
 version=${2:?release version required}
 source_sha=${3:?source commit SHA required}
+operation=${4:-stage}
+[[ $operation == stage || $operation == verify-only ]] || { echo 'invalid package staging operation' >&2; exit 2; }
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || { echo 'invalid release version' >&2; exit 2; }
 package_dir=$(cd "$package_dir" && pwd)
 repo=$(git rev-parse --show-toplevel)
@@ -81,10 +83,18 @@ verify_remote_tag() {
 existing=$(git -C "$repo" ls-remote --refs origin "$tag_ref")
 if [[ -n $existing ]]; then
   if commit=$(verify_remote_tag); then
-    echo "Reusing existing matching package tag $tag at $commit"
+    if [[ $operation == verify-only ]]; then
+      printf '%s\n' "$commit"
+    else
+      echo "Reusing existing matching package tag $tag at $commit"
+    fi
     exit 0
   fi
   echo "existing release tag cannot be reused: $tag" >&2
+  exit 1
+fi
+if [[ $operation == verify-only ]]; then
+  echo "missing package staging ref: $tag_ref" >&2
   exit 1
 fi
 

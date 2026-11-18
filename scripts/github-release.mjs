@@ -3,9 +3,9 @@ import { execFileSync } from 'node:child_process';
 import { closeSync, openSync, readFileSync, readdirSync, readSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
-const [operation, version, target, directory, packageDir] = process.argv.slice(2);
+const [operation, version, target, directory, packageDir, expectedReleaseId] = process.argv.slice(2);
 const repository = process.env.GITHUB_REPOSITORY;
-if (!['draft', 'publish'].includes(operation) || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version ?? '') || !/^jsbay-package-staging-[0-9]+$/.test(target ?? '') || !directory || !packageDir || !/^[\w.-]+\/[\w.-]+$/.test(repository ?? '')) throw new Error('invalid release arguments');
+if (!['draft', 'verify', 'publish'].includes(operation) || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version ?? '') || !/^jsbay-package-staging-[0-9]+$/.test(target ?? '') || !directory || !packageDir || !/^[\w.-]+\/[\w.-]+$/.test(repository ?? '') || (expectedReleaseId && !/^[1-9]\d*$/.test(expectedReleaseId))) throw new Error('invalid release arguments');
 const tag = `v${version}`;
 const endpoint = `repos/${repository}/releases`;
 const api = (...args) => JSON.parse(execFileSync('gh', ['api', ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }));
@@ -39,6 +39,7 @@ if (!release && operation === 'draft') {
   release = api('--method', 'POST', endpoint, '-f', `tag_name=${tag}`, '-f', `target_commitish=${target}`, '-f', `name=JS Bay ${tag}`, '-f', 'body=Release assets and package metadata for JS Bay.', '-F', 'draft=true', '-F', `prerelease=${version.includes('-')}`);
 }
 if (!release) throw new Error(`release not found: ${tag}`);
+if (expectedReleaseId && String(release.id) !== expectedReleaseId) throw new Error('release ID changed since verification');
 if (release.target_commitish !== target) throw new Error('release target does not match this workflow run');
 const remoteAssets = api('--paginate', '--slurp', `${endpoint}/${release.id}/assets?per_page=100`).flat();
 for (const remote of remoteAssets) {
@@ -53,5 +54,9 @@ if (operation === 'draft') {
   }
 } else {
   if (remoteAssets.length !== assets.length) throw new Error('release assets are incomplete');
-  if (release.draft) api('--method', 'PATCH', `${endpoint}/${release.id}`, '-F', 'draft=false');
+  if (operation === 'verify') {
+    if (!release.draft) throw new Error('the original release is already published');
+    console.log(release.id);
+  }
+  if (operation === 'publish' && release.draft) api('--method', 'PATCH', `${endpoint}/${release.id}`, '-F', 'draft=false');
 }

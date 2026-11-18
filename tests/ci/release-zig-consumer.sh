@@ -2,10 +2,8 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/../.." && pwd)
-archive=${1:?usage: release-zig-consumer.sh source-archive}
-archive=$(cd "$(dirname "$archive")" && pwd)/$(basename "$archive")
+source=${1:?usage: release-zig-consumer.sh source-archive-or-https-url}
 zig_bin=${ZIG:-zig}
-command -v node >/dev/null || { echo "Node.js is required to serve the source archive" >&2; exit 2; }
 work=$(mktemp -d "${TMPDIR:-/tmp}/jsbay-zig-release-consumer.XXXXXX")
 server_pid=
 cleanup() {
@@ -24,18 +22,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$work/packages"
-cp "$archive" "$work/packages/source.tar.gz"
-mkfifo "$work/server-port"
-# shellcheck disable=SC2016
-node -e 'const fs = require("node:fs"); const path = require("node:path"); const http = require("node:http"); const base = process.argv[1]; const filename = path.join(base, "source.tar.gz"); const server = http.createServer((request, response) => { fs.appendFileSync(path.join(base, "requests.log"), `${request.method} ${request.url}\n`); if (request.url !== "/source.tar.gz" || (request.method !== "GET" && request.method !== "HEAD")) { response.writeHead(404).end(); return; } const size = fs.statSync(filename).size; response.writeHead(200, { "Content-Length": size, "Content-Type": "application/gzip" }); if (request.method === "HEAD") response.end(); else fs.createReadStream(filename).pipe(response); }); server.listen(0, () => process.stdout.write(`${server.address().port}\n`));' "$work/packages" >"$work/server-port" 2>"$work/http.log" &
-server_pid=$!
-if ! read -r -t 15 port <"$work/server-port"; then
-    echo "Timed out waiting for the local source archive server" >&2
-    exit 1
+if [[ $source == https://* ]]; then
+    url=$source
+    export ZIG_GLOBAL_CACHE_DIR="$work/global-cache"
+else
+    command -v node >/dev/null || { echo "Node.js is required to serve the source archive" >&2; exit 2; }
+    archive=$(cd "$(dirname "$source")" && pwd)/$(basename "$source")
+    mkdir -p "$work/packages"
+    cp "$archive" "$work/packages/source.tar.gz"
+    mkfifo "$work/server-port"
+    # shellcheck disable=SC2016
+    node -e 'const fs = require("node:fs"); const path = require("node:path"); const http = require("node:http"); const base = process.argv[1]; const filename = path.join(base, "source.tar.gz"); const server = http.createServer((request, response) => { fs.appendFileSync(path.join(base, "requests.log"), `${request.method} ${request.url}\n`); if (request.url !== "/source.tar.gz" || (request.method !== "GET" && request.method !== "HEAD")) { response.writeHead(404).end(); return; } const size = fs.statSync(filename).size; response.writeHead(200, { "Content-Length": size, "Content-Type": "application/gzip" }); if (request.method === "HEAD") response.end(); else fs.createReadStream(filename).pipe(response); }); server.listen(0, () => process.stdout.write(`${server.address().port}\n`));' "$work/packages" >"$work/server-port" 2>"$work/http.log" &
+    server_pid=$!
+    if ! read -r -t 15 port <"$work/server-port"; then
+        echo "Timed out waiting for the local source archive server" >&2
+        exit 1
+    fi
+    url="http://localhost:$port/source.tar.gz"
+    curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 0 "$url" -o "$work/probe.tar.gz"
 fi
-url="http://localhost:$port/source.tar.gz"
-curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 0 "$url" -o "$work/probe.tar.gz"
+printf 'Installing Zig package from %s\n' "$url"
 for backend in quickjs quickjs_ng; do
     consumer="$work/$backend"
     mkdir -p "$consumer"

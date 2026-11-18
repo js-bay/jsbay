@@ -21,13 +21,16 @@ test('draft retries preserve assets and publication verifies every checksum', ()
       manifest += `url: "https://github.com/example/jsbay/releases/download/v1.2.3/${name}", checksum: "${hash}"\n`;
     }
     writeFileSync(join(assets, 'SHA256SUMS'), checksums); writeFileSync(join(pkg, 'Package.swift'), manifest);
-    const run = operation => spawnSync(process.execPath, ['scripts/github-release.mjs', operation, '1.2.3', 'jsbay-package-staging-123', assets, pkg], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: 'example/jsbay', FAKE_GH_STATE: state } });
+    const run = (operation, ...args) => spawnSync(process.execPath, ['scripts/github-release.mjs', operation, '1.2.3', 'jsbay-package-staging-123', assets, pkg, ...args], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, GITHUB_REPOSITORY: 'example/jsbay', FAKE_GH_STATE: state } });
     assert.equal(run('draft').status, 0); assert.equal(run('draft').status, 0);
     let data = JSON.parse(readFileSync(state)); assert.equal(data.release.assets.length, 4); assert.equal(data.release.draft, true);
+    assert.equal(run('verify').stdout.trim(), String(data.release.id));
+    assert.equal(JSON.parse(readFileSync(state)).release.draft, true);
+    assert.notEqual(run('publish', String(data.release.id + 1)).status, 0);
     data.release.assets[0].digest = 'sha256:incorrect'; writeFileSync(state, JSON.stringify(data));
-    assert.notEqual(run('publish').status, 0); assert.equal(JSON.parse(readFileSync(state)).release.draft, true);
+    assert.notEqual(run('verify').status, 0); assert.notEqual(run('publish').status, 0); assert.equal(JSON.parse(readFileSync(state)).release.draft, true);
     data.release.assets[0].digest = `sha256:${createHash('sha256').update(readFileSync(join(assets, data.release.assets[0].name))).digest('hex')}`; writeFileSync(state, JSON.stringify(data));
-    assert.equal(run('publish').status, 0); assert.equal(run('publish').status, 0); assert.notEqual(run('draft').status, 0);
+    assert.equal(run('publish', String(data.release.id)).status, 0); assert.equal(run('publish').status, 0); assert.notEqual(run('draft').status, 0); assert.notEqual(run('verify').status, 0);
     writeFileSync(join(pkg, 'Package.swift'), 'wrong'); assert.notEqual(run('publish').status, 0);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

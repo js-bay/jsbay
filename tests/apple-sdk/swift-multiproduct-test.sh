@@ -67,3 +67,16 @@ for module in JsBayQuickJS JsBayQuickJSNG JsBayJavaScriptCore; do
   test "$(unzip -p "$assets/jsbay-${version}-apple-${backend}-${module}.xcframework.zip" "${module}.xcframework/reproducible-symlink")" = Info.plist
   test "$(unzip -p "$second_assets/jsbay-${version}-apple-${backend}-${module}.xcframework.zip" "${module}.xcframework/reproducible-symlink")" = Info.plist
 done
+
+if [[ -n ${JSBAY_IOS_SIM_UDID:-} ]]; then
+  local_package="$work/local-simulator-package"
+  mkdir -p "$local_package/Frameworks"
+  cp -R "$second_output/Sources" "$second_output/Package.swift" "$local_package/"
+  for backend_module in quickjs-JsBayQuickJS quickjs_ng-JsBayQuickJSNG jsc-JsBayJavaScriptCore; do
+    unzip -q "$second_assets/jsbay-${version}-apple-${backend_module}.xcframework.zip" -d "$local_package/Frameworks"
+  done
+  sed -i.bak -E 's@\.binaryTarget\(name: "(JsBay(QuickJS|QuickJSNG|JavaScriptCore))", url: "[^"]+", checksum: "[a-f0-9]+"\)@.binaryTarget(name: "\1", path: "Frameworks/\1.xcframework")@' "$local_package/Package.swift"
+  rm -f "$local_package/Package.swift.bak"
+  JSBAY_SWIFTPM_LOCAL_PACKAGE=1 GITHUB_REPOSITORY=jsbay/jsbay \
+    bash "$root/tests/apple-sdk/remote-package-consumer.sh" "$local_package" "$version"
+fi

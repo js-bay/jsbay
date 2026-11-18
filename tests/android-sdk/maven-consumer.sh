@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage='usage: maven-consumer.sh <maven-repo> <version> <gradle-bin> <backend> [--run-on-device]'
+usage='usage: maven-consumer.sh <maven-repo-directory-or-github-packages-url> <version> <gradle-bin> <backend> [--run-on-device]'
 MAVEN_REPO="${1:?$usage}"
 VERSION="${2:?$usage}"
 GRADLE_BIN="${3:?$usage}"
 BACKEND="${4:?$usage}"
 device_mode=${5:-}
 [[ -z "$device_mode" || "$device_mode" == --run-on-device ]] || { echo "$usage" >&2; exit 2; }
-OUT="${ANDROID_MAVEN_CONSUMER_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/jsbay-android-maven-consumer.XXXXXX")}"
 script_dir=$(cd "$(dirname "$0")" && pwd)
 adb_bin=${ADB:-adb}
 application_id=com.example.jsbay.mavenconsumer
 installed=false
 
-test -d "$MAVEN_REPO"
 test -x "$GRADLE_BIN"
+repository_auth_mode=
+if [[ "$MAVEN_REPO" =~ ^https://maven\.pkg\.github\.com/[^/]+/[^/]+/?$ ]]; then
+    test -n "${GITHUB_ACTOR:-}" || { echo 'GITHUB_ACTOR is required for GitHub Packages' >&2; exit 2; }
+    test -n "${GITHUB_TOKEN:-}" || { echo 'GITHUB_TOKEN is required for GitHub Packages' >&2; exit 2; }
+    repository_auth_mode=github-packages
+else
+    test -d "$MAVEN_REPO" || { echo 'Maven repository must be a directory or an HTTPS GitHub Packages URL' >&2; exit 2; }
+fi
 case "$BACKEND" in
     quickjs) artifact=jsbayquickjs ;;
     quickjs_ng) artifact=jsbayquickjsng ;;
     *) echo "unsupported backend: $BACKEND" >&2; exit 2 ;;
 esac
+OUT="${ANDROID_MAVEN_CONSUMER_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/jsbay-android-maven-consumer.XXXXXX")}"
 LOG="$OUT/gradle.log"
 cleanup() {
     local status=$?
@@ -32,6 +39,8 @@ trap cleanup EXIT
 
 mkdir -p "$OUT/app/src/main/java/com/example/jsbay/mavenconsumer"
 cat > "$OUT/settings.gradle.kts" <<'EOF'
+import org.gradle.authentication.http.BasicAuthentication
+
 pluginManagement {
     repositories {
         google()
@@ -49,7 +58,18 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        maven { url = uri(System.getenv("JSBAY_MAVEN_REPO")) }
+        maven {
+            url = uri(System.getenv("JSBAY_MAVEN_REPO"))
+            if (System.getenv("JSBAY_MAVEN_REPOSITORY_AUTH") == "github-packages") {
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR") ?: error("GITHUB_ACTOR is required")
+                    password = System.getenv("GITHUB_TOKEN") ?: error("GITHUB_TOKEN is required")
+                }
+                authentication {
+                    create<BasicAuthentication>("basic")
+                }
+            }
+        }
         google()
         mavenCentral()
     }
@@ -89,12 +109,14 @@ cat > "$OUT/app/src/main/AndroidManifest.xml" <<'EOF'
 EOF
 cp "$script_dir/MavenConsumerInstrumentation.java" "$OUT/app/src/main/java/com/example/jsbay/mavenconsumer/"
 
-JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_VERSION="$VERSION" JSBAY_MAVEN_ARTIFACT="$artifact" \
+JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_REPOSITORY_AUTH="$repository_auth_mode" \
+JSBAY_MAVEN_VERSION="$VERSION" JSBAY_MAVEN_ARTIFACT="$artifact" \
     "$GRADLE_BIN" --no-daemon --console=plain -p "$OUT" \
     :app:dependencies --configuration debugRuntimeClasspath >"$LOG" 2>&1
 grep -Eq 'org\.jetbrains\.kotlin:kotlin-stdlib(:|[^[:space:]]*:)1\.9\.22' "$LOG"
 
-JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_VERSION="$VERSION" JSBAY_MAVEN_ARTIFACT="$artifact" \
+JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_REPOSITORY_AUTH="$repository_auth_mode" \
+JSBAY_MAVEN_VERSION="$VERSION" JSBAY_MAVEN_ARTIFACT="$artifact" \
     "$GRADLE_BIN" --no-daemon --console=plain -p "$OUT" :app:assembleDebug >>"$LOG" 2>&1
 APK="$OUT/app/build/outputs/apk/debug/app-debug.apk"
 test -f "$APK"

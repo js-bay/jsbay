@@ -3,18 +3,15 @@ name: npm packages
 on:
   workflow_call:
     inputs:
-      operation:
-        description: Build and test packages, or publish a checked artifact
-        required: true
-        type: string
       tag:
         description: Version tag validated by the release workflow
         required: true
         type: string
-      artifact_id:
-        description: Artifact ID returned by the build operation
+      verify_published:
+        description: Install and run the published npm packages on every supported platform
         required: false
-        type: string
+        type: boolean
+        default: false
     outputs:
       artifact_id:
         description: Artifact containing the verified npm tarballs
@@ -26,7 +23,7 @@ permissions:
 jobs:
   build-main:
     name: Pack engine packages
-    if: inputs.operation == 'build'
+    if: ${{ !inputs.verify_published }}
     runs-on: ubuntu-24.04
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
@@ -66,6 +63,7 @@ jobs:
   build-platform:
     name: ${{ matrix.backend }} ${{ matrix.platform }} ${{ matrix.arch }}
     needs: build-main
+    if: ${{ always() && (inputs.verify_published || needs.build-main.result == 'success') }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -131,22 +129,33 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
-          submodules: recursive
+          fetch-depth: ${{ inputs.verify_published && 1 || 0 }}
+          submodules: ${{ !inputs.verify_published && 'recursive' || 'false' }}
 
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
 
+      - name: Install and run the public npm package
+        if: ${{ inputs.verify_published }}
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          BACKEND: ${{ matrix.backend }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ matrix.arch }}
+        run: bash tests/node-sdk/published-package-consumer.sh "$BACKEND" "${RELEASE_TAG#v}" "$PLATFORM" "$ARCH"
+
       - uses: ./.github/actions/setup-zig
+        if: ${{ !inputs.verify_published }}
         with:
           version: 0.17.0
 
       - name: Install Linux native dependencies
-        if: runner.os == 'Linux'
+        if: ${{ !inputs.verify_published && runner.os == 'Linux' }}
         run: sudo apt-get update && sudo apt-get install --yes cmake g++ libuv1-dev
 
       - name: Build engine library and Node addon
+        if: ${{ !inputs.verify_published }}
         shell: bash
         env:
           ZIG_BACKEND: ${{ matrix.zig_backend }}
@@ -184,18 +193,21 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Test the release addon
+        if: ${{ !inputs.verify_published }}
         shell: bash
         run: |
           set -euo pipefail
           JSBAY_LIBRARY="$JSBAY_NODE_LIBRARY" JSBAY_NODE_RELEASE_ADDON="$JSBAY_NODE_ADDON" bash tests/node-sdk/run_native_consumer.sh
 
       - uses: actions/download-artifact@v4
+        if: ${{ !inputs.verify_published }}
         with:
           artifact-ids: ${{ needs.build-main.outputs.artifact_id }}
           path: ${{ runner.temp }}/npm-main
           merge-multiple: true
 
       - name: Pack the platform addon and install the engine package
+        if: ${{ !inputs.verify_published }}
         shell: bash
         env:
           BACKEND: ${{ matrix.backend }}
@@ -220,6 +232,7 @@ jobs:
           shasum -a 512 "$RUNNER_TEMP/npm-main/$main_tarball" | awk -v name="$main_tarball" '{ print $1 "  " name }' > MAIN-SHA512SUMS
 
       - uses: actions/upload-artifact@v6
+        if: ${{ !inputs.verify_published }}
         with:
           name: jsbay-npm-platform-${{ matrix.backend }}-${{ matrix.platform }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/npm-platform/
@@ -228,6 +241,7 @@ jobs:
   collect-packages:
     name: Collect verified npm tarballs
     needs: [build-main, build-platform]
+    if: ${{ !inputs.verify_published }}
     runs-on: ubuntu-24.04
     outputs:
       artifact_id: ${{ steps.upload.outputs.artifact-id }}
@@ -273,46 +287,3 @@ jobs:
           name: jsbay-npm-packages-${{ github.run_attempt }}
           path: npm-release/
           if-no-files-found: error
-
-  publish-packages:
-    name: Publish verified npm packages
-    if: inputs.operation == 'publish'
-    runs-on: ubuntu-24.04
-    environment: release
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-      - uses: actions/setup-node@v6
-        with:
-          node-version: '24'
-          registry-url: https://registry.npmjs.org
-      - uses: actions/download-artifact@v4
-        with:
-          artifact-ids: ${{ inputs.artifact_id }}
-          path: npm-release
-          merge-multiple: true
-      - name: Verify the selected package artifact
-        env:
-          ARTIFACT_ID: ${{ inputs.artifact_id }}
-          SOURCE_SHA: ${{ github.sha }}
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
-          cd npm-release
-          test "$(cat COMMIT)" = "$SOURCE_SHA"
-          test "v$(cat VERSION)" = "$RELEASE_TAG"
-          sha512sum --check --strict SHA512SUMS
-      - name: Publish platform packages, then engine packages
-        working-directory: npm-release
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          test -n "$NODE_AUTH_TOKEN"
-          for archive in platform/*.tgz main/*.tgz; do
-            hash="$(awk -v archive="$archive" '$2 == archive { print $1 }' SHA512SUMS)"
-            integrity="$(node -e 'process.stdout.write(Buffer.from(process.argv[1], "hex").toString("base64"))' "$hash")"
-            node "$GITHUB_WORKSPACE/scripts/publish-npm-package.mjs" "$archive" "sha512-$integrity"
-          done
