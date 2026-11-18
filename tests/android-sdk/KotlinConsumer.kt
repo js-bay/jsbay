@@ -310,6 +310,98 @@ fun runKotlinConsumer() {
         } catch (
             error: JsBayException,
         ) {
+            val details = error.details()
+            check(details.message == "kotlin-display\u0000😀") { "Kotlin exception snapshot preserves text" }
+            check(error.value!!.get("length").use { it.number() } > 0.0) { "Kotlin snapshot preserves original" }
+            check(error.detailsAndClose().message == details.message) { "Kotlin detailed consuming description" }
+            rejected(Status.STALE_VALUE, "Kotlin detailed description closes original") { error.value!!.string() }
+            rejected(Status.STALE_VALUE, "Kotlin details reject a consumed original") { error.details() }
+        }
+        try {
+            engine.evaluate("function namedFailure(){throw new Error('failure')} namedFailure()", "kotlin-stack.js")
+            error("Kotlin stack snapshot source")
+        } catch (error: JsBayException) {
+            val details = error.details()
+            check(details.stackTraceString?.contains("namedFailure") == true) { "Kotlin stack snapshot keeps frames" }
+            check(
+                details.stackTraceString?.contains("kotlin-stack.js") == true,
+            ) { "Kotlin stack snapshot keeps filename" }
+            check(error.describeDetailedAndClose().contains("namedFailure")) { "Kotlin detailed display prefers stack" }
+            rejected(Status.STALE_VALUE, "Kotlin detailed display closes original") { error.value!!.string() }
+        }
+        try {
+            engine.evaluate(
+                "throw ({message:'display marker', stack:'frameOne\\nframeTwo'})",
+                "kotlin-display-marker.js",
+            )
+            error("Kotlin detailed display marker source")
+        } catch (error: JsBayException) {
+            check(error.describeDetailedAndClose() == "display marker\nframeOne\nframeTwo") {
+                "Kotlin detailed display keeps a message missing from stack"
+            }
+            rejected(Status.STALE_VALUE, "Kotlin detailed display marker closes original") { error.value!!.string() }
+        }
+        try {
+            engine.evaluate(
+                "throw ({message:'repeated marker', stack:'Error: repeated marker\\nframe'})",
+                "kotlin-display-repeat.js",
+            )
+            error("Kotlin repeated display marker source")
+        } catch (error: JsBayException) {
+            check(error.describeDetailedAndClose() == "Error: repeated marker\nframe") {
+                "Kotlin detailed display avoids repeating message in stack"
+            }
+        }
+        try {
+            engine.evaluate(
+                "throw Object.defineProperty(new Error('failure'), 'stack', {get(){throw 1}})",
+                "kotlin-stack-getter.js",
+            )
+            error("Kotlin throwing stack getter source")
+        } catch (error: JsBayException) {
+            check(error.details().stackTraceString == null) { "Kotlin throwing stack getter falls back" }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw {message:'alias', sourceURL:'alias.js', line:4, column:2}", "kotlin-alias.js")
+            error("Kotlin exception alias source")
+        } catch (error: JsBayException) {
+            val details = error.details()
+            check(details.fileName == "alias.js" && details.lineNumber == 4 && details.columnNumber == 2) {
+                "Kotlin exception location aliases"
+            }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw {toString(){throw 5}}", "kotlin-description-failure.js")
+            error("Kotlin description fallback source")
+        } catch (error: JsBayException) {
+            check(error.details().message == "JavaScript exception") { "Kotlin failed message conversion fallback" }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw null", "kotlin-null-throw.js")
+            error("Kotlin null throw source")
+        } catch (error: JsBayException) {
+            check(error.details().message == "null") { "Kotlin null throw details" }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw {message:'invalid', line:1.5, column:2147483648}", "kotlin-invalid-location.js")
+            error("Kotlin invalid location source")
+        } catch (error: JsBayException) {
+            val details = error.details()
+            check(
+                details.lineNumber == null && details.columnNumber == null,
+            ) { "Kotlin invalid location values are omitted" }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw 'kotlin-display\\u0000😀'", "kotlin-describe-and-close.js")
+            error("Kotlin consuming description source")
+        } catch (
+            error: JsBayException,
+        ) {
             check(error.describeAndClose() == "kotlin-display\u0000😀") { "Kotlin consuming description text" }
             rejected(Status.STALE_VALUE, "Kotlin consuming description closes original") { error.value!!.string() }
         }
@@ -420,10 +512,15 @@ fun runKotlinConsumer() {
             }.use { engine.evaluate("kotlinCloseBorrowed(1)", "kotlin-borrowed-close.js").close() }
         engine
             .bind("kotlinBorrowedDescription") { thisValue, _ ->
+                val originalKind = thisValue.kind()
                 rejected(
                     Status.INVALID_ARGUMENT,
                     "Kotlin borrowed exception text",
                 ) { JsBayException(Status.EXCEPTION, thisValue).describeAndClose() }
+                rejected(Status.INVALID_ARGUMENT, "Kotlin borrowed exception details") {
+                    JsBayException(Status.EXCEPTION, thisValue).detailsAndClose()
+                }
+                check(thisValue.kind() == originalKind) { "Kotlin rejected consume preserves callback value" }
                 engine.undefined()
             }.use { engine.evaluate("kotlinBorrowedDescription()", "kotlin-borrowed-description.js").close() }
         var wrongThread: Throwable? = null
@@ -442,6 +539,33 @@ fun runKotlinConsumer() {
         check(
             wrongThread is JsBayException && (wrongThread as JsBayException).status == Status.WRONG_THREAD,
         ) { "Kotlin wrong thread status" }
+        val wrongThreadDetailsException =
+            try {
+                engine.evaluate("throw new Error('wrong thread details')", "kotlin-wrong-thread-details.js")
+                error("Kotlin wrong-thread details source")
+            } catch (exception: JsBayException) {
+                exception
+            }
+        var wrongThreadDetails: Throwable? = null
+        val detailsWorker =
+            Thread {
+                try {
+                    wrongThreadDetailsException.details()
+                } catch (failure: Throwable) {
+                    wrongThreadDetails =
+                        failure
+                }
+            }
+        detailsWorker.start()
+        detailsWorker.join()
+        val wrongThreadDetailsFailure = wrongThreadDetails as? JsBayException
+        check(wrongThreadDetailsFailure?.status == Status.WRONG_THREAD) {
+            "Kotlin exception details reject a foreign thread"
+        }
+        check(wrongThreadDetailsException.value!!.get("message").use { it.string() } == "wrong thread details") {
+            "Kotlin wrong-thread details preserves original exception"
+        }
+        wrongThreadDetailsException.value!!.close()
         val malformed = "\uD800"
         engine.objectValue().use { target ->
             rejected(Status.INVALID_ARGUMENT, "Kotlin malformed source") { engine.evaluate(malformed) }

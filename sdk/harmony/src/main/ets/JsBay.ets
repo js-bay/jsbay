@@ -185,12 +185,105 @@ export type HostCallback = (thisValue: Value, args: Value[]) => Value;
 /** Runs synchronously on the Engine owner Worker. requestId is an opaque uint64 token for native completion. */
 export type SyncStarter = (requestId: bigint, thisValue: Value, args: Value[]) => void;
 
+export interface JsExceptionDetails {
+  readonly message: string;
+  readonly stackTraceString: string | null;
+  readonly fileName: string | null;
+  readonly lineNumber: number | null;
+  readonly columnNumber: number | null;
+}
+
 /** A JavaScript throw. Close value after reading it. */
 export class JsException extends Error {
   readonly value: Value;
   constructor(value: Value) {
     super('JavaScript exception');
     this.value = value;
+  }
+  details(): JsExceptionDetails {
+    return {
+      message: this.stringField('message') ?? this.description(),
+      stackTraceString: this.stringField('stack'),
+      fileName: this.stringField('fileName') ?? this.stringField('sourceURL'),
+      lineNumber: this.integerField('lineNumber') ?? this.integerField('line'),
+      columnNumber: this.integerField('columnNumber') ?? this.integerField('column'),
+    };
+  }
+  detailsAndClose(): JsExceptionDetails {
+    this.value.requireOwnedForConsume();
+    try {
+      return this.details();
+    } finally {
+      this.value.close();
+    }
+  }
+  describeDetailedAndClose(): string {
+    const details = this.detailsAndClose();
+    const stack = details.stackTraceString;
+    if (stack === null || stack.length === 0) {
+      return details.message;
+    }
+    if (details.message.length === 0) {
+      return stack;
+    }
+    const firstLineEnd = stack.indexOf('\n');
+    const firstLine = firstLineEnd === -1 ? stack : stack.substring(0, firstLineEnd);
+    return firstLine.indexOf(details.message) >= 0 ? stack : `${details.message}\n${stack}`;
+  }
+  private stringField(name: string): string | null {
+    try {
+      const field = this.value.get(name);
+      try {
+        const kind = field.type();
+        return kind === ValueKind.Undefined || kind === ValueKind.Null ? null : field.string();
+      } finally {
+        field.close();
+      }
+    } catch (cause) {
+      if (cause instanceof JsException) {
+        cause.value.close();
+        return null;
+      }
+      if (cause instanceof JsBayStatusError) {
+        throw cause;
+      }
+      throw new Error(String(cause));
+    }
+  }
+  private integerField(name: string): number | null {
+    try {
+      const field = this.value.get(name);
+      try {
+        if (field.type() !== ValueKind.Number) return null;
+        const number = field.toNumber();
+        return Number.isInteger(number) && number >= 0 && number <= 2147483647 ? number : null;
+      } finally {
+        field.close();
+      }
+    } catch (cause) {
+      if (cause instanceof JsException) {
+        cause.value.close();
+        return null;
+      }
+      if (cause instanceof JsBayStatusError) {
+        throw cause;
+      }
+      throw new Error(String(cause));
+    }
+  }
+  private description(): string {
+    try {
+      return this.value.string();
+    } catch (cause) {
+      if (cause instanceof JsException) {
+        cause.value.close();
+        return 'JavaScript exception';
+      }
+      if (cause instanceof JsBayStatusError) {
+        throw cause;
+      }
+      throw new Error(String(cause));
+    }
   }
   /** Consumes the thrown value. A second JavaScript throw returns a fixed fallback. */
   describeAndClose(): string {
@@ -233,7 +326,10 @@ function invoke<T>(operation: () => T): T {
   try {
     return operation();
   } catch (cause) {
-    if (cause instanceof JsException || cause instanceof JsBayStatusError) {
+    if (cause instanceof JsException) {
+      throw cause;
+    }
+    if (cause instanceof JsBayStatusError) {
       throw cause;
     }
     const raw = (cause as NativeThrown).value;

@@ -1,15 +1,16 @@
-# SDK quality — Harmony opt-in only.
-# Portable (Linux) and Apple checks are folded into CI's linux / macos jobs
-# (aggressive one-job-per-platform aggregation). See docs/testing.md#ci.
+# SDK quality checks for public sources and the official Harmony toolchain.
 name: SDK quality
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
     inputs:
       harmony:
-        description: Run official Harmony lint on a provisioned SDK 12 runner
+        description: Run the optional SDK 12 HAR build on a provisioned Harmony runner
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -19,17 +20,70 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  harmony-toolchain:
+    name: Harmony local gate checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test Harmony toolchain resolution
+        run: |
+          bash tests/harmony-sdk/toolchain-resolver.sh
+          bash tests/ci/harmony-required-gate.sh
+          bash tests/ci/harmony-local-gate.sh
+
+  harmony-manual-preflight:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony
+    name: Optional Harmony runner preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check runner readiness setting
+        env:
+          HARMONY_SDK12_READY: ${{ vars.HARMONY_SDK12_READY }}
+        run: bash scripts/check-harmony-runner-readiness.sh "$HARMONY_SDK12_READY"
+
   harmony:
-    # Official Code Linter/ETS are not present on GitHub-hosted images. This opt-in job requires a runner provisioned as documented in sdk/QUALITY.md.
-    if: inputs.harmony
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony
+    needs: [harmony-toolchain, harmony-manual-preflight]
     runs-on: [self-hosted, jsbay-harmony-sdk12]
-    timeout-minutes: 20
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs_ng, quickjs]
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
       - uses: tiangong-dev/pawl@v0.8.2
         with:
           version: v0.8.2
       - name: Official ETS format and lint
         run: make check CHECKS=native-format,harmony-style
+      - name: Build and package HAR
+        env:
+          QUICKJS_BACKEND: ${{ matrix.backend }}
+          HARMONY_TARGET_SDK_VERSION: '5.0.0(12)'
+        run: |
+          set -euo pipefail
+          source scripts/harmony-toolchain.sh
+          harmony_toolchain_resolve
+          native="$OHOS_NATIVE_HOME"
+          zig build -Dbackend="$QUICKJS_BACKEND" -Dtarget=aarch64-linux-ohos -Dohos-sysroot="$native/sysroot" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/harmony-core" --summary all
+          export JSBAY_LIBRARY="$RUNNER_TEMP/harmony-core/lib/libjsbay.a"
+          export JSBAY_HARMONY_ARCHIVE="$JSBAY_LIBRARY"
+          : "${NODE_PATH:?configure the matching Hvigor module root on this runner}"
+          bash tests/harmony-sdk/style-consumer.sh
+          bash tests/benchmark_interop_contract.sh --arkts-only
+          bash scripts/stage-harmony-har.sh "$RUNNER_TEMP/harmony-har-${{ matrix.backend }}" "ci-${{ matrix.backend }}-${GITHUB_SHA:0:12}"
+      - name: Preserve the validated HAR
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-sdk-quality-${{ matrix.backend }}
+          path: ${{ runner.temp }}/harmony-har-${{ matrix.backend }}
+          if-no-files-found: error

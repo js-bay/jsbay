@@ -6,9 +6,8 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 stage_dir=${1:?usage: stage-harmony-har.sh <stage-dir> <version-label>}
 version=${2:?usage: stage-harmony-har.sh <stage-dir> <version-label>}
-: "${DEVECO_SDK_HOME:?set DEVECO_SDK_HOME to the DevEco SDK 12 directory}"
-: "${HVIGORW:?set HVIGORW to the DevEco Hvigor wrapper}"
-: "${OHPM:?set OHPM to the Harmony command-line-tools ohpm executable}"
+source "$repo_root/scripts/harmony-toolchain.sh"
+harmony_toolchain_resolve
 : "${JSBAY_LIBRARY:?set JSBAY_LIBRARY to a matching aarch64-linux-ohos libjsbay.a}"
 backend=${QUICKJS_BACKEND:-${JSBAY_BACKEND:-quickjs}}
 case "$backend" in
@@ -74,8 +73,8 @@ for member in \
   package/src/main/ets/index.d.ets; do
   grep -Fx "$member" "$members" >/dev/null
 done
-if grep -Fq 'ConformanceFixture' "$members"; then
-  echo "HAR contains the build-only ConformanceFixture" >&2
+if grep -Fq 'ConformanceFixture' "$members" || grep -Eq '(^|/)Quality[^/]*$' "$members"; then
+  echo 'HAR contains a build-only Quality fixture source' >&2
   exit 1
 fi
 

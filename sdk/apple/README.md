@@ -6,7 +6,11 @@ From this repository, `./build-apple.sh` (or `JSBAY_APPLE_BACKEND`) selects the 
 
 When declaring the dependency in another `Package.swift`, use the package identity SwiftPM resolves from the chosen repository URL in each `.product(..., package: ...)` entry. The two backend repository names can therefore require different `package:` values even though both expose the `JsBaySDK` and `JsBayObjC` products.
 
+For direct static-library or XCFramework integration, link `JavaScriptCore`, `Foundation`, and `libm` (`-lm`). The Swift package declares these dependencies for both SDK products. `JavaScriptCore` is also required by the JSC backend; QuickJS-family packages still use the same public package link settings.
+
 `JsBaySDK` is the Swift façade for the public `jsbay.h` Value API. Add the packaged Swift package, create an `Engine` on the thread that will execute JavaScript, and keep all `Value` operations on that same thread. The SDK attaches its automatic driver to that thread's `CFRunLoop`; JavaScript timers run when the host runs that loop and applications never call `tick` or compute deadlines. `runLoop()` temporarily uses the core blocking loop and restores the automatic driver when it returns. `stopLoop()`, `requestInterrupt()`, `beginShutdown`, `shutdownStatus`, and `cancel` are safe from another thread.
+
+`DedicatedEngineThread.start(id:)` creates an Engine on a private thread and provides `runOnOwner`, asynchronous `run`, and `post` for serialized work. Work closures run on the owner thread and must close every `Value` they create before returning an `EngineThreadResult`; use `performOnOwner`, asynchronous `perform`, or `postVoid` when no result is needed. Built-in conformances cover common scalar and Foundation data types, snapshots, and collections of safe results. A custom data-only result type can conform explicitly; that conformance promises it contains no live `Engine` or `Value` handles. Custom errors returned across the thread boundary must also contain only data; do not wrap a live `JsException`, `Engine`, or `Value` in another error. JavaScript exceptions crossing from an owner-thread job to a caller thread become `DedicatedEngineThreadError.javascript` with copied `JsExceptionDetails`; nested calls that run inline on the owner thread preserve the original `JsException`. The live thrown Value is consumed on its owner thread when converted. Call `close()` when finished; dropping the owner off its thread closes the Engine and waits for the thread to stop, while dropping it from an owner-thread task schedules shutdown and returns to avoid waiting on itself.
 
 ### Owner thread and multi-instance hosts
 
@@ -47,6 +51,8 @@ Every `JsBayError` exposes `statusCode`, with public `JsBayStatus` constants
 that match the C ABI. This includes SDK preconditions: a closed Engine reports
 `instanceNotFound`, a wrong thread reports `wrongThread`, and closed, foreign,
 or expired Values report `staleValue`.
+
+Use `try error.details()` to copy message, stack text, and available source location without closing the thrown value. The snapshot is `Sendable` and remains usable after the value is closed. `try error.detailsAndClose()` returns the same snapshot and closes the value; `try error.describeDetailedAndClose()` returns both message and stack, adding the message before the stack unless its first line already contains the message. It returns the message when the stack is empty and the stack when the message is empty. The SDK reads `fileName`/`sourceURL`, `lineNumber`/`line`, and `columnNumber`/`column`; it does not infer locations by parsing stack text. A JavaScript getter that throws while reading metadata leaves that detail empty, while owner-thread and stale-value failures remain errors.
 
 When an exception only needs display text, `try error.describeAndClose()` reads
 and consumes its original value. It preserves embedded NUL and Unicode. If a

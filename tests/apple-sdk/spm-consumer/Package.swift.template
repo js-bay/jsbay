@@ -10,5 +10,8 @@ let package = Package(
       name: "SwiftConsumer", dependencies: [.product(name: "JsBaySDK", package: "JsBay")]),
     .executableTarget(
       name: "ObjCConsumer", dependencies: [.product(name: "JsBayObjC", package: "JsBay")]),
+    .executableTarget(
+      name: "DedicatedEngineThreadConsumer",
+      dependencies: [.product(name: "JsBaySDK", package: "JsBay")]),
   ]
 )

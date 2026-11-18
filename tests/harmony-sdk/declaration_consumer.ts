@@ -1,10 +1,11 @@
-import { Engine, JsBayStatus, JsBayStatusError, JsException, Value } from '../../sdk/harmony';
+import { Engine, JsBayStatus, JsBayStatusError, JsException, JsExceptionDetails, Value } from '../../sdk/harmony';
 
 declare const value: Value;
 const jsError: JsException = new JsException(value);
 const statusError: JsBayStatusError = new JsBayStatusError(JsBayStatus.InvalidArgument);
 const codedError: JsBayStatusError = new JsBayStatusError(JsBayStatus.StaleValue, 'JSBAY_STALE_VALUE');
-void [jsError, statusError, codedError];
+declare const details: JsExceptionDetails;
+void [jsError, statusError, codedError, details];
 
 // @ts-expect-error Engine instances are created with Engine.create.
 new Engine();

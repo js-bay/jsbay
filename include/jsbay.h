@@ -185,7 +185,9 @@ jsbay_status_t jsbay_engine_with_value_scope(int instance_id, jsbay_value_scope_
 bool jsbay_engine_request_interrupt(int instance_id);
 bool jsbay_engine_clear_interrupt(int instance_id);
 bool jsbay_engine_cancel(int instance_id, uint64_t generation);
+/* Shared deadline: now + millis; 0 disables. VM entries do not refresh it. */
 bool jsbay_engine_set_execution_time_limit(int instance_id, uint64_t millis);
+/* Fresh outer-entry budget; 0 disables. The earliest active deadline wins. */
 bool jsbay_engine_set_execution_budget(int instance_id, uint64_t millis);
 bool jsbay_engine_set_memory_limit(int instance_id, uint64_t bytes);
 
