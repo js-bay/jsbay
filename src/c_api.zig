@@ -86,6 +86,12 @@ pub export fn jsbay_available_backends(out_backends: ?[*]BackendC, cap: usize) u
     return n;
 }
 
+pub fn ensureValueRegistry() void {
+    if (!api_value.isInitialized()) {
+        api_value.init(std.heap.c_allocator);
+    }
+}
+
 /// Create-time engine select. `backend == .primary` (0) selects the pack primary. Any packed backend (including non-primary) creates an instance; non-packed tags fail. Non-primary packed instances support create/eval/destroy plus the typed Value surface wired through packed_api_value; bytecode cache and bind/inspector remain primary-only.
 pub export fn jsbay_engine_create_with_options(
     instance_id: c_int,
@@ -134,6 +140,7 @@ pub export fn jsbay_engine_create_with_options(
             return false;
         }
     }
+    ensureValueRegistry();
     if (!api_value.noteCreated(id)) {
         engine.destroy(id);
         return false;
@@ -281,6 +288,7 @@ test "c_api: forced packed_alt typed value for the primary backend" {
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -366,6 +374,7 @@ test "c_api: forced packed_alt set/call/construct/new_* for the primary backend"
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -543,6 +552,7 @@ test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/ne
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -722,6 +732,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer {
         if (instance_map.getInstance(id) != null) jsbay_engine_destroy(id);
@@ -882,6 +893,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         std.heap.c_allocator.destroy(instance2);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id2));
     defer jsbay_engine_destroy(id2);
     var obj2: u64 = 0;
@@ -1169,6 +1181,7 @@ pub export fn jsbay_engine_create_with_limits(
         engine.destroy(id);
         return false;
     }
+    ensureValueRegistry();
     if (!api_value.noteCreated(id)) {
         engine.destroy(id);
         return false;
@@ -2004,6 +2017,7 @@ pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
         out_value.* = value;
         return API_OK;
     }
+    ensureValueRegistry();
     if (packed_api_value.isPackedHandle(value)) {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
@@ -2030,6 +2044,7 @@ pub export fn jsbay_value_release(value: u64) c_int {
     const val = value_mod.HyperValue{ .raw = value };
     if (val.isEmpty()) return API_STALE_VALUE;
     if (val.isPrimitive()) return API_OK;
+    ensureValueRegistry();
     if (host_string_values.take(value)) |entry| {
         std.heap.c_allocator.free(entry.bytes);
         return API_OK;

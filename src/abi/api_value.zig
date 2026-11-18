@@ -15,14 +15,46 @@ pub const SlotMap = hyper_box.GenerationalSlotMap(ActiveEngine.Value);
 pub const Entry = SlotMap.Entry;
 
 var mutex: sync.Mutex = .{};
-var owners = std.AutoHashMap(i32, Owner).init(std.heap.c_allocator);
-var slot_map = SlotMap.init(std.heap.c_allocator);
+var registry_allocator: ?std.mem.Allocator = null;
+var owners: std.AutoHashMapUnmanaged(i32, Owner) = .{};
+var slot_map: ?SlotMap = null;
+var initialized = std.atomic.Value(bool).init(false);
+
+/// Initialize the value registry lifecycle with an explicitly supplied allocator.
+/// Callers (such as the public C export boundary or test runners) govern all slot-array and instance-index allocations.
+pub fn init(allocator: std.mem.Allocator) void {
+    mutex.lock();
+    defer mutex.unlock();
+    if (slot_map) |*sm| sm.deinit();
+    if (registry_allocator) |alloc| owners.deinit(alloc);
+    registry_allocator = allocator;
+    owners = .{};
+    slot_map = SlotMap.init(allocator);
+    initialized.store(true, .release);
+}
+
+/// Reset and deinitialize the registry, releasing all slot and owner memory back to the supplied allocator.
+pub fn deinit() void {
+    mutex.lock();
+    defer mutex.unlock();
+    initialized.store(false, .release);
+    if (slot_map) |*sm| sm.deinit();
+    if (registry_allocator) |alloc| owners.deinit(alloc);
+    owners = .{};
+    slot_map = null;
+    registry_allocator = null;
+}
+
+pub fn isInitialized() bool {
+    return initialized.load(.acquire);
+}
 
 /// Record the owner of a successfully-created public C API instance.
 pub fn noteCreated(instance_id: i32) bool {
     mutex.lock();
     defer mutex.unlock();
-    owners.put(instance_id, .{ .thread_id = std.Thread.getCurrentId() }) catch return false;
+    const alloc = registry_allocator orelse return false;
+    owners.put(alloc, instance_id, .{ .thread_id = std.Thread.getCurrentId() }) catch return false;
     return true;
 }
 
@@ -35,7 +67,7 @@ pub fn dropInstance(instance_id: i32) void {
     // Detach one entry at a time. Never hold metadata state while entering a backend, and never allocate while tearing down (OOM must not leak a JS value or leave a live public handle behind).
     while (true) {
         mutex.lock();
-        const removed = slot_map.detachFirstForInstance(instance_id);
+        const removed = if (slot_map) |*sm| sm.detachFirstForInstance(instance_id) else null;
         mutex.unlock();
         const entry = removed orelse break;
         // Callback-local handles borrow the VM's stack values and carry no backend reference. They are normally revoked by the trampoline; teardown defensively removes a leaked one without freeing it.
@@ -73,7 +105,8 @@ pub fn instanceFor(value: u64) ?i32 {
     if (!val.isHandle()) return null;
     mutex.lock();
     defer mutex.unlock();
-    return slot_map.instanceFor(value);
+    const sm = slot_map orelse return null;
+    return sm.instanceFor(value);
 }
 
 pub fn get(value: u64) ?Entry {
@@ -81,7 +114,8 @@ pub fn get(value: u64) ?Entry {
     if (!val.isHandle()) return null;
     mutex.lock();
     defer mutex.unlock();
-    return slot_map.get(value);
+    const sm = slot_map orelse return null;
+    return sm.get(value);
 }
 
 /// Store an owned backend value. The caller transfers its reference here.
@@ -89,7 +123,8 @@ pub fn putOwned(instance_id: i32, value: ActiveEngine.Value) ?u64 {
     mutex.lock();
     defer mutex.unlock();
     if (!owners.contains(instance_id)) return null;
-    return slot_map.insert(instance_id, value, false) catch return null;
+    var sm = &(slot_map orelse return null);
+    return sm.insert(instance_id, value, false) catch return null;
 }
 
 pub const ReserveHandleError = error{
@@ -103,7 +138,8 @@ pub const ReservedHandle = struct {
     pub fn commit(self: ReservedHandle, owned: *OwnedValue) bool {
         mutex.lock();
         defer mutex.unlock();
-        if (slot_map.commit(self.handle, owned.borrow())) {
+        var sm = &(slot_map orelse return false);
+        if (sm.commit(self.handle, owned.borrow())) {
             _ = owned.release();
             return true;
         }
@@ -113,7 +149,9 @@ pub const ReservedHandle = struct {
     pub fn cancel(self: ReservedHandle) void {
         mutex.lock();
         defer mutex.unlock();
-        _ = slot_map.cancel(self.handle);
+        if (slot_map) |*sm| {
+            _ = sm.cancel(self.handle);
+        }
     }
 };
 
@@ -122,7 +160,8 @@ pub fn reserveHandle(instance_id: i32) ReserveHandleError!ReservedHandle {
     mutex.lock();
     defer mutex.unlock();
     if (!owners.contains(instance_id)) return error.OutOfMemory;
-    const handle = slot_map.reserve(instance_id, ActiveEngine.nullValue()) catch |err| switch (err) {
+    var sm = &(slot_map orelse return error.OutOfMemory);
+    const handle = sm.reserve(instance_id, ActiveEngine.nullValue()) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
     };
     return .{ .handle = handle };
@@ -133,7 +172,8 @@ pub fn putBorrowed(instance_id: i32, value: ActiveEngine.Value) ?u64 {
     mutex.lock();
     defer mutex.unlock();
     if (!owners.contains(instance_id)) return null;
-    return slot_map.insert(instance_id, value, true) catch return null;
+    var sm = &(slot_map orelse return null);
+    return sm.insert(instance_id, value, true) catch return null;
 }
 
 pub fn revokeBorrowed(value: u64) void {
@@ -141,8 +181,10 @@ pub fn revokeBorrowed(value: u64) void {
     if (!val.isHandle()) return;
     mutex.lock();
     defer mutex.unlock();
-    if (slot_map.get(value)) |entry| {
-        if (entry.borrowed) _ = slot_map.remove(value);
+    if (slot_map) |*sm| {
+        if (sm.get(value)) |entry| {
+            if (entry.borrowed) _ = sm.remove(value);
+        }
     }
 }
 
@@ -152,9 +194,10 @@ pub fn takeOwned(value: u64) ?Entry {
     if (!val.isHandle()) return null;
     mutex.lock();
     defer mutex.unlock();
-    const entry = slot_map.get(value) orelse return null;
+    var sm = &(slot_map orelse return null);
+    const entry = sm.get(value) orelse return null;
     if (entry.borrowed or entry.reserved) return null;
-    return slot_map.remove(value);
+    return sm.remove(value);
 }
 
 /// Remove an owned reference for transfer back into a backend callback, synthesizing an entry for unboxed primitives.
@@ -187,7 +230,7 @@ pub fn retain(value: u64) ?u64 {
     if (!val.isHandle()) return null;
 
     mutex.lock();
-    const entry = slot_map.get(value);
+    const entry = if (slot_map) |sm| sm.get(value) else null;
     mutex.unlock();
     const live_entry = entry orelse return null;
     const ctx = (instance_map.getPtrs(live_entry.instance_id) orelse return null).ctx;
@@ -198,7 +241,11 @@ pub fn retain(value: u64) ?u64 {
         ActiveEngine.freeValue(ctx, duplicate);
         return null;
     }
-    return slot_map.insert(live_entry.instance_id, duplicate, false) catch {
+    var sm = &(slot_map orelse {
+        ActiveEngine.freeValue(ctx, duplicate);
+        return null;
+    });
+    return sm.insert(live_entry.instance_id, duplicate, false) catch {
         ActiveEngine.freeValue(ctx, duplicate);
         return null;
     };
@@ -210,15 +257,20 @@ pub fn release(value: u64) bool {
     if (!val.isHandle()) return false;
 
     mutex.lock();
-    const existing = slot_map.get(value) orelse {
-        mutex.unlock();
-        return false;
-    };
-    if (existing.borrowed or existing.reserved) {
+    const existing = if (slot_map) |sm| sm.get(value) else null;
+    if (existing == null) {
         mutex.unlock();
         return false;
     }
-    const entry = slot_map.remove(value);
+    if (existing.?.borrowed or existing.?.reserved) {
+        mutex.unlock();
+        return false;
+    }
+    var sm = &(slot_map orelse {
+        mutex.unlock();
+        return false;
+    });
+    const entry = sm.remove(value);
     mutex.unlock();
     const removed = entry orelse return false;
     if (instance_map.getPtrs(removed.instance_id)) |ptrs| ActiveEngine.freeValue(ptrs.ctx, removed.value);
@@ -230,7 +282,8 @@ pub fn isBorrowed(value: u64) bool {
     if (!val.isHandle()) return false;
     mutex.lock();
     defer mutex.unlock();
-    const entry = slot_map.get(value) orelse return false;
+    const sm = slot_map orelse return false;
+    const entry = sm.get(value) orelse return false;
     return entry.borrowed;
 }
 
@@ -239,10 +292,14 @@ pub fn isReserved(value: u64) bool {
     if (!val.isHandle()) return false;
     mutex.lock();
     defer mutex.unlock();
-    return slot_map.isReserved(value);
+    const sm = slot_map orelse return false;
+    return sm.isReserved(value);
 }
 
 test "api_value: handle reservation, commit, cancel, and access invariants" {
+    init(std.testing.allocator);
+    defer deinit();
+
     const instance_id: i32 = 98_765;
     try std.testing.expect(noteCreated(instance_id));
     defer dropInstance(instance_id);
