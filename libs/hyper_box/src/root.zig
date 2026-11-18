@@ -9,6 +9,8 @@ pub const SplitBox32 = split_box32.SplitBox32;
 pub const HandlePayload = hyper_box64.HandlePayload;
 pub const SsoBuffer = hyper_box64.SsoBuffer;
 pub const GenerationalSlotMap = generational_slot_map.GenerationalSlotMap;
+pub const SENTINEL_FREE = generational_slot_map.SENTINEL_FREE;
+pub const MAX_SLOTS = generational_slot_map.MAX_SLOTS;
 
 pub const TAG_BASE = hyper_box64.TAG_BASE;
 pub const TAG_INT32 = hyper_box64.TAG_INT32;

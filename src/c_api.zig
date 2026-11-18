@@ -2946,9 +2946,11 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
     out_exception.* = 0;
     const val = value_mod.HyperValue{ .raw = value };
     if (val.isSso()) {
+        const len = val.ssoLength();
+        if (len > 6) return API_STALE_VALUE;
         var sso_buf: [6]u8 = undefined;
-        const len = val.copySso(&sso_buf);
-        const duped = std.heap.c_allocator.dupe(u8, sso_buf[0..len]) catch return API_OUT_OF_MEMORY;
+        const copied = val.copySso(&sso_buf);
+        const duped = std.heap.c_allocator.dupe(u8, sso_buf[0..copied]) catch return API_OUT_OF_MEMORY;
         out_bytes.* = .{ .data = duped.ptr, .len = duped.len };
         return API_OK;
     }
@@ -4291,6 +4293,13 @@ test "c_api: nanbox hyper_box primitive fast paths bypass lock without engine ha
     try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_retain(HV.empty().raw, &retained_float));
     try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(HV.empty().raw));
     try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(HV.empty().raw, &kind));
+
+    // Corrupt SSO handle (length 7 in bits 47..40) is rejected as stale handle
+    const corrupt_sso: u64 = 0xFFFE_0700_0000_0000;
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_to_utf8(corrupt_sso, &out_bytes, &out_exc));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(corrupt_sso, &kind));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_retain(corrupt_sso, &retained_float));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(corrupt_sso));
 }
 
 // Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`. Never part of the published product ABI. See tests/process-isolation/ and docs/host-isolation.md.

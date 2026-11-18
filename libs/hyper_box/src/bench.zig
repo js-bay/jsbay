@@ -342,13 +342,15 @@ pub fn main() !void {
     // HyperBox64: Primitive Bypass on Retain
     {
         var dummy_out: u64 = 0;
-        const test_val = HyperValue.fromInt32(42);
         const start = getNs();
         var i: u64 = 0;
         while (i < LIFE_ITERS) : (i += 1) {
+            var test_val = HyperValue.fromInt32(@as(i32, @truncate(@as(i64, @intCast(i % 1000)))) + 1);
+            std.mem.doNotOptimizeAway(&test_val);
             if (test_val.isPrimitive()) {
                 dummy_out +%= test_val.raw;
             }
+            std.mem.doNotOptimizeAway(&dummy_out);
         }
         const elapsed = getNs() - start;
         std.mem.doNotOptimizeAway(dummy_out);

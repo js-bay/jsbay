@@ -214,7 +214,12 @@ pub const Value = extern struct {
     }
 
     pub inline fn isSso(self: Value) bool {
-        return self.raw >= TAG_SSO_BASE;
+        if (self.raw >= TAG_SSO_6) return true;
+        if (self.raw >= TAG_SSO_0_5) {
+            const len = (self.raw >> 40) & 0xFF;
+            return len <= 5;
+        }
+        return false;
     }
 
     pub inline fn isPrimitive(self: Value) bool {
@@ -244,7 +249,11 @@ pub const Value = extern struct {
 
     pub inline fn ssoLength(self: Value) usize {
         if (self.raw >= TAG_SSO_6) return 6;
-        if (self.raw >= TAG_SSO_0_5) return @intCast((self.raw >> 40) & 0xFF);
+        if (self.raw >= TAG_SSO_0_5) {
+            const len = (self.raw >> 40) & 0xFF;
+            if (len <= 5) return @intCast(len);
+            return 0;
+        }
         return 0;
     }
 
@@ -252,7 +261,7 @@ pub const Value = extern struct {
     pub inline fn asSsoBytes(self: Value) SsoBuffer {
         const len = self.ssoLength();
         var buf: [6]u8 = @splat(0);
-        if (len > 0) {
+        if (len > 0 and len <= 6) {
             if (builtin.cpu.arch.endian() == .little) {
                 const raw_bytes: [8]u8 = @bitCast(self.raw);
                 @memcpy(buf[0..len], raw_bytes[0..len]);
@@ -265,12 +274,13 @@ pub const Value = extern struct {
                 }
             }
         }
-        return .{ .bytes = buf, .len = @intCast(len) };
+        return .{ .bytes = buf, .len = @intCast(@min(len, 6)) };
     }
 
     /// Copy inline string bytes into a destination buffer.
     pub inline fn copySso(self: Value, dest: []u8) usize {
         const len = self.ssoLength();
+        if (len == 0 or len > 6) return 0;
         const copy_len = @min(dest.len, len);
         if (copy_len == 0) return 0;
         const sso_buf = self.asSsoBytes();
@@ -281,7 +291,7 @@ pub const Value = extern struct {
     /// Return a slice view pointing into self.raw. Ensure self outlives the slice, or use asSsoBytes().
     pub fn asSsoSlice(self: *const Value) []const u8 {
         const len = self.ssoLength();
-        if (len == 0) return "";
+        if (len == 0 or len > 6) return "";
         if (builtin.cpu.arch.endian() == .little) {
             const ptr: [*]const u8 = @ptrCast(&self.raw);
             return ptr[0..len];

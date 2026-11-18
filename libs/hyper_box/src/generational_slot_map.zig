@@ -238,9 +238,14 @@ pub fn GenerationalSlotMap(comptime ValueType: type) type {
             slot.is_active = false;
             slot.borrowed = false;
             slot.reserved = false;
-            slot.generation = slot.generation +% 1;
-            if (slot.generation == 0) slot.generation = 1;
-            self.pushFreeSlot(h.slot_index);
+            if (slot.generation < std.math.maxInt(u16)) {
+                slot.generation += 1;
+                self.pushFreeSlot(h.slot_index);
+            } else {
+                // Generation is exhausted for this slot. Permanently retire the slot
+                // to prevent ABA recycling wrap-around and ensure stale handles are rejected forever.
+                slot.generation = 0;
+            }
             self.active_count -= 1;
             return entry;
         }
@@ -262,9 +267,14 @@ pub fn GenerationalSlotMap(comptime ValueType: type) type {
             slot.is_active = false;
             slot.borrowed = false;
             slot.reserved = false;
-            slot.generation = slot.generation +% 1;
-            if (slot.generation == 0) slot.generation = 1;
-            self.pushFreeSlot(head_idx);
+            if (slot.generation < std.math.maxInt(u16)) {
+                slot.generation += 1;
+                self.pushFreeSlot(head_idx);
+            } else {
+                // Generation is exhausted for this slot. Permanently retire the slot
+                // to prevent ABA recycling wrap-around and ensure stale handles are rejected forever.
+                slot.generation = 0;
+            }
             self.active_count -= 1;
             return entry;
         }

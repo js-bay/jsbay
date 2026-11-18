@@ -252,3 +252,53 @@ test "generational_slot_map reservation, commit, and safe cancel" {
     try testing.expect(!map.isReserved(reserved2));
     try testing.expect(map.get(reserved2) == null);
 }
+
+test "generational_slot_map retires slot on generation exhaustion" {
+    const testing = std.testing;
+    var map = GenerationalSlotMap(u32).init(testing.allocator);
+    defer map.deinit();
+
+    const h1 = try map.insert(1, 100, false);
+    const decoded = (Value{ .raw = h1 }).decodeHandle();
+    try testing.expectEqual(@as(u20, 0), decoded.slot_index);
+    try testing.expectEqual(@as(u16, 1), decoded.generation);
+
+    // Manually advance slot generation to maximum to simulate long-running wrap condition.
+    map.slots.items[0].generation = std.math.maxInt(u16);
+    const max_handle = Value.fromHandle(1, std.math.maxInt(u16), 0).raw;
+    try testing.expect(map.get(max_handle) != null);
+
+    // Removing the slot when generation is exhausted must permanently retire it.
+    try testing.expect(map.remove(max_handle) != null);
+    try testing.expectEqual(@as(u16, 0), map.slots.items[0].generation);
+    try testing.expectEqual(hyper_box.SENTINEL_FREE, map.first_free);
+
+    // Stale handle with generation 65535 must be permanently rejected.
+    try testing.expect(map.get(max_handle) == null);
+    try testing.expect(map.remove(max_handle) == null);
+
+    // Next insertion must allocate a fresh slot (slot index 1) rather than recycling slot 0.
+    const h2 = try map.insert(1, 200, false);
+    const decoded2 = (Value{ .raw = h2 }).decodeHandle();
+    try testing.expectEqual(@as(u20, 1), decoded2.slot_index);
+    try testing.expectEqual(@as(u16, 1), decoded2.generation);
+}
+
+test "hyper_box64 rejects out-of-range SSO length and corrupt inline tags" {
+    const testing = std.testing;
+    const corrupt_val = Value{ .raw = 0xFFFE_0700_0000_0000 };
+    try testing.expect(!corrupt_val.isSso());
+    try testing.expectEqual(@as(usize, 0), corrupt_val.ssoLength());
+    try testing.expectEqual(@as(u8, 0), corrupt_val.asSsoBytes().len);
+    try testing.expect(!corrupt_val.isPrimitive());
+
+    var buf: [6]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), corrupt_val.copySso(&buf));
+    try testing.expectEqualStrings("", corrupt_val.asSsoSlice());
+
+    const valid_val = Value.fromSso("hello").?;
+    try testing.expect(valid_val.isSso());
+    try testing.expectEqual(@as(usize, 5), valid_val.ssoLength());
+    try testing.expectEqual(@as(u8, 5), valid_val.asSsoBytes().len);
+    try testing.expect(valid_val.isPrimitive());
+}
