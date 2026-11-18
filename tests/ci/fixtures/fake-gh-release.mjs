@@ -14,6 +14,11 @@ else if (args.includes('https://uploads.example.test/assets?name=' + encodeURICo
   result = { name, digest }; state.release.assets.push(result); save();
 } else if (args.includes('POST')) {
   result = state.release = { id: 1, tag_name: value('tag_name'), target_commitish: value('target_commitish'), draft: true, upload_url: 'https://uploads.example.test/assets{?name,label}', assets: [] }; save();
-} else if (args.includes('PATCH')) { state.release.draft = false; result = state.release; save(); }
+} else if (args.includes('PATCH')) {
+  state.publication = { tag_name: value('tag_name'), target_commitish: value('target_commitish') };
+  state.release.draft = false;
+  result = state.release;
+  save();
+}
 else throw new Error(`unexpected gh arguments: ${args.join(' ')}`);
 process.stdout.write(JSON.stringify(result));

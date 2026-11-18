@@ -1426,7 +1426,7 @@ jobs:
           set -euo pipefail
           output="$RUNNER_TEMP/swift-package-release"
           test -s "$output/Package.swift"
-      - name: Commit package metadata and create version tag
+      - name: Stage the Swift package commit
         env:
           VERSION: ${{ inputs.version }}
           SOURCE_SHA: ${{ github.sha }}
@@ -1462,7 +1462,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
-        run: node scripts/github-release.mjs draft "$VERSION" "jsbay-package-staging-$GITHUB_RUN_ID" release-assets "$RUNNER_TEMP/swift-package-release"
+          SOURCE_SHA: ${{ github.sha }}
+        run: bash scripts/verify-staged-release.sh draft "$VERSION" "$SOURCE_SHA" "$GITHUB_RUN_ID" release-assets "$RUNNER_TEMP/swift-package-release"
 
   build-node-packages:
     needs: [validate-release-request]
@@ -1540,7 +1541,10 @@ jobs:
           set -euo pipefail
           if [[ "$VERIFY_ONLY" == true ]]; then
             test "$PUBLISH" = false || { echo 'Verify-only mode requires Publish a complete release to be disabled' >&2; exit 1; }
-            test -n "$ORIGINAL_RUN" && test -n "$ORIGINAL_ARTIFACTS" || { echo 'Verify-only mode requires the original release run and artifact IDs' >&2; exit 1; }
+            if [[ -z "$ORIGINAL_RUN" || -z "$ORIGINAL_ARTIFACTS" ]]; then
+              echo 'Verify-only mode requires the original release run and artifact IDs' >&2
+              exit 1
+            fi
           else
             test "$PUBLISH" = true || { echo 'Recovery requires Publish a complete release' >&2; exit 1; }
           fi
