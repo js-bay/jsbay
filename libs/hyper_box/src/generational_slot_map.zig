@@ -242,8 +242,7 @@ pub fn GenerationalSlotMap(comptime ValueType: type) type {
                 slot.generation += 1;
                 self.pushFreeSlot(h.slot_index);
             } else {
-                // Generation is exhausted for this slot. Permanently retire the slot
-                // to prevent ABA recycling wrap-around and ensure stale handles are rejected forever.
+                // Generation is exhausted for this slot. Permanently retire the slot to prevent ABA recycling wrap-around and ensure stale handles are rejected forever.
                 slot.generation = 0;
             }
             self.active_count -= 1;
@@ -271,8 +270,7 @@ pub fn GenerationalSlotMap(comptime ValueType: type) type {
                 slot.generation += 1;
                 self.pushFreeSlot(head_idx);
             } else {
-                // Generation is exhausted for this slot. Permanently retire the slot
-                // to prevent ABA recycling wrap-around and ensure stale handles are rejected forever.
+                // Generation is exhausted for this slot. Permanently retire the slot to prevent ABA recycling wrap-around and ensure stale handles are rejected forever.
                 slot.generation = 0;
             }
             self.active_count -= 1;

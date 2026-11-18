@@ -111,7 +111,7 @@ pub const Value = extern struct {
             // Normalize positive zero (+0.0) to Int32(0) so raw 0 is preserved as the invalid handle sentinel.
             return fromInt32(0);
         }
-        if (std.math.isNan(f)) {
+        if ((bits & EXPONENT_MASK) == EXPONENT_MASK and (bits & MANTISSA_MASK) != 0) {
             return .{ .raw = CANONICAL_NAN };
         }
         return .{ .raw = bits };
@@ -310,6 +310,7 @@ pub const Value = extern struct {
     }
 
     pub fn ssoEqualsSlice(self: Value, slice: []const u8) bool {
+        if (!self.isSso()) return false;
         if (self.ssoLength() != slice.len) return false;
         const sso_buf = self.asSsoBytes();
         return std.mem.eql(u8, sso_buf.slice(), slice);

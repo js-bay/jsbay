@@ -58,10 +58,18 @@ test "hyper_box doubles, infinities, and sNaN canonicalization" {
     const pos_snan_bits: u64 = @bitCast(pos_snan.asFloat());
     try std.testing.expectEqual(hyper_box.CANONICAL_NAN, pos_snan_bits);
 
+    const pos_snan_f: f64 = @bitCast(@as(u64, 0x7FF0_0000_0000_0001));
+    const val_pos_snan = Value.fromFloat(pos_snan_f);
+    try std.testing.expectEqual(hyper_box.CANONICAL_NAN, val_pos_snan.raw);
+
     const neg_snan = Value{ .raw = 0xFFF0_0000_0000_0001 };
     try std.testing.expect(std.math.isNan(neg_snan.asFloat()));
     const neg_snan_bits: u64 = @bitCast(neg_snan.asFloat());
     try std.testing.expectEqual(hyper_box.CANONICAL_NAN, neg_snan_bits);
+
+    const neg_snan_f: f64 = @bitCast(@as(u64, 0xFFF0_0000_0000_0001));
+    const val_neg_snan = Value.fromFloat(neg_snan_f);
+    try std.testing.expectEqual(hyper_box.CANONICAL_NAN, val_neg_snan.raw);
 
     const val_neg_zero = Value.fromFloat(-0.0);
     try std.testing.expect(val_neg_zero.isDouble());
@@ -169,6 +177,13 @@ test "hyper_box sso strings lengths 0 to 6 and safe copy" {
     try std.testing.expect(!s5.ssoEquals(s6));
     try std.testing.expect(s5.ssoEqualsSlice("hello"));
     try std.testing.expect(!s5.ssoEqualsSlice("world"));
+
+    try std.testing.expect(!Value.fromInt32(0).ssoEqualsSlice(""));
+    try std.testing.expect(!Value.fromInt32(42).ssoEqualsSlice(""));
+    try std.testing.expect(!Value.nullValue().ssoEqualsSlice(""));
+    try std.testing.expect(!Value.undefinedValue().ssoEqualsSlice(""));
+    try std.testing.expect(!Value.empty().ssoEqualsSlice(""));
+    try std.testing.expect(!Value.fromBool(false).ssoEqualsSlice(""));
 }
 
 test "hyper_box generational handles" {
