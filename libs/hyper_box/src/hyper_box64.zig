@@ -1,19 +1,19 @@
 //! HyperBox64: IEEE-754 Negative Quiet-NaN Value Engine with Inline SSO Strings.
 //!
 //! Memory layout (64-bit IEEE-754 Negative Quiet-NaN):
-//!   [63:48] Tag (16 bits, strictly >= 0xFFF8 to guarantee Bit 51 is 1: Quiet NaN)
-//!   [47:0]  Payload (48 bits)
+//! - [63:48] Tag (16 bits, strictly >= 0xFFF8 to guarantee Bit 51 is 1: Quiet NaN)
+//! - [47:0]  Payload (48 bits)
 //!
 //! Tag allocation (all boxed tags reside strictly in Quiet-NaN space 0xFFF8..0xFFFF):
-//!   0x0000..0xFFF7 : Pure IEEE-754 Doubles, +/-inf, subnormals, Canonical Quiet NaN.
-//!   0xFFF8         : Int32 (bits 31..0: signed 32-bit integer)
-//!   0xFFF9         : Boolean (bit 0: 0 for false, 1 for true)
-//!   0xFFFA         : Special (0 for undefined, 1 for null)
-//!   0xFFFB         : Generational Handle (12b instance_id, 16b generation, 20b slot_index)
-//!   0xFFFC         : Caged Heap Object (48-bit pointer / caged base-relative offset)
-//!   0xFFFD         : Extended (bit 32 = 0 for Symbol ID, bit 32 = 1 for BigInt offset)
-//!   0xFFFE         : Inline SSO Strings (lengths 0 to 5 bytes; length stored in bits 47..40)
-//!   0xFFFF         : Inline SSO Strings (length 6 bytes; all 48 payload bits are characters)
+//! - 0x0000..0xFFF7 : Pure IEEE-754 Doubles, +/-inf, subnormals, Canonical Quiet NaN.
+//! - 0xFFF8         : Int32 (bits 31..0: signed 32-bit integer)
+//! - 0xFFF9         : Boolean (bit 0: 0 for false, 1 for true)
+//! - 0xFFFA         : Special (0 for undefined, 1 for null)
+//! - 0xFFFB         : Generational Handle (12b instance_id, 16b generation, 20b slot_index)
+//! - 0xFFFC         : Caged Heap Object (48-bit pointer / caged base-relative offset)
+//! - 0xFFFD         : Extended (bit 32 = 0 for Symbol ID, bit 32 = 1 for BigInt offset)
+//! - 0xFFFE         : Inline SSO Strings (lengths 0 to 5 bytes; length stored in bits 47..40)
+//! - 0xFFFF         : Inline SSO Strings (length 6 bytes; all 48 payload bits are characters)
 
 const std = @import("std");
 const builtin = @import("builtin");

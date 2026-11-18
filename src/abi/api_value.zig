@@ -20,8 +20,7 @@ var owners: std.AutoHashMapUnmanaged(i32, Owner) = .{};
 var slot_map: ?SlotMap = null;
 var initialized = std.atomic.Value(bool).init(false);
 
-/// Ensure the value registry is initialized with the supplied allocator.
-/// If already initialized, this is a thread-safe no-op that preserves existing state and returns true.
+/// Ensure the value registry is initialized with the supplied allocator; returns true as a thread-safe no-op if already initialized.
 pub fn ensureInitialized(allocator: std.mem.Allocator) bool {
     if (initialized.load(.acquire)) return true;
     mutex.lock();
@@ -34,8 +33,7 @@ pub fn ensureInitialized(allocator: std.mem.Allocator) bool {
     return true;
 }
 
-/// Reset and reinitialize the value registry lifecycle with an explicitly supplied allocator.
-/// Callers (such as test suites) govern all slot-array and instance-index allocations.
+/// Reset and reinitialize the value registry lifecycle with an explicitly supplied allocator (e.g. for test suites).
 pub fn init(allocator: std.mem.Allocator) void {
     mutex.lock();
     defer mutex.unlock();

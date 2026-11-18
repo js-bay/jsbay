@@ -1,6 +1,7 @@
 //! Typed Value handles for packed-alt (non-primary) instances.
 //!
 //! Values are stored as erased backend bytes + tag + ctx addr (same pattern as TimerData).
+//!
 //! Handles use TAG_HEAP_OBJ so they never collide with primary `api_value` / host-string ids.
 
 const std = @import("std");
