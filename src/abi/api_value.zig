@@ -20,8 +20,22 @@ var owners: std.AutoHashMapUnmanaged(i32, Owner) = .{};
 var slot_map: ?SlotMap = null;
 var initialized = std.atomic.Value(bool).init(false);
 
-/// Initialize the value registry lifecycle with an explicitly supplied allocator.
-/// Callers (such as the public C export boundary or test runners) govern all slot-array and instance-index allocations.
+/// Ensure the value registry is initialized with the supplied allocator.
+/// If already initialized, this is a thread-safe no-op that preserves existing state and returns true.
+pub fn ensureInitialized(allocator: std.mem.Allocator) bool {
+    if (initialized.load(.acquire)) return true;
+    mutex.lock();
+    defer mutex.unlock();
+    if (initialized.load(.monotonic)) return true;
+    registry_allocator = allocator;
+    owners = .{};
+    slot_map = SlotMap.init(allocator);
+    initialized.store(true, .release);
+    return true;
+}
+
+/// Reset and reinitialize the value registry lifecycle with an explicitly supplied allocator.
+/// Callers (such as test suites) govern all slot-array and instance-index allocations.
 pub fn init(allocator: std.mem.Allocator) void {
     mutex.lock();
     defer mutex.unlock();
@@ -357,4 +371,34 @@ test "api_value: handle reservation, commit, cancel, and access invariants" {
 
     // 5. Retaining after instance is dropped returns null cleanly
     try std.testing.expect(retain(reserved.handle) == null);
+}
+
+test "api_value: concurrent ensureInitialized is idempotent and preserves registrations" {
+    init(std.testing.allocator);
+    defer deinit();
+
+    const Worker = struct {
+        fn run(alloc: std.mem.Allocator) void {
+            var i: usize = 0;
+            while (i < 50) : (i += 1) {
+                _ = ensureInitialized(alloc);
+            }
+        }
+    };
+
+    const thread1 = try std.Thread.spawn(.{}, Worker.run, .{std.testing.allocator});
+    const thread2 = try std.Thread.spawn(.{}, Worker.run, .{std.testing.allocator});
+    const thread3 = try std.Thread.spawn(.{}, Worker.run, .{std.testing.allocator});
+
+    Worker.run(std.testing.allocator);
+
+    thread1.join();
+    thread2.join();
+    thread3.join();
+
+    try std.testing.expect(isInitialized());
+    const instance_id: i32 = 12_345;
+    try std.testing.expect(noteCreated(instance_id));
+    defer dropInstance(instance_id);
+    try std.testing.expect(isOwner(instance_id));
 }

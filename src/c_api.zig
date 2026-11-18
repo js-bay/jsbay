@@ -87,9 +87,7 @@ pub export fn jsbay_available_backends(out_backends: ?[*]BackendC, cap: usize) u
 }
 
 pub fn ensureValueRegistry() void {
-    if (!api_value.isInitialized()) {
-        api_value.init(std.heap.c_allocator);
-    }
+    _ = api_value.ensureInitialized(std.heap.c_allocator);
 }
 
 /// Create-time engine select. `backend == .primary` (0) selects the pack primary. Any packed backend (including non-primary) creates an instance; non-packed tags fail. Non-primary packed instances support create/eval/destroy plus the typed Value surface wired through packed_api_value; bytecode cache and bind/inspector remain primary-only.
