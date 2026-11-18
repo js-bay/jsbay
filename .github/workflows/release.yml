@@ -1441,7 +1441,6 @@ jobs:
     with:
       operation: build
       tag: v${{ inputs.version }}
-      commit_sha: ${{ github.sha }}
 
   publish-node-packages:
     needs: [create-draft-release, build-node-packages, publish-android-packages]
@@ -1450,7 +1449,6 @@ jobs:
     with:
       operation: publish
       tag: v${{ inputs.version }}
-      commit_sha: ${{ github.sha }}
       artifact_id: ${{ needs.build-node-packages.outputs.artifact_id }}
     secrets:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

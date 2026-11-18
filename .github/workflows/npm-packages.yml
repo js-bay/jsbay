@@ -11,10 +11,6 @@ on:
         description: Version tag validated by the release workflow
         required: true
         type: string
-      commit_sha:
-        description: Release commit to build and publish
-        required: true
-        type: string
       artifact_id:
         description: Artifact ID returned by the build operation
         required: false
@@ -41,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.commit_sha }}
+          ref: ${{ github.sha }}
           submodules: recursive
       - uses: actions/setup-node@v6
         with:
@@ -137,7 +133,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.commit_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           submodules: recursive
 
@@ -248,7 +244,7 @@ jobs:
           path: npm-platform-artifacts
       - name: Verify the complete package set
         env:
-          SOURCE_SHA: ${{ inputs.commit_sha }}
+          SOURCE_SHA: ${{ github.sha }}
           VERSION: ${{ needs.build-main.outputs.version }}
         run: |
           set -euo pipefail
@@ -286,7 +282,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.commit_sha }}
+          ref: ${{ github.sha }}
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -299,7 +295,7 @@ jobs:
       - name: Verify the selected package artifact
         env:
           ARTIFACT_ID: ${{ inputs.artifact_id }}
-          SOURCE_SHA: ${{ inputs.commit_sha }}
+          SOURCE_SHA: ${{ github.sha }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail

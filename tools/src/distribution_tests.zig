@@ -473,7 +473,6 @@ test "test_release_workflow_stages_package_commit_before_publishing" {
     try contains(tag_test, "different generated metadata");
     try contains(tag_test, "different generated source content");
     try contains(workflow, "${{ github.sha }}");
-    try contains(workflow, "commit_sha: ${{ github.sha }}");
     try notContains(workflow, "APPLE_PACKAGE_TOKEN");
     try notContains(workflow, "push:\n    tags:");
     try notContains(workflow, "version=\"${{ inputs.version }}\"");
