@@ -86,6 +86,10 @@ pub export fn jsbay_available_backends(out_backends: ?[*]BackendC, cap: usize) u
     return n;
 }
 
+pub fn ensureValueRegistry() void {
+    _ = api_value.ensureInitialized(std.heap.c_allocator);
+}
+
 /// Create-time engine select. `backend == .primary` (0) selects the pack primary. Any packed backend (including non-primary) creates an instance; non-packed tags fail. Non-primary packed instances support create/eval/destroy plus the typed Value surface wired through packed_api_value; bytecode cache and bind/inspector remain primary-only.
 pub export fn jsbay_engine_create_with_options(
     instance_id: c_int,
@@ -134,6 +138,7 @@ pub export fn jsbay_engine_create_with_options(
             return false;
         }
     }
+    ensureValueRegistry();
     if (!api_value.noteCreated(id)) {
         engine.destroy(id);
         return false;
@@ -281,6 +286,7 @@ test "c_api: forced packed_alt typed value for the primary backend" {
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -366,6 +372,7 @@ test "c_api: forced packed_alt set/call/construct/new_* for the primary backend"
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -543,6 +550,7 @@ test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/ne
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -722,6 +730,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer {
         if (instance_map.getInstance(id) != null) jsbay_engine_destroy(id);
@@ -882,6 +891,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         std.heap.c_allocator.destroy(instance2);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id2));
     defer jsbay_engine_destroy(id2);
     var obj2: u64 = 0;
@@ -1169,6 +1179,7 @@ pub export fn jsbay_engine_create_with_limits(
         engine.destroy(id);
         return false;
     }
+    ensureValueRegistry();
     if (!api_value.noteCreated(id)) {
         engine.destroy(id);
         return false;
@@ -1998,6 +2009,13 @@ const discardTypedBytecodeResult = value_operation.discardTypedBytecodeResult;
 
 pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
     out_value.* = 0;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isEmpty()) return API_STALE_VALUE;
+    if (val.isPrimitive()) {
+        out_value.* = value;
+        return API_OK;
+    }
+    ensureValueRegistry();
     if (packed_api_value.isPackedHandle(value)) {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
@@ -2021,6 +2039,10 @@ pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
 }
 
 pub export fn jsbay_value_release(value: u64) c_int {
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isEmpty()) return API_STALE_VALUE;
+    if (val.isPrimitive()) return API_OK;
+    ensureValueRegistry();
     if (host_string_values.take(value)) |entry| {
         std.heap.c_allocator.free(entry.bytes);
         return API_OK;
@@ -2322,7 +2344,13 @@ pub export fn jsbay_value_new_array_buffer_no_copy(
     const maybe_val = value_buffers.newArrayBufferFromBytes(id, byte_ptr, len, fin, user_data);
     if (maybe_val) |val| {
         var owned = value_mod.OwnedValue.init(op.ctx, val);
-        reserved.commit(&owned);
+        defer owned.deinit();
+        reserved.commit(&owned) catch |err| {
+            return switch (err) {
+                error.RegistryUnavailable => API_INSTANCE_NOT_FOUND,
+                error.InvalidReservation => API_STALE_VALUE,
+            };
+        };
         out_value.* = reserved.handle;
         return API_OK;
     } else {
@@ -2333,6 +2361,28 @@ pub export fn jsbay_value_new_array_buffer_no_copy(
 
 pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
     out_kind.* = 0;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isEmpty()) return API_STALE_VALUE;
+    if (val.isUndefined()) {
+        out_kind.* = 0;
+        return API_OK;
+    }
+    if (val.isNull()) {
+        out_kind.* = 1;
+        return API_OK;
+    }
+    if (val.isBool()) {
+        out_kind.* = 2;
+        return API_OK;
+    }
+    if (val.isNumber()) {
+        out_kind.* = 3;
+        return API_OK;
+    }
+    if (val.isSso()) {
+        out_kind.* = 4;
+        return API_OK;
+    }
     if (host_string_values.get(value) != null) {
         out_kind.* = 4; // JSBAY_VALUE_STRING
         return API_OK;
@@ -2357,6 +2407,12 @@ pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
 
 pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
     out_value.* = false;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isBool()) {
+        out_value.* = val.asBool();
+        return API_OK;
+    }
+    if (val.isPrimitive()) return API_INVALID_ARGUMENT;
     if (packed_api_value.isPackedHandle(value)) {
         var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
@@ -2379,6 +2435,12 @@ pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
 
 pub export fn jsbay_value_to_number(value: u64, out_value: *f64) c_int {
     out_value.* = 0;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isNumber()) {
+        out_value.* = val.asFloat();
+        return API_OK;
+    }
+    if (val.isPrimitive()) return API_INVALID_ARGUMENT;
     if (packed_api_value.isPackedHandle(value)) {
         var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
@@ -2898,6 +2960,17 @@ pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, o
 pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
     out_exception.* = 0;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isSso()) {
+        const len = val.ssoLength();
+        if (len > 6) return API_STALE_VALUE;
+        var sso_buf: [6]u8 = undefined;
+        const copied = val.copySso(&sso_buf);
+        const duped = std.heap.c_allocator.dupe(u8, sso_buf[0..copied]) catch return API_OUT_OF_MEMORY;
+        out_bytes.* = .{ .data = duped.ptr, .len = duped.len };
+        return API_OK;
+    }
+    if (val.isPrimitive()) return API_INVALID_ARGUMENT;
     if (host_string_values.get(value)) |entry| {
         const duped = std.heap.c_allocator.dupe(u8, entry.bytes) catch return API_OUT_OF_MEMORY;
         out_bytes.* = .{ .data = duped.ptr, .len = duped.len };
@@ -4179,6 +4252,70 @@ test "c_api: jsbay_engine_post_gc accepts and coalesces" {
     // Stale generation or missing instance rejects
     try std.testing.expect(!jsbay_engine_post_gc(id, snapshot.generation + 1));
     try std.testing.expect(!jsbay_engine_post_gc(999999, 0));
+}
+
+test "c_api: nanbox hyper_box primitive fast paths bypass lock without engine handles" {
+    const HV = value_mod.HyperValue;
+
+    // Numbers (Float and Int32)
+    const float_val = HV.fromFloat(123.456).raw;
+    var out_num: f64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(float_val, &out_num));
+    try std.testing.expectEqual(@as(f64, 123.456), out_num);
+
+    var kind: c_int = -1;
+    try std.testing.expectEqual(API_OK, jsbay_value_type(float_val, &kind));
+    try std.testing.expectEqual(@as(c_int, 3), kind);
+
+    var out_bool: bool = true;
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_bool(float_val, &out_bool));
+
+    var retained_float: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_retain(float_val, &retained_float));
+    try std.testing.expectEqual(float_val, retained_float);
+    try std.testing.expectEqual(API_OK, jsbay_value_release(float_val));
+
+    // Booleans
+    const bool_val = HV.fromBool(true).raw;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_bool(bool_val, &out_bool));
+    try std.testing.expectEqual(true, out_bool);
+    try std.testing.expectEqual(API_OK, jsbay_value_type(bool_val, &kind));
+    try std.testing.expectEqual(@as(c_int, 2), kind);
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_number(bool_val, &out_num));
+
+    // Special: undefined & null
+    try std.testing.expectEqual(API_OK, jsbay_value_type(HV.undefinedValue().raw, &kind));
+    try std.testing.expectEqual(@as(c_int, 0), kind);
+    try std.testing.expectEqual(API_OK, jsbay_value_type(HV.nullValue().raw, &kind));
+    try std.testing.expectEqual(@as(c_int, 1), kind);
+
+    // SSO String
+    const sso_val = (HV.fromSso("hello") orelse return error.TestUnexpectedResult).raw;
+    try std.testing.expectEqual(API_OK, jsbay_value_type(sso_val, &kind));
+    try std.testing.expectEqual(@as(c_int, 4), kind);
+
+    var out_bytes: Bytes = .{ .data = null, .len = 0 };
+    var out_exc: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(sso_val, &out_bytes, &out_exc));
+    defer jsbay_free_bytes(out_bytes);
+    try std.testing.expectEqual(@as(usize, 5), out_bytes.len);
+    try std.testing.expectEqualStrings("hello", out_bytes.data.?[0..out_bytes.len]);
+
+    // Non-string unboxed primitives reject to_utf8 as invalid argument
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_utf8(float_val, &out_bytes, &out_exc));
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_utf8(bool_val, &out_bytes, &out_exc));
+
+    // Empty value returns stale
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_retain(HV.empty().raw, &retained_float));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(HV.empty().raw));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(HV.empty().raw, &kind));
+
+    // Corrupt SSO handle (length 7 in bits 47..40) is rejected as stale handle
+    const corrupt_sso: u64 = 0xFFFE_0700_0000_0000;
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_to_utf8(corrupt_sso, &out_bytes, &out_exc));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(corrupt_sso, &kind));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_retain(corrupt_sso, &retained_float));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(corrupt_sso));
 }
 
 // Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`. Never part of the published product ABI. See tests/process-isolation/ and docs/host-isolation.md.

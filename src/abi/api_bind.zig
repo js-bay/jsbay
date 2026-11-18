@@ -256,7 +256,7 @@ fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEn
     var thrown: u64 = 0;
     const rc = binding.callback(binding.instance_id, binding.user_data, borrowed_this, argc, if (argc == 0) null else handles.items.ptr, &result, &thrown);
     if (rc == 0 and result != 0 and thrown == 0) {
-        const owned = api_value.takeOwned(result) orelse return spikeThrow(ctx, "invalid native callback result");
+        const owned = api_value.takeOwnedOrSynthesize(binding.instance_id, result) orelse return spikeThrow(ctx, "invalid native callback result");
         if (owned.instance_id != binding.instance_id) {
             api_value.freeTaken(owned);
             return spikeThrow(ctx, "native callback returned foreign value");
@@ -264,7 +264,7 @@ fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEn
         return owned.value;
     }
     if (rc == 1 and result == 0 and thrown != 0) {
-        const owned = api_value.takeOwned(thrown) orelse return spikeThrow(ctx, "invalid native callback exception");
+        const owned = api_value.takeOwnedOrSynthesize(binding.instance_id, thrown) orelse return spikeThrow(ctx, "invalid native callback exception");
         if (owned.instance_id != binding.instance_id) {
             api_value.freeTaken(owned);
             return spikeThrow(ctx, "native callback returned foreign exception");
@@ -439,7 +439,7 @@ fn trampoline(ctx: ?*qjs.JSContext, this_value: qjs.JSValue, argc: c_int, argv: 
     var exception: u64 = 0;
     const rc = binding.callback(binding.instance_id, binding.user_data, borrowed_this, count, if (count == 0) null else handles.items.ptr, &result, &exception);
     if (rc == 0 and result != 0 and exception == 0) {
-        const value = api_value.takeOwned(result) orelse return statusException(ctx, "invalid native callback result");
+        const value = api_value.takeOwnedOrSynthesize(binding.instance_id, result) orelse return statusException(ctx, "invalid native callback result");
         if (value.instance_id != binding.instance_id) {
             api_value.freeTaken(value);
             return statusException(ctx, "native callback returned foreign value");
@@ -447,7 +447,7 @@ fn trampoline(ctx: ?*qjs.JSContext, this_value: qjs.JSValue, argc: c_int, argv: 
         return value.value;
     }
     if (rc == 1 and result == 0 and exception != 0) {
-        const thrown = api_value.takeOwned(exception) orelse return statusException(ctx, "invalid native callback exception");
+        const thrown = api_value.takeOwnedOrSynthesize(binding.instance_id, exception) orelse return statusException(ctx, "invalid native callback exception");
         if (thrown.instance_id != binding.instance_id) {
             api_value.freeTaken(thrown);
             return statusException(ctx, "native callback returned foreign exception");
@@ -487,7 +487,7 @@ fn jscTrampoline(ctx: jsc.JSContextRef, function: jsc.JSObjectRef, this_value: j
     var thrown: u64 = 0;
     const rc = live.callback(live.instance_id, live.user_data, borrowed_this, argc, if (argc == 0) null else handles.items.ptr, &result, &thrown);
     if (rc == 0 and result != 0 and thrown == 0) {
-        const owned = api_value.takeOwned(result) orelse return common.throwError(ctx, exception, "invalid native callback result");
+        const owned = api_value.takeOwnedOrSynthesize(live.instance_id, result) orelse return common.throwError(ctx, exception, "invalid native callback result");
         if (owned.instance_id != live.instance_id) {
             api_value.freeTaken(owned);
             return common.throwError(ctx, exception, "native callback returned foreign value");
@@ -497,7 +497,7 @@ fn jscTrampoline(ctx: jsc.JSContextRef, function: jsc.JSObjectRef, this_value: j
         return raw;
     }
     if (rc == 1 and result == 0 and thrown != 0) {
-        const owned = api_value.takeOwned(thrown) orelse return common.throwError(ctx, exception, "invalid native callback exception");
+        const owned = api_value.takeOwnedOrSynthesize(live.instance_id, thrown) orelse return common.throwError(ctx, exception, "invalid native callback exception");
         if (owned.instance_id != live.instance_id) {
             api_value.freeTaken(owned);
             return common.throwError(ctx, exception, "native callback returned foreign exception");

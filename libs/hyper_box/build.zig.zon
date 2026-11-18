@@ -1,0 +1,8 @@
+.{
+    .name = .hyper_box,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xe168ce186868d6c2,
+    .dependencies = .{},
+    .paths = .{ "LICENSE", "readme.md", "build.zig", "build.zig.zon", "src" },
+}
