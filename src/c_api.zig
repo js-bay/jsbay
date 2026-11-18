@@ -2345,9 +2345,12 @@ pub export fn jsbay_value_new_array_buffer_no_copy(
     if (maybe_val) |val| {
         var owned = value_mod.OwnedValue.init(op.ctx, val);
         defer owned.deinit();
-        if (!reserved.commit(&owned)) {
-            return API_INSTANCE_NOT_FOUND;
-        }
+        reserved.commit(&owned) catch |err| {
+            return switch (err) {
+                error.RegistryUnavailable => API_INSTANCE_NOT_FOUND,
+                error.InvalidReservation => API_STALE_VALUE,
+            };
+        };
         out_value.* = reserved.handle;
         return API_OK;
     } else {

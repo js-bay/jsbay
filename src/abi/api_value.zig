@@ -144,18 +144,23 @@ pub const ReserveHandleError = error{
     OutOfMemory,
 };
 
+pub const CommitError = error{
+    RegistryUnavailable,
+    InvalidReservation,
+};
+
 pub const ReservedHandle = struct {
     handle: u64,
 
-    pub fn commit(self: ReservedHandle, owned: *OwnedValue) bool {
+    pub fn commit(self: ReservedHandle, owned: *OwnedValue) CommitError!void {
         mutex.lock();
         defer mutex.unlock();
-        var sm = &(slot_map orelse return false);
+        var sm = &(slot_map orelse return error.RegistryUnavailable);
         if (sm.commit(self.handle, owned.borrow())) {
             _ = owned.release();
-            return true;
+            return;
         }
-        return false;
+        return error.InvalidReservation;
     }
 
     pub fn cancel(self: ReservedHandle) void {
@@ -334,7 +339,7 @@ test "api_value: handle reservation, commit, cancel, and access invariants" {
 
     // Commit handle
     var owned = OwnedValue.init(undefined, ActiveEngine.nullValue());
-    try std.testing.expect(reserved.commit(&owned));
+    try reserved.commit(&owned);
 
     // After commit, get() returns the entry and is not reserved
     const entry = get(reserved.handle);
@@ -363,12 +368,17 @@ test "api_value: handle reservation, commit, cancel, and access invariants" {
     reserved3.cancel();
     try std.testing.expect(get(reserved3.handle) == null);
 
-    // 4. Committing a cancelled or dropped reservation fails cleanly
+    // 4. Committing a cancelled or dropped reservation fails cleanly with typed error
     var dead_owned = OwnedValue.init(undefined, ActiveEngine.nullValue());
-    try std.testing.expect(!reserved3.commit(&dead_owned));
+    try std.testing.expectError(error.InvalidReservation, reserved3.commit(&dead_owned));
 
     // 5. Retaining after instance is dropped returns null cleanly
     try std.testing.expect(retain(reserved.handle) == null);
+
+    // 6. Committing when registry is deinitialized fails with RegistryUnavailable
+    deinit();
+    try std.testing.expectError(error.RegistryUnavailable, reserved.commit(&dead_owned));
+    init(std.testing.allocator);
 }
 
 test "api_value: concurrent ensureInitialized is idempotent and preserves registrations" {
