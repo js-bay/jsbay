@@ -28,3 +28,5 @@ runs:
         echo "$tool_dir/command-line-tools/bin" >> "$GITHUB_PATH"
         echo "$tool_dir/command-line-tools/tool/node/bin" >> "$GITHUB_PATH"
         echo "HOS_SDK_HOME=$tool_dir/command-line-tools/sdk" >> "$GITHUB_ENV"
+        echo "OHPM_NODE=$tool_dir/command-line-tools/tool/node/bin/node" >> "$GITHUB_ENV"
+        echo "OHPM_CRYPTO_MODULE=$tool_dir/command-line-tools/ohpm/lib/core/config-encrypt/crypto" >> "$GITHUB_ENV"
