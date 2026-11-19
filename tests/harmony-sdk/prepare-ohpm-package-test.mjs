@@ -33,6 +33,7 @@ try {
   for (const version of ['2147483648.0.0', '0.2147483648.0', '0.0.2147483648']) {
     assert.throws(() => execFileSync(process.execPath, [prepare, root, 'quickjs', version], { stdio: 'ignore' }));
   }
+  assert.throws(() => execFileSync(process.execPath, [prepare, root, 'quickjs', `1.2.3-${'a'.repeat(230)}`], { stdio: 'ignore' }));
   execFileSync(process.execPath, [prepare, root, 'quickjs', '2147483647.2147483647.2147483647']);
   execFileSync(process.execPath, [prepare, root, 'quickjs', '0.2.0']);
   assert.equal(JSON.parse(readFileSync(join(root, 'sdk/harmony/oh-package.json5'), 'utf8')).version, '0.2.0');
