@@ -359,9 +359,9 @@ pub fn main() !void {
     }
 
     // -------------------------------------------------------------------------
-    // 3. MPSC Task Queue: Cache-Line Isolated Mutex vs Unpadded Mutex
+    // 3. Task Queue Layout: Cache-Line Isolated Mutex vs Unpadded Mutex (Uncontended Overhead)
     // -------------------------------------------------------------------------
-    printHeader("3. MPSC Task Queue: Cache-Line Isolated Mutex vs Unpadded Mutex");
+    printHeader("3. Task Queue Layout: Cache-Line Isolated Mutex vs Unpadded Mutex (Uncontended)");
     const QUEUE_ITERS: u64 = 10_000_000;
     {
         var mq = UnpaddedTaskQueue{};
@@ -374,7 +374,7 @@ pub fn main() !void {
         }
         const elapsed = getNs() - start;
         std.mem.doNotOptimizeAway(dummy);
-        printRow("Unpadded Mutex Task Queue (Push + Pop)", QUEUE_ITERS, elapsed);
+        printRow("Unpadded Mutex Task Queue (Uncontended Push+Pop)", QUEUE_ITERS, elapsed);
     }
     {
         var isolated_q = CacheLineIsolatedTaskQueue{};
@@ -387,7 +387,7 @@ pub fn main() !void {
         }
         const elapsed = getNs() - start;
         std.mem.doNotOptimizeAway(dummy);
-        printRow("Cache-Line Isolated Mutex Queue (align(64))", QUEUE_ITERS, elapsed);
+        printRow("Cache-Line Isolated Mutex Queue (Uncontended Push+Pop)", QUEUE_ITERS, elapsed);
     }
 
     // -------------------------------------------------------------------------
@@ -589,14 +589,25 @@ pub fn main() !void {
     // -------------------------------------------------------------------------
     printHeader("9. Event Routing: Bit-Matrix Dispatch vs Branch Cascade");
     const ROUTE_ITERS: u64 = 20_000_000;
-    const active_instances: u64 = 0b1111_0000_1010_0101;
-    const registered_mask: u64 = 0b1100_0000_1000_0101;
+    const active_instances: u64 = 0b1010_0101;
+    const registered_mask: u64 = 0b1000_0101;
+
+    // Verify both dispatchers produce identical routing results across all 8 inputs.
+    var check_evt: u6 = 0;
+    while (check_evt < 8) : (check_evt += 1) {
+        const cascade_res = branchCascadeDispatch(active_instances, registered_mask, check_evt);
+        const matrix_res = branchlessBitMatrixDispatch(active_instances, registered_mask, check_evt);
+        if (cascade_res != matrix_res) {
+            std.debug.panic("Dispatcher mismatch for evt {d}: cascade={?d}, matrix={?d}\n", .{ check_evt, cascade_res, matrix_res });
+        }
+    }
+
     {
         var dummy: u64 = 0;
         const start = getNs();
         var i: u64 = 0;
         while (i < ROUTE_ITERS) : (i += 1) {
-            const evt: u6 = @truncate(i & 0x0F);
+            const evt: u6 = @truncate(i & 0x07);
             if (branchCascadeDispatch(active_instances, registered_mask, evt)) |matched| {
                 dummy +%= matched;
             }
@@ -610,7 +621,7 @@ pub fn main() !void {
         const start = getNs();
         var i: u64 = 0;
         while (i < ROUTE_ITERS) : (i += 1) {
-            const evt: u6 = @truncate(i & 0x0F);
+            const evt: u6 = @truncate(i & 0x07);
             if (branchlessBitMatrixDispatch(active_instances, registered_mask, evt)) |matched| {
                 dummy +%= matched;
             }

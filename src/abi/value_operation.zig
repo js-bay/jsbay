@@ -429,6 +429,22 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
         }
 
         pub fn packedDupBytes(handle: u64, expect_instance: i32, expect_tag: backend.BackendType, out: []u8) ?usize {
+            const val = HyperValue{ .raw = handle };
+            if (val.isSso()) {
+                const sso_buf = val.asSsoBytes();
+                const handles = packedHandlesOf(expect_instance) orelse return null;
+                const res = @import("../backend_dispatch.zig").valueNewString(expect_tag, handles.ctx_addr, sso_buf.slice());
+                if (res.exception) |e| @import("../backend_dispatch.zig").timerFreeValue(expect_tag, handles.ctx_addr, e.slice());
+                if (res.value) |v| {
+                    if (out.len < v.len) {
+                        @import("../backend_dispatch.zig").timerFreeValue(expect_tag, handles.ctx_addr, v.slice());
+                        return null;
+                    }
+                    @memcpy(out[0..v.len], v.bytes[0..v.len]);
+                    return v.len;
+                }
+                return null;
+            }
             const entry = packed_api_value.get(handle) orelse return null;
             if (entry.instance_id != expect_instance or entry.tag != expect_tag) return null;
             return @import("../backend_dispatch.zig").timerDupValue(entry.tag, entry.ctx_addr, entry.bytes(), out);

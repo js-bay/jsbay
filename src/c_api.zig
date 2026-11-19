@@ -455,6 +455,45 @@ test "c_api: forced packed_alt set/call/construct/new_* for the primary backend"
     try std.testing.expectEqual(API_OK, jsbay_value_to_number(px, &number));
     try std.testing.expectEqual(@as(f64, 5), number);
 
+    // sso string set / get / call / construct in packed_alt
+    var sso_val: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_sso_string("hello", 5, &sso_val));
+    defer _ = jsbay_value_release(sso_val);
+    try std.testing.expectEqual(API_OK, jsbay_value_set(obj, .{ .data = "greeting", .len = 8 }, sso_val, &exception));
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var got_sso: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(obj, .{ .data = "greeting", .len = 8 }, &got_sso, &exception));
+    defer _ = jsbay_value_release(got_sso);
+    var sso_bytes: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(got_sso, &sso_bytes, &exception));
+    defer jsbay_free_bytes(sso_bytes);
+    try std.testing.expectEqualStrings("hello", sso_bytes.data.?[0..sso_bytes.len]);
+
+    // sso string call argument and this in packed_alt
+    var fn_echo: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(s){ return s + '!'; })", .len = 32 }, .{ .data = "<echo>", .len = 6 }, null, &fn_echo, &exception));
+    defer _ = jsbay_value_release(fn_echo);
+    var echo_res: u64 = 0;
+    const sso_call_args = [_]u64{sso_val};
+    try std.testing.expectEqual(API_OK, jsbay_value_call(fn_echo, und, &sso_call_args, 1, &echo_res, &exception));
+    defer _ = jsbay_value_release(echo_res);
+    var echo_bytes: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(echo_res, &echo_bytes, &exception));
+    defer jsbay_free_bytes(echo_bytes);
+    try std.testing.expectEqualStrings("hello!", echo_bytes.data.?[0..echo_bytes.len]);
+
+    // sso string construct argument in packed_alt
+    var sso_constructed: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_construct(ctor, &sso_call_args, 1, &sso_constructed, &exception));
+    defer _ = jsbay_value_release(sso_constructed);
+    var sso_px: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(sso_constructed, .{ .data = "x", .len = 1 }, &sso_px, &exception));
+    defer _ = jsbay_value_release(sso_px);
+    var px_bytes: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(sso_px, &px_bytes, &exception));
+    defer jsbay_free_bytes(px_bytes);
+    try std.testing.expectEqualStrings("hello", px_bytes.data.?[0..px_bytes.len]);
+
     // ArrayBuffer
     const payload = [_]u8{ 1, 2, 3, 4 };
     var buf: u64 = 0;
@@ -2757,6 +2796,11 @@ const packedDupBytes = value_operation.packedDupBytes;
 
 const packedInstanceReady = value_operation.packedInstanceReady;
 
+fn isPackedOperand(handle: u64) bool {
+    const val = value_mod.HyperValue{ .raw = handle };
+    return packed_api_value.isPackedHandle(handle) or val.isSso();
+}
+
 fn evaluatePackedAlt(instance_id: i32, source: []const u8, filename: []const u8, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
     out_exception.* = 0;
@@ -3274,7 +3318,7 @@ pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_except
             .ok => |ok| ok,
         };
         defer data.deinit();
-        if (!packed_api_value.isPackedHandle(value)) return API_STALE_VALUE;
+        if (!isPackedOperand(value)) return API_STALE_VALUE;
         // Allocate before duplicating `value`: a key-allocation failure must not leave a duplicate without an owner.
         const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
         defer std.heap.c_allocator.free(key_z);
@@ -3321,7 +3365,7 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
     if (args == null and argc != 0) return API_INVALID_ARGUMENT;
     const INLINE_ARGS_CAP = 8;
     if (packed_api_value.isPackedHandle(function)) {
-        if (!packed_api_value.isPackedHandle(this_value)) return API_STALE_VALUE;
+        if (!isPackedOperand(this_value)) return API_STALE_VALUE;
         // Acquire the eval lease before duplicating this/args so Zig LIFO runs lease release after freeValue cleanup.
         var data = switch (beginPackedValueOp(function)) {
             .status => |status| return status,
@@ -3357,7 +3401,7 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         if (args) |raw_args| {
             if (argc <= INLINE_ARGS_CAP) {
                 for (raw_args[0..argc], 0..) |handle, idx| {
-                    if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
+                    if (!isPackedOperand(handle)) return API_STALE_VALUE;
                     const len = packedDupBytes(handle, data.js.id, data.js.tag, stack_storage[idx][0..]) orelse return API_STALE_VALUE;
                     stack_lens[idx] = len;
                     stack_slices[idx] = stack_storage[idx][0..len];
@@ -3365,7 +3409,7 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
                 }
             } else {
                 for (raw_args[0..argc]) |handle| {
-                    if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
+                    if (!isPackedOperand(handle)) return API_STALE_VALUE;
                     var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
                     const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
                     heap_storage.append(data.js.allocator, buf) catch {
@@ -3516,7 +3560,7 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
         if (args) |raw_args| {
             if (argc <= INLINE_ARGS_CAP) {
                 for (raw_args[0..argc], 0..) |handle, idx| {
-                    if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
+                    if (!isPackedOperand(handle)) return API_STALE_VALUE;
                     const len = packedDupBytes(handle, data.js.id, data.js.tag, stack_storage[idx][0..]) orelse return API_STALE_VALUE;
                     stack_lens[idx] = len;
                     stack_slices[idx] = stack_storage[idx][0..len];
@@ -3524,7 +3568,7 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
                 }
             } else {
                 for (raw_args[0..argc]) |handle| {
-                    if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
+                    if (!isPackedOperand(handle)) return API_STALE_VALUE;
                     var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
                     const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
                     heap_storage.append(data.js.allocator, buf) catch {
