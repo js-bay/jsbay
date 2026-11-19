@@ -318,31 +318,24 @@ test "hyper_box64 rejects out-of-range SSO length and corrupt inline tags" {
     try testing.expect(valid_val.isPrimitive());
 }
 
-test "cmph matches all standard bridge atoms and rejects unknown keys" {
+test "cmph matches generic compile-time static dictionary and rejects unknown keys" {
     const testing = std.testing;
+    const dictionary = [_][]const u8{
+        "apple",     "banana",    "cherry",   "date",  "elderberry",
+        "fig",       "grape",     "honeydew", "kiwi",  "lemon",
+        "mango",     "nectarine", "orange",   "peach", "quince",
+        "raspberry",
+    };
+    const FruitMatcher = hyper_box.ComptimeMinimalPerfectHash(&dictionary);
 
-    try testing.expectEqual(hyper_box.BridgeAtom.publish, hyper_box.matchBridgeAtom("publish").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.invoke, hyper_box.matchBridgeAtom("invoke").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.onMessage, hyper_box.matchBridgeAtom("onMessage").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.subscribe, hyper_box.matchBridgeAtom("subscribe").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.unsubscribe, hyper_box.matchBridgeAtom("unsubscribe").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.addEventListener, hyper_box.matchBridgeAtom("addEventListener").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.removeEventListener, hyper_box.matchBridgeAtom("removeEventListener").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.dispatchEvent, hyper_box.matchBridgeAtom("dispatchEvent").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.postMessage, hyper_box.matchBridgeAtom("postMessage").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.ready, hyper_box.matchBridgeAtom("ready").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.@"error", hyper_box.matchBridgeAtom("error").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.close, hyper_box.matchBridgeAtom("close").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.open, hyper_box.matchBridgeAtom("open").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.data, hyper_box.matchBridgeAtom("data").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.status, hyper_box.matchBridgeAtom("status").?);
-    try testing.expectEqual(hyper_box.BridgeAtom.init, hyper_box.matchBridgeAtom("init").?);
+    for (dictionary, 0..) |fruit, expected_idx| {
+        try testing.expectEqual(expected_idx, FruitMatcher.match(fruit).?);
+    }
 
-    // Non-existent or mutated strings must return null
-    try testing.expect(hyper_box.matchBridgeAtom("unknownMethod") == null);
-    try testing.expect(hyper_box.matchBridgeAtom("publisher") == null);
-    try testing.expect(hyper_box.matchBridgeAtom("publis") == null);
-    try testing.expect(hyper_box.matchBridgeAtom("") == null);
+    try testing.expect(FruitMatcher.match("unknownFruit") == null);
+    try testing.expect(FruitMatcher.match("app") == null);
+    try testing.expect(FruitMatcher.match("applepie") == null);
+    try testing.expect(FruitMatcher.match("") == null);
 }
 
 test "bit_matrix routes events with hardware count trailing zeros" {

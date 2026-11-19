@@ -227,6 +227,7 @@ pub fn takeOwnedOrSynthesize(instance_id: i32, value: u64) ?Entry {
     const ptrs = instance_map.getPtrs(instance_id) orelse return null;
     if (val.isBool()) return .{ .instance_id = instance_id, .value = ActiveEngine.newBoolVal(ptrs.ctx, val.asBool()) };
     if (val.isInt32()) return .{ .instance_id = instance_id, .value = ActiveEngine.newInt32Val(ptrs.ctx, val.asInt32()) };
+    if (val.isDouble()) return .{ .instance_id = instance_id, .value = ActiveEngine.newFloat64Val(ptrs.ctx, val.asFloat()) };
     if (val.isSso()) {
         const sso_buf = val.asSsoBytes();
         return .{ .instance_id = instance_id, .value = ActiveEngine.newStringVal(ptrs.ctx, sso_buf.slice()) };

@@ -4569,6 +4569,40 @@ test "c_api: nanbox hyper_box primitive fast paths bypass lock without engine ha
     try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(float_val, &extracted_buf, &extracted_len));
 }
 
+test "api_value: native callback returning unboxed double synthesizes float without error" {
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    defer jsbay_engine_destroy(id);
+
+    // IEEE-754 double
+    const dbl_val = value_mod.HyperValue.fromFloat(3.1415926535);
+    const dbl_entry = api_value.takeOwnedOrSynthesize(id, dbl_val.raw);
+    try std.testing.expect(dbl_entry != null);
+    try std.testing.expectEqual(id, dbl_entry.?.instance_id);
+    api_value.freeTaken(dbl_entry.?);
+
+    // Negative zero double
+    const neg_zero = value_mod.HyperValue.fromFloat(-0.0);
+    const neg_entry = api_value.takeOwnedOrSynthesize(id, neg_zero.raw);
+    try std.testing.expect(neg_entry != null);
+    api_value.freeTaken(neg_entry.?);
+
+    // Int32
+    const int_val = value_mod.HyperValue.fromInt32(42);
+    const int_entry = api_value.takeOwnedOrSynthesize(id, int_val.raw);
+    try std.testing.expect(int_entry != null);
+    api_value.freeTaken(int_entry.?);
+
+    // Boolean
+    const bool_val = value_mod.HyperValue.fromBool(true);
+    const bool_entry = api_value.takeOwnedOrSynthesize(id, bool_val.raw);
+    try std.testing.expect(bool_entry != null);
+    api_value.freeTaken(bool_entry.?);
+
+    // Empty value returns null
+    try std.testing.expect(api_value.takeOwnedOrSynthesize(id, 0) == null);
+}
+
 // Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`. Never part of the published product ABI. See tests/process-isolation/ and docs/host-isolation.md.
 comptime {
     if (@import("build_options").fault_injection) {

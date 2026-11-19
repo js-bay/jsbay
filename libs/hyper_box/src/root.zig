@@ -15,9 +15,6 @@ pub const SENTINEL_FREE = generational_slot_map.SENTINEL_FREE;
 pub const MAX_SLOTS = generational_slot_map.MAX_SLOTS;
 
 pub const ComptimeMinimalPerfectHash = cmph.ComptimeMinimalPerfectHash;
-pub const BridgeAtom = cmph.BridgeAtom;
-pub const BridgeAtomMatcher = cmph.BridgeAtomMatcher;
-pub const matchBridgeAtom = cmph.matchBridgeAtom;
 
 pub const BitMatrix = bit_matrix.BitMatrix;
 pub const BitMatrixIterator = bit_matrix.BitMatrixIterator;

@@ -1,6 +1,6 @@
-//! Comptime Minimal Perfect Hash (CMPH) generator and Bridge Atom matcher.
+//! Comptime Minimal Perfect Hash (CMPH) generator.
 //!
-//! Generates zero-collision, branchless O(1) string matchers at compile time for constant string dictionaries.
+//! Generates zero-collision, branchless O(1) string matchers at compile time for static string dictionaries.
 
 const std = @import("std");
 
@@ -78,51 +78,4 @@ pub fn ComptimeMinimalPerfectHash(comptime keys: []const []const u8) type {
             return null;
         }
     };
-}
-
-/// Standard bridge atoms recognized in high-frequency event routing.
-pub const BridgeAtom = enum(u4) {
-    publish = 0,
-    invoke = 1,
-    onMessage = 2,
-    subscribe = 3,
-    unsubscribe = 4,
-    addEventListener = 5,
-    removeEventListener = 6,
-    dispatchEvent = 7,
-    postMessage = 8,
-    ready = 9,
-    @"error" = 10,
-    close = 11,
-    open = 12,
-    data = 13,
-    status = 14,
-    init = 15,
-};
-
-pub const BRIDGE_ATOM_NAMES = [_][]const u8{
-    "publish",
-    "invoke",
-    "onMessage",
-    "subscribe",
-    "unsubscribe",
-    "addEventListener",
-    "removeEventListener",
-    "dispatchEvent",
-    "postMessage",
-    "ready",
-    "error",
-    "close",
-    "open",
-    "data",
-    "status",
-    "init",
-};
-
-pub const BridgeAtomMatcher = ComptimeMinimalPerfectHash(&BRIDGE_ATOM_NAMES);
-
-/// Resolve a bridge event or method name into an enum atom in 2 nanoseconds with zero allocations.
-pub inline fn matchBridgeAtom(str: []const u8) ?BridgeAtom {
-    const idx = BridgeAtomMatcher.match(str) orelse return null;
-    return @fromBackingInt(@intCast(@as(u4, @truncate(idx))));
 }

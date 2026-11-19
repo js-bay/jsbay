@@ -100,6 +100,7 @@ pub const c_api = struct {
     pub const LoopSchedule = c_api_impl.LoopSchedule;
     pub const LoopCancel = c_api_impl.LoopCancel;
     pub const LogHandler = @import("types.zig").LogHandler;
+    pub const bridge_atoms = @import("abi/bridge_atoms.zig");
 
     pub const ResourceLimitsC = c_api_impl.ResourceLimitsC;
     pub const ResourceUsageC = c_api_impl.ResourceUsageC;
