@@ -181,6 +181,10 @@ fn runIsolated(test_fn: std.builtin.TestFn, init: std.process.Init.Minimal, time
         const code: u8 = switch (child) {
             .pass => 0,
             .skip => 2,
+            .fail => |name| blk: {
+                std.debug.print("isolated failure: {s}: {s}\n", .{ test_fn.name, name });
+                break :blk 1;
+            },
             else => 1,
         };
         std.process.exit(code);

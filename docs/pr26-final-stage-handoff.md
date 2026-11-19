@@ -1,0 +1,42 @@
+# PR26 final-stage local handoff
+
+PR26 remains Draft/not ready to merge. All work is box-local: no cloud agent, remote write, push, comment, PR update or merge. Prior commits/vendor pins and dirty patches remain. Evidence root: `/workspace/pr26-evidence/final-triage-e7257f2`. The earlier startup repair058e30a and handoffe7257f2 remain intact.
+
+## Actual new result
+
+The original isolated Android runner erased returned error names into exit1; ReleaseSafe often has no error-return trace. A four-line runner-only change prints the existing test/error before the unchanged exit1. Sixteen deterministic before/after host fixtures prove original error loss, repaired exact names, and unchanged pass/skip/fail exits. This then captured a real NG API24 for-await failure: `WouldBlock`, not a line/column assertion. Its pre-fix test/helper files are byte-identical tob0d4b0c; only diagnostic reporting differed. The failing raw log and pre-fix ELF are preserved separately.
+
+The unique read-error path is Session.open -> WebSocket HTTP upgrade -> readHttpHeaders. That helper propagated the socket's 50-ms SO_RCVTIMEO polling expiration as fatal. FrameReader already catches WouldBlock; writeAll maps write failures to WriteFailed. The new test-only HTTP variant preserves partial bytes and polls within the SAME original absolute10000-ms readiness deadline, now shared by creation and HTTP read. It does not start another budget after readiness. The socket50ms, CDP receive/wait10000ms, object-chain3s/50ms, runner180s, every existing assertion and all skips remain unchanged. The old reader retains its old behavior for a deterministic negative control and unchanged callers.
+
+Fresh ReleaseSafe API24 binaries actually ran on API24/API35 for Escargot, NG and QuickJS. All54 selected testcases pass, zero skips/failures/crashes/timeouts:16 historical CDP cases,18 wire tests (legacy negative, first-byte/partial-header retention and hard-deadline controls), plus20 for-await repeats (10/API). Three compiles and26 native commands exit0; all12 deployed ELF/libc++ payloads match pulled bytes. This is targeted acceptance, not a full suite or SDK rerun. Hermes is excluded from this stage; its closed startup repair is not retested or reopened. Exact commands/exits are in handshake-validation-status.json and fixed-validation-summaries.json.
+
+## Historical closure versus repaired current branch
+
+The ten-item historical ledger remains deliberately conservative: one closed(startup), nine open. Six extra exact-original-ELF for-await direct cases and the five previously undiagnosed original cases once/direct plus once/isolated all pass. The new WouldBlock branch is genuinely captured and fixed, but the original historical exit1 has no retained error name, so this stage does not silently equate every historical failure with the new transport defect. No original item is closed from passing replay alone. Detailed source assertions/evidence/stop gates are in api24-ten-failures.json.
+
+| Item | Final disposition | Concrete next gate, not an endless replay |
+|---|---|---|
+| Hermes start/id/stop | Already closed by058e30a | Preserve prior original-ELF negative and dual-API proof; excluded here. |
+| Escargot await identity | Low-frequency signature uncaptured | Two callback line1 stops, second value29; capture invocation/value error, not assume updater race. |
+| Escargot finally breakpoint | Low-frequency signature uncaptured | Three run/line3 stops; distinguish duplicate return-PC pause from missing CDP message. |
+| NG empty for-of | Low-frequency signature uncaptured | Existing100 original passes do not close two column5 pauses/final empty seen assertion. Stop random repeats. |
+| NG for-in | Actionable signature required | Separate binding5/two progress stops from operator13/three; capture exact error/column before backend mapping changes. |
+| NG for-await | Current HTTP branch fixed; historical attribution unproven | Binding11/three and operator19/four preserved. Current20 repeats pass; do not auto-close an opaque old exit1. |
+| QJS for-of body | Actionable signature required | Three column25 stops; resolver mismatch versus duplicate pause versus transport error are distinct. |
+| QJS empty for-of | Actionable signature required | Two column5 stops/empty seen; NG evidence does not transfer across engines. |
+| QJS condition progress | Actionable signature required | One caller/line4 stop under inner()===7; only semantic evidence justifies nested debugger-state changes. |
+| QJS999 chain | Low-frequency FrameTimeout cause uncaptured | ZERO new runs here. Retain prior partial-frame diagnostic and150s batch stop; need phase/byte or owner/runner failure evidence before repair. |
+
+The other CDP helpers already acquire owner-ready publication and receive Debugger.enable acknowledgement. Neither theb0 hook-updater race nor the058 spike-thread race is a demonstrated cause of these historical failures. New named HeaderTimeout/CdpTimeout/UnexpectedPause/expected-found output gives a finite decision tree; no additional automatic random batch is scheduled. Platform and independent unwind-review gaps in the existing handoff remain unchanged.
+
+## Product contract and the only user design decision
+
+The header179-180 promises thread-safe foreign destroy/join; its bind declaration does not explicitly specify finalizer affinity. Existing normative api-contract.md:3,7,9,51 does: creator-is-owner, teardown join and exactly-once owner finalizers. These exact statements already exist in local main8e2aba7 and predate the probe; no test-only expectation is promoted into a new product promise. The probe-defined process exit42 is NOT a product error status: destroy returns void. It proves callback count/thread, not failure to return, not all resource releases, and not VM freed bytes. The Escargot leak is a separate source fact(free_vm=false); its off-thread deletion guard remains untouched.
+
+User decision is about allowed compatibility changes, not permission to delete the VM off-thread: (1) a guaranteed pumping creator executor or versioned pending/asynchronous teardown adds a host scheduling/migration requirement; a creator blocked joining the destroyer cannot pump and would deadlock under synchronous dispatch; (2) a dedicated runtime owner changes creator-is-owner, callback thread and reentry/SDK assumptions, and alone cannot invoke a callback on a blocked old creator. If arbitrary passive creators must retain both existing guarantees with no compatibility change, leave this release-blocking. No model or outward contract was changed. See CONTRACT-BOUNDARY.md and contract-baseline-proof.json.
+
+## Scope, evidence and honest limitations
+
+Only native runner/test sources changed: no production or SDK input dependency changed. Compared to the prior SDK repository freeze,13033/13037 hashes match; differences are the already committed startup test plus this stage's runner and two test helpers. Existing fresh NG/QuickJS seven-stage SDK results retain their old exact production/artifact scope, not newly built HEAD metadata. Vendor31 Escargot/9 Hermes dirty-file contents and pins remain. Acceptance/negative/diagnostic ELF roles and source hashes stay separate.
+
+Two API35 adb pulls initially exit1; the exact same read operation succeeds on one bounded retry and hashes match, with no transport cause guessed. Checkpoints avoid repeating completed tests. Early log-label reuse superseded only the pre-fix successful Escargot compile/raw API24-success log; their commands/exits/summaries and ELF/SHA survive, but those two raw logs are not falsely reconstructed. The actual failing NG log, all pre-fix binaries/source snapshots and all other original logs remain; new logs/pulls now use isolated directories. See log-preservation-note.json and pull-preservation-note.json. Final recovery/process/hash records provide the authoritative no-in-flight status.

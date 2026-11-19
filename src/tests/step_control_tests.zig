@@ -66,7 +66,10 @@ const Owner = struct {
 var active_owner: ?*Owner = null;
 
 fn waitFlag(flag: *std.atomic.Value(bool)) !void {
-    const deadline = io.monotonicMilliseconds() + 10_000;
+    return waitFlagUntil(flag, io.monotonicMilliseconds() + 10_000);
+}
+
+fn waitFlagUntil(flag: *std.atomic.Value(bool), deadline: i64) !void {
     while (!flag.load(.acquire)) {
         if (io.monotonicMilliseconds() >= deadline) return error.OwnerTimeout;
         std.Thread.yield() catch {};
@@ -93,15 +96,17 @@ const Session = struct {
     next_id: i64 = 1,
 
     fn open(owner: *Owner) !Session {
+        // Creation and HTTP upgrade share the original readiness budget.
+        const deadline = io.monotonicMilliseconds() + 10_000;
         active_owner = owner;
         errdefer active_owner = null;
         const thread = try std.Thread.spawn(.{ .stack_size = 128 * 1024 * 1024 }, Owner.run, .{owner});
         errdefer stopOwner(owner, thread);
-        try waitFlag(&owner.ready);
+        try waitFlagUntil(&owner.ready, deadline);
         try testing.expect(owner.created);
         const stream = try wire.connect(owner.port.load(.acquire));
         errdefer stream.close();
-        try wire.doWsHandshake(alloc, stream, "step-control-owner");
+        try wire.doWsHandshakeUntil(alloc, stream, "step-control-owner", deadline);
         return .{ .owner = owner, .thread = thread, .stream = stream, .reader = wire.FrameReader.init(stream) };
     }
 
