@@ -460,6 +460,10 @@ pub fn build(b: *std.Build) void {
         std.process.fatal("-Dandroid-test-probe-stack requires Android Escargot device tests", .{});
     }
     const unit_tests = b.addTest(.{
+        // The self-hosted x86 backend emits native ELF TLS in Debug even for
+        // Android API 24. Bionic before API 29 requires emulated TLS; LLVM
+        // honors the target API and avoids writes into the read-only TCB page.
+        .use_llvm = if (android_test_libc != null) true else null,
         .root_module = test_module,
         .filters = if (stress_tests) &.{"stress"} else if (test_filter) |filter| &.{filter} else &.{},
         .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
