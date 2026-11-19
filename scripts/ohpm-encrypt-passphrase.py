@@ -50,7 +50,8 @@ try:
                 break
             data += chunk
             if not sent and (b'password' in data.lower() or b'passphrase' in data.lower() or '\u5bc6\u7801'.encode() in data):
-                os.write(master, passphrase + b'\n')
+                os.write(master, passphrase)
+                os.write(master, b'\r')
                 sent = True
         if process.poll() is not None and not ready:
             break
