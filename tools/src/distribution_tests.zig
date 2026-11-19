@@ -282,8 +282,8 @@ test "test_android_release_includes_maven_metadata_and_transitive_kotlin" {
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
     const gradle = try read(a, io, cwd, &.{ "sdk", "android", "jsbay", "build.gradle.kts" });
-    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib" }) |needle| try contains(gradle, needle);
-    for ([_][]const u8{ ":jsbay:publishReleasePublicationToStagingRepository", "-PjsbayVersion=", "-PjsbayMavenRepo=", "archive=\"jsbay-${ver}-android-${backend}-maven.zip\"", "tests/android-sdk/maven-consumer.sh", "env -u ANDROID_HOME ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"", "-PjsbayVersion=\"${{ steps.ver.outputs.label }}\"", "tool -- check-maven" }) |needle| try contains(release, needle);
+    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbayquickjs\"", "\"quickjs_ng\" -> \"jsbayquickjsng\"", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
+    for ([_][]const u8{ ":jsbay:publishReleasePublicationToStagingRepository", "-PjsbayVersion=", "-PjsbayBackend=\"$backend\"", "-PjsbayMavenRepo=", "archive=\"jsbay-${ver}-android-${backend}-maven.zip\"", "tests/android-sdk/maven-consumer.sh", "env -u ANDROID_HOME ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"", "-PjsbayVersion=\"${{ steps.ver.outputs.label }}\"", "tool -- check-maven \"$module\" \"$ver\" \"$backend\"" }) |needle| try contains(release, needle);
 }
 
 test "test_library_build_accepts_empty_and_explicit_targets_with_runner_bash" {
@@ -436,8 +436,96 @@ test "test_release_exports_a_history_free_source_snapshot" {
     const io = testing.io;
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
-    for ([_][]const u8{ "Checkout reviewed source snapshot", "zig build tool -- export-public-source", "zig build tool -- release-version", "cp \"${{ steps.source.outputs.archive }}\" release-assets/", "contains no Git metadata or repository history", "for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar" }) |needle| try contains(release, needle);
+    for ([_][]const u8{ "Checkout reviewed source snapshot", "zig build tool -- export-public-source", "zig build tool -- release-version", "archive=\"$RUNNER_TEMP/jsbay-${version}-zig.tar.gz\"", "tests/ci/pack-zig-source.sh \"${{ steps.source.outputs.archive }}\" \"$archive\"", "tests/ci/release-zig-consumer.sh \"$archive\"", "cp \"${{ steps.zig_package.outputs.archive }}\" release-assets/", "cp \"${{ steps.source.outputs.archive }}\" release-assets/", "for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar" }) |needle| try contains(release, needle);
     try testing.expect((std.mem.indexOf(u8, release, "cp \"${{ steps.source.outputs.archive }}\" release-assets/") orelse return error.MissingSourceCopy) < (std.mem.indexOf(u8, release, ": > SHA256SUMS") orelse return error.MissingChecksums));
+}
+
+test "test_release_workflow_stages_package_commit_before_publishing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const workflow = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const tag_script = try read(a, io, cwd, &.{ "scripts", "create-swift-package-tag.sh" });
+    const tag_test = try read(a, io, cwd, &.{ "tests", "ci", "swift-package-tag-test.sh" });
+    try contains(workflow, "workflow_dispatch:");
+    try contains(workflow, "publish:");
+    try contains(workflow, "required: true");
+    try contains(workflow, "contents: write");
+    try contains(workflow, "prepare-swift-package-release.sh");
+    try contains(workflow, "single-package-consumer.sh");
+    try contains(workflow, "prepare-swift-package-release-assets:");
+    try contains(workflow, "runs-on: macos-26");
+    try contains(workflow, "jsbay-final-release-assets");
+    try contains(workflow, "shasum -a 256 \"$archive\" >> SHA256SUMS");
+    try contains(workflow, "scripts/create-swift-package-tag.sh");
+    try contains(workflow, "refs/tags/$tag");
+    try contains(tag_script, "git -C \"$worktree\" push origin \"$push_ref\"");
+    try contains(tag_script, "git -C \"$worktree\" add -- Package.swift Sources");
+    try contains(tag_script, "verify_package_commit \"$commit\"");
+    try contains(tag_script, "verify_remote_tag");
+    try contains(tag_script, "git -C \"$repo\" diff --name-only \"$source_sha\" \"$commit\"");
+    try contains(workflow, "RUN_ATTEMPT: ${{ github.run_attempt }}");
+    try contains(workflow, "\"$RUN_ATTEMPT\" = 1");
+    try contains(tag_test, "git init --bare");
+    try contains(tag_test, "different source commit");
+    try contains(tag_test, "different generated metadata");
+    try contains(tag_test, "different generated source content");
+    try contains(workflow, "${{ github.sha }}");
+    try notContains(workflow, "APPLE_PACKAGE_TOKEN");
+    try notContains(workflow, "push:\n    tags:");
+    try notContains(workflow, "version=\"${{ inputs.version }}\"");
+    const tag_guard = std.mem.indexOf(u8, workflow, "refs/tags/$tag") orelse return error.MissingTagGuard;
+    const helper_call = std.mem.indexOf(u8, workflow, "bash scripts/create-swift-package-tag.sh") orelse return error.MissingTagHelper;
+    const tag_push = std.mem.indexOf(u8, tag_script, "git -C \"$worktree\" push origin \"$push_ref\"") orelse return error.MissingTagPush;
+    const helper_guard = std.mem.indexOf(u8, tag_script, "existing=$(git -C \"$repo\" ls-remote --refs origin \"$tag_ref\")") orelse return error.MissingRemoteGuard;
+    try testing.expect(tag_guard < helper_call);
+    try testing.expect(helper_guard < tag_push);
+}
+
+test "test_release_downloads_assets after checkout and builds portable Linux npm libraries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const npm = try read(a, io, cwd, &.{ ".github", "workflows", "npm-packages.yml" });
+    const draft_start = std.mem.indexOf(u8, release, "  create-draft-release:\n") orelse return error.MissingDraftReleaseJob;
+    const draft_end = std.mem.indexOf(u8, release[draft_start + 1 ..], "\n  build-node-packages:") orelse return error.MissingBuildNodeJob;
+    const draft = release[draft_start .. draft_start + 1 + draft_end];
+    const checkout = std.mem.indexOf(u8, draft, "uses: actions/checkout@v7") orelse return error.MissingDraftCheckout;
+    const download = std.mem.indexOf(u8, draft, "name: jsbay-final-release-assets") orelse return error.MissingReleaseAssetDownload;
+    try testing.expect(checkout < download);
+    try contains(npm, "if [[ \"$PLATFORM\" == linux ]]; then\n            zig_args+=(\"-Dcpu=baseline\")\n          fi");
+}
+
+test "publication jobs require the release environment" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const jobs = [_][2][]const u8{
+        .{ "validate-release-request", "publish-android-packages" },
+        .{ "publish-android-packages", "prepare-swift-package-release" },
+        .{ "prepare-swift-package-release", "create-draft-release" },
+        .{ "create-draft-release", "build-node-packages" },
+        .{ "publish-node-packages", "publish-release" },
+        .{ "publish-release", "verify-published-swift" },
+    };
+    for (jobs) |job| {
+        const marker = try std.fmt.allocPrint(a, "  {s}:\n", .{job[0]});
+        const next = try std.fmt.allocPrint(a, "\n  {s}:\n", .{job[1]});
+        const start = std.mem.indexOf(u8, release, marker) orelse return error.MissingReleaseJob;
+        const rest = release[start + marker.len ..];
+        const end = std.mem.indexOf(u8, rest, next) orelse return error.MissingReleaseJob;
+        try contains(rest[0..end], "    environment: release\n");
+        try contains(rest[0..end], "!inputs.verify_only");
+    }
+    try notContains(release, "NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
 }
 
 test "test_release_asset_inventory_rejects_missing_and_extra_archives" {
@@ -449,11 +537,17 @@ test "test_release_asset_inventory_rejects_missing_and_extra_archives" {
     const directory = try temp(a, io, "jsbay-assets-missing");
     defer Dir.cwd().deleteTree(io, directory) catch {};
     const tool = try sdk.toolPath(a, io);
-    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz" };
+    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz", "zig.tar.gz" };
     for (names) |name| try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-{s}", .{ directory, name }), "");
     var complete = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
     defer complete.deinit();
     try testing.expect(complete.succeeded());
+    try Dir.cwd().deleteFile(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-zig.tar.gz", .{directory}));
+    var missing_zig = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
+    defer missing_zig.deinit();
+    try testing.expect(!missing_zig.succeeded());
+    try contains(try std.mem.concat(a, u8, &.{ missing_zig.result.stdout, missing_zig.result.stderr }), "zig.tar.gz");
+    try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-zig.tar.gz", .{directory}), "");
     try Dir.cwd().deleteFile(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-source.tar.gz", .{directory}));
     var missing = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
     defer missing.deinit();
@@ -475,7 +569,7 @@ test "test_release_asset_inventory_accepts_full_tag_set" {
     const directory = try temp(a, io, "jsbay-assets-full");
     defer Dir.cwd().deleteTree(io, directory) catch {};
     const tool = try sdk.toolPath(a, io);
-    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "apple-quickjs_ng-JsBay.xcframework.zip", "apple-quickjs-JsBay.xcframework.zip", "apple-jsc-JsBay.xcframework.zip", "android-quickjs_ng.aar", "android-quickjs_ng-maven.zip", "android-jniLibs-quickjs_ng.tar.gz", "android-quickjs.aar", "android-quickjs-maven.zip", "android-jniLibs-quickjs.tar.gz", "source.tar.gz" };
+    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "apple-quickjs_ng-JsBay.xcframework.zip", "apple-quickjs-JsBay.xcframework.zip", "apple-jsc-JsBay.xcframework.zip", "android-quickjs_ng.aar", "android-quickjs_ng-maven.zip", "android-jniLibs-quickjs_ng.tar.gz", "android-quickjs.aar", "android-quickjs-maven.zip", "android-jniLibs-quickjs.tar.gz", "source.tar.gz", "zig.tar.gz" };
     for (names) |name| try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-{s}", .{ directory, name }), "");
     var out = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "true", "true" }, cwd);
     defer out.deinit();
@@ -493,15 +587,58 @@ test "test_release_l1_matrix_pins_all_targets" {
     for ([_][]const u8{ "Build library quickjs (macos-aarch64)", "Build library quickjs (macos-x86_64)", "./build-apple.sh quickjs", "backend: [quickjs_ng, quickjs]" }) |needle| try contains(release, needle);
 }
 
-test "test_dispatch_cannot_create_a_release_or_receive_write_permission" {
+test "test_dispatch_publishes_only_after_explicit_opt_in" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const io = testing.io;
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
-    const publish = release[std.mem.indexOf(u8, release, "  publish:\n") orelse return error.MissingPublish ..];
-    for ([_][]const u8{ "permissions:\n  contents: read", "github.event_name == 'push'", "startsWith(github.ref, 'refs/tags/v')", "permissions:\n      contents: write", "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}" }) |needle| try contains(if (std.mem.eql(u8, needle, "permissions:\n  contents: read")) release else publish, needle);
+    const tag_job = release[std.mem.indexOf(u8, release, "  prepare-swift-package-release:\n") orelse return error.MissingTagJob ..];
+    const android_job = release[std.mem.indexOf(u8, release, "  publish-android-packages:\n") orelse return error.MissingAndroidPublishJob ..];
+    try contains(release, "permissions:\n  contents: read");
+    try contains(release, "publish:\n        description:");
+    try contains(release, "if: ${{ inputs.publish && !inputs.verify_only && !inputs.recovery_run_id }}");
+    try contains(tag_job, "permissions:\n      contents: write");
+    try contains(tag_job, "bash scripts/create-swift-package-tag.sh");
+    try contains(android_job, "needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release, create-draft-release]");
+    try notContains(release, "github.event_name == 'push'");
+    try notContains(release, "startsWith(github.ref, 'refs/tags/v')");
+    try contains(release, "bash scripts/verify-staged-release.sh publish");
+    const validation = release[std.mem.indexOf(u8, release, "  validate-release-request:\n") orelse return error.MissingValidationJob ..];
+    const validation_end = std.mem.indexOf(u8, validation, "\n  publish-android-packages:") orelse return error.MissingAndroidPublishJob;
+    try contains(validation[0..validation_end], "          submodules: recursive\n");
+}
+
+test "public consumer jobs run after recovery and verify-only without publishing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const jobs = [_][2][]const u8{
+        .{ "verify-published-npm", "verify-published-zig" },
+        .{ "verify-published-zig", "verify-release-recovery" },
+        .{ "verify-published-swift", "verify-published-android" },
+        .{ "verify-published-android", "" },
+    };
+    for (jobs) |job| {
+        const marker = try std.fmt.allocPrint(a, "  {s}:\n", .{job[0]});
+        const start = std.mem.indexOf(u8, release, marker) orelse return error.MissingReleaseJob;
+        const rest = release[start + marker.len ..];
+        const end = if (job[1].len == 0) rest.len else blk: {
+            const next = try std.fmt.allocPrint(a, "\n  {s}:\n", .{job[1]});
+            break :blk std.mem.indexOf(u8, rest, next) orelse return error.MissingReleaseJob;
+        };
+        const body = rest[0..end];
+        try contains(body, "always() && !cancelled()");
+        try contains(body, "inputs.verify_only && needs.verify-public-release.result == 'success'");
+        try contains(body, "!inputs.verify_only && needs.publish-release.result == 'success'");
+        try notContains(body, "environment: release");
+        try notContains(body, "contents: write");
+        try notContains(body, "packages: write");
+    }
 }
 
 test "test_harmony_device_acceptance_uses_sdk12_target" {

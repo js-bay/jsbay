@@ -46,14 +46,31 @@ JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/conversion_fault_con
 embed_addon="$output_dir/jsbay_node_embed.node"
 "${CXX:-c++}" -std=c++17 -DJSBAY_NODE_EMBEDDED=1 "${flags[@]}" -I"$root/include" -I"$root/sdk/node/include" -I"$node_include" -I"$(dirname "$node_include")" "$root/sdk/node/src/jsbay_node.cpp" "$root/tests/node-sdk/embed_consumer.cc" "$archive" -o "$embed_addon"
 JSBAY_NODE_EMBED_ADDON="$embed_addon" "$node_bin" "$root/tests/node-sdk/embed_consumer.cjs"
-mkdir -p "$package_root/node_modules/@js-bay"
-ln -s "$root/sdk/node" "$package_root/node_modules/@js-bay/node"
-JSBAY_NODE_ADDON="$addon" JSBAY_NODE_PACKAGE_ROOT="$package_root/package.mjs" "$node_bin" "$root/tests/node-sdk/package_consumer.mjs"
+production_addon=${JSBAY_NODE_RELEASE_ADDON:-}
+if [[ -z $production_addon ]]; then
+  cmake_bin=${CMAKE:-cmake}
+  "$cmake_bin" --version
+  cmake_output="$package_root/cmake"
+  "$cmake_bin" -S "$root/sdk/node" -B "$cmake_output" -DCMAKE_BUILD_TYPE=Release -DJSBAY_LIBRARY="$archive" -DNODE_INCLUDE="$node_include"
+  "$cmake_bin" --build "$cmake_output" --config Release
+  production_addon="$cmake_output/jsbay_node.node"
+fi
+test -s "$production_addon"
+JSBAY_NODE_ADDON="$production_addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
+JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
+for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
+  JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
+done
+JSBAY_NODE_ADDON="$production_addon" "$node_bin" "$root/tests/node-sdk/production_consumer.cjs"
+
 if [[ -n ${TSC:-} ]]; then
   "$node_bin" "$TSC" --target ES2020 --module commonjs --strict --noEmit "$root/tests/node-sdk/declaration_consumer.ts"
-  cp "$root/tests/node-sdk/package_type_consumer.cts" "$root/tests/node-sdk/package_esm_import.mts" "$package_root/"
-  "$node_bin" "$TSC" --target ES2020 --module node16 --moduleResolution node16 --strict --noEmit "$package_root/package_type_consumer.cts"
-  if "$node_bin" "$TSC" --target ES2020 --module node16 --moduleResolution node16 --strict --noEmit "$package_root/package_esm_import.mts" > "$package_root/esm-types.log" 2>&1; then
+  source_package="$package_root/npm-consumer/node_modules/@jsbay/node"
+  mkdir -p "$source_package"
+  cp "$root/sdk/node/"{package.json,index.cjs,index.d.ts} "$source_package/"
+  cp "$root/tests/node-sdk/package_type_consumer.cts" "$root/tests/node-sdk/package_esm_import.mts" "$package_root/npm-consumer/"
+  (cd "$package_root/npm-consumer" && "$node_bin" "$TSC" --target ES2020 --module node16 --moduleResolution node16 --strict --noEmit package_type_consumer.cts)
+  if (cd "$package_root/npm-consumer" && "$node_bin" "$TSC" --target ES2020 --module node16 --moduleResolution node16 --strict --noEmit package_esm_import.mts) > "$package_root/esm-types.log" 2>&1; then
     echo "expected ESM package import to be rejected" >&2
     exit 1
   fi
@@ -66,18 +83,3 @@ if [[ -n ${TSC:-} ]]; then
     exit 1
   fi
 fi
-
-cmake_bin=${CMAKE:-cmake}
-"$cmake_bin" --version
-cmake_output="$package_root/cmake"
-"$cmake_bin" -S "$root/sdk/node" -B "$cmake_output" -DCMAKE_BUILD_TYPE=Release -DJSBAY_LIBRARY="$archive" -DNODE_INCLUDE="$node_include"
-"$cmake_bin" --build "$cmake_output" --config Release
-cmake_addon="$cmake_output/jsbay_node.node"
-test -s "$cmake_addon"
-JSBAY_NODE_ADDON="$cmake_addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
-JSBAY_NODE_ADDON="$cmake_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
-for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
-  JSBAY_NODE_ADDON="$cmake_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
-done
-JSBAY_NODE_ADDON="$cmake_addon" JSBAY_NODE_PACKAGE_ROOT="$package_root/package.mjs" "$node_bin" "$root/tests/node-sdk/package_consumer.mjs"
-JSBAY_NODE_ADDON="$cmake_addon" "$node_bin" "$root/tests/node-sdk/production_consumer.cjs"

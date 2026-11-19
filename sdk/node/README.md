@@ -16,12 +16,20 @@ cmake -S sdk/node -B sdk/node/build -DCMAKE_BUILD_TYPE=Release -DJSBAY_LIBRARY="
 cmake --build sdk/node/build --config Release
 ```
 
-Load the source package with `require('./sdk/node')`, or its package name after installing it locally. The package exposes CommonJS; from an ES module, use `createRequire(import.meta.url)` and then require the package. Set `JSBAY_NODE_ADDON` to load an explicit addon path during development or packaging. No prebuilt binaries or npm release are included.
+Install one engine-specific package for the backend you want:
+
+- QuickJS: `npm install @jsbay/quickjs`
+- QuickJS-NG: `npm install @jsbay/quickjsng`
+- JavaScriptCore: `npm install @jsbay/jsc`
+
+The `quickjs` and `quickjsng` packages provide prebuilt addons for Linux and macOS on x64 and arm64. The `jsc` package is available for macOS on x64 and arm64. npm selects the matching platform addon as an optional dependency. macOS addons target macOS 11.0 or newer, and package metadata records that deployment target. The release workflow checks every static library object and addon load command against that minimum. Runtime execution on macOS 11 has not been tested. Linux addons declare the GLIBC family and the package metadata records the minimum GLIBC symbol version required by the binary. CI installs and runs each engine package using the packed platform dependency and publishes the verified tarballs. Platform packages are published before the engine packages. Prerelease versions use the `next` npm dist-tag.
+
+The repository source package exposes CommonJS through `require('./sdk/node')`; from an ES module, use `createRequire(import.meta.url)` and then require it. Set `JSBAY_NODE_ADDON` to load an explicit addon path during development.
 
 ## Use
 
 ```js
-const { Engine } = require('./sdk/node')
+const { Engine } = require('@jsbay/quickjsng')
 async function main() {
   const engine = Engine.create()
   engine.bindAsync('readValue', async () => ({ answer: 42 }))
@@ -63,7 +71,7 @@ Closing rejects pending evaluations but does not abort the host's I/O or returne
 
 Run `bash tests/node-sdk/run_native_consumer.sh` to build and exercise the SDK. `JSBAY_LIBRARY` selects an existing compatible archive; otherwise the script builds QuickJS-NG. The helper requires CMake; set `CMAKE` to select its executable. Set `TSC` to a TypeScript compiler script to also check declarations and package import conditions. The independent consumer requires `--expose-gc`; the helper supplies it.
 
-The helper builds both a test addon with fault controls and a Release CMake addon. It runs the basic and independent consumers against both, runs the fault consumer only against the test addon, and verifies that the production addon exports no test hooks. See [SDK quality checks](../QUALITY.md) and the [testing guide](../../docs/testing.md#native-promise-and-nodejs-consumers) for coverage and CI entry points.
+The helper builds a test addon with fault controls and a Release CMake addon. It runs the basic and independent consumers against both, runs the fault consumer against the test addon, and verifies that the production addon exports no test hooks. `JSBAY_NODE_RELEASE_ADDON` selects a prebuilt production addon, which lets CI exercise the exact binary it packages. See [SDK quality checks](../QUALITY.md) and the [testing guide](../../docs/testing.md#native-promise-and-nodejs-consumers) for coverage and CI entry points.
 
 ## Embedding
 
