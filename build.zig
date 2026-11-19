@@ -745,6 +745,24 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run js-bay benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const ms_bench_module = b.createModule(.{
+        .root_source_file = b.path("bench/mechanical_sympathy.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    ms_bench_module.addImport("hyper_box", hyper_box);
+    ms_bench_module.addImport("jsbay", mod);
+    const ms_bench_exe = b.addExecutable(.{
+        .name = "bench-roi",
+        .root_module = ms_bench_module,
+    });
+    b.installArtifact(ms_bench_exe);
+    const run_ms_bench = b.addRunArtifact(ms_bench_exe);
+    forwardRunArgs(b, run_ms_bench);
+    const ms_bench_step = b.step("bench-roi", "Run mechanical sympathy architecture benchmarks");
+    ms_bench_step.dependOn(&run_ms_bench.step);
+
     // --- Inspector demo ---
     // Standalone runnable that starts an engine + CDP inspector and drives the event loop. Used for manual Chrome DevTools testing and as the target of `tests/inspector/e2e.cjs`.
     const demo_module = b.createModule(.{

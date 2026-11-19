@@ -208,4 +208,7 @@ comptime {
         _ = @import("proxy_array_identity_tests.zig");
         _ = @import("reference_stress_tests.zig");
     }
+    _ = @import("../abi/cmph.zig");
+    _ = @import("../abi/bridge_atoms.zig");
+    _ = @import("../runtime/bit_matrix.zig");
 }

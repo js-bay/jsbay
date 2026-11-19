@@ -14,6 +14,9 @@
 
 const std = @import("std");
 const hyper_box = @import("hyper_box");
+const jsbay = @import("jsbay");
+const cmph = jsbay.cmph;
+const bit_matrix = jsbay.bit_matrix;
 const HyperValue = hyper_box.Value;
 const GenerationalSlotMap = hyper_box.GenerationalSlotMap;
 
@@ -161,7 +164,7 @@ const STATIC_KEYS = [_][]const u8{
     "postMessage", "ready",            "error",               "close",
     "open",        "data",             "status",              "init",
 };
-const StaticKeyMatcher = hyper_box.ComptimeMinimalPerfectHash(&STATIC_KEYS);
+const StaticKeyMatcher = cmph.ComptimeMinimalPerfectHash(&STATIC_KEYS);
 
 fn cmphMatch(str: []const u8) ?usize {
     return StaticKeyMatcher.match(str);
@@ -265,7 +268,7 @@ fn branchCascadeDispatch(active: u64, filter: u64, evt: u6) ?u6 {
 }
 
 fn branchlessBitMatrixDispatch(active: u64, filter: u64, evt: u6) ?u6 {
-    return hyper_box.BitMatrix.nextMatching(active, filter, evt);
+    return bit_matrix.BitMatrix.nextMatching(active, filter, evt);
 }
 
 // ---------------------------------------------------------------------------

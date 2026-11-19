@@ -44,3 +44,15 @@ pub const BitMatrixIterator = struct {
         return idx;
     }
 };
+
+test "bit_matrix routes events with hardware count trailing zeros" {
+    const active: u64 = 0b1010_1100;
+    const filter: u64 = 0b0010_1000;
+    var it = BitMatrixIterator.init(active, filter);
+    try std.testing.expectEqual(@as(?u6, 3), it.next());
+    try std.testing.expectEqual(@as(?u6, 5), it.next());
+    try std.testing.expectEqual(@as(?u6, null), it.next());
+    try std.testing.expectEqual(@as(?u6, 3), BitMatrix.firstMatching(active, filter));
+    try std.testing.expectEqual(@as(?u6, 5), BitMatrix.nextMatching(active, filter, 4));
+    try std.testing.expectEqual(@as(u7, 2), BitMatrix.countMatching(active, filter));
+}

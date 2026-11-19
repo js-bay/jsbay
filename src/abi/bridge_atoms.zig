@@ -1,7 +1,7 @@
 //! Host bridge protocol atoms with compile-time minimal perfect hash dispatch.
 
 const std = @import("std");
-const hyper_box = @import("hyper_box");
+const cmph = @import("cmph.zig");
 
 /// Standard host bridge atoms recognized in high-frequency event routing.
 pub const BridgeAtom = enum(u4) {
@@ -42,7 +42,7 @@ pub const BRIDGE_ATOM_NAMES = [_][]const u8{
     "init",
 };
 
-pub const BridgeAtomMatcher = hyper_box.ComptimeMinimalPerfectHash(&BRIDGE_ATOM_NAMES);
+pub const BridgeAtomMatcher = cmph.ComptimeMinimalPerfectHash(&BRIDGE_ATOM_NAMES);
 
 /// Resolve a bridge event or method name into an enum atom in 2 nanoseconds with zero allocations.
 pub inline fn matchBridgeAtom(str: []const u8) ?BridgeAtom {
