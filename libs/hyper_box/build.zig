@@ -24,10 +24,26 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{.{ .name = "hyper_box", .module = hyper_box }},
+            .link_libc = true,
         }),
     });
+    b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
     b.step("bench", "Run hyper_box benchmarks").dependOn(&run_bench.step);
+
+    const roi_bench_exe = b.addExecutable(.{
+        .name = "roi_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_roi.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{.{ .name = "hyper_box", .module = hyper_box }},
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(roi_bench_exe);
+    const run_roi_bench = b.addRunArtifact(roi_bench_exe);
+    b.step("roi-bench", "Run Mechanical Sympathy ROI Matrix benchmarks").dependOn(&run_roi_bench.step);
 
     const fmt_step = b.step("fmt", "Run zig fmt on hyper_box package source files");
     const fmt = b.addFmt(.{

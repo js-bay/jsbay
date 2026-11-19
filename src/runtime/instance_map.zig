@@ -128,6 +128,10 @@ const TaskQueue = struct {
     }
 
     pub fn push(self: *TaskQueue, allocator: std.mem.Allocator, script: [:0]const u8) !void {
+        if (self.head > 0 and self.head == self.items.items.len) {
+            self.items.clearRetainingCapacity();
+            self.head = 0;
+        }
         try self.items.append(allocator, script);
     }
 
@@ -138,7 +142,7 @@ const TaskQueue = struct {
         if (self.head == self.items.items.len) {
             self.items.clearRetainingCapacity();
             self.head = 0;
-        } else if (self.head >= 32) {
+        } else if (self.head >= 64 and self.head >= self.items.items.len / 2) {
             const remain = self.items.items[self.head..];
             var write: usize = 0;
             while (write < remain.len) : (write += 1) {

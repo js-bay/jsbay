@@ -328,6 +328,12 @@ jsbay_status_t jsbay_value_get(jsbay_value_t object, jsbay_utf8_t key, jsbay_val
 jsbay_status_t jsbay_value_set(jsbay_value_t object, jsbay_utf8_t key, jsbay_value_t value, jsbay_value_t *out_exception);
 /* args may be NULL only when argc is zero. */
 jsbay_status_t jsbay_value_call(jsbay_value_t function, jsbay_value_t this_value, const jsbay_value_t *args, size_t argc, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+/* Direct register-pass call trampolines for 0 to 4 arguments, avoiding argument slice allocation. */
+jsbay_status_t jsbay_value_call_0(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+jsbay_status_t jsbay_value_call_1(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t a0, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+jsbay_status_t jsbay_value_call_2(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t a0, jsbay_value_t a1, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+jsbay_status_t jsbay_value_call_3(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t a0, jsbay_value_t a1, jsbay_value_t a2, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+jsbay_status_t jsbay_value_call_4(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t a0, jsbay_value_t a1, jsbay_value_t a2, jsbay_value_t a3, jsbay_value_t *out_value, jsbay_value_t *out_exception);
 /* new function(...args). args may be NULL only when argc is zero. A non-constructor or a constructor that throws returns 1 with the JS exception in out_exception. */
 jsbay_status_t jsbay_value_construct(jsbay_value_t function, const jsbay_value_t *args, size_t argc, jsbay_value_t *out_value, jsbay_value_t *out_exception);
 /* key in object, including the prototype chain. A non-object throws a TypeError: returns 1 with the exception in out_exception and *out_has false. */
