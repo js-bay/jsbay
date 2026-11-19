@@ -154,7 +154,17 @@ jobs:
             printf '{"name":"consumer","version":"1.0.0"}\n' > "$consumer/oh-package.json5"
             (cd "$consumer" && ohpm install "$har")
             test -f "$consumer/oh_modules/@jsbay/$backend/oh-package.json5"
+            app="$RUNNER_TEMP/ohpm-consumer-$backend"
+            node tests/harmony-sdk/prepare-ohpm-consumer.mjs "$app" "$har" "$backend" "file:$har"
+            (cd "$app/entry" && ohpm install --no-link)
+            (cd "$app" && hvigorw --mode module -p module=entry@default assembleHap --no-daemon)
           done
+      - name: Preserve consumer applications
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-ohpm-consumers
+          path: ${{ runner.temp }}/ohpm-consumer-*/entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
       - name: Check non-interactive password encryption
         run: |
           set -euo pipefail
@@ -215,6 +225,8 @@ jobs:
           bash tests/harmony-sdk/toolchain-resolver.sh
           bash tests/ci/harmony-required-gate.sh
           bash tests/ci/harmony-local-gate.sh
+          node tests/harmony-sdk/prepare-ohpm-package-test.mjs
+          node tests/harmony-sdk/ohpm-encrypt-test.mjs
 
   harmony-manual-preflight:
     if: github.event_name == 'workflow_dispatch' && inputs.harmony
