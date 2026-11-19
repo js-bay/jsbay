@@ -92,6 +92,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
+      - uses: actions/checkout@v7
       - name: Install current OHPM tools
         uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721
         with:
@@ -118,7 +119,8 @@ jobs:
       - name: Check non-interactive password encryption
         run: |
           set -euo pipefail
-          output=$(printf 'example-passphrase\n' | timeout 30 ohpm config encrypt --crypto_path "$RUNNER_TEMP/ohpm-crypto")
+          python3 tests/harmony-sdk/ohpm-encrypt-test.py
+          output=$(printf 'example-passphrase\n' | python3 scripts/ohpm-encrypt-passphrase.py "$RUNNER_TEMP/ohpm-crypto")
           printf '%s\n' "$output" | grep -q 'security:'
 
   harmony-toolchain:
