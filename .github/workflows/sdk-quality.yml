@@ -52,6 +52,7 @@ jobs:
           version: 5.0.0
           mirror: false
       - name: Check toolchain and build HAR
+        timeout-minutes: 10
         env:
           QUICKJS_BACKEND: ${{ matrix.backend }}
           API12_SDK: ${{ steps.ohos.outputs.ohos-base-sdk-home }}
@@ -66,7 +67,9 @@ jobs:
           export JSBAY_LIBRARY="$RUNNER_TEMP/harmony-core/lib/libjsbay.a"
           export JSBAY_HARMONY_ARCHIVE="$JSBAY_LIBRARY"
           export AR="$API12_SDK/native/llvm/bin/llvm-ar"
-          find "$HOME/ohos-sdk/command-line-tools" -path '*/@ohos/hvigor/package.json' -print
+          printf '#!/usr/bin/env bash\nexec "%s" "$@" --no-daemon\n' "$(command -v hvigorw)" > "$RUNNER_TEMP/hvigorw-ci"
+          chmod +x "$RUNNER_TEMP/hvigorw-ci"
+          export HVIGORW="$RUNNER_TEMP/hvigorw-ci"
           unset NODE_PATH
           bash scripts/stage-harmony-har.sh "$RUNNER_TEMP/harmony-har-${QUICKJS_BACKEND}" "ci-${QUICKJS_BACKEND}-${GITHUB_SHA:0:12}"
       - name: Preserve HAR
