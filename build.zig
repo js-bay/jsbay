@@ -254,6 +254,10 @@ pub fn build(b: *std.Build) void {
     const commonjs = commonjs_dep.module("commonjs");
     const hyper_box_dep = b.dependency("hyper_box", .{ .target = target, .optimize = optimize });
     const hyper_box = hyper_box_dep.module("hyper_box");
+    const cmph_dep = b.dependency("cmph", .{ .target = target, .optimize = optimize });
+    const cmph = cmph_dep.module("cmph");
+    const simd_utf_dep = b.dependency("simd_utf", .{ .target = target, .optimize = optimize });
+    const simd_utf = simd_utf_dep.module("simd_utf");
     const state_tcas_dep = b.dependency("state_tcas", .{ .target = target, .optimize = optimize });
     const state_tcas = state_tcas_dep.module("state_tcas");
 
@@ -346,7 +350,7 @@ pub fn build(b: *std.Build) void {
         .strip = if (apple_package) true else null,
         .error_tracing = if (apple_package) false else null,
     });
-    wireImports(lib_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, qjs_mod);
+    wireImports(lib_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
     if (target.result.abi.isAndroid()) {
         if (android_sysroot) |sysroot| {
             const api = target.result.os.version_range.linux.android;
@@ -412,7 +416,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    wireImports(mod, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, qjs_mod);
+    wireImports(mod, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
     if (qjs_root) |root| mod.addIncludePath(root);
 
     // Demos and benchmarks use this repository-private implementation module. It stays out of the public `jsbay` module so product consumers use the typed C ABI or the documented Zig expert modules instead.
@@ -422,7 +426,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireImports(internal_tools_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, qjs_mod);
+    wireImports(internal_tools_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
     if (qjs_root) |root| internal_tools_module.addIncludePath(root);
 
     // --- Unit tests ---
@@ -432,7 +436,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireImports(test_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, qjs_mod);
+    wireImports(test_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
     test_module.addImport("state_tcas", state_tcas);
 
     if (apple_sysroot) |sysroot| {
@@ -558,6 +562,26 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&run_hyper_box_package.step);
         package_test_step.dependOn(&run_hyper_box_package.step);
 
+        const cmph_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = cmph_dep.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "cmph", .module = cmph }},
+        }), .filters = if (test_filter) |filter| &.{filter} else &.{} });
+        const run_cmph_package = b.addRunArtifact(cmph_tests);
+        test_step.dependOn(&run_cmph_package.step);
+        package_test_step.dependOn(&run_cmph_package.step);
+
+        const simd_utf_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = simd_utf_dep.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "simd_utf", .module = simd_utf }},
+        }), .filters = if (test_filter) |filter| &.{filter} else &.{} });
+        const run_simd_utf_package = b.addRunArtifact(simd_utf_tests);
+        test_step.dependOn(&run_simd_utf_package.step);
+        package_test_step.dependOn(&run_simd_utf_package.step);
+
         // state_tcas: calendar / toy ducks / real Scheduler+Driver (Timer/Notifier) / Safety-Liveness. Independent of ActiveEngine vendors so it can green without QuickJS checkout. Driver.testing pulls zev.Loop; import zev like js_event_loop package tests.
         const state_tcas_harness = b.addTest(.{
             .root_module = b.createModule(.{
@@ -644,7 +668,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .pic = true,
         });
-        wireImports(contract_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, qjs_mod);
+        wireImports(contract_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
         addPlatformCompatSources(b, contract_module);
         addBackendSources(b, contract_module, packed_backends, false, os, instrumented_root, true, heap_snapshot, false, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
         contract_module.linkSystemLibrary("m", .{});
@@ -672,7 +696,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireImports(conformance_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, qjs_mod);
+    wireImports(conformance_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
     addPlatformCompatSources(b, conformance_module);
     addBackendSources(b, conformance_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
     const conformance_library = b.addLibrary(.{
@@ -728,7 +752,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     bench_module.addImport("jsbay_tools", internal_tools_module);
-    wireImports(bench_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, qjs_mod);
+    wireImports(bench_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
 
     addPlatformCompatSources(b, bench_module);
     addBackendSources(b, bench_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
@@ -745,6 +769,37 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run js-bay benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const ms_hyper_box_dep = b.dependency("hyper_box", .{ .target = target, .optimize = .ReleaseFast });
+    const ms_hyper_box = ms_hyper_box_dep.module("hyper_box");
+    const ms_cmph_dep = b.dependency("cmph", .{ .target = target, .optimize = .ReleaseFast });
+    const ms_cmph = ms_cmph_dep.module("cmph");
+    const ms_simd_utf_dep = b.dependency("simd_utf", .{ .target = target, .optimize = .ReleaseFast });
+    const ms_simd_utf = ms_simd_utf_dep.module("simd_utf");
+    const bit_matrix_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/bit_matrix.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const ms_bench_module = b.createModule(.{
+        .root_source_file = b.path("bench/mechanical_sympathy.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    ms_bench_module.addImport("hyper_box", ms_hyper_box);
+    ms_bench_module.addImport("cmph", ms_cmph);
+    ms_bench_module.addImport("simd_utf", ms_simd_utf);
+    ms_bench_module.addImport("bit_matrix", bit_matrix_mod);
+    const ms_bench_exe = b.addExecutable(.{
+        .name = "bench-roi",
+        .root_module = ms_bench_module,
+    });
+    b.installArtifact(ms_bench_exe);
+    const run_ms_bench = b.addRunArtifact(ms_bench_exe);
+    forwardRunArgs(b, run_ms_bench);
+    const ms_bench_step = b.step("bench-roi", "Run mechanical sympathy architecture benchmarks");
+    ms_bench_step.dependOn(&run_ms_bench.step);
+
     // --- Inspector demo ---
     // Standalone runnable that starts an engine + CDP inspector and drives the event loop. Used for manual Chrome DevTools testing and as the target of `tests/inspector/e2e.cjs`.
     const demo_module = b.createModule(.{
@@ -754,7 +809,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     demo_module.addImport("jsbay_tools", internal_tools_module);
-    wireImports(demo_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, qjs_mod);
+    wireImports(demo_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
 
     addPlatformCompatSources(b, demo_module);
     addBackendSources(b, demo_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
@@ -850,7 +905,7 @@ pub fn build(b: *std.Build) void {
             safari_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sysroot}) });
         }
         safari_module.addImport("jsbay_tools", internal_tools_module);
-        wireImports(safari_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, null);
+        wireImports(safari_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, null);
         safari_module.linkFramework("JavaScriptCore", .{});
         safari_module.linkFramework("Foundation", .{});
         safari_module.linkFramework("CoreFoundation", .{});
@@ -1268,7 +1323,7 @@ fn ohosLibTriple(arch: std.Target.Cpu.Arch) []const u8 {
 }
 
 /// Only identical module imports belong here. Sources, target/link setup, test dependencies and private tooling imports remain explicit at their call sites.
-fn wireImports(module: *std.Build.Module, options: *std.Build.Step.Options, zev: *std.Build.Module, event_loop: *std.Build.Module, inspector: *std.Build.Module, transport: *std.Build.Module, bytecode_cache: *std.Build.Module, commonjs: *std.Build.Module, hyper_box: *std.Build.Module, qjs: ?*std.Build.Module) void {
+fn wireImports(module: *std.Build.Module, options: *std.Build.Step.Options, zev: *std.Build.Module, event_loop: *std.Build.Module, inspector: *std.Build.Module, transport: *std.Build.Module, bytecode_cache: *std.Build.Module, commonjs: *std.Build.Module, hyper_box: *std.Build.Module, cmph: *std.Build.Module, simd_utf: *std.Build.Module, qjs: ?*std.Build.Module) void {
     module.addOptions("build_options", options);
     module.addImport("zev", zev);
     module.addImport("js_event_loop", event_loop);
@@ -1277,5 +1332,7 @@ fn wireImports(module: *std.Build.Module, options: *std.Build.Step.Options, zev:
     module.addImport("bytecode_cache", bytecode_cache);
     module.addImport("commonjs", commonjs);
     module.addImport("hyper_box", hyper_box);
+    module.addImport("cmph", cmph);
+    module.addImport("simd_utf", simd_utf);
     if (qjs) |mod| module.addImport("qjs", mod);
 }

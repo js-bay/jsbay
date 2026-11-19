@@ -89,6 +89,11 @@ pub fn checkpointAfterExecution(execution: *Execution, ctx: ActiveEngine.Context
     execution.endScheduler();
     checkpoint(execution.instance_id, ctx);
     execution.endBudget();
+    if (execution.scheduler.scheduler.execution_depth == 0) {
+        if (instance_map.getInstance(execution.instance_id)) |inst| {
+            inst.turn_arena.reset();
+        }
+    }
 }
 
 /// Packed variant of checkpointAfterExecution.
@@ -96,6 +101,11 @@ pub fn checkpointInstanceAfterExecution(execution: *Execution) void {
     execution.endScheduler();
     checkpointInstance(execution.instance_id);
     execution.endBudget();
+    if (execution.scheduler.scheduler.execution_depth == 0) {
+        if (instance_map.getInstance(execution.instance_id)) |inst| {
+            inst.turn_arena.reset();
+        }
+    }
 }
 
 pub const Task = struct {

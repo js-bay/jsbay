@@ -8,6 +8,8 @@ const packed_api_value = @import("packed_api_value.zig");
 const api_backend = @import("api_backend.zig");
 const typed_bytecode = @import("../script/typed_bytecode.zig");
 const host_wake = @import("js_event_loop").host_wake;
+const hyper_box = @import("hyper_box");
+const HyperValue = hyper_box.Value;
 const ActiveEngine = backend.ActiveEngine;
 
 /// Boundary-owned status numbers and C byte layout are supplied once by c_api; this module never imports the export layer. This is not a backend or handle-store abstraction.
@@ -133,9 +135,24 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
         }
 
         pub fn pinValue(op: ApiOp, handle: u64) union(enum) { ok: ActiveEngine.Value, status: c_int } {
-            const entry = api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
-            if (entry.instance_id != op.id) return .{ .status = API_STALE_VALUE };
-            return .{ .ok = ActiveEngine.dupValue(op.ctx, entry.value) };
+            const val = HyperValue{ .raw = handle };
+            if (val.isHandle()) {
+                const entry = api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
+                if (entry.instance_id != op.id) return .{ .status = API_STALE_VALUE };
+                return .{ .ok = ActiveEngine.dupValue(op.ctx, entry.value) };
+            }
+            if (val.isUndefined()) return .{ .ok = ActiveEngine.undefinedValue() };
+            if (val.isNull()) return .{ .ok = ActiveEngine.nullValue() };
+            if (val.isBool()) return .{ .ok = ActiveEngine.newBoolVal(op.ctx, val.asBool()) };
+            if (val.isInt32()) return .{ .ok = ActiveEngine.newInt32Val(op.ctx, val.asInt32()) };
+            if (val.isSso()) {
+                const sso_buf = val.asSsoBytes();
+                return switch (api_backend.newString(op.ctx, sso_buf.slice())) {
+                    .ok => |str_val| .{ .ok = str_val },
+                    else => .{ .status = API_OUT_OF_MEMORY },
+                };
+            }
+            return .{ .status = API_STALE_VALUE };
         }
 
         pub fn apiStore(instance_id: i32, value: ActiveEngine.Value, out: *u64) c_int {
@@ -411,10 +428,34 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
             return API_OK;
         }
 
-        pub fn packedDupBytes(handle: u64, expect_instance: i32, expect_tag: backend.BackendType, out: []u8) ?usize {
-            const entry = packed_api_value.get(handle) orelse return null;
-            if (entry.instance_id != expect_instance or entry.tag != expect_tag) return null;
-            return @import("../backend_dispatch.zig").timerDupValue(entry.tag, entry.ctx_addr, entry.bytes(), out);
+        pub const PackedDupResult = union(enum) {
+            ok: usize,
+            stale: void,
+            out_of_memory: void,
+        };
+
+        pub fn packedDupBytes(handle: u64, expect_instance: i32, expect_tag: backend.BackendType, out: []u8) PackedDupResult {
+            const val = HyperValue{ .raw = handle };
+            if (val.isSso()) {
+                const sso_buf = val.asSsoBytes();
+                const handles = packedHandlesOf(expect_instance) orelse return .stale;
+                const res = @import("../backend_dispatch.zig").valueNewString(expect_tag, handles.ctx_addr, sso_buf.slice());
+                if (res.out_of_memory) return .out_of_memory;
+                if (res.exception) |e| @import("../backend_dispatch.zig").timerFreeValue(expect_tag, handles.ctx_addr, e.slice());
+                if (res.value) |v| {
+                    if (out.len < v.len) {
+                        @import("../backend_dispatch.zig").timerFreeValue(expect_tag, handles.ctx_addr, v.slice());
+                        return .out_of_memory;
+                    }
+                    @memcpy(out[0..v.len], v.bytes[0..v.len]);
+                    return .{ .ok = v.len };
+                }
+                return .stale;
+            }
+            const entry = packed_api_value.get(handle) orelse return .stale;
+            if (entry.instance_id != expect_instance or entry.tag != expect_tag) return .stale;
+            const len = @import("../backend_dispatch.zig").timerDupValue(entry.tag, entry.ctx_addr, entry.bytes(), out) orelse return .stale;
+            return .{ .ok = len };
         }
 
         pub fn packedInstanceReady(instance_id: i32) union(enum) {

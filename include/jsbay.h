@@ -320,6 +320,10 @@ jsbay_status_t jsbay_value_type(jsbay_value_t value, jsbay_value_kind_t *out_kin
 jsbay_status_t jsbay_value_to_bool(jsbay_value_t value, bool *out_value);
 jsbay_status_t jsbay_value_to_number(jsbay_value_t value, double *out_value);
 jsbay_status_t jsbay_value_to_utf8(jsbay_value_t value, jsbay_bytes_t *out_bytes, jsbay_value_t *out_exception);
+/* Direct zero-allocation extraction of inline SSO small strings (<= 6 bytes). Writes string bytes to out_buf if value is an SSO string; otherwise returns JSBAY_INVALID_ARGUMENT. */
+jsbay_status_t jsbay_value_to_sso_utf8(jsbay_value_t value, char out_buf[6], size_t *out_len);
+/* Construct an inline small string directly into a register without touching any engine instance or heap. Fails if len > 6 or invalid UTF-8. */
+jsbay_status_t jsbay_value_new_sso_string(const char *utf8, size_t len, jsbay_value_t *out_value);
 jsbay_status_t jsbay_value_to_json(jsbay_value_t value, jsbay_bytes_t *out_bytes, jsbay_value_t *out_exception);
 jsbay_status_t jsbay_value_copy_buffer(jsbay_value_t value, jsbay_bytes_t *out_bytes, jsbay_value_t *out_exception);
 /* Free library-owned bytes exactly once. A second free is undefined and typically aborts. */
@@ -328,6 +332,12 @@ jsbay_status_t jsbay_value_get(jsbay_value_t object, jsbay_utf8_t key, jsbay_val
 jsbay_status_t jsbay_value_set(jsbay_value_t object, jsbay_utf8_t key, jsbay_value_t value, jsbay_value_t *out_exception);
 /* args may be NULL only when argc is zero. */
 jsbay_status_t jsbay_value_call(jsbay_value_t function, jsbay_value_t this_value, const jsbay_value_t *args, size_t argc, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+/* Direct register-pass call trampolines for 0 to 4 arguments, avoiding argument slice allocation. */
+jsbay_status_t jsbay_value_call_0(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+jsbay_status_t jsbay_value_call_1(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t a0, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+jsbay_status_t jsbay_value_call_2(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t a0, jsbay_value_t a1, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+jsbay_status_t jsbay_value_call_3(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t a0, jsbay_value_t a1, jsbay_value_t a2, jsbay_value_t *out_value, jsbay_value_t *out_exception);
+jsbay_status_t jsbay_value_call_4(jsbay_value_t function, jsbay_value_t this_value, jsbay_value_t a0, jsbay_value_t a1, jsbay_value_t a2, jsbay_value_t a3, jsbay_value_t *out_value, jsbay_value_t *out_exception);
 /* new function(...args). args may be NULL only when argc is zero. A non-constructor or a constructor that throws returns 1 with the JS exception in out_exception. */
 jsbay_status_t jsbay_value_construct(jsbay_value_t function, const jsbay_value_t *args, size_t argc, jsbay_value_t *out_value, jsbay_value_t *out_exception);
 /* key in object, including the prototype chain. A non-object throws a TypeError: returns 1 with the exception in out_exception and *out_has false. */

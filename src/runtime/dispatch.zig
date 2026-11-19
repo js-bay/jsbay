@@ -63,7 +63,7 @@ pub const TaskReservation = struct {
     }
 };
 pub const NativeTaskQueue = struct {
-    mutex: sync.Mutex = .{},
+    mutex: sync.Mutex align(64) = .{},
     items: std.ArrayList(NativeTask) = .empty,
     head: usize = 0,
     closed: bool = false,
@@ -93,6 +93,10 @@ pub const NativeTaskQueue = struct {
     }
 
     pub fn push(self: *NativeTaskQueue, allocator: std.mem.Allocator, task: NativeTask) !void {
+        if (self.head > 0 and self.head == self.items.items.len) {
+            self.items.clearRetainingCapacity();
+            self.head = 0;
+        }
         try self.items.append(allocator, task);
     }
 
@@ -103,7 +107,7 @@ pub const NativeTaskQueue = struct {
         if (self.head == self.items.items.len) {
             self.items.clearRetainingCapacity();
             self.head = 0;
-        } else if (self.head >= 32) {
+        } else if (self.head >= 64 and self.head >= self.items.items.len / 2) {
             self.compact();
         }
         return task;

@@ -221,19 +221,18 @@ pub fn takeOwned(value: u64) ?Entry {
 pub fn takeOwnedOrSynthesize(instance_id: i32, value: u64) ?Entry {
     const val = HyperValue{ .raw = value };
     if (val.isEmpty()) return null;
+    if (val.isHandle()) return takeOwned(value);
     if (val.isUndefined()) return .{ .instance_id = instance_id, .value = ActiveEngine.undefinedValue() };
     if (val.isNull()) return .{ .instance_id = instance_id, .value = ActiveEngine.nullValue() };
-    if (val.isPrimitive()) {
-        const ptrs = instance_map.getPtrs(instance_id) orelse return null;
-        if (val.isBool()) return .{ .instance_id = instance_id, .value = ActiveEngine.newBoolVal(ptrs.ctx, val.asBool()) };
-        if (val.isInt32()) return .{ .instance_id = instance_id, .value = ActiveEngine.newInt32Val(ptrs.ctx, val.asInt32()) };
-        if (val.isDouble()) return .{ .instance_id = instance_id, .value = ActiveEngine.newFloat64Val(ptrs.ctx, val.asFloat()) };
-        if (val.isSso()) {
-            const sso_buf = val.asSsoBytes();
-            return .{ .instance_id = instance_id, .value = ActiveEngine.newStringVal(ptrs.ctx, sso_buf.slice()) };
-        }
+    const ptrs = instance_map.getPtrs(instance_id) orelse return null;
+    if (val.isBool()) return .{ .instance_id = instance_id, .value = ActiveEngine.newBoolVal(ptrs.ctx, val.asBool()) };
+    if (val.isInt32()) return .{ .instance_id = instance_id, .value = ActiveEngine.newInt32Val(ptrs.ctx, val.asInt32()) };
+    if (val.isDouble()) return .{ .instance_id = instance_id, .value = ActiveEngine.newFloat64Val(ptrs.ctx, val.asFloat()) };
+    if (val.isSso()) {
+        const sso_buf = val.asSsoBytes();
+        return .{ .instance_id = instance_id, .value = ActiveEngine.newStringVal(ptrs.ctx, sso_buf.slice()) };
     }
-    return takeOwned(value);
+    return null;
 }
 
 pub fn freeTaken(entry: Entry) void {

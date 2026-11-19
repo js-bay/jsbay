@@ -24,8 +24,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{.{ .name = "hyper_box", .module = hyper_box }},
+            .link_libc = true,
         }),
     });
+    b.installArtifact(bench_exe);
     const run_bench = b.addRunArtifact(bench_exe);
     b.step("bench", "Run hyper_box benchmarks").dependOn(&run_bench.step);
 
