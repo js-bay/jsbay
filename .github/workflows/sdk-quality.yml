@@ -11,6 +11,10 @@ on:
         description: Run the optional SDK 12 HAR build on a provisioned Harmony runner
         type: boolean
         default: false
+      harmony_hosted:
+        description: Try the Harmony HAR build on a GitHub-hosted runner
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,6 +24,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  harmony-hosted:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony_hosted
+    name: Experimental hosted Harmony HAR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs_ng, quickjs]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+      - name: Install Harmony command-line tools
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721
+        with:
+          version: 5.0.13.200
+      - name: Install OpenHarmony API 12 SDK
+        id: ohos
+        uses: openharmony-rs/setup-ohos-sdk@b312caf8a43bb836aa24c08f65f97e1f09a89cad
+        with:
+          version: 5.0.0
+          mirror: false
+      - name: Check toolchain and build HAR
+        env:
+          QUICKJS_BACKEND: ${{ matrix.backend }}
+          API12_SDK: ${{ steps.ohos.outputs.ohos-base-sdk-home }}
+          HARMONY_TARGET_SDK_VERSION: '5.0.0(12)'
+        run: |
+          set -euo pipefail
+          ohpm --version
+          hvigorw --version
+          test '${{ steps.ohos.outputs.api-version }}' = 12
+          test -d "$API12_SDK/native/sysroot"
+          zig build -Dbackend="$QUICKJS_BACKEND" -Dtarget=aarch64-linux-ohos -Dohos-sysroot="$API12_SDK/native/sysroot" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/harmony-core" --summary all
+          export JSBAY_LIBRARY="$RUNNER_TEMP/harmony-core/lib/libjsbay.a"
+          export JSBAY_HARMONY_ARCHIVE="$JSBAY_LIBRARY"
+          export AR="$API12_SDK/native/llvm/bin/llvm-ar"
+          export NODE_PATH="$HOME/ohos-sdk/command-line-tools/tools/hvigor/node_modules"
+          bash scripts/stage-harmony-har.sh "$RUNNER_TEMP/harmony-har-${QUICKJS_BACKEND}" "ci-${QUICKJS_BACKEND}-${GITHUB_SHA:0:12}"
+      - name: Preserve HAR
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-hosted-${{ matrix.backend }}
+          path: ${{ runner.temp }}/harmony-har-${{ matrix.backend }}
+          if-no-files-found: error
+
   harmony-toolchain:
     name: Harmony local gate checks
     runs-on: ubuntu-24.04
