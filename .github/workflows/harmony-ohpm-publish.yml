@@ -1,0 +1,315 @@
+name: Publish Harmony package to OHPM
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published GitHub Release version
+        required: true
+        type: string
+      backend:
+        description: Harmony JavaScript engine package
+        required: true
+        type: choice
+        options:
+          - quickjs
+          - quickjs_ng
+      release_run_id:
+        description: Original Release workflow run that produced the checked assets
+        required: true
+        type: string
+      release_artifact_id:
+        description: Exact final release assets artifact from the original Release run
+        required: true
+        type: string
+      confirmed_attempt_id:
+        description: OHPM attempt checked manually, in run_id:run_attempt format
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: harmony-ohpm-${{ inputs.version }}-${{ inputs.backend }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    name: Submit ${{ inputs.backend }} ${{ inputs.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate original Release run ID
+        env:
+          ORIGINAL_RUN_ID: ${{ inputs.release_run_id }}
+          ORIGINAL_ARTIFACT_ID: ${{ inputs.release_artifact_id }}
+        run: |
+          set -euo pipefail
+          [[ "$ORIGINAL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ORIGINAL_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+
+      - name: Download assets from the original Release run
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ inputs.release_artifact_id }}
+          path: ${{ runner.temp }}/original-release-assets
+          run-id: ${{ inputs.release_run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+
+      - name: Validate the published release and download its HAR
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          BACKEND: ${{ inputs.backend }}
+          ORIGINAL_RUN_ID: ${{ inputs.release_run_id }}
+          ORIGINAL_ARTIFACT_ID: ${{ inputs.release_artifact_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/validate-harmony-version.mjs "$VERSION"
+          [[ "$BACKEND" == quickjs || "$BACKEND" == quickjs_ng ]]
+          [[ "$ORIGINAL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          tag="v$VERSION"
+          release_json="$RUNNER_TEMP/harmony-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" > "$release_json"
+          jq -e --arg tag "$tag" '.tag_name == $tag and .draft == false' "$release_json" >/dev/null
+          release_id=$(jq -er '.id | tostring' "$release_json")
+          run_json="$RUNNER_TEMP/original-release-run.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$ORIGINAL_RUN_ID" > "$run_json"
+          release_commit=$(git rev-parse "refs/tags/$tag^{commit}")
+          parents=$(git show -s --format=%P "$release_commit")
+          read -r source_sha extra_parent <<< "$parents"
+          [[ "$source_sha" =~ ^[a-f0-9]{40}$ && -z "${extra_parent:-}" ]]
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$source_sha" refs/remotes/origin/main
+          source_version=$(git show "$source_sha:build.zig.zon" | awk -F '"' '/^[[:space:]]*\.version[[:space:]]*=/ && !seen { print $2; seen=1 }')
+          [[ "$source_version" == "$VERSION" ]]
+          asset_name="jsbay-$VERSION-harmony-$BACKEND-arm64-v8a.har"
+          original_assets="$RUNNER_TEMP/original-release-assets"
+          original_har="$original_assets/$asset_name"
+          original_sums="$original_assets/SHA256SUMS"
+          if [[ ! -s "$original_har" ]]; then
+            echo "::error::Original Release artifact $ORIGINAL_ARTIFACT_ID has no Harmony HAR for $BACKEND; OHPM submission cannot use this historical recovery artifact and must be handled separately. The GitHub Release remains published." >&2
+            exit 1
+          fi
+          test -s "$original_sums" || { echo '::error::Original Release artifact has no SHA256SUMS; refusing OHPM submission.' >&2; exit 1; }
+          api_asset=$(jq -cer --arg name "$asset_name" '[.assets[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0] else error("missing or duplicate Harmony HAR asset") end' "$release_json")
+          asset_url=$(jq -er '.browser_download_url' <<< "$api_asset")
+          sums_asset=$(jq -cer '[.assets[] | select(.name == "SHA256SUMS" and .state == "uploaded")] | if length == 1 then .[0] else error("missing or duplicate SHA256SUMS asset") end' "$release_json")
+          sums_url=$(jq -er '.browser_download_url' <<< "$sums_asset")
+          mkdir -p "$RUNNER_TEMP/harmony-release-assets"
+          curl --fail --location --retry 3 --silent --show-error "$asset_url" --output "$RUNNER_TEMP/harmony-release-assets/$asset_name"
+          curl --fail --location --retry 3 --silent --show-error "$sums_url" --output "$RUNNER_TEMP/harmony-release-assets/SHA256SUMS"
+          har="$RUNNER_TEMP/harmony-release-assets/$asset_name"
+          node scripts/verify-harmony-release-source.mjs "$VERSION" "$BACKEND" "$ORIGINAL_RUN_ID" "$source_sha" "$run_json" "$release_json" "$original_har" "$har" "$original_sums" "$RUNNER_TEMP/harmony-release-assets/SHA256SUMS"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$source_sha" refs/remotes/origin/main
+          tar -xOzf "$har" package/oh-package.json5 | jq -e --arg name "@jsbay/$BACKEND" --arg version "$VERSION" '.name == $name and .version == $version' >/dev/null
+          actual_sha256=$(sha256sum "$har" | cut -d' ' -f1)
+          actual_sha512=$(sha512sum "$har" | cut -d' ' -f1)
+          jq -n \
+            --arg version "$VERSION" \
+            --arg backend "$BACKEND" \
+            --arg releaseTag "$tag" \
+            --arg releaseId "$release_id" \
+            --arg sourceSha "$source_sha" \
+            --arg assetName "$asset_name" \
+            --arg sha256 "$actual_sha256" \
+            --arg sha512 "$actual_sha512" \
+            '{identity:{version:$version,backend:$backend,releaseTag:$releaseTag,releaseId:$releaseId,sourceSha:$sourceSha,assetName:$assetName,sha256:$sha256,sha512:$sha512}}' \
+            > "$RUNNER_TEMP/harmony-ohpm-identity.json"
+          {
+            echo "asset=$har"
+            echo "release-id=$release_id"
+            echo "source-sha=$source_sha"
+            echo "asset-name=$asset_name"
+            echo "sha256=$actual_sha256"
+            echo "sha512=$actual_sha512"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or resume durable submission record
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          BACKEND: ${{ inputs.backend }}
+          CONFIRMED_ATTEMPT_ID: ${{ inputs.confirmed_attempt_id }}
+          RELEASE_ID: ${{ steps.release.outputs.release-id }}
+          SOURCE_SHA: ${{ steps.release.outputs.source-sha }}
+          ASSET_NAME: ${{ steps.release.outputs.asset-name }}
+          ASSET_SHA256: ${{ steps.release.outputs.sha256 }}
+          ASSET_SHA512: ${{ steps.release.outputs.sha512 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          label=harmony-ohpm-publication
+          if ! gh api "repos/$GITHUB_REPOSITORY/labels/$label" >/dev/null 2>&1; then
+            if ! gh label create "$label" --repo "$GITHUB_REPOSITORY" --color 1D76DB --description 'Tracks OHPM publication and verification'; then
+              gh api "repos/$GITHUB_REPOSITORY/labels/$label" >/dev/null
+            fi
+          fi
+          state_input="$RUNNER_TEMP/harmony-ohpm-state-input.json"
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          jq -n \
+            --arg version "$VERSION" \
+            --arg backend "$BACKEND" \
+            --arg releaseTag "v$VERSION" \
+            --arg releaseId "$RELEASE_ID" \
+            --arg sourceSha "$SOURCE_SHA" \
+            --arg assetName "$ASSET_NAME" \
+            --arg sha256 "$ASSET_SHA256" \
+            --arg sha512 "$ASSET_SHA512" \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+            --arg time "$now" \
+            '{identity:{version:$version,backend:$backend,releaseTag:$releaseTag,releaseId:$releaseId,sourceSha:$sourceSha,assetName:$assetName,sha256:$sha256,sha512:$sha512},attempt:{runId:$runId,runAttempt:$runAttempt,time:$time}}' > "$state_input"
+          title=$(node scripts/harmony-ohpm-state.mjs title "$state_input")
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues?state=all&per_page=100&labels=$label" > "$RUNNER_TEMP/harmony-ohpm-issues.json"
+          jq --arg title "$title" '[.[][] | select(.pull_request == null and .title == $title)]' "$RUNNER_TEMP/harmony-ohpm-issues.json" > "$RUNNER_TEMP/harmony-ohpm-matches.json"
+          matches=$(jq length "$RUNNER_TEMP/harmony-ohpm-matches.json")
+          if [[ "$matches" == 0 ]]; then
+            node scripts/harmony-ohpm-state.mjs create "$state_input" > "$RUNNER_TEMP/harmony-ohpm-issue-body.md"
+            issue_url=$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --label "$label" --body-file "$RUNNER_TEMP/harmony-ohpm-issue-body.md")
+            issue_number=${issue_url##*/}
+            [[ "$issue_number" =~ ^[0-9]+$ ]]
+            publish=true
+          elif [[ "$matches" == 1 ]]; then
+            issue_number=$(jq -er '.[0].number | tostring' "$RUNNER_TEMP/harmony-ohpm-matches.json")
+            gh api "repos/$GITHUB_REPOSITORY/issues/$issue_number" > "$RUNNER_TEMP/harmony-ohpm-issue.json"
+            node scripts/harmony-ohpm-state.mjs validate-identity "$RUNNER_TEMP/harmony-ohpm-issue.json" "$state_input"
+            status=$(node --input-type=module -e 'import { stateFromIssue } from "./scripts/harmony-ohpm-state.mjs"; import { readFileSync } from "node:fs"; process.stdout.write(stateFromIssue(JSON.parse(readFileSync(process.argv[1], "utf8"))).status)' "$RUNNER_TEMP/harmony-ohpm-issue.json")
+            publish=false
+            install_verified=$(gh api "repos/$GITHUB_REPOSITORY/issues/$issue_number/labels" --jq 'any(.[]; .name == "harmony-ohpm-install-verified")')
+            if [[ "$install_verified" == true ]]; then
+              echo 'Public installation is already verified; skipping all OHPM resubmission attempts.'
+            elif [[ "$status" == preflight-failed ]]; then
+              node scripts/harmony-ohpm-state.mjs transition "$RUNNER_TEMP/harmony-ohpm-issue.json" submitting "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" "$now" 'Retrying after a prior run confirmed that the OHPM publish step was skipped.' > "$RUNNER_TEMP/harmony-ohpm-issue-body.md"
+              gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/harmony-ohpm-issue-body.md"
+              publish=true
+            elif [[ "$status" == submitting || "$status" == submit-unknown || "$status" == timeout-unknown ]]; then
+              if [[ -n "$CONFIRMED_ATTEMPT_ID" ]]; then
+                node scripts/harmony-ohpm-state.mjs transition "$RUNNER_TEMP/harmony-ohpm-issue.json" submitting "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" "$now" 'Manual retry authorized after checking the OHPM console.' --confirmed-attempt "$CONFIRMED_ATTEMPT_ID" > "$RUNNER_TEMP/harmony-ohpm-issue-body.md"
+                gh issue edit "$issue_number" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/harmony-ohpm-issue-body.md"
+                publish=true
+              else
+                echo '::warning::An earlier OHPM request may have been accepted. Check the OHPM console before retrying.'
+              fi
+            elif [[ "$status" == submitted || "$status" == public-verified || "$status" == install-verified || "$status" == device-verified ]]; then
+              echo 'The OHPM request was already submitted; skipping duplicate publication.'
+            else
+              echo "::error::Cannot publish while the durable issue is in state $status"
+              exit 1
+            fi
+          else
+            echo "::error::Found $matches durable issues for $title; refusing to publish"
+            exit 1
+          fi
+          {
+            echo "number=$issue_number"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned OHPM tools
+        if: steps.state.outputs.publish == 'true'
+        uses: ./.github/actions/setup-ohpm
+
+      - name: Check release environment credentials
+        if: steps.state.outputs.publish == 'true'
+        env:
+          OHPM_PRIVATE_KEY: ${{ secrets.OHPM_PRIVATE_KEY }}
+          OHPM_KEY_PASSPHRASE: ${{ secrets.OHPM_KEY_PASSPHRASE }}
+          OHPM_PUBLISH_ID: ${{ secrets.OHPM_PUBLISH_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${OHPM_PRIVATE_KEY:?missing OHPM private key}"
+          : "${OHPM_KEY_PASSPHRASE:?missing OHPM key passphrase}"
+          : "${OHPM_PUBLISH_ID:?missing OHPM publish ID}"
+          export -n OHPM_PRIVATE_KEY OHPM_KEY_PASSPHRASE OHPM_PUBLISH_ID
+
+      - name: Publish the verified HAR to OHPM
+        id: ohpm
+        if: steps.state.outputs.publish == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OHPM_PRIVATE_KEY: ${{ secrets.OHPM_PRIVATE_KEY }}
+          OHPM_KEY_PASSPHRASE: ${{ secrets.OHPM_KEY_PASSPHRASE }}
+          OHPM_PUBLISH_ID: ${{ secrets.OHPM_PUBLISH_ID }}
+          VERSION: ${{ inputs.version }}
+          HAR: ${{ steps.release.outputs.asset }}
+          ISSUE_NUMBER: ${{ steps.state.outputs.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue_labels=$(gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/labels" --jq 'any(.[]; .name == "harmony-ohpm-install-verified")')
+          export -n GH_TOKEN
+          if [[ "$issue_labels" == true ]]; then
+            echo 'Public installation became verified before submission; skipping OHPM resubmission.'
+            echo 'verified=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          : "${OHPM_PRIVATE_KEY:?missing OHPM private key}"
+          : "${OHPM_KEY_PASSPHRASE:?missing OHPM key passphrase}"
+          : "${OHPM_PUBLISH_ID:?missing OHPM publish ID}"
+          export -n OHPM_PRIVATE_KEY OHPM_KEY_PASSPHRASE OHPM_PUBLISH_ID
+          umask 077
+          work=$(mktemp -d "$RUNNER_TEMP/ohpm-publish.XXXXXX")
+          trap 'rm -rf "$work"' EXIT
+          printf '%s\n' "$OHPM_PRIVATE_KEY" > "$work/private_key"
+          ciphertext=$(printf '%s' "$OHPM_KEY_PASSPHRASE" | "$OHPM_NODE" scripts/ohpm-encrypt-passphrase.mjs "$OHPM_CRYPTO_MODULE" "$work/crypto")
+          echo "::add-mask::$ciphertext"
+          printf 'publish_id=%s\nkey_path=%s\ncrypto_path=%s\nkey_passphrase=%s\n' "$OHPM_PUBLISH_ID" "$work/private_key" "$work/crypto" "$ciphertext" > "$work/.ohpmrc"
+          version_without_build=${VERSION%%+*}
+          cd "$work"
+          if [[ "$version_without_build" == *-* ]]; then
+            echo 'request-started=true' >> "$GITHUB_OUTPUT"
+            ohpm publish "$HAR" --tag rc --publish_registry https://ohpm.openharmony.cn/ohpm/
+          else
+            echo 'request-started=true' >> "$GITHUB_OUTPUT"
+            ohpm publish "$HAR" --publish_registry https://ohpm.openharmony.cn/ohpm/
+          fi
+
+      - name: Record the OHPM response
+        if: always() && !cancelled() && steps.state.outputs.publish == 'true' && steps.ohpm.outputs.verified != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.state.outputs.number }}
+          OHPM_OUTCOME: ${{ steps.ohpm.outcome }}
+          OHPM_REQUEST_STARTED: ${{ steps.ohpm.outputs.request-started }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER" > "$RUNNER_TEMP/harmony-ohpm-issue.json"
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          next_status=$(node --input-type=module -e 'import { classifyPublishOutcome } from "./scripts/harmony-ohpm-state.mjs"; process.stdout.write(classifyPublishOutcome(process.argv[1], process.argv[2]))' "$OHPM_OUTCOME" "${OHPM_REQUEST_STARTED:-}")
+          if [[ "$next_status" == preflight-failed ]]; then
+            result='The OHPM publish step was skipped before a request was sent.'
+          elif [[ "$next_status" == submitted ]]; then
+            result='OHPM accepted the submission request; registry review is pending.'
+          else
+            next_status=submit-unknown
+            result='The publish process did not return success; the request may have reached OHPM. Check the OHPM console before retrying.'
+          fi
+          node scripts/harmony-ohpm-state.mjs transition "$RUNNER_TEMP/harmony-ohpm-issue.json" "$next_status" "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" "$now" "$result" > "$RUNNER_TEMP/harmony-ohpm-issue-body.md"
+          gh issue edit "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$RUNNER_TEMP/harmony-ohpm-issue-body.md"
+
+      - name: Fail when OHPM did not confirm submission
+        if: steps.state.outputs.publish == 'true' && steps.ohpm.outcome != 'success'
+        run: exit 1

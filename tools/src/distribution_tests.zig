@@ -436,7 +436,16 @@ test "test_release_exports_a_history_free_source_snapshot" {
     const io = testing.io;
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
-    for ([_][]const u8{ "Checkout reviewed source snapshot", "zig build tool -- export-public-source", "zig build tool -- release-version", "archive=\"$RUNNER_TEMP/jsbay-${version}-zig.tar.gz\"", "tests/ci/pack-zig-source.sh \"${{ steps.source.outputs.archive }}\" \"$archive\"", "tests/ci/release-zig-consumer.sh \"$archive\"", "cp \"${{ steps.zig_package.outputs.archive }}\" release-assets/", "cp \"${{ steps.source.outputs.archive }}\" release-assets/", "for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar" }) |needle| try contains(release, needle);
+    for ([_][]const u8{ "Checkout reviewed source snapshot", "zig build tool -- export-public-source", "zig build tool -- release-version", "archive=\"$RUNNER_TEMP/jsbay-${version}-zig.tar.gz\"", "tests/ci/pack-zig-source.sh \"${{ steps.source.outputs.archive }}\" \"$archive\"", "tests/ci/release-zig-consumer.sh \"$archive\"", "cp \"${{ steps.zig_package.outputs.archive }}\" release-assets/", "cp \"${{ steps.source.outputs.archive }}\" release-assets/", "for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar jsbay-*.har" }) |needle| try contains(release, needle);
+    try contains(release, "  build-harmony-release:");
+    try contains(release, "  harmony-release-consumer:");
+    try contains(release, "needs: [build-harmony-release]");
+    try contains(release, "ohpm prepublish \"$har\"");
+    try contains(release, "ohpm install \"$har\"");
+    try contains(release, "assembleHap --no-daemon");
+    try contains(release, "needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android, harmony-release-consumer]");
+    try contains(release, "pattern: harmony-release-*");
+    try contains(release, "har=\"$output/jsbay-$version-harmony-$QUICKJS_BACKEND-arm64-v8a.har\"");
     try testing.expect((std.mem.indexOf(u8, release, "cp \"${{ steps.source.outputs.archive }}\" release-assets/") orelse return error.MissingSourceCopy) < (std.mem.indexOf(u8, release, ": > SHA256SUMS") orelse return error.MissingChecksums));
 }
 
@@ -537,7 +546,7 @@ test "test_release_asset_inventory_rejects_missing_and_extra_archives" {
     const directory = try temp(a, io, "jsbay-assets-missing");
     defer Dir.cwd().deleteTree(io, directory) catch {};
     const tool = try sdk.toolPath(a, io);
-    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz", "zig.tar.gz" };
+    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz", "zig.tar.gz", "harmony-quickjs-arm64-v8a.har", "harmony-quickjs_ng-arm64-v8a.har" };
     for (names) |name| try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-{s}", .{ directory, name }), "");
     var complete = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
     defer complete.deinit();
@@ -548,17 +557,23 @@ test "test_release_asset_inventory_rejects_missing_and_extra_archives" {
     try testing.expect(!missing_zig.succeeded());
     try contains(try std.mem.concat(a, u8, &.{ missing_zig.result.stdout, missing_zig.result.stderr }), "zig.tar.gz");
     try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-zig.tar.gz", .{directory}), "");
+    try Dir.cwd().deleteFile(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-harmony-quickjs_ng-arm64-v8a.har", .{directory}));
+    var missing_harmony = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
+    defer missing_harmony.deinit();
+    try testing.expect(!missing_harmony.succeeded());
+    try contains(try std.mem.concat(a, u8, &.{ missing_harmony.result.stdout, missing_harmony.result.stderr }), "harmony-quickjs_ng-arm64-v8a.har");
+    try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-harmony-quickjs_ng-arm64-v8a.har", .{directory}), "");
     try Dir.cwd().deleteFile(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-source.tar.gz", .{directory}));
     var missing = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
     defer missing.deinit();
     try testing.expect(!missing.succeeded());
     try contains(try std.mem.concat(a, u8, &.{ missing.result.stdout, missing.result.stderr }), "source.tar.gz");
     try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-source.tar.gz", .{directory}), "");
-    try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-extra.tar.gz", .{directory}), "");
+    try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-harmony-jsc-arm64-v8a.har", .{directory}), "");
     var extra = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
     defer extra.deinit();
     try testing.expect(!extra.succeeded());
-    try contains(try std.mem.concat(a, u8, &.{ extra.result.stdout, extra.result.stderr }), "extra");
+    try contains(try std.mem.concat(a, u8, &.{ extra.result.stdout, extra.result.stderr }), "harmony-jsc-arm64-v8a.har");
 }
 test "test_release_asset_inventory_accepts_full_tag_set" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -569,7 +584,7 @@ test "test_release_asset_inventory_accepts_full_tag_set" {
     const directory = try temp(a, io, "jsbay-assets-full");
     defer Dir.cwd().deleteTree(io, directory) catch {};
     const tool = try sdk.toolPath(a, io);
-    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "apple-quickjs_ng-JsBay.xcframework.zip", "apple-quickjs-JsBay.xcframework.zip", "apple-jsc-JsBay.xcframework.zip", "android-quickjs_ng.aar", "android-quickjs_ng-maven.zip", "android-jniLibs-quickjs_ng.tar.gz", "android-quickjs.aar", "android-quickjs-maven.zip", "android-jniLibs-quickjs.tar.gz", "source.tar.gz", "zig.tar.gz" };
+    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "apple-quickjs_ng-JsBay.xcframework.zip", "apple-quickjs-JsBay.xcframework.zip", "apple-jsc-JsBay.xcframework.zip", "android-quickjs_ng.aar", "android-quickjs_ng-maven.zip", "android-jniLibs-quickjs_ng.tar.gz", "android-quickjs.aar", "android-quickjs-maven.zip", "android-jniLibs-quickjs.tar.gz", "source.tar.gz", "zig.tar.gz", "harmony-quickjs-arm64-v8a.har", "harmony-quickjs_ng-arm64-v8a.har" };
     for (names) |name| try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-{s}", .{ directory, name }), "");
     var out = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "true", "true" }, cwd);
     defer out.deinit();

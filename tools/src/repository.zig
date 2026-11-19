@@ -206,7 +206,7 @@ fn releaseAssets(c: Context, args: []const []const u8) !void {
     if (args.len != 4 or !safeLabel(args[1])) return error.Usage;
     for (args[2..]) |arg| if (!std.mem.eql(u8, arg, "true") and !std.mem.eql(u8, arg, "false")) return error.Usage;
     var expected: std.StringHashMap(void) = .init(c.allocator());
-    const base = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz", "zig.tar.gz" };
+    const base = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz", "zig.tar.gz", "harmony-quickjs-arm64-v8a.har", "harmony-quickjs_ng-arm64-v8a.har" };
     for (base) |name| try expected.put(try c.fmt("jsbay-{s}-{s}", .{ args[1], name }), {});
     if (std.mem.eql(u8, args[2], "true")) for ([_][]const u8{ "apple-quickjs_ng-JsBay.xcframework.zip", "apple-quickjs-JsBay.xcframework.zip", "apple-jsc-JsBay.xcframework.zip" }) |name| {
         try expected.put(try c.fmt("jsbay-{s}-{s}", .{ args[1], name }), {});
