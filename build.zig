@@ -769,6 +769,11 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run js-bay benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const bit_matrix_mod = b.createModule(.{
+        .root_source_file = b.path("src/runtime/bit_matrix.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const ms_bench_module = b.createModule(.{
         .root_source_file = b.path("bench/mechanical_sympathy.zig"),
         .target = target,
@@ -778,7 +783,7 @@ pub fn build(b: *std.Build) void {
     ms_bench_module.addImport("hyper_box", hyper_box);
     ms_bench_module.addImport("cmph", cmph);
     ms_bench_module.addImport("simd_utf", simd_utf);
-    ms_bench_module.addImport("jsbay", mod);
+    ms_bench_module.addImport("bit_matrix", bit_matrix_mod);
     const ms_bench_exe = b.addExecutable(.{
         .name = "bench-roi",
         .root_module = ms_bench_module,

@@ -16,8 +16,7 @@ const std = @import("std");
 const hyper_box = @import("hyper_box");
 const cmph = @import("cmph");
 const simd_utf = @import("simd_utf");
-const jsbay = @import("jsbay");
-const bit_matrix = jsbay.bit_matrix;
+const bit_matrix = @import("bit_matrix");
 const HyperValue = hyper_box.Value;
 const GenerationalSlotMap = hyper_box.GenerationalSlotMap;
 
