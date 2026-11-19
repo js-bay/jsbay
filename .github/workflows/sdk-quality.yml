@@ -45,9 +45,12 @@ jobs:
       - name: Install current OHPM tools
         uses: ./.github/actions/setup-ohpm
       - name: Probe encryption with a test password
+        env:
+          OHPM_TEST_DIAGNOSTIC: 'true'
         run: |
           set -euo pipefail
-          printf 'example-passphrase\n' | timeout 30 script -q -e -c "ohpm config encrypt --crypto_path $RUNNER_TEMP/ohpm-probe" /dev/null
+          ciphertext=$(printf 'example-passphrase\n' | python3 scripts/ohpm-encrypt-passphrase.py "$RUNNER_TEMP/ohpm-probe")
+          [[ "$ciphertext" == security:* ]]
 
   harmony-publish-guard:
     if: github.event_name == 'workflow_dispatch' && inputs.harmony_publish
@@ -81,16 +84,12 @@ jobs:
         with:
           version: 0.17.0
       - name: Install Harmony command-line tools
-        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721
+        uses: ./.github/actions/setup-ohpm
         with:
           version: 5.0.13.200
-          cache: true
       - name: Install OpenHarmony API 12 SDK
         id: ohos
-        uses: openharmony-rs/setup-ohos-sdk@b312caf8a43bb836aa24c08f65f97e1f09a89cad
-        with:
-          version: 5.0.0
-          mirror: false
+        uses: ./.github/actions/setup-openharmony-sdk
       - name: Check toolchain and build HAR
         timeout-minutes: 10
         env:

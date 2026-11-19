@@ -65,6 +65,8 @@ try:
     sys.stdout.write(match.group().decode('ascii') + '\n')
 except RuntimeError as error:
     print(error, file=sys.stderr)
+    if os.environ.get('OHPM_TEST_DIAGNOSTIC') == 'true' and passphrase == b'example-passphrase':
+        print(repr(data), file=sys.stderr)
     raise SystemExit(1)
 finally:
     if process.poll() is None:

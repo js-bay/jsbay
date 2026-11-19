@@ -1,5 +1,9 @@
 name: Install pinned OHPM tools
 description: Install the verified command-line tool archive without a shared cache
+inputs:
+  version:
+    description: Toolchain version to install
+    default: '6.1.1.280'
 runs:
   using: composite
   steps:
@@ -7,13 +11,20 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        TOOL_VERSION: ${{ inputs.version }}
       run: |
         set -euo pipefail
+        case "$TOOL_VERSION" in
+          5.0.13.200) checksum=0440e2a137542dd4066761efe0b9cf4e06cc1bc73ff85872774026f813e10b4f ;;
+          6.1.1.280) checksum=3d37eb5a3a81358a9731c35265f4f29d8ecf1028b0bbbb777f2928cd6990aa83 ;;
+          *) echo 'Unsupported Harmony toolchain version' >&2; exit 1 ;;
+        esac
         tool_dir="$RUNNER_TEMP/ohpm-tools"
         mkdir -p "$tool_dir"
-        gh release download 6.1.1.280 --repo ErBWs/ohos-sdk --pattern 'ohos-sdk-linux-amd64.tar.gz.aa' --pattern 'ohos-sdk-linux-amd64.tar.gz.ab' --dir "$tool_dir"
+        gh release download "$TOOL_VERSION" --repo ErBWs/ohos-sdk --pattern 'ohos-sdk-linux-amd64.tar.gz.aa' --pattern 'ohos-sdk-linux-amd64.tar.gz.ab' --dir "$tool_dir"
         cat "$tool_dir/ohos-sdk-linux-amd64.tar.gz.aa" "$tool_dir/ohos-sdk-linux-amd64.tar.gz.ab" > "$tool_dir/tools.tar.gz"
-        printf '%s  %s\n' '3d37eb5a3a81358a9731c35265f4f29d8ecf1028b0bbbb777f2928cd6990aa83' "$tool_dir/tools.tar.gz" | sha256sum -c -
+        printf '%s  %s\n' "$checksum" "$tool_dir/tools.tar.gz" | sha256sum -c -
         tar -xzf "$tool_dir/tools.tar.gz" -C "$tool_dir"
         echo "$tool_dir/command-line-tools/bin" >> "$GITHUB_PATH"
         echo "$tool_dir/command-line-tools/tool/node/bin" >> "$GITHUB_PATH"
+        echo "HOS_SDK_HOME=$tool_dir/command-line-tools/sdk" >> "$GITHUB_ENV"
