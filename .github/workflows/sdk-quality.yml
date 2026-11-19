@@ -50,6 +50,10 @@ jobs:
           node tests/harmony-sdk/ohpm-encrypt-test.mjs
           ciphertext=$(printf 'example-passphrase' | "$OHPM_NODE" scripts/ohpm-encrypt-passphrase.mjs "$OHPM_CRYPTO_MODULE" "$RUNNER_TEMP/ohpm-probe")
           [[ "$ciphertext" == security:* ]]
+          mkdir -p "$RUNNER_TEMP/ohpm-config-test"
+          printf 'crypto_path=%s\nkey_passphrase=%s\n' "$RUNNER_TEMP/ohpm-probe" "$ciphertext" > "$RUNNER_TEMP/ohpm-config-test/.ohpmrc"
+          actual=$(cd "$RUNNER_TEMP/ohpm-config-test" && ohpm config get crypto_path)
+          [[ "$actual" == "$RUNNER_TEMP/ohpm-probe" ]]
 
   harmony-publish-guard:
     if: github.event_name == 'workflow_dispatch' && inputs.harmony_publish
