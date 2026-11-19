@@ -526,6 +526,8 @@ const InspectorEnabledTests2 = if (@import("build_options").inspector) struct {
                     state.stop.store(true, .seq_cst);
                     updater.join();
                 };
+                // A fast script must not stop the updater before its first hook publication.
+                while (state.updates.load(.seq_cst) == 0) std.Thread.yield() catch {};
 
                 var box = EvalBox{
                     .id = instance_id,
