@@ -185,6 +185,8 @@ pub fn Module(comptime Host: type) type {
             // Once start is entered, an implementation may have retained the callback even if it reports an error. This errdefer is later than every state cleanup, hence runs first and drains any task leases produced by its final session_closed callback.
             transport_started = true;
             errdefer rollbackStart(state);
+            transport.setDeliveryObserver(state, dispatcher.deliveryObserver);
+            native_cdp.setDeliveryObserver(state, state.transport.vtable.set_delivery_observer != null);
             transport.start(state, dispatcher.transportEventHandler) catch {
                 return StartError.TransportStartFailed;
             };

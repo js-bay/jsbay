@@ -20,6 +20,18 @@ pub const Stream = struct {
         }
     }
 
+    pub fn readAll(self: Stream, buffer: []u8) !void {
+        var offset: usize = 0;
+        while (offset < buffer.len) {
+            const n = (socket.Socket{ .handle = self.handle }).read(buffer[offset..]) catch |err| {
+                if (err == error.Interrupted) continue;
+                return err;
+            };
+            if (n == 0) return error.EndOfStream;
+            offset += n;
+        }
+    }
+
     pub fn readByte(self: Stream) !u8 {
         var byte: [1]u8 = undefined;
         if (try self.read(&byte) == 0) return error.EndOfStream;

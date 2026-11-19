@@ -21,6 +21,9 @@ pub const Transport = struct {
         close_session: *const fn (ctx: *anyopaque, session: SessionId) void,
         set_discovery_target: ?*const fn (ctx: *anyopaque, target: DiscoveryTarget) void = null,
         bound_port: ?*const fn (ctx: *anyopaque) u16 = null,
+        max_message_bytes: ?*const fn (ctx: *anyopaque) usize = null,
+        max_backlog_bytes: ?*const fn (ctx: *anyopaque) usize = null,
+        set_delivery_observer: ?*const fn (ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId) void) void = null,
     };
     pub fn start(self: *Transport, event_ctx: ?*anyopaque, handler: EventHandler) !void {
         return self.vtable.start(self.ctx, event_ctx, handler);
@@ -42,5 +45,16 @@ pub const Transport = struct {
     }
     pub fn boundPort(self: *Transport) u16 {
         return if (self.vtable.bound_port) |f| f(self.ctx) else 0;
+    }
+    pub const default_max_message_bytes: usize = 64 * 1024 * 1024;
+    pub fn maxMessageBytes(self: *Transport) usize {
+        return if (self.vtable.max_message_bytes) |f| f(self.ctx) else default_max_message_bytes;
+    }
+    pub const default_max_backlog_bytes: usize = 8 * 1024 * 1024;
+    pub fn maxBacklogBytes(self: *Transport) usize {
+        return if (self.vtable.max_backlog_bytes) |f| f(self.ctx) else default_max_backlog_bytes;
+    }
+    pub fn setDeliveryObserver(self: *Transport, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId) void) void {
+        if (self.vtable.set_delivery_observer) |f| f(self.ctx, observer_ctx, observer);
     }
 };

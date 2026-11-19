@@ -19,6 +19,28 @@ const socket = @import("portable_socket");
 // A callback can request destruction of its transport. Its own socket worker must unwind before the transport can be released.
 threadlocal var callback_transport: ?*Transport = null;
 
+const FrameDeadline = struct {
+    stall_timeout_ms: i64,
+    max_deadline: i64,
+
+    fn init(stall_ms: i64, max_ms: i64) FrameDeadline {
+        const now = @as(i64, @intCast(zev.monotonicMilliseconds()));
+        return .{
+            .stall_timeout_ms = stall_ms,
+            .max_deadline = now + max_ms,
+        };
+    }
+
+    fn checkExpired(self: FrameDeadline) !void {
+        const now = @as(i64, @intCast(zev.monotonicMilliseconds()));
+        if (now >= self.max_deadline) return error.TimedOut;
+    }
+
+    fn stallDeadline(self: FrameDeadline, now: i64) i64 {
+        return @min(now + self.stall_timeout_ms, self.max_deadline);
+    }
+};
+
 // -- Portable socket layer -------------------------------------------------
 const RawSocket = struct {
     handle: socket.Handle,
@@ -43,26 +65,37 @@ const RawSocket = struct {
         (socket.Socket{ .handle = s.handle }).shutdownBoth();
     }
 
-    fn writeAll(s: RawSocket, bytes: []const u8) !void {
-        try s.writeUntil(bytes, @as(i64, @intCast(zev.monotonicMilliseconds())) + write_deadline_ms, null);
+    fn writeAll(s: RawSocket, bytes: []const u8, shutdown: ?*const std.atomic.Value(bool)) !void {
+        const deadline = FrameDeadline.init(http_timeout_ms, http_timeout_ms);
+        try s.writeUntil(bytes, deadline, null, shutdown);
     }
 
-    fn writeUntil(s: RawSocket, bytes: []const u8, deadline: i64, sess: ?*Session) !void {
+    fn writeUntil(s: RawSocket, bytes: []const u8, frame_deadline: FrameDeadline, sess: ?*Session, shutdown: ?*const std.atomic.Value(bool)) !void {
         var off: usize = 0;
+        var now = @as(i64, @intCast(zev.monotonicMilliseconds()));
+        if (now >= frame_deadline.max_deadline) return error.TimedOut;
+        var stall_deadline = frame_deadline.stallDeadline(now);
         while (off < bytes.len) {
             if (sess) |active| {
                 if (active.closed.load(.acquire)) return error.Closed;
             }
+            if (shutdown) |sd| {
+                if (sd.load(.acquire)) return error.Closed;
+            }
+            try frame_deadline.checkExpired();
             const n = s.write(bytes[off..]) catch |err| switch (err) {
                 error.Interrupted => continue,
                 error.WouldBlock => {
-                    try waitSocket(s, socket.PollEvent.write, deadline, sess);
+                    try waitSocket(s, socket.PollEvent.write, stall_deadline, sess, shutdown);
                     continue;
                 },
                 else => return error.WriteFailed,
             };
             if (n == 0) return error.WriteFailed;
             off += @intCast(n);
+            now = @as(i64, @intCast(zev.monotonicMilliseconds()));
+            if (now >= frame_deadline.max_deadline) return error.TimedOut;
+            stall_deadline = frame_deadline.stallDeadline(now);
         }
     }
 };
@@ -92,10 +125,16 @@ pub const DiscoveryTarget = inspector.DiscoveryTarget;
 // -- Internals ------------------------------------------------------------
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const max_queued_bytes: usize = 4 * 1024 * 1024;
-const max_queued_frames: usize = 256;
+pub const default_max_message_bytes: usize = 64 * 1024 * 1024;
+pub const default_max_backlog_bytes: usize = 8 * 1024 * 1024;
+pub const max_queued_bytes: usize = default_max_backlog_bytes;
+pub const max_message_bytes: usize = default_max_message_bytes;
+pub const max_queued_frames: usize = 256;
 const max_sessions: usize = 32;
+const http_timeout_ms: i64 = 2_000;
 const write_deadline_ms: i64 = 2_000;
+const stall_timeout_ms: i64 = 5_000;
+const max_write_timeout_ms: i64 = 60_000;
 const io_poll_ms: i32 = 100;
 
 const OutboundKind = enum { text, pong, close };
@@ -118,6 +157,8 @@ const Session = struct {
     queue: std.ArrayListUnmanaged(Outbound) = .empty,
     queue_head: usize = 0,
     queued_bytes: usize = 0,
+    queued_backlog_bytes: usize = 0,
+    large_message_in_flight: bool = false,
     accepting: bool = true,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Threads are detached. Their references give the transport a durable lifetime boundary while avoiding an ever-growing list of joined handles.
@@ -133,6 +174,9 @@ const Session = struct {
         for (self.queue.items[self.queue_head..]) |frame| self.allocator.free(frame.bytes);
         self.queue.deinit(self.allocator);
         self.queue_head = 0;
+        self.queued_bytes = 0;
+        self.queued_backlog_bytes = 0;
+        self.large_message_in_flight = false;
         self.queue_mu.unlock();
         self.queue_changed.deinit();
         self.queue_mu.deinit();
@@ -149,6 +193,8 @@ const Session = struct {
         self.queue.clearRetainingCapacity();
         self.queue_head = 0;
         self.queued_bytes = 0;
+        self.queued_backlog_bytes = 0;
+        self.large_message_in_flight = false;
         self.queue_changed.broadcast();
         self.queue_mu.unlock();
         self.stream.shutdownBoth();
@@ -160,11 +206,30 @@ const Session = struct {
             self.queue_mu.unlock();
             return false;
         }
+        const max_msg = self.transport.max_message_bytes;
+        const max_backlog = self.transport.max_backlog_bytes;
+        if (bytes.len > max_msg) {
+            self.queue_mu.unlock();
+            return false;
+        }
         const pending_frames = self.queue.items.len - self.queue_head;
-        if (bytes.len > max_queued_bytes or pending_frames >= max_queued_frames or self.queued_bytes > max_queued_bytes - bytes.len) {
+        if (pending_frames >= max_queued_frames) {
             self.queue_mu.unlock();
             if (close_on_reject) self.requestClose();
             return false;
+        }
+        const is_large = bytes.len > max_backlog;
+        if (is_large) {
+            if (self.large_message_in_flight or self.queued_backlog_bytes > max_backlog) {
+                self.queue_mu.unlock();
+                return false;
+            }
+        } else {
+            if (self.queued_backlog_bytes > max_backlog - bytes.len) {
+                self.queue_mu.unlock();
+                if (close_on_reject) self.requestClose();
+                return false;
+            }
         }
         const copy = self.allocator.dupe(u8, bytes) catch {
             self.queue_mu.unlock();
@@ -175,6 +240,11 @@ const Session = struct {
             self.queue_mu.unlock();
             return false;
         };
+        if (is_large) {
+            self.large_message_in_flight = true;
+        } else {
+            self.queued_backlog_bytes += copy.len;
+        }
         self.queued_bytes += copy.len;
         self.queue_changed.signal();
         self.queue_mu.unlock();
@@ -204,6 +274,7 @@ const Session = struct {
             return;
         };
         self.queued_bytes += copy.len;
+        self.queued_backlog_bytes += copy.len;
         self.queue_changed.signal();
         self.queue_mu.unlock();
     }
@@ -230,6 +301,8 @@ pub const Transport = struct {
     /// 0 = "bind ephemeral"; after start() this is the actual bound port.
     want_port: u16,
     bound_port: u16 = 0,
+    max_message_bytes: usize = default_max_message_bytes,
+    max_backlog_bytes: usize = default_max_backlog_bytes,
 
     server: ?RawListener = null,
 
@@ -263,14 +336,30 @@ pub const Transport = struct {
     target_set: bool = false,
     /// Borrowed protocol document. It must outlive this transport.
     protocol_json: []const u8 = "{}",
+    delivery_observer: ?*const fn (?*anyopaque, SessionId) void = null,
+    delivery_observer_ctx: ?*anyopaque = null,
+
+    pub const Options = struct {
+        max_message_bytes: usize = default_max_message_bytes,
+        max_backlog_bytes: usize = default_max_backlog_bytes,
+    };
 
     pub fn init(allocator: std.mem.Allocator, port: u16) !*Transport {
+        return initWithOptions(allocator, port, .{});
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, port: u16, options: Options) !*Transport {
+        if (options.max_message_bytes == 0 or options.max_backlog_bytes == 0) return error.InvalidArgument;
         const self = try allocator.create(Transport);
         errdefer allocator.destroy(self);
+        const max_msg = options.max_message_bytes;
+        const max_backlog = @min(options.max_backlog_bytes, max_msg);
         self.* = .{
             .allocator = allocator,
             .want_port = port,
             .sessions = .empty,
+            .max_message_bytes = max_msg,
+            .max_backlog_bytes = max_backlog,
         };
         self.interface = .{ .ctx = self, .vtable = &transport_vtable };
         return self;
@@ -559,7 +648,8 @@ fn acceptLoop(t: *Transport) void {
 /// Parse HTTP request line/headers. If the request upgrades to WebSocket, take over the stream and spawn a reader thread. Otherwise serve the appropriate discovery response and close.
 fn handleConnection(t: *Transport, conn: RawSocket) !void {
     const stream = conn;
-    errdefer stream.close();
+    var stream_owned = true;
+    defer if (stream_owned) stream.close();
 
     // Read until we see \r\n\r\n or fill the buffer. 8 KiB is ample for DevTools handshake requests.
     var buf: [8 * 1024]u8 = undefined;
@@ -569,7 +659,7 @@ fn handleConnection(t: *Transport, conn: RawSocket) !void {
         if (t.shutdown.load(.acquire)) return error.Closed;
         const n = stream.read(buf[used..]) catch |err| switch (err) {
             error.WouldBlock => {
-                try waitSocket(stream, .read, deadline, null);
+                try waitSocket(stream, .read, deadline, null, &t.shutdown);
                 continue;
             },
             else => return err,
@@ -581,18 +671,33 @@ fn handleConnection(t: *Transport, conn: RawSocket) !void {
     const req = buf[0..used];
 
     // Parse the request line.
-    const line_end = std.mem.indexOf(u8, req, "\r\n") orelse return writeBadRequest(stream);
+    const line_end = std.mem.indexOf(u8, req, "\r\n") orelse {
+        writeBadRequest(stream, &t.shutdown);
+        return;
+    };
     const req_line = req[0..line_end];
     // "GET /path HTTP/1.1"
     var it = std.mem.splitScalar(u8, req_line, ' ');
-    const method = it.next() orelse return writeBadRequest(stream);
-    const path = it.next() orelse return writeBadRequest(stream);
-    if (!std.mem.eql(u8, method, "GET")) return writeNotFound(stream);
+    const method = it.next() orelse {
+        writeBadRequest(stream, &t.shutdown);
+        return;
+    };
+    const path = it.next() orelse {
+        writeBadRequest(stream, &t.shutdown);
+        return;
+    };
+    if (!std.mem.eql(u8, method, "GET")) {
+        writeNotFound(stream, &t.shutdown);
+        return;
+    }
 
     // Scan headers.
     const headers_start = line_end + 2;
-    const headers_end = std.mem.indexOf(u8, req, "\r\n\r\n") orelse return writeBadRequest(stream);
-    const headers_slice = req[headers_start..headers_end];
+    const headers_end = std.mem.indexOf(u8, req, "\r\n\r\n") orelse {
+        writeBadRequest(stream, &t.shutdown);
+        return;
+    };
+    const headers_slice = if (headers_start <= headers_end) req[headers_start..headers_end] else "";
 
     var ws_key: ?[]const u8 = null;
     var upgrade_ws = false;
@@ -613,18 +718,29 @@ fn handleConnection(t: *Transport, conn: RawSocket) !void {
 
     if (upgrade_ws) {
         // Path must match configured target id (leading '/').
-        if (path.len < 2 or path[0] != '/') return writeBadRequest(stream);
+        if (path.len < 2 or path[0] != '/') {
+            writeBadRequest(stream, &t.shutdown);
+            return;
+        }
         const path_id = path[1..];
         if (!t.target_set or !std.mem.eql(u8, path_id, t.target_id)) {
-            return writeBadRequest(stream);
+            writeBadRequest(stream, &t.shutdown);
+            return;
         }
-        const key = ws_key orelse return writeBadRequest(stream);
+        const key = ws_key orelse {
+            writeBadRequest(stream, &t.shutdown);
+            return;
+        };
         // Capacity is reserved before 101 is visible to the peer.  The reservation and registry append share sessions_mu, so concurrent handshakes cannot all pass a racy preflight check.
         const sess = reserveSession(t, stream) catch |err| switch (err) {
-            error.SessionLimit => return writeServiceUnavailable(stream),
+            error.SessionLimit => {
+                writeServiceUnavailable(stream, &t.shutdown);
+                return;
+            },
             else => return err,
         };
-        writeWsAccept(stream, key) catch |err| {
+        stream_owned = false;
+        writeWsAccept(stream, key, &t.shutdown) catch |err| {
             discardReservedSession(t, sess);
             return err;
         };
@@ -635,73 +751,69 @@ fn handleConnection(t: *Transport, conn: RawSocket) !void {
 
     // HTTP discovery routing.
     if (std.mem.eql(u8, path, "/json/version")) {
-        try writeVersion(stream);
+        try writeVersion(stream, &t.shutdown);
     } else if (std.mem.eql(u8, path, "/json") or std.mem.eql(u8, path, "/json/list")) {
         try writeTargetList(t, stream);
     } else if (std.mem.eql(u8, path, "/json/protocol")) {
         try writeProtocol(t, stream);
     } else {
-        try writeNotFound(stream);
+        writeNotFound(stream, &t.shutdown);
     }
-    stream.close();
 }
 
-fn writeBadRequest(stream: RawSocket) !void {
+fn writeBadRequest(stream: RawSocket, shutdown: ?*const std.atomic.Value(bool)) void {
     const body = "Bad Request";
     var buf: [128]u8 = undefined;
-    const resp = try std.fmt.bufPrint(
+    const resp = std.fmt.bufPrint(
         &buf,
         "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ body.len, body },
-    );
-    stream.writeAll(resp) catch {};
-    stream.close();
+    ) catch return;
+    stream.writeAll(resp, shutdown) catch {};
 }
 
-fn writeNotFound(stream: RawSocket) !void {
+fn writeNotFound(stream: RawSocket, shutdown: ?*const std.atomic.Value(bool)) void {
     const body = "Not Found";
     var buf: [128]u8 = undefined;
-    const resp = try std.fmt.bufPrint(
+    const resp = std.fmt.bufPrint(
         &buf,
         "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ body.len, body },
-    );
-    stream.writeAll(resp) catch {};
-    stream.close();
+    ) catch return;
+    stream.writeAll(resp, shutdown) catch {};
 }
 
-fn writeServiceUnavailable(stream: RawSocket) !void {
+fn writeServiceUnavailable(stream: RawSocket, shutdown: ?*const std.atomic.Value(bool)) void {
     const body = "Inspector session capacity reached";
     var buf: [160]u8 = undefined;
-    const resp = try std.fmt.bufPrint(
+    const resp = std.fmt.bufPrint(
         &buf,
         "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
         .{ body.len, body },
-    );
-    stream.writeAll(resp) catch {};
-    stream.close();
+    ) catch return;
+    stream.writeAll(resp, shutdown) catch {};
 }
 
-fn writeJsonResponse(stream: RawSocket, body: []const u8) !void {
+fn writeJsonResponse(stream: RawSocket, body: []const u8, shutdown: ?*const std.atomic.Value(bool)) !void {
     var hdr_buf: [256]u8 = undefined;
     const hdr = try std.fmt.bufPrint(
         &hdr_buf,
         "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{body.len},
     );
-    try stream.writeAll(hdr);
-    try stream.writeAll(body);
+    try stream.writeAll(hdr, shutdown);
+    try stream.writeAll(body, shutdown);
 }
 
-fn writeVersion(stream: RawSocket) !void {
+fn writeVersion(stream: RawSocket, shutdown: ?*const std.atomic.Value(bool)) !void {
     const body =
         \\{"Browser":"js-bay/0.1","Protocol-Version":"1.3","V8-Version":"0","WebKit-Version":"0","User-Agent":"js-bay"}
     ;
-    try writeJsonResponse(stream, body);
+    try writeJsonResponse(stream, body, shutdown);
 }
 
 fn writeProtocol(t: *Transport, stream: RawSocket) !void {
-    try writeJsonResponse(stream, t.protocol_json);
+    try writeJsonResponse(stream, t.protocol_json, &t.shutdown);
 }
 
 fn writeTargetList(t: *Transport, stream: RawSocket) !void {
@@ -733,7 +845,7 @@ fn writeTargetList(t: *Transport, stream: RawSocket) !void {
         try w.writeByte(']');
     }
 
-    try writeJsonResponse(stream, aw.written());
+    try writeJsonResponse(stream, aw.written(), &t.shutdown);
 }
 
 fn writeJsonFmt(writer: anytype, comptime fmt: []const u8, args: anytype) !void {
@@ -763,7 +875,7 @@ fn writeJsonString(writer: anytype, s: []const u8) !void {
     try writer.writeByte('"');
 }
 
-fn writeWsAccept(stream: RawSocket, key: []const u8) !void {
+fn writeWsAccept(stream: RawSocket, key: []const u8, shutdown: ?*const std.atomic.Value(bool)) !void {
     // Sec-WebSocket-Accept = base64(sha1(key ++ WS_GUID))
     var sha = std.crypto.hash.Sha1.init(.{});
     sha.update(key);
@@ -780,7 +892,7 @@ fn writeWsAccept(stream: RawSocket, key: []const u8) !void {
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n",
         .{accept},
     );
-    try stream.writeAll(resp);
+    try stream.writeAll(resp, shutdown);
 }
 
 // -- Session lifecycle ---------------------------------------------------
@@ -874,11 +986,23 @@ fn writerLoop(sess: *Session) void {
             sess.queue_head = 0;
         }
         sess.queued_bytes -= frame.bytes.len;
+        const is_large = frame.bytes.len > sess.transport.max_backlog_bytes;
+        if (!is_large) {
+            sess.queued_backlog_bytes -= frame.bytes.len;
+        }
         sess.queue_mu.unlock();
 
         const ok = writeFrame(sess, frame.kind, frame.bytes);
         const close_after = frame.kind == .close;
         sess.allocator.free(frame.bytes);
+        if (is_large) {
+            sess.queue_mu.lock();
+            sess.large_message_in_flight = false;
+            sess.queue_mu.unlock();
+            if (sess.transport.delivery_observer) |obs| {
+                obs(sess.transport.delivery_observer_ctx, sess.id);
+            }
+        }
         if (!ok or close_after) {
             sess.requestClose();
             return;
@@ -886,11 +1010,14 @@ fn writerLoop(sess: *Session) void {
     }
 }
 
-fn waitSocket(stream: RawSocket, events: socket.PollEvent, deadline: ?i64, sess: ?*Session) !void {
+fn waitSocket(stream: RawSocket, events: socket.PollEvent, deadline: ?i64, sess: ?*Session, shutdown: ?*const std.atomic.Value(bool)) !void {
     while (true) {
         if (sess) |active| {
             // The close signal is Session-owned.  This path deliberately needs no transport lock while the writer is polling.
             if (active.closed.load(.acquire)) return error.Closed;
+        }
+        if (shutdown) |sd| {
+            if (sd.load(.acquire)) return error.Closed;
         }
         var timeout: i32 = io_poll_ms;
         if (deadline) |limit| {
@@ -925,9 +1052,9 @@ fn writeFrame(sess: *Session, kind: OutboundKind, payload: []const u8) bool {
         std.mem.writeInt(u64, header[2..10], payload.len, .big);
         header_len = 10;
     }
-    const deadline = @as(i64, @intCast(zev.monotonicMilliseconds())) + write_deadline_ms;
-    sess.stream.writeUntil(header[0..header_len], deadline, sess) catch return false;
-    sess.stream.writeUntil(payload, deadline, sess) catch return false;
+    const deadline = FrameDeadline.init(stall_timeout_ms, max_write_timeout_ms);
+    sess.stream.writeUntil(header[0..header_len], deadline, sess, null) catch return false;
+    sess.stream.writeUntil(payload, deadline, sess, null) catch return false;
     return true;
 }
 
@@ -970,6 +1097,11 @@ fn readLoop(sess: *Session) !bool {
             var ext: [8]u8 = undefined;
             try readExact(sess, &ext);
             payload_len = std.mem.readInt(u64, &ext, .big);
+        }
+
+        if (payload_len > t.max_message_bytes or payload_len > std.math.maxInt(usize)) {
+            sess.enqueueClose(1009);
+            return true;
         }
 
         // All client→server frames MUST be masked per RFC 6455.
@@ -1032,7 +1164,7 @@ fn readExact(sess: *Session, buf: []u8) !void {
         if (sess.closed.load(.acquire) or sess.transport.shutdown.load(.acquire)) return error.Closed;
         const n = sess.stream.read(buf[got..]) catch |err| switch (err) {
             error.WouldBlock => {
-                try waitSocket(sess.stream, .read, null, sess);
+                try waitSocket(sess.stream, .read, null, sess, null);
                 continue;
             },
             else => return err,
@@ -1050,6 +1182,9 @@ const transport_vtable: inspector.Transport.VTable = .{
     .close_session = interfaceCloseSession,
     .set_discovery_target = interfaceSetDiscoveryTarget,
     .bound_port = interfaceBoundPort,
+    .max_message_bytes = interfaceMaxMessageBytes,
+    .max_backlog_bytes = interfaceMaxBacklogBytes,
+    .set_delivery_observer = interfaceSetDeliveryObserver,
 };
 
 fn interfaceSelf(ctx: *anyopaque) *Transport {
@@ -1082,4 +1217,18 @@ fn interfaceSetDiscoveryTarget(ctx: *anyopaque, target: DiscoveryTarget) void {
 
 fn interfaceBoundPort(ctx: *anyopaque) u16 {
     return interfaceSelf(ctx).boundPort();
+}
+
+fn interfaceMaxMessageBytes(ctx: *anyopaque) usize {
+    return interfaceSelf(ctx).max_message_bytes;
+}
+
+fn interfaceMaxBacklogBytes(ctx: *anyopaque) usize {
+    return interfaceSelf(ctx).max_backlog_bytes;
+}
+
+fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId) void) void {
+    const self = interfaceSelf(ctx);
+    self.delivery_observer_ctx = observer_ctx;
+    self.delivery_observer = observer;
 }

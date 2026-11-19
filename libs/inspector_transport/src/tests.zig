@@ -143,3 +143,42 @@ test "transport: a failed accept-thread spawn rolls back the listener and allows
     try testing.expect(instance.boundPort() != 0);
     try testing.expect(instance.accept_thread != null);
 }
+
+test "transport: unknown route returns 404 and terminates cleanly" {
+    const instance = try transport.Transport.init(testing.allocator, 0);
+    defer instance.deinit();
+    try instance.start(null, ignoreStartEvents);
+
+    const client_stream = try connect(instance.boundPort());
+    defer client_stream.close();
+    try client_stream.writeAll("GET /nonexistent HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    const headers = try readHeaders(testing.allocator, client_stream);
+    defer testing.allocator.free(headers);
+    try testing.expect(std.mem.startsWith(u8, headers, "HTTP/1.1 404 Not Found"));
+}
+
+test "transport: bad request returns 400 and terminates cleanly" {
+    const instance = try transport.Transport.init(testing.allocator, 0);
+    defer instance.deinit();
+    try instance.start(null, ignoreStartEvents);
+
+    const client_stream = try connect(instance.boundPort());
+    defer client_stream.close();
+    try client_stream.writeAll("MALFORMED\r\n\r\n");
+    const headers = try readHeaders(testing.allocator, client_stream);
+    defer testing.allocator.free(headers);
+    try testing.expect(std.mem.startsWith(u8, headers, "HTTP/1.1 400 Bad Request"));
+}
+
+test "transport: headerless discovery request succeeds without panic" {
+    const instance = try transport.Transport.init(testing.allocator, 0);
+    defer instance.deinit();
+    try instance.start(null, ignoreStartEvents);
+
+    const client_stream = try connect(instance.boundPort());
+    defer client_stream.close();
+    try client_stream.writeAll("GET /json/version HTTP/1.1\r\n\r\n");
+    const headers = try readHeaders(testing.allocator, client_stream);
+    defer testing.allocator.free(headers);
+    try testing.expect(std.mem.startsWith(u8, headers, "HTTP/1.1 200 OK"));
+}

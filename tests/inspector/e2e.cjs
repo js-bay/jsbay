@@ -1352,6 +1352,31 @@ async function main() {
     }
 
     await runStep(
+      'large script source retrieval and session recovery',
+      async () => {
+        const largeParsed = disp.awaitEvent(message => message.method === 'Debugger.scriptParsed' && message.params?.url === 'cdp-large-e2e-source.js', timeoutMs, 'large-e2e-script');
+        disp.sendCommand(80, 'Runtime.evaluate', {
+          expression: `globalThis.__cdpLargeE2E = 99;\n/*${'y'.repeat(5 * 1024 * 1024)}*/\n//# sourceURL=cdp-large-e2e-source.js`,
+        });
+        const evaluated = await disp.awaitReply(80, timeoutMs, 'large-e2e-evaluate');
+        if (evaluated.error) throw new E2EError('large-e2e-evaluate', JSON.stringify(evaluated));
+        const scriptId = (await largeParsed).params.scriptId;
+        disp.sendCommand(81, 'Debugger.getScriptSource', { scriptId });
+        const sourceReply = await disp.awaitReply(81, timeoutMs, 'large-e2e-source');
+        if (!sourceReply.result || !sourceReply.result.scriptSource || !sourceReply.result.scriptSource.includes('globalThis.__cdpLargeE2E = 99;')) {
+          throw new E2EError('large-e2e-source', `expected scriptSource, got ${JSON.stringify(sourceReply)}`);
+        }
+        disp.sendCommand(82, 'Runtime.evaluate', { expression: '100 + 23' });
+        const afterReply = await disp.awaitReply(82, timeoutMs, 'after-large-e2e-evaluate');
+        if (afterReply.error || afterReply.result?.result?.value !== 123) {
+          throw new E2EError('after-large-e2e-evaluate', JSON.stringify(afterReply));
+        }
+        ok('large script source returns full content and keeps session alive');
+      },
+      'large-source-limit'
+    );
+
+    await runStep(
       'reconnect after debugger session close',
       async () => {
         client.sendClose(1000, 'debugger-flow-reconnect');

@@ -228,23 +228,22 @@ fn writeMaskedText(stream: Stream, text: []const u8) !void {
 
 fn readTextFrame(alloc: std.mem.Allocator, stream: Stream) ![]u8 {
     var header: [2]u8 = undefined;
-    header[0] = try stream.readByte();
-    header[1] = try stream.readByte();
+    try stream.readAll(&header);
     try testing.expectEqual(@as(u8, 0x1), header[0] & 0x0f);
     try testing.expect((header[1] & 0x80) == 0);
     var len: u64 = header[1] & 0x7f;
     if (len == 126) {
         var extended: [2]u8 = undefined;
-        for (&extended) |*byte| byte.* = try stream.readByte();
+        try stream.readAll(&extended);
         len = std.mem.readInt(u16, &extended, .big);
     } else if (len == 127) {
         var extended: [8]u8 = undefined;
-        for (&extended) |*byte| byte.* = try stream.readByte();
+        try stream.readAll(&extended);
         len = std.mem.readInt(u64, &extended, .big);
     }
     const text = try alloc.alloc(u8, @intCast(len));
     errdefer alloc.free(text);
-    for (text) |*byte| byte.* = try stream.readByte();
+    try stream.readAll(text);
     return text;
 }
 
@@ -687,6 +686,114 @@ test "transport: a slow session filling its budget does not block a second sessi
     const received = try readTextFrame(alloc, fast);
     defer alloc.free(received);
     try testing.expectEqualStrings("governance-fast-session", received);
+}
+
+test "transport: single message exceeding budget is rejected without dropping session" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_message_bytes = 4 * 1024 * 1024 });
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "oversize-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "oversize-peer");
+    const session = opened.wait(1);
+
+    const large = try alloc.alloc(u8, 5 * 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'z');
+
+    try testing.expect(!t.sendText(session, large));
+    try testing.expect(t.sendText(session, "governance-recovered-after-oversize"));
+    const received = try readTextFrame(alloc, peer);
+    defer alloc.free(received);
+    try testing.expectEqualStrings("governance-recovered-after-oversize", received);
+}
+
+test "transport: large message within 64 MiB limit is delivered successfully and allows concurrent small messages" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "large-deliver-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "large-deliver-peer");
+    const session = opened.wait(1);
+
+    // 10 MiB exceeds default 8 MiB backlog, exercising the large message path (is_large = true).
+    const large = try alloc.alloc(u8, 10 * 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'w');
+
+    try testing.expect(t.sendText(session, large));
+    // Small message sent while large message is in flight must not trigger backlog rejection or close session.
+    try testing.expect(t.sendText(session, "concurrent-small-notification"));
+
+    const received_large = try readTextFrame(alloc, peer);
+    defer alloc.free(received_large);
+    try testing.expectEqualStrings(large, received_large);
+
+    const received_small = try readTextFrame(alloc, peer);
+    defer alloc.free(received_small);
+    try testing.expectEqualStrings("concurrent-small-notification", received_small);
+}
+
+test "transport: second large message is rejected while first large message is in flight" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    // Use smaller limits to test gating deterministically: 64 KiB backlog, 2 MiB max message.
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 64 * 1024, .max_message_bytes = 2 * 1024 * 1024 });
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "large-in-flight-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "large-in-flight-peer");
+    const session = opened.wait(1);
+
+    try peer.setReceiveBuffer(4096);
+    const large1 = try alloc.alloc(u8, 512 * 1024);
+    defer alloc.free(large1);
+    @memset(large1, 'a');
+
+    const large2 = try alloc.alloc(u8, 128 * 1024);
+    defer alloc.free(large2);
+    @memset(large2, 'b');
+
+    try testing.expect(t.sendText(session, large1));
+    // Second large message while first is in flight must be rejected.
+    try testing.expect(!t.sendText(session, large2));
+
+    const received1 = try readTextFrame(alloc, peer);
+    defer alloc.free(received1);
+    try testing.expectEqualStrings(large1, received1);
+
+    // After draining, large messages are accepted again.
+    var accepted = false;
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        if (t.sendText(session, large2)) {
+            accepted = true;
+            break;
+        }
+        zev.sleepMilliseconds(1);
+    }
+    try testing.expect(accepted);
+    const received2 = try readTextFrame(alloc, peer);
+    defer alloc.free(received2);
+    try testing.expectEqualStrings(large2, received2);
 }
 
 test "transport: a broadcast snapshot allocation failure releases every retained session" {
