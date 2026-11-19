@@ -572,7 +572,6 @@ test "inspector: returnByValue serializes shared references as a DAG, not a cycl
     }
 }
 
-
 const ByValueFailWriter = struct {
     fail_at_byte: usize,
     byte_calls: usize = 0,

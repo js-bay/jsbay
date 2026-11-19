@@ -482,7 +482,6 @@ pub fn objectIdentity(_: Context, v: Value) ?u64 {
     return if (id == 0) null else id;
 }
 
-
 pub fn newArray(ctx: Context, len: u32) ?Value {
     const arr = qjs.JS_NewArray(ctx);
     if (c.jsIsException(arr)) {

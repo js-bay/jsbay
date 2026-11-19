@@ -927,6 +927,7 @@ fn preparePatchedQuickJsNg(b: *std.Build, tool: *std.Build.Step.Compile) std.Bui
     run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-unresolve-modules.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-pending-tla-module.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-promise-interrupt.patch"));
     return out;
 }
 
@@ -952,6 +953,7 @@ fn preparePatchedQuickJs(b: *std.Build, tool: *std.Build.Step.Compile) std.Build
     run.addFileArg(b.path("vendor/quickjs-debug-receiver.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-step.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
+    run.addFileArg(b.path("vendor/quickjs-promise-interrupt.patch"));
     return out;
 }
 
@@ -1126,7 +1128,6 @@ fn addQuickJsCSources(
     if (asan and hostLinuxX64CanLinkGccAsan(m)) linkHostLinuxAsanRuntime(b, m);
 }
 
-
 fn hostLinuxX64CanLinkGccAsan(m: *std.Build.Module) bool {
     const builtin = @import("builtin");
     if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return false;
@@ -1219,6 +1220,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-dataview-native.patch"));
             hash.update(@embedFile("vendor/quickjs-heap-labels.patch"));
             hash.update(@embedFile("vendor/quickjs-promise-then.patch"));
+            hash.update(@embedFile("vendor/quickjs-promise-interrupt.patch"));
             hash.update(@embedFile("vendor/quickjs-inspector-off.patch"));
             hash.update(@embedFile("vendor/quickjs-transfer-neuter.patch"));
             hash.update(@embedFile("vendor/quickjs-error-stack-header.patch"));
@@ -1251,6 +1253,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-unresolve-modules.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-pending-tla-module.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-promise-interrupt.patch"));
             hash.update(@embedFile("src/backend/quickjs_ng/qjs_wrapper_ng.c"));
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
             hash.update(@embedFile("src/backend/quickjs_common/bytecode.zig"));

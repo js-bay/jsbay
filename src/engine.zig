@@ -809,7 +809,6 @@ fn clearEngineHandles(instance: *instance_map.EngineInstance) void {
 
 /// Free the scheduler and JS runtime for an instance. The caller has already stopped the engine thread, or is that thread and has left the JS call.
 pub fn destroyRuntime(instance_id: i32) void {
-
     if (comptime backend.isEscargotBackend(backend.active_backend)) {
         if (@hasDecl(ActiveEngine, "threadEnter")) ActiveEngine.threadEnter();
     }

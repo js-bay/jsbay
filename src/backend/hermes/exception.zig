@@ -63,7 +63,7 @@ fn dispatchError(instance_id: i32, kind: types.ErrorKind, promise: Value, reason
 }
 
 fn onObserver(instance_id: i32, kind: i32, promise: Value, reason: Value, _: ?*anyopaque) callconv(.c) bool {
-    const k: types.ErrorKind = @enumFromInt(kind);
+    const k: types.ErrorKind = @fromBackingInt(@intCast(kind));
     return dispatchError(instance_id, k, promise, reason);
 }
 

@@ -1,0 +1,12 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -55950,6 +55950,9 @@
+     ret = JS_Call(ctx, executor, JS_UNDEFINED, 2, vc(args));
+     if (JS_IsException(ret)) {
+         JSValue ret2, error;
++        /* Host interrupts must unwind instead of becoming Promise rejections. */
++        if (JS_IsUncatchableError(ctx->rt->current_exception))
++            goto fail;
+         error = JS_GetException(ctx);
+         ret2 = JS_Call(ctx, args[1], JS_UNDEFINED, 1, vc(&error));
+         JS_FreeValue(ctx, error);
