@@ -62,6 +62,35 @@ pub fn instanceIdFromCtx(ctx: jsc.JSGlobalContextRef) i32 {
 //
 // These are file-level helpers used by every other submodule. They are also re-exported via `JscBackend.{jsStringFromSlice, valueToString, jsonStringify, jsonParse, formatException}` so external call sites such as cjs.zig keep working unchanged.
 
+// Vectorized ASCII transcode: zero-extends 16 ASCII bytes at a time, falling back to standard UTF-8 decoding for multibyte sequences.
+fn fastUtf8ToUtf16(dst: []jsc.JSChar, src: []const u8) !usize {
+    var i: usize = 0;
+    var out_i: usize = 0;
+    const VEC_SIZE = 16;
+    const ascii_mask: @Vector(VEC_SIZE, u8) = @splat(0x80);
+
+    while (i + VEC_SIZE <= src.len and out_i + VEC_SIZE <= dst.len) {
+        const chunk: @Vector(VEC_SIZE, u8) = src[i..][0..VEC_SIZE].*;
+        if (@reduce(.And, chunk < ascii_mask)) {
+            const widened: @Vector(VEC_SIZE, u16) = chunk;
+            dst[out_i..][0..VEC_SIZE].* = @bitCast(widened);
+            i += VEC_SIZE;
+            out_i += VEC_SIZE;
+        } else {
+            const seq_len = try std.unicode.utf8ByteSequenceLength(src[i]);
+            if (i + seq_len > src.len) return error.Utf8InvalidStartByte;
+            const written = try std.unicode.utf8ToUtf16Le(dst[out_i..], src[i .. i + seq_len]);
+            i += seq_len;
+            out_i += written;
+        }
+    }
+    if (i < src.len) {
+        const rem = try std.unicode.utf8ToUtf16Le(dst[out_i..], src[i..]);
+        out_i += rem;
+    }
+    return out_i;
+}
+
 pub fn jsStringFromSlice(s: []const u8) jsc.JSStringRef {
     // JSStringCreateWithUTF8CString stops at the first 0. UTF-16 with an explicit length keeps embedded 0x00. JSC copies the units, so the temporary buffer does not outlive this call.
     if (fail_next_typed_string_for_testing.swap(false, .acq_rel)) return null;
@@ -69,14 +98,15 @@ pub fn jsStringFromSlice(s: []const u8) jsc.JSStringRef {
         const dummy = [_]jsc.JSChar{0};
         return jsc.JSStringCreateWithCharacters(&dummy, 0);
     }
-    if (s.len <= 256) {
-        var stack_buf: [256]jsc.JSChar = undefined;
-        const count = std.unicode.utf8ToUtf16Le(&stack_buf, s) catch return null;
+    if (s.len <= 1024) {
+        var stack_buf: [1024]jsc.JSChar = undefined;
+        const count = fastUtf8ToUtf16(&stack_buf, s) catch return null;
         return jsc.JSStringCreateWithCharacters(&stack_buf, count);
     }
-    const utf16 = std.unicode.utf8ToUtf16LeAlloc(std.heap.c_allocator, s) catch return null;
+    const utf16 = std.heap.c_allocator.alloc(jsc.JSChar, s.len) catch return null;
     defer std.heap.c_allocator.free(utf16);
-    return jsc.JSStringCreateWithCharacters(utf16.ptr, utf16.len);
+    const count = fastUtf8ToUtf16(utf16, s) catch return null;
+    return jsc.JSStringCreateWithCharacters(utf16.ptr, count);
 }
 
 var fail_next_typed_string_for_testing = std.atomic.Value(bool).init(false);

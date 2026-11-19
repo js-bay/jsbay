@@ -34,6 +34,9 @@ pub const InstallResult = union(enum) { installed: Installed, exception: backend
 
 var mutex: sync.Mutex = .{};
 var bindings: std.ArrayList(?*Binding) = .empty;
+const INLINE_HANDLES_CAP: usize = 8;
+var jsc_mic_key: usize = 0;
+var jsc_mic_binding: ?Binding = null;
 
 fn statusException(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) backend.ActiveEngine.Value {
     const m = backend.ActiveEngineModule;
@@ -242,19 +245,26 @@ fn spikeTrampoline(ctx: backend.ActiveEngine.Context, this_val: backend.ActiveEn
     const binding = copy(slot) orelse return spikeThrow(ctx, "native binding is gone");
     const borrowed_this = api_value.putBorrowed(binding.instance_id, this_val) orelse return spikeThrow(ctx, "out of memory");
     defer api_value.revokeBorrowed(borrowed_this);
-    var handles = std.ArrayList(u64).empty;
-    defer handles.deinit(std.heap.c_allocator);
-    handles.ensureTotalCapacity(std.heap.c_allocator, argc) catch return spikeThrow(ctx, "out of memory");
-    defer for (handles.items) |handle| api_value.revokeBorrowed(handle);
-    var i: usize = 0;
-    while (i < argc) : (i += 1) {
-        const arg = if (args) |a| a[i] else null;
+    var stack_handles: [INLINE_HANDLES_CAP]u64 = undefined;
+    var heap_handles: ?[]u64 = null;
+    defer if (heap_handles) |h| std.heap.c_allocator.free(h);
+    const handles_slice = if (argc <= INLINE_HANDLES_CAP)
+        stack_handles[0..argc]
+    else blk: {
+        const h = std.heap.c_allocator.alloc(u64, argc) catch return spikeThrow(ctx, "out of memory");
+        heap_handles = h;
+        break :blk h;
+    };
+    var borrowed_count: usize = 0;
+    defer for (handles_slice[0..borrowed_count]) |handle| api_value.revokeBorrowed(handle);
+    while (borrowed_count < argc) : (borrowed_count += 1) {
+        const arg = if (args) |a| a[borrowed_count] else null;
         const handle = api_value.putBorrowed(binding.instance_id, arg) orelse return spikeThrow(ctx, "out of memory");
-        handles.appendAssumeCapacity(handle);
+        handles_slice[borrowed_count] = handle;
     }
     var result: u64 = 0;
     var thrown: u64 = 0;
-    const rc = binding.callback(binding.instance_id, binding.user_data, borrowed_this, argc, if (argc == 0) null else handles.items.ptr, &result, &thrown);
+    const rc = binding.callback(binding.instance_id, binding.user_data, borrowed_this, argc, if (argc == 0) null else handles_slice.ptr, &result, &thrown);
     if (rc == 0 and result != 0 and thrown == 0) {
         const owned = api_value.takeOwnedOrSynthesize(binding.instance_id, result) orelse return spikeThrow(ctx, "invalid native callback result");
         if (owned.instance_id != binding.instance_id) {
@@ -375,6 +385,10 @@ fn kill(slot: usize) void {
 
 fn killFunction(key: usize) void {
     mutex.lock();
+    if (jsc_mic_key == key) {
+        jsc_mic_key = 0;
+        jsc_mic_binding = null;
+    }
     var retired: ?*Binding = null;
     for (bindings.items) |*entry| {
         const binding = entry.* orelse continue;
@@ -390,6 +404,14 @@ fn killFunction(key: usize) void {
 
 pub fn dropInstance(id: i32) void {
     // Detach one binding at a time so teardown never allocates.  A finalizer is arbitrary host code and therefore always runs after releasing the registry lock.
+    mutex.lock();
+    if (jsc_mic_binding) |b| {
+        if (b.instance_id == id) {
+            jsc_mic_key = 0;
+            jsc_mic_binding = null;
+        }
+    }
+    mutex.unlock();
     while (true) {
         mutex.lock();
         var retired: ?*Binding = null;
@@ -424,20 +446,27 @@ fn trampoline(ctx: ?*qjs.JSContext, this_value: qjs.JSValue, argc: c_int, argv: 
     if (m.qjs.JS_ToInt64(ctx, &slot_i64, func_data[0]) < 0 or slot_i64 < 0) return m.c_api.JS_EXCEPTION;
     const binding = copy(@intCast(slot_i64)) orelse return statusException(ctx, "native binding is gone");
     const count: usize = if (argc > 0) @intCast(argc) else 0;
-    var handles = std.ArrayList(u64).empty;
-    defer handles.deinit(std.heap.c_allocator);
-    handles.ensureTotalCapacity(std.heap.c_allocator, count) catch return m.qjs.JS_ThrowOutOfMemory(ctx);
     const borrowed_this = api_value.putBorrowed(binding.instance_id, this_value) orelse return m.qjs.JS_ThrowOutOfMemory(ctx);
     defer api_value.revokeBorrowed(borrowed_this);
-    defer for (handles.items) |handle| api_value.revokeBorrowed(handle);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const handle = api_value.putBorrowed(binding.instance_id, argv[i]) orelse return m.qjs.JS_ThrowOutOfMemory(ctx);
-        handles.appendAssumeCapacity(handle);
+    var stack_handles: [INLINE_HANDLES_CAP]u64 = undefined;
+    var heap_handles: ?[]u64 = null;
+    defer if (heap_handles) |h| std.heap.c_allocator.free(h);
+    const handles_slice = if (count <= INLINE_HANDLES_CAP)
+        stack_handles[0..count]
+    else blk: {
+        const h = std.heap.c_allocator.alloc(u64, count) catch return m.qjs.JS_ThrowOutOfMemory(ctx);
+        heap_handles = h;
+        break :blk h;
+    };
+    var borrowed_count: usize = 0;
+    defer for (handles_slice[0..borrowed_count]) |handle| api_value.revokeBorrowed(handle);
+    while (borrowed_count < count) : (borrowed_count += 1) {
+        const handle = api_value.putBorrowed(binding.instance_id, argv[borrowed_count]) orelse return m.qjs.JS_ThrowOutOfMemory(ctx);
+        handles_slice[borrowed_count] = handle;
     }
     var result: u64 = 0;
     var exception: u64 = 0;
-    const rc = binding.callback(binding.instance_id, binding.user_data, borrowed_this, count, if (count == 0) null else handles.items.ptr, &result, &exception);
+    const rc = binding.callback(binding.instance_id, binding.user_data, borrowed_this, count, if (count == 0) null else handles_slice.ptr, &result, &exception);
     if (rc == 0 and result != 0 and exception == 0) {
         const value = api_value.takeOwnedOrSynthesize(binding.instance_id, result) orelse return statusException(ctx, "invalid native callback result");
         if (value.instance_id != binding.instance_id) {
@@ -463,29 +492,45 @@ fn jscTrampoline(ctx: jsc.JSContextRef, function: jsc.JSObjectRef, this_value: j
     const key = @intFromPtr(function orelse return common.throwError(ctx, exception, "native binding is gone"));
     var binding: ?Binding = null;
     mutex.lock();
-    for (bindings.items) |entry| {
-        const item = entry orelse continue;
-        if (item.function_key == key and item.alive) {
-            binding = item.*;
-            break;
+    if (jsc_mic_key == key) {
+        if (jsc_mic_binding) |b| {
+            if (b.alive) binding = b;
+        }
+    }
+    if (binding == null) {
+        for (bindings.items) |entry| {
+            const item = entry orelse continue;
+            if (item.function_key == key and item.alive) {
+                binding = item.*;
+                jsc_mic_key = key;
+                jsc_mic_binding = binding;
+                break;
+            }
         }
     }
     mutex.unlock();
     const live = binding orelse return common.throwError(ctx, exception, "native binding is gone");
     const borrowed_this = api_value.putBorrowed(live.instance_id, this_value) orelse return common.throwError(ctx, exception, "out of memory");
     defer api_value.revokeBorrowed(borrowed_this);
-    var handles = std.ArrayList(u64).empty;
-    defer handles.deinit(std.heap.c_allocator);
-    handles.ensureTotalCapacity(std.heap.c_allocator, argc) catch return common.throwError(ctx, exception, "out of memory");
-    defer for (handles.items) |handle| api_value.revokeBorrowed(handle);
-    var i: usize = 0;
-    while (i < argc) : (i += 1) {
-        const handle = api_value.putBorrowed(live.instance_id, argv[i]) orelse return common.throwError(ctx, exception, "out of memory");
-        handles.appendAssumeCapacity(handle);
+    var stack_handles: [INLINE_HANDLES_CAP]u64 = undefined;
+    var heap_handles: ?[]u64 = null;
+    defer if (heap_handles) |h| std.heap.c_allocator.free(h);
+    const handles_slice = if (argc <= INLINE_HANDLES_CAP)
+        stack_handles[0..argc]
+    else blk: {
+        const h = std.heap.c_allocator.alloc(u64, argc) catch return common.throwError(ctx, exception, "out of memory");
+        heap_handles = h;
+        break :blk h;
+    };
+    var borrowed_count: usize = 0;
+    defer for (handles_slice[0..borrowed_count]) |handle| api_value.revokeBorrowed(handle);
+    while (borrowed_count < argc) : (borrowed_count += 1) {
+        const handle = api_value.putBorrowed(live.instance_id, argv[borrowed_count]) orelse return common.throwError(ctx, exception, "out of memory");
+        handles_slice[borrowed_count] = handle;
     }
     var result: u64 = 0;
     var thrown: u64 = 0;
-    const rc = live.callback(live.instance_id, live.user_data, borrowed_this, argc, if (argc == 0) null else handles.items.ptr, &result, &thrown);
+    const rc = live.callback(live.instance_id, live.user_data, borrowed_this, argc, if (argc == 0) null else handles_slice.ptr, &result, &thrown);
     if (rc == 0 and result != 0 and thrown == 0) {
         const owned = api_value.takeOwnedOrSynthesize(live.instance_id, result) orelse return common.throwError(ctx, exception, "invalid native callback result");
         if (owned.instance_id != live.instance_id) {

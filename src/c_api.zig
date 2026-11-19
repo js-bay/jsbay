@@ -513,6 +513,7 @@ test "c_api: direct register call trampolines call_0 through call_4" {
     const id = helpers.nextInstanceId();
     try std.testing.expect(jsbay_engine_create(id, null, null));
     defer jsbay_engine_destroy(id);
+    const HV = value_mod.HyperValue;
 
     var und: u64 = 0;
     try std.testing.expectEqual(API_OK, jsbay_value_undefined(id, &und));
@@ -582,6 +583,15 @@ test "c_api: direct register call trampolines call_0 through call_4" {
     defer _ = jsbay_value_release(r4);
     try std.testing.expectEqual(API_OK, jsbay_value_to_number(r4, &n));
     try std.testing.expectEqual(@as(f64, 41), n);
+
+    // Direct unboxed primitive arguments bypass handle table completely
+    const unboxed_a = HV.fromInt32(50).raw;
+    const unboxed_b = HV.fromInt32(25).raw;
+    var r_unboxed: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_call_2(fn2, und, unboxed_a, unboxed_b, &r_unboxed, &ex));
+    defer _ = jsbay_value_release(r_unboxed);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(r_unboxed, &n));
+    try std.testing.expectEqual(@as(f64, 75), n);
 }
 
 test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/new_error" {

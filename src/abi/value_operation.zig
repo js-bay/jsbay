@@ -8,6 +8,8 @@ const packed_api_value = @import("packed_api_value.zig");
 const api_backend = @import("api_backend.zig");
 const typed_bytecode = @import("../script/typed_bytecode.zig");
 const host_wake = @import("js_event_loop").host_wake;
+const hyper_box = @import("hyper_box");
+const HyperValue = hyper_box.Value;
 const ActiveEngine = backend.ActiveEngine;
 
 /// Boundary-owned status numbers and C byte layout are supplied once by c_api; this module never imports the export layer. This is not a backend or handle-store abstraction.
@@ -133,6 +135,18 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
         }
 
         pub fn pinValue(op: ApiOp, handle: u64) union(enum) { ok: ActiveEngine.Value, status: c_int } {
+            const val = HyperValue{ .raw = handle };
+            if (val.isPrimitive()) {
+                if (val.isUndefined()) return .{ .ok = ActiveEngine.undefinedValue() };
+                if (val.isNull()) return .{ .ok = ActiveEngine.nullValue() };
+                if (val.isBool()) return .{ .ok = ActiveEngine.newBoolVal(op.ctx, val.asBool()) };
+                if (val.isInt32()) return .{ .ok = ActiveEngine.newInt32Val(op.ctx, val.asInt32()) };
+                if (val.isDouble()) return .{ .ok = ActiveEngine.newFloat64Val(op.ctx, val.asFloat()) };
+                if (val.isSso()) {
+                    const sso_buf = val.asSsoBytes();
+                    return .{ .ok = ActiveEngine.newStringVal(op.ctx, sso_buf.slice()) };
+                }
+            }
             const entry = api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
             if (entry.instance_id != op.id) return .{ .status = API_STALE_VALUE };
             return .{ .ok = ActiveEngine.dupValue(op.ctx, entry.value) };
