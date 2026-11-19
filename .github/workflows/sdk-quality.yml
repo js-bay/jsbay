@@ -44,6 +44,7 @@ jobs:
         uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721
         with:
           version: 5.0.13.200
+          cache: true
       - name: Install OpenHarmony API 12 SDK
         id: ohos
         uses: openharmony-rs/setup-ohos-sdk@b312caf8a43bb836aa24c08f65f97e1f09a89cad
@@ -65,7 +66,8 @@ jobs:
           export JSBAY_LIBRARY="$RUNNER_TEMP/harmony-core/lib/libjsbay.a"
           export JSBAY_HARMONY_ARCHIVE="$JSBAY_LIBRARY"
           export AR="$API12_SDK/native/llvm/bin/llvm-ar"
-          export NODE_PATH="$HOME/ohos-sdk/command-line-tools/tools/hvigor/node_modules"
+          find "$HOME/ohos-sdk/command-line-tools" -path '*/@ohos/hvigor/package.json' -print
+          unset NODE_PATH
           bash scripts/stage-harmony-har.sh "$RUNNER_TEMP/harmony-har-${QUICKJS_BACKEND}" "ci-${QUICKJS_BACKEND}-${GITHUB_SHA:0:12}"
       - name: Preserve HAR
         uses: actions/upload-artifact@v6
