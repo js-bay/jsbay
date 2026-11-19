@@ -769,10 +769,16 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run js-bay benchmarks");
     bench_step.dependOn(&run_bench.step);
 
+    const ms_hyper_box_dep = b.dependency("hyper_box", .{ .target = target, .optimize = .ReleaseFast });
+    const ms_hyper_box = ms_hyper_box_dep.module("hyper_box");
+    const ms_cmph_dep = b.dependency("cmph", .{ .target = target, .optimize = .ReleaseFast });
+    const ms_cmph = ms_cmph_dep.module("cmph");
+    const ms_simd_utf_dep = b.dependency("simd_utf", .{ .target = target, .optimize = .ReleaseFast });
+    const ms_simd_utf = ms_simd_utf_dep.module("simd_utf");
     const bit_matrix_mod = b.createModule(.{
         .root_source_file = b.path("src/runtime/bit_matrix.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseFast,
     });
     const ms_bench_module = b.createModule(.{
         .root_source_file = b.path("bench/mechanical_sympathy.zig"),
@@ -780,9 +786,9 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
         .link_libc = true,
     });
-    ms_bench_module.addImport("hyper_box", hyper_box);
-    ms_bench_module.addImport("cmph", cmph);
-    ms_bench_module.addImport("simd_utf", simd_utf);
+    ms_bench_module.addImport("hyper_box", ms_hyper_box);
+    ms_bench_module.addImport("cmph", ms_cmph);
+    ms_bench_module.addImport("simd_utf", ms_simd_utf);
     ms_bench_module.addImport("bit_matrix", bit_matrix_mod);
     const ms_bench_exe = b.addExecutable(.{
         .name = "bench-roi",

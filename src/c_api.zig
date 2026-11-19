@@ -3323,7 +3323,11 @@ pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_except
         const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
         defer std.heap.c_allocator.free(key_z);
         var value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const value_len = packedDupBytes(value, data.js.id, data.js.tag, value_buf[0..]) orelse return API_STALE_VALUE;
+        const value_len = switch (packedDupBytes(value, data.js.id, data.js.tag, value_buf[0..])) {
+            .ok => |len| len,
+            .out_of_memory => return API_OUT_OF_MEMORY,
+            .stale => return API_STALE_VALUE,
+        };
         // valueSetProperty consumes the duplicated value.
         const result = @import("backend_dispatch.zig").valueSetProperty(data.js.tag, data.js.ctx_addr, data.bytes(), key_z, value_buf[0..value_len]);
         if (!drainPackedJobs(&data.js)) {
@@ -3373,7 +3377,11 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         };
         defer data.deinit();
         var this_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const this_len = packedDupBytes(this_value, data.js.id, data.js.tag, this_buf[0..]) orelse return API_STALE_VALUE;
+        const this_len = switch (packedDupBytes(this_value, data.js.id, data.js.tag, this_buf[0..])) {
+            .ok => |len| len,
+            .out_of_memory => return API_OUT_OF_MEMORY,
+            .stale => return API_STALE_VALUE,
+        };
         defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, this_buf[0..this_len]);
 
         var stack_storage: [INLINE_ARGS_CAP][@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
@@ -3402,7 +3410,11 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
             if (argc <= INLINE_ARGS_CAP) {
                 for (raw_args[0..argc], 0..) |handle, idx| {
                     if (!isPackedOperand(handle)) return API_STALE_VALUE;
-                    const len = packedDupBytes(handle, data.js.id, data.js.tag, stack_storage[idx][0..]) orelse return API_STALE_VALUE;
+                    const len = switch (packedDupBytes(handle, data.js.id, data.js.tag, stack_storage[idx][0..])) {
+                        .ok => |l| l,
+                        .out_of_memory => return API_OUT_OF_MEMORY,
+                        .stale => return API_STALE_VALUE,
+                    };
                     stack_lens[idx] = len;
                     stack_slices[idx] = stack_storage[idx][0..len];
                     duped_count += 1;
@@ -3411,7 +3423,11 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
                 for (raw_args[0..argc]) |handle| {
                     if (!isPackedOperand(handle)) return API_STALE_VALUE;
                     var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-                    const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
+                    const len = switch (packedDupBytes(handle, data.js.id, data.js.tag, buf[0..])) {
+                        .ok => |l| l,
+                        .out_of_memory => return API_OUT_OF_MEMORY,
+                        .stale => return API_STALE_VALUE,
+                    };
                     heap_storage.append(data.js.allocator, buf) catch {
                         @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                         return API_OUT_OF_MEMORY;
@@ -3561,7 +3577,11 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
             if (argc <= INLINE_ARGS_CAP) {
                 for (raw_args[0..argc], 0..) |handle, idx| {
                     if (!isPackedOperand(handle)) return API_STALE_VALUE;
-                    const len = packedDupBytes(handle, data.js.id, data.js.tag, stack_storage[idx][0..]) orelse return API_STALE_VALUE;
+                    const len = switch (packedDupBytes(handle, data.js.id, data.js.tag, stack_storage[idx][0..])) {
+                        .ok => |l| l,
+                        .out_of_memory => return API_OUT_OF_MEMORY,
+                        .stale => return API_STALE_VALUE,
+                    };
                     stack_lens[idx] = len;
                     stack_slices[idx] = stack_storage[idx][0..len];
                     duped_count += 1;
@@ -3570,7 +3590,11 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
                 for (raw_args[0..argc]) |handle| {
                     if (!isPackedOperand(handle)) return API_STALE_VALUE;
                     var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-                    const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
+                    const len = switch (packedDupBytes(handle, data.js.id, data.js.tag, buf[0..])) {
+                        .ok => |l| l,
+                        .out_of_memory => return API_OUT_OF_MEMORY,
+                        .stale => return API_STALE_VALUE,
+                    };
                     heap_storage.append(data.js.allocator, buf) catch {
                         @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
                         return API_OUT_OF_MEMORY;
@@ -3762,7 +3786,11 @@ pub export fn jsbay_value_instance_of(value: u64, constructor: u64, out_result: 
         };
         defer data.deinit();
         var ctor_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const ctor_len = packedDupBytes(constructor, data.js.id, data.js.tag, ctor_buf[0..]) orelse return API_STALE_VALUE;
+        const ctor_len = switch (packedDupBytes(constructor, data.js.id, data.js.tag, ctor_buf[0..])) {
+            .ok => |l| l,
+            .out_of_memory => return API_OUT_OF_MEMORY,
+            .stale => return API_STALE_VALUE,
+        };
         defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, ctor_buf[0..ctor_len]);
         const result = @import("backend_dispatch.zig").valueInstanceOf(data.js.tag, data.js.ctx_addr, data.bytes(), ctor_buf[0..ctor_len]);
         if (!drainPackedJobs(&data.js)) {

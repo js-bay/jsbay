@@ -428,26 +428,34 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
             return API_OK;
         }
 
-        pub fn packedDupBytes(handle: u64, expect_instance: i32, expect_tag: backend.BackendType, out: []u8) ?usize {
+        pub const PackedDupResult = union(enum) {
+            ok: usize,
+            stale: void,
+            out_of_memory: void,
+        };
+
+        pub fn packedDupBytes(handle: u64, expect_instance: i32, expect_tag: backend.BackendType, out: []u8) PackedDupResult {
             const val = HyperValue{ .raw = handle };
             if (val.isSso()) {
                 const sso_buf = val.asSsoBytes();
-                const handles = packedHandlesOf(expect_instance) orelse return null;
+                const handles = packedHandlesOf(expect_instance) orelse return .stale;
                 const res = @import("../backend_dispatch.zig").valueNewString(expect_tag, handles.ctx_addr, sso_buf.slice());
+                if (res.out_of_memory) return .out_of_memory;
                 if (res.exception) |e| @import("../backend_dispatch.zig").timerFreeValue(expect_tag, handles.ctx_addr, e.slice());
                 if (res.value) |v| {
                     if (out.len < v.len) {
                         @import("../backend_dispatch.zig").timerFreeValue(expect_tag, handles.ctx_addr, v.slice());
-                        return null;
+                        return .out_of_memory;
                     }
                     @memcpy(out[0..v.len], v.bytes[0..v.len]);
-                    return v.len;
+                    return .{ .ok = v.len };
                 }
-                return null;
+                return .stale;
             }
-            const entry = packed_api_value.get(handle) orelse return null;
-            if (entry.instance_id != expect_instance or entry.tag != expect_tag) return null;
-            return @import("../backend_dispatch.zig").timerDupValue(entry.tag, entry.ctx_addr, entry.bytes(), out);
+            const entry = packed_api_value.get(handle) orelse return .stale;
+            if (entry.instance_id != expect_instance or entry.tag != expect_tag) return .stale;
+            const len = @import("../backend_dispatch.zig").timerDupValue(entry.tag, entry.ctx_addr, entry.bytes(), out) orelse return .stale;
+            return .{ .ok = len };
         }
 
         pub fn packedInstanceReady(instance_id: i32) union(enum) {
