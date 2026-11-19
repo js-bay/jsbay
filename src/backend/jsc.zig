@@ -381,6 +381,7 @@ pub const JSContextGroupSetExecutionTimeLimit = runtime_control_mod.JSContextGro
 pub const JSContextGroupClearExecutionTimeLimit = runtime_control_mod.JSContextGroupClearExecutionTimeLimit;
 pub const JscInterruptState = runtime_control_mod.JscInterruptState;
 pub const jscInstallInterruptHandler = runtime_control_mod.jscInstallInterruptHandler;
+pub const jscArmWatchdogPeriod = runtime_control_mod.jscArmWatchdogPeriod;
 pub const jscUninstallInterruptHandler = runtime_control_mod.jscUninstallInterruptHandler;
 pub const jscRunGc = runtime_control_mod.jscRunGc;
 

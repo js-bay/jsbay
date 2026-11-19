@@ -2,7 +2,73 @@
 
 Create an `Engine` and use its values from one ArkTS Worker. Production hosts should keep the engine off the UI ability thread; the Worker example under `examples/` is the recommended pattern. Owner-thread observability: `getMemoryUsage()`, `runGc()`, and `setEventHandler`. Same-process native faults still terminate the host process — see `docs/host-isolation.md`.
 
+When consuming the packaged bytecode HAR, set `app.products[].runtimeOS` to `HarmonyOS` and enable `app.buildModeSet[].buildOption.strictMode.useNormalizedOHMUrl` in the consumer app's `build-profile.json5`. Hvigor requires normalized OHM URLs for projects that depend on a bytecode HAR; see [Huawei's HAR build guidance](https://developer.huawei.com/consumer/en/doc/harmonyos-guides/ide-hvigor-build-har/). The fixture at `tests/harmony-sdk/fixture/build-profile.json5` shows the required settings.
+
 Create an `Engine` and use its values from one ArkTS Worker. Close owned values explicitly; callback values are borrowed and only live during that callback. Call `retain()` inside the callback to keep a value after it returns. Create engines with `Engine.create(instanceId)`; the `Engine` and `Value` constructors are private.
+
+## Install from OHPM
+
+Choose one engine package in the consuming module directory. The packages contain different engines but expose the same API and native library name; use one per app.
+
+```sh
+ohpm install @jsbay/quickjs@0.1.1-rc.1
+# or
+ohpm install @jsbay/quickjs_ng@0.1.1-rc.1
+```
+
+The RC packages have been submitted to OHPM and are awaiting registry review. Public installation is available only after approval. The published HAR targets `arm64-v8a`.
+
+In the app-level `build-profile.json5`, merge the following into the existing product and each build mode, including release:
+
+```json5
+{
+  "app": {
+    "products": [{ "name": "default", "runtimeOS": "HarmonyOS" }],
+    "buildModeSet": [{
+      "name": "debug",
+      "buildOption": { "strictMode": { "useNormalizedOHMUrl": true } }
+    }]
+  }
+}
+```
+
+Create `entry/src/main/ets/workers/JsBayWorker.ets`, replacing the import with the package you installed:
+
+```ts
+import { MessageEvents, ThreadWorkerGlobalScope, worker } from '@kit.ArkTS';
+import { Engine } from '@jsbay/quickjs';
+
+const port: ThreadWorkerGlobalScope = worker.workerPort;
+port.onmessage = (message: MessageEvents): void => {
+  if (message.data !== 'start') return;
+  const engine = Engine.create(1);
+  try {
+    const result = engine.evaluate('40 + 2', 'example.js');
+    try {
+      port.postMessage(result.toNumber());
+    } finally {
+      result.close();
+    }
+  } finally {
+    engine.close();
+  }
+};
+```
+
+Start the Worker from the entry module and receive its result:
+
+```ts
+import { MessageEvents, worker } from '@kit.ArkTS';
+
+const jsWorker = new worker.ThreadWorker('entry/ets/workers/JsBayWorker.ets');
+jsWorker.onmessage = (message: MessageEvents): void => {
+  console.info(`Result: ${message.data}`);
+  jsWorker.terminate();
+};
+jsWorker.postMessage('start');
+```
+
+For a complete application fixture, see `tests/harmony-sdk/prepare-ohpm-consumer.mjs`.
 
 ## Owner Worker and multi-instance hosts
 
@@ -20,7 +86,7 @@ For host-side protocol checks, build the N-API consumer with `tests/harmony-sdk/
 
 The C ABI `jsbay_engine_request_interrupt(instanceId)` may run on an independent native thread. The ArkTS `requestInterrupt()` instance method still needs a wrapper available in the current Worker; it cannot interrupt a synchronous evaluation that is blocking that same Worker.
 
-`Value.string()` decodes the engine's UTF-8 bytes with ArkTS `util.TextDecoder` and preserves embedded NUL and Unicode. JavaScript throws remain `JsException` with their original `value`. `describeAndClose()` reads and consumes that value; if `toString` throws, it closes both values and returns `"JavaScript exception"`. It reports borrowed, stale, and wrong-thread failures instead of hiding them. `JsBayStatusError.status` and `.code` identify C ABI failures; its constructor accepts `(status, code?)`, and `JsException` accepts an owned `Value`.
+`Value.string()` decodes the engine's UTF-8 bytes with ArkTS `util.TextDecoder` and preserves embedded NUL and Unicode. JavaScript throws remain `JsException` with their original `value`. Use `details()` to copy message, stack text, and available source location without closing the value. `detailsAndClose()` returns the snapshot and consumes the value; `describeDetailedAndClose()` returns both message and stack, adding the message before the stack unless its first line already contains the message. It returns the message when the stack is empty and the stack when the message is empty. The snapshot is plain data and remains usable after the value is closed. Location fields use `fileName`/`sourceURL`, `lineNumber`/`line`, and `columnNumber`/`column`; locations are not guessed by parsing stack text. A JavaScript getter that throws while reading metadata leaves that field empty. `describeAndClose()` remains the short display-text operation. Owner-thread, borrowed, and stale-value failures remain visible. `JsBayStatusError.status` and `.code` identify C ABI failures; its constructor accepts `(status, code?)`, and `JsException` accepts an owned `Value`.
 
 `bindSync` passes an opaque lossless `bigint` request ID, borrowed callback values, and a finite timeout. Forward the ID to independent native work and complete it with `jsbay_sync_complete`; do not schedule completion on the blocked owner Worker. `Engine.completeSyncString` / `completeSyncBytes` / `rejectSync` are the data-only ArkTS entries for another Worker's own N-API environment. `completeSyncBytes` takes `ArrayBuffer` / TypedArray / DataView (opaque octets; no UTF-8 check). Keep the ID as `bigint`; converting it to `number` may lose precision. Use `setAdmissionClass(0|1)` with Hide/Show when pairing suspend with BACKGROUND/FOREGROUND quota preference.
 
@@ -43,3 +109,5 @@ The SDK automatically connects the JavaScript event loop to its owner Worker thr
 Run `make check CHECKS=native-format,harmony-style` through pawl, or `make format PLATFORMS=harmony` to format native and ArkTS sources. `bash scripts/quality/harmony-style.sh check` or `fix` checks or formats all hand-written ArkTS/TypeScript declarations, examples, and test consumers with Huawei Code Linter **1.0.0**. Set `CODELINTER` to its executable and `HARMONY_ETS_SDK` to the SDK API **12**, version **5.0.0.71**, `ets` directory, or set `HARMONY_SDK_HOME` to an installation containing both. The sh script uses the official ETS parser and fixers in a temporary project; it fails on reported or suppressed diagnostics. `BuildProfile.ets` is generated by Hvigor and is excluded. Native formatting uses `bash scripts/quality/native-style.sh check|fix`.
 
 `tests/harmony-sdk/build_har.sh` compiles the conformance cases, recursive callback case, and Worker example with the selected SDK’s real ArkTS checker, then packages a HAR without those fixtures. The default fixture targets API 20 and retains API 12 compatibility. To test the actual SDK 12 toolchain, set `HARMONY_TARGET_SDK_VERSION='5.0.0(12)'`; this creates a temporary project without changing the default target. Both builds require a matching OpenHarmony `JSBAY_LIBRARY`, `DEVECO_SDK_HOME`, `HVIGORW`, and `OHPM`. Node host tests exercise the same native bridge and ArkTS facade behavior; they do not prove that a device Worker loads the HAR.
+
+Before shipping Harmony SDK changes, run `make harmony-har-local OUT=/tmp/jsbay-harmony-local` on a machine with the matching SDK 12, Hvigor, OHPM, Node modules, and Zig toolchain configured. This builds fresh `quickjs_ng` and `quickjs` OpenHarmony cores, compiles the ArkTS fixtures with target SDK `5.0.0(12)`, cleans and rebuilds each production HAR, and validates the staged package. The output directory must be empty and outside the checkout; it contains per-backend logs and staged archives. The command stops on the first backend failure and rejects missing or empty HAR output.

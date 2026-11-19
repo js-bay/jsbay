@@ -1,18 +1,25 @@
-# JS Bay release — L1 desktop static libs + L2 Apple/Android when buildable. Tiers and exclusions: docs/testing.md#ci. Never upload empty XCFramework / fake .so.
+# JS Bay release — build artifacts for inspection or explicitly publish a complete release from CI.
 # Aggressive aggregation: one L1 job per runner image; Apple L2 backends run sequentially in one macos job.
 # assemble + publish stay separate (artifact gate / contents:write).
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: "Version label for artifact names (e.g. 0.1.0); defaults to tag or run id"
-        required: false
+        description: "Release version; must match build.zig.zon (e.g. 0.1.0)"
+        required: true
         type: string
+      publish:
+        description: "Publish a complete release after every build and consumer check succeeds"
+        required: true
+        type: boolean
+        default: false
+      verify_only:
+        description: "Install and test an already published version using its original run and artifact IDs"
+        required: false
+        type: boolean
+        default: false
       build_android:
         description: "Build Android jniLibs (needs NDK setup on Ubuntu)"
         required: false
@@ -23,12 +30,20 @@ on:
         required: false
         type: boolean
         default: true
+      recovery_run_id:
+        description: "Original Release run ID for recovery or verify-only mode"
+        required: false
+        type: string
+      recovery_artifact_ids:
+        description: "Original artifact IDs in npm, Swift package, final release assets order (comma-separated)"
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.version }}-${{ inputs.verify_only && 'verify' || 'publish' }}
   cancel-in-progress: false
 
 jobs:
@@ -37,6 +52,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-libs-linux:
     name: L1 linux-x86_64
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -186,6 +202,7 @@ jobs:
 
   build-libs-linux-arm:
     name: L1 linux-aarch64
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     steps:
@@ -335,6 +352,7 @@ jobs:
 
   build-libs-macos:
     name: L1 macos-aarch64
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: macos-26
     timeout-minutes: 90
     steps:
@@ -546,6 +564,7 @@ jobs:
 
   build-libs-macos-intel:
     name: L1 macos-x86_64
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
     runs-on: macos-26-intel
     timeout-minutes: 90
     steps:
@@ -760,7 +779,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-apple:
     name: L2 Apple XCFramework
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_apple }}
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id && inputs.build_apple }}
     runs-on: macos-26
     timeout-minutes: 150
     steps:
@@ -914,7 +933,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-android:
     name: L2 Android SDK (${{ matrix.backend }})
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_android }}
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id && inputs.build_android }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
@@ -988,6 +1007,7 @@ jobs:
           cd sdk/android
           env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" "$gradle" --no-daemon \
             -PjsbayVersion="${{ steps.ver.outputs.label }}" \
+            -PjsbayBackend="${{ matrix.backend }}" \
             -PjsbayJniLibs="$GITHUB_WORKSPACE/build-android/jniLibs" \
             :jsbay:assembleRelease
           aar=jsbay/build/outputs/aar/jsbay-release.aar
@@ -1010,32 +1030,41 @@ jobs:
           set -euo pipefail
           ver="${{ steps.ver.outputs.label }}"
           backend="${{ matrix.backend }}"
+          case "$backend" in quickjs) artifact=jsbayquickjs ;; quickjs_ng) artifact=jsbayquickjsng ;; esac
           repo="$GITHUB_WORKSPACE/build-android/maven-repo"
           rm -rf "$repo"
           cd sdk/android
           env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" "$RUNNER_TEMP/gradle-8.9/bin/gradle" --no-daemon \
             -PjsbayJniLibs="$GITHUB_WORKSPACE/build-android/jniLibs" \
             -PjsbayVersion="$ver" \
+            -PjsbayBackend="$backend" \
             -PjsbayMavenRepo="$repo" \
             :jsbay:publishReleasePublicationToStagingRepository
-          module="$repo/io/jsbay/js-bay-android/$ver"
-          test -s "$module/js-bay-android-$ver.aar"
-          test -s "$module/js-bay-android-$ver.pom"
-          test -s "$module/js-bay-android-$ver.module"
-          cmp "$module/js-bay-android-$ver.aar" jsbay/build/outputs/aar/jsbay-release.aar
-          unzip -p "$module/js-bay-android-$ver.aar" META-INF/LICENSE | cmp - "$GITHUB_WORKSPACE/LICENSE"
-          unzip -p "$module/js-bay-android-$ver.aar" META-INF/THIRD_PARTY_NOTICES.md | cmp - "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md"
-          grep -F 'org.jetbrains.kotlin' "$module/js-bay-android-$ver.pom"
-          grep -F 'kotlin-stdlib' "$module/js-bay-android-$ver.pom"
-          zig build --build-file "$GITHUB_WORKSPACE/build.zig" tool -- check-maven "$module" "$ver"
+          module="$repo/io/jsbay/$artifact/$ver"
+          test -s "$module/$artifact-$ver.aar"
+          test -s "$module/$artifact-$ver.pom"
+          test -s "$module/$artifact-$ver.module"
+          cmp "$module/$artifact-$ver.aar" jsbay/build/outputs/aar/jsbay-release.aar
+          unzip -p "$module/$artifact-$ver.aar" META-INF/LICENSE | cmp - "$GITHUB_WORKSPACE/LICENSE"
+          unzip -p "$module/$artifact-$ver.aar" META-INF/THIRD_PARTY_NOTICES.md | cmp - "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md"
+          grep -F 'org.jetbrains.kotlin' "$module/$artifact-$ver.pom"
+          grep -F 'kotlin-stdlib' "$module/$artifact-$ver.pom"
+          zig build --build-file "$GITHUB_WORKSPACE/build.zig" tool -- check-maven "$module" "$ver" "$backend"
           mkdir -p "$GITHUB_WORKSPACE/build-android/aar"
           raw_aar="$GITHUB_WORKSPACE/build-android/aar/jsbay-${ver}-android-${backend}.aar"
-          cp "$module/js-bay-android-$ver.aar" "$raw_aar"
-          cmp "$raw_aar" "$module/js-bay-android-$ver.aar"
+          cp "$module/$artifact-$ver.aar" "$raw_aar"
+          cmp "$raw_aar" "$module/$artifact-$ver.aar"
           cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/THIRD_PARTY_NOTICES.md" "$repo/"
           archive="jsbay-${ver}-android-${backend}-maven.zip"
           ( cd "$repo" && zip -qr "$GITHUB_WORKSPACE/$archive" io LICENSE THIRD_PARTY_NOTICES.md )
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Test Android Maven retry safety
+        env:
+          VERSION: ${{ steps.ver.outputs.label }}
+          BACKEND: ${{ matrix.backend }}
+          ARCHIVE: ${{ steps.maven.outputs.archive }}
+        run: node tests/android-sdk/maven-deploy-retry-test.mjs "$ARCHIVE" "$VERSION" "$BACKEND"
 
       - name: Test Android Maven consumer
         shell: bash
@@ -1045,7 +1074,7 @@ jobs:
           mkdir -p "$repo"
           unzip -q "${{ steps.maven.outputs.archive }}" -d "$repo"
           env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" \
-            bash tests/android-sdk/maven-consumer.sh "$repo" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle"
+            bash tests/android-sdk/maven-consumer.sh "$repo" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle" "${{ matrix.backend }}"
 
       - name: Enable KVM for packaged Android acceptance
         run: |
@@ -1059,7 +1088,7 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash tests/ci/release-android-consumer.sh "${{ steps.maven.outputs.archive }}" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle"
+          script: bash tests/ci/release-android-consumer.sh "${{ steps.maven.outputs.archive }}" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle" "${{ matrix.backend }}"
 
       - name: Upload Android Maven repository
         uses: actions/upload-artifact@v6
@@ -1131,23 +1160,137 @@ jobs:
           path: ${{ steps.pack.outputs.archive }}
           if-no-files-found: error
 
+  build-harmony-release:
+    name: Build Harmony HAR (${{ matrix.backend }})
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs, quickjs_ng]
+    steps:
+      - name: Checkout reviewed source snapshot
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+
+      - name: Install Harmony command-line tools
+        uses: ./.github/actions/setup-ohpm
+        with:
+          version: 5.0.13.200
+
+      - name: Install OpenHarmony API 12 SDK
+        id: ohos
+        uses: ./.github/actions/setup-openharmony-sdk
+
+      - name: Build and validate release HAR
+        env:
+          QUICKJS_BACKEND: ${{ matrix.backend }}
+          API12_SDK: ${{ steps.ohos.outputs.ohos-base-sdk-home }}
+          HARMONY_TARGET_SDK_VERSION: '5.0.0(12)'
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          node scripts/validate-harmony-version.mjs "$version"
+          ohpm --version
+          command -v hvigorw
+          test '${{ steps.ohos.outputs.api-version }}' = 12
+          test -d "$API12_SDK/native/sysroot"
+          node tests/harmony-sdk/prepare-ohpm-package-test.mjs
+          node scripts/prepare-harmony-ohpm.mjs "$PWD" "$QUICKJS_BACKEND" "$version"
+          zig build -Dbackend="$QUICKJS_BACKEND" -Dtarget=aarch64-linux-ohos -Dohos-sysroot="$API12_SDK/native/sysroot" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/harmony-core" --summary all
+          export JSBAY_LIBRARY="$RUNNER_TEMP/harmony-core/lib/libjsbay.a"
+          export JSBAY_HARMONY_ARCHIVE="$JSBAY_LIBRARY"
+          export AR="$API12_SDK/native/llvm/bin/llvm-ar"
+          printf '#!/usr/bin/env bash\nexec "%s" "$@" --no-daemon -p buildMode=release\n' "$(command -v hvigorw)" > "$RUNNER_TEMP/hvigorw-ci"
+          chmod +x "$RUNNER_TEMP/hvigorw-ci"
+          export HVIGORW="$RUNNER_TEMP/hvigorw-ci"
+          unset NODE_PATH
+          output="$RUNNER_TEMP/harmony-release-$QUICKJS_BACKEND"
+          bash scripts/stage-harmony-har.sh "$output" "$version"
+          har="$output/jsbay-$version-harmony-$QUICKJS_BACKEND-arm64-v8a.har"
+          test "$(cat "$output/backend")" = "$QUICKJS_BACKEND"
+          tar -xOzf "$har" package/oh-package.json5 | jq -e --arg name "@jsbay/$QUICKJS_BACKEND" --arg version "$version" '.name == $name and .version == $version and .author.name == "jsbay" and .author.url == "https://github.com/js-bay/jsbay" and .repository == "https://github.com/js-bay/jsbay" and .metadata.debug == false'
+          for file in README.md LICENSE CHANGELOG.md; do test "$(tar -xOzf "$har" "package/$file" | wc -c)" -gt 0; done
+
+      - name: Upload checked Harmony HAR
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-release-${{ matrix.backend }}
+          path: ${{ runner.temp }}/harmony-release-${{ matrix.backend }}
+          if-no-files-found: error
+
+  harmony-release-consumer:
+    name: Build Harmony package consumers
+    needs: [build-harmony-release]
+    if: ${{ always() && needs.build-harmony-release.result == 'success' && !inputs.verify_only && !inputs.recovery_run_id }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-ohpm
+        with:
+          version: 6.1.1.280
+
+      - name: Download checked Harmony HARs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: harmony-release-*
+          path: ${{ runner.temp }}/harmony-packages
+
+      - name: Prepublish, install, and build each Harmony consumer
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERSION_INPUT"
+          for backend in quickjs quickjs_ng; do
+            har="$RUNNER_TEMP/harmony-packages/harmony-release-$backend/jsbay-$version-harmony-$backend-arm64-v8a.har"
+            ohpm prepublish "$har"
+            consumer="$RUNNER_TEMP/harmony-local-$backend"
+            mkdir -p "$consumer"
+            printf '{"name":"consumer","version":"1.0.0"}\n' > "$consumer/oh-package.json5"
+            (cd "$consumer" && ohpm install "$har")
+            test -f "$consumer/oh_modules/@jsbay/$backend/oh-package.json5"
+            app="$RUNNER_TEMP/harmony-consumer-$backend"
+            node tests/harmony-sdk/prepare-ohpm-consumer.mjs "$app" "$har" "$backend" "file:$har"
+            (cd "$app/entry" && ohpm install --no-link)
+            (cd "$app" && hvigorw --mode module -p module=entry@default assembleHap --no-daemon)
+          done
+
+      - name: Preserve Harmony consumer applications
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-release-consumers
+          path: ${{ runner.temp }}/harmony-consumer-*/entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
-  # Assemble assets under read-only permissions. A separate tag-only job is the only place that receives contents: write to create a GitHub Release.
+  # Assemble assets under read-only permissions before any release tag or package is published.
   # ---------------------------------------------------------------------------
   assemble-release-assets:
     name: Assemble checked release assets
-    needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android]
-    # A tag is a complete release: both L2 jobs must succeed. Dispatch can explicitly opt out of either L2 tier, in which case that job is skipped.
+    needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android, harmony-release-consumer]
+    # Build-only runs may skip either L2 tier; release publication validates that both were selected and succeeded.
     if: >-
-      ${{ always() &&
+      ${{ always() && !inputs.verify_only &&
           needs.build-libs-linux.result == 'success' &&
           needs.build-libs-linux-arm.result == 'success' &&
           needs.build-libs-macos.result == 'success' &&
           needs.build-libs-macos-intel.result == 'success' &&
-          ((github.event_name == 'push' && needs.build-apple.result == 'success' && needs.build-android.result == 'success') ||
-           (github.event_name == 'workflow_dispatch' &&
-            ((inputs.build_apple && needs.build-apple.result == 'success') || (!inputs.build_apple && needs.build-apple.result == 'skipped')) &&
-            ((inputs.build_android && needs.build-android.result == 'success') || (!inputs.build_android && needs.build-android.result == 'skipped')))) }}
+          ((needs.harmony-release-consumer.result == 'success') ||
+           (!inputs.verify_only && inputs.recovery_run_id != '' && needs.harmony-release-consumer.result == 'skipped')) &&
+          ((inputs.build_apple && needs.build-apple.result == 'success') ||
+           (!inputs.build_apple && needs.build-apple.result == 'skipped')) &&
+          ((inputs.build_android && needs.build-android.result == 'success') ||
+           (!inputs.build_android && needs.build-android.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout reviewed source snapshot
@@ -1178,6 +1321,19 @@ jobs:
           zig build tool -- export-public-source "$archive"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
+      - name: Pack and test Zig source dependency
+        id: zig_package
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          archive="$RUNNER_TEMP/jsbay-${version}-zig.tar.gz"
+          bash tests/ci/pack-zig-source.sh "${{ steps.source.outputs.archive }}" "$archive"
+          bash tests/ci/release-zig-consumer.sh "$archive"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
       - name: Download all archives
         uses: actions/download-artifact@v4
         with:
@@ -1193,8 +1349,9 @@ jobs:
           set -euo pipefail
           version="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
           mkdir -p release-assets
-          find dist -type f \( -name 'jsbay-*.tar.gz' -o -name 'jsbay-*.zip' -o -name 'jsbay-*.aar' \) -exec cp {} release-assets/ \;
+          find dist -type f \( -name 'jsbay-*.tar.gz' -o -name 'jsbay-*.zip' -o -name 'jsbay-*.aar' -o -name 'jsbay-*.har' \) -exec cp {} release-assets/ \;
           cp "${{ steps.source.outputs.archive }}" release-assets/
+          cp "${{ steps.zig_package.outputs.archive }}" release-assets/
           cd release-assets
           ls -la
           zig build --build-file "$GITHUB_WORKSPACE/build.zig" tool -- check-release-assets \
@@ -1203,7 +1360,7 @@ jobs:
             "${{ github.event_name != 'workflow_dispatch' || inputs.build_apple }}" \
             "${{ github.event_name != 'workflow_dispatch' || inputs.build_android }}"
           : > SHA256SUMS
-          for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar; do
+          for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar jsbay-*.har; do
             [ -f "$f" ] || continue
             sha256sum "$f" >> SHA256SUMS
           done
@@ -1216,44 +1373,537 @@ jobs:
           path: release-assets/
           if-no-files-found: error
 
-  publish:
-    name: GitHub Release
+
+  prepare-swift-package-release-assets:
+    name: Prepare and test the single Swift package
     needs: [assemble-release-assets]
-    if: ${{ needs.assemble-release-assets.result == 'success' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    if: ${{ always() && !inputs.verify_only && inputs.build_apple && needs.assemble-release-assets.result == 'success' }}
+    runs-on: macos-26
+    outputs:
+      assets_id: ${{ steps.upload-final-assets.outputs.artifact-id }}
     steps:
-      - name: Download checked archives
+      - name: Checkout source snapshot
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+      - name: Download checked release assets
         uses: actions/download-artifact@v4
         with:
           name: jsbay-release-assets
           path: release-assets
-
-      - name: Create GitHub Release
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-        uses: softprops/action-gh-release@v2
+      - name: Prepare and validate single Swift package
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/swift-package-release"
+          bash scripts/prepare-swift-package-release.sh release-assets "$VERSION" "$SOURCE_SHA" "$output"
+          for archive in \
+            "jsbay-${VERSION}-apple-quickjs-JsBayQuickJS.xcframework.zip" \
+            "jsbay-${VERSION}-apple-quickjs_ng-JsBayQuickJSNG.xcframework.zip" \
+            "jsbay-${VERSION}-apple-jsc-JsBayJavaScriptCore.xcframework.zip"; do
+            test -s "release-assets/$archive"
+          done
+          bash tests/apple-sdk/single-package-consumer.sh release-assets "$VERSION" "$SOURCE_SHA" "$output"
+          test -s "$output/Package.swift"
+          cd release-assets
+          : > SHA256SUMS
+          for archive in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar jsbay-*.har; do
+            [ -f "$archive" ] || continue
+            shasum -a 256 "$archive" >> SHA256SUMS
+          done
+      - name: Upload final checked release assets
+        id: upload-final-assets
+        uses: actions/upload-artifact@v6
         with:
-          tag_name: ${{ github.ref_name }}
-          name: JS Bay ${{ github.ref_name }}
-          body: |
-            **JS Bay** (`jsbay`) release built with Zig 0.17.0.
+          name: jsbay-final-release-assets
+          path: release-assets/
+          if-no-files-found: error
+      - name: Upload generated Swift package metadata
+        uses: actions/upload-artifact@v6
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release/
+          if-no-files-found: error
 
-            ### L1 — desktop static libraries
-            `jsbay-<ver>-<os>-<arch>-<backend>.tar.gz` with `lib/libjsbay.a`, public headers, `LICENSE`, `THIRD_PARTY_NOTICES.md`, plus `VERSION`, `COMMIT`, and `backend` text files. Linux ships `quickjs_ng` and `quickjs`; macOS ships `quickjs_ng`, `quickjs`, and `jsc`. C ABI entry points are declared in `include/jsbay.h`.
+  validate-release-request:
+    name: Validate release request and reserve no existing version
+    environment: release
+    if: ${{ inputs.publish && !inputs.verify_only && !inputs.recovery_run_id }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source snapshot for authenticated remote tag check
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          submodules: recursive
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+      - name: Validate complete release selection and unused tag
+        env:
+          VERSION: ${{ inputs.version }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          test "${{ inputs.build_apple }}" = true || { echo 'Publishing requires the Apple build' >&2; exit 1; }
+          test "${{ inputs.build_android }}" = true || { echo 'Publishing requires the Android build' >&2; exit 1; }
+          resolved="$(zig build tool -- release-version "$VERSION" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          test "$resolved" = "$VERSION"
+          tag="v$VERSION"
+          existing="$(git ls-remote --refs origin "refs/tags/$tag")"
+          if [ -n "$existing" ] && [ "$RUN_ATTEMPT" = 1 ]; then
+            echo "Release tag already exists: $tag" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - name: Verify npm publication credentials are configured
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$NODE_AUTH_TOKEN" || { echo 'NPM_TOKEN is required in the release environment' >&2; exit 1; }
+          npm whoami --registry https://registry.npmjs.org > /dev/null
 
-            ### L2 — platform packages
-            - **Apple:** `jsbay-<ver>-apple-<backend>-JsBay.xcframework.zip` for `jsc` (product default; matches `./build-apple.sh` / `JSBAY_APPLE_BACKEND`), `quickjs`, and `quickjs_ng`. `quickjs` / `quickjs_ng` are alternate packages, not the default host choice. Each zip is a Git-ready Swift package: extract the top-level directory, publish it as a fresh Git repository, and tag it. Xcode consumers add that repository URL. Distinct backends need distinct repository URLs.
-            - **Android:** `quickjs_ng` and `quickjs` each ship `jsbay-<ver>-android-<backend>-maven.zip` (Maven repo with AAR/POM/Gradle metadata and Kotlin stdlib), a standalone `.aar`, and `jsbay-<ver>-android-jniLibs-<backend>.tar.gz` for C hosts. Each maven zip uses `io.jsbay:js-bay-android:<ver>` for that backend alone — host one backend zip per Maven root.
-            - **Harmony:** stage `jsbay-<ver>-harmony-<backend>-arm64-v8a.har` locally with `QUICKJS_BACKEND=quickjs_ng|quickjs scripts/stage-harmony-har.sh <stage-dir> <ver>`. GitHub-hosted runners do not yet have a verified DevEco SDK 12/Hvigor/ohpm path, so this release does not upload a HAR.
+  publish-android-packages:
+    name: Publish Android package (${{ matrix.backend }})
+    needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release, create-draft-release]
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.create-draft-release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs_ng, quickjs]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+      - uses: actions/download-artifact@v4
+        with:
+          name: jsbay-release-assets
+          path: release-assets
+      - name: Publish the checked Maven package
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BACKEND: ${{ matrix.backend }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          bash scripts/publish-android-maven.sh \
+            "release-assets/jsbay-${version}-android-${BACKEND}-maven.zip" \
+            "$version" "$BACKEND" "https://maven.pkg.github.com/$GITHUB_REPOSITORY" github
 
-            ### Source snapshot
-            `jsbay-<ver>-source.tar.gz` is created from the reviewed release commit. It contains no Git metadata or repository history. Tag versions must equal `build.zig.zon`.
+  prepare-swift-package-release:
+    name: Stage immutable Swift package commit
+    needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release-assets]
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.assemble-release-assets.result == 'success' && needs.validate-release-request.result == 'success' && needs.prepare-swift-package-release-assets.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout source snapshot
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Download generated Swift package metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release
+      - name: Verify generated Swift package metadata
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/swift-package-release"
+          test -s "$output/Package.swift"
+      - name: Stage the Swift package commit
+        env:
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+          JSBAY_PACKAGE_REF: refs/heads/jsbay-package-staging-${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/swift-package-release"
+          bash scripts/create-swift-package-tag.sh "$output" "$VERSION" "$SOURCE_SHA"
 
-            ### Not in this Release (L3 / deferred)
-            Windows `.lib`/`.dll` (inspector still POSIX), demo/bench binaries, docs site zip. See `docs/testing.md#ci`.
+  create-draft-release:
+    name: Create draft release with checked assets
+    needs: [assemble-release-assets, prepare-swift-package-release, build-node-packages]
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.assemble-release-assets.result == 'success' && needs.prepare-swift-package-release.result == 'success' && needs.build-node-packages.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - name: Download checked archives
+        uses: actions/download-artifact@v4
+        with:
+          name: jsbay-final-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release
+      - name: Create or verify draft release without replacing assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: bash scripts/verify-staged-release.sh draft "$VERSION" "$SOURCE_SHA" "$GITHUB_RUN_ID" release-assets "$RUNNER_TEMP/swift-package-release"
 
-            Verify with `SHA256SUMS`.
-          files: release-assets/*
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+  build-node-packages:
+    needs: [validate-release-request]
+    if: ${{ always() && !inputs.verify_only && !inputs.recovery_run_id && (!inputs.publish || needs.validate-release-request.result == 'success') }}
+    uses: ./.github/workflows/npm-packages.yml
+    with:
+      tag: v${{ inputs.version }}
+
+  verify-published-npm:
+    name: Verify public npm package installs
+    needs: [publish-release, verify-public-release]
+    if: >-
+      ${{ always() && !cancelled() &&
+          ((inputs.verify_only && needs.verify-public-release.result == 'success') ||
+           (!inputs.verify_only && needs.publish-release.result == 'success')) }}
+    uses: ./.github/workflows/npm-packages.yml
+    with:
+      tag: v${{ inputs.version }}
+      verify_published: true
+
+  verify-published-zig:
+    name: Verify public Zig package installs
+    needs: [publish-release, verify-public-release]
+    if: >-
+      ${{ always() && !cancelled() &&
+          ((inputs.verify_only && needs.verify-public-release.result == 'success') ||
+           (!inputs.verify_only && needs.publish-release.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+          cache-build: false
+          cache-toolchain: false
+      - name: Fetch the published Zig package and run both engines
+        env:
+          VERSION: ${{ inputs.version }}
+        run: bash tests/ci/release-zig-consumer.sh "https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION/jsbay-$VERSION-zig.tar.gz"
+
+  verify-release-recovery:
+    name: Find original release artifacts
+    if: ${{ inputs.verify_only || inputs.recovery_run_id != '' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      source_sha: ${{ steps.original.outputs.source_sha }}
+      npm_id: ${{ steps.original.outputs.npm_id }}
+      npm_digest: ${{ steps.original.outputs.npm_digest }}
+      swift_id: ${{ steps.original.outputs.swift_id }}
+      swift_digest: ${{ steps.original.outputs.swift_digest }}
+      assets_id: ${{ steps.original.outputs.assets_id }}
+      assets_digest: ${{ steps.original.outputs.assets_digest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Verify original run, Android jobs and artifact ownership
+        id: original
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLISH: ${{ inputs.publish }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+          ORIGINAL_RUN: ${{ inputs.recovery_run_id }}
+          ORIGINAL_ARTIFACTS: ${{ inputs.recovery_artifact_ids }}
+        run: |
+          set -euo pipefail
+          if [[ "$VERIFY_ONLY" == true ]]; then
+            test "$PUBLISH" = false || { echo 'Verify-only mode requires Publish a complete release to be disabled' >&2; exit 1; }
+            if [[ -z "$ORIGINAL_RUN" || -z "$ORIGINAL_ARTIFACTS" ]]; then
+              echo 'Verify-only mode requires the original release run and artifact IDs' >&2
+              exit 1
+            fi
+          else
+            test "$PUBLISH" = true || { echo 'Recovery requires Publish a complete release' >&2; exit 1; }
+          fi
+          node scripts/verify-release-recovery.mjs resolve "$ORIGINAL_RUN" "$ORIGINAL_ARTIFACTS" >> "$GITHUB_OUTPUT"
+
+  verify-public-release:
+    name: Verify the published tag and release assets
+    needs: [verify-release-recovery]
+    if: ${{ inputs.verify_only && !inputs.publish }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Verify the original source, public tag and release attachments
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          ORIGINAL_RUN: ${{ inputs.recovery_run_id }}
+          SOURCE_SHA: ${{ needs.verify-release-recovery.outputs.source_sha }}
+          SWIFT_ID: ${{ needs.verify-release-recovery.outputs.swift_id }}
+          SWIFT_DIGEST: ${{ needs.verify-release-recovery.outputs.swift_digest }}
+          ASSETS_ID: ${{ needs.verify-release-recovery.outputs.assets_id }}
+          ASSETS_DIGEST: ${{ needs.verify-release-recovery.outputs.assets_digest }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-recovery.mjs download "$SWIFT_ID" "$SWIFT_DIGEST" "$RUNNER_TEMP/swift-package-release"
+          node scripts/verify-release-recovery.mjs download "$ASSETS_ID" "$ASSETS_DIGEST" release-assets
+          bash scripts/verify-staged-release.sh verify-published "$VERSION" "$SOURCE_SHA" "$ORIGINAL_RUN" release-assets "$RUNNER_TEMP/swift-package-release"
+
+  publish-node-packages:
+    name: Publish verified npm packages
+    needs: [create-draft-release, build-node-packages, publish-android-packages, verify-release-recovery]
+    if: >-
+      ${{ always() && inputs.publish && !inputs.verify_only &&
+          ((inputs.recovery_run_id && needs.verify-release-recovery.result == 'success') ||
+           (!inputs.recovery_run_id && needs.create-draft-release.result == 'success' &&
+            needs.build-node-packages.result == 'success' && needs.publish-android-packages.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+    outputs:
+      recovery_draft_id: ${{ steps.recovery.outputs.draft_id }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.recovery_run_id }}
+        with:
+          artifact-ids: ${{ needs.build-node-packages.outputs.artifact_id }}
+          path: npm-release
+          merge-multiple: true
+      - name: Download original artifacts and verify the existing draft
+        id: recovery
+        if: ${{ inputs.recovery_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          ORIGINAL_RUN: ${{ inputs.recovery_run_id }}
+          SOURCE_SHA: ${{ needs.verify-release-recovery.outputs.source_sha }}
+          NPM_ID: ${{ needs.verify-release-recovery.outputs.npm_id }}
+          NPM_DIGEST: ${{ needs.verify-release-recovery.outputs.npm_digest }}
+          SWIFT_ID: ${{ needs.verify-release-recovery.outputs.swift_id }}
+          SWIFT_DIGEST: ${{ needs.verify-release-recovery.outputs.swift_digest }}
+          ASSETS_ID: ${{ needs.verify-release-recovery.outputs.assets_id }}
+          ASSETS_DIGEST: ${{ needs.verify-release-recovery.outputs.assets_digest }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-recovery.mjs download "$NPM_ID" "$NPM_DIGEST" npm-release
+          node scripts/verify-release-recovery.mjs download "$SWIFT_ID" "$SWIFT_DIGEST" "$RUNNER_TEMP/swift-package-release"
+          node scripts/verify-release-recovery.mjs download "$ASSETS_ID" "$ASSETS_DIGEST" release-assets
+          draft_id=$(bash scripts/verify-staged-release.sh verify "$VERSION" "$SOURCE_SHA" "$ORIGINAL_RUN" release-assets "$RUNNER_TEMP/swift-package-release")
+          [[ "$draft_id" =~ ^[1-9][0-9]*$ ]]
+          echo "draft_id=$draft_id" >> "$GITHUB_OUTPUT"
+      - name: Verify and publish the original npm tarballs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.verify-release-recovery.outputs.source_sha || github.sha }}
+        run: node scripts/publish-npm-release.mjs npm-release "$VERSION" "$SOURCE_SHA" publish
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [create-draft-release, publish-node-packages, verify-release-recovery]
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.publish-node-packages.result == 'success' && (inputs.recovery_run_id || needs.create-draft-release.result == 'success') }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.recovery_run_id }}
+        with:
+          name: jsbay-final-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.recovery_run_id }}
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release
+      - name: Download original Swift metadata and release assets
+        if: ${{ inputs.recovery_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFT_ID: ${{ needs.verify-release-recovery.outputs.swift_id }}
+          SWIFT_DIGEST: ${{ needs.verify-release-recovery.outputs.swift_digest }}
+          ASSETS_ID: ${{ needs.verify-release-recovery.outputs.assets_id }}
+          ASSETS_DIGEST: ${{ needs.verify-release-recovery.outputs.assets_digest }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-recovery.mjs download "$SWIFT_ID" "$SWIFT_DIGEST" "$RUNNER_TEMP/swift-package-release"
+          node scripts/verify-release-recovery.mjs download "$ASSETS_ID" "$ASSETS_DIGEST" release-assets
+      - name: Verify assets and publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.verify-release-recovery.outputs.source_sha || github.sha }}
+          ORIGINAL_RUN: ${{ inputs.recovery_run_id || github.run_id }}
+          RECOVERY_RUN: ${{ inputs.recovery_run_id }}
+          DRAFT_ID: ${{ needs.publish-node-packages.outputs.recovery_draft_id }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$RECOVERY_RUN" ]]; then test -n "$DRAFT_ID"; fi
+          bash scripts/verify-staged-release.sh publish "$VERSION" "$SOURCE_SHA" "$ORIGINAL_RUN" release-assets "$RUNNER_TEMP/swift-package-release" "$DRAFT_ID"
+
+  dispatch-harmony-ohpm:
+    name: Dispatch OHPM submission (${{ matrix.backend }})
+    needs: [publish-release, prepare-swift-package-release-assets, verify-release-recovery]
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.publish-release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs, quickjs_ng]
+    steps:
+      - name: Start protected OHPM publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          BACKEND: ${{ matrix.backend }}
+          RELEASE_RUN_ID: ${{ inputs.recovery_run_id || github.run_id }}
+          RELEASE_ARTIFACT_ID: ${{ inputs.recovery_run_id != '' && needs.verify-release-recovery.outputs.assets_id || needs.prepare-swift-package-release-assets.outputs.assets_id }}
+        run: gh workflow run harmony-ohpm-publish.yml --repo "$GITHUB_REPOSITORY" --ref main -f version="$VERSION" -f backend="$BACKEND" -f release_run_id="$RELEASE_RUN_ID" -f release_artifact_id="$RELEASE_ARTIFACT_ID"
+
+  verify-published-swift:
+    name: Verify published Swift package downloads
+    needs: [publish-release, verify-release-recovery, verify-public-release]
+    if: >-
+      ${{ always() && !cancelled() &&
+          ((inputs.verify_only && needs.verify-public-release.result == 'success') ||
+           (!inputs.verify_only && needs.publish-release.result == 'success')) }}
+    runs-on: macos-26
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        if: ${{ !inputs.recovery_run_id }}
+        with:
+          name: jsbay-swift-package
+          path: ${{ runner.temp }}/swift-package-release
+      - name: Download the original Swift package metadata
+        if: ${{ inputs.recovery_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWIFT_ID: ${{ needs.verify-release-recovery.outputs.swift_id }}
+          SWIFT_DIGEST: ${{ needs.verify-release-recovery.outputs.swift_digest }}
+        run: node scripts/verify-release-recovery.mjs download "$SWIFT_ID" "$SWIFT_DIGEST" "$RUNNER_TEMP/swift-package-release"
+      - name: Download and run all published Swift and Objective-C products
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          udid="$(xcrun simctl list devices available -j | jq -r '[.devices | to_entries[] | .value[] | select(.isAvailable == true) | select(.name | startswith("iPhone"))] | .[0].udid // empty')"
+          test -n "$udid" || { echo 'No iOS Simulator available' >&2; exit 1; }
+          if ! xcrun simctl boot "$udid"; then
+            xcrun simctl list devices booted -j | jq -e --arg udid "$udid" '[.devices[][] | select(.udid == $udid)] | length == 1' >/dev/null
+          fi
+          xcrun simctl bootstatus "$udid" -b
+          JSBAY_IOS_SIM_UDID="$udid" bash tests/apple-sdk/remote-package-consumer.sh "$RUNNER_TEMP/swift-package-release" "$VERSION"
+
+  verify-published-android:
+    name: Install published Android packages on ART
+    needs: [publish-release, verify-public-release]
+    if: >-
+      ${{ always() && !cancelled() &&
+          ((inputs.verify_only && needs.verify-public-release.result == 'success') ||
+           (!inputs.verify_only && needs.publish-release.result == 'success')) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4.0.4
+      - name: Install Android SDK and Gradle
+        run: |
+          set -euo pipefail
+          sdkmanager --install 'platforms;android-35' 'build-tools;35.0.0'
+          curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install Maven packages and run consumers
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: bash tests/android-sdk/run-maven-remote-consumer.sh "$VERSION" "$RUNNER_TEMP/gradle-8.9/bin/gradle"

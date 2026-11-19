@@ -14,13 +14,21 @@ let package = Package(
     .target(
       name: "JsBaySDK",
       dependencies: ["JsBay"],
-      linkerSettings: [.linkedFramework("JavaScriptCore")]
+      linkerSettings: [
+        .linkedFramework("JavaScriptCore"),
+        .linkedFramework("Foundation"),
+        .linkedLibrary("m"),
+      ]
     ),
     .target(
       name: "JsBayObjC",
       dependencies: ["JsBay"],
       publicHeadersPath: "include",
-      linkerSettings: [.linkedFramework("JavaScriptCore")]
+      linkerSettings: [
+        .linkedFramework("JavaScriptCore"),
+        .linkedFramework("Foundation"),
+        .linkedLibrary("m"),
+      ]
     ),
   ]
 )

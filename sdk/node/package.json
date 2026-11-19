@@ -1,5 +1,5 @@
 {
-  "name": "@js-bay/node",
+  "name": "@jsbay/node",
   "private": true,
   "type": "commonjs",
   "main": "index.cjs",

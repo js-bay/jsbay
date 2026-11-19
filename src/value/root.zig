@@ -109,3 +109,10 @@ pub const defineDataProperty = dispatch.defineDataProperty;
 
 pub const Local = @import("reference.zig").Local;
 pub const OwnedValue = @import("reference.zig").OwnedValue;
+
+// ---- NaN-Box Value Engine ----
+
+pub const hyper_box = @import("hyper_box");
+pub const HyperValue = hyper_box.Value;
+pub const GenerationalSlotMap = hyper_box.GenerationalSlotMap;
+pub const SplitBox32 = hyper_box.SplitBox32;

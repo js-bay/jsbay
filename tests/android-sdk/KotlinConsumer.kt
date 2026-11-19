@@ -1,5 +1,6 @@
 package io.jsbay.consumer
 
+import io.jsbay.DedicatedEngineThread
 import io.jsbay.Engine
 import io.jsbay.JsBayException
 import io.jsbay.ShutdownPhase
@@ -10,6 +11,9 @@ import io.jsbay.SyncCompletion
 import io.jsbay.Value
 import io.jsbay.ValueKind
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Drain the current thread's Looper for [milliseconds] of wall-clock time.
@@ -382,6 +386,98 @@ fun runKotlinConsumer() {
         } catch (
             error: JsBayException,
         ) {
+            val details = error.details()
+            check(details.message == "kotlin-display\u0000😀") { "Kotlin exception snapshot preserves text" }
+            check(error.value!!.get("length").use { it.number() } > 0.0) { "Kotlin snapshot preserves original" }
+            check(error.detailsAndClose().message == details.message) { "Kotlin detailed consuming description" }
+            rejected(Status.STALE_VALUE, "Kotlin detailed description closes original") { error.value!!.string() }
+            rejected(Status.STALE_VALUE, "Kotlin details reject a consumed original") { error.details() }
+        }
+        try {
+            engine.evaluate("function namedFailure(){throw new Error('failure')} namedFailure()", "kotlin-stack.js")
+            error("Kotlin stack snapshot source")
+        } catch (error: JsBayException) {
+            val details = error.details()
+            check(details.stackTraceString?.contains("namedFailure") == true) { "Kotlin stack snapshot keeps frames" }
+            check(
+                details.stackTraceString?.contains("kotlin-stack.js") == true,
+            ) { "Kotlin stack snapshot keeps filename" }
+            check(error.describeDetailedAndClose().contains("namedFailure")) { "Kotlin detailed display prefers stack" }
+            rejected(Status.STALE_VALUE, "Kotlin detailed display closes original") { error.value!!.string() }
+        }
+        try {
+            engine.evaluate(
+                "throw ({message:'display marker', stack:'frameOne\\nframeTwo'})",
+                "kotlin-display-marker.js",
+            )
+            error("Kotlin detailed display marker source")
+        } catch (error: JsBayException) {
+            check(error.describeDetailedAndClose() == "display marker\nframeOne\nframeTwo") {
+                "Kotlin detailed display keeps a message missing from stack"
+            }
+            rejected(Status.STALE_VALUE, "Kotlin detailed display marker closes original") { error.value!!.string() }
+        }
+        try {
+            engine.evaluate(
+                "throw ({message:'repeated marker', stack:'Error: repeated marker\\nframe'})",
+                "kotlin-display-repeat.js",
+            )
+            error("Kotlin repeated display marker source")
+        } catch (error: JsBayException) {
+            check(error.describeDetailedAndClose() == "Error: repeated marker\nframe") {
+                "Kotlin detailed display avoids repeating message in stack"
+            }
+        }
+        try {
+            engine.evaluate(
+                "throw Object.defineProperty(new Error('failure'), 'stack', {get(){throw 1}})",
+                "kotlin-stack-getter.js",
+            )
+            error("Kotlin throwing stack getter source")
+        } catch (error: JsBayException) {
+            check(error.details().stackTraceString == null) { "Kotlin throwing stack getter falls back" }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw {message:'alias', sourceURL:'alias.js', line:4, column:2}", "kotlin-alias.js")
+            error("Kotlin exception alias source")
+        } catch (error: JsBayException) {
+            val details = error.details()
+            check(details.fileName == "alias.js" && details.lineNumber == 4 && details.columnNumber == 2) {
+                "Kotlin exception location aliases"
+            }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw {toString(){throw 5}}", "kotlin-description-failure.js")
+            error("Kotlin description fallback source")
+        } catch (error: JsBayException) {
+            check(error.details().message == "JavaScript exception") { "Kotlin failed message conversion fallback" }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw null", "kotlin-null-throw.js")
+            error("Kotlin null throw source")
+        } catch (error: JsBayException) {
+            check(error.details().message == "null") { "Kotlin null throw details" }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw {message:'invalid', line:1.5, column:2147483648}", "kotlin-invalid-location.js")
+            error("Kotlin invalid location source")
+        } catch (error: JsBayException) {
+            val details = error.details()
+            check(
+                details.lineNumber == null && details.columnNumber == null,
+            ) { "Kotlin invalid location values are omitted" }
+            error.value!!.close()
+        }
+        try {
+            engine.evaluate("throw 'kotlin-display\\u0000😀'", "kotlin-describe-and-close.js")
+            error("Kotlin consuming description source")
+        } catch (
+            error: JsBayException,
+        ) {
             check(error.describeAndClose() == "kotlin-display\u0000😀") { "Kotlin consuming description text" }
             rejected(Status.STALE_VALUE, "Kotlin consuming description closes original") { error.value!!.string() }
         }
@@ -492,10 +588,15 @@ fun runKotlinConsumer() {
             }.use { engine.evaluate("kotlinCloseBorrowed(1)", "kotlin-borrowed-close.js").close() }
         engine
             .bind("kotlinBorrowedDescription") { thisValue, _ ->
+                val originalKind = thisValue.kind()
                 rejected(
                     Status.INVALID_ARGUMENT,
                     "Kotlin borrowed exception text",
                 ) { JsBayException(Status.EXCEPTION, thisValue).describeAndClose() }
+                rejected(Status.INVALID_ARGUMENT, "Kotlin borrowed exception details") {
+                    JsBayException(Status.EXCEPTION, thisValue).detailsAndClose()
+                }
+                check(thisValue.kind() == originalKind) { "Kotlin rejected consume preserves callback value" }
                 engine.undefined()
             }.use { engine.evaluate("kotlinBorrowedDescription()", "kotlin-borrowed-description.js").close() }
         var wrongThread: Throwable? = null
@@ -514,6 +615,33 @@ fun runKotlinConsumer() {
         check(
             wrongThread is JsBayException && (wrongThread as JsBayException).status == Status.WRONG_THREAD,
         ) { "Kotlin wrong thread status" }
+        val wrongThreadDetailsException =
+            try {
+                engine.evaluate("throw new Error('wrong thread details')", "kotlin-wrong-thread-details.js")
+                error("Kotlin wrong-thread details source")
+            } catch (exception: JsBayException) {
+                exception
+            }
+        var wrongThreadDetails: Throwable? = null
+        val detailsWorker =
+            Thread {
+                try {
+                    wrongThreadDetailsException.details()
+                } catch (failure: Throwable) {
+                    wrongThreadDetails =
+                        failure
+                }
+            }
+        detailsWorker.start()
+        detailsWorker.join()
+        val wrongThreadDetailsFailure = wrongThreadDetails as? JsBayException
+        check(wrongThreadDetailsFailure?.status == Status.WRONG_THREAD) {
+            "Kotlin exception details reject a foreign thread"
+        }
+        check(wrongThreadDetailsException.value!!.get("message").use { it.string() } == "wrong thread details") {
+            "Kotlin wrong-thread details preserves original exception"
+        }
+        wrongThreadDetailsException.value!!.close()
         val malformed = "\uD800"
         engine.objectValue().use { target ->
             rejected(Status.INVALID_ARGUMENT, "Kotlin malformed source") { engine.evaluate(malformed) }
@@ -713,6 +841,7 @@ fun runKotlinConsumer() {
             "Kotlin foreign-thread shutdown terminal phase"
         }
     }
+    runKotlinSubmissionOperations()
     val closed = Engine(mainInstanceId)
     closed.close()
     Engine(mainInstanceId).use { replacement ->
@@ -721,4 +850,148 @@ fun runKotlinConsumer() {
             check(result.number() == 42.0) { "Kotlin replacement Engine remains runnable" }
         }
     }
+}
+
+private fun runKotlinSubmissionOperations() {
+    DedicatedEngineThread.start(7104).use { dedicated ->
+        val outcomes = mutableListOf<SubmissionResult>()
+        val fence = CountDownLatch(1)
+        val sealed = CountDownLatch(1)
+        dedicated.runOnOwner { submitted ->
+            check(submitted.postScript("globalThis.__submitted = 40 + 2", "submission-ok.js") { outcomes += it }) {
+                "Kotlin postScript admission"
+            }
+            check(submitted.postScript("throw new Error('submission')", "submission-error.js") { outcomes += it }) {
+                "Kotlin exception submission admission"
+            }
+            check(
+                submitted.postFence {
+                    outcomes += it
+                    fence.countDown()
+                },
+            ) { "Kotlin postFence admission" }
+        }
+        check(fence.await(5, TimeUnit.SECONDS)) { "Kotlin submission fence completed" }
+        dedicated.runOnOwner { submitted ->
+            check(
+                outcomes.map { it.status } ==
+                    listOf(SubmissionStatus.COMPLETED, SubmissionStatus.EXCEPTION, SubmissionStatus.COMPLETED),
+            ) {
+                "Kotlin FIFO submission outcomes: $outcomes"
+            }
+            submitted.evaluate("__submitted", "submission-result.js").use { check(it.number() == 42.0) }
+            check(submitted.beginShutdown(1_000)) { "Kotlin beginShutdown admission" }
+            check(submitted.postFence(sealShutdown = true) { sealed.countDown() }) { "Kotlin sealing fence admission" }
+        }
+        check(sealed.await(5, TimeUnit.SECONDS)) { "Kotlin sealing fence completed" }
+        dedicated.runOnOwner { submitted ->
+            check(submitted.shutdownStatus()?.phase == ShutdownPhase.DRAINED) { "Kotlin shutdown drains through fence" }
+            check(!submitted.postScript("1", "submission-rejected.js")) { "Kotlin sealed shutdown rejects new scripts" }
+        }
+    }
+    DedicatedEngineThread.start(7105).use { dedicated ->
+        val outcomes = mutableListOf<SubmissionResult>()
+        val entered = CountDownLatch(1)
+        val completed = CountDownLatch(1)
+        dedicated.runOnOwner { busy ->
+            check(busy.setExecutionBudget(5_000)) { "Kotlin busy submission budget" }
+            busy
+                .bind("submissionBusyEntered") { _, _ ->
+                    entered.countDown()
+                    busy.undefined()
+                }.close()
+            check(
+                busy.postScript("submissionBusyEntered(); for (;;) {}", "submission-busy.js") {
+                    outcomes += it
+                    completed.countDown()
+                },
+            ) { "Kotlin busy submission admission" }
+        }
+        check(entered.await(5, TimeUnit.SECONDS)) { "Kotlin busy submission entered" }
+        check(dedicated.engine.beginShutdown(20)) { "Kotlin foreign-thread beginShutdown admission" }
+        check(completed.await(5, TimeUnit.SECONDS)) { "Kotlin busy submission completed" }
+        dedicated.runOnOwner { busy ->
+            check(outcomes.singleOrNull()?.status == SubmissionStatus.CANCELLED) {
+                "Kotlin foreign-thread shutdown cancels a running submission: $outcomes"
+            }
+            check(busy.shutdownStatus()?.phase == ShutdownPhase.CANCELLED) {
+                "Kotlin foreign-thread shutdown terminal phase"
+            }
+        }
+    }
+    runKotlinDedicatedThreadParityTests()
+}
+
+private fun runKotlinDedicatedThreadParityTests() {
+    DedicatedEngineThread.start(7106).use { dedicated ->
+        val nestedResult =
+            dedicated.runOnOwner { engine1 ->
+                dedicated.runOnOwner { engine2 ->
+                    check(engine1.id == engine2.id)
+                    "nested-ok"
+                }
+            }
+        check(nestedResult == "nested-ok") { "Kotlin nested runOnOwner executes inline" }
+        check(dedicated.setExecutionTimeLimit(10_000L)) { "Kotlin dedicated setExecutionTimeLimit" }
+        check(dedicated.setExecutionBudget(5_000L)) { "Kotlin dedicated setExecutionBudget" }
+        check(dedicated.setMemoryLimit(10_000_000L)) { "Kotlin dedicated setMemoryLimit" }
+        check(dedicated.clearInterrupt()) { "Kotlin dedicated clearInterrupt" }
+    }
+    val loopStarted = CountDownLatch(1)
+    val loopDedicated = DedicatedEngineThread.start(7107)
+    val loopThread =
+        Thread {
+            try {
+                loopDedicated.runOnOwner { engine ->
+                    engine
+                        .bind("loopNotify") { _, _ ->
+                            loopStarted.countDown()
+                            engine.undefined()
+                        }.close()
+                    engine.evaluate("loopNotify(); while (true) {}", "infinite.js").close()
+                }
+            } catch (_: Throwable) {
+                // Expected interruption/cancellation on close.
+            }
+        }
+    loopThread.start()
+    check(loopStarted.await(5, TimeUnit.SECONDS)) { "Kotlin infinite loop started" }
+    loopDedicated.close(5_000L)
+    loopThread.join(5_000)
+    check(!loopThread.isAlive) { "Kotlin infinite loop thread terminated on close" }
+
+    val queuedDrainDedicated = DedicatedEngineThread.start(7108)
+    val queuedDrainResult = AtomicBoolean(false)
+    queuedDrainDedicated.post {
+        val value = queuedDrainDedicated.engine.evaluate("21 + 21", "drain.js")
+        if (value.number() == 42.0) {
+            queuedDrainResult.set(true)
+        }
+        value.close()
+    }
+    queuedDrainDedicated.close(5_000L)
+    check(queuedDrainResult.get()) { "Kotlin queued evaluations drain on close" }
+
+    val userInterruptDedicated = DedicatedEngineThread.start(7109)
+    val interruptObserved = AtomicBoolean(false)
+    val userInterruptDone = CountDownLatch(1)
+    userInterruptDedicated.post {
+        userInterruptDedicated.engine.requestInterrupt()
+    }
+    userInterruptDedicated.post {
+        val engine = userInterruptDedicated.engine
+        try {
+            engine.evaluate("while (true) {}", "user_interrupt.js").close()
+        } catch (e: JsBayException) {
+            if (e.status == Status.EXCEPTION) {
+                interruptObserved.set(true)
+            }
+        } finally {
+            engine.clearInterrupt()
+            userInterruptDone.countDown()
+        }
+    }
+    check(userInterruptDone.await(5, TimeUnit.SECONDS)) { "Kotlin user interrupt job completed" }
+    userInterruptDedicated.close(5_000L)
+    check(interruptObserved.get()) { "Kotlin user interrupt preserved across jobs" }
 }

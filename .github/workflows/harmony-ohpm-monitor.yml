@@ -1,0 +1,214 @@
+name: Verify Harmony packages on OHPM
+
+on:
+  schedule:
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/harmony-ohpm-monitor.yml'
+      - 'scripts/harmony-ohpm-monitor.mjs'
+      - 'scripts/harmony-ohpm-state.mjs'
+      - 'scripts/verify-harmony-release-source.mjs'
+      - 'scripts/validate-harmony-version.mjs'
+      - 'tests/harmony-sdk/ohpm-tracking-test.mjs'
+      - 'tests/harmony-sdk/harmony-ohpm-state-test.mjs'
+      - 'tests/harmony-sdk/release-source-test.mjs'
+      - 'tests/harmony-sdk/prepare-ohpm-consumer.mjs'
+      - '.github/workflows/harmony-ohpm-publish.yml'
+      - '.github/actions/setup-ohpm/**'
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  test:
+    name: Test Harmony tracking
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          node tests/harmony-sdk/ohpm-tracking-test.mjs
+          node tests/harmony-sdk/harmony-ohpm-state-test.mjs
+          node tests/harmony-sdk/release-source-test.mjs
+
+  discover:
+    name: Find pending Harmony packages
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: read
+    outputs:
+      matrix: ${{ steps.pending.outputs.matrix }}
+      count: ${{ steps.pending.outputs.count }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select submitted packages
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues?state=open&labels=harmony-ohpm-publication&per_page=100" | jq '[.[][] | select(.pull_request == null) | select(any(.labels[]?; .name == "harmony-ohpm-install-verified") | not)]' > "$RUNNER_TEMP/issues.json"
+          matrix=$(node scripts/harmony-ohpm-monitor.mjs < "$RUNNER_TEMP/issues.json")
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "count=$(jq '.include | length' <<< "$matrix")" >> "$GITHUB_OUTPUT"
+
+  reconcile:
+    name: Find Harmony releases without submission records
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Compare published releases with tracking records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" | jq 'add // []' > "$RUNNER_TEMP/releases.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues?state=all&labels=harmony-ohpm-publication&per_page=100" | jq '[.[][] | select(.pull_request == null)]' > "$RUNNER_TEMP/all-issues.json"
+          jq -n --slurpfile releases "$RUNNER_TEMP/releases.json" --slurpfile issues "$RUNNER_TEMP/all-issues.json" '{releases:$releases[0],issues:$issues[0]}' | node scripts/harmony-ohpm-monitor.mjs reconcile
+
+  verify:
+    name: Verify ${{ matrix.backend }} ${{ matrix.version }}
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      issues: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    concurrency:
+      group: harmony-ohpm-verify-${{ matrix.version }}-${{ matrix.backend }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check public registry and original release
+        id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ matrix.version }}
+          BACKEND: ${{ matrix.backend }}
+          ISSUE: ${{ matrix.issue }}
+        run: |
+          set -euo pipefail
+          node scripts/validate-harmony-version.mjs "$VERSION"
+          [[ "$BACKEND" == quickjs || "$BACKEND" == quickjs_ng ]]
+          gh api "repos/$GITHUB_REPOSITORY/issues/$ISSUE" > "$RUNNER_TEMP/issue.json"
+          node --input-type=module -e 'import { stateFromIssue } from "./scripts/harmony-ohpm-state.mjs"; import { readFileSync, writeFileSync } from "node:fs"; const issue = JSON.parse(readFileSync(process.argv[1], "utf8")); const state = stateFromIssue(issue); if (issue.state !== "open" || state.version !== process.argv[2] || state.backend !== process.argv[3] || !["submitting", "submitted", "submit-unknown"].includes(state.status)) process.exit(1); writeFileSync(process.argv[4], JSON.stringify(state));' "$RUNNER_TEMP/issue.json" "$VERSION" "$BACKEND" "$RUNNER_TEMP/identity.json"
+          status=$(curl --location --retry 3 --silent --show-error --output "$RUNNER_TEMP/registry.json" --write-out '%{http_code}' "https://ohpm.openharmony.cn/ohpm/@jsbay%2f$BACKEND")
+          registry_integrity=$(node scripts/harmony-ohpm-monitor.mjs probe "$status" "$VERSION" "$RUNNER_TEMP/registry.json")
+          if [[ "$registry_integrity" == not-public ]]; then
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$VERSION" > "$RUNNER_TEMP/release.json"
+          jq -e '.draft == false' "$RUNNER_TEMP/release.json" > /dev/null
+          [[ "$(jq -r '.id | tostring' "$RUNNER_TEMP/release.json")" == "$(jq -r '.release_id' "$RUNNER_TEMP/identity.json")" ]]
+          gh api "repos/$GITHUB_REPOSITORY/commits/v$VERSION" > "$RUNNER_TEMP/release-commit.json"
+          [[ "$(jq -er 'if (.parents | length) == 1 then .parents[0].sha else error("invalid release commit") end' "$RUNNER_TEMP/release-commit.json")" == "$(jq -r '.source_sha' "$RUNNER_TEMP/identity.json")" ]]
+          har="jsbay-$VERSION-harmony-$BACKEND-arm64-v8a.har"
+          mkdir "$RUNNER_TEMP/release"
+          gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern "$har" --pattern SHA256SUMS --dir "$RUNNER_TEMP/release"
+          expected=$(jq -er --arg name "$har" '[.assets[] | select(.name == $name) | .digest] | if length == 1 then .[0] else error("invalid asset count") end' "$RUNNER_TEMP/release.json")
+          actual="sha256:$(sha256sum "$RUNNER_TEMP/release/$har" | cut -d' ' -f1)"
+          [[ "$actual" == "$expected" ]]
+          [[ "$actual" == "sha256:$(jq -r '.sha256' "$RUNNER_TEMP/identity.json")" ]]
+          [[ "$(sha512sum "$RUNNER_TEMP/release/$har" | cut -d' ' -f1)" == "$(jq -r '.sha512' "$RUNNER_TEMP/identity.json")" ]]
+          manifest=$(awk -v name="$har" '$2 == name { print $1 }' "$RUNNER_TEMP/release/SHA256SUMS")
+          [[ "$actual" == "sha256:$manifest" ]]
+          tar -xOzf "$RUNNER_TEMP/release/$har" package/oh-package.json5 | jq -e --arg name "@jsbay/$BACKEND" --arg version "$VERSION" '.name == $name and .version == $version'
+          integrity="sha512-$(openssl dgst -sha512 -binary "$RUNNER_TEMP/release/$har" | openssl base64 -A)"
+          [[ "$integrity" == "$registry_integrity" ]]
+          echo 'available=true' >> "$GITHUB_OUTPUT"
+          echo "integrity=$integrity" >> "$GITHUB_OUTPUT"
+
+      - name: Install Harmony command-line tools
+        if: steps.probe.outputs.available == 'true'
+        uses: ./.github/actions/setup-ohpm
+      - name: Install public package and build consumer
+        if: steps.probe.outputs.available == 'true'
+        env:
+          VERSION: ${{ matrix.version }}
+          BACKEND: ${{ matrix.backend }}
+          INTEGRITY: ${{ steps.probe.outputs.integrity }}
+        run: |
+          set -euo pipefail
+          ohpm config set registry https://ohpm.openharmony.cn/ohpm/
+          har="$RUNNER_TEMP/release/jsbay-$VERSION-harmony-$BACKEND-arm64-v8a.har"
+          app="$RUNNER_TEMP/registry-consumer"
+          node tests/harmony-sdk/prepare-ohpm-consumer.mjs "$app" "$har" "$BACKEND" "$VERSION"
+          (cd "$app/entry" && ohpm install --no-link)
+          jq -e --arg package "@jsbay/$BACKEND@$VERSION" --arg integrity "$INTEGRITY" '.packages[$package].integrity == $integrity and (.packages[$package].resolved | startswith("https://ohpm.openharmony.cn/ohpm/"))' "$app/entry/oh-package-lock.json5"
+          tar -xOzf "$har" package/libs/arm64-v8a/libjsbay_harmony.so > "$RUNNER_TEMP/published.so"
+          cmp "$RUNNER_TEMP/published.so" "$app/entry/oh_modules/@jsbay/$BACKEND/libs/arm64-v8a/libjsbay_harmony.so"
+          (cd "$app" && hvigorw --mode module -p module=entry@default assembleHap --no-daemon)
+      - name: Preserve consumer application
+        if: steps.probe.outputs.available == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-registry-${{ matrix.issue }}
+          path: ${{ runner.temp }}/registry-consumer/entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
+      - name: Prepare verification result
+        if: steps.probe.outputs.available == 'true'
+        env:
+          ISSUE: ${{ matrix.issue }}
+          VERSION: ${{ matrix.version }}
+          BACKEND: ${{ matrix.backend }}
+        run: jq -n --arg issue "$ISSUE" --slurpfile identity "$RUNNER_TEMP/identity.json" '{issue:$issue,identity:$identity[0]}' > "$RUNNER_TEMP/harmony-proof.json"
+      - name: Preserve verification result
+        if: steps.probe.outputs.available == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-proof-${{ matrix.issue }}
+          path: ${{ runner.temp }}/harmony-proof.json
+          if-no-files-found: error
+
+  record:
+    name: Record verified Harmony packages
+    needs: [discover, verify]
+    if: always() && !cancelled() && needs.discover.outputs.count != '0' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: harmony-proof-*
+          path: ${{ runner.temp }}/harmony-proofs
+      - name: Record successful installation and consumer build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! compgen -G "$RUNNER_TEMP/harmony-proofs/*/harmony-proof.json" > /dev/null; then exit 0; fi
+          gh label create harmony-ohpm-install-verified --repo "$GITHUB_REPOSITORY" --color 0e8a16 --description 'OHPM package installed and consumer built' 2>/dev/null || gh api "repos/$GITHUB_REPOSITORY/labels/harmony-ohpm-install-verified" > /dev/null
+          record_one() {
+            local proof="$1" issue
+            issue=$(jq -er '.issue | select(test("^[0-9]+$"))' "$proof") || return 1
+            gh api "repos/$GITHUB_REPOSITORY/issues/$issue" > "$RUNNER_TEMP/issue.json" || return 1
+            node --input-type=module -e 'import { stateFromIssue } from "./scripts/harmony-ohpm-state.mjs"; import { readFileSync } from "node:fs"; const issue = JSON.parse(readFileSync(process.argv[1], "utf8")); const proof = JSON.parse(readFileSync(process.argv[2], "utf8")); const state = stateFromIssue(issue); if (issue.state !== "open" || ["version", "backend", "release_id", "release_tag", "source_sha", "asset_name", "sha256", "sha512"].some(key => state[key] !== proof.identity[key])) process.exit(1);' "$RUNNER_TEMP/issue.json" "$proof" || return 1
+            gh issue edit "$issue" --repo "$GITHUB_REPOSITORY" --add-label harmony-ohpm-install-verified || return 1
+          }
+          failed=0
+          for proof in "$RUNNER_TEMP"/harmony-proofs/*/harmony-proof.json; do
+            if ! record_one "$proof"; then
+              echo "::error::Could not record verification result from $proof"
+              failed=1
+            fi
+          done
+          exit "$failed"

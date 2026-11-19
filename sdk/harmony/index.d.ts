@@ -57,9 +57,20 @@ export declare class Value {
 export type HostCallback = (thisValue: Value, args: Value[]) => Value;
 export type SyncStarter = (requestId: bigint, thisValue: Value, args: Value[]) => void;
 
+export declare interface JsExceptionDetails {
+  readonly message: string;
+  readonly stackTraceString: string | null;
+  readonly fileName: string | null;
+  readonly lineNumber: number | null;
+  readonly columnNumber: number | null;
+}
+
 export declare class JsException extends Error {
   constructor(value: Value);
   readonly value: Value;
+  details(): JsExceptionDetails;
+  detailsAndClose(): JsExceptionDetails;
+  describeDetailedAndClose(): string;
   describeAndClose(): string;
 }
 

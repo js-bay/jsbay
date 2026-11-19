@@ -62,6 +62,8 @@ git clone --bare -q "$PACKAGE_ROOT" "$BARE_REPO"
 mkdir -p "$CONSUMER/Sources"
 cp -R "$FIXTURE/Sources/SwiftConsumer" "$CONSUMER/Sources/"
 cp -R "$FIXTURE/Sources/ObjCConsumer" "$CONSUMER/Sources/"
+mkdir -p "$CONSUMER/Sources/DedicatedEngineThreadConsumer"
+cp "$ROOT/tests/apple-sdk/DedicatedEngineThreadConsumer.swift" "$CONSUMER/Sources/DedicatedEngineThreadConsumer/main.swift"
 sed "s#\.package(name: \"JsBay\", path: \"@JSBAY_PACKAGE@\")#.package(url: \"file://$BARE_REPO\", from: \"$SEMVER\")#" \
     "$FIXTURE/Package.swift.template" > "$CONSUMER/Package.swift"
 
@@ -70,4 +72,5 @@ sed "s#\.package(name: \"JsBay\", path: \"@JSBAY_PACKAGE@\")#.package(url: \"fil
     swift build
     swift run SwiftConsumer
     swift run ObjCConsumer
+    swift run DedicatedEngineThreadConsumer
 )

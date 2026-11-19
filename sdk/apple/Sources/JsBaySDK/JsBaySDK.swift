@@ -47,6 +47,106 @@ public final class JsException: Error {
   public let value: Value
   fileprivate init(_ value: Value) { self.value = value }
 
+  public func details() throws -> JsExceptionDetails {
+    let message = try Self.stringField(value, "message") ?? Self.description(value)
+    return JsExceptionDetails(
+      message: message,
+      stackTraceString: try Self.stringField(value, "stack"),
+      fileName: try Self.stringField(value, "fileName") ?? Self.stringField(value, "sourceURL"),
+      lineNumber: try Self.integerField(value, "lineNumber") ?? Self.integerField(value, "line"),
+      columnNumber: try Self.integerField(value, "columnNumber")
+        ?? Self.integerField(value, "column"))
+  }
+
+  public func detailsAndClose() throws -> JsExceptionDetails {
+    try value.requireOwnedForConsume()
+    let snapshot: JsExceptionDetails
+    do {
+      snapshot = try details()
+    } catch {
+      try value.close()
+      throw error
+    }
+    try value.close()
+    return snapshot
+  }
+
+  public func describeDetailedAndClose() throws -> String {
+    let details = try detailsAndClose()
+    guard let stack = details.stackTraceString, !stack.isEmpty else { return details.message }
+    guard !details.message.isEmpty else { return stack }
+    let firstLine =
+      stack.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(
+        String.init) ?? stack
+    return firstLine.contains(details.message) ? stack : "\(details.message)\n\(stack)"
+  }
+
+  private static func stringField(_ value: Value, _ name: String) throws -> String? {
+    let field: Value
+    do {
+      field = try value.get(name)
+    } catch let secondary as JsException {
+      try secondary.value.close()
+      return nil
+    }
+    let result: String?
+    do {
+      switch try field.kind() {
+      case .undefined, .null: result = nil
+      default: result = try field.string()
+      }
+    } catch let secondary as JsException {
+      try field.close()
+      try secondary.value.close()
+      return nil
+    } catch {
+      try field.close()
+      throw error
+    }
+    try field.close()
+    return result
+  }
+
+  private static func integerField(_ value: Value, _ name: String) throws -> Int? {
+    let field: Value
+    do {
+      field = try value.get(name)
+    } catch let secondary as JsException {
+      try secondary.value.close()
+      return nil
+    }
+    let result: Int?
+    do {
+      guard try field.kind() == .number else {
+        result = nil
+        try field.close()
+        return result
+      }
+      let number = try field.number()
+      result =
+        number.isFinite && number >= 0 && number <= Double(Int32.max)
+          && number.rounded(.towardZero) == number ? Int(number) : nil
+    } catch let secondary as JsException {
+      try field.close()
+      try secondary.value.close()
+      return nil
+    } catch {
+      try field.close()
+      throw error
+    }
+    try field.close()
+    return result
+  }
+
+  private static func description(_ value: Value) throws -> String {
+    do {
+      return try value.string()
+    } catch let secondary as JsException {
+      try secondary.value.close()
+      return "JavaScript exception"
+    }
+  }
+
   /// Returns the thrown value's text and closes it. A second JavaScript throw closes both values and returns a fixed
   /// fallback.
   public func describeAndClose() throws -> String {
@@ -61,6 +161,14 @@ public final class JsException: Error {
       return "JavaScript exception"
     }
   }
+}
+
+public struct JsExceptionDetails: Equatable, Sendable {
+  public let message: String
+  public let stackTraceString: String?
+  public let fileName: String?
+  public let lineNumber: Int?
+  public let columnNumber: Int?
 }
 
 /// A thread-safe, data-only completion for `Engine.bindSync`. It may run on a background queue and never calls Engine
@@ -1012,16 +1120,19 @@ public final class Engine {
     guard isOpen, Engine.live[id]?.value === self else { return false }
     return jsbay_engine_is_suspended(id)
   }
+  /// Requests asynchronous interruption of JavaScript execution. Thread-safe. Latches a persistent user-interrupt flag that must be cleared via clearInterrupt before executing subsequent scripts.
   public func requestInterrupt() -> Bool {
     Engine.liveLock.lock()
     defer { Engine.liveLock.unlock() }
     guard isOpen, Engine.live[id]?.value === self else { return false }
     return jsbay_engine_request_interrupt(id)
   }
+  /// Clears a previously requested user interrupt before executing more JavaScript.
   public func clearInterrupt() throws -> Bool {
     try requireOpen()
     return jsbay_engine_clear_interrupt(id)
   }
+  /// Arms a relative execution limit in milliseconds without blocking. Zero disables the limit. Deadlines expire automatically and do not latch a persistent interrupt flag.
   public func setExecutionTimeLimit(milliseconds: UInt64) throws -> Bool {
     try requireOpen()
     return jsbay_engine_set_execution_time_limit(id, milliseconds)

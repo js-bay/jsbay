@@ -86,6 +86,10 @@ pub export fn jsbay_available_backends(out_backends: ?[*]BackendC, cap: usize) u
     return n;
 }
 
+pub fn ensureValueRegistry() void {
+    _ = api_value.ensureInitialized(std.heap.c_allocator);
+}
+
 /// Create-time engine select. `backend == .primary` (0) selects the pack primary. Any packed backend (including non-primary) creates an instance; non-packed tags fail. Non-primary packed instances support create/eval/destroy plus the typed Value surface wired through packed_api_value; bytecode cache and bind/inspector remain primary-only.
 pub export fn jsbay_engine_create_with_options(
     instance_id: c_int,
@@ -134,6 +138,7 @@ pub export fn jsbay_engine_create_with_options(
             return false;
         }
     }
+    ensureValueRegistry();
     if (!api_value.noteCreated(id)) {
         engine.destroy(id);
         return false;
@@ -282,6 +287,7 @@ test "c_api: forced packed_alt typed value for the primary backend" {
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -368,6 +374,7 @@ test "c_api: forced packed_alt set/call/construct/new_* for the primary backend"
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -450,6 +457,45 @@ test "c_api: forced packed_alt set/call/construct/new_* for the primary backend"
     try std.testing.expectEqual(API_OK, jsbay_value_to_number(px, &number));
     try std.testing.expectEqual(@as(f64, 5), number);
 
+    // sso string set / get / call / construct in packed_alt
+    var sso_val: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_sso_string("hello", 5, &sso_val));
+    defer _ = jsbay_value_release(sso_val);
+    try std.testing.expectEqual(API_OK, jsbay_value_set(obj, .{ .data = "greeting", .len = 8 }, sso_val, &exception));
+    try std.testing.expectEqual(@as(u64, 0), exception);
+    var got_sso: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(obj, .{ .data = "greeting", .len = 8 }, &got_sso, &exception));
+    defer _ = jsbay_value_release(got_sso);
+    var sso_bytes: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(got_sso, &sso_bytes, &exception));
+    defer jsbay_free_bytes(sso_bytes);
+    try std.testing.expectEqualStrings("hello", sso_bytes.data.?[0..sso_bytes.len]);
+
+    // sso string call argument and this in packed_alt
+    var fn_echo: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(s){ return s + '!'; })", .len = 32 }, .{ .data = "<echo>", .len = 6 }, null, &fn_echo, &exception));
+    defer _ = jsbay_value_release(fn_echo);
+    var echo_res: u64 = 0;
+    const sso_call_args = [_]u64{sso_val};
+    try std.testing.expectEqual(API_OK, jsbay_value_call(fn_echo, und, &sso_call_args, 1, &echo_res, &exception));
+    defer _ = jsbay_value_release(echo_res);
+    var echo_bytes: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(echo_res, &echo_bytes, &exception));
+    defer jsbay_free_bytes(echo_bytes);
+    try std.testing.expectEqualStrings("hello!", echo_bytes.data.?[0..echo_bytes.len]);
+
+    // sso string construct argument in packed_alt
+    var sso_constructed: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_construct(ctor, &sso_call_args, 1, &sso_constructed, &exception));
+    defer _ = jsbay_value_release(sso_constructed);
+    var sso_px: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_get(sso_constructed, .{ .data = "x", .len = 1 }, &sso_px, &exception));
+    defer _ = jsbay_value_release(sso_px);
+    var px_bytes: Bytes = .{ .data = null, .len = 0 };
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(sso_px, &px_bytes, &exception));
+    defer jsbay_free_bytes(px_bytes);
+    try std.testing.expectEqualStrings("hello", px_bytes.data.?[0..px_bytes.len]);
+
     // ArrayBuffer
     const payload = [_]u8{ 1, 2, 3, 4 };
     var buf: u64 = 0;
@@ -503,6 +549,92 @@ test "c_api: packed-alt set/call/new when real non-primary packed" {
     }
 }
 
+test "c_api: direct register call trampolines call_0 through call_4" {
+    const helpers = @import("tests/test_helpers.zig");
+    const id = helpers.nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    defer jsbay_engine_destroy(id);
+    const HV = value_mod.HyperValue;
+
+    var und: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_undefined(id, &und));
+    defer _ = jsbay_value_release(und);
+
+    var n: f64 = 0;
+    var ex: u64 = 0;
+
+    // call_0
+    var fn0: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(){ return 100; })", .len = 27 }, .{ .data = "<fn0>", .len = 5 }, null, &fn0, &ex));
+    defer _ = jsbay_value_release(fn0);
+    var r0: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_call_0(fn0, und, &r0, &ex));
+    defer _ = jsbay_value_release(r0);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(r0, &n));
+    try std.testing.expectEqual(@as(f64, 100), n);
+
+    // call_1
+    var fn1: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(a){ return a * 2; })", .len = 30 }, .{ .data = "<fn1>", .len = 5 }, null, &fn1, &ex));
+    defer _ = jsbay_value_release(fn1);
+    var a1: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 21, &a1));
+    defer _ = jsbay_value_release(a1);
+    var r1: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_call_1(fn1, und, a1, &r1, &ex));
+    defer _ = jsbay_value_release(r1);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(r1, &n));
+    try std.testing.expectEqual(@as(f64, 42), n);
+
+    // call_2
+    var fn2: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(a,b){ return a + b; })", .len = 32 }, .{ .data = "<fn2>", .len = 5 }, null, &fn2, &ex));
+    defer _ = jsbay_value_release(fn2);
+    var a2: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 9, &a2));
+    defer _ = jsbay_value_release(a2);
+    var r2: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_call_2(fn2, und, a1, a2, &r2, &ex));
+    defer _ = jsbay_value_release(r2);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(r2, &n));
+    try std.testing.expectEqual(@as(f64, 30), n);
+
+    // call_3
+    var fn3: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(a,b,c){ return a + b + c; })", .len = 38 }, .{ .data = "<fn3>", .len = 5 }, null, &fn3, &ex));
+    defer _ = jsbay_value_release(fn3);
+    var a3: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 1, &a3));
+    defer _ = jsbay_value_release(a3);
+    var r3: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_call_3(fn3, und, a1, a2, a3, &r3, &ex));
+    defer _ = jsbay_value_release(r3);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(r3, &n));
+    try std.testing.expectEqual(@as(f64, 31), n);
+
+    // call_4
+    var fn4: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_engine_evaluate(id, .{ .data = "(function(a,b,c,d){ return a + b + c + d; })", .len = 44 }, .{ .data = "<fn4>", .len = 5 }, null, &fn4, &ex));
+    defer _ = jsbay_value_release(fn4);
+    var a4: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_number(id, 10, &a4));
+    defer _ = jsbay_value_release(a4);
+    var r4: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_call_4(fn4, und, a1, a2, a3, a4, &r4, &ex));
+    defer _ = jsbay_value_release(r4);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(r4, &n));
+    try std.testing.expectEqual(@as(f64, 41), n);
+
+    // Direct unboxed primitive arguments bypass handle table completely
+    const unboxed_a = HV.fromInt32(50).raw;
+    const unboxed_b = HV.fromInt32(25).raw;
+    var r_unboxed: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_call_2(fn2, und, unboxed_a, unboxed_b, &r_unboxed, &ex));
+    defer _ = jsbay_value_release(r_unboxed);
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(r_unboxed, &n));
+    try std.testing.expectEqual(@as(f64, 75), n);
+}
+
 test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/new_error" {
     const helpers = @import("tests/test_helpers.zig");
     try helpers.skipUnlessPrimaryPacked();
@@ -546,6 +678,7 @@ test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/ne
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer jsbay_engine_destroy(id);
 
@@ -726,6 +859,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         std.heap.c_allocator.destroy(instance);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id));
     defer {
         if (instance_map.getInstance(id) != null) jsbay_engine_destroy(id);
@@ -886,6 +1020,7 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
         std.heap.c_allocator.destroy(instance2);
         return error.InsertFailed;
     }
+    ensureValueRegistry();
     try std.testing.expect(api_value.noteCreated(id2));
     defer jsbay_engine_destroy(id2);
     var obj2: u64 = 0;
@@ -1173,6 +1308,7 @@ pub export fn jsbay_engine_create_with_limits(
         engine.destroy(id);
         return false;
     }
+    ensureValueRegistry();
     if (!api_value.noteCreated(id)) {
         engine.destroy(id);
         return false;
@@ -1452,7 +1588,7 @@ pub export fn jsbay_engine_clear_interrupt(instance_id: c_int) bool {
     return runtime_control.clearInterrupt(@intCast(instance_id));
 }
 
-/// Arm a relative execution limit without blocking the caller. Zero disables the limit. The backend interrupt handler owns enforcement.
+/// Arm a relative execution limit without blocking the caller. Zero disables the limit. Deadlines expire automatically and do not latch a sticky interrupt flag, unlike request_interrupt. The backend interrupt handler owns enforcement.
 pub export fn jsbay_engine_set_execution_time_limit(instance_id: c_int, millis: u64) bool {
     const id: i32 = @intCast(instance_id);
     if (!api_value.isOwner(id)) return false;
@@ -2002,6 +2138,13 @@ const discardTypedBytecodeResult = value_operation.discardTypedBytecodeResult;
 
 pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
     out_value.* = 0;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isEmpty()) return API_STALE_VALUE;
+    if (val.isPrimitive()) {
+        out_value.* = value;
+        return API_OK;
+    }
+    ensureValueRegistry();
     if (packed_api_value.isPackedHandle(value)) {
         const instance_id = packed_api_value.instanceFor(value) orelse return API_STALE_VALUE;
         if (!api_value.isOwner(instance_id)) return API_WRONG_THREAD;
@@ -2025,6 +2168,10 @@ pub export fn jsbay_value_retain(value: u64, out_value: *u64) c_int {
 }
 
 pub export fn jsbay_value_release(value: u64) c_int {
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isEmpty()) return API_STALE_VALUE;
+    if (val.isPrimitive()) return API_OK;
+    ensureValueRegistry();
     if (host_string_values.take(value)) |entry| {
         std.heap.c_allocator.free(entry.bytes);
         return API_OK;
@@ -2326,7 +2473,13 @@ pub export fn jsbay_value_new_array_buffer_no_copy(
     const maybe_val = value_buffers.newArrayBufferFromBytes(id, byte_ptr, len, fin, user_data);
     if (maybe_val) |val| {
         var owned = value_mod.OwnedValue.init(op.ctx, val);
-        reserved.commit(&owned);
+        defer owned.deinit();
+        reserved.commit(&owned) catch |err| {
+            return switch (err) {
+                error.RegistryUnavailable => API_INSTANCE_NOT_FOUND,
+                error.InvalidReservation => API_STALE_VALUE,
+            };
+        };
         out_value.* = reserved.handle;
         return API_OK;
     } else {
@@ -2337,6 +2490,28 @@ pub export fn jsbay_value_new_array_buffer_no_copy(
 
 pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
     out_kind.* = 0;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isEmpty()) return API_STALE_VALUE;
+    if (val.isUndefined()) {
+        out_kind.* = 0;
+        return API_OK;
+    }
+    if (val.isNull()) {
+        out_kind.* = 1;
+        return API_OK;
+    }
+    if (val.isBool()) {
+        out_kind.* = 2;
+        return API_OK;
+    }
+    if (val.isNumber()) {
+        out_kind.* = 3;
+        return API_OK;
+    }
+    if (val.isSso()) {
+        out_kind.* = 4;
+        return API_OK;
+    }
     if (host_string_values.get(value) != null) {
         out_kind.* = 4; // JSBAY_VALUE_STRING
         return API_OK;
@@ -2361,6 +2536,12 @@ pub export fn jsbay_value_type(value: u64, out_kind: *c_int) c_int {
 
 pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
     out_value.* = false;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isBool()) {
+        out_value.* = val.asBool();
+        return API_OK;
+    }
+    if (val.isPrimitive()) return API_INVALID_ARGUMENT;
     if (packed_api_value.isPackedHandle(value)) {
         var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
@@ -2383,6 +2564,12 @@ pub export fn jsbay_value_to_bool(value: u64, out_value: *bool) c_int {
 
 pub export fn jsbay_value_to_number(value: u64, out_value: *f64) c_int {
     out_value.* = 0;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isNumber()) {
+        out_value.* = val.asFloat();
+        return API_OK;
+    }
+    if (val.isPrimitive()) return API_INVALID_ARGUMENT;
     if (packed_api_value.isPackedHandle(value)) {
         var data = switch (beginPackedValueOp(value)) {
             .status => |status| return status,
@@ -2612,6 +2799,11 @@ const packedPublishBytes = value_operation.packedPublishBytes;
 const packedDupBytes = value_operation.packedDupBytes;
 
 const packedInstanceReady = value_operation.packedInstanceReady;
+
+fn isPackedOperand(handle: u64) bool {
+    const val = value_mod.HyperValue{ .raw = handle };
+    return packed_api_value.isPackedHandle(handle) or val.isSso();
+}
 
 fn evaluatePackedAlt(instance_id: i32, source: []const u8, filename: []const u8, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
@@ -2902,6 +3094,17 @@ pub export fn jsbay_value_new_error(instance_id_raw: c_int, message_arg: Utf8, o
 pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
     out_exception.* = 0;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (val.isSso()) {
+        const len = val.ssoLength();
+        if (len > 6) return API_STALE_VALUE;
+        var sso_buf: [6]u8 = undefined;
+        const copied = val.copySso(&sso_buf);
+        const duped = std.heap.c_allocator.dupe(u8, sso_buf[0..copied]) catch return API_OUT_OF_MEMORY;
+        out_bytes.* = .{ .data = duped.ptr, .len = duped.len };
+        return API_OK;
+    }
+    if (val.isPrimitive()) return API_INVALID_ARGUMENT;
     if (host_string_values.get(value)) |entry| {
         const duped = std.heap.c_allocator.dupe(u8, entry.bytes) catch return API_OUT_OF_MEMORY;
         out_bytes.* = .{ .data = duped.ptr, .len = duped.len };
@@ -2962,6 +3165,29 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
         .out_of_memory => return API_OUT_OF_MEMORY,
         .invalid_argument => return API_INVALID_ARGUMENT,
     }
+}
+pub export fn jsbay_value_to_sso_utf8(value: u64, out_buf: ?[*]u8, out_len: ?*usize) c_int {
+    const len_ptr = out_len orelse return API_INVALID_ARGUMENT;
+    len_ptr.* = 0;
+    const buf = out_buf orelse return API_INVALID_ARGUMENT;
+    const val = value_mod.HyperValue{ .raw = value };
+    if (!val.isSso()) return API_INVALID_ARGUMENT;
+    const len = val.ssoLength();
+    if (len > 6) return API_STALE_VALUE;
+    var sso_buf: [6]u8 = undefined;
+    const copied = val.copySso(&sso_buf);
+    @memcpy(buf[0..copied], sso_buf[0..copied]);
+    len_ptr.* = copied;
+    return API_OK;
+}
+pub export fn jsbay_value_new_sso_string(utf8: ?[*]const u8, len: usize, out_value: ?*u64) c_int {
+    const out = out_value orelse return API_INVALID_ARGUMENT;
+    out.* = 0;
+    if (len > 6) return API_INVALID_ARGUMENT;
+    const slice = if (len == 0) "" else (utf8 orelse return API_INVALID_ARGUMENT)[0..len];
+    const val = value_mod.HyperValue.fromSso(slice) orelse return API_INVALID_ARGUMENT;
+    out.* = val.raw;
+    return API_OK;
 }
 pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
     out_bytes.* = .{ .data = null, .len = 0 };
@@ -3096,12 +3322,16 @@ pub export fn jsbay_value_set(object: u64, key_arg: Utf8, value: u64, out_except
             .ok => |ok| ok,
         };
         defer data.deinit();
-        if (!packed_api_value.isPackedHandle(value)) return API_STALE_VALUE;
+        if (!isPackedOperand(value)) return API_STALE_VALUE;
         // Allocate before duplicating `value`: a key-allocation failure must not leave a duplicate without an owner.
         const key_z = duplicateKey(key) orelse return API_OUT_OF_MEMORY;
         defer std.heap.c_allocator.free(key_z);
         var value_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const value_len = packedDupBytes(value, data.js.id, data.js.tag, value_buf[0..]) orelse return API_STALE_VALUE;
+        const value_len = switch (packedDupBytes(value, data.js.id, data.js.tag, value_buf[0..])) {
+            .ok => |len| len,
+            .out_of_memory => return API_OUT_OF_MEMORY,
+            .stale => return API_STALE_VALUE,
+        };
         // valueSetProperty consumes the duplicated value.
         const result = @import("backend_dispatch.zig").valueSetProperty(data.js.tag, data.js.ctx_addr, data.bytes(), key_z, value_buf[0..value_len]);
         if (!drainPackedJobs(&data.js)) {
@@ -3141,8 +3371,9 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
     out_value.* = 0;
     out_exception.* = 0;
     if (args == null and argc != 0) return API_INVALID_ARGUMENT;
+    const INLINE_ARGS_CAP = 8;
     if (packed_api_value.isPackedHandle(function)) {
-        if (!packed_api_value.isPackedHandle(this_value)) return API_STALE_VALUE;
+        if (!isPackedOperand(this_value)) return API_STALE_VALUE;
         // Acquire the eval lease before duplicating this/args so Zig LIFO runs lease release after freeValue cleanup.
         var data = switch (beginPackedValueOp(function)) {
             .status => |status| return status,
@@ -3150,41 +3381,76 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         };
         defer data.deinit();
         var this_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const this_len = packedDupBytes(this_value, data.js.id, data.js.tag, this_buf[0..]) orelse return API_STALE_VALUE;
+        const this_len = switch (packedDupBytes(this_value, data.js.id, data.js.tag, this_buf[0..])) {
+            .ok => |len| len,
+            .out_of_memory => return API_OUT_OF_MEMORY,
+            .stale => return API_STALE_VALUE,
+        };
         defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, this_buf[0..this_len]);
 
-        var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
-        defer arg_storage.deinit(data.js.allocator);
-        var arg_lens = std.ArrayList(usize).empty;
-        defer arg_lens.deinit(data.js.allocator);
+        var stack_storage: [INLINE_ARGS_CAP][@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+        var stack_lens: [INLINE_ARGS_CAP]usize = undefined;
+        var stack_slices: [INLINE_ARGS_CAP][]const u8 = undefined;
+        var heap_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
+        defer heap_storage.deinit(data.js.allocator);
+        var heap_lens = std.ArrayList(usize).empty;
+        defer heap_lens.deinit(data.js.allocator);
+        var heap_slices = std.ArrayList([]const u8).empty;
+        defer heap_slices.deinit(data.js.allocator);
+        var duped_count: usize = 0;
         defer {
             var i: usize = 0;
-            while (i < arg_storage.items.len) : (i += 1) {
-                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, arg_storage.items[i][0..arg_lens.items[i]]);
+            if (argc <= INLINE_ARGS_CAP) {
+                while (i < duped_count) : (i += 1) {
+                    @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, stack_storage[i][0..stack_lens[i]]);
+                }
+            } else {
+                while (i < heap_storage.items.len) : (i += 1) {
+                    @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, heap_storage.items[i][0..heap_lens.items[i]]);
+                }
             }
         }
-        if (args) |raw_args| for (raw_args[0..argc]) |handle| {
-            if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
-            var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-            const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
-            arg_storage.append(data.js.allocator, buf) catch {
-                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
-                return API_OUT_OF_MEMORY;
-            };
-            arg_lens.append(data.js.allocator, len) catch {
-                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
-                _ = arg_storage.pop();
-                return API_OUT_OF_MEMORY;
-            };
-        };
-        var arg_slices = std.ArrayList([]const u8).empty;
-        defer arg_slices.deinit(data.js.allocator);
-        arg_slices.ensureTotalCapacityPrecise(data.js.allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
-        var ai: usize = 0;
-        while (ai < arg_storage.items.len) : (ai += 1) {
-            arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
+        if (args) |raw_args| {
+            if (argc <= INLINE_ARGS_CAP) {
+                for (raw_args[0..argc], 0..) |handle, idx| {
+                    if (!isPackedOperand(handle)) return API_STALE_VALUE;
+                    const len = switch (packedDupBytes(handle, data.js.id, data.js.tag, stack_storage[idx][0..])) {
+                        .ok => |l| l,
+                        .out_of_memory => return API_OUT_OF_MEMORY,
+                        .stale => return API_STALE_VALUE,
+                    };
+                    stack_lens[idx] = len;
+                    stack_slices[idx] = stack_storage[idx][0..len];
+                    duped_count += 1;
+                }
+            } else {
+                for (raw_args[0..argc]) |handle| {
+                    if (!isPackedOperand(handle)) return API_STALE_VALUE;
+                    var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+                    const len = switch (packedDupBytes(handle, data.js.id, data.js.tag, buf[0..])) {
+                        .ok => |l| l,
+                        .out_of_memory => return API_OUT_OF_MEMORY,
+                        .stale => return API_STALE_VALUE,
+                    };
+                    heap_storage.append(data.js.allocator, buf) catch {
+                        @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
+                        return API_OUT_OF_MEMORY;
+                    };
+                    heap_lens.append(data.js.allocator, len) catch {
+                        @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
+                        _ = heap_storage.pop();
+                        return API_OUT_OF_MEMORY;
+                    };
+                }
+                heap_slices.ensureTotalCapacityPrecise(data.js.allocator, heap_storage.items.len) catch return API_OUT_OF_MEMORY;
+                var ai: usize = 0;
+                while (ai < heap_storage.items.len) : (ai += 1) {
+                    heap_slices.appendAssumeCapacity(heap_storage.items[ai][0..heap_lens.items[ai]]);
+                }
+            }
         }
-        const result = @import("backend_dispatch.zig").valueCall(data.js.allocator, data.js.tag, data.js.ctx_addr, data.bytes(), this_buf[0..this_len], arg_slices.items);
+        const effective_slices: []const []const u8 = if (argc <= INLINE_ARGS_CAP) stack_slices[0..argc] else heap_slices.items;
+        const result = @import("backend_dispatch.zig").valueCall(data.js.allocator, data.js.tag, data.js.ctx_addr, data.bytes(), this_buf[0..this_len], effective_slices);
         if (!drainPackedJobs(&data.js)) {
             discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
             return API_INSTANCE_NOT_FOUND;
@@ -3201,20 +3467,43 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         .ok => |ok| ok,
     };
     defer ActiveEngine.freeValue(function_data.op.ctx, pinned_this);
-    var values = std.ArrayList(ActiveEngine.Value).empty;
-    defer values.deinit(function_data.op.allocator);
-    defer for (values.items) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
-    if (args) |raw_args| for (raw_args[0..argc]) |handle| {
-        const item = switch (pinValue(function_data.op, handle)) {
-            .status => |status| return status,
-            .ok => |ok| ok,
-        };
-        values.append(function_data.op.allocator, item) catch {
-            ActiveEngine.freeValue(function_data.op.ctx, item);
-            return API_OUT_OF_MEMORY;
-        };
-    };
-    const result = api_backend.call(function_data.op.allocator, function_data.op.ctx, function_data.value, pinned_this, values.items);
+
+    var stack_values: [INLINE_ARGS_CAP]ActiveEngine.Value = undefined;
+    var heap_values = std.ArrayList(ActiveEngine.Value).empty;
+    defer heap_values.deinit(function_data.op.allocator);
+    var pinned_count: usize = 0;
+    defer {
+        if (argc <= INLINE_ARGS_CAP) {
+            for (stack_values[0..pinned_count]) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
+        } else {
+            for (heap_values.items) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
+        }
+    }
+    if (args) |raw_args| {
+        if (argc <= INLINE_ARGS_CAP) {
+            for (raw_args[0..argc], 0..) |handle, idx| {
+                const item = switch (pinValue(function_data.op, handle)) {
+                    .status => |status| return status,
+                    .ok => |ok| ok,
+                };
+                stack_values[idx] = item;
+                pinned_count += 1;
+            }
+        } else {
+            for (raw_args[0..argc]) |handle| {
+                const item = switch (pinValue(function_data.op, handle)) {
+                    .status => |status| return status,
+                    .ok => |ok| ok,
+                };
+                heap_values.append(function_data.op.allocator, item) catch {
+                    ActiveEngine.freeValue(function_data.op.ctx, item);
+                    return API_OUT_OF_MEMORY;
+                };
+            }
+        }
+    }
+    const call_args: []const ActiveEngine.Value = if (argc <= INLINE_ARGS_CAP) stack_values[0..argc] else heap_values.items;
+    const result = api_backend.call(function_data.op.allocator, function_data.op.ctx, function_data.value, pinned_this, call_args);
     if (!drainApiJobs(&function_data.op)) {
         discardBackendResult(function_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
@@ -3228,10 +3517,36 @@ pub export fn jsbay_value_call(function: u64, this_value: u64, args: ?[*]const u
         .out_of_memory => API_OUT_OF_MEMORY,
     };
 }
+
+pub export fn jsbay_value_call_0(function: u64, this_value: u64, out_value: *u64, out_exception: *u64) c_int {
+    return jsbay_value_call(function, this_value, null, 0, out_value, out_exception);
+}
+
+pub export fn jsbay_value_call_1(function: u64, this_value: u64, a0: u64, out_value: *u64, out_exception: *u64) c_int {
+    const args = [1]u64{a0};
+    return jsbay_value_call(function, this_value, &args, 1, out_value, out_exception);
+}
+
+pub export fn jsbay_value_call_2(function: u64, this_value: u64, a0: u64, a1: u64, out_value: *u64, out_exception: *u64) c_int {
+    const args = [2]u64{ a0, a1 };
+    return jsbay_value_call(function, this_value, &args, 2, out_value, out_exception);
+}
+
+pub export fn jsbay_value_call_3(function: u64, this_value: u64, a0: u64, a1: u64, a2: u64, out_value: *u64, out_exception: *u64) c_int {
+    const args = [3]u64{ a0, a1, a2 };
+    return jsbay_value_call(function, this_value, &args, 3, out_value, out_exception);
+}
+
+pub export fn jsbay_value_call_4(function: u64, this_value: u64, a0: u64, a1: u64, a2: u64, a3: u64, out_value: *u64, out_exception: *u64) c_int {
+    const args = [4]u64{ a0, a1, a2, a3 };
+    return jsbay_value_call(function, this_value, &args, 4, out_value, out_exception);
+}
+
 pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: usize, out_value: *u64, out_exception: *u64) c_int {
     out_value.* = 0;
     out_exception.* = 0;
     if (args == null and argc != 0) return API_INVALID_ARGUMENT;
+    const INLINE_ARGS_CAP = 8;
     if (packed_api_value.isPackedHandle(function)) {
         // Acquire the eval lease before duplicating args so Zig LIFO runs lease release after freeValue cleanup.
         var data = switch (beginPackedValueOp(function)) {
@@ -3239,38 +3554,70 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
             .ok => |ok| ok,
         };
         defer data.deinit();
-        var arg_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
-        defer arg_storage.deinit(data.js.allocator);
-        var arg_lens = std.ArrayList(usize).empty;
-        defer arg_lens.deinit(data.js.allocator);
+
+        var stack_storage: [INLINE_ARGS_CAP][@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+        var stack_lens: [INLINE_ARGS_CAP]usize = undefined;
+        var stack_slices: [INLINE_ARGS_CAP][]const u8 = undefined;
+        var heap_storage = std.ArrayList([@import("backend_dispatch.zig").value_storage_size]u8).empty;
+        defer heap_storage.deinit(data.js.allocator);
+        var heap_lens = std.ArrayList(usize).empty;
+        defer heap_lens.deinit(data.js.allocator);
+        var heap_slices = std.ArrayList([]const u8).empty;
+        defer heap_slices.deinit(data.js.allocator);
+        var duped_count: usize = 0;
         defer {
             var i: usize = 0;
-            while (i < arg_storage.items.len) : (i += 1) {
-                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, arg_storage.items[i][0..arg_lens.items[i]]);
+            if (argc <= INLINE_ARGS_CAP) {
+                while (i < duped_count) : (i += 1) {
+                    @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, stack_storage[i][0..stack_lens[i]]);
+                }
+            } else {
+                while (i < heap_storage.items.len) : (i += 1) {
+                    @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, heap_storage.items[i][0..heap_lens.items[i]]);
+                }
             }
         }
-        if (args) |raw_args| for (raw_args[0..argc]) |handle| {
-            if (!packed_api_value.isPackedHandle(handle)) return API_STALE_VALUE;
-            var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-            const len = packedDupBytes(handle, data.js.id, data.js.tag, buf[0..]) orelse return API_STALE_VALUE;
-            arg_storage.append(data.js.allocator, buf) catch {
-                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
-                return API_OUT_OF_MEMORY;
-            };
-            arg_lens.append(data.js.allocator, len) catch {
-                @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
-                _ = arg_storage.pop();
-                return API_OUT_OF_MEMORY;
-            };
-        };
-        var arg_slices = std.ArrayList([]const u8).empty;
-        defer arg_slices.deinit(data.js.allocator);
-        arg_slices.ensureTotalCapacityPrecise(data.js.allocator, arg_storage.items.len) catch return API_OUT_OF_MEMORY;
-        var ai: usize = 0;
-        while (ai < arg_storage.items.len) : (ai += 1) {
-            arg_slices.appendAssumeCapacity(arg_storage.items[ai][0..arg_lens.items[ai]]);
+        if (args) |raw_args| {
+            if (argc <= INLINE_ARGS_CAP) {
+                for (raw_args[0..argc], 0..) |handle, idx| {
+                    if (!isPackedOperand(handle)) return API_STALE_VALUE;
+                    const len = switch (packedDupBytes(handle, data.js.id, data.js.tag, stack_storage[idx][0..])) {
+                        .ok => |l| l,
+                        .out_of_memory => return API_OUT_OF_MEMORY,
+                        .stale => return API_STALE_VALUE,
+                    };
+                    stack_lens[idx] = len;
+                    stack_slices[idx] = stack_storage[idx][0..len];
+                    duped_count += 1;
+                }
+            } else {
+                for (raw_args[0..argc]) |handle| {
+                    if (!isPackedOperand(handle)) return API_STALE_VALUE;
+                    var buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
+                    const len = switch (packedDupBytes(handle, data.js.id, data.js.tag, buf[0..])) {
+                        .ok => |l| l,
+                        .out_of_memory => return API_OUT_OF_MEMORY,
+                        .stale => return API_STALE_VALUE,
+                    };
+                    heap_storage.append(data.js.allocator, buf) catch {
+                        @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
+                        return API_OUT_OF_MEMORY;
+                    };
+                    heap_lens.append(data.js.allocator, len) catch {
+                        @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, buf[0..len]);
+                        _ = heap_storage.pop();
+                        return API_OUT_OF_MEMORY;
+                    };
+                }
+                heap_slices.ensureTotalCapacityPrecise(data.js.allocator, heap_storage.items.len) catch return API_OUT_OF_MEMORY;
+                var ai: usize = 0;
+                while (ai < heap_storage.items.len) : (ai += 1) {
+                    heap_slices.appendAssumeCapacity(heap_storage.items[ai][0..heap_lens.items[ai]]);
+                }
+            }
         }
-        const result = @import("backend_dispatch.zig").valueConstruct(data.js.allocator, data.js.tag, data.js.ctx_addr, data.bytes(), arg_slices.items);
+        const effective_slices: []const []const u8 = if (argc <= INLINE_ARGS_CAP) stack_slices[0..argc] else heap_slices.items;
+        const result = @import("backend_dispatch.zig").valueConstruct(data.js.allocator, data.js.tag, data.js.ctx_addr, data.bytes(), effective_slices);
         if (!drainPackedJobs(&data.js)) {
             discardPackedEvalResult(data.js.tag, data.js.ctx_addr, result);
             return API_INSTANCE_NOT_FOUND;
@@ -3282,20 +3629,43 @@ pub export fn jsbay_value_construct(function: u64, args: ?[*]const u64, argc: us
         .ok => |ok| ok,
     };
     defer function_data.deinit();
-    var values = std.ArrayList(ActiveEngine.Value).empty;
-    defer values.deinit(function_data.op.allocator);
-    defer for (values.items) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
-    if (args) |raw_args| for (raw_args[0..argc]) |handle| {
-        const item = switch (pinValue(function_data.op, handle)) {
-            .status => |status| return status,
-            .ok => |ok| ok,
-        };
-        values.append(function_data.op.allocator, item) catch {
-            ActiveEngine.freeValue(function_data.op.ctx, item);
-            return API_OUT_OF_MEMORY;
-        };
-    };
-    const result = api_backend.construct(function_data.op.allocator, function_data.op.ctx, function_data.value, values.items);
+
+    var stack_values: [INLINE_ARGS_CAP]ActiveEngine.Value = undefined;
+    var heap_values = std.ArrayList(ActiveEngine.Value).empty;
+    defer heap_values.deinit(function_data.op.allocator);
+    var pinned_count: usize = 0;
+    defer {
+        if (argc <= INLINE_ARGS_CAP) {
+            for (stack_values[0..pinned_count]) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
+        } else {
+            for (heap_values.items) |item| ActiveEngine.freeValue(function_data.op.ctx, item);
+        }
+    }
+    if (args) |raw_args| {
+        if (argc <= INLINE_ARGS_CAP) {
+            for (raw_args[0..argc], 0..) |handle, idx| {
+                const item = switch (pinValue(function_data.op, handle)) {
+                    .status => |status| return status,
+                    .ok => |ok| ok,
+                };
+                stack_values[idx] = item;
+                pinned_count += 1;
+            }
+        } else {
+            for (raw_args[0..argc]) |handle| {
+                const item = switch (pinValue(function_data.op, handle)) {
+                    .status => |status| return status,
+                    .ok => |ok| ok,
+                };
+                heap_values.append(function_data.op.allocator, item) catch {
+                    ActiveEngine.freeValue(function_data.op.ctx, item);
+                    return API_OUT_OF_MEMORY;
+                };
+            }
+        }
+    }
+    const call_args: []const ActiveEngine.Value = if (argc <= INLINE_ARGS_CAP) stack_values[0..argc] else heap_values.items;
+    const result = api_backend.construct(function_data.op.allocator, function_data.op.ctx, function_data.value, call_args);
     if (!drainApiJobs(&function_data.op)) {
         discardBackendResult(function_data.op.ctx, result);
         return API_INSTANCE_NOT_FOUND;
@@ -3420,7 +3790,11 @@ pub export fn jsbay_value_instance_of(value: u64, constructor: u64, out_result: 
         };
         defer data.deinit();
         var ctor_buf: [@import("backend_dispatch.zig").value_storage_size]u8 = undefined;
-        const ctor_len = packedDupBytes(constructor, data.js.id, data.js.tag, ctor_buf[0..]) orelse return API_STALE_VALUE;
+        const ctor_len = switch (packedDupBytes(constructor, data.js.id, data.js.tag, ctor_buf[0..])) {
+            .ok => |l| l,
+            .out_of_memory => return API_OUT_OF_MEMORY,
+            .stale => return API_STALE_VALUE,
+        };
         defer @import("backend_dispatch.zig").timerFreeValue(data.js.tag, data.js.ctx_addr, ctor_buf[0..ctor_len]);
         const result = @import("backend_dispatch.zig").valueInstanceOf(data.js.tag, data.js.ctx_addr, data.bytes(), ctor_buf[0..ctor_len]);
         if (!drainPackedJobs(&data.js)) {
@@ -4183,6 +4557,126 @@ test "c_api: jsbay_engine_post_gc accepts and coalesces" {
     // Stale generation or missing instance rejects
     try std.testing.expect(!jsbay_engine_post_gc(id, snapshot.generation + 1));
     try std.testing.expect(!jsbay_engine_post_gc(999999, 0));
+}
+
+test "c_api: nanbox hyper_box primitive fast paths bypass lock without engine handles" {
+    const HV = value_mod.HyperValue;
+
+    // Numbers (Float and Int32)
+    const float_val = HV.fromFloat(123.456).raw;
+    var out_num: f64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_number(float_val, &out_num));
+    try std.testing.expectEqual(@as(f64, 123.456), out_num);
+
+    var kind: c_int = -1;
+    try std.testing.expectEqual(API_OK, jsbay_value_type(float_val, &kind));
+    try std.testing.expectEqual(@as(c_int, 3), kind);
+
+    var out_bool: bool = true;
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_bool(float_val, &out_bool));
+
+    var retained_float: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_retain(float_val, &retained_float));
+    try std.testing.expectEqual(float_val, retained_float);
+    try std.testing.expectEqual(API_OK, jsbay_value_release(float_val));
+
+    // Booleans
+    const bool_val = HV.fromBool(true).raw;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_bool(bool_val, &out_bool));
+    try std.testing.expectEqual(true, out_bool);
+    try std.testing.expectEqual(API_OK, jsbay_value_type(bool_val, &kind));
+    try std.testing.expectEqual(@as(c_int, 2), kind);
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_number(bool_val, &out_num));
+
+    // Special: undefined & null
+    try std.testing.expectEqual(API_OK, jsbay_value_type(HV.undefinedValue().raw, &kind));
+    try std.testing.expectEqual(@as(c_int, 0), kind);
+    try std.testing.expectEqual(API_OK, jsbay_value_type(HV.nullValue().raw, &kind));
+    try std.testing.expectEqual(@as(c_int, 1), kind);
+
+    // SSO String
+    const sso_val = (HV.fromSso("hello") orelse return error.TestUnexpectedResult).raw;
+    try std.testing.expectEqual(API_OK, jsbay_value_type(sso_val, &kind));
+    try std.testing.expectEqual(@as(c_int, 4), kind);
+
+    var out_bytes: Bytes = .{ .data = null, .len = 0 };
+    var out_exc: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(sso_val, &out_bytes, &out_exc));
+    defer jsbay_free_bytes(out_bytes);
+    try std.testing.expectEqual(@as(usize, 5), out_bytes.len);
+    try std.testing.expectEqualStrings("hello", out_bytes.data.?[0..out_bytes.len]);
+
+    // Non-string unboxed primitives reject to_utf8 as invalid argument
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_utf8(float_val, &out_bytes, &out_exc));
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_utf8(bool_val, &out_bytes, &out_exc));
+
+    // Empty value returns stale
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_retain(HV.empty().raw, &retained_float));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(HV.empty().raw));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(HV.empty().raw, &kind));
+
+    // Corrupt SSO handle (length 7 in bits 47..40) is rejected as stale handle
+    const corrupt_sso: u64 = 0xFFFE_0700_0000_0000;
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_to_utf8(corrupt_sso, &out_bytes, &out_exc));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(corrupt_sso, &kind));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_retain(corrupt_sso, &retained_float));
+    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(corrupt_sso));
+
+    // Direct register SSO string creation and zero-copy extraction
+    var created_sso: u64 = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_new_sso_string("abc", 3, &created_sso));
+    var extracted_buf: [6]u8 = undefined;
+    var extracted_len: usize = 0;
+    try std.testing.expectEqual(API_OK, jsbay_value_to_sso_utf8(created_sso, &extracted_buf, &extracted_len));
+    try std.testing.expectEqual(@as(usize, 3), extracted_len);
+    try std.testing.expectEqualStrings("abc", extracted_buf[0..extracted_len]);
+
+    // Null safety guards for SSO C APIs
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_new_sso_string("abc", 3, null));
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_new_sso_string(null, 1, &created_sso));
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(created_sso, null, &extracted_len));
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(created_sso, &extracted_buf, null));
+
+    // Reject SSO creation for strings longer than 6 bytes
+    var overflow_sso: u64 = 0;
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_new_sso_string("toolong", 7, &overflow_sso));
+
+    // Reject non-SSO value in to_sso_utf8
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(float_val, &extracted_buf, &extracted_len));
+}
+
+test "api_value: native callback returning unboxed double synthesizes float without error" {
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    defer jsbay_engine_destroy(id);
+
+    // IEEE-754 double
+    const dbl_val = value_mod.HyperValue.fromFloat(3.1415926535);
+    const dbl_entry = api_value.takeOwnedOrSynthesize(id, dbl_val.raw);
+    try std.testing.expect(dbl_entry != null);
+    try std.testing.expectEqual(id, dbl_entry.?.instance_id);
+    api_value.freeTaken(dbl_entry.?);
+
+    // Negative zero double
+    const neg_zero = value_mod.HyperValue.fromFloat(-0.0);
+    const neg_entry = api_value.takeOwnedOrSynthesize(id, neg_zero.raw);
+    try std.testing.expect(neg_entry != null);
+    api_value.freeTaken(neg_entry.?);
+
+    // Int32
+    const int_val = value_mod.HyperValue.fromInt32(42);
+    const int_entry = api_value.takeOwnedOrSynthesize(id, int_val.raw);
+    try std.testing.expect(int_entry != null);
+    api_value.freeTaken(int_entry.?);
+
+    // Boolean
+    const bool_val = value_mod.HyperValue.fromBool(true);
+    const bool_entry = api_value.takeOwnedOrSynthesize(id, bool_val.raw);
+    try std.testing.expect(bool_entry != null);
+    api_value.freeTaken(bool_entry.?);
+
+    // Empty value returns null
+    try std.testing.expect(api_value.takeOwnedOrSynthesize(id, 0) == null);
 }
 
 // Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`. Never part of the published product ABI. See tests/process-isolation/ and docs/host-isolation.md.

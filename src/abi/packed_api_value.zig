@@ -1,15 +1,17 @@
 //! Typed Value handles for packed-alt (non-primary) instances.
 //!
 //! Values are stored as erased backend bytes + tag + ctx addr (same pattern as TimerData).
-//! Handles use the high bit set so they never collide with primary `api_value` / host-string ids.
+//!
+//! Handles use TAG_HEAP_OBJ so they never collide with primary `api_value` / host-string ids.
 
 const std = @import("std");
 const sync = @import("zev");
 const backend = @import("../backend.zig");
 const dispatch = @import("../backend_dispatch.zig");
 const instance_map = @import("../runtime/instance_map.zig");
+const hyper_box = @import("hyper_box");
 
-pub const handle_flag: u64 = 1 << 63;
+pub const handle_tag: u64 = hyper_box.TAG_HEAP_OBJ;
 
 pub const Entry = struct {
     instance_id: i32,
@@ -29,11 +31,11 @@ var values = std.AutoHashMap(u64, Entry).init(std.heap.c_allocator);
 var next_handle: u64 = 1;
 
 pub fn isPackedHandle(handle: u64) bool {
-    return handle & handle_flag != 0;
+    return (handle & hyper_box.TAG_MASK) == handle_tag;
 }
 
 fn encode(raw: u64) u64 {
-    return raw | handle_flag;
+    return handle_tag | (raw & hyper_box.PAYLOAD_MASK);
 }
 
 pub fn instanceFor(handle: u64) ?i32 {

@@ -43,6 +43,16 @@ The advanced `reference` helpers are available to Zig consumers that need retain
 
 The JavaScript event loop owns its monotonic clock, timers, waiting, and wakeups. Call `jsbay_engine_run_loop` on a dedicated owner thread, or let the SDK connect it to the platform owner thread. `jsbay_engine_stop_loop` is thread-safe. Each queued JavaScript task finishes with a microtask checkpoint; callers do not supply timestamps or compute deadlines.
 
+### Host execution windows and per-entry budgets
+
+`setExecutionTimeLimit` and `setExecutionBudget` protect different boundaries. The C entry points are `jsbay_engine_set_execution_time_limit` and `jsbay_engine_set_execution_budget`; Kotlin, Swift, and ArkTS expose the corresponding Engine methods. Both accept a duration in milliseconds, and `0` disables that particular limit.
+
+An execution time limit stores a single monotonic deadline when the setter is called. If a host frame has 6 ms remaining, set the time limit to that remaining duration once before dispatching JavaScript work for the frame. Multiple evaluations, callbacks, and other VM entries share that deadline; starting another entry does not refresh it. Clear the limit when leaving the host execution window, including error paths, or replace it when starting the next window. The setter accepts a remaining duration, not a host clock timestamp.
+
+An execution budget starts a fresh deadline at each outer VM entry. Nested entries share that entry's deadline, and the next outer entry receives a fresh budget. A 50 ms entry budget therefore cannot enforce a shared 6 ms frame window. Configure both when the host needs both protections: the earlier active deadline wins, including synchronous bridge waits. Changing or disabling one limit does not disable the other.
+
+Deadlines are cooperative interruption requests, not real-time scheduling guarantees. Deadlines expire automatically and do not latch a persistent interrupt flag. Setting a fresh non-zero execution time limit or budget establishes a new execution window and automatically clears pending user interrupts. Watchdog precision varies across backends: QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops); JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at `min(remaining, 50ms)` intervals (clamped to a 5 ms floor), during which no checks occur during foreign host callbacks. Arbitrary native work that has not returned to an interrupt or synchronous-wait boundary cannot be preempted. Run JavaScript off the UI thread even when a host supplies frame limits.
+
 Do not run a second scheduler for the same instance.
 
 ## C and SDKs

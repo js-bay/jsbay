@@ -48,6 +48,69 @@ function expectJsError(operation: () => void, name: string, message: string): vo
   throw new Error(`${message}: did not throw`);
 }
 
+function expectExceptionDetails(engine: Engine): void {
+  try {
+    engine.evaluate("function namedFailure(){throw new Error('failure')} namedFailure()", 'details.js');
+    throw new Error('expected Error with a stack');
+  } catch (cause) {
+    expect(cause instanceof JsException, 'exception details preserve JavaScript throw');
+    const error = cause as JsException;
+    const details = error.details();
+    expect(details.stackTraceString !== null && details.stackTraceString.indexOf('namedFailure') >= 0, 'exception details preserve stack frames');
+    expect(details.stackTraceString !== null && details.stackTraceString.indexOf('details.js') >= 0, 'exception stack preserves filename');
+    expect(error.value.get('message').string() === 'failure', 'non-consuming details preserve original value');
+    expect(error.detailsAndClose().message === 'failure', 'consuming details return the message');
+    expectStatus(() => error.value.toNumber(), JsBayStatus.StaleValue, 'consuming details close original value');
+    expectStatus(() => error.details(), JsBayStatus.StaleValue, 'details reject a consumed original value');
+  }
+  try {
+    engine.evaluate("throw {message:'display marker', stack:'frameOne\\nframeTwo'}", 'display-marker.js');
+    throw new Error('expected exception with a separate message and stack');
+  } catch (cause) {
+    expect(cause instanceof JsException, 'display marker preserves JavaScript exception');
+    const error = cause as JsException;
+    expect(error.describeDetailedAndClose() === 'display marker\nframeOne\nframeTwo', 'detailed display keeps message missing from stack');
+    expectStatus(() => error.value.toNumber(), JsBayStatus.StaleValue, 'display marker consumes original value');
+  }
+  try {
+    engine.evaluate("throw {message:'repeated marker', stack:'Error: repeated marker\\nframe'}", 'display-repeat.js');
+    throw new Error('expected stack header with the full message');
+  } catch (cause) {
+    expect(cause instanceof JsException, 'repeated marker preserves JavaScript exception');
+    const error = cause as JsException;
+    expect(error.describeDetailedAndClose() === 'Error: repeated marker\nframe', 'detailed display avoids repeating message in stack');
+  }
+  try {
+    engine.evaluate("throw {message:'alias', sourceURL:'alias.js', line:4, column:2}", 'alias.js');
+    throw new Error('expected location object');
+  } catch (cause) {
+    expect(cause instanceof JsException, 'location aliases preserve thrown value');
+    const error = cause as JsException;
+    const details = error.details();
+    expect(details.fileName === 'alias.js' && details.lineNumber === 4 && details.columnNumber === 2, 'location aliases are normalized');
+    error.value.close();
+  }
+  try {
+    engine.evaluate("throw Object.defineProperty(new Error('failure'), 'stack', {get(){throw 1}})", 'details-getter.js');
+    throw new Error('expected getter exception');
+  } catch (cause) {
+    expect(cause instanceof JsException, 'throwing metadata getter preserves original exception');
+    const error = cause as JsException;
+    expect(error.details().stackTraceString === null, 'throwing stack getter falls back');
+    error.value.close();
+  }
+  try {
+    engine.evaluate("throw {message:'failure', stack:{toString(){throw 2}}}", 'details-conversion.js');
+    throw new Error('expected stack conversion exception');
+  } catch (cause) {
+    expect(cause instanceof JsException, 'throwing stack conversion preserves original exception');
+    const error = cause as JsException;
+    expect(error.details().stackTraceString === null, 'throwing stack conversion uses an empty stack');
+    expect(error.value.get('message').string() === 'failure', 'throwing stack conversion retains the original value');
+    error.value.close();
+  }
+}
+
 function keyNames(keys: Value): string {
   const length = keys.get('length');
   try {
@@ -194,6 +257,7 @@ function checkObjectOperations(engine: Engine): void {
 }
 
 const engine = Engine.create(1101);
+expectExceptionDetails(engine);
 try {
   const binding = engine.bind('throwValue', (_this: Value, _args: Value[]): Value => {
     throw new JsException(engine.newNumber(7));
@@ -245,7 +309,10 @@ try {
     nul.close();
   }
   const borrowedDescription = engine.bind('borrowedDescription', (thisValue: Value, _args: Value[]): Value => {
+    const originalType = thisValue.type();
     expectStatus(() => new JsException(thisValue).describeAndClose(), JsBayStatus.InvalidArgument, 'Harmony borrowed exception text is rejected before conversion');
+    expectStatus(() => new JsException(thisValue).detailsAndClose(), JsBayStatus.InvalidArgument, 'Harmony borrowed exception details are rejected before consumption');
+    expect(thisValue.type() === originalType, 'rejected Harmony consume preserves borrowed callback value');
 
     return engine.undefined();
   });

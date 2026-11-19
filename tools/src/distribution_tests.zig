@@ -282,8 +282,8 @@ test "test_android_release_includes_maven_metadata_and_transitive_kotlin" {
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
     const gradle = try read(a, io, cwd, &.{ "sdk", "android", "jsbay", "build.gradle.kts" });
-    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib" }) |needle| try contains(gradle, needle);
-    for ([_][]const u8{ ":jsbay:publishReleasePublicationToStagingRepository", "-PjsbayVersion=", "-PjsbayMavenRepo=", "archive=\"jsbay-${ver}-android-${backend}-maven.zip\"", "tests/android-sdk/maven-consumer.sh", "env -u ANDROID_HOME ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"", "-PjsbayVersion=\"${{ steps.ver.outputs.label }}\"", "tool -- check-maven" }) |needle| try contains(release, needle);
+    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbayquickjs\"", "\"quickjs_ng\" -> \"jsbayquickjsng\"", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
+    for ([_][]const u8{ ":jsbay:publishReleasePublicationToStagingRepository", "-PjsbayVersion=", "-PjsbayBackend=\"$backend\"", "-PjsbayMavenRepo=", "archive=\"jsbay-${ver}-android-${backend}-maven.zip\"", "tests/android-sdk/maven-consumer.sh", "env -u ANDROID_HOME ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"", "-PjsbayVersion=\"${{ steps.ver.outputs.label }}\"", "tool -- check-maven \"$module\" \"$ver\" \"$backend\"" }) |needle| try contains(release, needle);
 }
 
 test "test_library_build_accepts_empty_and_explicit_targets_with_runner_bash" {
@@ -436,8 +436,105 @@ test "test_release_exports_a_history_free_source_snapshot" {
     const io = testing.io;
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
-    for ([_][]const u8{ "Checkout reviewed source snapshot", "zig build tool -- export-public-source", "zig build tool -- release-version", "cp \"${{ steps.source.outputs.archive }}\" release-assets/", "contains no Git metadata or repository history", "for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar" }) |needle| try contains(release, needle);
+    for ([_][]const u8{ "Checkout reviewed source snapshot", "zig build tool -- export-public-source", "zig build tool -- release-version", "archive=\"$RUNNER_TEMP/jsbay-${version}-zig.tar.gz\"", "tests/ci/pack-zig-source.sh \"${{ steps.source.outputs.archive }}\" \"$archive\"", "tests/ci/release-zig-consumer.sh \"$archive\"", "cp \"${{ steps.zig_package.outputs.archive }}\" release-assets/", "cp \"${{ steps.source.outputs.archive }}\" release-assets/", "for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar jsbay-*.har" }) |needle| try contains(release, needle);
+    try contains(release, "  build-harmony-release:");
+    try contains(release, "  harmony-release-consumer:");
+    try contains(release, "needs: [build-harmony-release]");
+    try contains(release, "ohpm prepublish \"$har\"");
+    try contains(release, "ohpm install \"$har\"");
+    try contains(release, "assembleHap --no-daemon");
+    try contains(release, "needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android, harmony-release-consumer]");
+    try contains(release, "pattern: harmony-release-*");
+    try contains(release, "har=\"$output/jsbay-$version-harmony-$QUICKJS_BACKEND-arm64-v8a.har\"");
     try testing.expect((std.mem.indexOf(u8, release, "cp \"${{ steps.source.outputs.archive }}\" release-assets/") orelse return error.MissingSourceCopy) < (std.mem.indexOf(u8, release, ": > SHA256SUMS") orelse return error.MissingChecksums));
+}
+
+test "test_release_workflow_stages_package_commit_before_publishing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const workflow = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const tag_script = try read(a, io, cwd, &.{ "scripts", "create-swift-package-tag.sh" });
+    const tag_test = try read(a, io, cwd, &.{ "tests", "ci", "swift-package-tag-test.sh" });
+    try contains(workflow, "workflow_dispatch:");
+    try contains(workflow, "publish:");
+    try contains(workflow, "required: true");
+    try contains(workflow, "contents: write");
+    try contains(workflow, "prepare-swift-package-release.sh");
+    try contains(workflow, "single-package-consumer.sh");
+    try contains(workflow, "prepare-swift-package-release-assets:");
+    try contains(workflow, "runs-on: macos-26");
+    try contains(workflow, "jsbay-final-release-assets");
+    try contains(workflow, "shasum -a 256 \"$archive\" >> SHA256SUMS");
+    try contains(workflow, "scripts/create-swift-package-tag.sh");
+    try contains(workflow, "refs/tags/$tag");
+    try contains(tag_script, "git -C \"$worktree\" push origin \"$push_ref\"");
+    try contains(tag_script, "git -C \"$worktree\" add -- Package.swift Sources");
+    try contains(tag_script, "verify_package_commit \"$commit\"");
+    try contains(tag_script, "verify_remote_tag");
+    try contains(tag_script, "git -C \"$repo\" diff --name-only \"$source_sha\" \"$commit\"");
+    try contains(workflow, "RUN_ATTEMPT: ${{ github.run_attempt }}");
+    try contains(workflow, "\"$RUN_ATTEMPT\" = 1");
+    try contains(tag_test, "git init --bare");
+    try contains(tag_test, "different source commit");
+    try contains(tag_test, "different generated metadata");
+    try contains(tag_test, "different generated source content");
+    try contains(workflow, "${{ github.sha }}");
+    try notContains(workflow, "APPLE_PACKAGE_TOKEN");
+    try notContains(workflow, "push:\n    tags:");
+    try notContains(workflow, "version=\"${{ inputs.version }}\"");
+    const tag_guard = std.mem.indexOf(u8, workflow, "refs/tags/$tag") orelse return error.MissingTagGuard;
+    const helper_call = std.mem.indexOf(u8, workflow, "bash scripts/create-swift-package-tag.sh") orelse return error.MissingTagHelper;
+    const tag_push = std.mem.indexOf(u8, tag_script, "git -C \"$worktree\" push origin \"$push_ref\"") orelse return error.MissingTagPush;
+    const helper_guard = std.mem.indexOf(u8, tag_script, "existing=$(git -C \"$repo\" ls-remote --refs origin \"$tag_ref\")") orelse return error.MissingRemoteGuard;
+    try testing.expect(tag_guard < helper_call);
+    try testing.expect(helper_guard < tag_push);
+}
+
+test "test_release_downloads_assets after checkout and builds portable Linux npm libraries" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const npm = try read(a, io, cwd, &.{ ".github", "workflows", "npm-packages.yml" });
+    const draft_start = std.mem.indexOf(u8, release, "  create-draft-release:\n") orelse return error.MissingDraftReleaseJob;
+    const draft_end = std.mem.indexOf(u8, release[draft_start + 1 ..], "\n  build-node-packages:") orelse return error.MissingBuildNodeJob;
+    const draft = release[draft_start .. draft_start + 1 + draft_end];
+    const checkout = std.mem.indexOf(u8, draft, "uses: actions/checkout@v7") orelse return error.MissingDraftCheckout;
+    const download = std.mem.indexOf(u8, draft, "name: jsbay-final-release-assets") orelse return error.MissingReleaseAssetDownload;
+    try testing.expect(checkout < download);
+    try contains(npm, "if [[ \"$PLATFORM\" == linux ]]; then\n            zig_args+=(\"-Dcpu=baseline\")\n          fi");
+}
+
+test "publication jobs require the release environment" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const jobs = [_][2][]const u8{
+        .{ "validate-release-request", "publish-android-packages" },
+        .{ "publish-android-packages", "prepare-swift-package-release" },
+        .{ "prepare-swift-package-release", "create-draft-release" },
+        .{ "create-draft-release", "build-node-packages" },
+        .{ "publish-node-packages", "publish-release" },
+        .{ "publish-release", "verify-published-swift" },
+    };
+    for (jobs) |job| {
+        const marker = try std.fmt.allocPrint(a, "  {s}:\n", .{job[0]});
+        const next = try std.fmt.allocPrint(a, "\n  {s}:\n", .{job[1]});
+        const start = std.mem.indexOf(u8, release, marker) orelse return error.MissingReleaseJob;
+        const rest = release[start + marker.len ..];
+        const end = std.mem.indexOf(u8, rest, next) orelse return error.MissingReleaseJob;
+        try contains(rest[0..end], "    environment: release\n");
+        try contains(rest[0..end], "!inputs.verify_only");
+    }
+    try notContains(release, "NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
 }
 
 test "test_release_asset_inventory_rejects_missing_and_extra_archives" {
@@ -449,22 +546,34 @@ test "test_release_asset_inventory_rejects_missing_and_extra_archives" {
     const directory = try temp(a, io, "jsbay-assets-missing");
     defer Dir.cwd().deleteTree(io, directory) catch {};
     const tool = try sdk.toolPath(a, io);
-    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz" };
+    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "source.tar.gz", "zig.tar.gz", "harmony-quickjs-arm64-v8a.har", "harmony-quickjs_ng-arm64-v8a.har" };
     for (names) |name| try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-{s}", .{ directory, name }), "");
     var complete = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
     defer complete.deinit();
     try testing.expect(complete.succeeded());
+    try Dir.cwd().deleteFile(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-zig.tar.gz", .{directory}));
+    var missing_zig = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
+    defer missing_zig.deinit();
+    try testing.expect(!missing_zig.succeeded());
+    try contains(try std.mem.concat(a, u8, &.{ missing_zig.result.stdout, missing_zig.result.stderr }), "zig.tar.gz");
+    try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-zig.tar.gz", .{directory}), "");
+    try Dir.cwd().deleteFile(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-harmony-quickjs_ng-arm64-v8a.har", .{directory}));
+    var missing_harmony = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
+    defer missing_harmony.deinit();
+    try testing.expect(!missing_harmony.succeeded());
+    try contains(try std.mem.concat(a, u8, &.{ missing_harmony.result.stdout, missing_harmony.result.stderr }), "harmony-quickjs_ng-arm64-v8a.har");
+    try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-harmony-quickjs_ng-arm64-v8a.har", .{directory}), "");
     try Dir.cwd().deleteFile(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-source.tar.gz", .{directory}));
     var missing = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
     defer missing.deinit();
     try testing.expect(!missing.succeeded());
     try contains(try std.mem.concat(a, u8, &.{ missing.result.stdout, missing.result.stderr }), "source.tar.gz");
     try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-source.tar.gz", .{directory}), "");
-    try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-extra.tar.gz", .{directory}), "");
+    try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-harmony-jsc-arm64-v8a.har", .{directory}), "");
     var extra = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "false", "false" }, cwd);
     defer extra.deinit();
     try testing.expect(!extra.succeeded());
-    try contains(try std.mem.concat(a, u8, &.{ extra.result.stdout, extra.result.stderr }), "extra");
+    try contains(try std.mem.concat(a, u8, &.{ extra.result.stdout, extra.result.stderr }), "harmony-jsc-arm64-v8a.har");
 }
 test "test_release_asset_inventory_accepts_full_tag_set" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -475,7 +584,7 @@ test "test_release_asset_inventory_accepts_full_tag_set" {
     const directory = try temp(a, io, "jsbay-assets-full");
     defer Dir.cwd().deleteTree(io, directory) catch {};
     const tool = try sdk.toolPath(a, io);
-    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "apple-quickjs_ng-JsBay.xcframework.zip", "apple-quickjs-JsBay.xcframework.zip", "apple-jsc-JsBay.xcframework.zip", "android-quickjs_ng.aar", "android-quickjs_ng-maven.zip", "android-jniLibs-quickjs_ng.tar.gz", "android-quickjs.aar", "android-quickjs-maven.zip", "android-jniLibs-quickjs.tar.gz", "source.tar.gz" };
+    const names = [_][]const u8{ "linux-x86_64-quickjs_ng.tar.gz", "linux-x86_64-quickjs.tar.gz", "linux-aarch64-quickjs_ng.tar.gz", "linux-aarch64-quickjs.tar.gz", "macos-aarch64-quickjs_ng.tar.gz", "macos-aarch64-quickjs.tar.gz", "macos-aarch64-jsc.tar.gz", "macos-x86_64-quickjs_ng.tar.gz", "macos-x86_64-quickjs.tar.gz", "macos-x86_64-jsc.tar.gz", "apple-quickjs_ng-JsBay.xcframework.zip", "apple-quickjs-JsBay.xcframework.zip", "apple-jsc-JsBay.xcframework.zip", "android-quickjs_ng.aar", "android-quickjs_ng-maven.zip", "android-jniLibs-quickjs_ng.tar.gz", "android-quickjs.aar", "android-quickjs-maven.zip", "android-jniLibs-quickjs.tar.gz", "source.tar.gz", "zig.tar.gz", "harmony-quickjs-arm64-v8a.har", "harmony-quickjs_ng-arm64-v8a.har" };
     for (names) |name| try write(io, try std.fmt.allocPrint(a, "{s}/jsbay-0.1.0-{s}", .{ directory, name }), "");
     var out = try sdk.run(a, io, &.{ tool, "check-release-assets", directory, "0.1.0", "true", "true" }, cwd);
     defer out.deinit();
@@ -493,15 +602,58 @@ test "test_release_l1_matrix_pins_all_targets" {
     for ([_][]const u8{ "Build library quickjs (macos-aarch64)", "Build library quickjs (macos-x86_64)", "./build-apple.sh quickjs", "backend: [quickjs_ng, quickjs]" }) |needle| try contains(release, needle);
 }
 
-test "test_dispatch_cannot_create_a_release_or_receive_write_permission" {
+test "test_dispatch_publishes_only_after_explicit_opt_in" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const io = testing.io;
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
-    const publish = release[std.mem.indexOf(u8, release, "  publish:\n") orelse return error.MissingPublish ..];
-    for ([_][]const u8{ "permissions:\n  contents: read", "github.event_name == 'push'", "startsWith(github.ref, 'refs/tags/v')", "permissions:\n      contents: write", "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}" }) |needle| try contains(if (std.mem.eql(u8, needle, "permissions:\n  contents: read")) release else publish, needle);
+    const tag_job = release[std.mem.indexOf(u8, release, "  prepare-swift-package-release:\n") orelse return error.MissingTagJob ..];
+    const android_job = release[std.mem.indexOf(u8, release, "  publish-android-packages:\n") orelse return error.MissingAndroidPublishJob ..];
+    try contains(release, "permissions:\n  contents: read");
+    try contains(release, "publish:\n        description:");
+    try contains(release, "if: ${{ inputs.publish && !inputs.verify_only && !inputs.recovery_run_id }}");
+    try contains(tag_job, "permissions:\n      contents: write");
+    try contains(tag_job, "bash scripts/create-swift-package-tag.sh");
+    try contains(android_job, "needs: [assemble-release-assets, validate-release-request, prepare-swift-package-release, create-draft-release]");
+    try notContains(release, "github.event_name == 'push'");
+    try notContains(release, "startsWith(github.ref, 'refs/tags/v')");
+    try contains(release, "bash scripts/verify-staged-release.sh publish");
+    const validation = release[std.mem.indexOf(u8, release, "  validate-release-request:\n") orelse return error.MissingValidationJob ..];
+    const validation_end = std.mem.indexOf(u8, validation, "\n  publish-android-packages:") orelse return error.MissingAndroidPublishJob;
+    try contains(validation[0..validation_end], "          submodules: recursive\n");
+}
+
+test "public consumer jobs run after recovery and verify-only without publishing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const cwd = try root(a, io);
+    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
+    const jobs = [_][2][]const u8{
+        .{ "verify-published-npm", "verify-published-zig" },
+        .{ "verify-published-zig", "verify-release-recovery" },
+        .{ "verify-published-swift", "verify-published-android" },
+        .{ "verify-published-android", "" },
+    };
+    for (jobs) |job| {
+        const marker = try std.fmt.allocPrint(a, "  {s}:\n", .{job[0]});
+        const start = std.mem.indexOf(u8, release, marker) orelse return error.MissingReleaseJob;
+        const rest = release[start + marker.len ..];
+        const end = if (job[1].len == 0) rest.len else blk: {
+            const next = try std.fmt.allocPrint(a, "\n  {s}:\n", .{job[1]});
+            break :blk std.mem.indexOf(u8, rest, next) orelse return error.MissingReleaseJob;
+        };
+        const body = rest[0..end];
+        try contains(body, "always() && !cancelled()");
+        try contains(body, "inputs.verify_only && needs.verify-public-release.result == 'success'");
+        try contains(body, "!inputs.verify_only && needs.publish-release.result == 'success'");
+        try notContains(body, "environment: release");
+        try notContains(body, "contents: write");
+        try notContains(body, "packages: write");
+    }
 }
 
 test "test_harmony_device_acceptance_uses_sdk12_target" {
@@ -524,9 +676,9 @@ test "test_local_harmony_staging_accepts_tar_and_zip_and_rejects_fixture" {
     const fixture = try temp(a, io, "jsbay-harmony-stage");
     defer Dir.cwd().deleteTree(io, fixture) catch {};
     const repo = try join(a, fixture, &.{"repo"});
-    var setup = try mustRun(a, io, fixture, &.{ "mkdir", "-p", try join(a, repo, &.{"scripts"}), try join(a, repo, &.{ "tests", "harmony-sdk", "fixture" }), try join(a, repo, &.{ "sdk", "harmony", "src", "main", "ets" }), try join(a, repo, &.{ "sdk", "harmony", "examples" }), try join(a, repo, &.{ "sdk", "harmony", ".cxx" }), try join(a, repo, &.{ "sdk", "harmony", "oh_modules" }), try join(a, repo, &.{ "packages", "@ohos", "hvigor" }), try join(a, repo, &.{ "packages", "@ohos", "hvigor-ohos-plugin" }) });
+    var setup = try mustRun(a, io, fixture, &.{ "mkdir", "-p", try join(a, repo, &.{"scripts"}), try join(a, repo, &.{ "default", "openharmony", "native" }), try join(a, repo, &.{ "tests", "harmony-sdk", "fixture" }), try join(a, repo, &.{ "sdk", "harmony", "src", "main", "ets" }), try join(a, repo, &.{ "sdk", "harmony", "examples" }), try join(a, repo, &.{ "sdk", "harmony", ".cxx" }), try join(a, repo, &.{ "sdk", "harmony", "oh_modules" }), try join(a, repo, &.{ "packages", "@ohos", "hvigor" }), try join(a, repo, &.{ "packages", "@ohos", "hvigor-ohos-plugin" }) });
     defer setup.deinit();
-    for ([_][]const []const u8{ &.{ try join(a, cwd, &.{ "scripts", "stage-harmony-har.sh" }), try join(a, repo, &.{ "scripts", "stage-harmony-har.sh" }) }, &.{ try join(a, cwd, &.{ "tests", "harmony-sdk", "build_har.sh" }), try join(a, repo, &.{ "tests", "harmony-sdk", "build_har.sh" }) } }) |copy| {
+    for ([_][]const []const u8{ &.{ try join(a, cwd, &.{ "scripts", "stage-harmony-har.sh" }), try join(a, repo, &.{ "scripts", "stage-harmony-har.sh" }) }, &.{ try join(a, cwd, &.{ "scripts", "harmony-toolchain.sh" }), try join(a, repo, &.{ "scripts", "harmony-toolchain.sh" }) }, &.{ try join(a, cwd, &.{ "tests", "harmony-sdk", "build_har.sh" }), try join(a, repo, &.{ "tests", "harmony-sdk", "build_har.sh" }) } }) |copy| {
         var out = try mustRun(a, io, fixture, &.{ "cp", copy[0], copy[1] });
         defer out.deinit();
     }
@@ -546,7 +698,7 @@ test "test_local_harmony_staging_accepts_tar_and_zip_and_rejects_fixture" {
     try write(io, object, "\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\xb7\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00");
     var ar = try mustRun(a, io, repo, &.{ "zig", "ar", "rcs", core, object });
     defer ar.deinit();
-    try executable(a, io, repo, try join(a, repo, &.{"tool"}), "#!/bin/sh\nset -eu\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\ncase \"$*\" in\n  *assembleHar*)\n    for package in hvigor hvigor-ohos-plugin; do\n      test -L \"$root/sdk/harmony/node_modules/@ohos/$package\"\n      test -L \"$root/tests/harmony-sdk/fixture/node_modules/@ohos/$package\"\n    done\n    work=$(mktemp -d); trap 'rm -rf \"$work\"' EXIT\n    mkdir -p \"$work/package/libs/arm64-v8a\" \"$work/package/ets\" \"$work/package/src/main/ets\"\n    : > \"$work/package/libs/arm64-v8a/libjsbay_harmony.so\"; : > \"$work/package/ets/modules.abc\"; : > \"$work/package/src/main/ets/JsBay.d.ets\"; : > \"$work/package/src/main/ets/index.d.ets\"\n    [ \"${HAR_FIXTURE:-}\" = 1 ] && : > \"$work/package/src/main/ets/ConformanceFixture.ets\"\n    har=\"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\"; mkdir -p \"$(dirname \"$har\")\"; rm -f \"$har\"\n    if [ \"${HAR_FORMAT:-tar}\" = zip ]; then (cd \"$work\" && zip -qr \"$har\" package); else tar -czf \"$har\" -C \"$work\" package; fi\n    ;;\n  *clean*) rm -f \"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\" ;;\nesac\n");
+    try executable(a, io, repo, try join(a, repo, &.{"tool"}), "#!/bin/sh\nset -eu\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\ncase \"$*\" in\n  *assembleHar*)\n    for package in hvigor hvigor-ohos-plugin; do\n      test -L \"$root/sdk/harmony/node_modules/@ohos/$package\"\n      test -L \"$root/tests/harmony-sdk/fixture/node_modules/@ohos/$package\"\n    done\n    work=$(mktemp -d); trap 'rm -rf \"$work\"' EXIT\n    mkdir -p \"$work/package/libs/arm64-v8a\" \"$work/package/ets\" \"$work/package/src/main/ets\"\n    : > \"$work/package/libs/arm64-v8a/libjsbay_harmony.so\"; : > \"$work/package/ets/modules.abc\"; : > \"$work/package/src/main/ets/JsBay.d.ets\"; : > \"$work/package/src/main/ets/index.d.ets\"\n    [ \"${HAR_FIXTURE:-}\" = 1 ] && : > \"$work/package/src/main/ets/Qualityconformance.d.ets\"\n    har=\"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\"; mkdir -p \"$(dirname \"$har\")\"; rm -f \"$har\"\n    if [ \"${HAR_FORMAT:-tar}\" = zip ]; then (cd \"$work\" && zip -qr \"$har\" package); else tar -czf \"$har\" -C \"$work\" package; fi\n    ;;\n  *clean*) rm -f \"$root/sdk/harmony/build/default/outputs/default/jsbay_harmony.har\" ;;\nesac\n");
     try executable(a, io, repo, try join(a, repo, &.{"node"}), "#!/bin/sh\ncase \"$*\" in\n  *hvigor-ohos-plugin*) printf '%s\\n' \"$FAKE_PACKAGE_ROOT/@ohos/hvigor-ohos-plugin/package.json\" ;;\n  *) printf '%s\\n' \"$FAKE_PACKAGE_ROOT/@ohos/hvigor/package.json\" ;;\nesac\n");
     try executable(a, io, repo, try join(a, repo, &.{"link-check"}), "#!/bin/sh\nset -eu\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\nfor package in hvigor hvigor-ohos-plugin; do\n  test -L \"$root/sdk/harmony/node_modules/@ohos/$package\"\n  test -L \"$root/tests/harmony-sdk/fixture/node_modules/@ohos/$package\"\ndone\n");
     var zig_which = try mustRun(a, io, repo, &.{ "sh", "-c", "command -v zig" });
@@ -588,11 +740,11 @@ test "test_local_harmony_staging_accepts_tar_and_zip_and_rejects_fixture" {
     var zip_bad = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], "HAR_FORMAT=zip", "HAR_FIXTURE=1", env[10], env[11], env[12], try join(a, repo, &.{"zip-fixture-stage"}), "1.2.3" }, repo);
     defer zip_bad.deinit();
     try testing.expect(!zip_bad.succeeded());
-    try contains(zip_bad.result.stderr, "ConformanceFixture");
+    try contains(zip_bad.result.stderr, "Quality");
     var bad = try sdk.run(a, io, &.{ env[0], env[1], env[2], env[3], env[4], env[5], env[6], env[7], env[8], env[9], "HAR_FIXTURE=1", env[10], env[11], env[12], try join(a, repo, &.{"fixture-stage"}), "1.2.3" }, repo);
     defer bad.deinit();
     try testing.expect(!bad.succeeded());
-    try contains(bad.result.stderr, "ConformanceFixture");
+    try contains(bad.result.stderr, "Quality");
     for ([_][]const u8{ "sdk/harmony", "tests/harmony-sdk/fixture" }) |project| {
         const scope = try join(a, repo, &.{ project, "node_modules", "@ohos" });
         var mkdir = try mustRun(a, io, repo, &.{ "mkdir", "-p", scope });

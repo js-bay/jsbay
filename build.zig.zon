@@ -1,6 +1,6 @@
 .{
     .name = .jsbay,
-    .version = "0.1.0",
+    .version = "0.1.1-rc.3",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0x72461bb335e796f6,
     .dependencies = .{
@@ -10,6 +10,9 @@
         .inspector_transport = .{ .path = "libs/inspector_transport" },
         .bytecode_cache = .{ .path = "libs/bytecode_cache" },
         .commonjs = .{ .path = "libs/commonjs" },
+        .hyper_box = .{ .path = "libs/hyper_box" },
+        .cmph = .{ .path = "libs/cmph" },
+        .simd_utf = .{ .path = "libs/simd_utf" },
         .state_tcas = .{
             .url = "git+https://github.com/lbb00/state_tcas.git#v0.3.1",
             .hash = "state_tcas-0.3.1-4jw0KOc_BwDoNgKW5lFxvB6MrNbAzuu-llwW9K6VyGcN",
@@ -34,6 +37,9 @@
         "libs/inspector_transport",
         "libs/bytecode_cache",
         "libs/commonjs",
+        "libs/hyper_box",
+        "libs/cmph",
+        "libs/simd_utf",
         "vendor/quickjs",
         "vendor/quickjs-ng",
         "vendor/quickjs-finalizer.patch",

@@ -94,6 +94,8 @@ jobs:
           set -euo pipefail
           zig build test-tools --summary all
           bash tests/native_prefix_stamp_test.sh
+          bash tests/ci/swift-package-tag-test.sh
+          node --test tests/ci/github-release-test.mjs tests/ci/npm-visibility-test.mjs
 
       - name: Check generated CDP protocols
         run: node scripts/generate-cdp-protocol.mjs --fetch --check
@@ -630,7 +632,8 @@ jobs:
           curl --fail --location --retry 2 --output "$RUNNER_TEMP/gradle-8.9-bin.zip" https://services.gradle.org/distributions/gradle-8.9-bin.zip
           unzip -q "$RUNNER_TEMP/gradle-8.9-bin.zip" -d "$RUNNER_TEMP"
           cd sdk/android
-          env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" "$RUNNER_TEMP/gradle-8.9/bin/gradle" --no-daemon -PjsbayJniLibs="$GITHUB_WORKSPACE/artifacts/android/jniLibs" :jsbay:assembleRelease
+          env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" bash "$GITHUB_WORKSPACE/tests/android-sdk/aar-backend-test.sh" \
+            "$GITHUB_WORKSPACE/artifacts/android/jniLibs" "$RUNNER_TEMP/gradle-8.9/bin/gradle"
           env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" GRADLE="$RUNNER_TEMP/gradle-8.9/bin/gradle" JSBAY_JNI_LIBS="$GITHUB_WORKSPACE/artifacts/android/jniLibs" pawl measure --config "$GITHUB_WORKSPACE/pawl.yaml" --only android-lint
           aar=jsbay/build/outputs/aar/jsbay-release.aar
           test -f "$aar"

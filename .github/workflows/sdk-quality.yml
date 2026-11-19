@@ -1,15 +1,36 @@
-# SDK quality — Harmony opt-in only.
-# Portable (Linux) and Apple checks are folded into CI's linux / macos jobs
-# (aggressive one-job-per-platform aggregation). See docs/testing.md#ci.
+# SDK quality checks for public sources and the official Harmony toolchain.
 name: SDK quality
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
     inputs:
       harmony:
-        description: Run official Harmony lint on a provisioned SDK 12 runner
+        description: Run the optional SDK 12 HAR build on a provisioned Harmony runner
         type: boolean
-        default: true
+        default: false
+      harmony_hosted:
+        description: Try the Harmony HAR build on a GitHub-hosted runner
+        type: boolean
+        default: false
+      harmony_registry_verify:
+        description: Install the already published Harmony packages from OHPM
+        type: boolean
+        default: false
+      harmony_version:
+        description: Harmony package version
+        type: string
+        default: '0.1.1-rc.1'
+      publication_run:
+        description: Successful GitHub Actions publication run ID containing the HAR artifacts
+        type: string
+        default: ''
+      harmony_auth_probe:
+        description: Diagnose OHPM password encryption with test data
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,17 +40,270 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  harmony:
-    # Official Code Linter/ETS are not present on GitHub-hosted images. This opt-in job requires a runner provisioned as documented in sdk/QUALITY.md.
-    if: inputs.harmony
-    runs-on: [self-hosted, jsbay-harmony-sdk12]
-    timeout-minutes: 20
+  harmony-registry-consumer:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony_registry_verify
+    name: Verify published Harmony packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate package version
+        env:
+          HARMONY_VERSION: ${{ inputs.harmony_version }}
+        run: node scripts/validate-harmony-version.mjs "$HARMONY_VERSION"
+      - uses: ./.github/actions/setup-ohpm
+      - name: Install published packages and build consumers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_RUN: ${{ inputs.publication_run }}
+          HARMONY_VERSION: ${{ inputs.harmony_version }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLICATION_RUN" =~ ^[0-9]+$ ]]
+          node scripts/validate-harmony-version.mjs "$HARMONY_VERSION"
+          ohpm config set registry https://ohpm.openharmony.cn/ohpm/
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PUBLICATION_RUN" > "$RUNNER_TEMP/published-run.json"
+          jq -e '.path == ".github/workflows/sdk-quality.yml" and .event == "workflow_dispatch" and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/published-run.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$PUBLICATION_RUN/jobs?per_page=100&filter=all" > "$RUNNER_TEMP/published-jobs.json"
+          jq -e '[.[].jobs[]] as $jobs | all(["quickjs", "quickjs_ng"][]; . as $backend | any($jobs[]; (.name == ("Publish Harmony packages (" + $backend + ")") or .name == ("Publish Harmony RC packages (" + $backend + ")")) and .conclusion == "success"))' "$RUNNER_TEMP/published-jobs.json"
+          for backend in quickjs quickjs_ng; do
+            artifacts="$RUNNER_TEMP/published-$backend"
+            gh run download "$PUBLICATION_RUN" --repo "$GITHUB_REPOSITORY" --name "harmony-hosted-$backend" --dir "$artifacts"
+            har="$artifacts/jsbay-$HARMONY_VERSION-harmony-$backend-arm64-v8a.har"
+            curl --fail --location --retry 3 --silent --show-error "https://ohpm.openharmony.cn/ohpm/@jsbay%2f$backend" > "$RUNNER_TEMP/registry-$backend.json"
+            registry_integrity=$(jq -er --arg version "$HARMONY_VERSION" '.versions[$version].dist.integrity' "$RUNNER_TEMP/registry-$backend.json")
+            expected_integrity="sha512-$(openssl dgst -sha512 -binary "$har" | openssl base64 -A)"
+            [[ "$registry_integrity" == "$expected_integrity" ]]
+            app="$RUNNER_TEMP/registry-consumer-$backend"
+            node tests/harmony-sdk/prepare-ohpm-consumer.mjs "$app" "$har" "$backend" "$HARMONY_VERSION"
+            (cd "$app/entry" && ohpm install --no-link)
+            jq -e --arg package "@jsbay/$backend@$HARMONY_VERSION" --arg integrity "$expected_integrity" '.packages[$package].integrity == $integrity and (.packages[$package].resolved | startswith("https://ohpm.openharmony.cn/ohpm/"))' "$app/entry/oh-package-lock.json5"
+            tar -xOzf "$har" package/libs/arm64-v8a/libjsbay_harmony.so > "$RUNNER_TEMP/published-$backend.so"
+            cmp "$RUNNER_TEMP/published-$backend.so" "$app/entry/oh_modules/@jsbay/$backend/libs/arm64-v8a/libjsbay_harmony.so"
+            (cd "$app" && hvigorw --mode module -p module=entry@default assembleHap --no-daemon)
+          done
+      - name: Preserve registry consumer applications
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-registry-consumers
+          path: ${{ runner.temp }}/registry-consumer-*/entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
+
+  harmony-auth-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony_auth_probe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install current OHPM tools
+        uses: ./.github/actions/setup-ohpm
+      - name: Probe encryption with a test password
+        run: |
+          set -euo pipefail
+          node tests/harmony-sdk/ohpm-encrypt-test.mjs
+          ciphertext=$(printf 'example-passphrase' | "$OHPM_NODE" scripts/ohpm-encrypt-passphrase.mjs "$OHPM_CRYPTO_MODULE" "$RUNNER_TEMP/ohpm-probe")
+          [[ "$ciphertext" == security:* ]]
+          mkdir -p "$RUNNER_TEMP/ohpm-config-test"
+          printf 'crypto_path=%s\nkey_passphrase=%s\n' "$RUNNER_TEMP/ohpm-probe" "$ciphertext" > "$RUNNER_TEMP/ohpm-config-test/.ohpmrc"
+          actual=$(cd "$RUNNER_TEMP/ohpm-config-test" && ohpm config get crypto_path)
+          [[ "$actual" == "$RUNNER_TEMP/ohpm-probe" ]]
+      - name: Probe registry dependency layout
+        run: |
+          set -euo pipefail
+          consumer="$RUNNER_TEMP/ohpm-layout-test"
+          mkdir -p "$consumer"
+          printf '{"name":"consumer","version":"1.0.0"}\n' > "$consumer/oh-package.json5"
+          (cd "$consumer" && ohpm install '@ohos/lottie@2.0.38' --no-link)
+          jq -e '.packages["@ohos/lottie@2.0.38"].registryType == "ohpm" and (.packages["@ohos/lottie@2.0.38"].integrity | startswith("sha512-"))' "$consumer/oh-package-lock.json5"
+          test -f "$consumer/oh_modules/@ohos/lottie/oh-package.json5"
+
+  harmony-hosted:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony_hosted
+    name: Experimental hosted Harmony HAR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs_ng, quickjs]
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      - name: Validate package version
+        env:
+          HARMONY_VERSION: ${{ inputs.harmony_version }}
+        run: node scripts/validate-harmony-version.mjs "$HARMONY_VERSION"
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+      - name: Install Harmony command-line tools
+        uses: ./.github/actions/setup-ohpm
+        with:
+          version: 5.0.13.200
+      - name: Install OpenHarmony API 12 SDK
+        id: ohos
+        uses: ./.github/actions/setup-openharmony-sdk
+      - name: Check toolchain and build HAR
+        timeout-minutes: 10
+        env:
+          QUICKJS_BACKEND: ${{ matrix.backend }}
+          API12_SDK: ${{ steps.ohos.outputs.ohos-base-sdk-home }}
+          HARMONY_TARGET_SDK_VERSION: '5.0.0(12)'
+          HARMONY_VERSION: ${{ inputs.harmony_version }}
+        run: |
+          set -euo pipefail
+          ohpm --version
+          command -v hvigorw
+          test '${{ steps.ohos.outputs.api-version }}' = 12
+          test -d "$API12_SDK/native/sysroot"
+          node tests/harmony-sdk/prepare-ohpm-package-test.mjs
+          node scripts/prepare-harmony-ohpm.mjs "$PWD" "$QUICKJS_BACKEND" "$HARMONY_VERSION"
+          zig build -Dbackend="$QUICKJS_BACKEND" -Dtarget=aarch64-linux-ohos -Dohos-sysroot="$API12_SDK/native/sysroot" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/harmony-core" --summary all
+          export JSBAY_LIBRARY="$RUNNER_TEMP/harmony-core/lib/libjsbay.a"
+          export JSBAY_HARMONY_ARCHIVE="$JSBAY_LIBRARY"
+          export AR="$API12_SDK/native/llvm/bin/llvm-ar"
+          printf '#!/usr/bin/env bash\nexec "%s" "$@" --no-daemon -p buildMode=release\n' "$(command -v hvigorw)" > "$RUNNER_TEMP/hvigorw-ci"
+          chmod +x "$RUNNER_TEMP/hvigorw-ci"
+          export HVIGORW="$RUNNER_TEMP/hvigorw-ci"
+          unset NODE_PATH
+          output="$RUNNER_TEMP/harmony-har-${QUICKJS_BACKEND}"
+          bash scripts/stage-harmony-har.sh "$output" "$HARMONY_VERSION"
+          har="$output/jsbay-$HARMONY_VERSION-harmony-${QUICKJS_BACKEND}-arm64-v8a.har"
+          tar -xOzf "$har" package/oh-package.json5 | jq -e --arg name "@jsbay/${QUICKJS_BACKEND}" --arg version "$HARMONY_VERSION" '.name == $name and .version == $version and .author.name == "jsbay" and .author.url == "https://github.com/js-bay/jsbay" and .repository == "https://github.com/js-bay/jsbay" and .metadata.debug == false'
+          for file in README.md LICENSE CHANGELOG.md; do test "$(tar -xOzf "$har" "package/$file" | wc -c)" -gt 0; done
+      - name: Preserve HAR
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-hosted-${{ matrix.backend }}
+          path: ${{ runner.temp }}/harmony-har-${{ matrix.backend }}
+          if-no-files-found: error
+
+  harmony-ohpm-preflight:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony_hosted
+    needs: harmony-hosted
+    name: Validate OHPM packages and authentication setup
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      quickjs-sha256: ${{ steps.verify.outputs.quickjs-sha256 }}
+      quickjs-ng-sha256: ${{ steps.verify.outputs.quickjs-ng-sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install current OHPM tools
+        uses: ./.github/actions/setup-ohpm
+      - name: Download HAR packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: harmony-hosted-*
+          path: ${{ runner.temp }}/harmony-packages
+      - name: Validate packages and local installation
+        id: verify
+        env:
+          HARMONY_VERSION: ${{ inputs.harmony_version }}
+        run: |
+          set -euo pipefail
+          ohpm --version
+          for backend in quickjs quickjs_ng; do
+            har="$RUNNER_TEMP/harmony-packages/harmony-hosted-$backend/jsbay-$HARMONY_VERSION-harmony-$backend-arm64-v8a.har"
+            ohpm prepublish "$har"
+            digest=$(sha256sum "$har")
+            case "$backend" in
+              quickjs) echo "quickjs-sha256=${digest%% *}" >> "$GITHUB_OUTPUT" ;;
+              quickjs_ng) echo "quickjs-ng-sha256=${digest%% *}" >> "$GITHUB_OUTPUT" ;;
+            esac
+            consumer="$RUNNER_TEMP/consumer-$backend"
+            mkdir -p "$consumer"
+            printf '{"name":"consumer","version":"1.0.0"}\n' > "$consumer/oh-package.json5"
+            (cd "$consumer" && ohpm install "$har")
+            test -f "$consumer/oh_modules/@jsbay/$backend/oh-package.json5"
+            app="$RUNNER_TEMP/ohpm-consumer-$backend"
+            node tests/harmony-sdk/prepare-ohpm-consumer.mjs "$app" "$har" "$backend" "file:$har"
+            (cd "$app/entry" && ohpm install --no-link)
+            (cd "$app" && hvigorw --mode module -p module=entry@default assembleHap --no-daemon)
+          done
+      - name: Preserve consumer applications
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-ohpm-consumers
+          path: ${{ runner.temp }}/ohpm-consumer-*/entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
+      - name: Check non-interactive password encryption
+        run: |
+          set -euo pipefail
+          node tests/harmony-sdk/ohpm-encrypt-test.mjs
+          output=$(printf 'example-passphrase' | "$OHPM_NODE" scripts/ohpm-encrypt-passphrase.mjs "$OHPM_CRYPTO_MODULE" "$RUNNER_TEMP/ohpm-crypto")
+          printf '%s\n' "$output" | grep -q 'security:'
+
+  harmony-toolchain:
+    name: Harmony local gate checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test Harmony toolchain resolution
+        run: |
+          bash tests/harmony-sdk/toolchain-resolver.sh
+          bash tests/ci/harmony-required-gate.sh
+          bash tests/ci/harmony-local-gate.sh
+          node tests/harmony-sdk/prepare-ohpm-package-test.mjs
+          node tests/harmony-sdk/ohpm-encrypt-test.mjs
+
+  harmony-manual-preflight:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony
+    name: Optional Harmony runner preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check runner readiness setting
+        env:
+          HARMONY_SDK12_READY: ${{ vars.HARMONY_SDK12_READY }}
+        run: bash scripts/check-harmony-runner-readiness.sh "$HARMONY_SDK12_READY"
+
+  harmony:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony
+    needs: [harmony-toolchain, harmony-manual-preflight]
+    runs-on: [self-hosted, jsbay-harmony-sdk12]
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs_ng, quickjs]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
       - uses: tiangong-dev/pawl@v0.8.2
         with:
           version: v0.8.2
       - name: Official ETS format and lint
         run: make check CHECKS=native-format,harmony-style
+      - name: Build and package HAR
+        env:
+          QUICKJS_BACKEND: ${{ matrix.backend }}
+          HARMONY_TARGET_SDK_VERSION: '5.0.0(12)'
+        run: |
+          set -euo pipefail
+          source scripts/harmony-toolchain.sh
+          harmony_toolchain_resolve
+          native="$OHOS_NATIVE_HOME"
+          zig build -Dbackend="$QUICKJS_BACKEND" -Dtarget=aarch64-linux-ohos -Dohos-sysroot="$native/sysroot" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/harmony-core" --summary all
+          export JSBAY_LIBRARY="$RUNNER_TEMP/harmony-core/lib/libjsbay.a"
+          export JSBAY_HARMONY_ARCHIVE="$JSBAY_LIBRARY"
+          : "${NODE_PATH:?configure the matching Hvigor module root on this runner}"
+          bash tests/harmony-sdk/style-consumer.sh
+          bash tests/benchmark_interop_contract.sh --arkts-only
+          bash scripts/stage-harmony-har.sh "$RUNNER_TEMP/harmony-har-${{ matrix.backend }}" "ci-${{ matrix.backend }}-${GITHUB_SHA:0:12}"
+      - name: Preserve the validated HAR
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-sdk-quality-${{ matrix.backend }}
+          path: ${{ runner.temp }}/harmony-har-${{ matrix.backend }}
+          if-no-files-found: error

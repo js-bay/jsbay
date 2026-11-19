@@ -1,28 +1,75 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MAVEN_REPO="${1:?usage: maven-consumer.sh <maven-repo> <version> <gradle-bin>}"
-VERSION="${2:?usage: maven-consumer.sh <maven-repo> <version> <gradle-bin>}"
-GRADLE_BIN="${3:?usage: maven-consumer.sh <maven-repo> <version> <gradle-bin>}"
-OUT="${ANDROID_MAVEN_CONSUMER_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/jsbay-android-maven-consumer.XXXXXX")}"
+usage='usage: maven-consumer.sh <maven-repo-directory-or-github-packages-url> <version> <gradle-bin> <backend> [--run-on-device]'
+MAVEN_REPO="${1:?$usage}"
+VERSION="${2:?$usage}"
+GRADLE_BIN="${3:?$usage}"
+BACKEND="${4:?$usage}"
+device_mode=${5:-}
+[[ -z "$device_mode" || "$device_mode" == --run-on-device ]] || { echo "$usage" >&2; exit 2; }
+script_dir=$(cd "$(dirname "$0")" && pwd)
+adb_bin=${ADB:-adb}
+application_id=com.example.jsbay.mavenconsumer
+installed=false
 
-test -d "$MAVEN_REPO"
 test -x "$GRADLE_BIN"
-if [ -z "${ANDROID_MAVEN_CONSUMER_OUT:-}" ]; then trap 'rm -rf "$OUT"' EXIT; fi
+repository_auth_mode=
+if [[ "$MAVEN_REPO" =~ ^https://maven\.pkg\.github\.com/[^/]+/[^/]+/?$ ]]; then
+    test -n "${GITHUB_ACTOR:-}" || { echo 'GITHUB_ACTOR is required for GitHub Packages' >&2; exit 2; }
+    test -n "${GITHUB_TOKEN:-}" || { echo 'GITHUB_TOKEN is required for GitHub Packages' >&2; exit 2; }
+    repository_auth_mode=github-packages
+else
+    test -d "$MAVEN_REPO" || { echo 'Maven repository must be a directory or an HTTPS GitHub Packages URL' >&2; exit 2; }
+fi
+case "$BACKEND" in
+    quickjs) artifact=jsbayquickjs ;;
+    quickjs_ng) artifact=jsbayquickjsng ;;
+    *) echo "unsupported backend: $BACKEND" >&2; exit 2 ;;
+esac
+OUT="${ANDROID_MAVEN_CONSUMER_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/jsbay-android-maven-consumer.XXXXXX")}"
+LOG="$OUT/gradle.log"
+cleanup() {
+    local status=$?
+    if [[ $status != 0 && -f "$LOG" ]]; then cat "$LOG" >&2; fi
+    if [[ "$installed" == true ]]; then "$adb_bin" uninstall "$application_id" >&2 || true; fi
+    if [[ -z "${ANDROID_MAVEN_CONSUMER_OUT:-}" ]]; then rm -rf "$OUT"; fi
+}
+trap cleanup EXIT
 
-mkdir -p "$OUT/app/src/main/java/io/jsbay/mavenconsumer"
+mkdir -p "$OUT/app/src/main/java/com/example/jsbay/mavenconsumer"
 cat > "$OUT/settings.gradle.kts" <<'EOF'
+import org.gradle.authentication.http.BasicAuthentication
+
 pluginManagement {
     repositories {
         google()
         mavenCentral()
         gradlePluginPortal()
     }
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id == "com.android.application") {
+                useModule("com.android.tools.build:gradle:${requested.version}")
+            }
+        }
+    }
 }
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        maven { url = uri(System.getenv("JSBAY_MAVEN_REPO")) }
+        maven {
+            url = uri(System.getenv("JSBAY_MAVEN_REPO"))
+            if (System.getenv("JSBAY_MAVEN_REPOSITORY_AUTH") == "github-packages") {
+                credentials {
+                    username = System.getenv("GITHUB_ACTOR") ?: error("GITHUB_ACTOR is required")
+                    password = System.getenv("GITHUB_TOKEN") ?: error("GITHUB_TOKEN is required")
+                }
+                authentication {
+                    create<BasicAuthentication>("basic")
+                }
+            }
+        }
         google()
         mavenCentral()
     }
@@ -39,10 +86,10 @@ cat > "$OUT/app/build.gradle.kts" <<'EOF'
 plugins { id("com.android.application") }
 
 android {
-    namespace = "io.jsbay.mavenconsumer"
+    namespace = "com.example.jsbay.mavenconsumer"
     compileSdk = 35
     defaultConfig {
-        applicationId = "io.jsbay.mavenconsumer"
+        applicationId = "com.example.jsbay.mavenconsumer"
         minSdk = 24
         targetSdk = 35
         versionCode = 1
@@ -50,32 +97,26 @@ android {
     }
 }
 
-dependencies { implementation("io.jsbay:js-bay-android:${System.getenv("JSBAY_MAVEN_VERSION")}") }
+dependencies { implementation("io.jsbay:${System.getenv("JSBAY_MAVEN_ARTIFACT")}:${System.getenv("JSBAY_MAVEN_VERSION")}") }
 EOF
 cat > "$OUT/app/src/main/AndroidManifest.xml" <<'EOF'
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
   <application android:label="JsBay Maven consumer" />
+  <instrumentation
+      android:name=".MavenConsumerInstrumentation"
+      android:targetPackage="com.example.jsbay.mavenconsumer" />
 </manifest>
 EOF
-cat > "$OUT/app/src/main/java/io/jsbay/mavenconsumer/Main.java" <<'EOF'
-package io.jsbay.mavenconsumer;
+cp "$script_dir/MavenConsumerInstrumentation.java" "$OUT/app/src/main/java/com/example/jsbay/mavenconsumer/"
 
-import io.jsbay.Engine;
-
-final class Main {
-  static Engine createEngine() {
-    return new Engine(1);
-  }
-}
-EOF
-
-LOG="$OUT/gradle.log"
-JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_VERSION="$VERSION" \
+JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_REPOSITORY_AUTH="$repository_auth_mode" \
+JSBAY_MAVEN_VERSION="$VERSION" JSBAY_MAVEN_ARTIFACT="$artifact" \
     "$GRADLE_BIN" --no-daemon --console=plain -p "$OUT" \
     :app:dependencies --configuration debugRuntimeClasspath >"$LOG" 2>&1
 grep -Eq 'org\.jetbrains\.kotlin:kotlin-stdlib(:|[^[:space:]]*:)1\.9\.22' "$LOG"
 
-JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_VERSION="$VERSION" \
+JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_REPOSITORY_AUTH="$repository_auth_mode" \
+JSBAY_MAVEN_VERSION="$VERSION" JSBAY_MAVEN_ARTIFACT="$artifact" \
     "$GRADLE_BIN" --no-daemon --console=plain -p "$OUT" :app:assembleDebug >>"$LOG" 2>&1
 APK="$OUT/app/build/outputs/apk/debug/app-debug.apk"
 test -f "$APK"
@@ -86,3 +127,13 @@ for abi in arm64-v8a x86_64; do
 done
 
 printf 'PASS: Maven consumer assembled %s\n' "$APK"
+if [[ "$device_mode" == --run-on-device ]]; then
+    "$adb_bin" install "$APK"
+    installed=true
+    "$adb_bin" shell am instrument -w -r -e backend "$BACKEND" \
+        "$application_id/.MavenConsumerInstrumentation" > "$OUT/instrumentation.log" 2>&1
+    cat "$OUT/instrumentation.log"
+    grep -Eq "^INSTRUMENTATION_RESULT: jsbayResult=$BACKEND:42[[:space:]]*$" "$OUT/instrumentation.log"
+    grep -Eq '^INSTRUMENTATION_CODE: -1[[:space:]]*$' "$OUT/instrumentation.log"
+    printf 'PASS: installed Maven consumer ran %s on ART\n' "$BACKEND"
+fi
