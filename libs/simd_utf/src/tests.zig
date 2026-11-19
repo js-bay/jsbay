@@ -50,3 +50,9 @@ test "simd_utf: transcodeUtf16ToUtf8 replaces unpaired surrogates" {
     const result = utf8_buf[0..utf8_len];
     try std.testing.expect(std.mem.indexOf(u8, result, "\xEF\xBF\xBD") != null);
 }
+
+test "simd_utf: transcodeUtf8ToUtf16 rejects undersized destination" {
+    const src = "Short payload";
+    var tiny_buf: [4]u16 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, simd_utf.transcodeUtf8ToUtf16(&tiny_buf, src));
+}

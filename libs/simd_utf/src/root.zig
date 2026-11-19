@@ -3,6 +3,7 @@
 //! Provides high-throughput UTF-8 and UTF-16 transcoding utilizing hardware vector registers (@Vector(16, u8)) on ARM NEON and x86 architectures.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const VEC_SIZE: usize = 16;
 const ascii_mask: @Vector(VEC_SIZE, u8) = @splat(0x80);
@@ -38,6 +39,7 @@ pub fn validateUtf8(src: []const u8) bool {
 ///
 /// Uses 16-byte vector extensions on ASCII-heavy runs, dropping into scalar sequence decoding for multi-byte code points. Returns the count of UTF-16 code units written.
 pub fn transcodeUtf8ToUtf16(dst: []u16, src: []const u8) !usize {
+    if (dst.len < src.len) return error.NoSpaceLeft;
     var i: usize = 0;
     var out_i: usize = 0;
 
@@ -53,12 +55,22 @@ pub fn transcodeUtf8ToUtf16(dst: []u16, src: []const u8) !usize {
             const seq_len = try std.unicode.utf8ByteSequenceLength(src[i]);
             if (i + seq_len > src.len) return error.Utf8InvalidStartByte;
             const written = try std.unicode.utf8ToUtf16Le(dst[out_i..], src[i .. i + seq_len]);
+            if (builtin.cpu.arch.endian() == .big) {
+                for (dst[out_i .. out_i + written]) |*unit| {
+                    unit.* = std.mem.littleToNative(u16, unit.*);
+                }
+            }
             i += seq_len;
             out_i += written;
         }
     }
     if (i < src.len) {
         const rem = try std.unicode.utf8ToUtf16Le(dst[out_i..], src[i..]);
+        if (builtin.cpu.arch.endian() == .big) {
+            for (dst[out_i .. out_i + rem]) |*unit| {
+                unit.* = std.mem.littleToNative(u16, unit.*);
+            }
+        }
         out_i += rem;
     }
     return out_i;
