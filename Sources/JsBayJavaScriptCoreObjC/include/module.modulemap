@@ -1,0 +1,4 @@
+module JsBayJavaScriptCoreObjC {
+    umbrella header "JSBayObjC.h"
+    export *
+}

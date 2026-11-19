@@ -1,0 +1,4 @@
+module JsBayQuickJSObjC {
+    umbrella header "JSBayObjC.h"
+    export *
+}
