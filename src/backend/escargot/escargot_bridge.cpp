@@ -488,6 +488,7 @@ extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
 }
 
 extern "C" void escargot_context_free(EscargotContext *ctx) {
+    if (ctx && ctx->rt && ctx->rt->vm.get()) ctx->rt->vm.get()->setExecutionTerminationCallback(nullptr, nullptr);
     escargotTrace("context_free");
     if (!ctx) return;
 #ifdef ESCARGOT_DEBUGGER
@@ -569,8 +570,16 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
     escargotTrace("context_free done");
 }
 
+extern "C" bool jsbay_escargot_should_terminate_execution(int32_t instance_id);
+
 extern "C" void escargot_context_set_opaque(EscargotContext *ctx, void *opaque) {
-    if (ctx) ctx->opaque = opaque;
+    if (!ctx) return;
+    ctx->opaque = opaque;
+    ctx->rt->vm.get()->setExecutionTerminationCallback([](void *raw) -> bool {
+        auto *context = static_cast<EscargotContext *>(raw);
+        const auto id = static_cast<int32_t>(reinterpret_cast<uintptr_t>(context->opaque) & 0xffffffffu);
+        return id != 0 && jsbay_escargot_should_terminate_execution(id);
+    }, ctx);
 }
 extern "C" void *escargot_context_get_opaque(EscargotContext *ctx) {
     return ctx ? ctx->opaque : nullptr;
@@ -657,44 +666,57 @@ extern "C" bool escargot_debugger_location_is_breakpoint_target(EscargotContext 
 
 extern "C" EscargotValue escargot_debugger_scope(EscargotContext *ctx, int frame, int scope_index) {
     if (!ctx || !ctx->debug_operations || frame < 0 || scope_index < 0) return nullptr;
-    DebuggerOperationsRef::DebuggerStackTraceDataVector stack;
-    ctx->debug_operations->getStackTrace(stack);
-    if (static_cast<size_t>(frame) >= stack.size() || stack[frame].depth == SIZE_MAX) return nullptr;
-    const uint32_t state_index = static_cast<uint32_t>(stack[frame].depth);
-    DebuggerOperationsRef::LexicalScopeChainVector kinds;
-    ctx->debug_operations->getLexicalScopeChain(state_index, kinds);
-    auto *state = ctx->debug_operations->executionState();
-    auto *object = ObjectRef::create(state, nullptr);
-    for (size_t reverse = kinds.size(); reverse > 0; --reverse) {
-        const uint32_t index = static_cast<uint32_t>(reverse - 1);
-        const auto kind = kinds[index];
-        bool seen_function = false;
-        for (uint32_t prior = 0; prior < index; ++prior) {
-            if (kinds[prior] == DebuggerOperationsRef::FUNCTION_ENVIRONMENT) {
-                seen_function = true;
-                break;
+    struct ScopePack {
+        EscargotContext *ctx;
+        int frame;
+        int scope_index;
+    } pack{ctx, frame, scope_index};
+    // Reading a global or object scope can execute accessor code; contain its termination before returning to the host.
+    const auto scoped = Evaluator::execute(ctx->ctx.get(), [](ExecutionStateRef *, ScopePack *p) -> ValueRef * {
+        auto *ctx = p->ctx;
+        const int frame = p->frame;
+        const int scope_index = p->scope_index;
+        DebuggerOperationsRef::DebuggerStackTraceDataVector stack;
+        ctx->debug_operations->getStackTrace(stack);
+        if (static_cast<size_t>(frame) >= stack.size() || stack[frame].depth == SIZE_MAX) return nullptr;
+        const uint32_t state_index = static_cast<uint32_t>(stack[frame].depth);
+        DebuggerOperationsRef::LexicalScopeChainVector kinds;
+        ctx->debug_operations->getLexicalScopeChain(state_index, kinds);
+        auto *state = ctx->debug_operations->executionState();
+        auto *object = ObjectRef::create(state, nullptr);
+        for (size_t reverse = kinds.size(); reverse > 0; --reverse) {
+            const uint32_t index = static_cast<uint32_t>(reverse - 1);
+            const auto kind = kinds[index];
+            bool seen_function = false;
+            for (uint32_t prior = 0; prior < index; ++prior) {
+                if (kinds[prior] == DebuggerOperationsRef::FUNCTION_ENVIRONMENT) {
+                    seen_function = true;
+                    break;
+                }
             }
-        }
-        bool include = false;
-        if (scope_index == 0) {
-            include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && !seen_function;
-        } else if (scope_index == 1) {
-            include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && seen_function;
-        } else if (scope_index == 2) {
-            include = kind == DebuggerOperationsRef::GLOBAL_ENVIRONMENT;
-        }
-        if (include) {
-            const auto properties = ctx->debug_operations->getLexicalScopeChainProperties(state_index, index);
-            for (size_t property_index = 0; property_index < properties.size(); ++property_index) {
-                const auto &property = properties[property_index];
-                if (property.key && property.value.hasValue()) {
-                    // Walk outward-to-inward so inner bindings replace outer ones.
-                    object->defineDataProperty(state, property.key, const_cast<ValueRef *>(property.value.value()), true, true, true);
+            bool include = false;
+            if (scope_index == 0) {
+                include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && !seen_function;
+            } else if (scope_index == 1) {
+                include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && seen_function;
+            } else if (scope_index == 2) {
+                include = kind == DebuggerOperationsRef::GLOBAL_ENVIRONMENT;
+            }
+            if (include) {
+                const auto properties = ctx->debug_operations->getLexicalScopeChainProperties(state_index, index);
+                for (size_t property_index = 0; property_index < properties.size(); ++property_index) {
+                    const auto &property = properties[property_index];
+                    if (property.key && property.value.hasValue()) {
+                        // Walk outward-to-inward so inner bindings replace outer ones.
+                        object->defineDataProperty(state, property.key, const_cast<ValueRef *>(property.value.value()), true, true, true);
+                    }
                 }
             }
         }
-    }
-    return retain(ctx, object);
+        return object;
+    }, &pack);
+    if (!scoped.isSuccessful()) return nullptr;
+    return retain(ctx, scoped.result);
 }
 
 extern "C" EscargotValue escargot_debugger_this(EscargotContext *ctx, int frame) {
@@ -715,7 +737,16 @@ extern "C" EscargotValue escargot_debugger_eval_frame(EscargotContext *ctx, int 
         return nullptr;
     }
     ValueRef *exception = nullptr;
-    ValueRef *result = ctx->debug_operations->evalValue(StringRef::createFromUTF8(expr, expr_len), exception);
+    struct EvalPack {
+        EscargotContext *ctx;
+        StringRef *expression;
+        ValueRef **exception;
+    } pack{ctx, StringRef::createFromUTF8(expr, expr_len), &exception};
+    const auto evaluated = Evaluator::execute(ctx->ctx.get(), [](ExecutionStateRef *, EvalPack *p) -> ValueRef * {
+        return p->ctx->debug_operations->evalValue(p->expression, *p->exception);
+    }, &pack);
+    if (evaluated.wasTerminated) return nullptr;
+    ValueRef *result = evaluated.result;
     if (exception) {
         if (out_exception) *out_exception = retain(ctx, exception);
         return nullptr;

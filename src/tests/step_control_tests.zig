@@ -21,6 +21,7 @@ const Owner = struct {
     stop: std.atomic.Value(bool) = .init(false),
     host_ready: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
+    deadline_armed: std.atomic.Value(bool) = .init(false),
     port: std.atomic.Value(u16) = .init(0),
     created: bool = false,
 
@@ -37,12 +38,19 @@ const Owner = struct {
         return .{ .number = 42 };
     }
 
+    fn hostArmDeadline(instance_id: i32, _: value.NativeArgs) value.NativeResult {
+        const armed = runtime_control.setExecutionTimeLimit(instance_id, 20);
+        if (active_owner) |owner| if (owner.id == instance_id) owner.deadline_armed.store(armed, .release);
+        return .{ .boolean = armed };
+    }
+
     fn run(owner: *Owner) void {
         defer owner.ready.store(true, .release);
         if (!engine.create(owner.id, .{ .max_stack_size = 48 * 1024 * 1024 })) return;
         defer engine.destroy(owner.id);
         value.registerFunction(owner.id, null, "__cdpHostReady", &hostReady);
         value.registerFunction(owner.id, null, "__cdpHostDone", &hostDone);
+        value.registerFunction(owner.id, null, "__cdpHostArmDeadline", &hostArmDeadline);
         const handle = inspector.start(owner.id, .{ .port = 0, .target_id = "step-control-owner" }) catch return;
         defer inspector.stop(handle);
         owner.port.store(inspector.boundPort(handle), .release);
@@ -686,6 +694,31 @@ test "cdp: Escargot before-super this evaluation reports a TDZ error" {
     const completed = try session.reply(evaluation);
     defer completed.deinit();
     try expectNumber(completed.value, 42);
+
+    owner.finished.store(false, .release);
+    const scope_evaluation = try session.evaluate("globalThis.__scopeArmed = true; Object.defineProperty(globalThis, '__scopeCancel', { configurable:true, get(){ if (!__scopeArmed) return 0; __scopeArmed = false; __cdpHostArmDeadline(); try { while(true){} } catch(e) { globalThis.__scopeCaught = true; } } }); debugger; __cdpHostDone();\n//# sourceURL=escargot-scope-cancellation.js");
+    const scope_paused = try session.pause();
+    defer scope_paused.deinit();
+    try testing.expect(owner.deadline_armed.load(.acquire));
+    try testing.expect(runtime_control.setExecutionTimeLimit(owner.id, 0));
+    const recovered = try session.reply(try session.send("Debugger.evaluateOnCallFrame", "{\"callFrameId\":\"0\",\"expression\":\"typeof __scopeCaught === 'undefined' ? 42 : 0\"}"));
+    defer recovered.deinit();
+    try expectNumber(recovered.value, 42);
+    try session.command("Debugger.resume", "{}");
+    try session.waitFinished();
+    const scope_completed = try session.reply(scope_evaluation);
+    defer scope_completed.deinit();
+    try expectNumber(scope_completed.value, 42);
+
+    owner.deadline_armed.store(false, .release);
+    const format_evaluation = try session.evaluate("throw {toString(){ __cdpHostArmDeadline(); try {while(true){}} catch(e) {globalThis.__formatCaught = true;} }};");
+    const format_cancelled = try session.receive(format_evaluation, null);
+    defer format_cancelled.deinit();
+    try testing.expect(owner.deadline_armed.load(.acquire));
+    try testing.expect(runtime_control.setExecutionTimeLimit(owner.id, 0));
+    const format_recovered = try session.reply(try session.evaluate("typeof __formatCaught === 'undefined' ? 42 : 0"));
+    defer format_recovered.deinit();
+    try expectNumber(format_recovered.value, 42);
 }
 
 test "cdp: a line-granular for-of step remains interruptible" {

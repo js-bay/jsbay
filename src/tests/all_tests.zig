@@ -101,6 +101,9 @@ comptime {
     if (!spike) {
         _ = @import("runtime_control_tests.zig");
     }
+    if (!spike or backend.isEscargotBackend(backend.active_backend)) {
+        _ = @import("execution_cancellation_tests.zig");
+    }
     // buffers_tests: basic + finalizer in spike scope; advanced cases Skip inside the suite. Transfer: Escargot native; Hermes polyfill (detachArrayBuffer + copy). Tight-cap case still QJS-only Skip inside.
     _ = @import("buffers_tests.zig");
     _ = @import("buffers_transfer_tests.zig");

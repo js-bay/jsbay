@@ -13,7 +13,7 @@ if [[ ! -f "$SRC/CMakeLists.txt" ]]; then
   exit 1
 fi
 
-for patch_name in escargot-debugger.patch escargot-default-async.patch escargot-module-bindings.patch; do
+for patch_name in escargot-debugger.patch escargot-default-async.patch escargot-module-bindings.patch escargot-execution-termination.patch; do
     PATCH="$ROOT/vendor/$patch_name"
     if ! patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
         patch -d "$SRC" -p1 --forward --batch < "$PATCH"

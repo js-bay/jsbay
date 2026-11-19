@@ -46,6 +46,12 @@ export fn jsbay_escargot_should_stop_pending_job_drain(instance_id: c_int) callc
     return shouldStopPendingJobDrain(@intCast(instance_id));
 }
 
+/// Poll execution deadlines only; unsupported user-interrupt and lifecycle-stop APIs retain their existing capability contract.
+export fn jsbay_escargot_should_terminate_execution(instance_id: c_int) callconv(.c) bool {
+    const control = @import("../../runtime/runtime_control.zig");
+    return if (control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
+}
+
 pub fn processPendingJobs(ctx: Context) void {
     // Match QuickJS/JSC: Deferred.settleWith can call this while an outer script/native callback is still on the stack; gate so Promise reactions wait for the outer checkpoint.
     if (ctx == null) return;
