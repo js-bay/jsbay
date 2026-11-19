@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import errno
+import fcntl
 import os
 import pty
 import re
@@ -20,9 +21,16 @@ master, slave = pty.openpty()
 settings = termios.tcgetattr(slave)
 settings[3] &= ~termios.ECHO
 termios.tcsetattr(slave, termios.TCSANOW, settings)
+
+
+def attach_terminal():
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+
 process = subprocess.Popen(
     [os.environ.get('OHPM_BIN', 'ohpm'), 'config', 'encrypt', '--crypto_path', sys.argv[1]],
-    stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+    stdin=slave, stdout=slave, stderr=slave, preexec_fn=attach_terminal,
 )
 os.close(slave)
 data = b''

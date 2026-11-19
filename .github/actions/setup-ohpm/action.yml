@@ -1,0 +1,19 @@
+name: Install pinned OHPM tools
+description: Install the verified command-line tool archive without a shared cache
+runs:
+  using: composite
+  steps:
+    - name: Download and verify OHPM tools
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        tool_dir="$RUNNER_TEMP/ohpm-tools"
+        mkdir -p "$tool_dir"
+        gh release download 6.1.1.280 --repo ErBWs/ohos-sdk --pattern 'ohos-sdk-linux-amd64.tar.gz.aa' --pattern 'ohos-sdk-linux-amd64.tar.gz.ab' --dir "$tool_dir"
+        cat "$tool_dir/ohos-sdk-linux-amd64.tar.gz.aa" "$tool_dir/ohos-sdk-linux-amd64.tar.gz.ab" > "$tool_dir/tools.tar.gz"
+        printf '%s  %s\n' '3d37eb5a3a81358a9731c35265f4f29d8ecf1028b0bbbb777f2928cd6990aa83' "$tool_dir/tools.tar.gz" | sha256sum -c -
+        tar -xzf "$tool_dir/tools.tar.gz" -C "$tool_dir"
+        echo "$tool_dir/command-line-tools/bin" >> "$GITHUB_PATH"
+        echo "$tool_dir/command-line-tools/tool/node/bin" >> "$GITHUB_PATH"
