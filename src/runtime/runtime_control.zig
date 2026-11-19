@@ -287,12 +287,10 @@ pub fn disarmHermesDeadlineWatch(instance_id: i32) void {
     hermesDrainAsyncTimeout(instance_id);
 }
 
-/// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from requestStopInterrupt (destroy/stop) therefore kills finite work after a host callback (`hostDestroy(); 42`). Call from the host trampoline on the way back into JS: clear sticky bits on every eval-active instance on this thread (nested destroy can arm outer frames too), then arm a short watch so loops still abort soon.
+/// Rearm shutdown cancellation only for the runtime returning from its host callback. An outer runtime remains suspended while a nested eval unwinds and destroys its deferred instance; arming its watch here would charge native cleanup time and poison its eventual finite return. Its own host trampoline rearms the watch when it is ready to resume JavaScript.
 pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    const et = @import("engine_thread.zig");
     rearmOneHermesStop(instance_id);
-    et.forEachEvalActiveOnCurrentThread(rearmOneHermesStop);
 }
 
 fn rearmOneHermesStop(instance_id: i32) void {

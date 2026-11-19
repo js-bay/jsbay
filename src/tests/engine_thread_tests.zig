@@ -1905,6 +1905,7 @@ const NestedEvalDestroy = struct {
     id_a: i32,
     id_b: i32,
     nested_eval_ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    pause_after_inner: bool = false,
 
     fn enterB(
         _: c_int,
@@ -1915,8 +1916,11 @@ const NestedEvalDestroy = struct {
     ) callconv(.c) c_int {
         const self: *NestedEvalDestroy = @ptrCast(@alignCast(user.?));
         const result = engine.evalScript(self.id_b, "destroyNestedInstances(); 42", "<nested-destroy-b>");
+        if (result.err) |message| std.debug.print("nested destroy inner eval: {s}\n", .{message});
         self.nested_eval_ok.store(result.err == null and result.result != null and std.mem.eql(u8, result.result.?, "42"), .seq_cst);
         helpers.freeEvalResult(result);
+        // Model inner-runtime cleanup while the outer runtime remains suspended in native code.
+        if (self.pause_after_inner) io.sleepMs(100);
         clearHost(out);
         return 0;
     }
@@ -1943,6 +1947,14 @@ const NestedEvalDestroy = struct {
 };
 
 test "engine_thread: nested direct eval destroys each deferred instance" {
+    try expectNestedEvalDestroy(false);
+}
+
+test "engine_thread: nested direct eval defers the outer stop watch until host return" {
+    try expectNestedEvalDestroy(true);
+}
+
+fn expectNestedEvalDestroy(pause_after_inner: bool) !void {
     try skipSpikeUnlessGreen();
     const id_a = helpers.nextInstanceId();
     const id_b = helpers.nextInstanceId();
@@ -1953,12 +1965,13 @@ test "engine_thread: nested direct eval destroys each deferred instance" {
     var cleanup_b = true;
     errdefer if (cleanup_b) live_b.close();
 
-    var nested = NestedEvalDestroy{ .id_a = id_a, .id_b = id_b };
+    var nested = NestedEvalDestroy{ .id_a = id_a, .id_b = id_b, .pause_after_inner = pause_after_inner };
     try install(id_a, "enterNestedB", NestedEvalDestroy.enterB, &nested);
     try install(id_b, "destroyNestedInstances", NestedEvalDestroy.destroyBoth, &nested);
 
     const result = engine.evalScript(id_a, "enterNestedB(); 42", "<nested-destroy-a>");
     defer helpers.freeEvalResult(result);
+    if (result.err) |message| std.debug.print("nested destroy outer eval: {s}\n", .{message});
     try testing.expect(result.err == null and result.result != null and std.mem.eql(u8, result.result.?, "42"));
     try testing.expect(nested.nested_eval_ok.load(.seq_cst));
     try testing.expect(engine.getContext(id_b) == null);
