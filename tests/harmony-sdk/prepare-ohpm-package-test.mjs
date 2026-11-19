@@ -17,6 +17,7 @@ try {
     const metadata = JSON.parse(readFileSync(join(root, 'sdk/harmony/oh-package.json5'), 'utf8'));
     assert.equal(metadata.name, expected);
     assert.equal(metadata.version, '0.1.1-rc.1');
+    assert.equal(metadata.author.name, 'jsbay');
     assert.match(readFileSync(join(root, 'sdk/harmony/README.md'), 'utf8'), new RegExp(`ohpm install ${expected}@0\\.1\\.1-rc\\.1`));
     assert.match(readFileSync(join(root, 'sdk/harmony/CHANGELOG.md'), 'utf8'), /0\.1\.1-rc\.1/);
     assert.ok(readFileSync(join(root, 'sdk/harmony/LICENSE'), 'utf8').length > 0);

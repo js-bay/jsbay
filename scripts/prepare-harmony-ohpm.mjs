@@ -14,6 +14,7 @@ const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 const name = packageNames[backend];
 manifest.name = name;
 manifest.version = version;
+manifest.author = { name: 'jsbay' };
 writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
 const profilePath = join(root, 'tests/harmony-sdk/fixture/build-profile.json5');

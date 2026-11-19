@@ -118,7 +118,7 @@ jobs:
           output="$RUNNER_TEMP/harmony-har-${QUICKJS_BACKEND}"
           bash scripts/stage-harmony-har.sh "$output" "0.1.1-rc.1"
           har="$output/jsbay-0.1.1-rc.1-harmony-${QUICKJS_BACKEND}-arm64-v8a.har"
-          tar -xOzf "$har" package/oh-package.json5 | jq -e --arg name "@jsbay/${QUICKJS_BACKEND}" '.name == $name and .version == "0.1.1-rc.1" and .metadata.debug == false'
+          tar -xOzf "$har" package/oh-package.json5 | jq -e --arg name "@jsbay/${QUICKJS_BACKEND}" '.name == $name and .version == "0.1.1-rc.1" and .author.name == "jsbay" and .metadata.debug == false'
           for file in README.md LICENSE CHANGELOG.md; do test "$(tar -xOzf "$har" "package/$file" | wc -c)" -gt 0; done
       - name: Preserve HAR
         uses: actions/upload-artifact@v6
