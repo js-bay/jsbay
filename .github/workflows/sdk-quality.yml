@@ -58,7 +58,7 @@ jobs:
         run: |
           set -euo pipefail
           ohpm --version
-          hvigorw --version
+          command -v hvigorw
           test '${{ steps.ohos.outputs.api-version }}' = 12
           test -d "$API12_SDK/native/sysroot"
           zig build -Dbackend="$QUICKJS_BACKEND" -Dtarget=aarch64-linux-ohos -Dohos-sysroot="$API12_SDK/native/sysroot" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/harmony-core" --summary all
