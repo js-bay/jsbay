@@ -15,37 +15,29 @@ on:
         description: Try the Harmony HAR build on a GitHub-hosted runner
         type: boolean
         default: false
-      harmony_publish:
-        description: Publish the verified Harmony packages
+      harmony_registry_verify:
+        description: Install the already published Harmony packages from OHPM
         type: boolean
         default: false
       harmony_version:
         description: Harmony package version
         type: string
         default: '0.1.1-rc.1'
+      publication_run:
+        description: Successful GitHub Actions publication run ID containing the HAR artifacts
+        type: string
+        default: ''
       harmony_auth_probe:
         description: Diagnose OHPM password encryption with test data
         type: boolean
         default: false
-      harmony_registry_verify:
-        description: Install published Harmony packages from OHPM
-        type: boolean
-        default: false
-      publication_run:
-        description: Successful GitHub Actions publication run ID
-        type: string
-        default: ''
-      expected_sha:
-        description: Full commit SHA approved for publication
-        type: string
-        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ inputs.harmony_publish && 'harmony-ohpm-publish' || format('sdk-quality-{0}', github.ref) }}
-  cancel-in-progress: ${{ !inputs.harmony_publish }}
+  group: sdk-quality-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   harmony-registry-consumer:
@@ -127,21 +119,6 @@ jobs:
           (cd "$consumer" && ohpm install '@ohos/lottie@2.0.38' --no-link)
           jq -e '.packages["@ohos/lottie@2.0.38"].registryType == "ohpm" and (.packages["@ohos/lottie@2.0.38"].integrity | startswith("sha512-"))' "$consumer/oh-package-lock.json5"
           test -f "$consumer/oh_modules/@ohos/lottie/oh-package.json5"
-
-  harmony-publish-guard:
-    if: github.event_name == 'workflow_dispatch' && inputs.harmony_publish
-    name: Validate Harmony publication request
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check the requested commit and build selection
-        env:
-          EXPECTED_SHA: ${{ inputs.expected_sha }}
-          BUILD_HARMONY: ${{ inputs.harmony_hosted }}
-          ACTUAL_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          [[ "$EXPECTED_SHA" =~ ^[a-f0-9]{40}$ && "$EXPECTED_SHA" == "$ACTUAL_SHA" ]]
-          [[ "$BUILD_HARMONY" == true ]]
 
   harmony-hosted:
     if: github.event_name == 'workflow_dispatch' && inputs.harmony_hosted
@@ -260,70 +237,6 @@ jobs:
           node tests/harmony-sdk/ohpm-encrypt-test.mjs
           output=$(printf 'example-passphrase' | "$OHPM_NODE" scripts/ohpm-encrypt-passphrase.mjs "$OHPM_CRYPTO_MODULE" "$RUNNER_TEMP/ohpm-crypto")
           printf '%s\n' "$output" | grep -q 'security:'
-
-  harmony-ohpm-publish:
-    if: github.event_name == 'workflow_dispatch' && inputs.harmony_hosted && inputs.harmony_publish && inputs.expected_sha == github.sha
-    needs: [harmony-publish-guard, harmony-hosted, harmony-ohpm-preflight]
-    name: Publish Harmony packages
-    runs-on: ubuntu-24.04
-    timeout-minutes: 25
-    environment: release
-    strategy:
-      fail-fast: false
-      matrix:
-        backend: [quickjs, quickjs_ng]
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install OHPM tools
-        uses: ./.github/actions/setup-ohpm
-      - name: Download verified HAR packages
-        uses: actions/download-artifact@v4
-        with:
-          pattern: harmony-hosted-*
-          path: ${{ runner.temp }}/harmony-packages
-      - name: Verify the preflight artifact
-        env:
-          PUBLISH_BACKEND: ${{ matrix.backend }}
-          QUICKJS_SHA256: ${{ needs.harmony-ohpm-preflight.outputs.quickjs-sha256 }}
-          QUICKJS_NG_SHA256: ${{ needs.harmony-ohpm-preflight.outputs.quickjs-ng-sha256 }}
-          HARMONY_VERSION: ${{ inputs.harmony_version }}
-        run: |
-          set -euo pipefail
-          case "$PUBLISH_BACKEND" in
-            quickjs) expected="$QUICKJS_SHA256" ;;
-            quickjs_ng) expected="$QUICKJS_NG_SHA256" ;;
-            *) exit 1 ;;
-          esac
-          [[ "$expected" =~ ^[a-f0-9]{64}$ ]]
-          har="$RUNNER_TEMP/harmony-packages/harmony-hosted-$PUBLISH_BACKEND/jsbay-$HARMONY_VERSION-harmony-$PUBLISH_BACKEND-arm64-v8a.har"
-          printf '%s  %s\n' "$expected" "$har" | sha256sum -c -
-      - name: Publish engine package
-        env:
-          OHPM_PRIVATE_KEY: ${{ secrets.OHPM_PRIVATE_KEY }}
-          OHPM_KEY_PASSPHRASE: ${{ secrets.OHPM_KEY_PASSPHRASE }}
-          OHPM_PUBLISH_ID: ${{ secrets.OHPM_PUBLISH_ID }}
-          PUBLISH_BACKEND: ${{ matrix.backend }}
-          HARMONY_VERSION: ${{ inputs.harmony_version }}
-        run: |
-          set -euo pipefail
-          : "${OHPM_PRIVATE_KEY:?missing OHPM private key}"
-          : "${OHPM_KEY_PASSPHRASE:?missing OHPM key passphrase}"
-          : "${OHPM_PUBLISH_ID:?missing OHPM publish ID}"
-          export -n OHPM_PRIVATE_KEY OHPM_KEY_PASSPHRASE OHPM_PUBLISH_ID
-          umask 077
-          work=$(mktemp -d "$RUNNER_TEMP/ohpm-publish.XXXXXX")
-          trap 'rm -rf "$work"' EXIT
-          printf '%s\n' "$OHPM_PRIVATE_KEY" > "$work/private_key"
-          ciphertext=$(printf '%s' "$OHPM_KEY_PASSPHRASE" | "$OHPM_NODE" scripts/ohpm-encrypt-passphrase.mjs "$OHPM_CRYPTO_MODULE" "$work/crypto")
-          echo "::add-mask::$ciphertext"
-          printf 'publish_id=%s\nkey_path=%s\ncrypto_path=%s\nkey_passphrase=%s\n' "$OHPM_PUBLISH_ID" "$work/private_key" "$work/crypto" "$ciphertext" > "$work/.ohpmrc"
-          har="$RUNNER_TEMP/harmony-packages/harmony-hosted-$PUBLISH_BACKEND/jsbay-$HARMONY_VERSION-harmony-$PUBLISH_BACKEND-arm64-v8a.har"
-          version_without_build=${HARMONY_VERSION%%+*}
-          if [[ "$version_without_build" == *-* ]]; then
-            (cd "$work" && ohpm publish "$har" --tag rc --publish_registry https://ohpm.openharmony.cn/ohpm/)
-          else
-            (cd "$work" && ohpm publish "$har" --publish_registry https://ohpm.openharmony.cn/ohpm/)
-          fi
 
   harmony-toolchain:
     name: Harmony local gate checks

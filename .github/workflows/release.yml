@@ -1160,12 +1160,124 @@ jobs:
           path: ${{ steps.pack.outputs.archive }}
           if-no-files-found: error
 
+  build-harmony-release:
+    name: Build Harmony HAR (${{ matrix.backend }})
+    if: ${{ !inputs.verify_only && !inputs.recovery_run_id }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs, quickjs_ng]
+    steps:
+      - name: Checkout reviewed source snapshot
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+
+      - name: Install Harmony command-line tools
+        uses: ./.github/actions/setup-ohpm
+        with:
+          version: 5.0.13.200
+
+      - name: Install OpenHarmony API 12 SDK
+        id: ohos
+        uses: ./.github/actions/setup-openharmony-sdk
+
+      - name: Build and validate release HAR
+        env:
+          QUICKJS_BACKEND: ${{ matrix.backend }}
+          API12_SDK: ${{ steps.ohos.outputs.ohos-base-sdk-home }}
+          HARMONY_TARGET_SDK_VERSION: '5.0.0(12)'
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
+          node scripts/validate-harmony-version.mjs "$version"
+          ohpm --version
+          command -v hvigorw
+          test '${{ steps.ohos.outputs.api-version }}' = 12
+          test -d "$API12_SDK/native/sysroot"
+          node tests/harmony-sdk/prepare-ohpm-package-test.mjs
+          node scripts/prepare-harmony-ohpm.mjs "$PWD" "$QUICKJS_BACKEND" "$version"
+          zig build -Dbackend="$QUICKJS_BACKEND" -Dtarget=aarch64-linux-ohos -Dohos-sysroot="$API12_SDK/native/sysroot" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$RUNNER_TEMP/harmony-core" --summary all
+          export JSBAY_LIBRARY="$RUNNER_TEMP/harmony-core/lib/libjsbay.a"
+          export JSBAY_HARMONY_ARCHIVE="$JSBAY_LIBRARY"
+          export AR="$API12_SDK/native/llvm/bin/llvm-ar"
+          printf '#!/usr/bin/env bash\nexec "%s" "$@" --no-daemon -p buildMode=release\n' "$(command -v hvigorw)" > "$RUNNER_TEMP/hvigorw-ci"
+          chmod +x "$RUNNER_TEMP/hvigorw-ci"
+          export HVIGORW="$RUNNER_TEMP/hvigorw-ci"
+          unset NODE_PATH
+          output="$RUNNER_TEMP/harmony-release-$QUICKJS_BACKEND"
+          bash scripts/stage-harmony-har.sh "$output" "$version"
+          har="$output/jsbay-$version-harmony-$QUICKJS_BACKEND-arm64-v8a.har"
+          test "$(cat "$output/backend")" = "$QUICKJS_BACKEND"
+          tar -xOzf "$har" package/oh-package.json5 | jq -e --arg name "@jsbay/$QUICKJS_BACKEND" --arg version "$version" '.name == $name and .version == $version and .author.name == "jsbay" and .author.url == "https://github.com/js-bay/jsbay" and .repository == "https://github.com/js-bay/jsbay" and .metadata.debug == false'
+          for file in README.md LICENSE CHANGELOG.md; do test "$(tar -xOzf "$har" "package/$file" | wc -c)" -gt 0; done
+
+      - name: Upload checked Harmony HAR
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-release-${{ matrix.backend }}
+          path: ${{ runner.temp }}/harmony-release-${{ matrix.backend }}
+          if-no-files-found: error
+
+  harmony-release-consumer:
+    name: Build Harmony package consumers
+    needs: [build-harmony-release]
+    if: ${{ always() && needs.build-harmony-release.result == 'success' && !inputs.verify_only && !inputs.recovery_run_id }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup-ohpm
+        with:
+          version: 6.1.1.280
+
+      - name: Download checked Harmony HARs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: harmony-release-*
+          path: ${{ runner.temp }}/harmony-packages
+
+      - name: Prepublish, install, and build each Harmony consumer
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERSION_INPUT"
+          for backend in quickjs quickjs_ng; do
+            har="$RUNNER_TEMP/harmony-packages/harmony-release-$backend/jsbay-$version-harmony-$backend-arm64-v8a.har"
+            ohpm prepublish "$har"
+            consumer="$RUNNER_TEMP/harmony-local-$backend"
+            mkdir -p "$consumer"
+            printf '{"name":"consumer","version":"1.0.0"}\n' > "$consumer/oh-package.json5"
+            (cd "$consumer" && ohpm install "$har")
+            test -f "$consumer/oh_modules/@jsbay/$backend/oh-package.json5"
+            app="$RUNNER_TEMP/harmony-consumer-$backend"
+            node tests/harmony-sdk/prepare-ohpm-consumer.mjs "$app" "$har" "$backend" "file:$har"
+            (cd "$app/entry" && ohpm install --no-link)
+            (cd "$app" && hvigorw --mode module -p module=entry@default assembleHap --no-daemon)
+          done
+
+      - name: Preserve Harmony consumer applications
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-release-consumers
+          path: ${{ runner.temp }}/harmony-consumer-*/entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
   # Assemble assets under read-only permissions before any release tag or package is published.
   # ---------------------------------------------------------------------------
   assemble-release-assets:
     name: Assemble checked release assets
-    needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android]
+    needs: [build-libs-linux, build-libs-linux-arm, build-libs-macos, build-libs-macos-intel, build-apple, build-android, harmony-release-consumer]
     # Build-only runs may skip either L2 tier; release publication validates that both were selected and succeeded.
     if: >-
       ${{ always() && !inputs.verify_only &&
@@ -1173,6 +1285,8 @@ jobs:
           needs.build-libs-linux-arm.result == 'success' &&
           needs.build-libs-macos.result == 'success' &&
           needs.build-libs-macos-intel.result == 'success' &&
+          ((needs.harmony-release-consumer.result == 'success') ||
+           (!inputs.verify_only && inputs.recovery_run_id != '' && needs.harmony-release-consumer.result == 'skipped')) &&
           ((inputs.build_apple && needs.build-apple.result == 'success') ||
            (!inputs.build_apple && needs.build-apple.result == 'skipped')) &&
           ((inputs.build_android && needs.build-android.result == 'success') ||
@@ -1235,7 +1349,7 @@ jobs:
           set -euo pipefail
           version="$(zig build tool -- release-version "$VERSION_INPUT" "$GITHUB_REF" "$GITHUB_RUN_ID")"
           mkdir -p release-assets
-          find dist -type f \( -name 'jsbay-*.tar.gz' -o -name 'jsbay-*.zip' -o -name 'jsbay-*.aar' \) -exec cp {} release-assets/ \;
+          find dist -type f \( -name 'jsbay-*.tar.gz' -o -name 'jsbay-*.zip' -o -name 'jsbay-*.aar' -o -name 'jsbay-*.har' \) -exec cp {} release-assets/ \;
           cp "${{ steps.source.outputs.archive }}" release-assets/
           cp "${{ steps.zig_package.outputs.archive }}" release-assets/
           cd release-assets
@@ -1246,7 +1360,7 @@ jobs:
             "${{ github.event_name != 'workflow_dispatch' || inputs.build_apple }}" \
             "${{ github.event_name != 'workflow_dispatch' || inputs.build_android }}"
           : > SHA256SUMS
-          for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar; do
+          for f in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar jsbay-*.har; do
             [ -f "$f" ] || continue
             sha256sum "$f" >> SHA256SUMS
           done
@@ -1265,6 +1379,8 @@ jobs:
     needs: [assemble-release-assets]
     if: ${{ always() && !inputs.verify_only && inputs.build_apple && needs.assemble-release-assets.result == 'success' }}
     runs-on: macos-26
+    outputs:
+      assets_id: ${{ steps.upload-final-assets.outputs.artifact-id }}
     steps:
       - name: Checkout source snapshot
         uses: actions/checkout@v7
@@ -1294,11 +1410,12 @@ jobs:
           test -s "$output/Package.swift"
           cd release-assets
           : > SHA256SUMS
-          for archive in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar; do
+          for archive in jsbay-*.tar.gz jsbay-*.zip jsbay-*.aar jsbay-*.har; do
             [ -f "$archive" ] || continue
             shasum -a 256 "$archive" >> SHA256SUMS
           done
       - name: Upload final checked release assets
+        id: upload-final-assets
         uses: actions/upload-artifact@v6
         with:
           name: jsbay-final-release-assets
@@ -1685,6 +1802,28 @@ jobs:
           set -euo pipefail
           if [[ -n "$RECOVERY_RUN" ]]; then test -n "$DRAFT_ID"; fi
           bash scripts/verify-staged-release.sh publish "$VERSION" "$SOURCE_SHA" "$ORIGINAL_RUN" release-assets "$RUNNER_TEMP/swift-package-release" "$DRAFT_ID"
+
+  dispatch-harmony-ohpm:
+    name: Dispatch OHPM submission (${{ matrix.backend }})
+    needs: [publish-release, prepare-swift-package-release-assets, verify-release-recovery]
+    if: ${{ always() && inputs.publish && !inputs.verify_only && needs.publish-release.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quickjs, quickjs_ng]
+    steps:
+      - name: Start protected OHPM publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          BACKEND: ${{ matrix.backend }}
+          RELEASE_RUN_ID: ${{ inputs.recovery_run_id || github.run_id }}
+          RELEASE_ARTIFACT_ID: ${{ inputs.recovery_run_id != '' && needs.verify-release-recovery.outputs.assets_id || needs.prepare-swift-package-release-assets.outputs.assets_id }}
+        run: gh workflow run harmony-ohpm-publish.yml --repo "$GITHUB_REPOSITORY" --ref main -f version="$VERSION" -f backend="$BACKEND" -f release_run_id="$RELEASE_RUN_ID" -f release_artifact_id="$RELEASE_ARTIFACT_ID"
 
   verify-published-swift:
     name: Verify published Swift package downloads
