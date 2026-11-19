@@ -23,6 +23,14 @@ on:
         description: Diagnose OHPM password encryption with test data
         type: boolean
         default: false
+      harmony_registry_verify:
+        description: Install published Harmony RC packages from OHPM
+        type: boolean
+        default: false
+      publication_run:
+        description: Successful GitHub Actions publication run ID
+        type: string
+        default: ''
       expected_sha:
         description: Full commit SHA approved for publication
         type: string
@@ -36,6 +44,52 @@ concurrency:
   cancel-in-progress: ${{ !inputs.harmony_publish }}
 
 jobs:
+  harmony-registry-consumer:
+    if: github.event_name == 'workflow_dispatch' && inputs.harmony_registry_verify
+    name: Verify published Harmony packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-ohpm
+      - name: Install published packages and build consumers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLICATION_RUN: ${{ inputs.publication_run }}
+        run: |
+          set -euo pipefail
+          [[ "$PUBLICATION_RUN" =~ ^[0-9]+$ ]]
+          ohpm config set registry https://ohpm.openharmony.cn/ohpm/
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PUBLICATION_RUN" > "$RUNNER_TEMP/published-run.json"
+          jq -e '.path == ".github/workflows/sdk-quality.yml" and .event == "workflow_dispatch" and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/published-run.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$PUBLICATION_RUN/jobs?per_page=100&filter=all" > "$RUNNER_TEMP/published-jobs.json"
+          jq -e '[.[].jobs[]] as $jobs | all(["quickjs", "quickjs_ng"][]; . as $backend | any($jobs[]; .name == ("Publish Harmony RC packages (" + $backend + ")") and .conclusion == "success"))' "$RUNNER_TEMP/published-jobs.json"
+          for backend in quickjs quickjs_ng; do
+            artifacts="$RUNNER_TEMP/published-$backend"
+            gh run download "$PUBLICATION_RUN" --repo "$GITHUB_REPOSITORY" --name "harmony-hosted-$backend" --dir "$artifacts"
+            har="$artifacts/jsbay-0.1.1-rc.1-harmony-$backend-arm64-v8a.har"
+            curl --fail --location --retry 3 --silent --show-error "https://ohpm.openharmony.cn/ohpm/@jsbay%2f$backend" > "$RUNNER_TEMP/registry-$backend.json"
+            registry_integrity=$(jq -er '.versions["0.1.1-rc.1"].dist.integrity' "$RUNNER_TEMP/registry-$backend.json")
+            expected_integrity="sha512-$(openssl dgst -sha512 -binary "$har" | openssl base64 -A)"
+            [[ "$registry_integrity" == "$expected_integrity" ]]
+            app="$RUNNER_TEMP/registry-consumer-$backend"
+            node tests/harmony-sdk/prepare-ohpm-consumer.mjs "$app" "$har" "$backend" '0.1.1-rc.1'
+            (cd "$app/entry" && ohpm install --no-link)
+            jq -e --arg package "@jsbay/$backend@0.1.1-rc.1" --arg integrity "$expected_integrity" '.packages[$package].integrity == $integrity and (.packages[$package].resolved | startswith("https://ohpm.openharmony.cn/ohpm/"))' "$app/entry/oh-package-lock.json5"
+            tar -xOzf "$har" package/libs/arm64-v8a/libjsbay_harmony.so > "$RUNNER_TEMP/published-$backend.so"
+            cmp "$RUNNER_TEMP/published-$backend.so" "$app/entry/oh_modules/@jsbay/$backend/libs/arm64-v8a/libjsbay_harmony.so"
+            (cd "$app" && hvigorw --mode module -p module=entry@default assembleHap --no-daemon)
+          done
+      - name: Preserve registry consumer applications
+        uses: actions/upload-artifact@v6
+        with:
+          name: harmony-registry-consumers
+          path: ${{ runner.temp }}/registry-consumer-*/entry/build/default/outputs/default/*.hap
+          if-no-files-found: error
+
   harmony-auth-probe:
     if: github.event_name == 'workflow_dispatch' && inputs.harmony_auth_probe
     runs-on: ubuntu-24.04
