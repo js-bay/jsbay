@@ -447,11 +447,41 @@ pub fn build(b: *std.Build) void {
     addPlatformCompatSources(b, test_module);
     addBackendSources(b, test_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
 
+    const android_test_libc = b.option([]const u8, "android-test-libc", "NDK libc description for the Android device test executable");
+    const android_test_libdir = b.option([]const u8, "android-test-libdir", "NDK link directory for the Android device test executable");
+    const android_test_probe_stack = b.option([]const u8, "android-test-probe-stack", "Stack probe object for Android Escargot tests using NDK compiler runtime");
+    if (android_test_libc != null and (os != .linux or target.result.abi != .android)) {
+        std.process.fatal("-Dandroid-test-libc requires an Android target", .{});
+    }
+    if ((android_test_libc == null) != (android_test_libdir == null)) {
+        std.process.fatal("-Dandroid-test-libc and -Dandroid-test-libdir must be provided together", .{});
+    }
+    if (android_test_probe_stack != null and (android_test_libc == null or backend != .escargot)) {
+        std.process.fatal("-Dandroid-test-probe-stack requires Android Escargot device tests", .{});
+    }
     const unit_tests = b.addTest(.{
         .root_module = test_module,
         .filters = if (stress_tests) &.{"stress"} else if (test_filter) |filter| &.{filter} else &.{},
         .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
+        .test_runner = if (android_test_libc != null) .{ .path = b.path("scripts/android-unit-tests/android_test_runner.zig"), .mode = .simple } else null,
     });
+    if (android_test_libc) |libc| {
+        unit_tests.linkage = .dynamic;
+        unit_tests.pie = true;
+        test_module.addCSourceFile(.{ .file = b.path("scripts/android-unit-tests/android_phdr_compat.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+        unit_tests.setLibCFile(.{ .cwd_relative = libc });
+        test_module.addLibraryPath(.{ .cwd_relative = android_test_libdir.? });
+        if (backend == .escargot) {
+            const probe_stack = android_test_probe_stack orelse std.process.fatal("Android Escargot tests require -Dandroid-test-probe-stack", .{});
+            test_module.addObjectFile(.{ .cwd_relative = probe_stack });
+            for ([_][]const u8{ "c++abi", "log", "unwind", "clang_rt.builtins-x86_64-android" }) |name| {
+                test_module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+            }
+            unit_tests.bundle_compiler_rt = false;
+        }
+        const install_android_tests = b.addInstallFile(unit_tests.getEmittedBin(), "unit_tests");
+        b.step("android-test-compile", "Build and install official Android device tests without running them").dependOn(&install_android_tests.step);
+    }
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
     if (asan) {

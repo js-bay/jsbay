@@ -82,5 +82,7 @@
         "vendor/hermes-debugger-step-out.patch",
         "vendor/hermes-drain-microtasks-hint.patch",
         "vendor/escargot-debugger.patch",
+        "vendor/escargot-default-async.patch",
+        "vendor/escargot-module-bindings.patch",
     },
 }

@@ -174,7 +174,7 @@ fn runIsolated(test_fn: std.builtin.TestFn, init: std.process.Init.Minimal, time
     const linux = std.os.linux;
     const fork_rc = linux.fork();
     if (posix.errno(fork_rc) != .SUCCESS) {
-        return runInProcess(test_fn, init);
+        return .{ .fail = "fork failed; isolation and timeout cannot be guaranteed" };
     }
     if (fork_rc == 0) {
         const child = runInProcess(test_fn, init);
@@ -187,22 +187,41 @@ fn runIsolated(test_fn: std.builtin.TestFn, init: std.process.Init.Minimal, time
     }
 
     const child_pid: linux.pid_t = @intCast(fork_rc);
-    var slices: u32 = if (timeout_s == 0) std.math.maxInt(u32) else timeout_s *% 20;
+    const started = monotonicMilliseconds() orelse {
+        _ = linux.kill(child_pid, .KILL);
+        var status: i32 = 0;
+        _ = linux.waitpid(child_pid, &status, 0);
+        return .{ .fail = "monotonic clock unavailable" };
+    };
+    const deadline = started +| @as(u64, timeout_s) * std.time.ms_per_s;
     while (true) {
         var status_i: i32 = 0;
         const wait_rc = linux.waitpid(child_pid, &status_i, linux.W.NOHANG);
         if (posix.errno(wait_rc) == .SUCCESS and wait_rc != 0) {
             return classifyWaitStatus(@as(u32, @bitCast(status_i)));
         }
-        if (timeout_s > 0 and slices == 0) {
+        const now = monotonicMilliseconds() orelse {
+            _ = linux.kill(child_pid, .KILL);
+            _ = linux.waitpid(child_pid, &status_i, 0);
+            return .{ .fail = "monotonic clock failed" };
+        };
+        if (timeout_s > 0 and now >= deadline) {
             _ = linux.kill(child_pid, .KILL);
             _ = linux.waitpid(child_pid, &status_i, 0);
             return .timeout;
         }
-        if (slices != std.math.maxInt(u32) and slices > 0) slices -= 1;
         var req = linux.timespec{ .sec = 0, .nsec = 50_000_000 };
         _ = linux.nanosleep(&req, null);
     }
+}
+
+// Counting sleep calls extends a nominal timeout under guest scheduling stalls.
+// A monotonic deadline bounds elapsed time instead, including overslept polls.
+fn monotonicMilliseconds() ?u64 {
+    var stamp: std.os.linux.timespec = undefined;
+    if (posix.errno(std.os.linux.clock_gettime(.MONOTONIC, &stamp)) != .SUCCESS) return null;
+    if (stamp.sec < 0 or stamp.nsec < 0) return null;
+    return @as(u64, @intCast(stamp.sec)) *| std.time.ms_per_s +| @as(u64, @intCast(stamp.nsec)) / std.time.ns_per_ms;
 }
 
 fn classifyWaitStatus(status: u32) Outcome {
@@ -217,7 +236,7 @@ fn classifyWaitStatus(status: u32) Outcome {
     }
     if (W.IFSIGNALED(status)) {
         const sig = W.TERMSIG(status);
-        return .{ .crash = @intFromEnum(sig) };
+        return .{ .crash = @backingInt(sig) };
     }
     return .{ .fail_status = status };
 }

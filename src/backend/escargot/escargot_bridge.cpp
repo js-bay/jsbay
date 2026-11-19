@@ -89,10 +89,16 @@ struct EscargotContextOpaque {
     struct PendingRejection {
         ValueRef *promise = nullptr; // retained via protect map
         ValueRef *reason = nullptr;
+        bool handled = false;
+        bool reported = false;
+        bool canceled = false;
     };
     std::mutex rejection_mu;
     std::vector<PendingRejection> pending_rejections;
     using RejectionTrackerFn = void (*)(int32_t, bool, const char *, size_t, void *);
+    EscargotErrorObserverFn error_observer = nullptr;
+    EscargotShouldDeferFn defer_observer = nullptr;
+    std::vector<PendingRejection> *flushing_batch = nullptr;
     RejectionTrackerFn rejection_fn = nullptr;
     void *rejection_userdata = nullptr;
     int32_t rejection_instance_id = 0;
@@ -321,39 +327,33 @@ static void onPromiseRejectCallback(ExecutionStateRef *state, PromiseObjectRef *
                                     VMInstanceRef::PromiseRejectEvent event) {
     if (!state || !promise) return;
     EscargotContextOpaque *c = lookupCtx(state->context());
-    if (!c) return;
-    std::unique_lock<std::mutex> lock(c->rejection_mu);
-    if (event == VMInstanceRef::PromiseRejectWithNoHandler) {
-        ValueRef *p = static_cast<ValueRef *>(promise);
-        ValueRef *r = value ? value : ValueRef::createUndefined();
-        retain(c, p);
-        retain(c, r);
-        c->pending_rejections.push_back({p, r});
-        return;
-    }
+    if (!c || (!c->rejection_fn && !c->error_observer)) return;
+    std::lock_guard<std::mutex> lock(c->rejection_mu);
+    ValueRef *p = static_cast<ValueRef *>(promise);
+    ValueRef *r = value ? value : ValueRef::createUndefined();
     if (event == VMInstanceRef::PromiseHandlerAddedAfterReject) {
-        ValueRef *p = static_cast<ValueRef *>(promise);
-        for (size_t i = 0; i < c->pending_rejections.size(); ++i) {
-            if (c->pending_rejections[i].promise == p) {
-                release(c, c->pending_rejections[i].promise);
-                release(c, c->pending_rejections[i].reason);
-                c->pending_rejections.erase(c->pending_rejections.begin() + static_cast<std::ptrdiff_t>(i));
-                return; // caught before flush — stay quiet
+        for (auto it = c->pending_rejections.begin(); it != c->pending_rejections.end(); ++it) {
+            if (it->promise == p && !it->handled) {
+                release(c, it->promise);
+                release(c, it->reason);
+                c->pending_rejections.erase(it);
+                return;
             }
         }
-        EscargotContextOpaque::RejectionTrackerFn fn = c->rejection_fn;
-        int32_t id = c->rejection_instance_id;
-        void *ud = c->rejection_userdata;
-        ValueRef *r = value ? value : ValueRef::createUndefined();
-        std::string reason_text;
-        if (fn) {
-            StringRef *s = r->toStringWithoutException(c->ctx.get());
-            if (s) reason_text = s->toStdUTF8String();
-            lock.unlock();
-            fn(id, true, reason_text.data(), reason_text.size(), ud);
+        if (c->flushing_batch) {
+            for (auto &item : *c->flushing_batch) {
+                if (item.promise == p && !item.reported) {
+                    item.canceled = true;
+                    return;
+                }
+            }
         }
+    } else if (event != VMInstanceRef::PromiseRejectWithNoHandler) {
         return;
     }
+    retain(c, p);
+    retain(c, r);
+    c->pending_rejections.push_back({p, r, event == VMInstanceRef::PromiseHandlerAddedAfterReject});
 }
 
 static void flushPendingRejections(EscargotContextOpaque *c) {
@@ -363,16 +363,29 @@ static void flushPendingRejections(EscargotContextOpaque *c) {
     {
         std::lock_guard<std::mutex> lock(c->rejection_mu);
         queued.swap(c->pending_rejections);
+        c->flushing_batch = &queued;
     }
-    for (auto &item : queued) {
-        dispatchRejection(c, false, item.reason);
+    size_t index = 0;
+    for (; index < queued.size(); ++index) {
+        auto &item = queued[index];
+        if (!item.canceled) {
+            if (c->defer_observer && c->defer_observer(c->rejection_instance_id)) break;
+            item.reported = true;
+            if (c->error_observer && !c->error_observer(c->rejection_instance_id, item.handled ? 2 : 1, item.promise, item.reason, nullptr)) {
+                item.reported = false;
+                break;
+            }
+            dispatchRejection(c, item.handled, item.reason);
+        }
         release(c, item.promise);
         release(c, item.reason);
+        item.promise = nullptr;
+        item.reason = nullptr;
     }
-    // Drop anything queued re-entrantly during dispatch without another convert loop.
     {
         std::lock_guard<std::mutex> lock(c->rejection_mu);
-        clearPendingRejectionsLocked(c);
+        c->flushing_batch = nullptr;
+        c->pending_rejections.insert(c->pending_rejections.begin(), queued.begin() + static_cast<std::ptrdiff_t>(index), queued.end());
     }
     c->flushing_rejections = false;
 }
@@ -390,6 +403,8 @@ static void escargotTrace(const char *msg) {
 
 
 extern "C" void escargot_thread_enter(void) {
+    // A no-op lifecycle call can enter before the first runtime exists; per-thread initialization requires process globals first.
+    ensureGlobals();
     escargotTrace("thread_enter");
     // ENABLE_THREADING: g_globalsInited is thread_local; each OS thread that touches Escargot must initializeThread (Shell/cctest pattern). No-op when vendor is non-threaded (supportsThreading()==false).
     if (!Globals::supportsThreading()) return;
@@ -1093,14 +1108,31 @@ extern "C" void escargot_set_rejection_tracker(EscargotContext *c, int32_t insta
     if (!fn) {
         c->rejection_fn = nullptr;
         c->rejection_userdata = nullptr;
-        c->rejection_instance_id = 0;
-        clearPendingRejectionsLocked(c);
+        if (!c->error_observer) {
+            c->rejection_instance_id = 0;
+            clearPendingRejectionsLocked(c);
+        }
         return;
     }
     c->rejection_fn = fn;
     c->rejection_userdata = userdata;
     c->rejection_instance_id = instance_id;
     if (!c->rejection_hook_on_vm && c->rt && c->rt->vm.get()) {
+        c->rt->vm.get()->registerPromiseRejectCallback(&onPromiseRejectCallback);
+        c->rejection_hook_on_vm = true;
+    }
+}
+
+
+extern "C" void escargot_set_error_observer(EscargotContext *c, int32_t instance_id,
+                                             EscargotErrorObserverFn observer, EscargotShouldDeferFn should_defer) {
+    if (!c) return;
+    std::lock_guard<std::mutex> lock(c->rejection_mu);
+    c->error_observer = observer;
+    c->defer_observer = should_defer;
+    c->rejection_instance_id = instance_id;
+    if (!observer && !c->rejection_fn) clearPendingRejectionsLocked(c);
+    if (observer && !c->rejection_hook_on_vm && c->rt && c->rt->vm.get()) {
         c->rt->vm.get()->registerPromiseRejectCallback(&onPromiseRejectCallback);
         c->rejection_hook_on_vm = true;
     }

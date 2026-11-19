@@ -229,3 +229,7 @@ pub extern fn escargot_host_object_create(
     names_fn: ?HostNamesFn,
     finalize_fn: ?HostFinalizeFn,
 ) Value;
+
+pub const ErrorObserverFn = *const fn (i32, i32, Value, Value, ?*anyopaque) callconv(.c) bool;
+pub const ShouldDeferFn = *const fn (i32) callconv(.c) bool;
+pub extern fn escargot_set_error_observer(ctx: ?*Context, instance_id: i32, observer: ?ErrorObserverFn, should_defer: ?ShouldDeferFn) void;

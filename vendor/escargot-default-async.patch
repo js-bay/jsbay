@@ -1,0 +1,42 @@
+diff --git a/src/parser/esprima_cpp/esprima.cpp b/src/parser/esprima_cpp/esprima.cpp
+index be74a6eb..555cbd6e 100644
+--- a/src/parser/esprima_cpp/esprima.cpp
++++ b/src/parser/esprima_cpp/esprima.cpp
+@@ -6895,7 +6895,7 @@ public:
+             }
+ 
+             this->nextToken();
+-            if (this->matchKeyword(KeywordKind::FunctionKeyword)) {
++            if (this->matchKeyword(KeywordKind::FunctionKeyword) || this->matchAsyncFunction()) {
+                 // export default function foo () {}
+                 // export default function () {}
+                 ASTNode declaration = this->parseFunctionDeclaration<ASTBuilder, true>(builder);
+@@ -6925,9 +6925,6 @@ public:
+ 
+                     exportDeclaration = this->finalize(node, builder.createExportDefaultDeclarationNode(classNode, entry.m_exportName.value(), entry.m_localName.value()));
+                 }
+-            } else if (this->matchContextualKeyword(AsyncKeyword)) {
+-                // TODO
+-                this->throwUnexpectedToken(this->lookahead, "async keyword in export is not supported yet");
+             } else {
+                 if (this->matchContextualKeyword(FromKeyword)) {
+                     this->throwUnexpectedToken(this->lookahead);
+@@ -7347,7 +7344,7 @@ public:
+ 
+ ProgramNode* parseProgram(::Escargot::Context* ctx, StringView source, ASTClassInfo* outerClassInfo, bool isModule, bool strictFromOutside,
+                           bool inWith, bool allowSuperCallFromOutside, bool allowSuperPropertyFromOutside, bool allowNewTargetFromOutside, bool allowArgumentsFromOutside,
+-                          Optional<SourceRange> streamingSource)
++                          Optional<SourceRange> streamingSource, String** sourceURL)
+ {
+     // GC should be disabled during the parsing process
+     ASSERT(GC_is_disabled());
+@@ -7367,6 +7364,9 @@ ProgramNode* parseProgram(::Escargot::Context* ctx, StringView source, ASTClassI
+     parser.context->allowArguments = allowArgumentsFromOutside;
+ 
+     ProgramNode* nd = parser.parseProgram(builder);
++    if (sourceURL) {
++        *sourceURL = parser.scanner->sourceURLDirective();
++    }
+     return nd;
+ }
+ 

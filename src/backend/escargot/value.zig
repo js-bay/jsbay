@@ -274,3 +274,14 @@ pub fn makeFunction(ctx: Context, name: []const u8, fn_ptr: c_api.NativeFn, user
     buf[name.len] = 0;
     return c_api.escargot_make_function(ctx, @ptrCast(&buf), fn_ptr, user_data);
 }
+
+pub fn callFunctionNoArgsObserved(ctx: Context, fn_val: Value, instance_id: i32) ?[]const u8 {
+    const result = c_api.escargot_call_result(ctx, fn_val, null, null, 0);
+    defer freeValue(ctx, result.value);
+    defer freeValue(ctx, result.exception);
+    if (result.exception) |reason| {
+        @import("exception.zig").reportAsyncUncaught(ctx, instance_id, reason);
+        return valueToStringAlloc(std.heap.c_allocator, ctx, reason);
+    }
+    return null;
+}

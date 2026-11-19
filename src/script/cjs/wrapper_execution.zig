@@ -58,6 +58,16 @@ fn callWrapper(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []
         if (result.value == null) return ActiveEngine.newUndefinedVal(ctx);
         return result.value;
     }
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        const c_api = @import("../../backend/escargot/c_api.zig");
+        const result = c_api.escargot_call_result(ctx, function, ActiveEngine.undefinedValue(), if (args.len > 0) args.ptr else null, args.len);
+        if (result.exception != null) {
+            exception_sink(ctx, result.exception);
+            if (result.value != null) ActiveEngine.freeValue(ctx, result.value);
+            return error.CallFailed;
+        }
+        return if (result.value == null) ActiveEngine.newUndefinedVal(ctx) else result.value;
+    }
     if (comptime backend.active_backend == .jsc) {
         const jsc = @import("../../backend/jsc.zig").jsc;
         const ctx_ref: jsc.JSContextRef = @ptrCast(ctx);

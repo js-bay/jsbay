@@ -45,6 +45,7 @@ pub const EscargotBackend = struct {
     pub const isFunction = value_mod.isFunction;
     pub const isConstructor = value_mod.isConstructor;
     pub const callFunctionNoArgs = value_mod.callFunctionNoArgs;
+    pub const callFunctionNoArgsObserved = value_mod.callFunctionNoArgsObserved;
     pub const getGlobalObject = value_mod.getGlobalObject;
     pub const newObject = value_mod.newObject;
     pub fn setProperty(ctx: Context, obj: Value, key: []const u8, val: Value) bool {

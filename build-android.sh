@@ -104,7 +104,7 @@ link_android_so() {
     "$clang" -shared "$objs"/*.o -Wl,-z,defs -Wl,-soname,libjsbay.so "-Wl,--version-script=$TEMP_BUILD/exports.map" -lm -ldl -o "$out"
     # Hide QuickJS C wrappers from the public ABI (names match jsbay_* but are not in public headers).
     "$NDK_BIN/llvm-objcopy" --wildcard --localize-symbol='jsbay_qjs_*' "$out"
-    (cd "$SCRIPT_DIR" && zig build tool -- check-c-abi "$out" --nm "$NDK_BIN/llvm-nm")
+    (cd "$SCRIPT_DIR" && zig build tool -- check-c-abi "$out" --nm "$NDK_BIN/llvm-nm" --zig "$(command -v zig)")
     rm -rf "$objs"
 }
 

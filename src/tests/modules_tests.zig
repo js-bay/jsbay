@@ -1837,6 +1837,7 @@ test "modules: circular lexical export visible during cycle" {
 
     const res = engine.evalModule(id, "import {y} from 'a'; globalThis.__y__ = y;", "<entry>");
     defer helpers.freeEvalResult(res);
+    if (res.err) |message| std.debug.print("circular lexical module error: {s}\n", .{message});
     try testing.expect(res.err == null);
     try testing.expectEqual(@as(i64, 42), try helpers.evalInt(id, "globalThis.__y__"));
 }

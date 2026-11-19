@@ -240,7 +240,11 @@ pub fn setErrorObserver(instance_id: i32, observer: ?ErrorObserver, userdata: ?*
             const ctx = ctxFor(instance_id) orelse return .unsupported;
             return if (backend.ActiveEngineModule.exception.setErrorObserver(ctx, instance_id, observer, userdata)) .applied else .out_of_memory;
         },
-        .jsc, .escargot => return .unsupported,
+        .jsc => return .unsupported,
+        .escargot => {
+            const ctx = ctxFor(instance_id) orelse return .unsupported;
+            return if (@import("../backend/escargot/exception.zig").setErrorObserver(ctx, instance_id, observer, userdata)) .applied else .out_of_memory;
+        },
         .hermes => {
             const ctx = ctxFor(instance_id) orelse return .unsupported;
             const exception = @import("../backend/hermes/exception.zig");

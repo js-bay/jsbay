@@ -18,7 +18,7 @@ pub fn newContext(rt: Runtime) ?Context {
 }
 
 pub fn freeContext(ctx: Context) void {
-    // Safe when destroy runs on a thread other than runtime_new's caller.
+    // Thread registration does not remove Context thread affinity; the engine frees contexts only on their creating thread.
     c_api.escargot_thread_enter();
     defer c_api.escargot_thread_leave();
     c_api.escargot_context_free(ctx);

@@ -106,6 +106,8 @@ pub const EngineInstance = struct {
     active_control_ops: usize = 0,
     /// OS thread that created the JS runtime/context. Escargot Context is affine to this thread: `delete ctx` on another thread SIGSEGVs even after threadEnter.
     js_owner_tid: std.Thread.Id = undefined,
+    error_observer: ?types.ErrorObserver = null,
+    error_observer_userdata: ?*anyopaque = null,
     /// Set only after owner (or destroyer) JS teardown has returned, not when cleanup is merely claimed.
     ///
     /// Together with `js_teardown_in_progress` this is the wait handshake: destroyers may not `allocator.destroy` the instance until cleanup finishes. This is also the anti-double-free claim after the wait.
@@ -399,6 +401,9 @@ pub fn markTeardownPending(instance_id: i32) void {
     mutex.lock();
     defer mutex.unlock();
     const inst = instances.get(instance_id) orelse return;
+    // Admission readers hold the registry mutex; owner lease release reads this flag under dispatch_mutex. Writers hold both in registry-to-dispatch order.
+    inst.dispatch_mutex.lock();
+    defer inst.dispatch_mutex.unlock();
     inst.teardown_pending = true;
 }
 
@@ -528,6 +533,13 @@ pub const testing = if (@import("builtin").is_test) struct {
             while (!self.allowed) self.cond.wait(&self.mutex);
         }
 
+        pub fn signalArrived(self: *Gate) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.arrived = true;
+            self.cond.broadcast();
+        }
+
         pub fn waitArrived(self: *Gate) error{Timeout}!void {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -547,12 +559,14 @@ pub const testing = if (@import("builtin").is_test) struct {
     pub const TeardownOverlapHook = struct {
         before_wait: Gate = .{},
         cleanup: Gate = .{},
+        entered_gate: Gate = .{},
         entered_wait: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         wait_returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
         pub fn deinit(self: *TeardownOverlapHook) void {
             self.before_wait.deinit();
             self.cleanup.deinit();
+            self.entered_gate.deinit();
         }
     };
 
@@ -566,6 +580,7 @@ pub const testing = if (@import("builtin").is_test) struct {
         if (overlap_hook) |h| {
             h.before_wait.arriveAndWait();
             h.entered_wait.store(true, .release);
+            h.entered_gate.signalArrived();
         }
     }
 

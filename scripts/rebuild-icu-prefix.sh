@@ -23,6 +23,6 @@ fi
 mkdir -p "$BUILD"
 cd "$BUILD"
 "$SRC_DIR/source/configure" --prefix="$PREFIX" --disable-samples --disable-tests
-make -j"$(nproc 2>/dev/null || echo 4)"
+make -j"${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 make install
 echo "ICU ready: $PREFIX (export JSBAY_ICU_LIB_DIR=$PREFIX/lib)"

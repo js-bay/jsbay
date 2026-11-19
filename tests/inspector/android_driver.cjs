@@ -58,6 +58,10 @@ async function main() {
     const [code, signal] = await once(test, 'close');
     assert.equal(signal, null);
     assert.equal(code, 0);
+  } catch (error) {
+    // Preserve the primary failure when bounded process cleanup also fails.
+    console.error(error.stack || error);
+    throw error;
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) {
       const exited = once(child, 'close');

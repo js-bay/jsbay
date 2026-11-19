@@ -228,7 +228,7 @@ pub fn timerCallNoArgsObserved(tag: Backend, ctx_addr: usize, callback_bytes: []
                 const E = backend.Engine(cand);
                 if (callback_bytes.len != @sizeOf(E.Value)) return null;
                 const ctx = restorePtr(E.Context, ctx_addr);
-                if (comptime backend.isQuickJsApiBackend(cand) or backend.isHermesBackend(cand)) {
+                if (comptime backend.isQuickJsApiBackend(cand) or backend.isHermesBackend(cand) or backend.isEscargotBackend(cand)) {
                     return E.callFunctionNoArgsObserved(ctx, loadValue(E, callback_bytes), instance_id);
                 }
                 return E.callFunctionNoArgs(ctx, loadValue(E, callback_bytes));
