@@ -320,6 +320,10 @@ jsbay_status_t jsbay_value_type(jsbay_value_t value, jsbay_value_kind_t *out_kin
 jsbay_status_t jsbay_value_to_bool(jsbay_value_t value, bool *out_value);
 jsbay_status_t jsbay_value_to_number(jsbay_value_t value, double *out_value);
 jsbay_status_t jsbay_value_to_utf8(jsbay_value_t value, jsbay_bytes_t *out_bytes, jsbay_value_t *out_exception);
+/* Direct zero-allocation extraction of inline SSO small strings (<= 6 bytes). Writes string bytes to out_buf if value is an SSO string; otherwise returns JSBAY_INVALID_ARGUMENT. */
+jsbay_status_t jsbay_value_to_sso_utf8(jsbay_value_t value, char out_buf[6], size_t *out_len);
+/* Construct an inline small string directly into a register without touching any engine instance or heap. Fails if len > 6 or invalid UTF-8. */
+jsbay_status_t jsbay_value_new_sso_string(const char *utf8, size_t len, jsbay_value_t *out_value);
 jsbay_status_t jsbay_value_to_json(jsbay_value_t value, jsbay_bytes_t *out_bytes, jsbay_value_t *out_exception);
 jsbay_status_t jsbay_value_copy_buffer(jsbay_value_t value, jsbay_bytes_t *out_bytes, jsbay_value_t *out_exception);
 /* Free library-owned bytes exactly once. A second free is undefined and typically aborts. */

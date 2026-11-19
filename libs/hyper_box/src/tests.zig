@@ -317,3 +317,49 @@ test "hyper_box64 rejects out-of-range SSO length and corrupt inline tags" {
     try testing.expectEqual(@as(u8, 5), valid_val.asSsoBytes().len);
     try testing.expect(valid_val.isPrimitive());
 }
+
+test "cmph matches all standard bridge atoms and rejects unknown keys" {
+    const testing = std.testing;
+
+    try testing.expectEqual(hyper_box.BridgeAtom.publish, hyper_box.matchBridgeAtom("publish").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.invoke, hyper_box.matchBridgeAtom("invoke").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.onMessage, hyper_box.matchBridgeAtom("onMessage").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.subscribe, hyper_box.matchBridgeAtom("subscribe").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.unsubscribe, hyper_box.matchBridgeAtom("unsubscribe").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.addEventListener, hyper_box.matchBridgeAtom("addEventListener").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.removeEventListener, hyper_box.matchBridgeAtom("removeEventListener").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.dispatchEvent, hyper_box.matchBridgeAtom("dispatchEvent").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.postMessage, hyper_box.matchBridgeAtom("postMessage").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.ready, hyper_box.matchBridgeAtom("ready").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.@"error", hyper_box.matchBridgeAtom("error").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.close, hyper_box.matchBridgeAtom("close").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.open, hyper_box.matchBridgeAtom("open").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.data, hyper_box.matchBridgeAtom("data").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.status, hyper_box.matchBridgeAtom("status").?);
+    try testing.expectEqual(hyper_box.BridgeAtom.init, hyper_box.matchBridgeAtom("init").?);
+
+    // Non-existent or mutated strings must return null
+    try testing.expect(hyper_box.matchBridgeAtom("unknownMethod") == null);
+    try testing.expect(hyper_box.matchBridgeAtom("publisher") == null);
+    try testing.expect(hyper_box.matchBridgeAtom("publis") == null);
+    try testing.expect(hyper_box.matchBridgeAtom("") == null);
+}
+
+test "bit_matrix routes events with hardware count trailing zeros" {
+    const testing = std.testing;
+    const BitMatrix = hyper_box.BitMatrix;
+    const BitMatrixIterator = hyper_box.BitMatrixIterator;
+
+    const active: u64 = 0b1011_0010;
+    const filter: u64 = 0b1110_0010;
+
+    // Both masks have bit 1, 5, 7 active (active & filter = 0b1010_0010)
+    try testing.expectEqual(@as(?u6, 1), BitMatrix.firstMatching(active, filter));
+    try testing.expectEqual(@as(u7, 3), BitMatrix.countMatching(active, filter));
+
+    var it = BitMatrixIterator.init(active, filter);
+    try testing.expectEqual(@as(?u6, 1), it.next());
+    try testing.expectEqual(@as(?u6, 5), it.next());
+    try testing.expectEqual(@as(?u6, 7), it.next());
+    try testing.expectEqual(@as(?u6, null), it.next());
+}

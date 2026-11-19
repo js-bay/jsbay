@@ -63,7 +63,7 @@ pub const TaskReservation = struct {
     }
 };
 pub const NativeTaskQueue = struct {
-    mutex: sync.Mutex = .{},
+    mutex: sync.Mutex align(64) = .{},
     items: std.ArrayList(NativeTask) = .empty,
     head: usize = 0,
     closed: bool = false,

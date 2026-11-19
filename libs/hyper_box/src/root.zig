@@ -3,6 +3,8 @@
 pub const hyper_box64 = @import("hyper_box64.zig");
 pub const split_box32 = @import("split_box32.zig");
 pub const generational_slot_map = @import("generational_slot_map.zig");
+pub const cmph = @import("cmph.zig");
+pub const bit_matrix = @import("bit_matrix.zig");
 
 pub const Value = hyper_box64.Value;
 pub const SplitBox32 = split_box32.SplitBox32;
@@ -11,6 +13,14 @@ pub const SsoBuffer = hyper_box64.SsoBuffer;
 pub const GenerationalSlotMap = generational_slot_map.GenerationalSlotMap;
 pub const SENTINEL_FREE = generational_slot_map.SENTINEL_FREE;
 pub const MAX_SLOTS = generational_slot_map.MAX_SLOTS;
+
+pub const ComptimeMinimalPerfectHash = cmph.ComptimeMinimalPerfectHash;
+pub const BridgeAtom = cmph.BridgeAtom;
+pub const BridgeAtomMatcher = cmph.BridgeAtomMatcher;
+pub const matchBridgeAtom = cmph.matchBridgeAtom;
+
+pub const BitMatrix = bit_matrix.BitMatrix;
+pub const BitMatrixIterator = bit_matrix.BitMatrixIterator;
 
 pub const TAG_BASE = hyper_box64.TAG_BASE;
 pub const TAG_INT32 = hyper_box64.TAG_INT32;
