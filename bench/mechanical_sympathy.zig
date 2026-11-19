@@ -51,11 +51,14 @@ fn printRow(name: []const u8, iters: u64, elapsed_ns: u64) void {
 // ---------------------------------------------------------------------------
 // 1. Direct Register-Pass Trampoline vs Heap Argument Marshalling
 // ---------------------------------------------------------------------------
-fn mockCallTarget(a0: u64, a1: u64, a2: u64, a3: u64) u64 {
+var call_fn_opaque: *const fn (u64, u64, u64, u64) u64 = &mockCallTarget;
+var call_slice_fn_opaque: *const fn ([]const u64) u64 = &mockCallTargetSlice;
+
+noinline fn mockCallTarget(a0: u64, a1: u64, a2: u64, a3: u64) u64 {
     return a0 +% a1 +% a2 +% a3;
 }
 
-fn mockCallTargetSlice(args: []const u64) u64 {
+noinline fn mockCallTargetSlice(args: []const u64) u64 {
     var sum: u64 = 0;
     for (args) |a| sum +%= a;
     return sum;
@@ -311,8 +314,10 @@ pub fn main() !void {
         const start = getNs();
         var i: u64 = 0;
         while (i < CALL_ITERS) : (i += 1) {
-            const args = [_]u64{ i, i + 1, i + 2, i + 3 };
-            dummy +%= mockCallTargetSlice(&args);
+            var v = i;
+            std.mem.doNotOptimizeAway(&v);
+            const args = [_]u64{ v, v + 1, v + 2, v + 3 };
+            dummy +%= call_slice_fn_opaque(&args);
         }
         const elapsed = getNs() - start;
         std.mem.doNotOptimizeAway(dummy);
@@ -323,7 +328,9 @@ pub fn main() !void {
         const start = getNs();
         var i: u64 = 0;
         while (i < CALL_ITERS) : (i += 1) {
-            dummy +%= mockCallTarget(i, i + 1, i + 2, i + 3);
+            var v = i;
+            std.mem.doNotOptimizeAway(&v);
+            dummy +%= call_fn_opaque(v, v + 1, v + 2, v + 3);
         }
         const elapsed = getNs() - start;
         std.mem.doNotOptimizeAway(dummy);
@@ -344,6 +351,7 @@ pub fn main() !void {
             while (k < 10) : (k += 1) {
                 const node = try page_allocator.create(MockTask);
                 node.* = .{ .id = @intCast(k), .tag = 1, .callback = 0x1234, .payload = @splat(0) };
+                std.mem.doNotOptimizeAway(node);
                 dummy +%= node.id;
                 page_allocator.destroy(node);
             }
@@ -363,6 +371,7 @@ pub fn main() !void {
             while (k < 10) : (k += 1) {
                 const node = arena.alloc(MockTask) orelse break;
                 node.* = .{ .id = @intCast(k), .tag = 1, .callback = 0x1234, .payload = @splat(0) };
+                std.mem.doNotOptimizeAway(node);
                 dummy +%= node.id;
             }
             arena.reset();
