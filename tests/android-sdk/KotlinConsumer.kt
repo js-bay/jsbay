@@ -13,6 +13,7 @@ import io.jsbay.ValueKind
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 private fun expectJsError(
     name: String,
@@ -788,4 +789,16 @@ private fun runKotlinDedicatedThreadParityTests() {
     loopDedicated.close(5_000L)
     loopThread.join(5_000)
     check(!loopThread.isAlive) { "Kotlin infinite loop thread terminated on close" }
+
+    val queuedDrainDedicated = DedicatedEngineThread.start(7108)
+    val queuedDrainResult = AtomicBoolean(false)
+    queuedDrainDedicated.post {
+        val value = queuedDrainDedicated.engine.evaluate("21 + 21", "drain.js")
+        if (value.number() == 42.0) {
+            queuedDrainResult.set(true)
+        }
+        value.close()
+    }
+    queuedDrainDedicated.close(5_000L)
+    check(queuedDrainResult.get()) { "Kotlin queued evaluations drain on close" }
 }

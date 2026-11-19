@@ -160,6 +160,20 @@ struct DedicatedEngineThreadConsumer {
     try infiniteLoopOwner.close(timeout: .seconds(5))
     _ = await loopTask.result
 
+    let queuedDrainOwner = try DedicatedEngineThread.start(id: 81_554)
+    let queuedDrainResult = LockedFlag()
+    try queuedDrainOwner.post(
+      { engine in
+        let value = try engine.evaluate("21 + 21")
+        defer { try? value.close() }
+        return try value.number()
+      },
+      completion: { result in
+        if case .success(let value) = result { queuedDrainResult.set(value == 42) }
+      })
+    try queuedDrainOwner.close(timeout: .seconds(5))
+    precondition(queuedDrainResult.get())
+
   }
 }
 

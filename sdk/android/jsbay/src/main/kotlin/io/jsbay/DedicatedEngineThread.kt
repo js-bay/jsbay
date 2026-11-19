@@ -2,6 +2,7 @@ package io.jsbay
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 open class DedicatedEngineThreadTimeoutException(
@@ -16,6 +17,8 @@ class DedicatedEngineThread private constructor(
     private val postMethod: java.lang.reflect.Method,
     private val engineRef: AtomicReference<Engine?>,
 ) : AutoCloseable {
+    private val isExecutingJob = AtomicBoolean(false)
+
     /** The live engine. Only call Engine APIs from [post] or from code already running on the owner thread. */
     val engine: Engine
         get() = engineRef.get() ?: throw JsBayException(Status.INSTANCE_NOT_FOUND)
@@ -23,7 +26,19 @@ class DedicatedEngineThread private constructor(
     /** Queues [action] on the owner thread. Returns false if the thread has already quit. */
     fun post(action: Runnable): Boolean =
         try {
-            postMethod.invoke(handler, action) as Boolean
+            val wrapped =
+                Runnable {
+                    isExecutingJob.set(true)
+                    try {
+                        action.run()
+                    } finally {
+                        isExecutingJob.set(false)
+                        engineRef.get()?.let { live ->
+                            live.clearInterrupt()
+                        }
+                    }
+                }
+            postMethod.invoke(handler, wrapped) as Boolean
         } catch (_: ReflectiveOperationException) {
             false
         }
@@ -87,6 +102,7 @@ class DedicatedEngineThread private constructor(
         val done = CountDownLatch(1)
         val error = AtomicReference<Throwable?>(null)
         val destroyed = AtomicReference(false)
+        val isBusy = isExecutingJob.get()
         val posted =
             post {
                 try {
@@ -108,10 +124,12 @@ class DedicatedEngineThread private constructor(
             // call Native.destroy from a foreign thread.
             throw JsBayException(Status.INSTANCE_NOT_FOUND)
         }
-        // Cancel the running execution generation so an infinite JS loop does not prevent the Looper from dispatching the destroy task.
-        current.cancel()
+        if (isBusy) {
+            current.requestInterrupt()
+        }
         if (!done.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
-            // Timed out waiting for owner destroy; leave engineRef intact so the native id is not orphaned from Kotlin's view.
+            // Timed out waiting for owner destroy; cancel execution so stuck loops do not spin indefinitely.
+            current.cancel()
             throw DedicatedEngineThreadTimeoutException("Timed out waiting for dedicated engine thread shutdown")
         }
         error.get()?.let { throw it }

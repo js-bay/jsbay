@@ -51,8 +51,10 @@ if env -i PATH="$tmp/bin:/usr/bin:/bin" HOS_SDK_HOME="$tmp/missing" DEVECO_HOME=
 if env -i PATH="$tmp/bin:/usr/bin:/bin" OHOS_BASE_SDK_HOME="$tmp/missing" DEVECO_HOME="$tmp/DevEco.app" bash -c 'source "$1"; harmony_toolchain_resolve' _ "$resolver" 2>/dev/null; then fail 'invalid OHOS_BASE_SDK_HOME must fail rather than fall back'; fi
 if env -i PATH="$tmp/bin:/usr/bin:/bin" DEVECO_HOME="$tmp/missing" bash -c 'source "$1"; harmony_toolchain_resolve' _ "$resolver" 2>/dev/null; then fail 'invalid DEVECO_HOME must fail rather than use a default installation'; fi
 if env -i PATH="$tmp/bin:/usr/bin:/bin" DEVECO_SDK_HOME="$tmp/Explicit SDK" HVIGORW="$tmp/missing" bash -c 'source "$1"; harmony_toolchain_resolve' _ "$resolver" 2>/dev/null; then fail 'invalid executable override must fail'; fi
-unconfigured_output=$(/bin/bash -c 'set -euo pipefail; source "$1"; harmony_toolchain_resolve' _ "$resolver" 2>&1 || true)
-[[ $unconfigured_output == *"Harmony SDK not found"* ]] || fail "unconfigured environment must report missing SDK cleanly, got: $unconfigured_output"
+if [[ ! -d /Applications/DevEco-Studio.app/Contents/sdk ]]; then
+  unconfigured_output=$(env -i PATH="$tmp/bin:/usr/bin:/bin" /bin/bash -c 'set -euo pipefail; source "$1"; harmony_toolchain_resolve' _ "$resolver" 2>&1 || true)
+  [[ $unconfigured_output == *"Harmony SDK not found; set"* ]] || fail "unconfigured environment must report missing SDK cleanly, got: $unconfigured_output"
+fi
 touch "$tmp/sentinel"
 env -i PATH="$tmp/bin:/usr/bin:/bin" HOS_SDK_HOME="$tmp/SDK with spaces/default/openharmony" bash -c 'source "$1"; harmony_toolchain_resolve' _ "$resolver" || fail 'valid HOS_SDK_HOME resolver call'
 [[ -f "$tmp/sentinel" ]] || fail 'resolver changed unrelated files'

@@ -454,8 +454,7 @@ fn armJscWatchdogShortLimit(instance_id: i32, millis: u64) void {
 /// Deadlines expire automatically when monotonic time passes `now + millis` and do not leave a sticky interrupt flag.
 /// Setting a non-zero time limit establishes a new execution window and automatically clears any stale user interrupt flag.
 ///
-/// Enforcement precision varies by backend: QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops);
-/// JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at min(remaining, 50ms) intervals (clamped to >= 5ms).
+/// Enforcement precision varies by backend: QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops); JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at min(remaining, 50ms) intervals (clamped to >= 5ms).
 pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
@@ -469,8 +468,7 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     // Saturate instead of wrapping: an absurdly large `millis` must mean "effectively no deadline", never wrap to an already-expired one.
     const deadline = std.math.add(u64, now, millis) catch std.math.maxInt(u64);
     p.store(deadline, .monotonic);
-    // Setting a fresh execution time limit establishes a new execution window;
-    // clear any stale user interrupt flag so the upcoming execution is not prematurely aborted.
+    // Setting a fresh execution time limit establishes a new execution window; clear any stale user interrupt flag so the upcoming execution is not prematurely aborted.
     const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
     target_ptr.store(0, .monotonic);
     const req_ptr: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);

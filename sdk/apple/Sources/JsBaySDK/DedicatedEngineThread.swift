@@ -157,6 +157,7 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
   private var keepAliveSource: CFRunLoopSource?
   private var jobs: [Job] = []
   private var drainScheduled = false
+  private var isExecutingJob = false
   private var shutdownError: Error?
   private var shutdownCompleted = false
   private var thread: Thread!
@@ -269,25 +270,33 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
       state = .closing
       let currentEngine = engine
       let loop = runLoop
+      let isBusy = isExecutingJob
       jobs.append { [weak self] _ in self?.finishShutdown() }
       scheduleDrainLocked(on: loop)
       lock.unlock()
       if Thread.current === thread {
         return
       }
-      _ = currentEngine?.cancel()
+      if isBusy {
+        _ = currentEngine?.requestInterrupt()
+      }
       if shutdown.wait(timeout: .now() + timeout) == .timedOut {
+        _ = currentEngine?.cancel()
         throw DedicatedEngineThreadError.timeout
       }
       try throwShutdownErrorIfPresent()
     case .closing:
       let currentEngine = engine
+      let isBusy = isExecutingJob
       lock.unlock()
       if Thread.current === thread {
         return
       }
-      _ = currentEngine?.cancel()
+      if isBusy {
+        _ = currentEngine?.requestInterrupt()
+      }
       if shutdown.wait(timeout: .now() + timeout) == .timedOut {
+        _ = currentEngine?.cancel()
         throw DedicatedEngineThreadError.timeout
       }
       try throwShutdownErrorIfPresent()
@@ -331,8 +340,15 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
       }
       let job = jobs.removeFirst()
       let currentEngine = engine
+      isExecutingJob = true
       lock.unlock()
       job(currentEngine)
+      lock.lock()
+      isExecutingJob = false
+      if case .closing = state {
+        _ = try? currentEngine?.clearInterrupt()
+      }
+      lock.unlock()
     }
   }
 
