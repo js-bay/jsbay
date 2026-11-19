@@ -138,9 +138,8 @@ pub const FrameArena = struct {
         const self: *FrameArena = @ptrCast(@alignCast(ctx));
         const align_size = @as(usize, 1) << @intCast(ptr_align);
         const aligned = std.mem.alignForward(usize, self.offset, align_size);
-        const end = aligned + len;
-        if (end > BUFFER_CAP) return null;
-        self.offset = end;
+        if (aligned > BUFFER_CAP or len > BUFFER_CAP - aligned) return null;
+        self.offset = aligned + len;
         return @ptrCast(&self.buffer[aligned]);
     }
 
