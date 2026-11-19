@@ -1,0 +1,30 @@
+name: Install pinned OpenHarmony API 12 SDK
+description: Download and verify the official OpenHarmony SDK archive
+outputs:
+  ohos-base-sdk-home:
+    description: Path containing the OpenHarmony SDK components
+    value: ${{ steps.install.outputs.sdk-home }}
+  api-version:
+    description: API version of the installed native SDK
+    value: ${{ steps.install.outputs.api-version }}
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      run: |
+        set -euo pipefail
+        sdk_root="$RUNNER_TEMP/openharmony-sdk"
+        mkdir -p "$sdk_root"
+        curl --fail --location --retry 3 --output "$sdk_root/sdk.tar.gz" https://repo.huaweicloud.com/openharmony/os/5.0.0-Release/ohos-sdk-windows_linux-public.tar.gz
+        printf '%s  %s\n' 'f06a2a8ae38a3cf01c583557f5a4bb1e6e3626df975599aa71f4a59e9af70ecc' "$sdk_root/sdk.tar.gz" | sha256sum -c -
+        tar -xf "$sdk_root/sdk.tar.gz" -C "$sdk_root"
+        cd "$sdk_root/linux"
+        for component in ./*.zip; do unzip -q "$component"; done
+        api_version=$(jq -r .apiVersion native/oh-uni-package.json)
+        test "$api_version" = 12
+        echo "sdk-home=$PWD" >> "$GITHUB_OUTPUT"
+        echo "api-version=$api_version" >> "$GITHUB_OUTPUT"
+        echo "OHOS_BASE_SDK_HOME=$PWD" >> "$GITHUB_ENV"
+        echo "OHOS_NDK_HOME=$PWD" >> "$GITHUB_ENV"
+        echo "OHOS_SDK_NATIVE=$PWD/native" >> "$GITHUB_ENV"
