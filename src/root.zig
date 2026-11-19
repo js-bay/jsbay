@@ -86,7 +86,9 @@ pub const async_bridge = @import("runtime/async_bridge.zig");
 // Branchless bit-matrix router using hardware ctz instructions for single-cycle dispatch.
 pub const bit_matrix = @import("runtime/bit_matrix.zig");
 // Compile-time minimal perfect hash generator for static string dictionaries.
-pub const cmph = @import("abi/cmph.zig");
+pub const cmph = @import("cmph");
+// SIMD-accelerated Unicode transcoding and validation.
+pub const simd_utf = @import("simd_utf");
 /// Stable Zig access to the installed typed C ABI.  Keep implementation-only helpers in c_api.zig private to the package: importing this module must not expose test-only string-evaluation or fault-injection helpers.
 pub const c_api = struct {
     pub const Utf8 = c_api_impl.Utf8;

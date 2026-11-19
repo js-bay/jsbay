@@ -1,0 +1,8 @@
+.{
+    .name = .simd_utf,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0xafdd40f566f4364f,
+    .dependencies = .{},
+    .paths = .{ "LICENSE", "readme.md", "build.zig", "build.zig.zon", "src" },
+}

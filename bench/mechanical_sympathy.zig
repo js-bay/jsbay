@@ -14,8 +14,9 @@
 
 const std = @import("std");
 const hyper_box = @import("hyper_box");
+const cmph = @import("cmph");
+const simd_utf = @import("simd_utf");
 const jsbay = @import("jsbay");
-const cmph = jsbay.cmph;
 const bit_matrix = jsbay.bit_matrix;
 const HyperValue = hyper_box.Value;
 const GenerationalSlotMap = hyper_box.GenerationalSlotMap;
@@ -195,31 +196,7 @@ fn transcodeScalar(src: []const u8, dst: []u16) usize {
 }
 
 fn transcodeVectorized(src: []const u8, dst: []u16) usize {
-    var i: usize = 0;
-    var out_i: usize = 0;
-    const VEC_SIZE = 16;
-    const ascii_mask: @Vector(VEC_SIZE, u8) = @splat(0x80);
-
-    while (i + VEC_SIZE <= src.len and out_i + VEC_SIZE <= dst.len) {
-        const chunk: @Vector(VEC_SIZE, u8) = src[i..][0..VEC_SIZE].*;
-        const is_ascii = @reduce(.And, chunk < ascii_mask);
-        if (is_ascii) {
-            const widened: @Vector(VEC_SIZE, u16) = chunk;
-            dst[out_i..][0..VEC_SIZE].* = widened;
-            i += VEC_SIZE;
-            out_i += VEC_SIZE;
-        } else {
-            dst[out_i] = src[i];
-            i += 1;
-            out_i += 1;
-        }
-    }
-    while (i < src.len and out_i < dst.len) {
-        dst[out_i] = src[i];
-        i += 1;
-        out_i += 1;
-    }
-    return out_i;
+    return simd_utf.transcodeUtf8ToUtf16(dst, src) catch 0;
 }
 
 // ---------------------------------------------------------------------------

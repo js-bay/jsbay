@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const sync = @import("zev");
+const simd_utf = @import("simd_utf");
 
 pub const jsc = @import("jsc_c.zig");
 
@@ -62,33 +63,9 @@ pub fn instanceIdFromCtx(ctx: jsc.JSGlobalContextRef) i32 {
 //
 // These are file-level helpers used by every other submodule. They are also re-exported via `JscBackend.{jsStringFromSlice, valueToString, jsonStringify, jsonParse, formatException}` so external call sites such as cjs.zig keep working unchanged.
 
-// Vectorized ASCII transcode: zero-extends 16 ASCII bytes at a time, falling back to standard UTF-8 decoding for multibyte sequences.
+// Vectorized ASCII transcode: delegates to simd_utf package.
 fn fastUtf8ToUtf16(dst: []jsc.JSChar, src: []const u8) !usize {
-    var i: usize = 0;
-    var out_i: usize = 0;
-    const VEC_SIZE = 16;
-    const ascii_mask: @Vector(VEC_SIZE, u8) = @splat(0x80);
-
-    while (i + VEC_SIZE <= src.len and out_i + VEC_SIZE <= dst.len) {
-        const chunk: @Vector(VEC_SIZE, u8) = src[i..][0..VEC_SIZE].*;
-        if (@reduce(.And, chunk < ascii_mask)) {
-            const widened: @Vector(VEC_SIZE, u16) = chunk;
-            dst[out_i..][0..VEC_SIZE].* = @bitCast(widened);
-            i += VEC_SIZE;
-            out_i += VEC_SIZE;
-        } else {
-            const seq_len = try std.unicode.utf8ByteSequenceLength(src[i]);
-            if (i + seq_len > src.len) return error.Utf8InvalidStartByte;
-            const written = try std.unicode.utf8ToUtf16Le(dst[out_i..], src[i .. i + seq_len]);
-            i += seq_len;
-            out_i += written;
-        }
-    }
-    if (i < src.len) {
-        const rem = try std.unicode.utf8ToUtf16Le(dst[out_i..], src[i..]);
-        out_i += rem;
-    }
-    return out_i;
+    return simd_utf.transcodeUtf8ToUtf16(dst, src);
 }
 
 pub fn jsStringFromSlice(s: []const u8) jsc.JSStringRef {

@@ -1,7 +1,7 @@
 //! Host bridge protocol atoms with compile-time minimal perfect hash dispatch.
 
 const std = @import("std");
-const cmph = @import("cmph.zig");
+const cmph = @import("cmph");
 
 /// Standard host bridge atoms recognized in high-frequency event routing.
 pub const BridgeAtom = enum(u4) {
