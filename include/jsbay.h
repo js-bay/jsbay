@@ -185,7 +185,7 @@ jsbay_status_t jsbay_engine_with_value_scope(int instance_id, jsbay_value_scope_
 bool jsbay_engine_request_interrupt(int instance_id);
 bool jsbay_engine_clear_interrupt(int instance_id);
 bool jsbay_engine_cancel(int instance_id, uint64_t generation);
-/* Shared deadline: now + millis; 0 disables. VM entries do not refresh it. */
+/* Shared deadline: now + millis; 0 disables. VM entries do not refresh it. Setting a non-zero time limit establishes a new execution window and automatically clears pending user-interrupt requests. Explicit jsbay_engine_clear_interrupt is also available to clear pending user interrupts on the owner thread. QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops); JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at min(remaining, 50ms) intervals (clamped to >= 5ms). */
 bool jsbay_engine_set_execution_time_limit(int instance_id, uint64_t millis);
 /* Fresh outer-entry budget; 0 disables. The earliest active deadline wins. */
 bool jsbay_engine_set_execution_budget(int instance_id, uint64_t millis);

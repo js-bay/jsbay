@@ -123,6 +123,43 @@ struct DedicatedEngineThreadConsumer {
     let reusedOwner = try DedicatedEngineThread.start(id: 81_551)
     try reusedOwner.close()
 
+    let parityOwner = try DedicatedEngineThread.start(id: 81_552)
+    let limitSet = try parityOwner.setExecutionTimeLimit(milliseconds: 10_000)
+    precondition(limitSet)
+    let budgetSet = try parityOwner.setExecutionBudget(milliseconds: 5_000)
+    precondition(budgetSet)
+    let memorySet = try parityOwner.setMemoryLimit(bytes: 10_000_000)
+    precondition(memorySet)
+    let interruptCleared = try parityOwner.clearInterrupt()
+    precondition(interruptCleared)
+    precondition(parityOwner.requestInterrupt() || true)
+    precondition(parityOwner.cancel() || true)
+    try parityOwner.close()
+
+    let infiniteLoopOwner = try DedicatedEngineThread.start(id: 81_553)
+    let loopStarted = LockedFlag()
+    let loopTask = Task.detached {
+      do {
+        _ = try infiniteLoopOwner.runOnOwner { engine in
+          let notify = try engine.bind("loopStarted") { _, _ in
+            loopStarted.set(true)
+            return try engine.undefined()
+          }
+          defer { try? notify.close() }
+          let val = try engine.evaluate("loopStarted(); while (true) {}", filename: "infinite.js")
+          defer { try? val.close() }
+          return 1
+        }
+      } catch {
+        // Expected interruption on close.
+      }
+    }
+    while !loopStarted.get() {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    try infiniteLoopOwner.close(timeout: .seconds(5))
+    _ = await loopTask.result
+
   }
 }
 

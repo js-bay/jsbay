@@ -1584,7 +1584,7 @@ pub export fn jsbay_engine_clear_interrupt(instance_id: c_int) bool {
     return runtime_control.clearInterrupt(@intCast(instance_id));
 }
 
-/// Arm a relative execution limit without blocking the caller. Zero disables the limit. The backend interrupt handler owns enforcement.
+/// Arm a relative execution limit without blocking the caller. Zero disables the limit. Deadlines expire automatically and do not latch a sticky interrupt flag, unlike request_interrupt. The backend interrupt handler owns enforcement.
 pub export fn jsbay_engine_set_execution_time_limit(instance_id: c_int, millis: u64) bool {
     const id: i32 = @intCast(instance_id);
     if (!api_value.isOwner(id)) return false;

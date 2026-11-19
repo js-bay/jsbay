@@ -54,6 +54,10 @@ pub const InterruptState = extern struct {
     budget_depth: usize = 0,
     shutdown_deadline_ms: u64 = 0,
     shutdown_phase: ShutdownPhase = .open,
+    /// Execution epoch: even = idle, odd = running.
+    exec_epoch: u64 = 0,
+    /// Monotonic target epoch for user interrupts (via fetchMax).
+    interrupt_target: u64 = 0,
 };
 
 // ---- Module-global state registry --------------------------------------------
@@ -98,6 +102,8 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
         .budget_millis = 0,
         .budget_deadline_ms = 0,
         .budget_depth = 0,
+        .exec_epoch = 0,
+        .interrupt_target = 0,
     };
 
     registry_mutex.lock();
@@ -274,6 +280,11 @@ pub fn requestInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    const epoch_ptr: *std.atomic.Value(u64) = @ptrCast(&state.exec_epoch);
+    const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
+    const cur_epoch = epoch_ptr.load(.monotonic);
+    const target_epoch = if (cur_epoch % 2 == 1) cur_epoch else cur_epoch + 1;
+    _ = target_ptr.fetchMax(target_epoch, .monotonic);
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchOr(1, .monotonic);
     return true;
@@ -286,6 +297,8 @@ pub fn clearInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
+    target_ptr.store(0, .monotonic);
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchAnd(~@as(u8, 1), .monotonic);
     registry_mutex.unlock();
@@ -408,9 +421,41 @@ pub fn clearStopInterrupt(instance_id: i32) bool {
     return true;
 }
 
+fn armJscWatchdogShortLimit(instance_id: i32, millis: u64) void {
+    if (comptime !(backend.active_backend == .jsc or backend.isPacked(.jsc))) return;
+    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    defer lease.end();
+    const inst = lease.inst;
+    const jsc_mod = @import("../backend/jsc.zig");
+
+    registry_mutex.lock();
+    const state = registry.get(instance_id);
+    registry_mutex.unlock();
+    const interrupt_state = state orelse return;
+
+    const period_sec = @as(f64, @floatFromInt(millis)) / 1000.0;
+    switch (inst.engine_handles) {
+        .mono => |m| if (backend.active_backend == .jsc) {
+            const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(interrupt_state);
+            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
+            jsc_mod.jscArmWatchdogPeriod(group, jsc_state, period_sec);
+        },
+        .packed_alt => |a| if (a.tag == .jsc) {
+            const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(interrupt_state);
+            const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
+            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
+            jsc_mod.jscArmWatchdogPeriod(group, jsc_state, period_sec);
+        },
+    }
+}
+
 /// Set an execution time limit in milliseconds. Passing 0 disables the limit. Thread-safe. Returns false if not initialized.
 ///
-/// The deadline is computed at call time — any script that finishes before `now + millis` elapses is unaffected. Scripts still running after the deadline are interrupted on the next interrupt check (QJS: typically within a few hundred bytecode instructions; JSC: within ~50ms).
+/// Deadlines expire automatically when monotonic time passes `now + millis` and do not leave a sticky interrupt flag.
+/// Setting a non-zero time limit establishes a new execution window and automatically clears any stale user interrupt flag.
+///
+/// Enforcement precision varies by backend: QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops);
+/// JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at min(remaining, 50ms) intervals (clamped to >= 5ms).
 pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
@@ -424,7 +469,12 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     // Saturate instead of wrapping: an absurdly large `millis` must mean "effectively no deadline", never wrap to an already-expired one.
     const deadline = std.math.add(u64, now, millis) catch std.math.maxInt(u64);
     p.store(deadline, .monotonic);
-    // Hermes: do not arm IHermes watchTimeLimit here — an expired watch stays sticky and poisons later evals. Deadlines are enforced at job/sync wait boundaries via deadline_ms; mid-script cancel uses requestStopInterrupt → asyncTriggerTimeout.
+    // Setting a fresh execution time limit establishes a new execution window;
+    // clear any stale user interrupt flag so the upcoming execution is not prematurely aborted.
+    const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
+    target_ptr.store(0, .monotonic);
+    const req_ptr: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+    _ = req_ptr.fetchAnd(~@as(u8, 1), .monotonic);
     return true;
 }
 
@@ -434,21 +484,43 @@ pub fn setExecutionBudget(instance_id: i32, millis: u64) bool {
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
     state.budget_millis = millis;
+    if (millis != 0) {
+        const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
+        target_ptr.store(0, .monotonic);
+        const req_ptr: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+        _ = req_ptr.fetchAnd(~@as(u8, 1), .monotonic);
+    }
     return true;
 }
 
 /// Nested VM entries retain the first deadline so a callback cannot extend its caller's budget.
 pub fn beginExecutionBudget(instance_id: i32) bool {
     registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const state = registry.get(instance_id) orelse return false;
-    if (state.budget_depth == 0 and state.budget_millis != 0) {
-        const now: u64 = @intCast(io.monotonicMilliseconds());
-        const deadline: u64 = std.math.add(u64, now, state.budget_millis) catch std.math.maxInt(u64);
-        const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
-        deadline_ptr.store(deadline, .monotonic);
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
+    var short_budget_millis: u64 = 0;
+    if (state.budget_depth == 0) {
+        const epoch_ptr: *std.atomic.Value(u64) = @ptrCast(&state.exec_epoch);
+        const cur = epoch_ptr.load(.monotonic);
+        const next_odd = if (cur % 2 == 0) cur + 1 else cur + 2;
+        epoch_ptr.store(next_odd, .monotonic);
+
+        if (state.budget_millis != 0) {
+            const now: u64 = @intCast(io.monotonicMilliseconds());
+            const deadline: u64 = std.math.add(u64, now, state.budget_millis) catch std.math.maxInt(u64);
+            const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
+            deadline_ptr.store(deadline, .monotonic);
+            if (state.budget_millis < 50) short_budget_millis = state.budget_millis;
+        }
     }
     state.budget_depth += 1;
+    registry_mutex.unlock();
+
+    if (short_budget_millis != 0) {
+        armJscWatchdogShortLimit(instance_id, short_budget_millis);
+    }
     return true;
 }
 
@@ -459,6 +531,11 @@ pub fn endExecutionBudget(instance_id: i32) void {
     std.debug.assert(state.budget_depth != 0);
     state.budget_depth -= 1;
     if (state.budget_depth == 0) {
+        const epoch_ptr: *std.atomic.Value(u64) = @ptrCast(&state.exec_epoch);
+        const cur = epoch_ptr.load(.monotonic);
+        const next_even = if (cur % 2 == 1) cur + 1 else cur + 2;
+        epoch_ptr.store(next_even, .monotonic);
+
         const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
         deadline_ptr.store(0, .monotonic);
     }

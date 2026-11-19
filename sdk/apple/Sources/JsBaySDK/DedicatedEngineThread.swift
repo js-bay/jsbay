@@ -1,8 +1,9 @@
 import CoreFoundation
 import Foundation
 
-public enum DedicatedEngineThreadError: Error {
+public enum DedicatedEngineThreadError: Error, Equatable {
   case closed
+  case timeout
   case javascript(JsExceptionDetails)
 }
 
@@ -88,7 +89,48 @@ public final class DedicatedEngineThread: @unchecked Sendable {
     try worker.post(operation, completion: completion)
   }
 
-  public func close() throws { try worker.close() }
+  /// Requests asynchronous interruption of JavaScript execution on the dedicated thread. Safe to call from any thread.
+  public func requestInterrupt() -> Bool {
+    worker.requestInterrupt()
+  }
+
+  /// Cancels execution on the dedicated thread. Safe to call from any thread.
+  public func cancel() -> Bool {
+    worker.cancel()
+  }
+
+  /// Clears a previously requested user interrupt before executing more JavaScript.
+  @discardableResult public func clearInterrupt() throws -> Bool {
+    try runOnOwner { engine in
+      try engine.clearInterrupt()
+    }
+  }
+
+  /// Sets an execution time limit in milliseconds for upcoming work on the dedicated thread.
+  @discardableResult public func setExecutionTimeLimit(milliseconds: UInt64) throws -> Bool {
+    try runOnOwner { engine in
+      try engine.setExecutionTimeLimit(milliseconds: milliseconds)
+    }
+  }
+
+  /// Configures an execution budget in milliseconds applied to each outer evaluation.
+  @discardableResult public func setExecutionBudget(milliseconds: UInt64) throws -> Bool {
+    try runOnOwner { engine in
+      try engine.setExecutionBudget(milliseconds: milliseconds)
+    }
+  }
+
+  /// Configures the memory allocation limit in bytes.
+  @discardableResult public func setMemoryLimit(bytes: UInt64) throws -> Bool {
+    try runOnOwner { engine in
+      try engine.setMemoryLimit(bytes: bytes)
+    }
+  }
+
+  /// Stops accepting work, runs previously queued tasks, closes the Engine, and stops its run loop. Calling close from an owner-thread task schedules shutdown after work already in the queue and returns immediately.
+  public func close(timeout: DispatchTimeInterval = .seconds(30)) throws {
+    try worker.close(timeout: timeout)
+  }
 
   deinit { try? worker.close() }
 }
@@ -198,42 +240,63 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
     }
   }
 
+  func requestInterrupt() -> Bool {
+    lock.lock()
+    let currentEngine = engine
+    lock.unlock()
+    return currentEngine?.requestInterrupt() ?? false
+  }
+
+  func cancel() -> Bool {
+    lock.lock()
+    let currentEngine = engine
+    lock.unlock()
+    return currentEngine?.cancel() ?? false
+  }
+
   /// Stops accepting work, runs previously queued tasks, closes the Engine, and stops its run loop. Calling close from an owner-thread task schedules shutdown after work already in the queue and returns immediately.
-  func close() throws {
+  func close(timeout: DispatchTimeInterval = .seconds(30)) throws {
     lock.lock()
     switch state {
     case .starting:
       lock.unlock()
-      started.wait()
-      try close()
+      if started.wait(timeout: .now() + timeout) == .timedOut {
+        throw DedicatedEngineThreadError.timeout
+      }
+      try close(timeout: timeout)
       return
     case .running:
       state = .closing
-      if Thread.current === thread {
-        let loop = runLoop
-        jobs.append { [weak self] _ in self?.finishShutdown() }
-        scheduleDrainLocked(on: loop)
-        lock.unlock()
-        return
-      }
+      let currentEngine = engine
       let loop = runLoop
       jobs.append { [weak self] _ in self?.finishShutdown() }
       scheduleDrainLocked(on: loop)
       lock.unlock()
-      shutdown.wait()
-      try throwShutdownErrorIfPresent()
-    case .closing:
       if Thread.current === thread {
-        lock.unlock()
         return
       }
+      _ = currentEngine?.cancel()
+      if shutdown.wait(timeout: .now() + timeout) == .timedOut {
+        throw DedicatedEngineThreadError.timeout
+      }
+      try throwShutdownErrorIfPresent()
+    case .closing:
+      let currentEngine = engine
       lock.unlock()
-      shutdown.wait()
+      if Thread.current === thread {
+        return
+      }
+      _ = currentEngine?.cancel()
+      if shutdown.wait(timeout: .now() + timeout) == .timedOut {
+        throw DedicatedEngineThreadError.timeout
+      }
       try throwShutdownErrorIfPresent()
     case .closed:
       lock.unlock()
       if Thread.current === thread { return }
-      shutdown.wait()
+      if shutdown.wait(timeout: .now() + timeout) == .timedOut {
+        throw DedicatedEngineThreadError.timeout
+      }
       try throwShutdownErrorIfPresent()
     }
   }
@@ -274,18 +337,24 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
   }
 
   private func finishShutdown() {
-    var closeError: Error?
-    do { try engine?.close() } catch { closeError = error }
-    engine = nil
     lock.lock()
+    let currentEngine = engine
+    engine = nil
     state = .closed
-    shutdownError = closeError
     let loop = runLoop
     let source = keepAliveSource
     keepAliveSource = nil
     let pending = jobs
     jobs.removeAll(keepingCapacity: false)
     lock.unlock()
+
+    var closeError: Error?
+    do { try currentEngine?.close() } catch { closeError = error }
+
+    lock.lock()
+    shutdownError = closeError
+    lock.unlock()
+
     if let loop, let source {
       CFRunLoopRemoveSource(loop, source, CFRunLoopMode.defaultMode)
       CFRunLoopSourceInvalidate(source)
@@ -306,7 +375,8 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
     do {
       return DedicatedEngineThreadError.javascript(try exception.detailsAndClose())
     } catch {
-      return error
+      try? exception.value.close()
+      return DedicatedEngineThreadError.closed
     }
   }
 
@@ -366,14 +436,19 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
     CFRunLoopRun()
 
     var loopCloseError: Error?
-    if let engine {
-      do { try engine.close() } catch { loopCloseError = error }
-      self.engine = nil
-      if let source = keepAliveSource {
-        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, CFRunLoopMode.defaultMode)
-        CFRunLoopSourceInvalidate(source)
-        keepAliveSource = nil
-      }
+    lock.lock()
+    let lingeringEngine = engine
+    engine = nil
+    let lingeringSource = keepAliveSource
+    keepAliveSource = nil
+    lock.unlock()
+
+    if let lingeringEngine {
+      do { try lingeringEngine.close() } catch { loopCloseError = error }
+    }
+    if let lingeringSource {
+      CFRunLoopRemoveSource(CFRunLoopGetCurrent(), lingeringSource, CFRunLoopMode.defaultMode)
+      CFRunLoopSourceInvalidate(lingeringSource)
     }
     lock.lock()
     state = .closed

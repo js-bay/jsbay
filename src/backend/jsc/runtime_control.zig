@@ -36,6 +36,8 @@ pub const JscInterruptState = extern struct {
     budget_depth: usize = 0,
     shutdown_deadline_ms: u64 = 0,
     shutdown_phase: c_int = 0,
+    exec_epoch: u64 = 0,
+    interrupt_target: u64 = 0,
 };
 
 /// Trampoline for the execution-time-limit watchdog. Explicitly re-arm after a false return so the next interrupt check does not depend on framework-specific callback repetition.
@@ -43,20 +45,35 @@ fn jscShouldTerminate(ctx: jsc.JSContextRef, context: ?*anyopaque) callconv(.c) 
     const state_ptr = context orelse return false;
     const state: *JscInterruptState = @ptrCast(@alignCast(state_ptr));
 
+    const shutdown_ptr: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
+    const now: u64 = @intCast(io.monotonicMilliseconds());
+    const shutdown_deadline = shutdown_ptr.load(.monotonic);
+    if (shutdown_deadline != 0 and now >= shutdown_deadline) return true;
+
     const req_ptr: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     if (req_ptr.load(.monotonic) != 0) return true;
 
     const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     const budget_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
-    const shutdown_ptr: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
-    const now: u64 = @intCast(io.monotonicMilliseconds());
     const deadline = deadline_ptr.load(.monotonic);
     const budget_deadline = budget_ptr.load(.monotonic);
-    const shutdown_deadline = shutdown_ptr.load(.monotonic);
-    if ((deadline != 0 and now >= deadline) or (budget_deadline != 0 and now >= budget_deadline) or (shutdown_deadline != 0 and now >= shutdown_deadline)) return true;
-    // Keep the installation interval so an interrupt requested after this check is observed by the next callback.
+    if ((deadline != 0 and now >= deadline) or (budget_deadline != 0 and now >= budget_deadline)) return true;
+
+    // Dynamically adjust watchdog period if an active deadline is sooner than the default 50ms interval.
+    var next_period: f64 = watchdog_period_seconds;
+    var earliest: u64 = std.math.maxInt(u64);
+    if (deadline != 0 and deadline < earliest) earliest = deadline;
+    if (budget_deadline != 0 and budget_deadline < earliest) earliest = budget_deadline;
+    if (shutdown_deadline != 0 and shutdown_deadline < earliest) earliest = shutdown_deadline;
+    if (earliest != std.math.maxInt(u64) and earliest > now) {
+        const remaining_sec = @as(f64, @floatFromInt(earliest - now)) / 1000.0;
+        if (remaining_sec < next_period) {
+            next_period = @max(remaining_sec, 0.005);
+        }
+    }
+
     const group = jsc.JSContextGetGroup(ctx);
-    JSContextGroupSetExecutionTimeLimit(group, watchdog_period_seconds, jscShouldTerminate, context);
+    JSContextGroupSetExecutionTimeLimit(group, next_period, jscShouldTerminate, context);
 
     if (state.instance_id >= 0) {
         if (@import("../../inspector/sample_hook.zig").load()) |hook| hook(state.instance_id);
@@ -70,6 +87,16 @@ pub fn jscInstallInterruptHandler(
     state: *JscInterruptState,
 ) void {
     JSContextGroupSetExecutionTimeLimit(group, watchdog_period_seconds, jscShouldTerminate, @ptrCast(state));
+}
+
+/// Re-arm the JSC watchdog timer with a custom period (in seconds), clamped to at least 5ms.
+pub fn jscArmWatchdogPeriod(
+    group: jsc.JSContextGroupRef,
+    state: *JscInterruptState,
+    period_seconds: f64,
+) void {
+    const clamped = @max(period_seconds, 0.005);
+    JSContextGroupSetExecutionTimeLimit(group, clamped, jscShouldTerminate, @ptrCast(state));
 }
 
 /// Remove the JSC execution-time-limit callback.  Call before freeing `state`.

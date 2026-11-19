@@ -1120,16 +1120,19 @@ public final class Engine {
     guard isOpen, Engine.live[id]?.value === self else { return false }
     return jsbay_engine_is_suspended(id)
   }
+  /// Requests asynchronous interruption of JavaScript execution. Thread-safe. Latches a persistent user-interrupt flag that must be cleared via clearInterrupt before executing subsequent scripts.
   public func requestInterrupt() -> Bool {
     Engine.liveLock.lock()
     defer { Engine.liveLock.unlock() }
     guard isOpen, Engine.live[id]?.value === self else { return false }
     return jsbay_engine_request_interrupt(id)
   }
+  /// Clears a previously requested user interrupt before executing more JavaScript.
   public func clearInterrupt() throws -> Bool {
     try requireOpen()
     return jsbay_engine_clear_interrupt(id)
   }
+  /// Arms a relative execution limit in milliseconds without blocking. Zero disables the limit. Deadlines expire automatically and do not latch a persistent interrupt flag.
   public func setExecutionTimeLimit(milliseconds: UInt64) throws -> Bool {
     try requireOpen()
     return jsbay_engine_set_execution_time_limit(id, milliseconds)

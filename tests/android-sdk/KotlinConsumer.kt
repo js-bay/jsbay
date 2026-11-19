@@ -748,4 +748,44 @@ private fun runKotlinSubmissionOperations() {
             }
         }
     }
+    runKotlinDedicatedThreadParityTests()
+}
+
+private fun runKotlinDedicatedThreadParityTests() {
+    DedicatedEngineThread.start(7106).use { dedicated ->
+        val nestedResult =
+            dedicated.runOnOwner { engine1 ->
+                dedicated.runOnOwner { engine2 ->
+                    check(engine1.id == engine2.id)
+                    "nested-ok"
+                }
+            }
+        check(nestedResult == "nested-ok") { "Kotlin nested runOnOwner executes inline" }
+        check(dedicated.setExecutionTimeLimit(10_000L)) { "Kotlin dedicated setExecutionTimeLimit" }
+        check(dedicated.setExecutionBudget(5_000L)) { "Kotlin dedicated setExecutionBudget" }
+        check(dedicated.setMemoryLimit(10_000_000L)) { "Kotlin dedicated setMemoryLimit" }
+        check(dedicated.clearInterrupt()) { "Kotlin dedicated clearInterrupt" }
+    }
+    val loopStarted = CountDownLatch(1)
+    val loopDedicated = DedicatedEngineThread.start(7107)
+    val loopThread =
+        Thread {
+            try {
+                loopDedicated.runOnOwner { engine ->
+                    engine
+                        .bind("loopNotify") { _, _ ->
+                            loopStarted.countDown()
+                            engine.undefined()
+                        }.close()
+                    engine.evaluate("loopNotify(); while (true) {}", "infinite.js").close()
+                }
+            } catch (_: Throwable) {
+                // Expected interruption/cancellation on close.
+            }
+        }
+    loopThread.start()
+    check(loopStarted.await(5, TimeUnit.SECONDS)) { "Kotlin infinite loop started" }
+    loopDedicated.close(5_000L)
+    loopThread.join(5_000)
+    check(!loopThread.isAlive) { "Kotlin infinite loop thread terminated on close" }
 }

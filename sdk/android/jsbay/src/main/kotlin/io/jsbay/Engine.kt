@@ -400,17 +400,20 @@ class Engine
                 AdmissionClass.fromNative(Native.getAdmissionClass(id))
             }
 
+        /** Requests asynchronous interruption of JavaScript execution. Thread-safe. Latches a persistent user-interrupt flag that must be cleared via [clearInterrupt] before executing subsequent scripts. */
         fun requestInterrupt(): Boolean =
             synchronized(lifecycleLock) {
                 !closed &&
                     Native.requestInterrupt(id)
             }
 
+        /** Clears a previously requested user interrupt before evaluating more JavaScript. Must run on the owner thread. */
         fun clearInterrupt(): Boolean {
             checkOwner()
             return Native.clearInterrupt(id)
         }
 
+        /** Arms a relative execution limit in milliseconds without blocking. Zero disables the limit. Deadlines expire automatically and do not latch a persistent interrupt flag. */
         fun setExecutionTimeLimit(millis: Long): Boolean {
             checkOwner()
             return Native.timeLimit(id, millis)
