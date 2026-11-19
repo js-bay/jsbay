@@ -28,6 +28,14 @@ try {
   }
   assert.throws(() => execFileSync(process.execPath, [prepare, root, 'unknown', '0.1.1-rc.1'], { stdio: 'ignore' }));
   assert.throws(() => execFileSync(process.execPath, [prepare, root, 'quickjs', 'not-a-version'], { stdio: 'ignore' }));
+  assert.throws(() => execFileSync(process.execPath, [prepare, root, 'quickjs', '01.2.3'], { stdio: 'ignore' }));
+  assert.throws(() => execFileSync(process.execPath, [prepare, root, 'quickjs', '1.2.3-rc.01'], { stdio: 'ignore' }));
+  for (const version of ['2147483648.0.0', '0.2147483648.0', '0.0.2147483648']) {
+    assert.throws(() => execFileSync(process.execPath, [prepare, root, 'quickjs', version], { stdio: 'ignore' }));
+  }
+  execFileSync(process.execPath, [prepare, root, 'quickjs', '2147483647.2147483647.2147483647']);
+  execFileSync(process.execPath, [prepare, root, 'quickjs', '0.2.0']);
+  assert.equal(JSON.parse(readFileSync(join(root, 'sdk/harmony/oh-package.json5'), 'utf8')).version, '0.2.0');
 } finally {
   rmSync(root, { recursive: true, force: true });
 }
