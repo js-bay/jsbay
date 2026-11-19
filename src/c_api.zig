@@ -3118,24 +3118,27 @@ pub export fn jsbay_value_to_utf8(value: u64, out_bytes: *Bytes, out_exception: 
         .invalid_argument => return API_INVALID_ARGUMENT,
     }
 }
-pub export fn jsbay_value_to_sso_utf8(value: u64, out_buf: [*]u8, out_len: *usize) c_int {
-    out_len.* = 0;
+pub export fn jsbay_value_to_sso_utf8(value: u64, out_buf: ?[*]u8, out_len: ?*usize) c_int {
+    const len_ptr = out_len orelse return API_INVALID_ARGUMENT;
+    len_ptr.* = 0;
+    const buf = out_buf orelse return API_INVALID_ARGUMENT;
     const val = value_mod.HyperValue{ .raw = value };
     if (!val.isSso()) return API_INVALID_ARGUMENT;
     const len = val.ssoLength();
     if (len > 6) return API_STALE_VALUE;
     var sso_buf: [6]u8 = undefined;
     const copied = val.copySso(&sso_buf);
-    @memcpy(out_buf[0..copied], sso_buf[0..copied]);
-    out_len.* = copied;
+    @memcpy(buf[0..copied], sso_buf[0..copied]);
+    len_ptr.* = copied;
     return API_OK;
 }
-pub export fn jsbay_value_new_sso_string(utf8: ?[*]const u8, len: usize, out_value: *u64) c_int {
-    out_value.* = 0;
+pub export fn jsbay_value_new_sso_string(utf8: ?[*]const u8, len: usize, out_value: ?*u64) c_int {
+    const out = out_value orelse return API_INVALID_ARGUMENT;
+    out.* = 0;
     if (len > 6) return API_INVALID_ARGUMENT;
     const slice = if (len == 0) "" else (utf8 orelse return API_INVALID_ARGUMENT)[0..len];
     const val = value_mod.HyperValue.fromSso(slice) orelse return API_INVALID_ARGUMENT;
-    out_value.* = val.raw;
+    out.* = val.raw;
     return API_OK;
 }
 pub export fn jsbay_value_to_json(value: u64, out_bytes: *Bytes, out_exception: *u64) c_int {
@@ -4551,6 +4554,12 @@ test "c_api: nanbox hyper_box primitive fast paths bypass lock without engine ha
     try std.testing.expectEqual(API_OK, jsbay_value_to_sso_utf8(created_sso, &extracted_buf, &extracted_len));
     try std.testing.expectEqual(@as(usize, 3), extracted_len);
     try std.testing.expectEqualStrings("abc", extracted_buf[0..extracted_len]);
+
+    // Null safety guards for SSO C APIs
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_new_sso_string("abc", 3, null));
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_new_sso_string(null, 1, &created_sso));
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(created_sso, null, &extracted_len));
+    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(created_sso, &extracted_buf, null));
 
     // Reject SSO creation for strings longer than 6 bytes
     var overflow_sso: u64 = 0;

@@ -351,6 +351,10 @@ pub fn commit(binding: *Binding) void {
 /// Failed C API binding does not transfer user_data. Leave any function that escaped through an accessor as a tombstone so it rejects safely.
 pub fn abort(binding: *Binding) void {
     mutex.lock();
+    if (jsc_mic_key == binding.function_key) {
+        jsc_mic_key = 0;
+        jsc_mic_binding = null;
+    }
     if (binding.retired) {
         mutex.unlock();
         binding.allocator.free(binding.name);
@@ -379,6 +383,12 @@ fn kill(slot: usize) void {
     mutex.lock();
     const binding = if (slot < bindings.items.len) bindings.items[slot] else null;
     if (slot < bindings.items.len) bindings.items[slot] = null;
+    if (binding) |item| {
+        if (jsc_mic_key == item.function_key) {
+            jsc_mic_key = 0;
+            jsc_mic_binding = null;
+        }
+    }
     mutex.unlock();
     if (binding) |item| destroyBinding(item, false);
 }

@@ -136,20 +136,23 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
 
         pub fn pinValue(op: ApiOp, handle: u64) union(enum) { ok: ActiveEngine.Value, status: c_int } {
             const val = HyperValue{ .raw = handle };
-            if (val.isPrimitive()) {
-                if (val.isUndefined()) return .{ .ok = ActiveEngine.undefinedValue() };
-                if (val.isNull()) return .{ .ok = ActiveEngine.nullValue() };
-                if (val.isBool()) return .{ .ok = ActiveEngine.newBoolVal(op.ctx, val.asBool()) };
-                if (val.isInt32()) return .{ .ok = ActiveEngine.newInt32Val(op.ctx, val.asInt32()) };
-                if (val.isDouble()) return .{ .ok = ActiveEngine.newFloat64Val(op.ctx, val.asFloat()) };
-                if (val.isSso()) {
-                    const sso_buf = val.asSsoBytes();
-                    return .{ .ok = ActiveEngine.newStringVal(op.ctx, sso_buf.slice()) };
-                }
+            if (val.isHandle()) {
+                const entry = api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
+                if (entry.instance_id != op.id) return .{ .status = API_STALE_VALUE };
+                return .{ .ok = ActiveEngine.dupValue(op.ctx, entry.value) };
             }
-            const entry = api_value.get(handle) orelse return .{ .status = API_STALE_VALUE };
-            if (entry.instance_id != op.id) return .{ .status = API_STALE_VALUE };
-            return .{ .ok = ActiveEngine.dupValue(op.ctx, entry.value) };
+            if (val.isUndefined()) return .{ .ok = ActiveEngine.undefinedValue() };
+            if (val.isNull()) return .{ .ok = ActiveEngine.nullValue() };
+            if (val.isBool()) return .{ .ok = ActiveEngine.newBoolVal(op.ctx, val.asBool()) };
+            if (val.isInt32()) return .{ .ok = ActiveEngine.newInt32Val(op.ctx, val.asInt32()) };
+            if (val.isSso()) {
+                const sso_buf = val.asSsoBytes();
+                return switch (api_backend.newString(op.ctx, sso_buf.slice())) {
+                    .ok => |str_val| .{ .ok = str_val },
+                    else => .{ .status = API_OUT_OF_MEMORY },
+                };
+            }
+            return .{ .status = API_STALE_VALUE };
         }
 
         pub fn apiStore(instance_id: i32, value: ActiveEngine.Value, out: *u64) c_int {

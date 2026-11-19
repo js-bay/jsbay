@@ -7,8 +7,10 @@ const std = @import("std");
 /// Branchless bit-matrix router using hardware ctz instructions for single-cycle dispatch.
 pub const BitMatrix = struct {
     /// Select the next set bit representing an active, matching instance or event listener.
-    pub inline fn nextMatching(active_mask: u64, filter_mask: u64, from_bit: u6) ?u6 {
-        const shifted_mask = (~@as(u64, 0)) << from_bit;
+    pub inline fn nextMatching(active_mask: u64, filter_mask: u64, from_bit: usize) ?u6 {
+        if (from_bit >= 64) return null;
+        const shift: u6 = @intCast(from_bit);
+        const shifted_mask = (~@as(u64, 0)) << shift;
         const candidate = (active_mask & filter_mask) & shifted_mask;
         if (candidate == 0) return null;
         return @truncate(@ctz(candidate));

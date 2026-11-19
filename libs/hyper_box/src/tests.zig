@@ -362,4 +362,21 @@ test "bit_matrix routes events with hardware count trailing zeros" {
     try testing.expectEqual(@as(?u6, 5), it.next());
     try testing.expectEqual(@as(?u6, 7), it.next());
     try testing.expectEqual(@as(?u6, null), it.next());
+
+    // nextMatching boundary handling on bit 63 and beyond
+    const high_bit_mask: u64 = @as(u64, 1) << 63;
+    try testing.expectEqual(@as(?u6, 63), BitMatrix.nextMatching(high_bit_mask, high_bit_mask, 63));
+    try testing.expectEqual(@as(?u6, null), BitMatrix.nextMatching(high_bit_mask, high_bit_mask, 64));
+    try testing.expectEqual(@as(?u6, null), BitMatrix.nextMatching(high_bit_mask, high_bit_mask, 100));
+}
+
+test "cmph matches dictionary containing empty string key" {
+    const testing = std.testing;
+    const keys = [_][]const u8{ "", "alpha", "beta" };
+    const Matcher = hyper_box.ComptimeMinimalPerfectHash(&keys);
+
+    try testing.expectEqual(@as(?usize, 0), Matcher.match(""));
+    try testing.expectEqual(@as(?usize, 1), Matcher.match("alpha"));
+    try testing.expectEqual(@as(?usize, 2), Matcher.match("beta"));
+    try testing.expectEqual(@as(?usize, null), Matcher.match("gamma"));
 }

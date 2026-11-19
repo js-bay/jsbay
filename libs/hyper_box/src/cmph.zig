@@ -66,7 +66,6 @@ pub fn ComptimeMinimalPerfectHash(comptime keys: []const []const u8) type {
 
         /// Match a string against the compile-time dictionary in O(1) integer arithmetic.
         pub inline fn match(str: []const u8) ?usize {
-            if (str.len == 0) return null;
             var h: u32 = SEED;
             for (str) |b| {
                 h = (h ^ b) *% 16777619;
