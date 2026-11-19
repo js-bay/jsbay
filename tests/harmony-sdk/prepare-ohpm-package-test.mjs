@@ -21,6 +21,9 @@ try {
     assert.equal(metadata.author.url, 'https://github.com/js-bay/jsbay');
     assert.equal(metadata.repository, 'https://github.com/js-bay/jsbay');
     assert.match(readFileSync(join(root, 'sdk/harmony/README.md'), 'utf8'), new RegExp(`ohpm install ${expected}@0\\.1\\.1-rc\\.1`));
+    assert.match(readFileSync(join(root, 'sdk/harmony/README.md'), 'utf8'), /useNormalizedOHMUrl/);
+    assert.match(readFileSync(join(root, 'sdk/harmony/README.md'), 'utf8'), /worker\.workerPort/);
+    assert.match(readFileSync(join(root, 'sdk/harmony/README.md'), 'utf8'), /worker\.ThreadWorker/);
     assert.match(readFileSync(join(root, 'sdk/harmony/CHANGELOG.md'), 'utf8'), /0\.1\.1-rc\.1/);
     assert.ok(readFileSync(join(root, 'sdk/harmony/LICENSE'), 'utf8').length > 0);
     const profile = JSON.parse(readFileSync(join(root, 'tests/harmony-sdk/fixture/build-profile.json5'), 'utf8'));

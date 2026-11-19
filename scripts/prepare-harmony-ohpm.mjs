@@ -29,4 +29,75 @@ writeFileSync(profilePath, `${JSON.stringify(profile, null, 2)}\n`);
 
 copyFileSync(join(root, 'LICENSE'), join(sdk, 'LICENSE'));
 writeFileSync(join(sdk, 'CHANGELOG.md'), `# Changelog\n\n## ${version}\n\nRelease the ${backend} engine package.\n`);
-writeFileSync(join(sdk, 'README.md'), `# ${name}\n\nJsBay's ArkTS SDK with the ${backend} JavaScript engine. Create and use an engine on its own ArkTS Worker, and close owned values before closing the engine.\n\n\`\`\`sh\nohpm install ${name}@${version}\n\`\`\`\n\n\`\`\`ts\nimport { Engine } from '${name}';\n\nconst engine = Engine.create(1);\ntry {\n  const result = engine.evaluate('1 + 1', 'example.js');\n  try {\n    const text = result.toUtf8();\n  } finally {\n    result.close();\n  }\n} finally {\n  engine.close();\n}\n\`\`\`\n\nUse this example from a dedicated ArkTS Worker. Configure normalized OHM URLs when consuming the bytecode HAR.\n`);
+writeFileSync(join(sdk, 'README.md'), `# ${name}
+
+JsBay runs JavaScript in a dedicated ArkTS Worker using the ${backend} engine. This HAR contains the arm64-v8a native library.
+
+## Install
+
+In the consuming module directory, install the package:
+
+\`\`\`sh
+ohpm install ${name}@${version}
+\`\`\`
+
+Choose one JsBay engine package per app. The packages expose the same API and contain a native library with the same name.
+
+## Configure the app
+
+In the app-level \`build-profile.json5\`, set the product's \`runtimeOS\` and enable normalized OHM URLs for every build mode that consumes this bytecode HAR:
+
+\`\`\`json5
+{
+  "app": {
+    "products": [{ "name": "default", "runtimeOS": "HarmonyOS" }],
+    "buildModeSet": [{
+      "name": "debug",
+      "buildOption": { "strictMode": { "useNormalizedOHMUrl": true } }
+    }]
+  }
+}
+\`\`\`
+
+Merge these settings into the existing product and build modes; keep the app's other settings. Apply the same option to release builds.
+
+## Run JavaScript
+
+Create \`entry/src/main/ets/workers/JsBayWorker.ets\`:
+
+\`\`\`ts
+import { MessageEvents, ThreadWorkerGlobalScope, worker } from '@kit.ArkTS';
+import { Engine } from '${name}';
+
+const port: ThreadWorkerGlobalScope = worker.workerPort;
+port.onmessage = (message: MessageEvents): void => {
+  if (message.data !== 'start') return;
+  const engine = Engine.create(1);
+  try {
+    const result = engine.evaluate('40 + 2', 'example.js');
+    try {
+      port.postMessage(result.toNumber());
+    } finally {
+      result.close();
+    }
+  } finally {
+    engine.close();
+  }
+};
+\`\`\`
+
+Start the Worker from the entry module and receive the result:
+
+\`\`\`ts
+import { MessageEvents, worker } from '@kit.ArkTS';
+
+const jsWorker = new worker.ThreadWorker('entry/ets/workers/JsBayWorker.ets');
+jsWorker.onmessage = (message: MessageEvents): void => {
+  console.info(\`Result: \${message.data}\`);
+  jsWorker.terminate();
+};
+jsWorker.postMessage('start');
+\`\`\`
+
+Keep each engine and its values on the Worker that created them. Close owned values before closing the engine. A Worker does not isolate native crashes from the host process.
+`);

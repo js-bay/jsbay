@@ -65,7 +65,7 @@ The Android, Apple, .NET, Harmony, and Node.js SDKs wrap the same typed C ABI. I
 - [Android](sdk/android)
 - [Apple](sdk/apple)
 - [.NET](sdk/dotnet)
-- [Harmony](sdk/harmony)
+- [Harmony](sdk/harmony) — OHPM installation, app configuration, and Worker example
 - [Node.js](sdk/node)
 
 Native operations that finish later can return a Promise through [`include/jsbay_async.h`](include/jsbay_async.h). The host submits copied result data from its completion thread, and the engine settles the Promise on its owner thread. See [native asynchronous calls](docs/native-async.md). The [Node.js SDK](sdk/node) provides `evaluateAsync` and `bindAsync` with direct value conversion and automatic event-loop attachment.

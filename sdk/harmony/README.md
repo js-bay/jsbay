@@ -6,6 +6,70 @@ When consuming the packaged bytecode HAR, set `app.products[].runtimeOS` to `Har
 
 Create an `Engine` and use its values from one ArkTS Worker. Close owned values explicitly; callback values are borrowed and only live during that callback. Call `retain()` inside the callback to keep a value after it returns. Create engines with `Engine.create(instanceId)`; the `Engine` and `Value` constructors are private.
 
+## Install from OHPM
+
+Choose one engine package in the consuming module directory. The packages contain different engines but expose the same API and native library name; use one per app.
+
+```sh
+ohpm install @jsbay/quickjs@0.1.1-rc.1
+# or
+ohpm install @jsbay/quickjs_ng@0.1.1-rc.1
+```
+
+The RC packages have been submitted to OHPM and are awaiting registry review. Public installation is available only after approval. The published HAR targets `arm64-v8a`.
+
+In the app-level `build-profile.json5`, merge the following into the existing product and each build mode, including release:
+
+```json5
+{
+  "app": {
+    "products": [{ "name": "default", "runtimeOS": "HarmonyOS" }],
+    "buildModeSet": [{
+      "name": "debug",
+      "buildOption": { "strictMode": { "useNormalizedOHMUrl": true } }
+    }]
+  }
+}
+```
+
+Create `entry/src/main/ets/workers/JsBayWorker.ets`, replacing the import with the package you installed:
+
+```ts
+import { MessageEvents, ThreadWorkerGlobalScope, worker } from '@kit.ArkTS';
+import { Engine } from '@jsbay/quickjs';
+
+const port: ThreadWorkerGlobalScope = worker.workerPort;
+port.onmessage = (message: MessageEvents): void => {
+  if (message.data !== 'start') return;
+  const engine = Engine.create(1);
+  try {
+    const result = engine.evaluate('40 + 2', 'example.js');
+    try {
+      port.postMessage(result.toNumber());
+    } finally {
+      result.close();
+    }
+  } finally {
+    engine.close();
+  }
+};
+```
+
+Start the Worker from the entry module and receive its result:
+
+```ts
+import { MessageEvents, worker } from '@kit.ArkTS';
+
+const jsWorker = new worker.ThreadWorker('entry/ets/workers/JsBayWorker.ets');
+jsWorker.onmessage = (message: MessageEvents): void => {
+  console.info(`Result: ${message.data}`);
+  jsWorker.terminate();
+};
+jsWorker.postMessage('start');
+```
+
+For a complete application fixture, see `tests/harmony-sdk/prepare-ohpm-consumer.mjs`.
+
 ## Owner Worker and multi-instance hosts
 
 Pin each instance id to one dedicated ArkTS Worker for its whole lifetime. The native bridge records the creating thread id and raises `JsBayStatus.WrongThread` if Engine or Value APIs run elsewhere. Do not send `Engine`, `Value`, or their N-API wrappers to another Worker, and do not create many engines on the UI/main thread of a Worker that also renders.
