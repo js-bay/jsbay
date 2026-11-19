@@ -60,3 +60,34 @@ The independent single-backend pipeline now actually completes from source check
 All thirteen thousand thirty-seven frozen non-Markdown inputs are verified before every stage. Only the Android test compiler selection differs from the prior native checkpoint; production implementation remains `b0d4b0c`. New core libraries embed the new source commit. Seven actual deployment calls verify nineteen installed-APK or pushed-payload SHA pairs by pulling the bytes back before consumer execution. All four APK native libraries match the new AAR, and both core-library raw-to-AAR differences are exactly reproduced by standard symbol stripping. The original Inspector scripts remove their temporary DEX directories; per-deployment hashes and full logs are retained, but those temporary DEX bytes are not claimed retained. Persistent AAR, local Maven archive, APK, R8 DEX, mapping and JNI outputs have a separate artifact manifest under `sdk-focused-f559919`.
 
 SDK success does not close the original ten API24 native failures, the original Hermes ReleaseSafe readiness assertion, QuickJS object-chain `FrameTimeout`, Escargot foreign-owner teardown leak, unexecuted dynamic owner/finalizer probe, unsupported hardware/platform coverage or independent lifecycle/unwind review. The PR is still not ready to merge. No remote writes, vendor pin updates, contract changes, or validation relaxations occurred.
+
+## Fresh QuickJS SDK parity stage
+
+The matching QuickJS single-backend SDK pipeline now actually completes from source checkpoint `473d62bf9694f5080d580c473a7649e986240052`, Maven coordinate `0.1.0-local.473d62bf9694`. All seven stages exit zero: fresh arm64-v8a/x86_64 core libraries; Gradle JNI adapters, release AAR and local Maven staging; Maven checks; API35 deploy-file consumption, APK assembly/installation and ART instrumentation plus Java/Kotlin/automatic Looper/R8 consumers; API24 R8 consumers; API24 and API35 Inspector CDP end-to-end. QuickJS-NG was already green and was not rerun. Runtime coverage remains x86_64 emulators, not ARM64 hardware.
+
+All thirteen thousand thirty-seven frozen source inputs match before every stage and at completion. Seven actual deployment calls pull and compare nineteen APK/DEX/native payloads before execution; all SHA pairs match, and this stage retains every pulled payload, including temporary Inspector DEX, in content-addressed storage. Both ABI core libraries contain the new source commit, standard stripping exactly reproduces the AAR core bytes, and all four APK native libraries match the AAR. Commands, real exits, logs, artifact manifests and deployment bytes are retained under `sdk-quickjs-473d62b`. This is fresh SDK certification, not inherited historical success.
+
+The SDK group is the deliberate reporting boundary: no new native replay batches or finalizer probe are silently appended to this stage. The read-only startup contract decision and ten-failure ledger below are complete as evidence, but a handshake repair, bounded partial-frame fault capture, and dynamic owner/finalizer probe remain separate short follow-ups, not passed tests.
+
+## Per-failure API24 closure ledger after the SDK-only stage
+
+SDK success does not close any original native failure. All ten remain open; original logs and exact line references are indexed in `sdk-quickjs-473d62b/api24-ten-failures.json`.
+
+| Engine | Original failed test | Current state and reason |
+|---|---|---|
+| escargot | `cdp: await preserves identity within each distinct async invocation` | Open: ten isolated plus ten nonisolated passes without a fix; original failure unexplained. |
+| escargot | `cdp: finally call breakpoint pauses once for each loop execution` | Open: ten isolated plus ten nonisolated passes without a fix; original failure unexplained. |
+| hermes | `spike smoke: engine_thread start / id / stop` | Open: exact ReleaseSafe nonzero-id assertion still fails after ten thousand yields. Contract audit selects a test-only readiness handshake; not yet repaired. |
+| quickjs_ng | `cdp: QuickJS empty for-of binding has no duplicate pause` | Open: one hundred original-ELF passes without a fix are not closure. |
+| quickjs_ng | `cdp: QuickJS for-in binding and operator have distinct pauses` | Open: original affected exit one; no independently validated repair or precise isolated failure detail. |
+| quickjs_ng | `cdp: QuickJS for-await binding and operator do not repeat after resume` | Open: original affected exit one; no independently validated repair or precise isolated failure detail. |
+| quickjs | `cdp: QuickJS for-of body column remains bindable` | Open: original affected exit one; no independently validated repair; NG results do not transfer. |
+| quickjs | `cdp: QuickJS empty for-of binding has no duplicate pause` | Open: original affected exit one; no independently validated repair; NG results do not transfer. |
+| quickjs | `cdp: condition evaluation preserves caller breakpoint progress` | Open: original affected exit one; no independently validated repair. |
+| quickjs | `inspector: returnByValue serializes a 999-value object chain` | Open: original twelfth repetition fails with FrameTimeout; twenty-five later diagnostic passes do not capture partial-frame failure or prove a repair. |
+
+### Startup contract decision, not a production contract change
+
+The ten-thousand-yield assumption is not a documented startup publication guarantee. `src/runtime/engine_thread.zig:251-295` returns after spawn and started/running publication; `:1233-1234` publishes the id at worker entry. More importantly, `:750-756` and `:769-773` explicitly accept a started state with a zero id. `src/c_api.zig:1135-1154` exposes the legacy id/post/wait helpers only in its test-only namespace, not the production C facade. The existing native-task callback path at `engine_thread.zig:838-854` is reached only after worker id publication. Therefore the next repair should establish a bounded callback acknowledgement in the smoke test, preserve all original start/id/stop assertions and existing timeout settings, and leave production startup behavior unchanged. No test modification or new targeted validation is claimed by this read-only audit.
+
+Owner/finalizer dynamic probes and new bounded QuickJS partial-frame sampling have not run in this SDK-first stage. The public destroy-join and owner-finalizer guarantees remain unchanged; no Escargot execution-model alternative is implicitly approved. The original Debug TLS fix is separate from these ten native failures.
