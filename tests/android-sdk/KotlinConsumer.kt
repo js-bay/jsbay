@@ -804,6 +804,7 @@ private fun runKotlinDedicatedThreadParityTests() {
 
     val userInterruptDedicated = DedicatedEngineThread.start(7109)
     val interruptObserved = AtomicBoolean(false)
+    val userInterruptDone = CountDownLatch(1)
     userInterruptDedicated.post {
         userInterruptDedicated.engine.requestInterrupt()
     }
@@ -815,9 +816,12 @@ private fun runKotlinDedicatedThreadParityTests() {
             if (e.status == Status.EXCEPTION) {
                 interruptObserved.set(true)
             }
+        } finally {
+            engine.clearInterrupt()
+            userInterruptDone.countDown()
         }
-        engine.clearInterrupt()
     }
+    check(userInterruptDone.await(5, TimeUnit.SECONDS)) { "Kotlin user interrupt job completed" }
     userInterruptDedicated.close(5_000L)
     check(interruptObserved.get()) { "Kotlin user interrupt preserved across jobs" }
 }
