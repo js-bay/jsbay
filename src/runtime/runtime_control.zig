@@ -451,8 +451,7 @@ fn armJscWatchdogShortLimit(instance_id: i32, millis: u64) void {
 
 /// Set an execution time limit in milliseconds. Passing 0 disables the limit. Thread-safe. Returns false if not initialized.
 ///
-/// Deadlines expire automatically when monotonic time passes `now + millis` and do not leave a sticky interrupt flag.
-/// Setting a non-zero time limit establishes a new execution window and automatically clears any stale user interrupt flag.
+/// Deadlines expire automatically when monotonic time passes `now + millis` and do not leave a sticky interrupt flag. Setting a non-zero time limit establishes a new execution window and automatically clears any stale user interrupt flag.
 ///
 /// Enforcement precision varies by backend: QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops); JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at min(remaining, 50ms) intervals (clamped to >= 5ms).
 pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
