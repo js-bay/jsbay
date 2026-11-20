@@ -24,7 +24,8 @@ harmony_toolchain_resolve() {
     app_root=/Applications/DevEco-Studio.app
     sdk_candidates=("$app_root/Contents/sdk")
   else
-    configured_name=''
+    echo 'Harmony SDK not found; set DEVECO_SDK_HOME, HOS_SDK_HOME, OHOS_BASE_SDK_HOME, or DEVECO_HOME.' >&2
+    return 1
   fi
 
   for candidate in "${sdk_candidates[@]}"; do
@@ -40,7 +41,7 @@ harmony_toolchain_resolve() {
 
   if [[ -z $sdk_root ]]; then
     if [[ -n $configured_name ]]; then
-      echo "$configured_name does not identify a Harmony SDK: ${sdk_candidates[*]}" >&2
+      echo "$configured_name does not identify a Harmony SDK: ${sdk_candidates[*]:-}" >&2
       return 1
     fi
     echo 'Harmony SDK not found; set DEVECO_SDK_HOME, HOS_SDK_HOME, OHOS_BASE_SDK_HOME, or DEVECO_HOME.' >&2
@@ -60,7 +61,10 @@ harmony_toolchain_resolve() {
     if [[ -n $command_path ]]; then
       HVIGORW=$command_path
     else
-      for candidate in "$DEVECO_SDK_HOME/command-line-tools/bin/hvigorw" "$DEVECO_SDK_HOME/../command-line-tools/bin/hvigorw" "${DEVECO_HOME:-}/Contents/tools/hvigor/bin/hvigorw" "${app_root:-}/Contents/tools/hvigor/bin/hvigorw"; do
+      local -a hvigor_candidates=("$DEVECO_SDK_HOME/command-line-tools/bin/hvigorw" "$DEVECO_SDK_HOME/../command-line-tools/bin/hvigorw")
+      if [[ -n ${DEVECO_HOME:-} ]]; then hvigor_candidates+=("$DEVECO_HOME/Contents/tools/hvigor/bin/hvigorw"); fi
+      if [[ -n ${app_root:-} ]]; then hvigor_candidates+=("$app_root/Contents/tools/hvigor/bin/hvigorw"); fi
+      for candidate in "${hvigor_candidates[@]}"; do
         if [[ -x $candidate ]]; then HVIGORW=$candidate; break; fi
       done
     fi
@@ -75,7 +79,10 @@ harmony_toolchain_resolve() {
     if [[ -n $command_path ]]; then
       OHPM=$command_path
     else
-      for candidate in "$DEVECO_SDK_HOME/command-line-tools/bin/ohpm" "$DEVECO_SDK_HOME/../command-line-tools/bin/ohpm" "${DEVECO_HOME:-}/Contents/tools/ohpm/bin/ohpm" "${app_root:-}/Contents/tools/ohpm/bin/ohpm"; do
+      local -a ohpm_candidates=("$DEVECO_SDK_HOME/command-line-tools/bin/ohpm" "$DEVECO_SDK_HOME/../command-line-tools/bin/ohpm")
+      if [[ -n ${DEVECO_HOME:-} ]]; then ohpm_candidates+=("$DEVECO_HOME/Contents/tools/ohpm/bin/ohpm"); fi
+      if [[ -n ${app_root:-} ]]; then ohpm_candidates+=("$app_root/Contents/tools/ohpm/bin/ohpm"); fi
+      for candidate in "${ohpm_candidates[@]}"; do
         if [[ -x $candidate ]]; then OHPM=$candidate; break; fi
       done
     fi

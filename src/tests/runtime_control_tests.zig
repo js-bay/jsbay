@@ -227,6 +227,28 @@ test "runtime_control: clearInterrupt restores normal execution" {
     }.run);
 }
 
+test "runtime_control: subsequent execution after interrupt succeeds when setting new time limit without clearInterrupt" {
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            try testing.expect(rc.init(id));
+            defer _ = rc.deinit(id);
+
+            // Request interrupt before eval so the first eval aborts.
+            _ = rc.requestInterrupt(id);
+
+            const res1 = engine.evalScript(id, "let i = 0; while (true) i++;", "<t1>");
+            defer helpers.freeEvalResult(res1);
+            try testing.expect(res1.err != null);
+
+            // Configure a new execution time limit without calling clearInterrupt.
+            try testing.expect(rc.setExecutionTimeLimit(id, 5_000));
+
+            // The epoch model guarantees the stale interrupt does not poison the new execution turn.
+            try helpers.expectEvalEquals(id, "40 + 2", "42");
+        }
+    }.run);
+}
+
 // ---------------------------------------------------------------------------
 // 5. Execution time limit triggers interrupt
 // ---------------------------------------------------------------------------

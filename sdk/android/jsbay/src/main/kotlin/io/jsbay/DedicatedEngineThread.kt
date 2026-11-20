@@ -4,6 +4,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
+open class DedicatedEngineThreadTimeoutException(
+    message: String,
+) : RuntimeException(message)
+
 /** One [Engine] owned by a dedicated Looper thread. Matches the multi-instance host pattern: one owner thread per instance id, never the process main/UI thread. Construct with [start], post work with [post], and [close] on any thread (close runs on the owner thread). */
 class DedicatedEngineThread private constructor(
     val id: Int,
@@ -12,6 +16,10 @@ class DedicatedEngineThread private constructor(
     private val postMethod: java.lang.reflect.Method,
     private val engineRef: AtomicReference<Engine?>,
 ) : AutoCloseable {
+    private val lock = Any()
+    private var isExecutingJob = false
+    private var shutdownInterruptedJob = false
+
     /** The live engine. Only call Engine APIs from [post] or from code already running on the owner thread. */
     val engine: Engine
         get() = engineRef.get() ?: throw JsBayException(Status.INSTANCE_NOT_FOUND)
@@ -19,15 +27,33 @@ class DedicatedEngineThread private constructor(
     /** Queues [action] on the owner thread. Returns false if the thread has already quit. */
     fun post(action: Runnable): Boolean =
         try {
-            postMethod.invoke(handler, action) as Boolean
+            val wrapped =
+                Runnable {
+                    synchronized(lock) {
+                        isExecutingJob = true
+                    }
+                    try {
+                        action.run()
+                    } finally {
+                        synchronized(lock) {
+                            isExecutingJob = false
+                            if (shutdownInterruptedJob) {
+                                shutdownInterruptedJob = false
+                                engineRef.get()?.clearInterrupt()
+                            }
+                        }
+                    }
+                }
+            postMethod.invoke(handler, wrapped) as Boolean
         } catch (_: ReflectiveOperationException) {
             false
         }
 
-    /** Runs [action] on the owner thread and waits for it. Throws [JsBayException] with [Status.WRONG_THREAD] when called from the owner thread (would deadlock). Propagates exceptions thrown by [action]. */
+    /** Runs [action] synchronously on the owner thread. Calls made from the owner thread execute inline to avoid deadlock. Propagates exceptions thrown by [action]. */
     fun <T> runOnOwner(action: (Engine) -> T): T {
         if (Thread.currentThread() === thread) {
-            throw JsBayException(Status.WRONG_THREAD)
+            val liveEngine = engineRef.get() ?: throw JsBayException(Status.INSTANCE_NOT_FOUND)
+            return action(liveEngine)
         }
         val done = CountDownLatch(1)
         val result = AtomicReference<Any?>(ABSENT)
@@ -49,7 +75,25 @@ class DedicatedEngineThread private constructor(
         return result.get() as T
     }
 
-    override fun close() {
+    /** Requests asynchronous interruption of JavaScript execution on the owner thread. Safe to call from any thread. */
+    fun requestInterrupt(): Boolean = engineRef.get()?.requestInterrupt() ?: false
+
+    /** Cancels execution on the owner thread. Safe to call from any thread. */
+    fun cancel(): Boolean = engineRef.get()?.cancel() ?: false
+
+    /** Clears a previously requested user interrupt before evaluating more JavaScript. Must run on the owner thread. */
+    fun clearInterrupt(): Boolean = runOnOwner { it.clearInterrupt() }
+
+    /** Sets an execution time limit in milliseconds for upcoming work on the owner thread. Must run on the owner thread. */
+    fun setExecutionTimeLimit(millis: Long): Boolean = runOnOwner { it.setExecutionTimeLimit(millis) }
+
+    /** Sets an execution budget in milliseconds applied to each outer evaluation. Must run on the owner thread. */
+    fun setExecutionBudget(millis: Long): Boolean = runOnOwner { it.setExecutionBudget(millis) }
+
+    /** Sets the memory limit in bytes. Must run on the owner thread. */
+    fun setMemoryLimit(bytes: Long): Boolean = runOnOwner { it.setMemoryLimit(bytes) }
+
+    fun close(timeoutMillis: Long) {
         // Never clear engineRef before a successful owner-thread destroy — otherwise instance ids are orphaned.
         val current = engineRef.get() ?: return
         if (Thread.currentThread() === thread) {
@@ -64,20 +108,27 @@ class DedicatedEngineThread private constructor(
         val done = CountDownLatch(1)
         val error = AtomicReference<Throwable?>(null)
         val destroyed = AtomicReference(false)
-        val posted =
-            post {
-                try {
-                    if (engineRef.get() !== current) return@post
-                    current.close()
-                    engineRef.compareAndSet(current, null)
-                    destroyed.set(true)
-                } catch (t: Throwable) {
-                    error.set(t)
-                } finally {
-                    LoopDriver.quitCurrentLooperSafely()
-                    done.countDown()
-                }
+        val posted: Boolean
+        synchronized(lock) {
+            if (isExecutingJob) {
+                current.requestInterrupt()
+                shutdownInterruptedJob = true
             }
+            posted =
+                post {
+                    try {
+                        if (engineRef.get() !== current) return@post
+                        current.close()
+                        engineRef.compareAndSet(current, null)
+                        destroyed.set(true)
+                    } catch (t: Throwable) {
+                        error.set(t)
+                    } finally {
+                        LoopDriver.quitCurrentLooperSafely()
+                        done.countDown()
+                    }
+                }
+        }
         if (!posted) {
             // Dead / quit Looper: Handler.post failed. Best-effort policy (R2): leave engineRef set so
             // the native instance id is not silently orphaned; caller must recover (process restart or
@@ -85,15 +136,20 @@ class DedicatedEngineThread private constructor(
             // call Native.destroy from a foreign thread.
             throw JsBayException(Status.INSTANCE_NOT_FOUND)
         }
-        if (!done.await(30, TimeUnit.SECONDS)) {
-            // Timed out waiting for owner destroy; leave engineRef intact so the native id is not orphaned from Kotlin's view.
-            throw JsBayException(Status.INVALID_ARGUMENT)
+        if (!done.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
+            // Timed out waiting for owner destroy; cancel execution so stuck loops do not spin indefinitely.
+            current.cancel()
+            throw DedicatedEngineThreadTimeoutException("Timed out waiting for dedicated engine thread shutdown")
         }
         error.get()?.let { throw it }
         if (!destroyed.get() && engineRef.get() === current) {
             throw JsBayException(Status.INSTANCE_NOT_FOUND)
         }
-        thread.join(30_000)
+        thread.join(timeoutMillis)
+    }
+
+    override fun close() {
+        close(30_000L)
     }
 
     companion object {

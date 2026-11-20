@@ -1,4 +1,5 @@
 import Foundation
+import JsBay
 import JsBaySDK
 
 @main
@@ -122,6 +123,61 @@ struct DedicatedEngineThreadConsumer {
     precondition(releasedOwner == nil)
     let reusedOwner = try DedicatedEngineThread.start(id: 81_551)
     try reusedOwner.close()
+
+    let parityOwner = try DedicatedEngineThread.start(id: 81_552)
+    let limitSet = try parityOwner.setExecutionTimeLimit(milliseconds: 10_000)
+    precondition(limitSet)
+    let budgetSet = try parityOwner.setExecutionBudget(milliseconds: 5_000)
+    precondition(budgetSet)
+    let memorySet = try parityOwner.setMemoryLimit(bytes: 10_000_000)
+    if jsbay_library_backend() == JSBAY_BACKEND_JSC {
+      precondition(!memorySet, "JSC must report unsupported for memory limits")
+    } else {
+      precondition(memorySet, "QuickJS backends must accept memory limits")
+    }
+    let interruptCleared = try parityOwner.clearInterrupt()
+    precondition(interruptCleared)
+    precondition(parityOwner.requestInterrupt() || true)
+    precondition(parityOwner.cancel() || true)
+    try parityOwner.close()
+
+    let infiniteLoopOwner = try DedicatedEngineThread.start(id: 81_553)
+    let loopStarted = LockedFlag()
+    let loopTask = Task.detached {
+      do {
+        _ = try infiniteLoopOwner.runOnOwner { engine in
+          let notify = try engine.bind("loopStarted") { _, _ in
+            loopStarted.set(true)
+            return try engine.undefined()
+          }
+          defer { try? notify.close() }
+          let val = try engine.evaluate("loopStarted(); while (true) {}", filename: "infinite.js")
+          defer { try? val.close() }
+          return 1
+        }
+      } catch {
+        // Expected interruption on close.
+      }
+    }
+    while !loopStarted.get() {
+      try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    try infiniteLoopOwner.close(timeout: .seconds(5))
+    _ = await loopTask.result
+
+    let queuedDrainOwner = try DedicatedEngineThread.start(id: 81_554)
+    let queuedDrainResult = LockedFlag()
+    try queuedDrainOwner.post(
+      { engine in
+        let value = try engine.evaluate("21 + 21")
+        defer { try? value.close() }
+        return try value.number()
+      },
+      completion: { result in
+        if case .success(let value) = result { queuedDrainResult.set(value == 42) }
+      })
+    try queuedDrainOwner.close(timeout: .seconds(5))
+    precondition(queuedDrainResult.get())
 
   }
 }

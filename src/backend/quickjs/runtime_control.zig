@@ -20,6 +20,8 @@ pub const QjsInterruptState = extern struct {
     budget_depth: usize = 0,
     shutdown_deadline_ms: u64 = 0,
     shutdown_phase: c_int = 0,
+    exec_epoch: u64 = 0,
+    interrupt_target: u64 = 0,
 };
 
 /// C trampoline: called by QuickJS periodically during JS execution. Returns non-zero to trigger interrupt (QuickJS throws InternalError).
@@ -27,18 +29,20 @@ fn qjsInterruptTrampoline(_: ?*qjs.JSRuntime, opaque_ptr: ?*anyopaque) callconv(
     const state_ptr = opaque_ptr orelse return 0;
     const state: *QjsInterruptState = @ptrCast(@alignCast(state_ptr));
 
-    // Atomic-load the flag (relaxed ordering is fine — we tolerate seeing a stale value for up to one interrupt check period).
+    const shutdown_ptr: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
+    const now: u64 = @intCast(io.monotonicMilliseconds());
+    const shutdown_deadline = shutdown_ptr.load(.monotonic);
+    if (shutdown_deadline != 0 and now >= shutdown_deadline) return 1;
+
     const req_ptr: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     if (req_ptr.load(.monotonic) != 0) return 1;
 
     const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     const budget_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
-    const shutdown_ptr: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
-    const now: u64 = @intCast(io.monotonicMilliseconds());
     const deadline = deadline_ptr.load(.monotonic);
     const budget_deadline = budget_ptr.load(.monotonic);
-    const shutdown_deadline = shutdown_ptr.load(.monotonic);
-    if ((deadline != 0 and now >= deadline) or (budget_deadline != 0 and now >= budget_deadline) or (shutdown_deadline != 0 and now >= shutdown_deadline)) return 1;
+    if ((deadline != 0 and now >= deadline) or (budget_deadline != 0 and now >= budget_deadline)) return 1;
+
     if (state.instance_id >= 0) {
         if (@import("../../inspector/sample_hook.zig").load()) |hook| hook(state.instance_id);
     }
