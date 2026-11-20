@@ -158,6 +158,7 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
   private var jobs: [Job] = []
   private var drainScheduled = false
   private var isExecutingJob = false
+  private var shutdownInterruptedJob = false
   private var shutdownError: Error?
   private var shutdownCompleted = false
   private var thread: Thread!
@@ -270,15 +271,15 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
       state = .closing
       let currentEngine = engine
       let loop = runLoop
-      let isBusy = isExecutingJob
+      if isExecutingJob {
+        _ = currentEngine?.requestInterrupt()
+        shutdownInterruptedJob = true
+      }
       jobs.append { [weak self] _ in self?.finishShutdown() }
       scheduleDrainLocked(on: loop)
       lock.unlock()
       if Thread.current === thread {
         return
-      }
-      if isBusy {
-        _ = currentEngine?.requestInterrupt()
       }
       if shutdown.wait(timeout: .now() + timeout) == .timedOut {
         _ = currentEngine?.cancel()
@@ -287,13 +288,13 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
       try throwShutdownErrorIfPresent()
     case .closing:
       let currentEngine = engine
-      let isBusy = isExecutingJob
+      if isExecutingJob && !shutdownInterruptedJob {
+        _ = currentEngine?.requestInterrupt()
+        shutdownInterruptedJob = true
+      }
       lock.unlock()
       if Thread.current === thread {
         return
-      }
-      if isBusy {
-        _ = currentEngine?.requestInterrupt()
       }
       if shutdown.wait(timeout: .now() + timeout) == .timedOut {
         _ = currentEngine?.cancel()
@@ -345,7 +346,8 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
       job(currentEngine)
       lock.lock()
       isExecutingJob = false
-      if case .closing = state {
+      if shutdownInterruptedJob {
+        shutdownInterruptedJob = false
         _ = try? currentEngine?.clearInterrupt()
       }
       lock.unlock()

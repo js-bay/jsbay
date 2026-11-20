@@ -1,4 +1,5 @@
 import Foundation
+import JsBay
 import JsBaySDK
 
 @main
@@ -129,7 +130,11 @@ struct DedicatedEngineThreadConsumer {
     let budgetSet = try parityOwner.setExecutionBudget(milliseconds: 5_000)
     precondition(budgetSet)
     let memorySet = try parityOwner.setMemoryLimit(bytes: 10_000_000)
-    precondition(memorySet)
+    if jsbay_library_backend() == JSBAY_BACKEND_JSC {
+      precondition(!memorySet, "JSC must report unsupported for memory limits")
+    } else {
+      precondition(memorySet, "QuickJS backends must accept memory limits")
+    }
     let interruptCleared = try parityOwner.clearInterrupt()
     precondition(interruptCleared)
     precondition(parityOwner.requestInterrupt() || true)

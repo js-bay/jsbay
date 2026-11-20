@@ -2,7 +2,6 @@ package io.jsbay
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 open class DedicatedEngineThreadTimeoutException(
@@ -17,7 +16,9 @@ class DedicatedEngineThread private constructor(
     private val postMethod: java.lang.reflect.Method,
     private val engineRef: AtomicReference<Engine?>,
 ) : AutoCloseable {
-    private val isExecutingJob = AtomicBoolean(false)
+    private val lock = Any()
+    private var isExecutingJob = false
+    private var shutdownInterruptedJob = false
 
     /** The live engine. Only call Engine APIs from [post] or from code already running on the owner thread. */
     val engine: Engine
@@ -28,13 +29,18 @@ class DedicatedEngineThread private constructor(
         try {
             val wrapped =
                 Runnable {
-                    isExecutingJob.set(true)
+                    synchronized(lock) {
+                        isExecutingJob = true
+                    }
                     try {
                         action.run()
                     } finally {
-                        isExecutingJob.set(false)
-                        engineRef.get()?.let { live ->
-                            live.clearInterrupt()
+                        synchronized(lock) {
+                            isExecutingJob = false
+                            if (shutdownInterruptedJob) {
+                                shutdownInterruptedJob = false
+                                engineRef.get()?.clearInterrupt()
+                            }
                         }
                     }
                 }
@@ -102,30 +108,33 @@ class DedicatedEngineThread private constructor(
         val done = CountDownLatch(1)
         val error = AtomicReference<Throwable?>(null)
         val destroyed = AtomicReference(false)
-        val isBusy = isExecutingJob.get()
-        val posted =
-            post {
-                try {
-                    if (engineRef.get() !== current) return@post
-                    current.close()
-                    engineRef.compareAndSet(current, null)
-                    destroyed.set(true)
-                } catch (t: Throwable) {
-                    error.set(t)
-                } finally {
-                    LoopDriver.quitCurrentLooperSafely()
-                    done.countDown()
-                }
+        val posted: Boolean
+        synchronized(lock) {
+            if (isExecutingJob) {
+                current.requestInterrupt()
+                shutdownInterruptedJob = true
             }
+            posted =
+                post {
+                    try {
+                        if (engineRef.get() !== current) return@post
+                        current.close()
+                        engineRef.compareAndSet(current, null)
+                        destroyed.set(true)
+                    } catch (t: Throwable) {
+                        error.set(t)
+                    } finally {
+                        LoopDriver.quitCurrentLooperSafely()
+                        done.countDown()
+                    }
+                }
+        }
         if (!posted) {
             // Dead / quit Looper: Handler.post failed. Best-effort policy (R2): leave engineRef set so
             // the native instance id is not silently orphaned; caller must recover (process restart or
             // a last-ditch owner-thread destroy if the thread is somehow still alive). close() does not
             // call Native.destroy from a foreign thread.
             throw JsBayException(Status.INSTANCE_NOT_FOUND)
-        }
-        if (isBusy) {
-            current.requestInterrupt()
         }
         if (!done.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
             // Timed out waiting for owner destroy; cancel execution so stuck loops do not spin indefinitely.

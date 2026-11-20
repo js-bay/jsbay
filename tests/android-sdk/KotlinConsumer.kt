@@ -801,4 +801,23 @@ private fun runKotlinDedicatedThreadParityTests() {
     }
     queuedDrainDedicated.close(5_000L)
     check(queuedDrainResult.get()) { "Kotlin queued evaluations drain on close" }
+
+    val userInterruptDedicated = DedicatedEngineThread.start(7109)
+    val interruptObserved = AtomicBoolean(false)
+    userInterruptDedicated.post {
+        userInterruptDedicated.engine.requestInterrupt()
+    }
+    userInterruptDedicated.post {
+        val engine = userInterruptDedicated.engine
+        try {
+            engine.evaluate("while (true) {}", "user_interrupt.js").close()
+        } catch (e: JsBayException) {
+            if (e.status == Status.EXCEPTION) {
+                interruptObserved.set(true)
+            }
+        }
+        engine.clearInterrupt()
+    }
+    userInterruptDedicated.close(5_000L)
+    check(interruptObserved.get()) { "Kotlin user interrupt preserved across jobs" }
 }
