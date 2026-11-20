@@ -271,7 +271,8 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
       state = .closing
       let currentEngine = engine
       let loop = runLoop
-      if isExecutingJob {
+      let isForeignCaller = Thread.current !== thread
+      if isForeignCaller && isExecutingJob {
         _ = currentEngine?.requestInterrupt()
         shutdownInterruptedJob = true
       }
@@ -288,7 +289,8 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
       try throwShutdownErrorIfPresent()
     case .closing:
       let currentEngine = engine
-      if isExecutingJob && !shutdownInterruptedJob {
+      let isForeignCaller = Thread.current !== thread
+      if isForeignCaller && isExecutingJob && !shutdownInterruptedJob {
         _ = currentEngine?.requestInterrupt()
         shutdownInterruptedJob = true
       }
