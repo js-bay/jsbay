@@ -333,6 +333,14 @@ pub fn Module(comptime Host: type) type {
                     return true;
                 };
                 const id = std.fmt.parseInt(u32, raw, 10) catch 0;
+                if (@hasDecl(debugger_mod, "scriptSourceLengthById")) {
+                    if (debugger_mod.scriptSourceLengthById(state.instance_id, id)) |source_len| {
+                        if (source_len > state.transport.maxMessageBytes()) {
+                            json_writer.sendError(state, session_id, request_id, -32000, "Script source is too large to send");
+                            return true;
+                        }
+                    }
+                }
                 const script = debugger_mod.scriptById(state.instance_id, id) orelse {
                     json_writer.sendInvalidParams(state, session_id, request_id, "scriptId");
                     return true;

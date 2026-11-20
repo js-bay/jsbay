@@ -28,6 +28,11 @@ pub fn Module(comptime Host: type) type {
         // Transport event handler
         // ---------------------------------------------------------------------------
 
+        pub fn deliveryObserver(ctx: ?*anyopaque, session_id: transport_mod.SessionId) void {
+            const state: *InspectorState = @ptrCast(@alignCast(ctx.?));
+            native_cdp.deliveryComplete(state, session_id);
+        }
+
         pub fn transportEventHandler(ctx: ?*anyopaque, event: transport_mod.Event) void {
             const state: *InspectorState = @ptrCast(@alignCast(ctx.?));
             // A host may synchronously call inspector.stop from sendText while handling this event. Hold a state lease and mark the callback as owner work so teardown waits for every use below to return.
