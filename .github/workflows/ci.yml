@@ -95,7 +95,7 @@ jobs:
           zig build test-tools --summary all
           bash tests/native_prefix_stamp_test.sh
           bash tests/ci/swift-package-tag-test.sh
-          node --test tests/ci/github-release-test.mjs
+          node --test tests/ci/github-release-test.mjs tests/ci/npm-visibility-test.mjs
 
       - name: Check generated CDP protocols
         run: node scripts/generate-cdp-protocol.mjs --fetch --check

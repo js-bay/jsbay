@@ -4,6 +4,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 backend=${1:?expected npm backend}
 version=${2:?expected release version}
+registry=${NPM_REGISTRY:-https://registry.npmjs.org}
 platform=${3:?expected Node platform}
 arch=${4:?expected Node architecture}
 [[ $backend == quickjs || $backend == quickjsng || $backend == jsc ]]
@@ -15,7 +16,8 @@ trap 'rm -rf "$work"' EXIT
 cd "$work"
 printf '%s\n' '{"name":"jsbay-public-consumer","private":true}' > package.json
 : > .npmrc
-npm install --registry https://registry.npmjs.org --userconfig "$work/.npmrc" --cache "$work/cache" \
+node "$root/tests/node-sdk/wait-for-published-npm.mjs" "$version" "$work/npm-cache" "$work/.npmrc" "@jsbay/$backend"
+npm install --registry "$registry" --userconfig "$work/.npmrc" --cache "$work/npm-cache" --prefer-offline \
     --include=optional --ignore-scripts --no-audit --no-fund --save-exact "@jsbay/$backend@$version"
 
 JSBAY_NODE_PACKAGE_ROOT="$work/package.json" JSBAY_NODE_PACKAGE="@jsbay/$backend" JSBAY_NODE_PUBLIC_VERSION="$version" \
