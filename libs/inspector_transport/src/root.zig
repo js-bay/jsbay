@@ -18,6 +18,7 @@ const socket = @import("portable_socket");
 
 // A callback can request destruction of its transport. Its own socket worker must unwind before the transport can be released.
 threadlocal var callback_transport: ?*Transport = null;
+threadlocal var delivery_callback_transport: ?*Transport = null;
 
 const FrameDeadline = struct {
     stall_timeout_ms: i64,
@@ -142,6 +143,7 @@ const OutboundKind = enum { text, pong, close };
 const Outbound = struct {
     kind: OutboundKind,
     bytes: []u8,
+    delivery_token: u64 = 0,
 };
 
 const Session = struct {
@@ -200,7 +202,7 @@ const Session = struct {
         self.stream.shutdownBoth();
     }
 
-    fn enqueue(self: *Session, kind: OutboundKind, bytes: []const u8, close_on_reject: bool) bool {
+    fn enqueue(self: *Session, kind: OutboundKind, bytes: []const u8, close_on_reject: bool, delivery_token: u64) bool {
         self.queue_mu.lock();
         if (!self.accepting or self.closed.load(.acquire)) {
             self.queue_mu.unlock();
@@ -235,7 +237,7 @@ const Session = struct {
             self.queue_mu.unlock();
             return false;
         };
-        self.queue.append(self.allocator, .{ .kind = kind, .bytes = copy }) catch {
+        self.queue.append(self.allocator, .{ .kind = kind, .bytes = copy, .delivery_token = delivery_token }) catch {
             self.allocator.free(copy);
             self.queue_mu.unlock();
             return false;
@@ -336,7 +338,8 @@ pub const Transport = struct {
     target_set: bool = false,
     /// Borrowed protocol document. It must outlive this transport.
     protocol_json: []const u8 = "{}",
-    delivery_observer: ?*const fn (?*anyopaque, SessionId) void = null,
+    delivery_mu: zev.Mutex = .{},
+    delivery_observer: ?*const fn (?*anyopaque, SessionId, u64) void = null,
     delivery_observer_ctx: ?*anyopaque = null,
 
     pub const Options = struct {
@@ -425,6 +428,7 @@ pub const Transport = struct {
         self.sessions.deinit(alloc);
         self.workers_changed.deinit();
         self.workers_mu.deinit();
+        self.delivery_mu.deinit();
         self.sessions_mu.deinit();
         alloc.free(self.target_title);
         alloc.free(self.target_kind);
@@ -500,9 +504,13 @@ pub const Transport = struct {
     }
 
     pub fn sendText(self: *Transport, session: SessionId, message: []const u8) bool {
+        return self.sendTrackedText(session, message, 0);
+    }
+
+    pub fn sendTrackedText(self: *Transport, session: SessionId, message: []const u8, token: u64) bool {
         const sess = self.lookupSession(session) orelse return false;
         defer sess.release();
-        return sess.enqueue(.text, message, true);
+        return sess.enqueue(.text, message, true, token);
     }
 
     pub fn broadcastText(self: *Transport, message: []const u8) void {
@@ -523,7 +531,7 @@ pub const Transport = struct {
 
         // Socket I/O happens only on session writers.
         for (snapshot) |sess| {
-            _ = sess.enqueue(.text, message, true);
+            _ = sess.enqueue(.text, message, true, 0);
         }
     }
 
@@ -999,9 +1007,9 @@ fn writerLoop(sess: *Session) void {
             sess.queue_mu.lock();
             sess.large_message_in_flight = false;
             sess.queue_mu.unlock();
-            if (sess.transport.delivery_observer) |obs| {
-                obs(sess.transport.delivery_observer_ctx, sess.id);
-            }
+        }
+        if (ok and frame.delivery_token != 0) {
+            notifyDelivery(sess.transport, sess.id, frame.delivery_token);
         }
         if (!ok or close_after) {
             sess.requestClose();
@@ -1145,7 +1153,7 @@ fn readLoop(sess: *Session) !bool {
                 return true;
             },
             0x9 => { // ping
-                _ = sess.enqueue(.pong, payload, true);
+                _ = sess.enqueue(.pong, payload, true, 0);
             },
             0xA => { // pong — ignore
             },
@@ -1178,6 +1186,7 @@ const transport_vtable: inspector.Transport.VTable = .{
     .start = interfaceStart,
     .deinit = interfaceDeinit,
     .send_text = interfaceSendText,
+    .send_text_tracked = interfaceSendTrackedText,
     .broadcast_text = interfaceBroadcastText,
     .close_session = interfaceCloseSession,
     .set_discovery_target = interfaceSetDiscoveryTarget,
@@ -1227,8 +1236,30 @@ fn interfaceMaxBacklogBytes(ctx: *anyopaque) usize {
     return interfaceSelf(ctx).max_backlog_bytes;
 }
 
-fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId) void) void {
+fn interfaceSendTrackedText(ctx: *anyopaque, session: SessionId, message: []const u8, token: u64) bool {
+    return interfaceSelf(ctx).sendTrackedText(session, message, token);
+}
+
+fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId, u64) void) void {
     const self = interfaceSelf(ctx);
-    self.delivery_observer_ctx = observer_ctx;
+    const in_callback = delivery_callback_transport == self;
+    if (!in_callback) self.delivery_mu.lock();
+    defer if (!in_callback) self.delivery_mu.unlock();
+    self.delivery_observer_ctx = if (observer != null) observer_ctx else null;
     self.delivery_observer = observer;
+}
+
+fn notifyDelivery(self: *Transport, session: SessionId, token: u64) void {
+    self.delivery_mu.lock();
+    defer self.delivery_mu.unlock();
+    const callback = self.delivery_observer orelse return;
+    const previous_callback_transport = callback_transport;
+    const previous_delivery_transport = delivery_callback_transport;
+    callback_transport = self;
+    delivery_callback_transport = self;
+    defer {
+        delivery_callback_transport = previous_delivery_transport;
+        callback_transport = previous_callback_transport;
+    }
+    callback(self.delivery_observer_ctx, session, token);
 }

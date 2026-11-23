@@ -283,6 +283,141 @@ const Opened = struct {
     }
 };
 
+const Delivery = struct {
+    token: std.atomic.Value(u64) = .init(0),
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+        const self: *Delivery = @ptrCast(@alignCast(ctx.?));
+        self.token.store(token, .release);
+        _ = self.calls.fetchAdd(1, .acq_rel);
+    }
+};
+
+const SelfUnregisteringDelivery = struct {
+    transport_ptr: *transport.Transport,
+    token: std.atomic.Value(u64) = .init(0),
+
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+        const self: *SelfUnregisteringDelivery = @ptrCast(@alignCast(ctx.?));
+        self.transport_ptr.asTransport().setDeliveryObserver(null, null);
+        self.token.store(token, .release);
+    }
+};
+
+const DestroyingDelivery = struct {
+    transport_ptr: *transport.Transport,
+    completed: std.atomic.Value(bool) = .init(false),
+
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, _: u64) void {
+        const self: *DestroyingDelivery = @ptrCast(@alignCast(ctx.?));
+        self.transport_ptr.asTransport().setDeliveryObserver(null, null);
+        self.transport_ptr.deinit();
+        self.completed.store(true, .release);
+    }
+};
+
+test "transport: tracked delivery reports its token regardless of local backlog threshold" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    var delivery = Delivery{};
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 * 1024 });
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "tracked-delivery-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, Delivery.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "tracked-delivery-peer");
+    const session = opened.wait(1);
+
+    try testing.expect(t.sendTrackedText(session, "tracked-small-frame", 41));
+    const tracked = try readTextFrame(alloc, peer);
+    defer alloc.free(tracked);
+    try testing.expectEqualStrings("tracked-small-frame", tracked);
+    var attempts: usize = 0;
+    while (delivery.calls.load(.acquire) < 1 and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expectEqual(@as(u64, 41), delivery.token.load(.acquire));
+
+    const ordinary_large = try alloc.alloc(u8, 600 * 1024);
+    defer alloc.free(ordinary_large);
+    @memset(ordinary_large, 'o');
+    try testing.expect(t.sendText(session, ordinary_large));
+    const received = try readTextFrame(alloc, peer);
+    defer alloc.free(received);
+    try testing.expectEqualSlices(u8, ordinary_large, received);
+    try testing.expect(t.sendTrackedText(session, "tracked-sentinel", 42));
+    const sentinel = try readTextFrame(alloc, peer);
+    defer alloc.free(sentinel);
+    try testing.expectEqualStrings("tracked-sentinel", sentinel);
+    attempts = 0;
+    while (delivery.calls.load(.acquire) < 2 and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expectEqual(@as(usize, 2), delivery.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 42), delivery.token.load(.acquire));
+}
+
+test "transport: delivery observer can unregister itself while completing a frame" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
+    defer t.deinit();
+    var delivery = SelfUnregisteringDelivery{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "self-unregister-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, SelfUnregisteringDelivery.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "self-unregister-peer");
+    const session = opened.wait(1);
+
+    try testing.expect(t.sendTrackedText(session, "first-tracked-frame", 73));
+    const first = try readTextFrame(alloc, peer);
+    defer alloc.free(first);
+    try testing.expectEqualStrings("first-tracked-frame", first);
+    var attempts: usize = 0;
+    while (delivery.token.load(.acquire) == 0 and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expectEqual(@as(u64, 73), delivery.token.load(.acquire));
+
+    try testing.expect(t.sendTrackedText(session, "second-tracked-frame", 74));
+    const second = try readTextFrame(alloc, peer);
+    defer alloc.free(second);
+    try testing.expectEqualStrings("second-tracked-frame", second);
+    try testing.expectEqual(@as(u64, 73), delivery.token.load(.acquire));
+}
+
+test "transport: delivery observer can defer transport destruction until its worker exits" {
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(std.heap.page_allocator, 0);
+    var delivery = DestroyingDelivery{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "self-destroy-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, DestroyingDelivery.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "self-destroy-peer");
+    const session = opened.wait(1);
+
+    try testing.expect(t.sendTrackedText(session, "destroy-after-delivery", 91));
+    const received = try readTextFrame(std.heap.page_allocator, peer);
+    defer std.heap.page_allocator.free(received);
+    try testing.expectEqualStrings("destroy-after-delivery", received);
+    var attempts: usize = 0;
+    while (!delivery.completed.load(.acquire) and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expect(delivery.completed.load(.acquire));
+
+    var byte: [1]u8 = undefined;
+    while (try peer.read(&byte) != 0) {}
+}
+
 /// Records only sockets that finished connect so deferred cleanup never closes an uninitialized handle.
 const PeerList = struct {
     items: [32]Stream = undefined,
@@ -764,7 +899,7 @@ test "transport: second large message is rejected while first large message is i
     const session = opened.wait(1);
 
     try peer.setReceiveBuffer(4096);
-    const large1 = try alloc.alloc(u8, 512 * 1024);
+    const large1 = try alloc.alloc(u8, 1500 * 1024);
     defer alloc.free(large1);
     @memset(large1, 'a');
 

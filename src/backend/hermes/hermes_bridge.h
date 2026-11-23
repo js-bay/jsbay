@@ -35,7 +35,7 @@ void *hermes_context_get_opaque(JsbayHermesContext *ctx);
 
 /* Hermes CDPAgent bridge. Start and stop run on the engine owner thread; session and command admission are thread-safe. Every accepted runtime task calls exactly one of run or cancel. */
 typedef bool (*HermesInspectorEmitFn)(uint64_t session_id, const char *json, size_t len,
-                                      void *user_data);
+                                      uint64_t delivery_token, void *user_data);
 typedef void (*HermesInspectorCloseFn)(uint64_t session_id, void *user_data);
 typedef bool (*HermesInspectorEnqueueFn)(void (*run)(void *), void (*cancel)(void *),
                                          void *task_data, void *user_data);
@@ -63,7 +63,8 @@ bool hermes_inspector_session_open(JsbayHermesInspector *inspector, uint64_t ses
 bool hermes_inspector_message(JsbayHermesInspector *inspector, uint64_t session_id,
                               const char *json, size_t len);
 void hermes_inspector_session_close(JsbayHermesInspector *inspector, uint64_t session_id);
-void jsbay_hermes_inspector_delivery_complete(JsbayHermesInspector *inspector, uint64_t session_id);
+void jsbay_hermes_inspector_delivery_complete(JsbayHermesInspector *inspector, uint64_t session_id,
+                                              uint64_t delivery_token);
 void jsbay_hermes_inspector_set_delivery_observer(JsbayHermesInspector *inspector, bool observed);
 void hermes_inspector_close_sessions(JsbayHermesInspector *inspector);
 void hermes_inspector_stop(JsbayHermesInspector *inspector);

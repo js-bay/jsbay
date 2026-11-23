@@ -1323,7 +1323,7 @@ async function main() {
     );
 
     if (opts.typedConsole) {
-      await runStep('native Runtime re-enable and source limit', async () => {
+      await runStep('native Runtime re-enable and large source delivery', async () => {
         disp.sendCommand(30, 'Runtime.disable', {});
         const disabled = await disp.awaitReply(30, timeoutMs, 'native-runtime-disable');
         if (disabled.error) throw new E2EError('native-runtime-disable', JSON.stringify(disabled));
@@ -1334,20 +1334,26 @@ async function main() {
         await context;
 
         const parsed = disp.awaitEvent(message => message.method === 'Debugger.scriptParsed' && message.params?.url === 'cdp-large-native-source.js', timeoutMs, 'large-native-script');
-        disp.sendCommand(32, 'Runtime.evaluate', { expression: `globalThis.__cdpLargeSource = 42;\n/*${'x'.repeat(96 * 1024)}*/\n//# sourceURL=cdp-large-native-source.js` });
+        const expression = `globalThis.__cdpLargeSource = 42;\n/*${'x'.repeat(9 * 1024 * 1024)}*/\n//# sourceURL=cdp-large-native-source.js`;
+        disp.sendCommand(32, 'Runtime.evaluate', { expression });
         const evaluated = await disp.awaitReply(32, timeoutMs, 'large-native-evaluate');
-        if (evaluated.error || evaluated.result?.result?.value !== 42) {
-          throw new E2EError('large-native-evaluate', JSON.stringify(evaluated));
+        if (evaluated.result?.result?.value !== 42) throw new E2EError('large-native-evaluate', JSON.stringify(evaluated));
+
+        const scriptId = (await parsed).params.scriptId;
+        const peer = await wsHandshake(host, port, wsPath, timeoutMs);
+        const reader = makeDispatcher(peer.client);
+        try {
+          for (const id of [33, 34]) {
+            reader.sendCommand(id, 'Debugger.getScriptSource', { scriptId });
+            const reply = await reader.awaitReply(id, timeoutMs, 'large-native-source');
+            if (reply.result?.scriptSource !== expression) throw new E2EError('large-native-source', 'Expected the full script on both requests');
+          }
+        } finally {
+          reader.stop();
+          peer.client.sendClose(1000, 'source-read');
+          peer.socket.destroy();
         }
-        disp.sendCommand(33, 'Debugger.getScriptSource', { scriptId: (await parsed).params.scriptId });
-        const source = await disp.awaitReply(33, timeoutMs, 'large-native-source-limit');
-        if (!source.error) throw new E2EError('large-native-source-limit', 'Oversized source did not return an explicit error');
-        disp.sendCommand(34, 'Runtime.evaluate', { expression: '6 * 7' });
-        const afterLimit = await disp.awaitReply(34, timeoutMs, 'native-after-source-limit');
-        if (afterLimit.error || afterLimit.result?.result?.value !== 42) {
-          throw new E2EError('native-after-source-limit', JSON.stringify(afterLimit));
-        }
-        ok('native Runtime re-enable and explicit source limit error');
+        ok('fresh native session reads the complete large source twice');
       }, 'native-runtime-limits');
     }
 

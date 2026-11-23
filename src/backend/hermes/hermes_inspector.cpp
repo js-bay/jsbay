@@ -133,18 +133,20 @@ struct JsbayHermesInspector {
         uint64_t session_id;
         std::string json;
         std::optional<long long> response_id;
-        bool is_large = false;
-        bool is_fallback = false;
+        size_t charged_bytes = 0;
+        uint64_t delivery_token = 0;
     };
     struct OutboundState {
         size_t bytes = 0;
         size_t messages = 0;
         bool large_message_in_flight = false;
+        uint64_t large_message_seq = 0;
     };
     std::mutex outbound_mutex;
     std::condition_variable outbound_cv;
     std::deque<OutboundMessage> outbound;
     std::unordered_map<uint64_t, OutboundState> outbound_sessions;
+    uint64_t outbound_sequence = 0;
     uint64_t terminal_generation = 0;
     bool terminal_pending = false;
     bool outbound_open = true;
@@ -185,6 +187,28 @@ static void discardOutboundSession(JsbayHermesInspector *inspector, uint64_t ses
             ++it;
     }
     inspector->outbound_sessions.erase(state);
+}
+
+static uint64_t reserveLargeMessage(JsbayHermesInspector *inspector,
+                                    JsbayHermesInspector::OutboundState &state) {
+    ++inspector->outbound_sequence;
+    if (inspector->outbound_sequence == 0)
+        ++inspector->outbound_sequence;
+    state.large_message_seq = inspector->outbound_sequence;
+    state.large_message_in_flight = true;
+    return state.large_message_seq;
+}
+
+static void releaseLargeMessage(JsbayHermesInspector *inspector, uint64_t session_id,
+                                uint64_t delivery_token) {
+    if (delivery_token == 0)
+        return;
+    std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
+    const auto state = inspector->outbound_sessions.find(session_id);
+    if (state != inspector->outbound_sessions.end() &&
+        state->second.large_message_seq == delivery_token) {
+        state->second.large_message_in_flight = false;
+    }
 }
 
 // This only marks a terminal close. The separate sender calls the host without holding Hermes' outbound callback mutex, so releasing the last agent cannot recursively lock it.
@@ -234,7 +258,8 @@ static std::optional<uint64_t> takeTerminalSession(JsbayHermesInspector *inspect
 static bool enqueueOutbound(JsbayHermesInspector *inspector, uint64_t session_id,
                             std::string json,
                             std::optional<long long> response_id = std::nullopt,
-                            bool pre_reserved = false) {
+                            bool is_fallback = false,
+                            uint64_t reserved_seq = 0) {
     bool close_session = false;
     try {
         std::shared_ptr<JsbayHermesInspector::Metadata> metadata;
@@ -254,39 +279,45 @@ static bool enqueueOutbound(JsbayHermesInspector *inspector, uint64_t session_id
         const size_t max_msg = inspector->max_outbound_message_bytes;
         const size_t max_backlog = inspector->max_outbound_backlog_bytes;
         if (json.size() > max_msg) {
-            if (response_id && json.find("\"error\":") != std::string::npos) {
+            if (!response_id) {
                 close_session = true;
-            }
-        } else {
-            auto &state = inspector->outbound_sessions[session_id];
-            const bool is_large = json.size() > max_backlog;
-            const bool is_fallback = json.size() <= 256 && json.find("\"error\":") != std::string::npos;
-            if (state.messages >= kMaxOutboundMessages) {
-                close_session = true;
-            } else if (is_fallback) {
-                state.messages += 1;
-                inspector->outbound.push_back({session_id, std::move(json), response_id, false, true});
-                inspector->outbound_cv.notify_one();
-                return true;
-            } else if (is_large) {
-                if (!pre_reserved && (state.large_message_in_flight || state.bytes > max_backlog)) {
-                    return false;
-                }
-                state.large_message_in_flight = true;
-                state.messages += 1;
-                inspector->outbound.push_back({session_id, std::move(json), response_id, true, false});
-                inspector->outbound_cv.notify_one();
-                return true;
             } else {
-                if (json.size() > max_backlog - state.bytes) {
+                char fallback[128];
+                const int len = snprintf(fallback, sizeof(fallback),
+                    "{\"id\":%lld,\"error\":{\"code\":-32000,\"message\":\"Message is too large\"}}",
+                    *response_id);
+                if (len <= 0 || static_cast<size_t>(len) >= sizeof(fallback) ||
+                    static_cast<size_t>(len) > max_msg) {
                     close_session = true;
                 } else {
-                    state.bytes += json.size();
-                    state.messages += 1;
-                    inspector->outbound.push_back({session_id, std::move(json), response_id, false, false});
-                    inspector->outbound_cv.notify_one();
-                    return true;
+                    std::string bounded_fallback(fallback, static_cast<size_t>(len));
+                    json.swap(bounded_fallback);
+                    is_fallback = true;
                 }
+            }
+        }
+        if (!close_session) {
+            auto &state = inspector->outbound_sessions[session_id];
+            const bool is_large = !is_fallback && json.size() > max_backlog;
+            const size_t charged_bytes = (is_fallback || is_large) ? 0 : json.size();
+            if (state.messages >= kMaxOutboundMessages) {
+                close_session = true;
+            } else if (charged_bytes > max_backlog || state.bytes > max_backlog - charged_bytes) {
+                close_session = true;
+            } else if (is_large && reserved_seq != 0 &&
+                       (!state.large_message_in_flight || state.large_message_seq != reserved_seq)) {
+                return false;
+            } else if (is_large && reserved_seq == 0 && state.large_message_in_flight) {
+                return false;
+            } else {
+                inspector->outbound.push_back({session_id, std::move(json), response_id,
+                                               charged_bytes, reserved_seq});
+                state.bytes += charged_bytes;
+                state.messages += 1;
+                if (is_large && reserved_seq == 0)
+                    inspector->outbound.back().delivery_token = reserveLargeMessage(inspector, state);
+                inspector->outbound_cv.notify_one();
+                return true;
             }
         }
     } catch (...) {
@@ -297,11 +328,29 @@ static bool enqueueOutbound(JsbayHermesInspector *inspector, uint64_t session_id
     return false;
 }
 
+static bool enqueueFallbackError(JsbayHermesInspector *inspector, uint64_t session_id,
+                                 long long request_id, const char *message) {
+    char fallback[192];
+    const int len = snprintf(fallback, sizeof(fallback),
+        "{\"id\":%lld,\"error\":{\"code\":-32000,\"message\":\"%s\"}}",
+        request_id, message);
+    if (len <= 0 || static_cast<size_t>(len) >= sizeof(fallback) ||
+        static_cast<size_t>(len) > inspector->max_outbound_message_bytes) {
+        return false;
+    }
+    try {
+        return enqueueOutbound(inspector, session_id,
+                               std::string(fallback, static_cast<size_t>(len)), request_id, true);
+    } catch (...) {
+        return false;
+    }
+}
+
 static void runOutboundSender(JsbayHermesInspector *inspector) {
     for (;;) {
         try {
             JsbayHermesInspector::OutboundMessage message;
-            bool is_large = false;
+            uint64_t delivery_token = 0;
             {
                 std::unique_lock<std::mutex> lock(inspector->outbound_mutex);
                 inspector->outbound_cv.wait(lock, [inspector] {
@@ -324,29 +373,23 @@ static void runOutboundSender(JsbayHermesInspector *inspector) {
                 }
                 message = std::move(inspector->outbound.front());
                 inspector->outbound.pop_front();
-                is_large = message.is_large;
                 const auto state = inspector->outbound_sessions.find(message.session_id);
                 if (state != inspector->outbound_sessions.end()) {
-                    if (!message.is_large && !message.is_fallback) {
-                        if (state->second.bytes >= message.json.size()) {
-                            state->second.bytes -= message.json.size();
-                        } else {
-                            state->second.bytes = 0;
-                        }
+                    if (state->second.bytes >= message.charged_bytes) {
+                        state->second.bytes -= message.charged_bytes;
+                    } else {
+                        state->second.bytes = 0;
                     }
                     if (state->second.messages > 0) {
                         state->second.messages -= 1;
                     }
                 }
             }
+            delivery_token = message.delivery_token;
             const bool emit_ok = inspector->emit(message.session_id, message.json.data(),
-                                                 message.json.size(), inspector->user_data);
-            if (is_large && (!emit_ok || !inspector->delivery_observed.load())) {
-                std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
-                const auto state = inspector->outbound_sessions.find(message.session_id);
-                if (state != inspector->outbound_sessions.end()) {
-                    state->second.large_message_in_flight = false;
-                }
+                                                 message.json.size(), delivery_token, inspector->user_data);
+            if (delivery_token != 0 && (!emit_ok || !inspector->delivery_observed.load())) {
+                releaseLargeMessage(inspector, message.session_id, delivery_token);
             }
             if (!emit_ok && message.response_id) {
                 const auto rid = *message.response_id;
@@ -360,8 +403,10 @@ static void runOutboundSender(JsbayHermesInspector *inspector) {
                 bool fallback_ok = false;
                 if (n > 0 && static_cast<size_t>(n) < sizeof(err_buf)) {
                     try {
-                        fallback_ok = inspector->emit(message.session_id, err_buf,
-                                                      static_cast<size_t>(n), inspector->user_data);
+                        if (static_cast<size_t>(n) <= inspector->max_outbound_message_bytes) {
+                            fallback_ok = inspector->emit(message.session_id, err_buf,
+                                                          static_cast<size_t>(n), 0, inspector->user_data);
+                        }
                     } catch (...) {
                     }
                 }
@@ -650,26 +695,10 @@ extern "C" bool hermes_inspector_session_open(JsbayHermesInspector *inspector,
                         ",\"origin\":\"\",\"name\":\"jsbay\",\"auxData\":{\"isDefault\":true}}}}";
                     enqueueOutbound(inspector, session_id, context, std::nullopt);
                 }
-                const auto reply_id = id;
-                const size_t reply_len = reply.size();
-                if (!enqueueOutbound(inspector, session_id, std::move(reply), reply_id)) {
-                    if (reply_id) {
-                        const char *msg = (reply_len > inspector->max_outbound_message_bytes)
-                                              ? "Message is too large to send"
-                                              : "Inspector transport is busy or disconnected";
-                        char err_buf[128];
-                        const int n = snprintf(
-                            err_buf, sizeof(err_buf),
-                            "{\"id\":%lld,\"error\":{\"code\":-32000,\"message\":\"%s\"}}",
-                            *reply_id, msg);
-                        if (n > 0 && static_cast<size_t>(n) < sizeof(err_buf)) {
-                            if (!enqueueOutbound(inspector, session_id, std::string(err_buf, n), reply_id)) {
-                                terminalizeSession(inspector, session_id);
-                            }
-                        } else {
-                            terminalizeSession(inspector, session_id);
-                        }
-                    }
+                if (!enqueueOutbound(inspector, session_id, std::move(reply), id) && id &&
+                    !enqueueFallbackError(inspector, session_id, *id,
+                                          "Inspector transport is busy or disconnected")) {
+                    terminalizeSession(inspector, session_id);
                 }
             } catch (...) {
                 terminalizeSession(inspector, session_id);
@@ -723,10 +752,8 @@ extern "C" bool hermes_inspector_message(JsbayHermesInspector *inspector, uint64
                     source_ptr = it->second;
             }
             if (!source_ptr) {
-                const std::string error = "{\"id\":" + std::to_string(*id) +
-                                          ",\"error\":{\"code\":-32000,\"message\":\"Source is "
-                                          "unavailable for this script id\"}}";
-                if (!enqueueOutbound(inspector, session_id, std::move(error), *id)) {
+                if (!enqueueFallbackError(inspector, session_id, *id,
+                                          "Source is unavailable for this script id")) {
                     terminalizeSession(inspector, session_id);
                 }
                 return true;
@@ -742,32 +769,36 @@ extern "C" bool hermes_inspector_message(JsbayHermesInspector *inspector, uint64
                 __builtin_add_overflow(*escaped_len, id_str.size(), &total_len) ||
                 __builtin_add_overflow(total_len, kEnvelopeFixed, &total_len);
             if (overflow || total_len > inspector->max_outbound_message_bytes) {
-                const std::string error = "{\"id\":" + id_str +
-                                          ",\"error\":{\"code\":-32000,\"message\":\"Script source is too large to send\"}}";
-                if (!enqueueOutbound(inspector, session_id, std::move(error), *id)) {
+                if (!enqueueFallbackError(inspector, session_id, *id,
+                                          "Script source is too large to send")) {
                     terminalizeSession(inspector, session_id);
                 }
                 return true;
             }
             bool is_busy = false;
+            uint64_t reserved_seq = 0;
             const bool is_large = total_len > inspector->max_outbound_backlog_bytes;
             {
+                std::lock_guard<std::mutex> session_lock(inspector->mutex);
+                const auto current_session = inspector->sessions.find(session_id);
+                if (current_session == inspector->sessions.end() || current_session->second != session)
+                    return true;
+                std::lock_guard<std::mutex> metadata_lock(session->metadata->mutex);
+                if (session->metadata->terminal)
+                    return true;
                 std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
-                const auto it = inspector->outbound_sessions.find(session_id);
-                if (it != inspector->outbound_sessions.end()) {
-                    if (it->second.messages >= kMaxOutboundMessages ||
-                        (is_large && (it->second.large_message_in_flight ||
-                                      it->second.bytes > inspector->max_outbound_backlog_bytes))) {
-                        is_busy = true;
-                    } else if (is_large) {
-                        it->second.large_message_in_flight = true;
-                    }
+                auto &state = inspector->outbound_sessions[session_id];
+                if (state.messages >= kMaxOutboundMessages ||
+                    (is_large && (state.large_message_in_flight ||
+                                  state.bytes > inspector->max_outbound_backlog_bytes))) {
+                    is_busy = true;
+                } else if (is_large) {
+                    reserved_seq = reserveLargeMessage(inspector, state);
                 }
             }
             if (is_busy) {
-                const std::string error = "{\"id\":" + id_str +
-                                          ",\"error\":{\"code\":-32000,\"message\":\"Inspector transport is busy or disconnected\"}}";
-                if (!enqueueOutbound(inspector, session_id, std::move(error), *id)) {
+                if (!enqueueFallbackError(inspector, session_id, *id,
+                                          "Inspector transport is busy or disconnected")) {
                     terminalizeSession(inspector, session_id);
                 }
                 return true;
@@ -781,27 +812,17 @@ extern "C" bool hermes_inspector_message(JsbayHermesInspector *inspector, uint64
                 appendJsonQuoted(response, *source_ptr);
                 response += "}}";
             } catch (...) {
-                if (is_large) {
-                    std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
-                    const auto it = inspector->outbound_sessions.find(session_id);
-                    if (it != inspector->outbound_sessions.end()) {
-                        it->second.large_message_in_flight = false;
-                    }
-                }
-                terminalizeSession(inspector, session_id);
+                if (is_large) releaseLargeMessage(inspector, session_id, reserved_seq);
+                const bool queued = enqueueFallbackError(inspector, session_id, *id,
+                    "Unable to allocate script source response");
+                if (!queued) terminalizeSession(inspector, session_id);
                 return true;
             }
-            if (!enqueueOutbound(inspector, session_id, std::move(response), *id, is_large)) {
-                if (is_large) {
-                    std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
-                    const auto it = inspector->outbound_sessions.find(session_id);
-                    if (it != inspector->outbound_sessions.end()) {
-                        it->second.large_message_in_flight = false;
-                    }
-                }
-                const std::string error = "{\"id\":" + id_str +
-                                          ",\"error\":{\"code\":-32000,\"message\":\"Inspector transport is busy or disconnected\"}}";
-                if (!enqueueOutbound(inspector, session_id, std::move(error), *id)) {
+            if (!enqueueOutbound(inspector, session_id, std::move(response), *id, false,
+                                 reserved_seq)) {
+                if (is_large) releaseLargeMessage(inspector, session_id, reserved_seq);
+                if (!enqueueFallbackError(inspector, session_id, *id,
+                                          "Inspector transport is busy or disconnected")) {
                     terminalizeSession(inspector, session_id);
                 }
             }
@@ -980,17 +1001,13 @@ extern "C" void hermes_inspector_source_end(JsbayHermesContext *ctx) {
 }
 
 extern "C" void jsbay_hermes_inspector_delivery_complete(JsbayHermesInspector *inspector,
-                                                        uint64_t session_id) {
+                                                        uint64_t session_id, uint64_t delivery_token) {
     if (!inspector)
         return;
     std::lock_guard<std::mutex> live_lock(g_live_inspectors_mutex);
     if (g_live_inspectors.find(inspector) == g_live_inspectors.end())
         return;
-    std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
-    const auto state = inspector->outbound_sessions.find(session_id);
-    if (state != inspector->outbound_sessions.end()) {
-        state->second.large_message_in_flight = false;
-    }
+    releaseLargeMessage(inspector, session_id, delivery_token);
 }
 
 extern "C" void jsbay_hermes_inspector_set_delivery_observer(JsbayHermesInspector *inspector,

@@ -87,7 +87,7 @@ pub fn Module(comptime Host: type) type {
             return true;
         }
 
-        fn emit(session_id: u64, json: [*]const u8, len: usize, user: ?*anyopaque) callconv(.c) bool {
+        fn emit(session_id: u64, json: [*]const u8, len: usize, token: u64, user: ?*anyopaque) callconv(.c) bool {
             const state: *InspectorState = @ptrCast(@alignCast(user.?));
             if (!state_mod.tryAcquireStateLease(state)) return false;
             var frame: Host.dispatch.TaskOwnerFrame = undefined;
@@ -97,7 +97,7 @@ pub fn Module(comptime Host: type) type {
                 state_mod.releaseStateLease(state);
             }
             if (state_mod.hasSession(state, session_id)) {
-                return state.transport.sendText(session_id, json[0..len]);
+                return state.transport.sendTrackedText(session_id, json[0..len], token);
             }
             return false;
         }
@@ -119,9 +119,6 @@ pub fn Module(comptime Host: type) type {
             if (comptime !enabled) return true;
             const ctx = Host.engine.getContext(state.instance_id) orelse return false;
             state.native_debugger = api.hermes_inspector_start(ctx, state.instance_id, emit, close, enqueue, state, parseMessage, state.transport.maxMessageBytes(), state.transport.maxBacklogBytes()) orelse return false;
-            if (state.transport.vtable.set_delivery_observer != null) {
-                api.jsbay_hermes_inspector_set_delivery_observer(@ptrCast(state.native_debugger), true);
-            }
             return true;
         }
 
@@ -142,10 +139,10 @@ pub fn Module(comptime Host: type) type {
             api.hermes_inspector_session_close(@ptrCast(state.native_debugger), session_id);
         }
 
-        pub fn deliveryComplete(state: *InspectorState, session_id: u64) void {
+        pub fn deliveryComplete(state: *InspectorState, session_id: u64, token: u64) void {
             if (comptime !enabled) return;
             if (state.native_debugger) |native| {
-                api.jsbay_hermes_inspector_delivery_complete(@ptrCast(native), session_id);
+                api.jsbay_hermes_inspector_delivery_complete(@ptrCast(native), session_id, token);
             }
         }
 

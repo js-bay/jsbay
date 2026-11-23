@@ -186,7 +186,7 @@ pub fn Module(comptime Host: type) type {
             transport_started = true;
             errdefer rollbackStart(state);
             transport.setDeliveryObserver(state, dispatcher.deliveryObserver);
-            native_cdp.setDeliveryObserver(state, state.transport.vtable.set_delivery_observer != null);
+            native_cdp.setDeliveryObserver(state, transport.supportsTrackedDelivery());
             transport.start(state, dispatcher.transportEventHandler) catch {
                 return StartError.TransportStartFailed;
             };
@@ -250,15 +250,15 @@ pub fn Module(comptime Host: type) type {
             releaseInspector(state);
         }
 
-        /// A transport is permitted to synchronously report its final close while `deinit` runs. Reject task creation first, then release any leases that callback created before the start errdefers unlink and destroy the state.
+        /// Close admission and drain active callbacks before releasing the transport and the native debugger after a failed start.
         fn rollbackStart(state: *InspectorState) void {
             state_mod.beginClosing(state);
             native_cdp.closeSessions(state);
-            state.transport.deinit();
             debugger_cdp.stopInstance(state);
             await_promise.cancelState(state);
             dispatch.releaseTasksForOwner(state.instance_id, state);
             state_mod.waitForTasks(state);
+            closeTransport(state);
         }
 
         fn drainRetiredTask(ctx: ?*anyopaque) void {
@@ -275,6 +275,7 @@ pub fn Module(comptime Host: type) type {
                 return;
             }
             defer engine_thread.endEval(lease);
+            closeTransport(state);
             native_cdp.stop(state);
             // Finalization runs on the JS owner after all session/reader work has drained, so disarming here cannot race a new state with the same id.
             debugger_cdp.stopInstance(state);
@@ -303,15 +304,20 @@ pub fn Module(comptime Host: type) type {
             });
         }
 
+        fn closeTransport(state: *InspectorState) void {
+            if (state.transport_closed) return;
+            state.transport.setDeliveryObserver(state, null);
+            native_cdp.setDeliveryObserver(state, false);
+            state.transport.deinit();
+            state.transport_closed = true;
+        }
+
         fn closeNonJsResources(state: *InspectorState) void {
             if (!state.profiler_stopped) {
                 profiler.stopInstance(state.instance_id);
                 state.profiler_stopped = true;
             }
-            if (!state.transport_closed) {
-                state.transport.deinit();
-                state.transport_closed = true;
-            }
+            closeTransport(state);
             if (!state.console_buffer_freed) {
                 state_mod.deinitConsoleBuffer(state);
                 state.console_buffer_freed = true;

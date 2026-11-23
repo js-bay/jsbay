@@ -28,7 +28,7 @@ pub extern fn hermes_context_new(rt: ?*Runtime) ?*Context;
 pub extern fn hermes_context_free(ctx: ?*Context) void;
 pub extern fn hermes_context_set_opaque(ctx: ?*Context, opaque_ptr: ?*anyopaque) void;
 pub extern fn hermes_context_get_opaque(ctx: ?*Context) ?*anyopaque;
-pub const InspectorEmitFn = *const fn (session_id: u64, json: [*]const u8, len: usize, user_data: ?*anyopaque) callconv(.c) bool;
+pub const InspectorEmitFn = *const fn (session_id: u64, json: [*]const u8, len: usize, delivery_token: u64, user_data: ?*anyopaque) callconv(.c) bool;
 pub const InspectorCloseFn = *const fn (session_id: u64, user_data: ?*anyopaque) callconv(.c) void;
 pub const InspectorEnqueueFn = *const fn (run: *const fn (?*anyopaque) callconv(.c) void, cancel: *const fn (?*anyopaque) callconv(.c) void, task_data: ?*anyopaque, user_data: ?*anyopaque) callconv(.c) bool;
 pub const InspectorMessageInfo = extern struct { id: i64, flags: u32, method: ?[*]const u8, method_len: usize, script_id: ?[*]const u8, script_id_len: usize, expression: ?[*]const u8, expression_len: usize };
@@ -38,7 +38,7 @@ pub extern fn hermes_inspector_start(ctx: ?*Context, instance_id: i32, emit: ?In
 pub extern fn hermes_inspector_session_open(inspector: ?*Inspector, session_id: u64) bool;
 pub extern fn hermes_inspector_message(inspector: ?*Inspector, session_id: u64, json: [*]const u8, len: usize) bool;
 pub extern fn hermes_inspector_session_close(inspector: ?*Inspector, session_id: u64) void;
-pub extern fn jsbay_hermes_inspector_delivery_complete(inspector: ?*Inspector, session_id: u64) void;
+pub extern fn jsbay_hermes_inspector_delivery_complete(inspector: ?*Inspector, session_id: u64, delivery_token: u64) void;
 pub extern fn jsbay_hermes_inspector_set_delivery_observer(inspector: ?*Inspector, observed: bool) void;
 pub extern fn hermes_inspector_close_sessions(inspector: ?*Inspector) void;
 pub extern fn hermes_inspector_stop(inspector: ?*Inspector) void;
