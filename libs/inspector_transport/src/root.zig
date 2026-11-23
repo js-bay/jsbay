@@ -189,9 +189,17 @@ const Session = struct {
     /// This transition is deliberately separate from closing the socket: shutdown wakes both workers, but the handle remains owned until their/session leases have drained.
     fn requestClose(self: *Session) void {
         if (self.closed.swap(true, .acq_rel)) return;
+        var pending_tokens: [max_queued_frames]u64 = undefined;
+        var token_count: usize = 0;
         self.queue_mu.lock();
         self.accepting = false;
-        for (self.queue.items[self.queue_head..]) |frame| self.allocator.free(frame.bytes);
+        for (self.queue.items[self.queue_head..]) |frame| {
+            if (frame.delivery_token != 0 and token_count < pending_tokens.len) {
+                pending_tokens[token_count] = frame.delivery_token;
+                token_count += 1;
+            }
+            self.allocator.free(frame.bytes);
+        }
         self.queue.clearRetainingCapacity();
         self.queue_head = 0;
         self.queued_bytes = 0;
@@ -199,6 +207,10 @@ const Session = struct {
         self.large_message_in_flight = false;
         self.queue_changed.broadcast();
         self.queue_mu.unlock();
+
+        for (pending_tokens[0..token_count]) |token| {
+            notifyDelivery(self.transport, self.id, token);
+        }
         self.stream.shutdownBoth();
     }
 
@@ -222,7 +234,7 @@ const Session = struct {
         }
         const is_large = bytes.len > max_backlog;
         if (is_large) {
-            if (self.large_message_in_flight or self.queued_backlog_bytes > max_backlog) {
+            if (self.large_message_in_flight) {
                 self.queue_mu.unlock();
                 return false;
             }
@@ -998,19 +1010,17 @@ fn writerLoop(sess: *Session) void {
         if (!is_large) {
             sess.queued_backlog_bytes -= frame.bytes.len;
         }
+        if (is_large) {
+            sess.large_message_in_flight = false;
+        }
         sess.queue_mu.unlock();
 
         const ok = writeFrame(sess, frame.kind, frame.bytes);
         const close_after = frame.kind == .close;
-        sess.allocator.free(frame.bytes);
-        if (is_large) {
-            sess.queue_mu.lock();
-            sess.large_message_in_flight = false;
-            sess.queue_mu.unlock();
-        }
-        if (ok and frame.delivery_token != 0) {
+        if (frame.delivery_token != 0) {
             notifyDelivery(sess.transport, sess.id, frame.delivery_token);
         }
+        sess.allocator.free(frame.bytes);
         if (!ok or close_after) {
             sess.requestClose();
             return;
@@ -1109,6 +1119,12 @@ fn readLoop(sess: *Session) !bool {
 
         if (payload_len > t.max_message_bytes or payload_len > std.math.maxInt(usize)) {
             sess.enqueueClose(1009);
+            return true;
+        }
+
+        // Control frames (opcodes 0x8..0xF) must not be fragmented and payload <= 125 bytes (RFC 6455 §5.5).
+        if (opcode >= 0x8 and (!fin or payload_len > 125)) {
+            sess.enqueueClose(1002);
             return true;
         }
 

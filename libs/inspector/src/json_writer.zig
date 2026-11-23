@@ -39,7 +39,9 @@ pub fn Module(comptime Host: type) type {
 
         // Send a pre-built JSON payload to a single session. Transport takes care of framing. No inspector lock is held across this call.
         pub fn sendJson(state: *InspectorState, session_id: transport_mod.SessionId, payload: []const u8) void {
-            _ = state.transport.sendText(session_id, payload);
+            if (!state.transport.sendText(session_id, payload)) {
+                state.transport.closeSession(session_id);
+            }
         }
 
         pub fn sendEmptyResult(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) void {
@@ -266,7 +268,10 @@ pub fn Module(comptime Host: type) type {
                 sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Script source is too large to send");
                 return;
             }
-            var aw: std.Io.Writer.Allocating = .init(state.allocator);
+            var aw: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(state.allocator, total_len) catch {
+                sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Out of memory");
+                return;
+            };
             var send_ok = false;
             var too_large = false;
             serialize: {

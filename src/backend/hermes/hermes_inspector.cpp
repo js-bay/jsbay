@@ -10,6 +10,9 @@
 #error "hermes_inspector.cpp requires a debugger-enabled Hermes SDK"
 #endif
 
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -18,6 +21,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace jsi = facebook::jsi;
 using FbHermesRuntime = facebook::hermes::HermesRuntime;
@@ -375,11 +379,13 @@ static void runOutboundSender(JsbayHermesInspector *inspector) {
                 inspector->outbound.pop_front();
                 const auto state = inspector->outbound_sessions.find(message.session_id);
                 if (state != inspector->outbound_sessions.end()) {
+                    assert(state->second.bytes >= message.charged_bytes);
                     if (state->second.bytes >= message.charged_bytes) {
                         state->second.bytes -= message.charged_bytes;
                     } else {
                         state->second.bytes = 0;
                     }
+                    assert(state->second.messages > 0);
                     if (state->second.messages > 0) {
                         state->second.messages -= 1;
                     }
@@ -695,10 +701,15 @@ extern "C" bool hermes_inspector_session_open(JsbayHermesInspector *inspector,
                         ",\"origin\":\"\",\"name\":\"jsbay\",\"auxData\":{\"isDefault\":true}}}}";
                     enqueueOutbound(inspector, session_id, context, std::nullopt);
                 }
-                if (!enqueueOutbound(inspector, session_id, std::move(reply), id) && id &&
-                    !enqueueFallbackError(inspector, session_id, *id,
-                                          "Inspector transport is busy or disconnected")) {
-                    terminalizeSession(inspector, session_id);
+                if (!enqueueOutbound(inspector, session_id, std::move(reply), id)) {
+                    if (id) {
+                        if (!enqueueFallbackError(inspector, session_id, *id,
+                                                  "Inspector transport is busy or disconnected")) {
+                            terminalizeSession(inspector, session_id);
+                        }
+                    } else {
+                        terminalizeSession(inspector, session_id);
+                    }
                 }
             } catch (...) {
                 terminalizeSession(inspector, session_id);
@@ -789,8 +800,7 @@ extern "C" bool hermes_inspector_message(JsbayHermesInspector *inspector, uint64
                 std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
                 auto &state = inspector->outbound_sessions[session_id];
                 if (state.messages >= kMaxOutboundMessages ||
-                    (is_large && (state.large_message_in_flight ||
-                                  state.bytes > inspector->max_outbound_backlog_bytes))) {
+                    (is_large && state.large_message_in_flight)) {
                     is_busy = true;
                 } else if (is_large) {
                     reserved_seq = reserveLargeMessage(inspector, state);
