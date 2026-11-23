@@ -79,6 +79,7 @@ if grep -Fq 'ConformanceFixture' "$members" || grep -Eq '(^|/)Quality[^/]*$' "$m
 fi
 
 mkdir -p "$stage_dir"
+stage_dir=$(cd "$stage_dir" && pwd)
 asset="$stage_dir/jsbay-${version}-harmony-${backend}-arm64-v8a.har"
 
 # Strip in-place @ts-nocheck comments from packaged ArkTS declaration files so strict consumer projects pass linter gates.
