@@ -1,0 +1,4 @@
+module JsBayQuickJSNGObjC {
+    umbrella header "JSBayObjC.h"
+    export *
+}
