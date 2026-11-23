@@ -220,15 +220,26 @@ static void testPendingLargeSourceQueueing() {
     const auto frame1 = fixture.waitForFrame(1);
     CHECK(frame1.token != 0);
     CHECK(frame1.text.find(std::string(32, 'a')) != std::string::npos);
-
     jsbay_hermes_inspector_delivery_complete(inspector, 1, frame1.token);
     fixture.finishFrame(1);
 
-    const auto frame2 = fixture.waitForFrame(2);
-    CHECK(frame2.token != 0);
-    CHECK(frame2.text.find(std::string(32, 'b')) != std::string::npos);
-    jsbay_hermes_inspector_delivery_complete(inspector, 1, frame2.token);
+    const auto busy = fixture.waitForFrame(2);
+    CHECK(busy.token == 0);
+    CHECK(busy.text.find("busy") != std::string::npos);
     fixture.finishFrame(2);
+
+    for (size_t n = 3; n < 3 + kMaxPendingLargeRequests; ++n) {
+        const auto frame = fixture.waitForFrame(n);
+        CHECK(frame.token != 0);
+        CHECK(frame.text.find(std::string(32, 'b')) != std::string::npos);
+        jsbay_hermes_inspector_delivery_complete(inspector, 1, frame.token);
+        fixture.finishFrame(n);
+    }
+    for (int spin = 0; spin < 200 && fixture.state().messages != 0; ++spin)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(!fixture.state().large_message_in_flight);
+    CHECK(fixture.state().pending_large.empty());
+    CHECK(fixture.state().messages == 0);
 }
 
 static void testPendingLargeClearedOnSessionDiscard() {

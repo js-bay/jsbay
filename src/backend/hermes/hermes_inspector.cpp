@@ -215,21 +215,30 @@ static void releaseLargeMessage(JsbayHermesInspector *inspector, uint64_t sessio
                                 uint64_t delivery_token) {
     if (delivery_token == 0)
         return;
-    std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
-    const auto it = inspector->outbound_sessions.find(session_id);
-    if (it == inspector->outbound_sessions.end() ||
-        it->second.large_message_seq != delivery_token) {
-        return;
+    bool terminalize = false;
+    {
+        std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
+        const auto it = inspector->outbound_sessions.find(session_id);
+        if (it == inspector->outbound_sessions.end() ||
+            it->second.large_message_seq != delivery_token)
+            return;
+        it->second.large_message_in_flight = false;
+        if (!it->second.pending_large.empty()) {
+            const auto &next = it->second.pending_large.front();
+            const uint64_t next_seq = reserveLargeMessage(inspector, it->second);
+            try {
+                inspector->outbound.push_back({session_id, "", next.id, 0, next_seq, next.source});
+                it->second.pending_large.pop_front();
+                it->second.messages += 1;
+                inspector->outbound_cv.notify_one();
+            } catch (...) {
+                it->second.large_message_in_flight = false;
+                terminalize = true;
+            }
+        }
     }
-    it->second.large_message_in_flight = false;
-    if (!it->second.pending_large.empty()) {
-        auto next = std::move(it->second.pending_large.front());
-        it->second.pending_large.pop_front();
-        const uint64_t next_seq = reserveLargeMessage(inspector, it->second);
-        inspector->outbound.push_back({session_id, "", next.id, 0, next_seq, std::move(next.source)});
-        it->second.messages += 1;
-        inspector->outbound_cv.notify_one();
-    }
+    if (terminalize)
+        terminalizeSession(inspector, session_id);
 }
 
 static std::optional<size_t> escapedJsonLen(const std::string &s) noexcept {
@@ -1058,10 +1067,13 @@ extern "C" void jsbay_hermes_inspector_delivery_complete(JsbayHermesInspector *i
                                                         uint64_t session_id, uint64_t delivery_token) {
     if (!inspector)
         return;
-    std::lock_guard<std::mutex> live_lock(g_live_inspectors_mutex);
-    if (g_live_inspectors.find(inspector) == g_live_inspectors.end())
-        return;
-    releaseLargeMessage(inspector, session_id, delivery_token);
+    try {
+        std::lock_guard<std::mutex> live_lock(g_live_inspectors_mutex);
+        if (g_live_inspectors.find(inspector) == g_live_inspectors.end())
+            return;
+        releaseLargeMessage(inspector, session_id, delivery_token);
+    } catch (...) {
+    }
 }
 
 extern "C" void jsbay_hermes_inspector_set_delivery_observer(JsbayHermesInspector *inspector,
