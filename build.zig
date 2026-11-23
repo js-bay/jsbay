@@ -830,13 +830,14 @@ pub fn build(b: *std.Build) void {
         const cdp_test = b.addSystemCommand(&.{"node"});
         cdp_test.addFileArg(b.path("tests/inspector/debugger_driver.cjs"));
         cdp_test.addArtifactArg(demo_exe);
+        const cdp_test_step = b.step("test-cdp", "Run CDP breakpoint, paused-frame evaluation, stepping and reconnect tests");
+        cdp_test_step.dependOn(&cdp_test.step);
         if (backend == .hermes) {
             cdp_test.addArg("--typed-console");
             cdp_test.addArg("--native-debugger");
         }
         if (backend == .escargot) cdp_test.addArg("--line-breakpoints");
         cdp_test.addFileInput(b.path("tests/inspector/e2e.cjs"));
-        b.step("test-cdp", "Run CDP breakpoint, paused-frame evaluation, stepping and reconnect tests").dependOn(&cdp_test.step);
     }
 
     // --- Pauseable DevTools owner-thread C embed sample ---

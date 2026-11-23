@@ -39,7 +39,9 @@ pub fn Module(comptime Host: type) type {
 
         // Send a pre-built JSON payload to a single session. Transport takes care of framing. No inspector lock is held across this call.
         pub fn sendJson(state: *InspectorState, session_id: transport_mod.SessionId, payload: []const u8) void {
-            _ = state.transport.sendText(session_id, payload);
+            if (!state.transport.sendText(session_id, payload)) {
+                state.transport.closeSession(session_id);
+            }
         }
 
         pub fn sendEmptyResult(state: *InspectorState, session_id: transport_mod.SessionId, request_id: i64) void {
@@ -204,19 +206,97 @@ pub fn Module(comptime Host: type) type {
             sendJson(state, session_id, aw.written());
         }
 
+        // Computes the exact length of a string when JSON-escaped, returning null on overflow.
+        pub fn escapedJsonStringLen(s: []const u8) ?usize {
+            var len: usize = 2;
+            for (s) |c| {
+                const add: usize = switch (c) {
+                    '"', '\\', '\n', '\r', '\t' => 2,
+                    0...0x08, 0x0B, 0x0C, 0x0E...0x1F => 6,
+                    else => 1,
+                };
+                len = std.math.add(usize, len, add) catch return null;
+            }
+            return len;
+        }
+
+        fn sendBoundedErrorOrClose(
+            state: *InspectorState,
+            session_id: transport_mod.SessionId,
+            request_id: i64,
+            code: i32,
+            message: []const u8,
+        ) void {
+            const max_bytes = state.transport.maxMessageBytes();
+            var buf: [384]u8 = undefined;
+            const total = std.fmt.bufPrint(&buf, "{{\"id\":{d},\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}", .{
+                request_id,
+                code,
+                message,
+            }) catch {
+                state.transport.closeSession(session_id);
+                return;
+            };
+            if (total.len > max_bytes or !state.transport.sendText(session_id, total)) {
+                state.transport.closeSession(session_id);
+            }
+        }
+
         pub fn sendScriptSource(
             state: *InspectorState,
             session_id: transport_mod.SessionId,
             request_id: i64,
             source: []const u8,
         ) void {
-            var aw: std.Io.Writer.Allocating = .init(state.allocator);
-            defer aw.deinit();
-            const w = &aw.writer;
-            w.print("{{\"id\":{d},\"result\":{{\"scriptSource\":", .{request_id}) catch return;
-            writeJsonString(w, source) catch return;
-            w.writeAll("}}") catch return;
-            sendJson(state, session_id, aw.written());
+            const max_bytes = state.transport.maxMessageBytes();
+            if (source.len > max_bytes) {
+                sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Script source is too large to send");
+                return;
+            }
+            const escaped_len = escapedJsonStringLen(source) orelse {
+                sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Script source is too large to send");
+                return;
+            };
+            var id_buf: [32]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{request_id}) catch "";
+            const envelope_overhead: usize = comptime "{\"id\":".len + ",\"result\":{\"scriptSource\":".len + "}}".len;
+            const total_len = std.math.add(usize, escaped_len, id_str.len + envelope_overhead) catch {
+                sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Script source is too large to send");
+                return;
+            };
+            if (total_len > max_bytes) {
+                sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Script source is too large to send");
+                return;
+            }
+            var aw: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(state.allocator, total_len) catch {
+                sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Out of memory");
+                return;
+            };
+            var send_ok = false;
+            var too_large = false;
+            serialize: {
+                const w = &aw.writer;
+                w.print("{{\"id\":{d},\"result\":{{\"scriptSource\":", .{request_id}) catch break :serialize;
+                writeJsonString(w, source) catch break :serialize;
+                w.writeAll("}}") catch break :serialize;
+                const written = aw.written();
+                if (written.len > max_bytes) {
+                    too_large = true;
+                    break :serialize;
+                }
+                send_ok = state.transport.sendText(session_id, written);
+                aw.deinit();
+                if (!send_ok) {
+                    sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Inspector transport is busy or disconnected");
+                }
+                return;
+            }
+            aw.deinit();
+            if (too_large) {
+                sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Script source is too large to send");
+            } else {
+                sendBoundedErrorOrClose(state, session_id, request_id, -32000, "Unable to serialize script source");
+            }
         }
 
         pub const PausedFrame = struct {

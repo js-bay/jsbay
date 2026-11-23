@@ -16,7 +16,7 @@ pub const ScriptInfo = struct {
 
 /// The debugger journal is a bounded diagnostic cache, not a source archive. The newest source is retained whole even when it alone exceeds the byte budget, so Debugger.getScriptSource never receives a fabricated truncation.
 pub const max_retained_scripts: usize = 256;
-pub const max_retained_source_bytes: usize = 8 * 1024 * 1024;
+pub const max_retained_source_bytes: usize = 64 * 1024 * 1024;
 
 pub const Script = struct {
     id: u32,

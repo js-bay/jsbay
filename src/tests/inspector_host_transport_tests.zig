@@ -14,6 +14,10 @@ const HostTransport = struct {
     handler_ctx: ?*anyopaque = null,
     frames: std.ArrayList(Frame) = .empty,
     deinit_count: usize = 0,
+    delivery_observer: ?*const fn (?*anyopaque, inspector.SessionId, u64) void = null,
+    delivery_observer_ctx: ?*anyopaque = null,
+    delivery_observer_registered: bool = false,
+    observer_present_at_deinit: bool = false,
     fail_start: bool = false,
     close_during_deinit: bool = false,
     stop_on_send: ?*inspector.Handle = null,
@@ -26,6 +30,7 @@ const HostTransport = struct {
         .send_text = send,
         .broadcast_text = broadcast,
         .close_session = closeSession,
+        .set_delivery_observer = setDeliveryObserver,
     };
 
     fn init(self: *HostTransport) void {
@@ -46,9 +51,17 @@ const HostTransport = struct {
         }
     }
 
+    fn setDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, inspector.SessionId, u64) void) void {
+        const self = from(ctx);
+        self.delivery_observer_ctx = observer_ctx;
+        self.delivery_observer = observer;
+        self.delivery_observer_registered = observer != null;
+    }
+
     fn deinit(ctx: *anyopaque) void {
         const self = from(ctx);
         self.deinit_count += 1;
+        self.observer_present_at_deinit = self.delivery_observer_registered;
         // A transport may finish an already admitted callback while closing.
         if (self.close_during_deinit) self.emit(.session_closed, 7, "");
         self.handler = null;
@@ -283,13 +296,36 @@ const Enabled = if (options.inspector) struct {
         defer host.freeFrames();
         try testing.expectError(error.TransportStartFailed, inspector.startWithTransport(id, &host.endpoint, .{}));
         try testing.expectEqual(@as(usize, 1), host.deinit_count);
+        try testing.expect(!host.observer_present_at_deinit);
         try testing.expect(host.handler == null);
         // A failed attach leaves the same instance available for a new attach.
         host.fail_start = false;
         host.init();
         const handle = try inspector.startWithTransport(id, &host.endpoint, .{});
+        try testing.expect(host.delivery_observer_registered);
         inspector.stop(handle);
         try testing.expectEqual(@as(usize, 2), host.deinit_count);
+        try testing.expect(!host.observer_present_at_deinit);
+    }
+
+    test "host transport delivery observer lifecycle and completion dispatch" {
+        const id = helpers.nextInstanceId();
+        try testing.expect(engine.create(id, .{}));
+        defer engine.destroy(id);
+        var host = HostTransport{};
+        host.init();
+        defer host.freeFrames();
+        const handle = try inspector.startWithTransport(id, &host.endpoint, .{});
+        defer if (host.handler != null) inspector.stop(handle);
+        try testing.expect(host.delivery_observer_registered);
+        try testing.expect(host.delivery_observer != null);
+
+        // Dispatches tracked completion cleanly while inspector session is active.
+        host.delivery_observer.?(host.delivery_observer_ctx, 7, 41);
+
+        inspector.stop(handle);
+        try testing.expect(!host.delivery_observer_registered);
+        try testing.expect(!host.observer_present_at_deinit);
     }
 
     test "host transport can stop synchronously from an owner-thread send callback" {
@@ -323,6 +359,7 @@ const Enabled = if (options.inspector) struct {
             }
         }.run, .{&host});
         thread.join();
+        try testing.expect(!host.observer_present_at_deinit);
         engine.runEventLoopOnce(id);
         try testing.expectEqual(@as(usize, 1), host.deinit_count);
         try testing.expect(host.handler == null);
