@@ -49,6 +49,23 @@ static void *request(void *p) {
     }
     return NULL;
 }
+static void request_concurrently(void) {
+    pthread_t threads[8];
+    for (int i = 0; i < 8; ++i)
+        CHECK(!pthread_create(&threads[i], NULL, request, NULL));
+    for (int i = 0; i < 8; ++i)
+        CHECK(!pthread_join(threads[i], NULL));
+}
+static void request_from_owner_scope(void *p) {
+    (void)p;
+    CHECK(pthread_equal(creator, pthread_self()));
+    request_concurrently();
+    CHECK(jsbay_engine_request_destroy(id, generation) == JSBAY_DESTROY_PENDING);
+    CHECK(jsbay_engine_destroy_status(id, generation) == JSBAY_DESTROY_PENDING);
+    CHECK(jsbay_engine_drain_destroy(id, generation) == JSBAY_DESTROY_PENDING);
+    CHECK(!atomic_load(&finalizers));
+    CHECK(!jsbay_test_owner_destroy_read(0) && !jsbay_test_owner_destroy_read(1));
+}
 int main(void) {
     creator = pthread_self();
     for (int round = 0; round < 8; ++round) {
@@ -67,11 +84,13 @@ int main(void) {
         CHECK(fn && !exception && jsbay_value_release(fn) == JSBAY_OK);
         atomic_store(&finalizers, 0);
         jsbay_test_owner_destroy_reset();
-        pthread_t threads[8];
-        for (int i = 0; i < 8; ++i)
-            CHECK(!pthread_create(&threads[i], NULL, request, NULL));
-        for (int i = 0; i < 8; ++i)
-            CHECK(!pthread_join(threads[i], NULL));
+        if (round % 2 == 0)
+            CHECK(jsbay_engine_with_value_scope(id, request_from_owner_scope, NULL) == JSBAY_OK);
+        else
+            request_concurrently();
+        jsbay_value_t rejected = 99;
+        CHECK(jsbay_value_new_number(id, 42, &rejected) == JSBAY_INSTANCE_NOT_FOUND);
+        CHECK(rejected == 0);
         CHECK(!atomic_load(&finalizers));
         CHECK(!jsbay_test_owner_destroy_read(0) && !jsbay_test_owner_destroy_read(1));
         CHECK(jsbay_engine_drain_destroy(id, generation) == JSBAY_DESTROY_COMPLETE);
@@ -82,7 +101,8 @@ int main(void) {
         CHECK(jsbay_engine_request_destroy(id, generation) == JSBAY_DESTROY_COMPLETE);
         CHECK(jsbay_engine_drain_destroy(id, generation) == JSBAY_DESTROY_COMPLETE);
     }
-    puts("PASS: 8 creator-drained generations, 64 pthreads, 1024 requests, owner finalizers and "
-         "separate backend-free counts");
+    puts(
+        "PASS: 8 creator-drained generations, 64 pthreads, 1024 requests, owner finalizers and "
+        "separate backend-free counts; 4 active owner scopes defer drain and reject pending calls");
     return 0;
 }

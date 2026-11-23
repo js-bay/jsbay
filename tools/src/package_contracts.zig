@@ -240,7 +240,7 @@ fn writeFile(io: std.Io, target: []const u8, contents: []const u8) !void {
     try Dir.cwd().writeFile(io, .{ .sub_path = target, .data = contents });
 }
 
-test "published package includes every engine patch build input" {
+fn testPublishedPackageInputs() !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -351,7 +351,7 @@ test "cache fingerprint changes for the wrapper and pinned QuickJS-NG input" {
     try testing.expectEqualStrings(source_before, try Dir.cwd().readFileAlloc(io, source_path, allocator, .limited(1024 * 1024)));
 }
 
-test "commonjs package owns loading and cache behavior without engine imports" {
+fn testCommonjsIsolation() !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -417,4 +417,28 @@ test "commonjs package owns loading and cache behavior without engine imports" {
     if (!output.succeeded()) std.debug.print("isolated commonjs tests failed:\n{s}\n{s}", .{ output.result.stdout, output.result.stderr });
     try testing.expect(output.succeeded());
     try expectContains(output.result.stderr, "tests passed");
+}
+
+// Both consumers require cold package/compiler caches. Their unrelated compiler bootstraps may overlap without sharing fixture state.
+test "published and commonjs packages retain cold-cache isolation" {
+    const Published = struct {
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            testPublishedPackageInputs() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var published: Published = .{};
+    const worker = try std.Thread.spawn(.{}, Published.run, .{&published});
+    const commonjs_failure: ?anyerror = if (testCommonjsIsolation()) |_| null else |err| err;
+    worker.join();
+    if (published.failure) |err| {
+        std.debug.print("published package consumer failed: {t}\n", .{err});
+        return err;
+    }
+    if (commonjs_failure) |err| {
+        std.debug.print("commonjs package consumer failed: {t}\n", .{err});
+        return err;
+    }
 }
