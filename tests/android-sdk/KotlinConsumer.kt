@@ -58,30 +58,41 @@ private fun advanceCurrentLooper(milliseconds: Long) {
     if (milliseconds > 0) {
         handler.postDelayed({ windowElapsed.set(true) }, milliseconds)
     }
-    val next = android.os.MessageQueue::class.java.getDeclaredMethod("next").apply { isAccessible = true }
+    val queueClass = Class.forName("android.os.MessageQueue")
+    val messageClass = Class.forName("android.os.Message")
+    val queue = looper.javaClass.getMethod("getQueue").invoke(looper)
+    val isIdle = queueClass.getMethod("isIdle")
+    val next = queueClass.getDeclaredMethod("next").apply { isAccessible = true }
+    val getTarget = messageClass.getMethod("getTarget")
+    val dispatchMessage = android.os.Handler::class.java.getMethod("dispatchMessage", messageClass)
     val recycle =
         try {
-            android.os.Message::class.java.getDeclaredMethod("recycleUnchecked").apply { isAccessible = true }
+            messageClass.getDeclaredMethod("recycleUnchecked").apply { isAccessible = true }
         } catch (_: NoSuchMethodException) {
-            android.os.Message::class.java.getMethod("recycle")
+            messageClass.getMethod("recycle")
         }
     var dueFlushed = 0
     while (true) {
         if (windowElapsed.get()) {
-            if (looper.queue.isIdle) break
+            if (isIdle.invoke(queue) as Boolean) break
             check(dueFlushed < MAX_DUE_FLUSH_MESSAGES) {
                 "advanceCurrentLooper due-flush cap ($MAX_DUE_FLUSH_MESSAGES) reached with work still queued"
             }
         }
-        val msg = (next.invoke(looper.queue) as android.os.Message?) ?: break
-        if (msg.target != null) {
-            msg.target.dispatchMessage(msg)
+        val msg = next.invoke(queue) ?: break
+        val target = getTarget.invoke(msg)
+        if (target != null) {
+            try {
+                dispatchMessage.invoke(target, msg)
+            } catch (error: java.lang.reflect.InvocationTargetException) {
+                throw (error.targetException ?: error)
+            }
         }
         try {
             recycle.invoke(msg)
         } catch (_: Throwable) {
         }
-        if (android.os.SystemClock.uptimeMillis() >= deadlineUptime) {
+        if (uptime() >= deadlineUptime) {
             windowElapsed.set(true)
         }
         if (windowElapsed.get()) {
@@ -791,7 +802,7 @@ fun runKotlinConsumer() {
                 }
             } finally {
                 keepGoing.set(false)
-                handler.removeCallbacksAndMessages(null)
+                handler.removeCallbacks(tick)
             }
             check(livelock.get() == MAX_DUE_FLUSH_MESSAGES) {
                 "Kotlin due-flush cap dispatched ${livelock.get()}, expected $MAX_DUE_FLUSH_MESSAGES"
