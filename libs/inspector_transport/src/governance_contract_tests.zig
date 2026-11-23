@@ -1697,6 +1697,7 @@ test "transport: nested delivery queues are isolated between transports" {
     const CrossDelivery = struct {
         tb_ptr: *transport.Transport,
         session_b: transport.SessionId,
+        mutex: zev.Mutex = .{},
         a_tokens: [4]u64 = @splat(0),
         a_count: usize = 0,
         b_tokens: [4]u64 = @splat(0),
@@ -1705,22 +1706,34 @@ test "transport: nested delivery queues are isolated between transports" {
 
         fn observerA(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.mutex.lock();
             if (self.a_count < self.a_tokens.len) {
                 self.a_tokens[self.a_count] = token;
                 self.a_count += 1;
             }
-            if (!self.cross_triggered and token == 10) {
-                self.cross_triggered = true;
+            const should_trigger = !self.cross_triggered and token == 10;
+            if (should_trigger) self.cross_triggered = true;
+            self.mutex.unlock();
+
+            if (should_trigger) {
                 _ = self.tb_ptr.sendTrackedText(self.session_b, "msg-b", 20);
             }
         }
 
         fn observerB(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.mutex.lock();
+            defer self.mutex.unlock();
             if (self.b_count < self.b_tokens.len) {
                 self.b_tokens[self.b_count] = token;
                 self.b_count += 1;
             }
+        }
+
+        fn counts(self: *@This()) struct { a: usize, b: usize } {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return .{ .a = self.a_count, .b = self.b_count };
         }
     };
 
@@ -1731,12 +1744,87 @@ test "transport: nested delivery queues are isolated between transports" {
     try testing.expect(ta.sendTrackedText(session_a, "msg-a", 10));
 
     var attempts: usize = 0;
-    while ((cross.a_count < 1 or cross.b_count < 1) and attempts < 1000) : (attempts += 1) zev.sleepMilliseconds(1);
+    while (attempts < 1000) : (attempts += 1) {
+        const c = cross.counts();
+        if (c.a >= 1 and c.b >= 1) break;
+        zev.sleepMilliseconds(1);
+    }
 
+    cross.mutex.lock();
+    defer cross.mutex.unlock();
     try testing.expectEqual(@as(usize, 1), cross.a_count);
     try testing.expectEqual(@as(u64, 10), cross.a_tokens[0]);
     try testing.expectEqual(@as(usize, 1), cross.b_count);
     try testing.expectEqual(@as(u64, 20), cross.b_tokens[0]);
+}
+
+test "transport: outer delivery callback recognizes active frame during nested cross-transport teardown" {
+    const alloc = std.heap.page_allocator;
+    var opened_a = Opened{};
+    defer opened_a.changed.deinit();
+    var opened_b = Opened{};
+    defer opened_b.changed.deinit();
+
+    const ta = try transport.Transport.init(alloc, 0);
+    const tb = try transport.Transport.initWithOptions(alloc, 0, .{
+        .max_message_bytes = 4096,
+        .max_backlog_bytes = 100,
+    });
+    defer tb.deinit();
+
+    ta.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "peer-a" });
+    tb.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "peer-b" });
+
+    try ta.start(&opened_a, Opened.handler);
+    try tb.start(&opened_b, Opened.handler);
+
+    const peer_a = try connectLoopback(ta.boundPort());
+    defer peer_a.close();
+    try handshake(peer_a, "peer-a");
+    const session_a = opened_a.wait(1);
+
+    const peer_b = try connectLoopback(tb.boundPort());
+    defer peer_b.close();
+    try handshake(peer_b, "peer-b");
+    const session_b = opened_b.wait(1);
+
+    const CrossTeardown = struct {
+        ta_ptr: *transport.Transport,
+        tb_ptr: *transport.Transport,
+        session_b: transport.SessionId,
+        nested_teardown_done: std.atomic.Value(bool) = .init(false),
+
+        fn observerA(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (token == 100) {
+                const overflow_msg: [150]u8 = @splat('x');
+                _ = self.tb_ptr.sendTrackedText(self.session_b, &overflow_msg, 200);
+            }
+        }
+
+        fn observerB(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (token == 200) {
+                self.ta_ptr.asTransport().setDeliveryObserver(null, null);
+                self.ta_ptr.deinit();
+                self.nested_teardown_done.store(true, .release);
+            }
+        }
+    };
+
+    var teardown = CrossTeardown{
+        .ta_ptr = ta,
+        .tb_ptr = tb,
+        .session_b = session_b,
+    };
+    ta.asTransport().setDeliveryObserver(&teardown, CrossTeardown.observerA);
+    tb.asTransport().setDeliveryObserver(&teardown, CrossTeardown.observerB);
+
+    try testing.expect(ta.sendTrackedText(session_a, "trigger-a", 100));
+
+    var attempts: usize = 0;
+    while (!teardown.nested_teardown_done.load(.acquire) and attempts < 1000) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expect(teardown.nested_teardown_done.load(.acquire));
 }
 
 const CallerThreadDeliveryTeardown = struct {

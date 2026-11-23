@@ -16,8 +16,12 @@ const inspector = @import("inspector");
 const zev = @import("zev");
 const socket = @import("portable_socket");
 
-// A callback can request destruction of its transport. Its own socket worker must unwind before the transport can be released.
-threadlocal var callback_transport: ?*Transport = null;
+// Active callback and delivery frames are tracked on the stack so nested or cross-transport callbacks correctly recognize callers during teardown.
+const CallbackFrame = struct {
+    transport: *Transport,
+    previous: ?*CallbackFrame = null,
+};
+threadlocal var active_callback_frame: ?*CallbackFrame = null;
 
 const DeliveryFrame = struct {
     transport: *Transport,
@@ -25,12 +29,20 @@ const DeliveryFrame = struct {
 };
 threadlocal var active_delivery_frame: ?*DeliveryFrame = null;
 
-fn findActiveFrame(t: *Transport) ?*DeliveryFrame {
+fn findActiveDeliveryFrame(t: *Transport) ?*DeliveryFrame {
     var cur = active_delivery_frame;
     while (cur) |f| : (cur = f.previous) {
         if (f.transport == t) return f;
     }
     return null;
+}
+
+fn inActiveCallback(t: *Transport) bool {
+    var cur_cb = active_callback_frame;
+    while (cur_cb) |f| : (cur_cb = f.previous) {
+        if (f.transport == t) return true;
+    }
+    return findActiveDeliveryFrame(t) != null;
 }
 
 const FrameDeadline = struct {
@@ -415,7 +427,7 @@ pub const Transport = struct {
     /// Outside an event handler, waits for every owned thread and socket. In this transport's handler, requests shutdown and returns; the last worker releases the transport after all callbacks have unwound. The allocator and handler context must outlive that deferred release.
     pub fn deinit(self: *Transport) void {
         if (self.deinit_started.swap(true, .acq_rel)) return;
-        if (callback_transport == self) {
+        if (inActiveCallback(self)) {
             self.shutdown.store(true, .release);
             self.sessions_mu.lock();
             for (self.sessions.items) |sess| sess.requestClose();
@@ -641,9 +653,12 @@ pub const Transport = struct {
         if (self.shutdown.load(.acquire)) return;
         self.callbackLeaseAcquire();
         defer self.callbackLeaseRelease();
-        const previous = callback_transport;
-        callback_transport = self;
-        defer callback_transport = previous;
+        var frame = CallbackFrame{
+            .transport = self,
+            .previous = active_callback_frame,
+        };
+        active_callback_frame = &frame;
+        defer active_callback_frame = frame.previous;
         if (self.handler) |h| h(self.ctx, ev);
     }
 
@@ -1310,7 +1325,7 @@ const max_nested_deliveries: usize = max_sessions * max_queued_frames;
 
 fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId, u64) void) void {
     const self = interfaceSelf(ctx);
-    const in_callback = findActiveFrame(self) != null;
+    const in_callback = findActiveDeliveryFrame(self) != null;
     if (!in_callback) self.delivery_mu.lock();
     defer if (!in_callback) self.delivery_mu.unlock();
     self.delivery_observer_ctx = if (observer != null) observer_ctx else null;
@@ -1318,7 +1333,7 @@ fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, obse
 }
 
 fn notifyDelivery(self: *Transport, session: SessionId, token: u64) void {
-    if (findActiveFrame(self)) |_| {
+    if (findActiveDeliveryFrame(self)) |_| {
         if (self.deinit_started.load(.acquire) or self.delivery_observer == null) return;
         if (self.nested_tail >= self.nested_deliveries.len and self.nested_head > 0) {
             const len = self.nested_tail - self.nested_head;
@@ -1345,12 +1360,9 @@ fn notifyDelivery(self: *Transport, session: SessionId, token: u64) void {
         .previous = active_delivery_frame,
     };
     active_delivery_frame = &frame;
-    const previous_callback_transport = callback_transport;
-    callback_transport = self;
     defer {
         self.nested_head = 0;
         self.nested_tail = 0;
-        callback_transport = previous_callback_transport;
         active_delivery_frame = frame.previous;
     }
 
