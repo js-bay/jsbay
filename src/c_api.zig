@@ -1425,9 +1425,40 @@ test "c_api: engine creation keeps recursion below native stack limits" {
     try std.testing.expectEqualStrings("42", std.mem.span(result));
 }
 
+pub export fn jsbay_engine_destroy_protocol_version() u32 {
+    return 2;
+}
+
+fn ownerDestroyErrorStatus(err: engine.OwnerDestroyError) c_int {
+    return switch (err) {
+        error.InvalidGeneration => 3,
+        error.WrongThread => 4,
+        error.StaleGeneration => 5,
+        error.AlreadyClosing => 6,
+    };
+}
+
+pub export fn jsbay_engine_request_destroy(instance_id: c_int, generation: u64) c_int {
+    return @backingInt(engine.requestDestroy(@intCast(instance_id), generation) catch |err| return ownerDestroyErrorStatus(err));
+}
+
+pub export fn jsbay_engine_drain_destroy(instance_id: c_int, generation: u64) c_int {
+    return @backingInt(engine.drainDestroy(@intCast(instance_id), generation) catch |err| return ownerDestroyErrorStatus(err));
+}
+
+pub export fn jsbay_engine_destroy_status(instance_id: c_int, generation: u64) c_int {
+    return @backingInt(engine.destroyProgress(@intCast(instance_id), generation) catch |err| return ownerDestroyErrorStatus(err));
+}
+
 pub export fn jsbay_engine_destroy(instance_id: c_int) void {
     if (host_wake.isNotifying()) return;
     const id: i32 = @intCast(instance_id);
+    if (@import("runtime/instance_map.zig").ownerDestroyInfo(id)) |info| {
+        if (info.requested) {
+            engine.destroy(id);
+            return;
+        }
+    }
     // Owner-thread destroy is the common path (release values first, then destroy). A non-owner may also destroy: it closes admission and joins teardown so "destroy then Worker.terminate" does not kill an owner still inside run_loop or deferred cleanup. Attached-loop detach stays on the owner when this is the owner thread; destroyRuntime detaches after loop scopes have drained when destroy runs elsewhere.
     if (api_value.isOwner(id)) {
         engine.detachLoop(id);

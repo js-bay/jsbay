@@ -473,6 +473,16 @@ pub fn runEventLoopOnce(instance_id: i32) void {
 }
 
 pub const testing = if (@import("builtin").is_test) struct {
+    pub var vm_free_calls: std.atomic.Value(usize) = .init(0);
+    pub var context_free_calls: std.atomic.Value(usize) = .init(0);
+    pub var last_vm_free_tid: std.atomic.Value(std.Thread.Id) = .init(0);
+
+    pub fn resetOwnerDestroyCounters() void {
+        vm_free_calls.store(0, .seq_cst);
+        context_free_calls.store(0, .seq_cst);
+        last_vm_free_tid.store(0, .seq_cst);
+    }
+
     /// L0 host-tick: clamp-push clock + gated turn. ABI frozen — `now_ms < 0` /
     /// not admitted / idle → `-1`; never `ClockRewind`. Stale-host product contract
     /// (see `timers_tests`). For strict install use `setNow`.
@@ -673,8 +683,59 @@ pub fn dispatchTask(instance_id: i32, script: [*:0]const u8) bool {
     return dispatched;
 }
 
+pub const OwnerDestroyError = instance_map.OwnerDestroyError;
+pub const OwnerDestroyProgress = instance_map.OwnerDestroyProgress;
+
+/// Request owner-affine teardown. The host must explicitly drain on the creator after callbacks unwind.
+pub fn requestDestroy(instance_id: i32, generation: u64) OwnerDestroyError!OwnerDestroyProgress {
+    const request = try instance_map.requestOwnerDestroy(instance_id, generation);
+    if (request.lease) |lease| {
+        defer lease.end();
+        lease.ptrs.loop.requestStop();
+        lease.ptrs.loop.wake();
+        @import("js_event_loop").native_sync.cancelForInstance(instance_id);
+        debugger_mod.abandon(instance_id);
+        _ = @import("runtime/runtime_control.zig").requestStopInterrupt(instance_id);
+    }
+    return request.progress;
+}
+
+/// Data-only query for a valid captured generation; absence or replacement means that generation is complete.
+pub fn destroyProgress(instance_id: i32, generation: u64) OwnerDestroyError!OwnerDestroyProgress {
+    if (generation == 0) return error.InvalidGeneration;
+    const info = instance_map.ownerDestroyInfo(instance_id) orelse return .complete;
+    if (info.generation != generation) return .complete;
+    return if (info.requested) .pending else .live;
+}
+
+/// Complete teardown on the original creating thread, never inside a live callback or admitted operation.
+pub fn drainDestroy(instance_id: i32, generation: u64) OwnerDestroyError!OwnerDestroyProgress {
+    if (generation == 0) return error.InvalidGeneration;
+    const info = instance_map.ownerDestroyInfo(instance_id) orelse return .complete;
+    if (info.generation != generation) return error.StaleGeneration;
+    if (!info.on_creator) return error.WrongThread;
+    if (!info.requested) return .live;
+    if (info.draining or @import("runtime/engine_thread.zig").isEvalActiveOnCurrentThread(instance_id) or dispatch.isRunningTaskForInstance(instance_id)) return .pending;
+    switch (try instance_map.claimOwnerDestroy(instance_id, generation)) {
+        .live => return .live,
+        .pending => return .pending,
+        .complete => return .complete,
+        .ready => destroy(instance_id),
+    }
+    return destroyProgress(instance_id, generation);
+}
+
 /// Destroy an engine instance.
 pub fn destroy(instance_id: i32) void {
+    if (instance_map.ownerDestroyInfo(instance_id)) |info| {
+        if (info.requested) {
+            if (!info.on_creator) return;
+            if (!info.draining) {
+                _ = drainDestroy(instance_id, info.generation) catch {};
+                return;
+            }
+        }
+    }
     const engine_thread = @import("runtime/engine_thread.zig");
     if (engine_thread.isDestroying(instance_id)) return;
     if (engine_thread.isEvalActiveOnCurrentThread(instance_id)) {
@@ -785,8 +846,13 @@ fn releaseJsResources(instance: *instance_map.EngineInstance, free_vm: bool) voi
                 if (m.ctx != null and m.runtime != null) {
                     ActiveEngine.runGc(m.runtime);
                     ActiveEngine.freeContext(m.ctx);
+                    if (comptime @import("builtin").is_test) _ = testing.context_free_calls.fetchAdd(1, .seq_cst);
                     ActiveEngine.runGc(m.runtime);
                     ActiveEngine.freeRuntime(m.runtime);
+                    if (comptime @import("builtin").is_test) {
+                        _ = testing.vm_free_calls.fetchAdd(1, .seq_cst);
+                        testing.last_vm_free_tid.store(std.Thread.getCurrentId(), .seq_cst);
+                    }
                 }
             },
             .packed_alt => |a| @import("backend_dispatch.zig").destroyPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }),
@@ -809,6 +875,9 @@ fn clearEngineHandles(instance: *instance_map.EngineInstance) void {
 
 /// Free the scheduler and JS runtime for an instance. The caller has already stopped the engine thread, or is that thread and has left the JS call.
 pub fn destroyRuntime(instance_id: i32) void {
+    if (instance_map.ownerDestroyInfo(instance_id)) |info| {
+        if (info.requested and !info.on_creator) return;
+    }
     if (comptime backend.isEscargotBackend(backend.active_backend)) {
         if (@hasDecl(ActiveEngine, "threadEnter")) ActiveEngine.threadEnter();
     }

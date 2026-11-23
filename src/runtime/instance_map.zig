@@ -106,6 +106,9 @@ pub const EngineInstance = struct {
     active_control_ops: usize = 0,
     /// OS thread that created the JS runtime/context. Escargot Context is affine to this thread: `delete ctx` on another thread SIGSEGVs even after threadEnter.
     js_owner_tid: std.Thread.Id = undefined,
+    js_owner_incarnation: u64 = 0,
+    owner_destroy_requested: bool = false,
+    owner_destroy_draining: bool = false,
     error_observer: ?types.ErrorObserver = null,
     error_observer_userdata: ?*anyopaque = null,
     /// Set only after owner (or destroyer) JS teardown has returned, not when cleanup is merely claimed.
@@ -222,6 +225,8 @@ const InstanceMap = std.AutoHashMap(i32, *EngineInstance);
 var instances: InstanceMap = InstanceMap.init(std.heap.c_allocator);
 var mutex: sync.Mutex = .{};
 var next_generation: u64 = 1;
+var next_owner_incarnation: u64 = 1;
+threadlocal var owner_incarnation: u64 = 0;
 
 pub fn insert(instance: *EngineInstance) bool {
     return insertWith(instance, struct {
@@ -239,7 +244,13 @@ pub fn insertWith(instance: *EngineInstance, on_inserted: anytype) bool {
     if (next_generation == 0) return false;
     instance.generation = next_generation;
     next_generation +%= 1;
+    if (owner_incarnation == 0) {
+        if (next_owner_incarnation == 0) return false;
+        owner_incarnation = next_owner_incarnation;
+        next_owner_incarnation +%= 1;
+    }
     instance.js_owner_tid = std.Thread.getCurrentId();
+    instance.js_owner_incarnation = owner_incarnation;
     instances.put(instance.instance_id, instance) catch return false;
     if (!on_inserted.call(instance)) {
         _ = instances.fetchRemove(instance.instance_id);
@@ -271,6 +282,56 @@ pub fn isDestroyed(instance_id: i32, generation: u64) bool {
     defer mutex.unlock();
     const inst = instances.get(instance_id) orelse return true;
     return inst.generation != generation;
+}
+
+pub const OwnerDestroyError = error{ InvalidGeneration, StaleGeneration, WrongThread, AlreadyClosing };
+pub const OwnerDestroyProgress = enum(c_int) { live = 0, pending = 1, complete = 2 };
+pub const OwnerDestroyClaim = enum { live, pending, complete, ready };
+pub const OwnerDestroyInfo = struct { generation: u64, requested: bool, draining: bool, on_creator: bool };
+
+pub fn ownerDestroyInfo(instance_id: i32) ?OwnerDestroyInfo {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return null;
+    return .{ .generation = inst.generation, .requested = inst.owner_destroy_requested, .draining = inst.owner_destroy_draining, .on_creator = owner_incarnation != 0 and inst.js_owner_incarnation == owner_incarnation and inst.js_owner_tid == std.Thread.getCurrentId() };
+}
+
+pub const OwnerDestroyRequest = struct { progress: OwnerDestroyProgress, lease: ?ControlLease = null };
+
+/// Close admission without transferring VM ownership or allocating a teardown task.
+pub fn requestOwnerDestroy(instance_id: i32, generation: u64) OwnerDestroyError!OwnerDestroyRequest {
+    if (generation == 0) return error.InvalidGeneration;
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return .{ .progress = .complete };
+    if (inst.generation != generation) return error.StaleGeneration;
+    inst.dispatch_mutex.lock();
+    defer inst.dispatch_mutex.unlock();
+    if (inst.owner_destroy_requested) return .{ .progress = .pending };
+    if (inst.teardown_pending or inst.js_teardown_in_progress or inst.js_teardown_done.load(.acquire)) return error.AlreadyClosing;
+    inst.owner_destroy_requested = true;
+    inst.teardown_pending = true;
+    inst.active_control_ops += 1;
+    return .{ .progress = .pending, .lease = .{ .inst = inst, .ptrs = switch (inst.engine_handles) {
+        .mono => |m| .{ .ctx = m.ctx, .loop = inst.loop, .backend_tag = backend.active_backend },
+        .packed_alt => |a| .{ .ctx = @ptrFromInt(0), .loop = inst.loop, .backend_tag = a.tag },
+    } } };
+}
+
+/// Claim only from the creator outside admitted work; never wait on a lease held by the caller.
+pub fn claimOwnerDestroy(instance_id: i32, generation: u64) OwnerDestroyError!OwnerDestroyClaim {
+    if (generation == 0) return error.InvalidGeneration;
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return .complete;
+    if (inst.generation != generation) return error.StaleGeneration;
+    if (owner_incarnation == 0 or inst.js_owner_incarnation != owner_incarnation or inst.js_owner_tid != std.Thread.getCurrentId()) return error.WrongThread;
+    inst.dispatch_mutex.lock();
+    defer inst.dispatch_mutex.unlock();
+    if (!inst.owner_destroy_requested) return .live;
+    if (inst.owner_destroy_draining or inst.active_control_ops != 0 or inst.active_dispatch_tasks != 0 or inst.js_teardown_in_progress) return .pending;
+    inst.owner_destroy_draining = true;
+    return .ready;
 }
 
 pub const InstancePtrs = struct {
@@ -351,7 +412,7 @@ pub fn endControlPlane(inst: *EngineInstance) void {
     // The crash test holds the reservation on the creator thread, drops it,
     // then join()s the foreign destroyer — hopping delete after join starts
     // would deadlock, and threadEnter on the destroyer is not enough.
-    const owner_js = (comptime backend.isEscargotBackend(backend.active_backend)) and last and inst.teardown_pending and inst.js_owner_tid == std.Thread.getCurrentId() and !inst.js_teardown_done.load(.acquire);
+    const owner_js = (comptime backend.isEscargotBackend(backend.active_backend)) and last and inst.teardown_pending and !inst.owner_destroy_requested and inst.js_owner_tid == std.Thread.getCurrentId() and !inst.js_teardown_done.load(.acquire);
     if (!owner_js) {
         inst.dispatch_wake.broadcast();
         inst.dispatch_mutex.unlock();

@@ -176,8 +176,22 @@ typedef struct {
 bool jsbay_engine_create(int instance_id, jsbay_log_handler_t log_handler, void *log_user_data);
 /* limits may be NULL for the same defaults as jsbay_engine_create. Otherwise struct_size must be sizeof(*limits). */
 bool jsbay_engine_create_with_limits(int instance_id, jsbay_log_handler_t log_handler, void *log_user_data, const jsbay_resource_limits_t *limits);
-/* Thread-safe. Joins teardown: when called off the owner thread it waits until the instance is gone (including waking a blocking run_loop). Prefer owner-thread destroy after releasing values when following the embed shutdown checklist. A destroy requested from a JS/native callback on the owner may defer physical cleanup until that callback unwinds; a later destroy joins that work. */
+/* Legacy owner-thread convenience. Cleanup may defer until a live callback unwinds. Foreign legacy destroy cannot provide owner-affine finalizers and is unsupported: migrate to generation-scoped request/status/drain. Do not race an initial request with legacy teardown. Once an asynchronous request is pending, foreign legacy calls do nothing and creator legacy calls attempt a drain; void return is not completion evidence. */
 void jsbay_engine_destroy(int instance_id);
+
+#define JSBAY_DESTROY_PROTOCOL_VERSION 2u
+typedef enum {
+    JSBAY_DESTROY_LIVE = 0, JSBAY_DESTROY_PENDING = 1, JSBAY_DESTROY_COMPLETE = 2,
+    JSBAY_DESTROY_INVALID_ARGUMENT = 3, JSBAY_DESTROY_WRONG_THREAD = 4,
+    JSBAY_DESTROY_STALE = 5, JSBAY_DESTROY_ALREADY_CLOSING = 6,
+} jsbay_destroy_status_t;
+uint32_t jsbay_engine_destroy_protocol_version(void);
+/* Capture generation from snapshot before closing. request is any-thread and allocation-free; it closes admission and returns PENDING without running finalizers. Never mix a legacy foreign destroy with the initial request. */
+jsbay_destroy_status_t jsbay_engine_request_destroy(int instance_id, uint64_t generation);
+/* Creator only, outside callbacks and admitted work. PENDING means the creator must retry after unwinding, never synchronously wait inside a callback. No creator pump/exit means the instance remains pending and is not reclaimed. */
+jsbay_destroy_status_t jsbay_engine_drain_destroy(int instance_id, uint64_t generation);
+/* Any-thread, data-only status for a previously captured valid token. COMPLETE means that generation's VM/callback teardown has ended, including when the id has been replaced. A token carries no host-memory ownership. */
+jsbay_destroy_status_t jsbay_engine_destroy_status(int instance_id, uint64_t generation);
 typedef void (*jsbay_value_scope_callback_t)(void *user_data);
 /* Owner-thread synchronous scope for batching typed Value API calls. The return status reports admission; the callback records operation results through user_data. Value handle ownership is unchanged. The callback must return without yielding or crossing threads, and C++ exceptions must not cross the callback boundary; each typed API call keeps its normal validation and error behavior. This is not a transaction and does not roll back changes. A destroy requested by the callback follows the existing deferred-destroy rules and physical teardown waits until the callback returns. Nested scopes for the same instance are supported. */
 jsbay_status_t jsbay_engine_with_value_scope(int instance_id, jsbay_value_scope_callback_t callback,

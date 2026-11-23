@@ -20,6 +20,7 @@ comptime {
     }
     _ = @import("../script/typed_eval.zig");
     _ = @import("test_helpers.zig");
+    _ = @import("owner_destroy_tests.zig");
     _ = @import("value_tests.zig");
     _ = @import("string_roundtrip_tests.zig");
     _ = @import("engine_tests.zig");
