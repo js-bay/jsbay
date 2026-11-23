@@ -219,8 +219,7 @@ fn runIsolated(test_fn: std.builtin.TestFn, init: std.process.Init.Minimal, time
     }
 }
 
-// Counting sleep calls extends a nominal timeout under guest scheduling stalls.
-// A monotonic deadline bounds elapsed time instead, including overslept polls.
+// Counting sleep calls extends a nominal timeout under guest scheduling stalls. A monotonic deadline bounds elapsed time instead, including overslept polls.
 fn monotonicMilliseconds() ?u64 {
     var stamp: std.os.linux.timespec = undefined;
     if (posix.errno(std.os.linux.clock_gettime(.MONOTONIC, &stamp)) != .SUCCESS) return null;

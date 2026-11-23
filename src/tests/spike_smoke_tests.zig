@@ -177,8 +177,7 @@ fn awaitStartupPublication(id: i32, ready: *sync.Waiter) !void {
 
 test "spike smoke: engine_thread start / id / stop" {
     if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
-    // Minimal contract only: post/wait still throws on Escargot spike (status=exception) — leave full suite to non-spike.
-    // Keep the receipt alive until stop has joined the worker on every path.
+    // Minimal contract only: post/wait still throws on Escargot spike (status=exception) — leave full suite to non-spike. Keep the receipt alive until stop has joined the worker on every path.
     var ready: sync.Waiter = .init;
     defer ready.deinit();
     const id = helpers.nextInstanceId();
