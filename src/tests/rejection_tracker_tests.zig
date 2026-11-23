@@ -251,7 +251,8 @@ test "error observer: execution budget cancellation stays quiet for timers and m
         try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_set_error_observer(id, EventCount.handler, &log));
         try helpers.evalOk(id, "globalThis.__budget_started = false; globalThis.__budget_finished = false;");
         try testing.expect(c_api.jsbay_engine_set_execution_budget(id, 10));
-        const source: []const u8 = schedule ++ "(function () { globalThis.__budget_started = true; const end = Date.now() + 100; while (Date.now() < end) {} globalThis.__budget_finished = true; }, 0);";
+        // A finite wall-clock loop can end after the owner is descheduled before its next bytecode interrupt poll. Only budget cancellation may end this workload.
+        const source: []const u8 = schedule ++ "(function () { globalThis.__budget_started = true; while (true) {} globalThis.__budget_finished = true; }, 0);";
         var value: u64 = 0;
         var exception: u64 = 0;
         defer {
