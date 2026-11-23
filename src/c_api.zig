@@ -4729,5 +4729,20 @@ comptime {
             }
         };
         @export(&fault.trigger, .{ .name = "jsbay_test_trigger_native_fault" });
+        const owner_probe = struct {
+            fn reset() callconv(.c) void {
+                engine.testing.resetOwnerDestroyCounters();
+            }
+            fn read(index: u32) callconv(.c) u64 {
+                return switch (index) {
+                    0 => engine.testing.context_free_calls.load(.seq_cst),
+                    1 => engine.testing.vm_free_calls.load(.seq_cst),
+                    2 => engine.testing.last_vm_free_tid.load(.seq_cst),
+                    else => 0,
+                };
+            }
+        };
+        @export(&owner_probe.reset, .{ .name = "jsbay_test_owner_destroy_reset" });
+        @export(&owner_probe.read, .{ .name = "jsbay_test_owner_destroy_read" });
     }
 }

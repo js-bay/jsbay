@@ -197,6 +197,7 @@ pub fn build(b: *std.Build) void {
     const apple_package = b.option(bool, "apple-package", "Build a stripped Apple XCFramework library without Zig error tracing") orelse false;
     const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const android_sysroot = b.option([]const u8, "android-sysroot", "NDK sysroot whose usr/include provides Bionic headers");
+    const android_libc = b.option([]const u8, "android-libc", "NDK libc description for the Android library only, not host build tools");
     const android_lib_dir = b.option([]const u8, "android-lib-dir", "Directory of static stubs Zig can resolve while linking a static archive. The NDK clang step links the real Bionic libraries.");
     const ohos_sysroot = b.option([]const u8, "ohos-sysroot", "OpenHarmony native sysroot (the native/sysroot directory from the SDK)");
 
@@ -362,15 +363,15 @@ pub fn build(b: *std.Build) void {
             lib_module.addSystemIncludePath(.{
                 .cwd_relative = b.fmt("{s}/usr/include", .{sysroot}),
             });
-            // A real NDK libm.so in this path gets archived into the static library and corrupts the shared object. Callers pass a directory that contains a static stub instead.
-            if (android_lib_dir) |lib_dir| {
-                lib_module.addLibraryPath(.{ .cwd_relative = lib_dir });
-            } else {
+            // A real NDK libm.so must not be archived into the static library.
+            if (android_lib_dir == null) {
                 lib_module.addLibraryPath(.{
                     .cwd_relative = b.fmt("{s}/usr/lib/{s}/{d}", .{ sysroot, triple, api }),
                 });
             }
         }
+        // Static stubs are also valid with Zig's target headers; header selection must not discard the explicit link path.
+        if (android_lib_dir) |lib_dir| lib_module.addLibraryPath(.{ .cwd_relative = lib_dir });
     }
 
     if (ohos) {
@@ -402,6 +403,10 @@ pub fn build(b: *std.Build) void {
     });
     if (!shared and (os.isDarwin() or (os == .linux and !target.result.abi.isAndroid() and !ohos)))
         lib.bundle_compiler_rt = true;
+    if (android_libc) |libc| {
+        if (!target.result.abi.isAndroid()) std.process.fatal("-Dandroid-libc requires Android", .{});
+        lib.setLibCFile(.{ .cwd_relative = libc });
+    }
     b.installArtifact(lib);
 
     // Install C header

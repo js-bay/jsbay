@@ -24,6 +24,18 @@ class Engine
         private val generation: Long
 
         @Volatile private var closed = false
+
+        @Volatile private var closing = false
+        private val closeHandler =
+            android.os.Looper
+                .myLooper()
+                ?.let { android.os.Handler(it) }
+        private var closeTaskPosted = false
+        private val closeTask =
+            Runnable {
+                synchronized(lifecycleLock) { closeTaskPosted = false }
+                drainClose()
+            }
         private var loopBinding: Long = 0
         private val lifecycleLock = Any()
         private val callbackScopes = ArrayDeque<CallbackScope>()
@@ -87,12 +99,16 @@ class Engine
             if (Thread.currentThread() !== owner) {
                 throw JsBayException(Status.WRONG_THREAD)
             }
-            if (closed) throw JsBayException(Status.INSTANCE_NOT_FOUND)
+            if (isClosed()) throw JsBayException(Status.INSTANCE_NOT_FOUND)
+            if (Native.snapshotEngine(id)?.getOrNull(1) != generation) {
+                throw JsBayException(Status.INSTANCE_NOT_FOUND)
+            }
             val loopStatus = Status.of(Native.loopStatus(id))
             if (loopStatus != Status.OK) throw JsBayException(loopStatus)
         }
 
-        internal fun isClosed(): Boolean = closed
+        /** Unavailable to Value operations; physical completion is reported by closeStatus. */
+        internal fun isClosed(): Boolean = closed || closing
 
         internal fun text(value: String): String {
             if (!value.hasValidSurrogatePairs()) throw JsBayException(Status.INVALID_ARGUMENT)
@@ -290,7 +306,7 @@ class Engine
         /** May be called from any thread, including a native callback. While the platform Looper drives the loop, this stops that automatic driving until the engine is closed. */
         fun stopLoop(): Boolean =
             synchronized(lifecycleLock) {
-                !closed && Native.stopLoop(id)
+                !isClosed() && Native.stopLoop(id)
             }
 
         fun setExecutionBudget(millis: Long): Boolean {
@@ -342,19 +358,19 @@ class Engine
 
         fun beginShutdown(graceMillis: Long): Boolean =
             synchronized(lifecycleLock) {
-                !closed && graceMillis > 0 && Native.beginShutdown(id, generation, graceMillis)
+                !isClosed() && graceMillis > 0 && Native.beginShutdown(id, generation, graceMillis)
             }
 
         fun shutdownStatus(): ShutdownStatus? =
             synchronized(lifecycleLock) {
-                if (closed) return@synchronized null
+                if (isClosed()) return@synchronized null
                 val raw = Native.shutdownStatus(id, generation) ?: return@synchronized null
                 if (raw.size < 2) return@synchronized null
                 ShutdownPhase.of(raw[0].toInt())?.let { ShutdownStatus(it, raw[1]) }
             }
 
         /** Cancels only the immutable generation created by this Engine object. */
-        fun cancel(): Boolean = synchronized(lifecycleLock) { !closed && Native.cancel(id, generation) }
+        fun cancel(): Boolean = synchronized(lifecycleLock) { !isClosed() && Native.cancel(id, generation) }
 
         fun setResourceLimits(limits: ResourceLimits): Boolean {
             checkOwner()
@@ -374,36 +390,36 @@ class Engine
          */
         fun suspendLoop(): Boolean =
             synchronized(lifecycleLock) {
-                !closed && Native.suspendLoop(id)
+                !isClosed() && Native.suspendLoop(id)
             }
 
         /** Resume after [suspendLoop]. Does not recreate the engine. May be called from any thread. */
         fun resumeLoop(): Boolean =
             synchronized(lifecycleLock) {
-                !closed && Native.resumeLoop(id)
+                !isClosed() && Native.resumeLoop(id)
             }
 
         fun isSuspended(): Boolean =
             synchronized(lifecycleLock) {
-                !closed && Native.isSuspended(id)
+                !isClosed() && Native.isSuspended(id)
             }
 
         /** Future timer/task admissions only. Pair Hide→BACKGROUND and Show→FOREGROUND with suspend/resume. */
         fun setAdmissionClass(cls: AdmissionClass): Boolean =
             synchronized(lifecycleLock) {
-                !closed && Native.setAdmissionClass(id, cls.native)
+                !isClosed() && Native.setAdmissionClass(id, cls.native)
             }
 
         fun getAdmissionClass(): AdmissionClass? =
             synchronized(lifecycleLock) {
-                if (closed) return@synchronized null
+                if (isClosed()) return@synchronized null
                 AdmissionClass.fromNative(Native.getAdmissionClass(id))
             }
 
         /** Requests asynchronous interruption of JavaScript execution. Thread-safe. Latches a persistent user-interrupt flag that must be cleared via [clearInterrupt] before executing subsequent scripts. */
         fun requestInterrupt(): Boolean =
             synchronized(lifecycleLock) {
-                !closed &&
+                !isClosed() &&
                     Native.requestInterrupt(id)
             }
 
@@ -468,34 +484,59 @@ class Engine
             return Native.setEventHandler(id, handler)
         }
 
-        override fun close() {
-            val destroy =
-                synchronized(lifecycleLock) {
-                    if (closed) {
-                        false
-                    } else {
-                        if (Thread.currentThread() !== owner) {
-                            throw JsBayException(Status.WRONG_THREAD)
-                        }
-                        true
-                    }
-                }
-            if (!destroy) return
-            if (loopBinding != 0L) {
-                val detach = Status.of(Native.detachLoop(id, loopBinding))
-                if (detach != Status.OK) {
-                    throw JsBayException(detach)
-                }
-                loopBinding = 0
+        /** Any-thread nonblocking request. A Looper owner gets one independent drain task. */
+        fun requestClose(): CloseStatus {
+            synchronized(lifecycleLock) {
+                if (closed) return CloseStatus.COMPLETE
+                closing = true
             }
-            synchronized(lifecycleLock) { closed = true }
-            Native.destroy(id)
+            val status = CloseStatus.of(Native.requestDestroy(id, generation))
+            if (status == CloseStatus.PENDING) scheduleCloseDrain()
+            return status
+        }
+
+        private fun scheduleCloseDrain() {
+            synchronized(lifecycleLock) {
+                val handler = closeHandler ?: return
+                if (closed || closeTaskPosted) return
+                closeTaskPosted = handler.postDelayed(closeTask, 0)
+            }
+        }
+
+        /** Any-thread data-only progress. It never pumps the owner or frees JNI state. */
+        fun closeStatus(): CloseStatus =
+            if (closed) CloseStatus.COMPLETE else CloseStatus.of(Native.destroyStatus(id, generation))
+
+        /** Creator only. Retry on a later host turn if admitted work still holds a lease. */
+        fun drainClose(): CloseStatus {
+            if (Thread.currentThread() !== owner) throw JsBayException(Status.WRONG_THREAD)
+            if (closed) return CloseStatus.COMPLETE
+            val status = CloseStatus.of(Native.drainDestroy(id, generation, loopBinding))
+            if (status == CloseStatus.COMPLETE) {
+                synchronized(lifecycleLock) {
+                    closed = true
+                    closing = true
+                    loopBinding = 0
+                    closeHandler?.removeCallbacks(closeTask)
+                    closeTaskPosted = false
+                }
+                backgroundThread?.quitSafely()
+            }
+            return status
+        }
+
+        /** Owner-only convenience: request and attempt one drain; inspect closeStatus for completion. */
+        override fun close() {
+            if (closed) return
+            if (Thread.currentThread() !== owner) throw JsBayException(Status.WRONG_THREAD)
+            requestClose()
+            drainClose()
         }
 
         /** Any-thread control-plane snapshot of this engine; null if closed/tearing down. */
         fun snapshot(): InstanceSnapshot? =
             synchronized(lifecycleLock) {
-                if (closed) return@synchronized null
+                if (isClosed()) return@synchronized null
                 parseSnapshot(Native.snapshotEngine(id))
             }
 

@@ -10,6 +10,8 @@ The host supplies an `int32_t` instance ID, including zero or negative IDs. It m
 
 Language bindings must provide explicit close or dispose operations (prefer the owner thread). Garbage-collector finalizers must not call engine destroy or value release.
 
+Android exposes protocol-v2 `Engine.requestClose()` and `closeStatus()` on any thread, with creator-only `drainClose()`. `Engine.close()` remains creator-only and is a request plus one drain attempt, not a completion guarantee inside callbacks. Pending invalidates Value admission using the binding's existing stale-value result. The existing opt-in `DedicatedEngineThread.close()` now requests asynchronously and only quits after creator completion; hosts must migrate synchronous-close assumptions under a new major SDK version. An unpumped or exited creator leaves pending, never a foreign-thread fallback. See the executable manual/Looper migration paths in [owner destruction](owner-destruction.md#android-lifecycle-migration).
+
 ## Build identity
 
 `jsbay_engine_version` is process-wide and thread-safe; it does not require an instance or the owner thread. Callers set `struct_size` to at least `sizeof(jsbay_engine_version_info_t)`. On success the `version`, `commit`, and `backend` pointers are library-owned NUL-terminated strings that outlive any instance and must not be freed. `commit` may be empty when the build did not record a revision. `backend` is one of `quickjs_ng`, `quickjs`, or `jsc` (pack primary when built with `-Dbackends=`).

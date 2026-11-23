@@ -472,7 +472,7 @@ pub fn runEventLoopOnce(instance_id: i32) void {
     event_loop.Driver.integration.runOne(ptrs.loop, turn.hooks());
 }
 
-pub const testing = if (@import("builtin").is_test) struct {
+pub const testing = if (@import("builtin").is_test or @import("build_options").fault_injection) struct {
     pub var vm_free_calls: std.atomic.Value(usize) = .init(0);
     pub var context_free_calls: std.atomic.Value(usize) = .init(0);
     pub var last_vm_free_tid: std.atomic.Value(std.Thread.Id) = .init(0);
@@ -846,10 +846,10 @@ fn releaseJsResources(instance: *instance_map.EngineInstance, free_vm: bool) voi
                 if (m.ctx != null and m.runtime != null) {
                     ActiveEngine.runGc(m.runtime);
                     ActiveEngine.freeContext(m.ctx);
-                    if (comptime @import("builtin").is_test) _ = testing.context_free_calls.fetchAdd(1, .seq_cst);
+                    if (comptime (@import("builtin").is_test or @import("build_options").fault_injection)) _ = testing.context_free_calls.fetchAdd(1, .seq_cst);
                     ActiveEngine.runGc(m.runtime);
                     ActiveEngine.freeRuntime(m.runtime);
-                    if (comptime @import("builtin").is_test) {
+                    if (comptime (@import("builtin").is_test or @import("build_options").fault_injection)) {
                         _ = testing.vm_free_calls.fetchAdd(1, .seq_cst);
                         testing.last_vm_free_tid.store(std.Thread.getCurrentId(), .seq_cst);
                     }

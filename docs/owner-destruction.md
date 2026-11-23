@@ -51,4 +51,36 @@ The comments describe distinct host turns, not permission to run the creator tas
 
 ## Binding and release boundary
 
-The Android JNI/Kotlin, Java, Apple, .NET, Harmony, and Node.js wrappers require explicit adaptation before exposing versioned foreign close. Keep pending distinct from closed; retain generation-tagged JNI/global callback hooks until matching completion; never clear a replacement generation's hooks; schedule drains on the original creator outside engine work; and keep environment teardown alive until draining finishes. Existing SDK `close`/dispose implementations are not automatically upgraded by these core symbols. ABI consumers, AAR/Maven packaging, R8, release builds, and Inspector need certification against the changed production core rather than inheriting certification from an older core.
+The Android JNI/Kotlin and Java SDK now expose this protocol as `Engine.requestClose`, `closeStatus`, and creator-only `drainClose`. JNI refuses a mismatched destruction protocol at load, retains matching-generation hooks until completion, and uses creator-checked opaque monotonic loop handles instead of exposing recyclable pointers. Apple, .NET, Harmony, and Node.js wrappers still require explicit adaptation before exposing versioned foreign close. Keep pending distinct from closed; retain generation-tagged JNI/global callback hooks until matching completion; never clear a replacement generation's hooks; schedule drains on the original creator outside engine work; and keep environment teardown alive until draining finishes. Other SDK `close`/dispose implementations are not automatically upgraded by these core symbols. ABI consumers, AAR/Maven packaging, R8, release builds, and Inspector need certification against the changed production core rather than inheriting certification from an older core.
+
+## Android lifecycle migration
+
+Deploy the new Kotlin/Java classes, JNI adapter, and protocol-v2 core together; mixed artifacts are unsupported. This lifecycle migration must ship under a new major SDK version, not replace an existing released artifact: `DedicatedEngineThread.close()` now requests asynchronously instead of synchronously dispatching and joining. No release version is selected or published by this local change. `Engine.close()` remains owner-only; it requests and attempts one drain, and its void return is not completion evidence, especially inside callbacks. Do not use foreign `Native.destroy` as an alternative.
+
+`requestClose()` closes wrapper admission immediately; retained `Value`s can no longer be used. This is separate from physical release. `closeStatus()` is any-thread, data-only VM progress. `drainClose()` must run on the original Java creator thread after callbacks unwind; `COMPLETE` means native teardown ended and that drain released the matching JNI state. Neither data-only status nor VM completion proves the host Looper thread has terminated. Duplicate requests coalesce and a stale generation cannot destroy or clear a replacement.
+
+```kotlin
+// Creator without a Looper: retain engine until this owner-side drain completes.
+val engine = Engine(42)
+val requester = Thread { check(engine.requestClose() == CloseStatus.PENDING) }
+requester.start()
+requester.join() // Safe: requester does not synchronously dispatch back here.
+check(engine.drainClose() == CloseStatus.COMPLETE) // Outside engine callbacks/work.
+```
+
+```java
+// Same manual-owner migration in Java.
+Engine engine = new Engine(43);
+Thread requester = new Thread(() -> engine.requestClose());
+requester.start();
+requester.join();
+if (engine.drainClose() != CloseStatus.COMPLETE) {
+    // Keep the original creator alive; retry on a later host turn after leases end.
+}
+```
+
+For an existing Android Looper creator, each request coalesces one independent `Handler` drain task, not an engine-queue task. It does not install a new owner thread. If the task still finds a lease or callback, progress remains pending: arrange another later owner `drainClose()` or call `requestClose()` again to schedule another attempt. There is no busy wait, hidden timeout, unbounded timer retry, or synchronous owner dispatch. Check progress before quitting the Looper. The existing opt-in `DedicatedEngineThread` helper similarly posts a nonblocking completion attempt and only quits after creator drain completes; retry its request if a lease deferred that attempt. Its `runOnOwner` remains a synchronous general-work helper and must not be used to wait on teardown while the creator joins the caller.
+
+A rejected post, stopped/unpumped Looper, or exited creator leaves `PENDING`, with wrappers/native resources retained. No foreign fallback frees the VM or invokes finalizers. Resuming the same creator and draining is the only in-process recovery; an exited creator cannot be replaced by a new thread with a recycled OS id. Keep host/process teardown alive until completion, or explicitly accept process-lifetime retention. This preserves creator-is-owner and existing callback/reentry semantics rather than silently moving ownership.
+
+The standalone Android diagnostic runs real ART and measures returned backend context/runtime free calls separately from exactly-once finalizer count/thread. It is not a retained-byte or sanitizer certificate. Fault-only counters and probe exports are absent from normal packaged builds.

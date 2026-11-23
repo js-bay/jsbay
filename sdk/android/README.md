@@ -1,5 +1,7 @@
 # JsBay Android SDK
 
+> Lifecycle protocol v2: deploy matching core/JNI/classes and migrate close as described in [owner destruction](../../docs/owner-destruction.md#android-lifecycle-migration). `Engine.close()` is owner-only and may defer; `DedicatedEngineThread.close()` is now nonblocking. Check `closeStatus()` and keep the original owner alive until creator drain completes. A new major SDK release is required for this behavioral migration; no release is published here.
+
 `Engine` and `Value` are owner-thread objects. Close each owned `Value` and
 the engine on the thread that created the engine. Callback arguments are
 borrowed; call `retain()` before keeping one after the callback returns.
@@ -8,7 +10,7 @@ borrowed; call `retain()` before keeping one after the callback returns.
 Do **not** create an `Engine` on the UI/main `Looper` in production: synchronous
 `evaluate` will ANR. Prefer `Engine.createOnBackground(id) { engine -> ... }`,
 which starts a `HandlerThread` named `jsbay-<id>` and runs `ready` on that owner
-thread. Quit the returned thread after `engine.close()` on the owner thread.
+thread. Quit the returned thread only after creator drain reports `CloseStatus.COMPLETE`.
 
 Same-process native crashes still kill the host process; time/memory limits and
 wrong-thread checks are soft failures only. Use a separate `android:process` when
@@ -60,7 +62,7 @@ DedicatedEngineThread.start(instanceId).use { dedicated ->
 }
 ```
 
-`DedicatedEngineThread.post` / `runOnOwner` marshal work onto the owner thread. `close()` closes the engine on that thread and quits its Looper. Threads without a Looper still use `runLoop()` on the owner thread; never call `runLoop()` on the main/UI thread.
+`DedicatedEngineThread.post` / `runOnOwner` marshal work onto the owner thread. `requestClose()` / `close()` request asynchronously; an independent owner task attempts `drainClose()` and only quits its Looper after completion. A pending attempt needs a later retry; `closeStatus()` reports VM progress, not thread-exit proof. Threads without a Looper still use `runLoop()` on the owner thread; never call `runLoop()` on the main/UI thread.
 
 JavaScript throws are `JsBayException` values. The original thrown `Value` is available through `getValue()` in Java and `value` in Kotlin. Use `describeAndClose()` when only display text is needed: it reads and closes the original value, preserves embedded NUL and Unicode, and returns `"JavaScript exception"` if coercion throws another JavaScript value. Owner-thread, borrowed, and stale-value errors still throw instead of becoming fallback text.
 

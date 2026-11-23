@@ -38,6 +38,22 @@ internal object Native {
 
     external fun destroy(id: Int)
 
+    external fun requestDestroy(
+        id: Int,
+        generation: Long,
+    ): Int
+
+    external fun destroyStatus(
+        id: Int,
+        generation: Long,
+    ): Int
+
+    external fun drainDestroy(
+        id: Int,
+        generation: Long,
+        binding: Long,
+    ): Int
+
     external fun setEventHandler(
         id: Int,
         eventHandler: EventHandler?,

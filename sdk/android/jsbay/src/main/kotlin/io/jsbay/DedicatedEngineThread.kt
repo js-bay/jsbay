@@ -2,13 +2,14 @@ package io.jsbay
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 open class DedicatedEngineThreadTimeoutException(
     message: String,
 ) : RuntimeException(message)
 
-/** One [Engine] owned by a dedicated Looper thread. Matches the multi-instance host pattern: one owner thread per instance id, never the process main/UI thread. Construct with [start], post work with [post], and [close] on any thread (close runs on the owner thread). */
+/** One [Engine] owned by a dedicated Looper thread. Matches the multi-instance host pattern: one owner thread per instance id, never the process main/UI thread. Construct with [start], post work with [post], and request [close] on any thread (nonblocking; creator drain completes teardown). */
 class DedicatedEngineThread private constructor(
     val id: Int,
     private val thread: Thread,
@@ -93,63 +94,94 @@ class DedicatedEngineThread private constructor(
     /** Sets the memory limit in bytes. Must run on the owner thread. */
     fun setMemoryLimit(bytes: Long): Boolean = runOnOwner { it.setMemoryLimit(bytes) }
 
+    /** Explicit bounded compatibility wait. Never call from a requester that the creator is joining; prefer requestClose. Timeout is not completion. */
     fun close(timeoutMillis: Long) {
-        // Never clear engineRef before a successful owner-thread destroy — otherwise instance ids are orphaned.
-        val current = engineRef.get() ?: return
+        require(timeoutMillis > 0) { "A positive close timeout is required" }
         if (Thread.currentThread() === thread) {
-            try {
-                current.close()
-                engineRef.compareAndSet(current, null)
-            } finally {
-                LoopDriver.quitCurrentLooperSafely()
+            close()
+            if (closeStatus() != CloseStatus.COMPLETE) {
+                throw DedicatedEngineThreadTimeoutException(
+                    "Creator callback cannot wait for its own drain; destruction pending",
+                )
             }
             return
         }
+        val budget = TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        val started = System.nanoTime()
         val done = CountDownLatch(1)
         val error = AtomicReference<Throwable?>(null)
-        val destroyed = AtomicReference(false)
-        val posted: Boolean
-        synchronized(lock) {
-            if (isExecutingJob) {
-                current.requestInterrupt()
-                shutdownInterruptedJob = true
-            }
-            posted =
+        val posted =
+            synchronized(lock) {
+                val current = engineRef.get()
+                if (isExecutingJob && current != null) {
+                    current.requestInterrupt()
+                    shutdownInterruptedJob = true
+                }
                 post {
                     try {
-                        if (engineRef.get() !== current) return@post
-                        current.close()
-                        engineRef.compareAndSet(current, null)
-                        destroyed.set(true)
-                    } catch (t: Throwable) {
-                        error.set(t)
+                        close()
+                    } catch (failure: Throwable) {
+                        error.set(failure)
                     } finally {
-                        LoopDriver.quitCurrentLooperSafely()
                         done.countDown()
                     }
                 }
-        }
+            }
         if (!posted) {
-            // Dead / quit Looper: Handler.post failed. Best-effort policy (R2): leave engineRef set so
-            // the native instance id is not silently orphaned; caller must recover (process restart or
-            // a last-ditch owner-thread destroy if the thread is somehow still alive). close() does not
-            // call Native.destroy from a foreign thread.
-            throw JsBayException(Status.INSTANCE_NOT_FOUND)
+            if (!thread.isAlive && closeStatus() == CloseStatus.COMPLETE) return
+            requestClose()
+            throw DedicatedEngineThreadTimeoutException("Owner unavailable; destruction pending")
         }
-        if (!done.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
-            // Timed out waiting for owner destroy; cancel execution so stuck loops do not spin indefinitely.
-            current.cancel()
-            throw DedicatedEngineThreadTimeoutException("Timed out waiting for dedicated engine thread shutdown")
+        val remaining = budget - (System.nanoTime() - started)
+        if (remaining <= 0 || !done.await(remaining, TimeUnit.NANOSECONDS)) {
+            requestClose()
+            throw DedicatedEngineThreadTimeoutException(
+                "Timed out awaiting creator drain; completion is not acknowledged",
+            )
         }
         error.get()?.let { throw it }
-        if (!destroyed.get() && engineRef.get() === current) {
-            throw JsBayException(Status.INSTANCE_NOT_FOUND)
+        val joinRemaining = budget - (System.nanoTime() - started)
+        if (joinRemaining > 0 && thread.isAlive) {
+            thread.join(joinRemaining / 1_000_000, (joinRemaining % 1_000_000).toInt())
         }
-        thread.join(timeoutMillis)
+        if (thread.isAlive || closeStatus() != CloseStatus.COMPLETE) {
+            throw DedicatedEngineThreadTimeoutException("Creator drain or thread-exit acknowledgement pending")
+        }
     }
 
+    private val closePosted = AtomicBoolean(false)
+
+    /** Nonblocking on every thread. A stopped owner leaves the native generation pending. */
+    fun requestClose(): CloseStatus {
+        val current = engineRef.get() ?: return CloseStatus.COMPLETE
+        val status = current.requestClose()
+        if (closePosted.compareAndSet(false, true)) {
+            if (!post {
+                    closePosted.set(false)
+                    finishClose(current)
+                }
+            ) {
+                closePosted.set(false)
+            }
+        }
+        return status
+    }
+
+    /** Data-only VM progress, not proof that the Looper thread has exited. */
+    fun closeStatus(): CloseStatus = engineRef.get()?.closeStatus() ?: CloseStatus.COMPLETE
+
+    private fun finishClose(current: Engine) {
+        if (current.drainClose() == CloseStatus.COMPLETE) {
+            engineRef.compareAndSet(current, null)
+            LoopDriver.quitCurrentLooperSafely()
+        }
+    }
+
+    /** Migration: close requests asynchronously; use closeStatus, never block the creator joining a requester. */
     override fun close() {
-        close(30_000L)
+        val current = engineRef.get() ?: return
+        requestClose()
+        if (Thread.currentThread() === thread) finishClose(current)
     }
 
     companion object {

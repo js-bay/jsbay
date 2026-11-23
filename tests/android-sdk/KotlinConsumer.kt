@@ -49,7 +49,9 @@ private fun advanceCurrentLooper(milliseconds: Long) {
     // Real Looper has no advanceBy. Pump MessageQueue.next() for the requested window, then flush already-due work up to MAX_DUE_FLUSH_MESSAGES.
     val handler = android.os.Handler(looper)
     val deadlineUptime = android.os.SystemClock.uptimeMillis() + milliseconds
-    val windowElapsed = java.util.concurrent.atomic.AtomicBoolean(milliseconds == 0L)
+    val windowElapsed =
+        java.util.concurrent.atomic
+            .AtomicBoolean(milliseconds == 0L)
     if (milliseconds > 0) {
         handler.postDelayed({ windowElapsed.set(true) }, milliseconds)
     }
@@ -745,7 +747,9 @@ fun runKotlinConsumer() {
     run {
         val looper = android.os.Looper.myLooper() ?: error("Kotlin due-flush tests require a prepared Looper")
         val handler = android.os.Handler(looper)
-        val ran = java.util.concurrent.atomic.AtomicInteger(0)
+        val ran =
+            java.util.concurrent.atomic
+                .AtomicInteger(0)
         val chain = 64
         repeat(chain) { handler.post { ran.incrementAndGet() } }
         advanceCurrentLooper(0)
@@ -759,8 +763,12 @@ fun runKotlinConsumer() {
             }
         // The iteration cap is the device MessageQueue pump only. The host stub still uses advanceBy and is not the unbounded-flush path.
         if (!hasAdvanceBy) {
-            val keepGoing = java.util.concurrent.atomic.AtomicBoolean(true)
-            val livelock = java.util.concurrent.atomic.AtomicInteger(0)
+            val keepGoing =
+                java.util.concurrent.atomic
+                    .AtomicBoolean(true)
+            val livelock =
+                java.util.concurrent.atomic
+                    .AtomicInteger(0)
             val tick =
                 object : Runnable {
                     override fun run() {
