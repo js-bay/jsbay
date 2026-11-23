@@ -211,6 +211,8 @@ static uint64_t reserveLargeMessage(JsbayHermesInspector *inspector,
     return state.large_message_seq;
 }
 
+static void terminalizeSession(JsbayHermesInspector *inspector, uint64_t session_id);
+
 static void releaseLargeMessage(JsbayHermesInspector *inspector, uint64_t session_id,
                                 uint64_t delivery_token) {
     if (delivery_token == 0)
@@ -588,15 +590,6 @@ static std::optional<ParsedMessage> parseMessage(JsbayHermesInspector *inspector
     return inspector->parse(json.data(), json.size(), copyInfo, &out) && out.valid
                ? std::optional<ParsedMessage>(std::move(out))
                : std::nullopt;
-}
-
-static std::string jsonQuote(const std::string &value) {
-    std::string out;
-    if (const auto len = escapedJsonLen(value)) {
-        out.reserve(*len);
-    }
-    appendJsonQuoted(out, value);
-    return out;
 }
 
 // enqueue owns task_data only after returning true; a false result leaves cleanup to this bridge.
