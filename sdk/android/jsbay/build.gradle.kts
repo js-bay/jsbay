@@ -60,7 +60,8 @@ android {
 
 kotlin { jvmToolchain(17) }
 
-dependencies { implementation("org.jetbrains.kotlin:kotlin-stdlib:1.9.22") }
+// Public callback and runOnOwner signatures expose Kotlin function types to Java consumers.
+dependencies { api("org.jetbrains.kotlin:kotlin-stdlib:1.9.22") }
 
 tasks.configureEach {
     if (name == "bundleReleaseAar") {

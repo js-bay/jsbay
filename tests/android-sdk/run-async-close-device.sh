@@ -24,6 +24,6 @@ source "$ROOT/tests/android-sdk/android-device-lib.sh"
 require_android_device_abi "$JNI"
 "$ADB" shell "mkdir -p '$REMOTE'"
 push_android_device_payload "$OUT/dex/classes.dex" "$REMOTE/"
-for mode in normal quit-owner; do
+for mode in normal quit-owner quit-helper; do
     "$ADB" shell "CLASSPATH='$REMOTE/classes.dex' LD_LIBRARY_PATH='$REMOTE' app_process / io.jsbay.consumer.AsyncCloseConsumer '$mode'" 2>&1 | tee "$OUT/$mode.log"
 done

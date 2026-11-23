@@ -282,7 +282,7 @@ test "test_android_release_includes_maven_metadata_and_transitive_kotlin" {
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
     const gradle = try read(a, io, cwd, &.{ "sdk", "android", "jsbay", "build.gradle.kts" });
-    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbayquickjs\"", "\"quickjs_ng\" -> \"jsbayquickjsng\"", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
+    for ([_][]const u8{ "maven-publish", "api(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbayquickjs\"", "\"quickjs_ng\" -> \"jsbayquickjsng\"", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
     for ([_][]const u8{ ":jsbay:publishReleasePublicationToStagingRepository", "-PjsbayVersion=", "-PjsbayBackend=\"$backend\"", "-PjsbayMavenRepo=", "archive=\"jsbay-${ver}-android-${backend}-maven.zip\"", "tests/android-sdk/maven-consumer.sh", "env -u ANDROID_HOME ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"", "-PjsbayVersion=\"${{ steps.ver.outputs.label }}\"", "tool -- check-maven \"$module\" \"$ver\" \"$backend\"" }) |needle| try contains(release, needle);
 }
 

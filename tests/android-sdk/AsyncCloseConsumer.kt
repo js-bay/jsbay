@@ -4,6 +4,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import io.jsbay.CloseStatus
 import io.jsbay.DedicatedEngineThread
+import io.jsbay.DedicatedEngineThreadTimeoutException
 import io.jsbay.Engine
 import io.jsbay.JsBayException
 import io.jsbay.Status
@@ -17,7 +18,11 @@ import java.util.concurrent.atomic.AtomicReference
 object AsyncCloseConsumer {
     @JvmStatic fun main(args: Array<String>) {
         try {
-            if (args.firstOrNull() == "quit-owner") quitOwner() else verify()
+            when (args.firstOrNull()) {
+                "quit-owner" -> quitOwner()
+                "quit-helper" -> quitHelper()
+                else -> verify()
+            }
         } catch (failure: Throwable) {
             failure.printStackTrace(System.err)
             throw failure
@@ -78,6 +83,91 @@ object AsyncCloseConsumer {
         println("PASS: dedicated helper self-thread close")
         dedicated(false, 94104)
         dedicated(true, 94105)
+        boundedCompatibility()
+    }
+
+    private fun boundedCompatibility() {
+        val helper = DedicatedEngineThread.start(94107)
+        helper.runOnOwner {
+            val failure = AtomicReference<Throwable>()
+            val timeout = AtomicInteger()
+            val requester =
+                Thread {
+                    try {
+                        helper.close(20)
+                        error("creator join falsely acknowledged")
+                    } catch (
+                        _: DedicatedEngineThreadTimeoutException,
+                    ) {
+                        timeout.incrementAndGet()
+                    } catch (error: Throwable) {
+                        failure.set(error)
+                    }
+                }
+            requester.start()
+            requester.join(3000)
+            check(!requester.isAlive)
+            failure.get()?.let { throw it }
+            check(timeout.get() == 1 && helper.closeStatus() == CloseStatus.PENDING)
+            helper.close()
+            check(helper.closeStatus() == CloseStatus.COMPLETE)
+        }
+        helper.close(3000)
+        helper.close(3000)
+        println(
+            "PASS: explicit bounded wait times out under creator join; owner closes and thread exit is acknowledged",
+        )
+        val callback = DedicatedEngineThread.start(94108)
+        callback.runOnOwner { engine ->
+            engine
+                .bind("boundedClose") { _, _ ->
+                    val result = engine.number(1.0)
+                    try {
+                        callback.close(3000)
+                        error("callback self-wait falsely acknowledged")
+                    } catch (
+                        _: DedicatedEngineThreadTimeoutException,
+                    ) {
+                    }
+                    check(callback.closeStatus() == CloseStatus.PENDING)
+                    result
+                }.close()
+            try {
+                engine.evaluate("boundedClose()")
+                error("closing evaluation unexpectedly succeeded")
+            } catch (
+                failure: JsBayException,
+            ) {
+                check(failure.status == Status.INSTANCE_NOT_FOUND)
+            }
+            callback.close()
+            check(callback.closeStatus() == CloseStatus.COMPLETE)
+        }
+        callback.close(3000)
+        println("PASS: bounded callback self-wait reports pending until callback unwind")
+    }
+
+    private fun quitHelper() {
+        val helper = DedicatedEngineThread.start(94109)
+        helper.runOnOwner {
+            android.os.Looper
+                .myLooper()!!
+                .quitSafely()
+        }
+        try {
+            helper.close(3000)
+            error("unavailable helper owner falsely acknowledged")
+        } catch (
+            _: DedicatedEngineThreadTimeoutException,
+        ) {
+        }
+        repeat(16) {
+            check(helper.requestClose() == CloseStatus.PENDING)
+            check(helper.closeStatus() == CloseStatus.PENDING)
+        }
+        println(
+            "PASS: helper Looper refuses close posting; explicit wait fails and async state stays pending; no release claim",
+        )
     }
 
     private fun requestConcurrently(request: () -> CloseStatus) {
