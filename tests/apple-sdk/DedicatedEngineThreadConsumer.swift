@@ -179,6 +179,14 @@ struct DedicatedEngineThreadConsumer {
     try queuedDrainOwner.close(timeout: .seconds(5))
     precondition(queuedDrainResult.get())
 
+    let directInitOwner = try DedicatedEngineThread(id: 81_552)
+    let directValue = try directInitOwner.runOnOwner { engine in
+      let evaluated = try engine.evaluate("10 + 32")
+      defer { try? evaluated.close() }
+      return try evaluated.number()
+    }
+    precondition(directValue == 42)
+    try directInitOwner.close(timeout: .seconds(5))
   }
 }
 

@@ -80,7 +80,45 @@ fi
 
 mkdir -p "$stage_dir"
 asset="$stage_dir/jsbay-${version}-harmony-${backend}-arm64-v8a.har"
-cp "$har" "$asset"
+
+# Strip in-place @ts-nocheck comments from packaged ArkTS declaration files so strict consumer projects pass linter gates.
+repack_dir="$work/repack"
+mkdir -p "$repack_dir"
+if tar -tzf "$har" >/dev/null 2>&1; then
+  tar -xzf "$har" -C "$repack_dir"
+  for decl in "$repack_dir"/package/src/main/ets/*.d.ets; do
+    if [[ -f "$decl" ]]; then
+      sed '/^[[:space:]]*\/\/[[:space:]]*@ts-nocheck[[:space:]]*$/d' "$decl" > "$decl.tmp"
+      mv "$decl.tmp" "$decl"
+    fi
+  done
+  (cd "$repack_dir" && tar -czf "$asset" package)
+elif command -v unzip >/dev/null && command -v zip >/dev/null && unzip -Z1 "$har" >/dev/null 2>&1; then
+  unzip -q "$har" -d "$repack_dir"
+  for decl in "$repack_dir"/package/src/main/ets/*.d.ets; do
+    if [[ -f "$decl" ]]; then
+      sed '/^[[:space:]]*\/\/[[:space:]]*@ts-nocheck[[:space:]]*$/d' "$decl" > "$decl.tmp"
+      mv "$decl.tmp" "$decl"
+    fi
+  done
+  (cd "$repack_dir" && zip -qr "$asset" package)
+else
+  cp "$har" "$asset"
+fi
+
+for decl_member in package/src/main/ets/JsBay.d.ets package/src/main/ets/index.d.ets; do
+  if tar -tzf "$asset" >/dev/null 2>&1; then
+    if tar -xOzf "$asset" "$decl_member" | grep -Eq '^[[:space:]]*//[[:space:]]*@ts-nocheck'; then
+      echo "Staged HAR declaration retains @ts-nocheck: $decl_member" >&2
+      exit 1
+    fi
+  elif command -v unzip >/dev/null && unzip -Z1 "$asset" >/dev/null 2>&1; then
+    if unzip -p "$asset" "$decl_member" | grep -Eq '^[[:space:]]*//[[:space:]]*@ts-nocheck'; then
+      echo "Staged HAR declaration retains @ts-nocheck: $decl_member" >&2
+      exit 1
+    fi
+  fi
+done
 printf '%s\n' "$backend" > "$stage_dir/backend"
 if command -v sha256sum >/dev/null; then
   sha256sum "$asset" > "$stage_dir/SHA256SUMS"
