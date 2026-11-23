@@ -23,7 +23,7 @@ pub const Transport = struct {
         bound_port: ?*const fn (ctx: *anyopaque) u16 = null,
         max_message_bytes: ?*const fn (ctx: *anyopaque) usize = null,
         max_backlog_bytes: ?*const fn (ctx: *anyopaque) usize = null,
-        /// An accepted nonzero token is reported to the delivery observer exactly once upon wire delivery, write failure, or frame drop on session close. Token zero does not request a delivery callback.
+        /// An accepted nonzero token is reported to the delivery observer exactly once upon wire delivery, write failure, or frame drop on session close. Not invoked after transport deinit has started or within re-entrant teardown callbacks. Token zero does not request a delivery callback.
         send_text_tracked: ?*const fn (ctx: *anyopaque, session: SessionId, text: []const u8, token: u64) bool = null,
         /// Setting the observer to null waits for a running callback to return, except when called by that callback itself.
         set_delivery_observer: ?*const fn (ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId, u64) void) void = null,

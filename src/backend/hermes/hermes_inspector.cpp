@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,7 @@ extern "C" void hermes_context_set_inspector(JsbayHermesContext *, JsbayHermesIn
 extern "C" JsbayHermesInspector *hermes_context_get_inspector(JsbayHermesContext *);
 
 constexpr size_t kMaxOutboundMessages = 256;
+constexpr size_t kMaxPendingLargeRequests = 16;
 constexpr size_t kDefaultMaxOutboundMessageBytes = 64 << 20;
 constexpr size_t kDefaultMaxOutboundBacklogBytes = 8 << 20;
 
@@ -133,23 +135,24 @@ struct JsbayHermesInspector {
     std::unordered_map<std::string, std::shared_ptr<const std::string>> script_sources;
     std::deque<std::string> script_source_order;
     size_t script_source_bytes = 0;
+    struct PendingLargeSource {
+        long long id;
+        std::shared_ptr<const std::string> source;
+    };
     struct OutboundMessage {
         uint64_t session_id;
         std::string json;
         std::optional<long long> response_id;
         size_t charged_bytes = 0;
         uint64_t delivery_token = 0;
-    };
-    struct PendingLargeSource {
-        long long id;
-        std::shared_ptr<const std::string> source;
+        std::shared_ptr<const std::string> pending_source;
     };
     struct OutboundState {
         size_t bytes = 0;
         size_t messages = 0;
         bool large_message_in_flight = false;
         uint64_t large_message_seq = 0;
-        std::vector<PendingLargeSource> pending_large;
+        std::deque<PendingLargeSource> pending_large;
     };
     std::mutex outbound_mutex;
     std::condition_variable outbound_cv;
@@ -209,7 +212,91 @@ static uint64_t reserveLargeMessage(JsbayHermesInspector *inspector,
 }
 
 static void releaseLargeMessage(JsbayHermesInspector *inspector, uint64_t session_id,
-                                uint64_t delivery_token);
+                                uint64_t delivery_token) {
+    if (delivery_token == 0)
+        return;
+    std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
+    const auto it = inspector->outbound_sessions.find(session_id);
+    if (it == inspector->outbound_sessions.end() ||
+        it->second.large_message_seq != delivery_token) {
+        return;
+    }
+    it->second.large_message_in_flight = false;
+    if (!it->second.pending_large.empty()) {
+        auto next = std::move(it->second.pending_large.front());
+        it->second.pending_large.pop_front();
+        const uint64_t next_seq = reserveLargeMessage(inspector, it->second);
+        inspector->outbound.push_back({session_id, "", next.id, 0, next_seq, std::move(next.source)});
+        it->second.messages += 1;
+        inspector->outbound_cv.notify_one();
+    }
+}
+
+static std::optional<size_t> escapedJsonLen(const std::string &s) noexcept {
+    size_t len = 2; // surrounding quotes
+    for (unsigned char c : s) {
+        size_t add = 1;
+        switch (c) {
+        case '"':
+        case '\\':
+        case '\b':
+        case '\f':
+        case '\n':
+        case '\r':
+        case '\t':
+            add = 2;
+            break;
+        default:
+            if (c <= 0x1f) {
+                add = 6;
+            }
+            break;
+        }
+        if (__builtin_add_overflow(len, add, &len))
+            return std::nullopt;
+    }
+    return len;
+}
+
+static void appendJsonQuoted(std::string &out, const std::string &value) {
+    out.push_back('\"');
+    static constexpr char hex[] = "0123456789abcdef";
+    for (unsigned char c : value) {
+        switch (c) {
+        case '\"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c <= 0x1f) {
+                out += "\\u00";
+                out.push_back(hex[c >> 4]);
+                out.push_back(hex[c & 15]);
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+            break;
+        }
+    }
+    out.push_back('\"');
+}
 
 // This only marks a terminal close. The separate sender calls the host without holding Hermes' outbound callback mutex, so releasing the last agent cannot recursively lock it.
 static void terminalizeSession(JsbayHermesInspector *inspector, uint64_t session_id) {
@@ -382,6 +469,33 @@ static void runOutboundSender(JsbayHermesInspector *inspector) {
                     state->second.messages -= 1;
                 }
             }
+            if (message.pending_source) {
+                try {
+                    const std::string id_str = std::to_string(*message.response_id);
+                    const auto escaped_len = escapedJsonLen(*message.pending_source);
+                    if (!escaped_len) throw std::bad_alloc();
+                    constexpr size_t kEnvelopeFixed =
+                        sizeof("{\"id\":") - 1 +
+                        sizeof(",\"result\":{\"scriptSource\":") - 1 +
+                        sizeof("}}") - 1;
+                    message.json.reserve(*escaped_len + id_str.size() + kEnvelopeFixed);
+                    message.json += "{\"id\":";
+                    message.json += id_str;
+                    message.json += ",\"result\":{\"scriptSource\":";
+                    appendJsonQuoted(message.json, *message.pending_source);
+                    message.json += "}}";
+                    message.pending_source.reset();
+                } catch (...) {
+                    const auto rid = *message.response_id;
+                    const auto token = message.delivery_token;
+                    releaseLargeMessage(inspector, message.session_id, token);
+                    if (!enqueueFallbackError(inspector, message.session_id, rid,
+                                              "Unable to allocate script source response")) {
+                        terminalizeSession(inspector, message.session_id);
+                    }
+                    continue;
+                }
+            }
             delivery_token = message.delivery_token;
             const bool emit_ok = inspector->emit(message.session_id, message.json.data(),
                                                  message.json.size(), delivery_token, inspector->user_data);
@@ -465,126 +579,6 @@ static std::optional<ParsedMessage> parseMessage(JsbayHermesInspector *inspector
     return inspector->parse(json.data(), json.size(), copyInfo, &out) && out.valid
                ? std::optional<ParsedMessage>(std::move(out))
                : std::nullopt;
-}
-
-static std::optional<size_t> escapedJsonLen(const std::string &s) noexcept {
-    size_t len = 2; // surrounding quotes
-    for (unsigned char c : s) {
-        size_t add = 1;
-        switch (c) {
-        case '"':
-        case '\\':
-        case '\b':
-        case '\f':
-        case '\n':
-        case '\r':
-        case '\t':
-            add = 2;
-            break;
-        default:
-            if (c <= 0x1f) {
-                add = 6;
-            }
-            break;
-        }
-        if (__builtin_add_overflow(len, add, &len))
-            return std::nullopt;
-    }
-    return len;
-}
-
-static void appendJsonQuoted(std::string &out, const std::string &value) {
-    out.push_back('\"');
-    static constexpr char hex[] = "0123456789abcdef";
-    for (unsigned char c : value) {
-        switch (c) {
-        case '\"':
-            out += "\\\"";
-            break;
-        case '\\':
-            out += "\\\\";
-            break;
-        case '\b':
-            out += "\\b";
-            break;
-        case '\f':
-            out += "\\f";
-            break;
-        case '\n':
-            out += "\\n";
-            break;
-        case '\r':
-            out += "\\r";
-            break;
-        case '\t':
-            out += "\\t";
-            break;
-        default:
-            if (c <= 0x1f) {
-                out += "\\u00";
-                out.push_back(hex[c >> 4]);
-                out.push_back(hex[c & 15]);
-            } else {
-                out.push_back(static_cast<char>(c));
-            }
-            break;
-        }
-    }
-    out.push_back('\"');
-}
-
-static void releaseLargeMessage(JsbayHermesInspector *inspector, uint64_t session_id,
-                                uint64_t delivery_token) {
-    if (delivery_token == 0)
-        return;
-    std::optional<JsbayHermesInspector::PendingLargeSource> next;
-    uint64_t next_seq = 0;
-    {
-        std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
-        const auto it = inspector->outbound_sessions.find(session_id);
-        if (it == inspector->outbound_sessions.end() ||
-            it->second.large_message_seq != delivery_token) {
-            return;
-        }
-        it->second.large_message_in_flight = false;
-        if (!it->second.pending_large.empty()) {
-            next = std::move(it->second.pending_large.front());
-            it->second.pending_large.erase(it->second.pending_large.begin());
-            next_seq = reserveLargeMessage(inspector, it->second);
-        }
-    }
-    if (!next)
-        return;
-    std::string response;
-    try {
-        const std::string id_str = std::to_string(next->id);
-        const auto escaped_len = escapedJsonLen(*next->source);
-        if (!escaped_len) throw std::bad_alloc();
-        constexpr size_t kEnvelopeFixed =
-            sizeof("{\"id\":") - 1 +
-            sizeof(",\"result\":{\"scriptSource\":") - 1 +
-            sizeof("}}") - 1;
-        response.reserve(*escaped_len + id_str.size() + kEnvelopeFixed);
-        response += "{\"id\":";
-        response += id_str;
-        response += ",\"result\":{\"scriptSource\":";
-        appendJsonQuoted(response, *next->source);
-        response += "}}";
-    } catch (...) {
-        releaseLargeMessage(inspector, session_id, next_seq);
-        if (!enqueueFallbackError(inspector, session_id, next->id,
-                                  "Unable to allocate script source response")) {
-            terminalizeSession(inspector, session_id);
-        }
-        return;
-    }
-    if (!enqueueOutbound(inspector, session_id, std::move(response), next->id, false, next_seq)) {
-        releaseLargeMessage(inspector, session_id, next_seq);
-        if (!enqueueFallbackError(inspector, session_id, next->id,
-                                  "Inspector transport is busy or disconnected")) {
-            terminalizeSession(inspector, session_id);
-        }
-    }
 }
 
 static std::string jsonQuote(const std::string &value) {
@@ -847,7 +841,7 @@ extern "C" bool hermes_inspector_message(JsbayHermesInspector *inspector, uint64
                 if (state.messages >= kMaxOutboundMessages) {
                     is_busy = true;
                 } else if (is_large && state.large_message_in_flight) {
-                    if (state.pending_large.size() < 16) {
+                    if (state.pending_large.size() < kMaxPendingLargeRequests) {
                         state.pending_large.push_back({*id, source_ptr});
                         return true;
                     }

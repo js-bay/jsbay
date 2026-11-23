@@ -184,7 +184,7 @@ static void testPendingLargeSourceQueueing() {
     source2 = std::make_shared<const std::string>(32, 'b');
 
     static std::string current_script_id = "1";
-    inspector->parse_script_source = [](const char *, size_t, HermesInspectorInfoSink sink, void *target) -> bool {
+    inspector->parse = [](const char *, size_t, HermesInspectorInfoSink sink, void *target) -> bool {
         constexpr char method[] = "Debugger.getScriptSource";
         HermesInspectorMessageInfo info{};
         info.id = 10;
@@ -207,6 +207,15 @@ static void testPendingLargeSourceQueueing() {
     CHECK(fixture.state().large_message_in_flight);
     CHECK(fixture.state().pending_large.size() == 1);
 
+    // Queue up to the maximum capacity of 16
+    for (int i = 0; i < 15; ++i) {
+        CHECK(hermes_inspector_message(inspector, 1, "{}", 2));
+    }
+    CHECK(fixture.state().pending_large.size() == 16);
+    // 17th request is rejected with busy fallback without growing queue
+    CHECK(hermes_inspector_message(inspector, 1, "{}", 2));
+    CHECK(fixture.state().pending_large.size() == 16);
+
     fixture.startSender();
     const auto frame1 = fixture.waitForFrame(1);
     CHECK(frame1.token != 0);
@@ -220,8 +229,32 @@ static void testPendingLargeSourceQueueing() {
     CHECK(frame2.text.find(std::string(32, 'b')) != std::string::npos);
     jsbay_hermes_inspector_delivery_complete(inspector, 1, frame2.token);
     fixture.finishFrame(2);
-    CHECK(!fixture.state().large_message_in_flight);
-    CHECK(fixture.state().pending_large.empty());
+}
+
+static void testPendingLargeClearedOnSessionDiscard() {
+    OutboundFixture fixture(8);
+    auto *inspector = &fixture.inspector;
+    auto &source = inspector->script_sources["1"];
+    source = std::make_shared<const std::string>(32, 'z');
+    inspector->parse = [](const char *, size_t, HermesInspectorInfoSink sink, void *target) -> bool {
+        constexpr char method[] = "Debugger.getScriptSource";
+        HermesInspectorMessageInfo info{};
+        info.id = 20;
+        info.flags = 1;
+        info.method = method;
+        info.method_len = sizeof(method) - 1;
+        info.script_id = "1";
+        info.script_id_len = 1;
+        sink(target, &info);
+        return true;
+    };
+    CHECK(hermes_inspector_message(inspector, 1, "{}", 2));
+    CHECK(fixture.state().large_message_in_flight);
+    CHECK(hermes_inspector_message(inspector, 1, "{}", 2));
+    CHECK(fixture.state().pending_large.size() == 1);
+    discardOutboundSession(inspector, 1);
+    std::lock_guard<std::mutex> lock(inspector->outbound_mutex);
+    CHECK(inspector->outbound_sessions.find(1) == inspector->outbound_sessions.end());
 }
 
 int main() {
@@ -232,6 +265,7 @@ int main() {
         testOversizedResponseAndNotification();
         testStaleDeliveryToken();
         testPendingLargeSourceQueueing();
+        testPendingLargeClearedOnSessionDiscard();
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

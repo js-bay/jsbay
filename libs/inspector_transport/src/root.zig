@@ -195,11 +195,9 @@ const Session = struct {
         self.accepting = false;
         for (self.queue.items[self.queue_head..]) |frame| {
             if (frame.delivery_token != 0) {
-                std.debug.assert(token_count < pending_tokens.len);
-                if (token_count < pending_tokens.len) {
-                    pending_tokens[token_count] = frame.delivery_token;
-                    token_count += 1;
-                }
+                if (token_count >= pending_tokens.len) @panic("too many pending tokens in requestClose");
+                pending_tokens[token_count] = frame.delivery_token;
+                token_count += 1;
             }
             self.allocator.free(frame.bytes);
         }
@@ -1014,16 +1012,13 @@ fn writerLoop(sess: *Session) void {
         const is_large = frame.bytes.len > sess.transport.max_backlog_bytes;
         if (!is_large) {
             sess.queued_backlog_bytes -= frame.bytes.len;
+        } else {
+            sess.large_message_in_flight = false;
         }
         sess.queue_mu.unlock();
 
         const ok = writeFrame(sess, frame.kind, frame.bytes);
         const close_after = frame.kind == .close;
-        if (is_large) {
-            sess.queue_mu.lock();
-            sess.large_message_in_flight = false;
-            sess.queue_mu.unlock();
-        }
         if (frame.delivery_token != 0) {
             notifyDelivery(sess.transport, sess.id, frame.delivery_token);
         }

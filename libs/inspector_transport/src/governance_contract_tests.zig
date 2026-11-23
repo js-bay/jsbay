@@ -882,7 +882,7 @@ test "transport: large message within 64 MiB limit is delivered successfully and
     try testing.expectEqualStrings("concurrent-small-notification", received_small);
 }
 
-test "transport: second large message is rejected while first large message is in flight" {
+test "transport: at most one large message waits in queue while another is being written" {
     const alloc = testing.allocator;
     var opened = Opened{};
     defer opened.changed.deinit();
@@ -907,25 +907,24 @@ test "transport: second large message is rejected while first large message is i
     defer alloc.free(large2);
     @memset(large2, 'b');
 
+    const large3 = try alloc.alloc(u8, 128 * 1024);
+    defer alloc.free(large3);
+    @memset(large3, 'c');
+
     try testing.expect(t.sendText(session, large1));
-    // Second large message while first is in flight must be rejected.
-    try testing.expect(!t.sendText(session, large2));
+    var queued = false;
+    var attempts: usize = 0;
+    while (!queued and attempts < 500) : (attempts += 1) {
+        queued = t.sendText(session, large2);
+        if (!queued) zev.sleepMilliseconds(1);
+    }
+    try testing.expect(queued);
+    try testing.expect(!t.sendText(session, large3));
 
     const received1 = try readTextFrame(alloc, peer);
     defer alloc.free(received1);
     try testing.expectEqualStrings(large1, received1);
 
-    // After draining, large messages are accepted again.
-    var accepted = false;
-    var attempts: usize = 0;
-    while (attempts < 500) : (attempts += 1) {
-        if (t.sendText(session, large2)) {
-            accepted = true;
-            break;
-        }
-        zev.sleepMilliseconds(1);
-    }
-    try testing.expect(accepted);
     const received2 = try readTextFrame(alloc, peer);
     defer alloc.free(received2);
     try testing.expectEqualStrings(large2, received2);
@@ -1519,28 +1518,78 @@ test "transport: fragmented control frame is rejected with 1002" {
     try testing.expectEqual(@as(u16, 1002), close_code);
 }
 
-test "transport: session close drains pending delivery tokens without leaking" {
+const TokenRecorder = struct {
+    mutex: zev.Mutex = .{},
+    tokens: [8]u64 = @splat(0),
+    count: usize = 0,
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+        const self: *TokenRecorder = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count < self.tokens.len) self.tokens[self.count] = token;
+        self.count += 1;
+    }
+};
+
+test "transport: peer disconnect drains queued tracked tokens exactly once" {
     const alloc = testing.allocator;
     var opened = Opened{};
     defer opened.changed.deinit();
     defer opened.mutex.deinit();
-    var delivery = Delivery{};
-    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 * 1024 });
+    var recorder = TokenRecorder{};
+    defer recorder.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
     defer t.deinit();
-    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "drain-tokens-peer" });
-    t.asTransport().setDeliveryObserver(&delivery, Delivery.observer);
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "drain-peer" });
+    t.asTransport().setDeliveryObserver(&recorder, TokenRecorder.observer);
     try t.start(&opened, Opened.handler);
-
     const peer = try connectLoopback(t.boundPort());
     defer peer.close();
-    try handshake(peer, "drain-tokens-peer");
+    try peer.setReceiveBuffer(4096);
+    try handshake(peer, "drain-peer");
     const session = opened.wait(1);
+    const big = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'd');
+    try testing.expect(t.sendText(session, big));
+    try testing.expect(t.sendTrackedText(session, "drain-1", 101));
+    try testing.expect(t.sendTrackedText(session, "drain-2", 102));
+    peer.close();
+    opened.waitClosed(1);
+    zev.sleepMilliseconds(50);
+    recorder.mutex.lock();
+    defer recorder.mutex.unlock();
+    try testing.expectEqual(@as(usize, 2), recorder.count);
+    try testing.expectEqual(@as(u64, 101), recorder.tokens[0]);
+    try testing.expectEqual(@as(u64, 102), recorder.tokens[1]);
+}
 
-    try testing.expect(t.sendTrackedText(session, "token-frame-1", 101));
-    try testing.expect(t.sendTrackedText(session, "token-frame-2", 102));
-    t.closeSession(session);
-
+test "transport: deferred deinit in a delivery callback skips another session's queued token without deadlock" {
+    const alloc = std.heap.page_allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
+    var delivery = DestroyingDelivery{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "n1-peer" });
+    try t.start(&opened, Opened.handler);
+    const blocked = try connectLoopback(t.boundPort());
+    defer blocked.close();
+    try blocked.setReceiveBuffer(4096);
+    try handshake(blocked, "n1-peer");
+    const blocked_session = opened.wait(1);
+    const big = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'q');
+    try testing.expect(t.sendText(blocked_session, big));
+    try testing.expect(t.sendTrackedText(blocked_session, "queued-behind-blocked-writer", 501));
+    const trigger = try connectLoopback(t.boundPort());
+    defer trigger.close();
+    try handshake(trigger, "n1-peer");
+    const trigger_session = opened.wait(2);
+    t.asTransport().setDeliveryObserver(&delivery, DestroyingDelivery.observer);
+    try testing.expect(t.sendTrackedText(trigger_session, "trigger-deferred-deinit", 502));
     var attempts: usize = 0;
-    while (delivery.calls.load(.acquire) < 2 and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
-    try testing.expectEqual(@as(usize, 2), delivery.calls.load(.acquire));
+    while (!delivery.completed.load(.acquire) and attempts < 3000) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expect(delivery.completed.load(.acquire));
 }
