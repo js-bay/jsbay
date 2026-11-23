@@ -46,9 +46,15 @@ public final class DedicatedEngineThread: @unchecked Sendable {
 
   private init(worker: DedicatedEngineThreadWorker) { self.worker = worker }
 
+  /// Creates and starts an engine on a private dedicated thread.
+  public convenience init(id: Int32, limits: ResourceLimits? = nil) throws {
+    self.init(worker: try DedicatedEngineThreadWorker.start(id: id, limits: limits))
+  }
+
+  /// Starts an engine on a private dedicated thread.
   public static func start(id: Int32, limits: ResourceLimits? = nil) throws -> DedicatedEngineThread
   {
-    DedicatedEngineThread(worker: try DedicatedEngineThreadWorker.start(id: id, limits: limits))
+    try DedicatedEngineThread(id: id, limits: limits)
   }
 
   public func runOnOwner<T: EngineThreadResult>(
