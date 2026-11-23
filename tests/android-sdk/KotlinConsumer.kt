@@ -48,7 +48,10 @@ private fun advanceCurrentLooper(milliseconds: Long) {
     }
     // Real Looper has no advanceBy. Pump MessageQueue.next() for the requested window, then flush already-due work up to MAX_DUE_FLUSH_MESSAGES.
     val handler = android.os.Handler(looper)
-    val deadlineUptime = android.os.SystemClock.uptimeMillis() + milliseconds
+    val uptimeMillis = Class.forName("android.os.SystemClock").getMethod("uptimeMillis")
+
+    fun uptime() = uptimeMillis.invoke(null) as Long
+    val deadlineUptime = uptime() + milliseconds
     val windowElapsed =
         java.util.concurrent.atomic
             .AtomicBoolean(milliseconds == 0L)
