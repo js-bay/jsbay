@@ -11,9 +11,9 @@ Create an `Engine` and use its values from one ArkTS Worker. Close owned values 
 Choose one engine package in the consuming module directory. The packages contain different engines but expose the same API and native library name; use one per app.
 
 ```sh
-ohpm install @jsbay/quickjs@0.1.1
+ohpm install @jsbay/quickjs@0.1.2
 # or
-ohpm install @jsbay/quickjs_ng@0.1.1
+ohpm install @jsbay/quickjs_ng@0.1.2
 ```
 
 The published HAR targets `arm64-v8a`.
