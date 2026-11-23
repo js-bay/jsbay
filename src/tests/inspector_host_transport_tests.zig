@@ -14,6 +14,8 @@ const HostTransport = struct {
     handler_ctx: ?*anyopaque = null,
     frames: std.ArrayList(Frame) = .empty,
     deinit_count: usize = 0,
+    delivery_observer: ?*const fn (?*anyopaque, inspector.SessionId, u64) void = null,
+    delivery_observer_ctx: ?*anyopaque = null,
     delivery_observer_registered: bool = false,
     observer_present_at_deinit: bool = false,
     fail_start: bool = false,
@@ -49,8 +51,11 @@ const HostTransport = struct {
         }
     }
 
-    fn setDeliveryObserver(ctx: *anyopaque, _: ?*anyopaque, observer: ?*const fn (?*anyopaque, inspector.SessionId, u64) void) void {
-        from(ctx).delivery_observer_registered = observer != null;
+    fn setDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, inspector.SessionId, u64) void) void {
+        const self = from(ctx);
+        self.delivery_observer_ctx = observer_ctx;
+        self.delivery_observer = observer;
+        self.delivery_observer_registered = observer != null;
     }
 
     fn deinit(ctx: *anyopaque) void {
@@ -300,6 +305,26 @@ const Enabled = if (options.inspector) struct {
         try testing.expect(host.delivery_observer_registered);
         inspector.stop(handle);
         try testing.expectEqual(@as(usize, 2), host.deinit_count);
+        try testing.expect(!host.observer_present_at_deinit);
+    }
+
+    test "host transport delivery observer lifecycle and completion dispatch" {
+        const id = helpers.nextInstanceId();
+        try testing.expect(engine.create(id, .{}));
+        defer engine.destroy(id);
+        var host = HostTransport{};
+        host.init();
+        defer host.freeFrames();
+        const handle = try inspector.startWithTransport(id, &host.endpoint, .{});
+        defer if (host.handler != null) inspector.stop(handle);
+        try testing.expect(host.delivery_observer_registered);
+        try testing.expect(host.delivery_observer != null);
+
+        // Dispatches tracked completion cleanly while inspector session is active.
+        host.delivery_observer.?(host.delivery_observer_ctx, 7, 41);
+
+        inspector.stop(handle);
+        try testing.expect(!host.delivery_observer_registered);
         try testing.expect(!host.observer_present_at_deinit);
     }
 

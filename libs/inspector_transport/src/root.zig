@@ -189,6 +189,8 @@ const Session = struct {
     /// This transition is deliberately separate from closing the socket: shutdown wakes both workers, but the handle remains owned until their/session leases have drained.
     fn requestClose(self: *Session) void {
         if (self.closed.swap(true, .acq_rel)) return;
+        self.transport.callbackLeaseAcquire();
+        defer self.transport.callbackLeaseRelease();
         var pending_tokens: [max_queued_frames]u64 = undefined;
         var token_count: usize = 0;
         self.queue_mu.lock();
@@ -524,12 +526,16 @@ pub const Transport = struct {
     }
 
     pub fn sendTrackedText(self: *Transport, session: SessionId, message: []const u8, token: u64) bool {
+        self.callbackLeaseAcquire();
+        defer self.callbackLeaseRelease();
         const sess = self.lookupSession(session) orelse return false;
         defer sess.release();
         return sess.enqueue(.text, message, true, token);
     }
 
     pub fn broadcastText(self: *Transport, message: []const u8) void {
+        self.callbackLeaseAcquire();
+        defer self.callbackLeaseRelease();
         // Allocate the lease snapshot before retaining anything. An append-while-retaining loop can fail mid-growth after some sessions were already retained; pairing those releases with a growable ArrayList is easy to get wrong under concurrent allocator pressure. Exact alloc-or-fail keeps OOM from observing any broadcast lease.
         self.sessions_mu.lock();
         const n = self.sessions.items.len;
@@ -552,6 +558,8 @@ pub const Transport = struct {
     }
 
     pub fn closeSession(self: *Transport, session: SessionId) void {
+        self.callbackLeaseAcquire();
+        defer self.callbackLeaseRelease();
         const sess = self.lookupSession(session) orelse return;
         defer sess.release();
         sess.enqueueClose(1000);
@@ -1282,7 +1290,7 @@ const NestedDelivery = struct {
     session: SessionId,
     token: u64,
 };
-const max_nested_deliveries: usize = max_queued_frames * 2;
+const max_nested_deliveries: usize = max_sessions * max_queued_frames;
 threadlocal var nested_deliveries: [max_nested_deliveries]NestedDelivery = undefined;
 threadlocal var nested_delivery_head: usize = 0;
 threadlocal var nested_delivery_tail: usize = 0;
@@ -1299,6 +1307,12 @@ fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, obse
 fn notifyDelivery(self: *Transport, session: SessionId, token: u64) void {
     if (delivery_callback_transport == self) {
         if (self.deinit_started.load(.acquire) or self.delivery_observer == null) return;
+        if (nested_delivery_tail >= nested_deliveries.len and nested_delivery_head > 0) {
+            const len = nested_delivery_tail - nested_delivery_head;
+            std.mem.copyForwards(NestedDelivery, nested_deliveries[0..len], nested_deliveries[nested_delivery_head..nested_delivery_tail]);
+            nested_delivery_head = 0;
+            nested_delivery_tail = len;
+        }
         if (nested_delivery_tail < nested_deliveries.len) {
             nested_deliveries[nested_delivery_tail] = .{ .session = session, .token = token };
             nested_delivery_tail += 1;

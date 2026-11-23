@@ -1660,10 +1660,11 @@ const CallerThreadDeliveryTeardown = struct {
 };
 
 test "transport: caller-thread delivery callback retains transport lifetime during teardown" {
+    const alloc = std.heap.page_allocator;
     var opened = Opened{};
     defer opened.changed.deinit();
     defer opened.mutex.deinit();
-    const t = try transport.Transport.initWithOptions(std.heap.page_allocator, 0, .{ .max_backlog_bytes = 256 });
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 });
     var delivery = CallerThreadDeliveryTeardown{ .transport_ptr = t };
     t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "caller-teardown-peer" });
     t.asTransport().setDeliveryObserver(&delivery, CallerThreadDeliveryTeardown.observer);
@@ -1671,13 +1672,22 @@ test "transport: caller-thread delivery callback retains transport lifetime duri
 
     const peer = try connectLoopback(t.boundPort());
     defer peer.close();
+    try peer.setReceiveBuffer(4096);
     try handshake(peer, "caller-teardown-peer");
     const session = opened.wait(1);
+
+    const big = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'q');
+    try testing.expect(t.sendText(session, big));
 
     var first_buf: [150]u8 = @splat('m');
     try testing.expect(t.sendTrackedText(session, &first_buf, 201));
 
-    var overflow_buf: [150]u8 = @splat('n');
+    var second_buf: [150]u8 = @splat('o');
+    try testing.expect(t.sendTrackedText(session, &second_buf, 202));
+
+    var overflow_buf: [300]u8 = @splat('n');
     try testing.expect(!t.sendTrackedText(session, &overflow_buf, 999));
 
     var attempts: usize = 0;
