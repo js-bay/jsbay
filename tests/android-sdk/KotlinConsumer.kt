@@ -991,6 +991,8 @@ private fun runKotlinDedicatedThreadParityTests() {
         }
         value.close()
     }
+    // A foreign bounded close cancels an active job; queue graceful close after the evaluation on the owner.
+    queuedDrainDedicated.runOnOwner { queuedDrainDedicated.close(5_000L) }
     queuedDrainDedicated.close(5_000L)
     check(queuedDrainResult.get()) { "Kotlin queued evaluations drain on close" }
 

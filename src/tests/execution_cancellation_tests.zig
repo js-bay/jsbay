@@ -6,6 +6,7 @@ const engine_thread = @import("../runtime/engine_thread.zig");
 const control = @import("../runtime/runtime_control.zig");
 const host = @import("../abi/host_value.zig");
 const helpers = @import("test_helpers.zig");
+const backend = @import("../backend.zig");
 
 const Probe = struct {
     id: i32,
@@ -74,7 +75,11 @@ test "execution cancellation: native reentry preserves the deadline until explic
         var probe = Probe{ .id = id, .target = id, .clear_nested_deadline = clear };
         try testing.expect(engine_thread.hostInstall(id, "__jsbayArmCancel", Probe.arm, &probe));
         try testing.expect(engine_thread.hostInstall(id, "__jsbayNestedCancel", Probe.reenter, &probe));
-        const result = engine.evalScript(id, "__jsbayNestedCancel(); for (var i = 0; i < 1000000; i++) {} globalThis.__cancelPast = true;", "<outer-cancellation>");
+        // A finite opcode count need not reach JSC's CPU-time watchdog; the uncleared case must reach a real cancellation check.
+        const result = engine.evalScript(id, if (clear)
+            "__jsbayNestedCancel(); for (var i = 0; i < 1000000; i++) {} globalThis.__cancelPast = true;"
+        else
+            "__jsbayNestedCancel(); while (true) {} globalThis.__cancelPast = true;", "<outer-cancellation>");
         defer helpers.freeEvalResult(result);
         try testing.expect(probe.armed and probe.nested_cancelled);
         try testing.expectEqual(!clear, result.err != null);
@@ -112,7 +117,7 @@ test "execution cancellation: entry budget terminates without becoming catchable
     try helpers.expectEvalEquals(id, "40 + 2", "42");
 }
 
-test "execution cancellation: generator termination releases suspended roots" {
+test "execution cancellation: generator termination preserves VM recovery" {
     const id = helpers.nextInstanceId();
     try testing.expect(engine.create(id, .{}));
     defer engine.destroy(id);
@@ -122,7 +127,13 @@ test "execution cancellation: generator termination releases suspended roots" {
     defer helpers.freeEvalResult(result);
     try testing.expect(probe.armed and result.err != null);
     try testing.expect(control.setExecutionTimeLimit(id, 0));
-    try helpers.expectEvalEquals(id, "String(__cancelGenerator.next().done)", "true");
+    if (comptime backend.active_backend == .jsc) {
+        // System JSC skips generatorResume's JavaScript catch on termination, leaving that generator executing and unusable.
+        try helpers.expectEvalEquals(id, "(() => { try { __cancelGenerator.next(); return 'unexpected resume'; } catch (e) { return e.name + ': ' + e.message; } })()", "TypeError: Generator is executing");
+    } else {
+        try helpers.expectEvalEquals(id, "String(__cancelGenerator.next().done)", "true");
+    }
+    try helpers.evalOk(id, "__cancelGenerator = null;");
     try testing.expect(control.runGc(id));
     try helpers.expectEvalEquals(id, "40 + 2", "42");
 }
