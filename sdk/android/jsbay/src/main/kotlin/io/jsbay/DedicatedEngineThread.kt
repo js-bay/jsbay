@@ -128,12 +128,13 @@ class DedicatedEngineThread private constructor(
                 }
             }
         if (!posted) {
-            if (!thread.isAlive && closeStatus() == CloseStatus.COMPLETE) return
-            requestClose()
-            throw DedicatedEngineThreadTimeoutException("Owner unavailable; destruction pending")
+            if (closeStatus() != CloseStatus.COMPLETE) {
+                requestClose()
+                throw DedicatedEngineThreadTimeoutException("Owner unavailable; destruction pending")
+            }
         }
         val remaining = budget - (System.nanoTime() - started)
-        if (remaining <= 0 || !done.await(remaining, TimeUnit.NANOSECONDS)) {
+        if (posted && (remaining <= 0 || !done.await(remaining, TimeUnit.NANOSECONDS))) {
             requestClose()
             throw DedicatedEngineThreadTimeoutException(
                 "Timed out awaiting creator drain; completion is not acknowledged",

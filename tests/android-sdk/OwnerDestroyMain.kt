@@ -39,6 +39,74 @@ object OwnerDestroyMain {
     private fun verify(args: Array<String>) {
         System.loadLibrary("jsbay_owner_probe")
         check(probeCommit() == System.getProperty("jsbay.expectedCommit"))
+        if (args.firstOrNull() == "bounded-close") {
+            val helper = DedicatedEngineThread.start(92022)
+            helper.runOnOwner { engine ->
+                val owner = probeTid()
+                probeReset(engine.id)
+                val failure = AtomicReference<Throwable>()
+                val timedOut = AtomicInteger()
+                val requester =
+                    Thread {
+                        try {
+                            helper.close(20)
+                            error("blocked creator falsely acknowledged")
+                        } catch (
+                            _: DedicatedEngineThreadTimeoutException,
+                        ) {
+                            timedOut.incrementAndGet()
+                        } catch (error: Throwable) {
+                            failure.set(error)
+                        }
+                    }
+                requester.start()
+                requester.join(3000)
+                check(!requester.isAlive)
+                failure.get()?.let { throw it }
+                check(timedOut.get() == 1)
+                check(helper.closeStatus() == CloseStatus.PENDING)
+                pending()
+                helper.close()
+                released(owner)
+            }
+            helper.close(3000)
+            helper.close(3000)
+            println(
+                "PASS: explicit bounded wait times out while creator joins; owner drain frees once and duplicate wait acknowledges thread exit",
+            )
+            val callbackHelper = DedicatedEngineThread.start(92023)
+            callbackHelper.runOnOwner { engine ->
+                val owner = probeTid()
+                probeReset(engine.id)
+                engine
+                    .bind("boundedReentry") { _, _ ->
+                        val result = engine.number(1.0)
+                        try {
+                            callbackHelper.close(3000)
+                            error("creator callback falsely acknowledged")
+                        } catch (
+                            _: DedicatedEngineThreadTimeoutException,
+                        ) {
+                        }
+                        check(callbackHelper.closeStatus() == CloseStatus.PENDING)
+                        pending()
+                        result
+                    }.close()
+                try {
+                    engine.evaluate("boundedReentry()")
+                    error("closing evaluation succeeded")
+                } catch (
+                    failure: JsBayException,
+                ) {
+                    check(failure.status == Status.INSTANCE_NOT_FOUND)
+                }
+                callbackHelper.close()
+                released(owner)
+            }
+            callbackHelper.close(3000)
+            println("PASS: creator callback bounded close refuses self-wait; actual free waits for callback unwind")
+            return
+        }
         if (args.firstOrNull() == "looper-exited") {
             val ownerThread = HandlerThread("diagnostic-exited-owner")
             ownerThread.start()

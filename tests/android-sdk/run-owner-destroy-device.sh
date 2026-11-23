@@ -49,6 +49,6 @@ for lib in "$OUT/libs/"*.so; do
     cmp "$lib" "$PULLED/$name"
 done
 sha256sum "$PULLED/"* | tee -a "$LOG"
-for mode in normal owner-exited looper-exited; do
+for mode in normal owner-exited looper-exited bounded-close; do
     "$ADB" -s "$SERIAL" shell "CLASSPATH='$REMOTE/classes.dex' LD_LIBRARY_PATH='$REMOTE' app_process -Djava.io.tmpdir='$REMOTE' -Djsbay.expectedCommit='$COMMIT' / io.jsbay.OwnerDestroyMain '$mode'" 2>&1 | tee -a "$LOG"
 done
