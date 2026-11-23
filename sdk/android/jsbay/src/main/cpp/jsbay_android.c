@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "jsbay.h"
 #include "jsbay_sync.h"
 #include <jni.h>
@@ -356,12 +360,22 @@ static jint destroy_status(JNIEnv *e, jclass c, jint id, jlong generation) {
     (void)c;
     return jsbay_engine_destroy_status(id, (uint64_t)generation);
 }
+// Match std.Thread.getCurrentId() rather than the opaque pthread_t representation.
+static int is_current_owner_thread(uint64_t owner_thread_id) {
+#if defined(__APPLE__)
+    uint64_t thread_id = 0;
+    return pthread_threadid_np(NULL, &thread_id) == 0 && owner_thread_id == thread_id;
+#else
+    return owner_thread_id == (uint64_t)gettid();
+#endif
+}
+
 static jboolean set_event_handler(JNIEnv *e, jclass c, jint id, jobject eventHandler) {
     (void)c;
     JavaVM *vm = NULL;
     jsbay_instance_snapshot_t snapshot = {.struct_size = sizeof(snapshot)};
     if ((*e)->GetJavaVM(e, &vm) != JNI_OK || !jsbay_engine_snapshot(id, &snapshot) ||
-        snapshot.owner_thread_id != (uint64_t)gettid())
+        !is_current_owner_thread(snapshot.owner_thread_id))
         return JNI_FALSE;
     pthread_mutex_lock(&g_hooks_lock);
     host_hooks *h = hooks_find(id);
