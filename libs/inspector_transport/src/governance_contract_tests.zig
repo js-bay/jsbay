@@ -1596,18 +1596,27 @@ test "transport: deferred deinit in a delivery callback skips another session's 
 
 const ReentrantDeliveryClosure = struct {
     transport_ptr: *transport.Transport,
+    mutex: zev.Mutex = .{},
+    allow_reentrant: std.atomic.Value(bool) = .init(false),
     received_tokens: [8]u64 = @splat(0),
     received_count: usize = 0,
     overflow_triggered: bool = false,
 
     fn observer(ctx: ?*anyopaque, session: transport.SessionId, token: u64) void {
         const self: *ReentrantDeliveryClosure = @ptrCast(@alignCast(ctx.?));
+        if (token == 101) {
+            while (!self.allow_reentrant.load(.acquire)) zev.sleepMilliseconds(1);
+        }
+        self.mutex.lock();
         if (self.received_count < self.received_tokens.len) {
             self.received_tokens[self.received_count] = token;
             self.received_count += 1;
         }
-        if (!self.overflow_triggered and token == 101) {
-            self.overflow_triggered = true;
+        const trigger = !self.overflow_triggered and token == 101;
+        if (trigger) self.overflow_triggered = true;
+        self.mutex.unlock();
+
+        if (trigger) {
             var overflow_buf: [300]u8 = @splat('x');
             _ = self.transport_ptr.sendTrackedText(session, &overflow_buf, 999);
         }
@@ -1636,12 +1645,98 @@ test "transport: reentrant session closure preserves queued delivery tokens" {
     try testing.expect(t.sendTrackedText(session, &first_buf, 101));
     try testing.expect(t.sendTrackedText(session, &second_buf, 102));
 
-    var attempts: usize = 0;
-    while (delivery.received_count < 2 and attempts < 1000) : (attempts += 1) zev.sleepMilliseconds(1);
+    delivery.allow_reentrant.store(true, .release);
 
+    var count: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < 1000) : (attempts += 1) {
+        delivery.mutex.lock();
+        count = delivery.received_count;
+        delivery.mutex.unlock();
+        if (count >= 2) break;
+        zev.sleepMilliseconds(1);
+    }
+
+    delivery.mutex.lock();
+    defer delivery.mutex.unlock();
     try testing.expectEqual(@as(usize, 2), delivery.received_count);
     try testing.expectEqual(@as(u64, 101), delivery.received_tokens[0]);
     try testing.expectEqual(@as(u64, 102), delivery.received_tokens[1]);
+}
+
+test "transport: nested delivery queues are isolated between transports" {
+    const alloc = testing.allocator;
+    var opened_a = Opened{};
+    defer opened_a.changed.deinit();
+    defer opened_a.mutex.deinit();
+    var opened_b = Opened{};
+    defer opened_b.changed.deinit();
+    defer opened_b.mutex.deinit();
+
+    const ta = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 });
+    defer ta.deinit();
+    const tb = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 });
+    defer tb.deinit();
+
+    ta.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "peer-a" });
+    tb.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "peer-b" });
+
+    try ta.start(&opened_a, Opened.handler);
+    try tb.start(&opened_b, Opened.handler);
+
+    const peer_a = try connectLoopback(ta.boundPort());
+    defer peer_a.close();
+    try handshake(peer_a, "peer-a");
+    const session_a = opened_a.wait(1);
+
+    const peer_b = try connectLoopback(tb.boundPort());
+    defer peer_b.close();
+    try handshake(peer_b, "peer-b");
+    const session_b = opened_b.wait(1);
+
+    const CrossDelivery = struct {
+        tb_ptr: *transport.Transport,
+        session_b: transport.SessionId,
+        a_tokens: [4]u64 = @splat(0),
+        a_count: usize = 0,
+        b_tokens: [4]u64 = @splat(0),
+        b_count: usize = 0,
+        cross_triggered: bool = false,
+
+        fn observerA(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.a_count < self.a_tokens.len) {
+                self.a_tokens[self.a_count] = token;
+                self.a_count += 1;
+            }
+            if (!self.cross_triggered and token == 10) {
+                self.cross_triggered = true;
+                _ = self.tb_ptr.sendTrackedText(self.session_b, "msg-b", 20);
+            }
+        }
+
+        fn observerB(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.b_count < self.b_tokens.len) {
+                self.b_tokens[self.b_count] = token;
+                self.b_count += 1;
+            }
+        }
+    };
+
+    var cross = CrossDelivery{ .tb_ptr = tb, .session_b = session_b };
+    ta.asTransport().setDeliveryObserver(&cross, CrossDelivery.observerA);
+    tb.asTransport().setDeliveryObserver(&cross, CrossDelivery.observerB);
+
+    try testing.expect(ta.sendTrackedText(session_a, "msg-a", 10));
+
+    var attempts: usize = 0;
+    while ((cross.a_count < 1 or cross.b_count < 1) and attempts < 1000) : (attempts += 1) zev.sleepMilliseconds(1);
+
+    try testing.expectEqual(@as(usize, 1), cross.a_count);
+    try testing.expectEqual(@as(u64, 10), cross.a_tokens[0]);
+    try testing.expectEqual(@as(usize, 1), cross.b_count);
+    try testing.expectEqual(@as(u64, 20), cross.b_tokens[0]);
 }
 
 const CallerThreadDeliveryTeardown = struct {

@@ -18,7 +18,20 @@ const socket = @import("portable_socket");
 
 // A callback can request destruction of its transport. Its own socket worker must unwind before the transport can be released.
 threadlocal var callback_transport: ?*Transport = null;
-threadlocal var delivery_callback_transport: ?*Transport = null;
+
+const DeliveryFrame = struct {
+    transport: *Transport,
+    previous: ?*DeliveryFrame = null,
+};
+threadlocal var active_delivery_frame: ?*DeliveryFrame = null;
+
+fn findActiveFrame(t: *Transport) ?*DeliveryFrame {
+    var cur = active_delivery_frame;
+    while (cur) |f| : (cur = f.previous) {
+        if (f.transport == t) return f;
+    }
+    return null;
+}
 
 const FrameDeadline = struct {
     stall_timeout_ms: i64,
@@ -359,6 +372,9 @@ pub const Transport = struct {
     delivery_mu: zev.Mutex = .{},
     delivery_observer: ?*const fn (?*anyopaque, SessionId, u64) void = null,
     delivery_observer_ctx: ?*anyopaque = null,
+    nested_deliveries: [max_nested_deliveries]NestedDelivery = undefined,
+    nested_head: usize = 0,
+    nested_tail: usize = 0,
 
     pub const Options = struct {
         max_message_bytes: usize = default_max_message_bytes,
@@ -1291,13 +1307,10 @@ const NestedDelivery = struct {
     token: u64,
 };
 const max_nested_deliveries: usize = max_sessions * max_queued_frames;
-threadlocal var nested_deliveries: [max_nested_deliveries]NestedDelivery = undefined;
-threadlocal var nested_delivery_head: usize = 0;
-threadlocal var nested_delivery_tail: usize = 0;
 
 fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId, u64) void) void {
     const self = interfaceSelf(ctx);
-    const in_callback = delivery_callback_transport == self;
+    const in_callback = findActiveFrame(self) != null;
     if (!in_callback) self.delivery_mu.lock();
     defer if (!in_callback) self.delivery_mu.unlock();
     self.delivery_observer_ctx = if (observer != null) observer_ctx else null;
@@ -1305,17 +1318,17 @@ fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, obse
 }
 
 fn notifyDelivery(self: *Transport, session: SessionId, token: u64) void {
-    if (delivery_callback_transport == self) {
+    if (findActiveFrame(self)) |_| {
         if (self.deinit_started.load(.acquire) or self.delivery_observer == null) return;
-        if (nested_delivery_tail >= nested_deliveries.len and nested_delivery_head > 0) {
-            const len = nested_delivery_tail - nested_delivery_head;
-            std.mem.copyForwards(NestedDelivery, nested_deliveries[0..len], nested_deliveries[nested_delivery_head..nested_delivery_tail]);
-            nested_delivery_head = 0;
-            nested_delivery_tail = len;
+        if (self.nested_tail >= self.nested_deliveries.len and self.nested_head > 0) {
+            const len = self.nested_tail - self.nested_head;
+            std.mem.copyForwards(NestedDelivery, self.nested_deliveries[0..len], self.nested_deliveries[self.nested_head..self.nested_tail]);
+            self.nested_head = 0;
+            self.nested_tail = len;
         }
-        if (nested_delivery_tail < nested_deliveries.len) {
-            nested_deliveries[nested_delivery_tail] = .{ .session = session, .token = token };
-            nested_delivery_tail += 1;
+        if (self.nested_tail < self.nested_deliveries.len) {
+            self.nested_deliveries[self.nested_tail] = .{ .session = session, .token = token };
+            self.nested_tail += 1;
         }
         return;
     }
@@ -1327,31 +1340,34 @@ fn notifyDelivery(self: *Transport, session: SessionId, token: u64) void {
     self.delivery_mu.lock();
     defer self.delivery_mu.unlock();
 
+    var frame = DeliveryFrame{
+        .transport = self,
+        .previous = active_delivery_frame,
+    };
+    active_delivery_frame = &frame;
     const previous_callback_transport = callback_transport;
-    const previous_delivery_transport = delivery_callback_transport;
     callback_transport = self;
-    delivery_callback_transport = self;
     defer {
-        nested_delivery_head = 0;
-        nested_delivery_tail = 0;
-        delivery_callback_transport = previous_delivery_transport;
+        self.nested_head = 0;
+        self.nested_tail = 0;
         callback_transport = previous_callback_transport;
+        active_delivery_frame = frame.previous;
     }
 
     var current_session = session;
     var current_token = token;
     while (true) {
         if (self.deinit_started.load(.acquire) or self.delivery_observer == null) {
-            nested_delivery_head = 0;
-            nested_delivery_tail = 0;
+            self.nested_head = 0;
+            self.nested_tail = 0;
             return;
         }
         const callback = self.delivery_observer orelse return;
         callback(self.delivery_observer_ctx, current_session, current_token);
 
-        if (nested_delivery_head == nested_delivery_tail) break;
-        const next = nested_deliveries[nested_delivery_head];
-        nested_delivery_head += 1;
+        if (self.nested_head == self.nested_tail) break;
+        const next = self.nested_deliveries[self.nested_head];
+        self.nested_head += 1;
         current_session = next.session;
         current_token = next.token;
     }
