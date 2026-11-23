@@ -1455,7 +1455,7 @@ pub export fn jsbay_engine_destroy(instance_id: c_int) void {
     const id: i32 = @intCast(instance_id);
     if (@import("runtime/instance_map.zig").ownerDestroyInfo(id)) |info| {
         if (info.requested) {
-            engine.destroy(id);
+            if (info.on_creator) _ = engine.drainDestroy(id, info.generation) catch {};
             return;
         }
     }
