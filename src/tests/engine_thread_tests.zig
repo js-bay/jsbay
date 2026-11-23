@@ -1704,7 +1704,8 @@ test "engine_thread: callback destroy interrupts JavaScript that continues after
     try testing.expectEqual(jsbay_destroyed, run.status);
     try testing.expect(destroy.callback_returned.load(.seq_cst));
     const deadline = io.monotonicMilliseconds() + 3_000;
-    while (engine.getContext(id) != null) {
+    // Observe registry removal without dereferencing a borrowed context while teardown clears and frees it.
+    while (@import("../runtime/instance_map.zig").getInstance(id) != null) {
         if (io.monotonicMilliseconds() >= deadline) return error.DeferredDestroyDidNotRemoveRuntime;
         io.sleepMs(1);
     }

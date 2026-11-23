@@ -134,6 +134,7 @@ if [[ "$device_mode" == --run-on-device ]]; then
         "$application_id/.MavenConsumerInstrumentation" > "$OUT/instrumentation.log" 2>&1
     cat "$OUT/instrumentation.log"
     grep -Eq "^INSTRUMENTATION_RESULT: jsbayResult=$BACKEND:42[[:space:]]*$" "$OUT/instrumentation.log"
+    grep -Eq '^INSTRUMENTATION_RESULT: jsbayAsyncClose=creator-drained[[:space:]]*$' "$OUT/instrumentation.log"
     grep -Eq '^INSTRUMENTATION_CODE: -1[[:space:]]*$' "$OUT/instrumentation.log"
     printf 'PASS: installed Maven consumer ran %s on ART\n' "$BACKEND"
 fi

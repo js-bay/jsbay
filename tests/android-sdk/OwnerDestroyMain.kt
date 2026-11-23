@@ -39,6 +39,42 @@ object OwnerDestroyMain {
     private fun verify(args: Array<String>) {
         System.loadLibrary("jsbay_owner_probe")
         check(probeCommit() == System.getProperty("jsbay.expectedCommit"))
+        if (args.firstOrNull() == "looper-exited") {
+            val ownerThread = HandlerThread("diagnostic-exited-owner")
+            ownerThread.start()
+            val engine = AtomicReference<Engine>()
+            val error = AtomicReference<Throwable>()
+            val ready = CountDownLatch(1)
+            check(
+                Handler(ownerThread.looper).post {
+                    try {
+                        val created = Engine(92021)
+                        probeReset(created.id)
+                        engine.set(created)
+                    } catch (failure: Throwable) {
+                        error.set(failure)
+                    } finally {
+                        ready.countDown()
+                    }
+                },
+            )
+            check(ready.await(5, TimeUnit.SECONDS))
+            ownerThread.quitSafely()
+            ownerThread.join(3000)
+            check(!ownerThread.isAlive)
+            error.get()?.let { throw it }
+            repeat(16) {
+                check(engine.get().requestClose() == CloseStatus.PENDING)
+                check(engine.get().closeStatus() == CloseStatus.PENDING)
+            }
+            check(
+                Native.drainDestroy(engine.get().id, NativeGeneration.value(engine.get()), 0) ==
+                    CloseStatus.WRONG_THREAD.native,
+            )
+            check(probeStats().contentEquals(longArrayOf(0, 0, 0, 0, 0)))
+            println("PASS: exited Looper rejected posts; context_frees=0 runtime_frees=0 finalizers=0 status=PENDING")
+            return
+        }
         if (args.firstOrNull() == "owner-exited") {
             val ref = AtomicReference<Engine>()
             val worker =
