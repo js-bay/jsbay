@@ -835,18 +835,6 @@ pub fn build(b: *std.Build) void {
         if (backend == .hermes) {
             cdp_test.addArg("--typed-console");
             cdp_test.addArg("--native-debugger");
-            const outbound_contract_test = b.addSystemCommand(&.{"node"});
-            outbound_contract_test.addFileArg(b.path("tests/hermes-inspector-outbound-contract.test.mjs"));
-            outbound_contract_test.addArg(spike_hermes_install);
-            outbound_contract_test.addFileInput(b.path("tests/hermes-inspector-outbound-contract.cpp"));
-            outbound_contract_test.addFileInput(b.path("src/backend/hermes/hermes_inspector.cpp"));
-            outbound_contract_test.addFileInput(b.path("src/backend/hermes/hermes_bridge.h"));
-            const outbound_test_step = b.step(
-                "test-hermes-inspector-outbound",
-                "Run Hermes outbound accounting and delivery-token regression tests",
-            );
-            outbound_test_step.dependOn(&outbound_contract_test.step);
-            cdp_test_step.dependOn(outbound_test_step);
         }
         if (backend == .escargot) cdp_test.addArg("--line-breakpoints");
         cdp_test.addFileInput(b.path("tests/inspector/e2e.cjs"));

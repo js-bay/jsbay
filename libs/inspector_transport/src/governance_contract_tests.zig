@@ -1593,3 +1593,94 @@ test "transport: deferred deinit in a delivery callback skips another session's 
     while (!delivery.completed.load(.acquire) and attempts < 3000) : (attempts += 1) zev.sleepMilliseconds(1);
     try testing.expect(delivery.completed.load(.acquire));
 }
+
+const ReentrantDeliveryClosure = struct {
+    transport_ptr: *transport.Transport,
+    received_tokens: [8]u64 = @splat(0),
+    received_count: usize = 0,
+    overflow_triggered: bool = false,
+
+    fn observer(ctx: ?*anyopaque, session: transport.SessionId, token: u64) void {
+        const self: *ReentrantDeliveryClosure = @ptrCast(@alignCast(ctx.?));
+        if (self.received_count < self.received_tokens.len) {
+            self.received_tokens[self.received_count] = token;
+            self.received_count += 1;
+        }
+        if (!self.overflow_triggered and token == 101) {
+            self.overflow_triggered = true;
+            var overflow_buf: [300]u8 = @splat('x');
+            _ = self.transport_ptr.sendTrackedText(session, &overflow_buf, 999);
+        }
+    }
+};
+
+test "transport: reentrant session closure preserves queued delivery tokens" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 });
+    defer t.deinit();
+    var delivery = ReentrantDeliveryClosure{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "reentrant-close-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, ReentrantDeliveryClosure.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "reentrant-close-peer");
+    const session = opened.wait(1);
+
+    var first_buf: [100]u8 = @splat('a');
+    var second_buf: [300]u8 = @splat('b');
+    try testing.expect(t.sendTrackedText(session, &first_buf, 101));
+    try testing.expect(t.sendTrackedText(session, &second_buf, 102));
+
+    var attempts: usize = 0;
+    while (delivery.received_count < 2 and attempts < 1000) : (attempts += 1) zev.sleepMilliseconds(1);
+
+    try testing.expectEqual(@as(usize, 2), delivery.received_count);
+    try testing.expectEqual(@as(u64, 101), delivery.received_tokens[0]);
+    try testing.expectEqual(@as(u64, 102), delivery.received_tokens[1]);
+}
+
+const CallerThreadDeliveryTeardown = struct {
+    transport_ptr: *transport.Transport,
+    completed: std.atomic.Value(bool) = .init(false),
+
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+        const self: *CallerThreadDeliveryTeardown = @ptrCast(@alignCast(ctx.?));
+        if (token == 201) {
+            self.transport_ptr.asTransport().setDeliveryObserver(null, null);
+            self.transport_ptr.deinit();
+            zev.sleepMilliseconds(20);
+            self.completed.store(true, .release);
+        }
+    }
+};
+
+test "transport: caller-thread delivery callback retains transport lifetime during teardown" {
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.initWithOptions(std.heap.page_allocator, 0, .{ .max_backlog_bytes = 256 });
+    var delivery = CallerThreadDeliveryTeardown{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "caller-teardown-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, CallerThreadDeliveryTeardown.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "caller-teardown-peer");
+    const session = opened.wait(1);
+
+    var first_buf: [150]u8 = @splat('m');
+    try testing.expect(t.sendTrackedText(session, &first_buf, 201));
+
+    var overflow_buf: [150]u8 = @splat('n');
+    try testing.expect(!t.sendTrackedText(session, &overflow_buf, 999));
+
+    var attempts: usize = 0;
+    while (!delivery.completed.load(.acquire) and attempts < 1000) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expect(delivery.completed.load(.acquire));
+}

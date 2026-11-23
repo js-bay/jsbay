@@ -341,6 +341,7 @@ pub const Transport = struct {
     accept_exited: bool = true,
     deferred_deinit: bool = false,
     deinit_started: std.atomic.Value(bool) = .init(false),
+    callback_leases: usize = 0,
 
     /// Monotonic session id counter (starts at 1).
     next_session_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
@@ -429,9 +430,9 @@ pub const Transport = struct {
         for (self.sessions.items) |sess| sess.requestClose();
         self.sessions_mu.unlock();
 
-        // Wait for detached workers so no reader, writer, or transport-owned socket remains once deinit returns.
+        // Wait for detached workers and active callback leases so no reader, writer, transport-owned socket, or callback lease remains once deinit returns.
         self.workers_mu.lock();
-        while (self.workers_alive != 0) self.workers_changed.wait(&self.workers_mu);
+        while (self.workers_alive != 0 or self.callback_leases != 0) self.workers_changed.wait(&self.workers_mu);
         self.workers_mu.unlock();
 
         self.destroyStorage();
@@ -596,8 +597,26 @@ pub const Transport = struct {
         }
     }
 
+    fn callbackLeaseAcquire(self: *Transport) void {
+        self.workers_mu.lock();
+        self.callback_leases += 1;
+        self.workers_mu.unlock();
+    }
+
+    fn callbackLeaseRelease(self: *Transport) void {
+        self.workers_mu.lock();
+        std.debug.assert(self.callback_leases != 0);
+        self.callback_leases -= 1;
+        const finalize = self.deferred_deinit and self.accept_exited and self.workers_alive == 0 and self.callback_leases == 0;
+        self.workers_changed.broadcast();
+        self.workers_mu.unlock();
+        if (finalize) self.destroyStorage();
+    }
+
     fn fire(self: *Transport, ev: Event) void {
         if (self.shutdown.load(.acquire)) return;
+        self.callbackLeaseAcquire();
+        defer self.callbackLeaseRelease();
         const previous = callback_transport;
         callback_transport = self;
         defer callback_transport = previous;
@@ -614,7 +633,7 @@ pub const Transport = struct {
         self.workers_mu.lock();
         std.debug.assert(self.workers_alive != 0);
         self.workers_alive -= 1;
-        const finalize = self.deferred_deinit and self.accept_exited and self.workers_alive == 0;
+        const finalize = self.deferred_deinit and self.accept_exited and self.workers_alive == 0 and self.callback_leases == 0;
         self.workers_changed.broadcast();
         self.workers_mu.unlock();
         if (finalize) self.destroyStorage();
@@ -623,7 +642,8 @@ pub const Transport = struct {
     fn acceptGone(self: *Transport) void {
         self.workers_mu.lock();
         self.accept_exited = true;
-        const finalize = self.deferred_deinit and self.workers_alive == 0;
+        const finalize = self.deferred_deinit and self.workers_alive == 0 and self.callback_leases == 0;
+        self.workers_changed.broadcast();
         self.workers_mu.unlock();
         if (finalize) self.destroyStorage();
     }
@@ -1258,6 +1278,15 @@ fn interfaceSendTrackedText(ctx: *anyopaque, session: SessionId, message: []cons
     return interfaceSelf(ctx).sendTrackedText(session, message, token);
 }
 
+const NestedDelivery = struct {
+    session: SessionId,
+    token: u64,
+};
+const max_nested_deliveries: usize = max_queued_frames * 2;
+threadlocal var nested_deliveries: [max_nested_deliveries]NestedDelivery = undefined;
+threadlocal var nested_delivery_head: usize = 0;
+threadlocal var nested_delivery_tail: usize = 0;
+
 fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId, u64) void) void {
     const self = interfaceSelf(ctx);
     const in_callback = delivery_callback_transport == self;
@@ -1268,18 +1297,48 @@ fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, obse
 }
 
 fn notifyDelivery(self: *Transport, session: SessionId, token: u64) void {
-    if (delivery_callback_transport == self) return;
+    if (delivery_callback_transport == self) {
+        if (self.deinit_started.load(.acquire) or self.delivery_observer == null) return;
+        if (nested_delivery_tail < nested_deliveries.len) {
+            nested_deliveries[nested_delivery_tail] = .{ .session = session, .token = token };
+            nested_delivery_tail += 1;
+        }
+        return;
+    }
     if (self.deinit_started.load(.acquire)) return;
+
+    self.callbackLeaseAcquire();
+    defer self.callbackLeaseRelease();
+
     self.delivery_mu.lock();
     defer self.delivery_mu.unlock();
-    const callback = self.delivery_observer orelse return;
+
     const previous_callback_transport = callback_transport;
     const previous_delivery_transport = delivery_callback_transport;
     callback_transport = self;
     delivery_callback_transport = self;
     defer {
+        nested_delivery_head = 0;
+        nested_delivery_tail = 0;
         delivery_callback_transport = previous_delivery_transport;
         callback_transport = previous_callback_transport;
     }
-    callback(self.delivery_observer_ctx, session, token);
+
+    var current_session = session;
+    var current_token = token;
+    while (true) {
+        if (self.deinit_started.load(.acquire) or self.delivery_observer == null) {
+            nested_delivery_head = 0;
+            nested_delivery_tail = 0;
+            return;
+        }
+        const callback = self.delivery_observer orelse return;
+        callback(self.delivery_observer_ctx, current_session, current_token);
+
+        if (nested_delivery_head == nested_delivery_tail) break;
+        const next = nested_deliveries[nested_delivery_head];
+        nested_delivery_head += 1;
+        current_session = next.session;
+        current_token = next.token;
+    }
 }
