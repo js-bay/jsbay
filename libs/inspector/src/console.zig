@@ -57,7 +57,9 @@ pub fn Module(comptime Host: type) type {
             };
 
             for (ids.items) |sid| {
-                _ = state.transport.sendText(sid, aw.written());
+                if (!state.transport.sendText(sid, aw.written())) {
+                    state.transport.closeSession(sid);
+                }
             }
         }
 
@@ -103,7 +105,10 @@ pub fn Module(comptime Host: type) type {
                 return;
             }
             for (buffered.entries) |entry| {
-                _ = state.transport.sendText(session_id, entry);
+                if (!state.transport.sendText(session_id, entry)) {
+                    state.transport.closeSession(session_id);
+                    return;
+                }
             }
         }
 

@@ -194,9 +194,12 @@ const Session = struct {
         self.queue_mu.lock();
         self.accepting = false;
         for (self.queue.items[self.queue_head..]) |frame| {
-            if (frame.delivery_token != 0 and token_count < pending_tokens.len) {
-                pending_tokens[token_count] = frame.delivery_token;
-                token_count += 1;
+            if (frame.delivery_token != 0) {
+                std.debug.assert(token_count < pending_tokens.len);
+                if (token_count < pending_tokens.len) {
+                    pending_tokens[token_count] = frame.delivery_token;
+                    token_count += 1;
+                }
             }
             self.allocator.free(frame.bytes);
         }
@@ -208,8 +211,10 @@ const Session = struct {
         self.queue_changed.broadcast();
         self.queue_mu.unlock();
 
-        for (pending_tokens[0..token_count]) |token| {
-            notifyDelivery(self.transport, self.id, token);
+        if (!self.transport.deinit_started.load(.acquire)) {
+            for (pending_tokens[0..token_count]) |token| {
+                notifyDelivery(self.transport, self.id, token);
+            }
         }
         self.stream.shutdownBoth();
     }
@@ -1010,13 +1015,15 @@ fn writerLoop(sess: *Session) void {
         if (!is_large) {
             sess.queued_backlog_bytes -= frame.bytes.len;
         }
-        if (is_large) {
-            sess.large_message_in_flight = false;
-        }
         sess.queue_mu.unlock();
 
         const ok = writeFrame(sess, frame.kind, frame.bytes);
         const close_after = frame.kind == .close;
+        if (is_large) {
+            sess.queue_mu.lock();
+            sess.large_message_in_flight = false;
+            sess.queue_mu.unlock();
+        }
         if (frame.delivery_token != 0) {
             notifyDelivery(sess.transport, sess.id, frame.delivery_token);
         }
@@ -1266,6 +1273,8 @@ fn interfaceSetDeliveryObserver(ctx: *anyopaque, observer_ctx: ?*anyopaque, obse
 }
 
 fn notifyDelivery(self: *Transport, session: SessionId, token: u64) void {
+    if (delivery_callback_transport == self) return;
+    if (self.deinit_started.load(.acquire)) return;
     self.delivery_mu.lock();
     defer self.delivery_mu.unlock();
     const callback = self.delivery_observer orelse return;

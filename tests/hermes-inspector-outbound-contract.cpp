@@ -174,6 +174,56 @@ static void testStaleDeliveryToken() {
     CHECK(enqueueOutbound(inspector, 1, large));
 }
 
+static void testPendingLargeSourceQueueing() {
+    OutboundFixture fixture(8);
+    auto *inspector = &fixture.inspector;
+    inspector->delivery_observed.store(true);
+    auto &source1 = inspector->script_sources["1"];
+    source1 = std::make_shared<const std::string>(32, 'a');
+    auto &source2 = inspector->script_sources["2"];
+    source2 = std::make_shared<const std::string>(32, 'b');
+
+    static std::string current_script_id = "1";
+    inspector->parse_script_source = [](const char *, size_t, HermesInspectorInfoSink sink, void *target) -> bool {
+        constexpr char method[] = "Debugger.getScriptSource";
+        HermesInspectorMessageInfo info{};
+        info.id = 10;
+        info.flags = 1;
+        info.method = method;
+        info.method_len = sizeof(method) - 1;
+        info.script_id = current_script_id.c_str();
+        info.script_id_len = current_script_id.size();
+        sink(target, &info);
+        return true;
+    };
+
+    current_script_id = "1";
+    CHECK(hermes_inspector_message(inspector, 1, "{}", 2));
+    CHECK(fixture.state().large_message_in_flight);
+    CHECK(fixture.state().pending_large.empty());
+
+    current_script_id = "2";
+    CHECK(hermes_inspector_message(inspector, 1, "{}", 2));
+    CHECK(fixture.state().large_message_in_flight);
+    CHECK(fixture.state().pending_large.size() == 1);
+
+    fixture.startSender();
+    const auto frame1 = fixture.waitForFrame(1);
+    CHECK(frame1.token != 0);
+    CHECK(frame1.text.find(std::string(32, 'a')) != std::string::npos);
+
+    jsbay_hermes_inspector_delivery_complete(inspector, 1, frame1.token);
+    fixture.finishFrame(1);
+
+    const auto frame2 = fixture.waitForFrame(2);
+    CHECK(frame2.token != 0);
+    CHECK(frame2.text.find(std::string(32, 'b')) != std::string::npos);
+    jsbay_hermes_inspector_delivery_complete(inspector, 1, frame2.token);
+    fixture.finishFrame(2);
+    CHECK(!fixture.state().large_message_in_flight);
+    CHECK(fixture.state().pending_large.empty());
+}
+
 int main() {
     try {
         testChargedBytes();
@@ -181,6 +231,7 @@ int main() {
         testOversizedSourceFallbackKeepsSessionUsable();
         testOversizedResponseAndNotification();
         testStaleDeliveryToken();
+        testPendingLargeSourceQueueing();
     } catch (const std::exception &error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

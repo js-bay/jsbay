@@ -1459,3 +1459,88 @@ test "transport: a late deadline after accepting a peer closes that socket" {
     const peer = try connectLoopback(listener.port);
     try testing.expectError(error.HandshakeTimeout, adoptPeerBeforeDeadline(peer, 0));
 }
+
+fn readCloseFrame(stream: Stream) !u16 {
+    var header: [2]u8 = undefined;
+    try stream.readAll(&header);
+    try testing.expectEqual(@as(u8, 0x8), header[0] & 0x0f);
+    const len: u64 = header[1] & 0x7f;
+    if (len >= 2) {
+        var code_bytes: [2]u8 = undefined;
+        try stream.readAll(&code_bytes);
+        if (len > 2) {
+            var rest: [128]u8 = undefined;
+            try stream.readAll(rest[0 .. @as(usize, @intCast(len)) - 2]);
+        }
+        return std.mem.readInt(u16, &code_bytes, .big);
+    }
+    return 1005;
+}
+
+test "transport: control frame with payload exceeding 125 bytes is rejected with 1002" {
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(testing.allocator, 0);
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "control-frame-len-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "control-frame-len-peer");
+    _ = opened.wait(1);
+
+    const mask = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    const ping_hdr = [_]u8{ 0x89, 0xfe, 0x00, 126, mask[0], mask[1], mask[2], mask[3] };
+    try peer.writeAll(&ping_hdr);
+    const close_code = try readCloseFrame(peer);
+    try testing.expectEqual(@as(u16, 1002), close_code);
+}
+
+test "transport: fragmented control frame is rejected with 1002" {
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(testing.allocator, 0);
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "control-frame-fin-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "control-frame-fin-peer");
+    _ = opened.wait(1);
+
+    const mask = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const ping_hdr = [_]u8{ 0x09, 0x84, mask[0], mask[1], mask[2], mask[3], 0, 0, 0, 0 };
+    try peer.writeAll(&ping_hdr);
+    const close_code = try readCloseFrame(peer);
+    try testing.expectEqual(@as(u16, 1002), close_code);
+}
+
+test "transport: session close drains pending delivery tokens without leaking" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    var delivery = Delivery{};
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 * 1024 });
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "drain-tokens-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, Delivery.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "drain-tokens-peer");
+    const session = opened.wait(1);
+
+    try testing.expect(t.sendTrackedText(session, "token-frame-1", 101));
+    try testing.expect(t.sendTrackedText(session, "token-frame-2", 102));
+    t.closeSession(session);
+
+    var attempts: usize = 0;
+    while (delivery.calls.load(.acquire) < 2 and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expectEqual(@as(usize, 2), delivery.calls.load(.acquire));
+}
