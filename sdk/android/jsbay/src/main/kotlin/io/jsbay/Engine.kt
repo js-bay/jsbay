@@ -429,6 +429,13 @@ class Engine
             return Native.clearInterrupt(id)
         }
 
+        /** Job cleanup must not throw after a concurrent close has stopped wrapper admission. */
+        @JvmSynthetic
+        internal fun clearJobInterrupt(): Boolean =
+            synchronized(lifecycleLock) {
+                if (isClosed()) false else clearInterrupt()
+            }
+
         /** Arms a relative execution limit in milliseconds without blocking. Zero disables the limit. Deadlines expire automatically and do not latch a persistent interrupt flag. */
         fun setExecutionTimeLimit(millis: Long): Boolean {
             checkOwner()

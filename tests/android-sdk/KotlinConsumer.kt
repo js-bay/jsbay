@@ -1,6 +1,8 @@
 package io.jsbay.consumer
 
+import io.jsbay.CloseStatus
 import io.jsbay.DedicatedEngineThread
+import io.jsbay.DedicatedEngineThreadTimeoutException
 import io.jsbay.Engine
 import io.jsbay.JsBayException
 import io.jsbay.ShutdownPhase
@@ -995,6 +997,30 @@ private fun runKotlinDedicatedThreadParityTests() {
     queuedDrainDedicated.runOnOwner { queuedDrainDedicated.close(5_000L) }
     queuedDrainDedicated.close(5_000L)
     check(queuedDrainResult.get()) { "Kotlin queued evaluations drain on close" }
+
+    val timeoutDedicated = DedicatedEngineThread.start(7110)
+    val timeoutEngine = timeoutDedicated.engine
+    val timeoutOwner = timeoutDedicated.runOnOwner { Thread.currentThread() }
+    val timeoutEntered = CountDownLatch(1)
+    val timeoutRelease = CountDownLatch(1)
+    check(
+        timeoutDedicated.post {
+            timeoutEntered.countDown()
+            check(timeoutRelease.await(5, TimeUnit.SECONDS)) { "Kotlin blocked owner released" }
+        },
+    )
+    check(timeoutEntered.await(5, TimeUnit.SECONDS)) { "Kotlin blocked owner entered" }
+    try {
+        timeoutDedicated.close(1L)
+        error("Kotlin blocked creator cannot acknowledge close")
+    } catch (_: DedicatedEngineThreadTimeoutException) {
+        check(timeoutEngine.closeStatus() == CloseStatus.PENDING) { "Kotlin close timeout remains pending" }
+    } finally {
+        timeoutRelease.countDown()
+    }
+    timeoutOwner.join(5_000)
+    check(!timeoutOwner.isAlive) { "Kotlin timed-out close owner exits after drain" }
+    check(timeoutEngine.closeStatus() == CloseStatus.COMPLETE) { "Kotlin job cleanup preserves creator drain" }
 
     val userInterruptDedicated = DedicatedEngineThread.start(7109)
     val interruptObserved = AtomicBoolean(false)

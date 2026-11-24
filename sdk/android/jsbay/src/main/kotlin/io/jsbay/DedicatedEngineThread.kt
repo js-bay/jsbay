@@ -40,7 +40,7 @@ class DedicatedEngineThread private constructor(
                             isExecutingJob = false
                             if (shutdownInterruptedJob) {
                                 shutdownInterruptedJob = false
-                                engineRef.get()?.clearInterrupt()
+                                engineRef.get()?.clearJobInterrupt()
                             }
                         }
                     }

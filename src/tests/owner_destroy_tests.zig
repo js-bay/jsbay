@@ -193,3 +193,42 @@ test "owner destroy: finalizer reentry observes pending without recursion" {
     try t.expectEqual(pending, probe.reenter_status);
     try expectReleased(&probe);
 }
+
+test "owner destroy: native callback teardown cannot free its live result" {
+    const id = helpers.nextInstanceId();
+    var probe: Probe = undefined;
+    try createProbe(id, &probe);
+    defer engine.destroy(id);
+    const Callback = struct {
+        probe: *Probe,
+        value_status: c_int = -1,
+        requested: c_int = -1,
+        drained: c_int = -1,
+        finalized_in_callback: usize = 99,
+        fn run(instance_id: i32, raw: ?*anyopaque, _: u64, _: usize, _: ?[*]const u64, out: *u64, exception: *u64) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            exception.* = 0;
+            self.value_status = c.jsbay_value_new_number(instance_id, 42, out);
+            self.requested = c.jsbay_engine_request_destroy(instance_id, self.probe.generation);
+            self.drained = c.jsbay_engine_drain_destroy(instance_id, self.probe.generation);
+            self.finalized_in_callback = self.probe.calls.load(.seq_cst);
+            return self.value_status;
+        }
+    };
+    var callback = Callback{ .probe = &probe };
+    const name = "requestDestroyFromNative";
+    var function: u64 = 0;
+    var exception: u64 = 0;
+    try t.expectEqual(@as(c_int, 0), c.jsbay_engine_bind(id, .{ .data = name.ptr, .len = name.len }, Callback.run, &callback, null, &function, &exception));
+    try t.expectEqual(@as(c_int, 0), c.jsbay_value_release(function));
+    const result = engine.evalScript(id, "requestDestroyFromNative()", "<owner-destroy-native>");
+    defer helpers.freeEvalResult(result);
+    try t.expectEqual(@as(c_int, 0), callback.value_status);
+    try t.expectEqual(pending, callback.requested);
+    try t.expectEqual(pending, callback.drained);
+    try t.expectEqual(@as(usize, 0), callback.finalized_in_callback);
+    try t.expectEqual(@as(usize, 0), probe.calls.load(.seq_cst));
+    try t.expectEqual(pending, c.jsbay_engine_destroy_status(id, probe.generation));
+    try t.expectEqual(complete, c.jsbay_engine_drain_destroy(id, probe.generation));
+    try expectReleased(&probe);
+}
