@@ -13,20 +13,20 @@ const helpers = @import("test_helpers.zig");
 const types = @import("../types.zig");
 const wire = @import("inspector_tests.zig");
 
-const Conn = struct {
+pub const Conn = struct {
     alloc: std.mem.Allocator,
     stream: wire.TestStream,
     reader: wire.FrameReader,
     got: std.ArrayList(u8),
     next_id: i64 = 1,
 
-    fn deinit(self: *Conn) void {
+    pub fn deinit(self: *Conn) void {
         self.reader.deinit(self.alloc);
         self.stream.close();
         self.got.deinit(self.alloc);
     }
 
-    fn command(self: *Conn, method: []const u8, params: []const u8) !i64 {
+    pub fn command(self: *Conn, method: []const u8, params: []const u8) !i64 {
         const id = self.next_id;
         self.next_id += 1;
         const text = if (params.len == 0)
@@ -38,7 +38,7 @@ const Conn = struct {
         return id;
     }
 
-    fn waitFrom(self: *Conn, start: usize, needle: []const u8, spins: usize) !bool {
+    pub fn waitFrom(self: *Conn, start: usize, needle: []const u8, spins: usize) !bool {
         var i: usize = 0;
         while (i < spins) : (i += 1) {
             try wire.readTextFrames(self.alloc, &self.reader, &self.got, 1);
@@ -52,19 +52,19 @@ const Conn = struct {
         return self.waitFrom(0, needle, spins);
     }
 
-    fn expect(self: *Conn, ok: bool) !void {
+    pub fn expect(self: *Conn, ok: bool) !void {
         if (ok) return;
         std.debug.print("cdp console bytes:\n{s}\n", .{self.got.items});
         return error.TestUnexpectedResult;
     }
 };
 
-const Session = struct {
+pub const Session = struct {
     conn: Conn,
     id: i32,
     handle: *inspector.Handle,
 
-    fn deinit(self: *Session) void {
+    pub fn deinit(self: *Session) void {
         self.conn.deinit();
         inspector.stop(self.handle);
         engine.destroy(self.id);
@@ -83,7 +83,7 @@ fn openConn(alloc: std.mem.Allocator, port: u16, target_id: []const u8) !Conn {
     };
 }
 
-fn openSession(alloc: std.mem.Allocator, target_id: []const u8) !Session {
+pub fn openSession(alloc: std.mem.Allocator, target_id: []const u8) !Session {
     const id = helpers.nextInstanceId();
     try testing.expect(engine.create(id, .{}));
     const handle = try inspector.start(id, .{ .port = 0, .target_id = target_id });
@@ -97,11 +97,11 @@ fn openSession(alloc: std.mem.Allocator, target_id: []const u8) !Session {
     };
 }
 
-fn idMarker(alloc: std.mem.Allocator, id: i64) ![]u8 {
+pub fn idMarker(alloc: std.mem.Allocator, id: i64) ![]u8 {
     return std.fmt.allocPrint(alloc, "\"id\":{d},", .{id});
 }
 
-fn discardEval(res: types.EvalResult) void {
+pub fn discardEval(res: types.EvalResult) void {
     if (res.result) |text| std.heap.c_allocator.free(text);
     if (res.err) |text| {
         if (res.err_is_heap) std.heap.c_allocator.free(text);

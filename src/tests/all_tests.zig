@@ -137,6 +137,7 @@ comptime {
         _ = @import("oom_error_tests.zig");
         _ = @import("oom_sweep_tests.zig");
         _ = @import("inspector_host_transport_tests.zig");
+        _ = @import("inspector_reentrant_message_tests.zig");
     }
     if (!spike and build_options.inspector) {
         _ = @import("console_tap_tests.zig");
@@ -149,6 +150,7 @@ comptime {
             _ = @import("cdp_reference_tests.zig");
             _ = @import("cdp_properties_tests.zig");
             _ = @import("cdp_console_tests.zig");
+            _ = @import("cdp_runtime_enable_race_tests.zig");
             _ = @import("cdp_heap_async_tests.zig");
             _ = @import("async_job_oom_tests.zig");
             _ = @import("cdp_alignment_tests.zig");
