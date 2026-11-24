@@ -2,7 +2,7 @@ pub fn run(comptime Host: type, comptime TestApi: type) !void {
     const std = @import("std");
     const transport_mod = TestApi;
     const state_mod = TestApi.state(Host);
-    const replay = TestApi.console_replay();
+    const replay = state_mod.TestCases.ConsoleReplay;
     const testing = std.testing;
 
     const Probe = struct {

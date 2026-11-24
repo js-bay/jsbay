@@ -2,7 +2,7 @@ pub fn run(comptime Host: type, comptime TestApi: type) !void {
     // Includes bounded admission and cross-thread session discard/drain behavior.
     const std = @import("std");
     const testing = std.testing;
-    const queue_mod = TestApi.command_queue(Host);
+    const queue_mod = TestApi.state(Host).TestCases.CommandQueue;
 
     var count_queue = queue_mod.Queue{};
     defer queue_mod.deinit(&count_queue, testing.allocator);

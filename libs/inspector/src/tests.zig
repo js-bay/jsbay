@@ -8,14 +8,6 @@ const InspectorTestApi = struct {
     pub fn state(comptime Host: type) type {
         return inspector.modules.state(Host);
     }
-
-    pub fn command_queue(comptime Host: type) type {
-        return inspector.modules.command_queue(Host);
-    }
-
-    pub fn console_replay() type {
-        return inspector.modules.console_replay();
-    }
 };
 
 comptime {
