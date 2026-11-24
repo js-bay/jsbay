@@ -608,3 +608,43 @@ test "rejection: a timer callback that catches its own rejection reports nothing
         }
     }.run);
 }
+
+test "rejection tracker: application timers keep delays arguments and identity" {
+    for ([_]bool{ false, true }) |typed| {
+        const id = helpers.nextInstanceId();
+        try testing.expect(c_api.jsbay_engine_create(id, null, null));
+        defer c_api.jsbay_engine_destroy(id);
+        try helpers.evalOk(id,
+            \\globalThis.timerCalls = []; globalThis.timerHits = []; globalThis.timerCleared = [];
+            \\globalThis.setTimeout = function (fn, delay) { timerCalls.push([fn, delay, Array.prototype.slice.call(arguments, 2)]); return 1073741824 + timerCalls.length; };
+            \\globalThis.clearTimeout = function (id) { timerCleared.push(id); };
+            \\globalThis.originalTimer = setTimeout; globalThis.originalClear = clearTimeout;
+        );
+        var legacy = RejectionLog{};
+        var observer = EventCount{};
+        if (typed) {
+            const status = c_api.jsbay_engine_set_error_observer(id, EventCount.handler, &observer);
+            if (backend.active_backend == .jsc) {
+                try testing.expectEqual(@as(c_int, 7), status);
+                continue;
+            }
+            try testing.expectEqual(@as(c_int, 0), status);
+        } else if (!install(id, &legacy)) {
+            try testing.expectEqual(backend.BackendType.jsc, backend.active_backend);
+            continue;
+        }
+        try helpers.evalOk(id,
+            \\function onUnhandled(a, b) { timerHits.push(String(a) + ':' + String(b)); }
+            \\globalThis.firstTimer = setTimeout(onUnhandled.bind(null, 7), 100, 9);
+            \\setTimeout(onUnhandled, 2000, 'two', 'args');
+            \\Promise.reject('private-tracker');
+        );
+        try helpers.expectEvalEquals(id, "String(setTimeout === originalTimer && clearTimeout === originalClear)", "true");
+        try helpers.expectEvalEquals(id, "String(timerCalls.length === 2 && timerHits.length === 0 && timerCalls[0][1] === 100 && timerCalls[1][1] === 2000)", "true");
+        try helpers.expectEvalEquals(id, "String(timerCalls[0][2][0] === 9 && timerCalls[1][2].join(':') === 'two:args')", "true");
+        try helpers.evalOk(id, "timerCalls.forEach(function (v) { v[0].apply(undefined, v[2]); }); clearTimeout(firstTimer);");
+        try helpers.expectEvalEquals(id, "timerHits.join(',')", "7:9,two:args");
+        try helpers.expectEvalEquals(id, "String(timerCleared[0] === firstTimer)", "true");
+        try testing.expectEqual(@as(u32, 1), if (typed) observer.count else legacy.count);
+    }
+}

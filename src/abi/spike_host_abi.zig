@@ -223,12 +223,12 @@ fn trampoline(
     const argv_ptr: ?[*]const host_value.HostValue = if (argc == 0) null else hv.ptr;
     const rc_mod = @import("../runtime/runtime_control.zig");
     rc_mod.beginHostCallback(call.instance_id);
-    defer rc_mod.endHostCallback(call.instance_id);
+    defer {
+        rc_mod.softRearmHermesStopAfterHost(call.instance_id);
+        rc_mod.endHostCallback(call.instance_id);
+    }
     const rc = call.func(call.instance_id, call.user_data, @intCast(argc), argv_ptr, &out);
     if (rc != 0) return throwMsg(ctx, "host function failed");
-
-    // Arm a short Hermes watch after stop/destroy requested from this (or another) thread during the callback. Must not drain via nested evaluateJavaScript.
-    rc_mod.softRearmHermesStopAfterHost(call.instance_id);
 
     return switch (out.tag) {
         host_value.tag_undefined => backend.ActiveEngine.undefinedValue(),

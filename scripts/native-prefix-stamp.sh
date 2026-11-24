@@ -10,7 +10,7 @@ case "$BACKEND" in
         inputs=(scripts/rebuild-escargot-install.sh src/backend/escargot/escargot_bridge.cpp src/backend/escargot/escargot_bridge.h vendor/escargot-debugger.patch vendor/escargot-default-async.patch vendor/escargot-module-bindings.patch vendor/escargot-execution-termination.patch scripts/rebuild-escargot-android-install.sh)
         ;;
     hermes)
-        inputs=(scripts/rebuild-hermes-install.sh scripts/rebuild-hermes-android-install.sh src/backend/hermes/hermes_bridge.cpp src/backend/hermes/hermes_bridge.h src/backend/hermes/hermes_esm.cpp src/backend/hermes/hermes_inspector.cpp vendor/hermes-drain-microtasks-hint.patch vendor/hermes-cdp-frame-url.patch vendor/hermes-cdp-cancel-pending.patch vendor/hermes-debugger-step-out.patch)
+        inputs=(scripts/rebuild-hermes-install.sh scripts/rebuild-hermes-android-install.sh scripts/hermes-compilejs-libs.sh src/backend/hermes/hermes_bridge.cpp src/backend/hermes/hermes_bridge.h src/backend/hermes/hermes_esm.cpp src/backend/hermes/hermes_inspector.cpp vendor/hermes-drain-microtasks-hint.patch vendor/hermes-cdp-frame-url.patch vendor/hermes-cdp-cancel-pending.patch vendor/hermes-debugger-step-out.patch vendor/hermes-rejection-timers.patch)
         ;;
     *) echo 'Unknown native backend.' >&2; exit 2 ;;
 esac

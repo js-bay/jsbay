@@ -56,6 +56,10 @@ if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
 else
   patch -d "$SRC" -p1 --forward --batch < "$PATCH"
 fi
+PATCH="$ROOT/vendor/hermes-rejection-timers.patch"
+if ! patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
+  patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+fi
 # libicuuc.so.73 DT_NEEDED libicudata.so.73 is not transitive through RUNPATH of libhermesvm.so. Without -rpath-link, linking tools such as bin/hdb fails with "libicudata.so.73 ... not found" / undefined `icudt73_dat`.
 ICU_LINK_FLAGS="-Wl,-rpath-link,${ICU}/lib -Wl,-rpath,${ICU}/lib"
 cmake -S "$SRC" -B "$BUILD" -G Ninja \

@@ -11,7 +11,7 @@ ICU="${ICU_ANDROID_PREFIX:-$ROOT/vendor/icu-android-prefix-x86_64}"
 API="${ANDROID_API:-24}"
 HOST="${ANDROID_NDK_HOST_PREBUILT:-linux-x86_64}"
 [[ -f "$HERMES_HOST_COMPILERS" && -f "$ICU/include/unicode/ucnv.h" ]] || { echo "Native hermesc export or Android ICU prefix missing" >&2; exit 1; }
-for name in hermes-drain-microtasks-hint.patch hermes-cdp-frame-url.patch hermes-cdp-cancel-pending.patch hermes-debugger-step-out.patch; do
+for name in hermes-drain-microtasks-hint.patch hermes-cdp-frame-url.patch hermes-cdp-cancel-pending.patch hermes-debugger-step-out.patch hermes-rejection-timers.patch; do
     if ! patch -d "$SRC" -p1 --reverse --dry-run < "$ROOT/vendor/$name" >/dev/null 2>&1; then
         patch -d "$SRC" -p1 --forward --batch < "$ROOT/vendor/$name"
     fi

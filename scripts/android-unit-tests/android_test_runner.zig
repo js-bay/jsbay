@@ -177,10 +177,11 @@ fn runIsolated(test_fn: std.builtin.TestFn, init: std.process.Init.Minimal, time
         return .{ .fail = "fork failed; isolation and timeout cannot be guaranteed" };
     }
     if (fork_rc == 0) {
+        log_err_count = 0;
         const child = runInProcess(test_fn, init);
         const code: u8 = switch (child) {
-            .pass => 0,
-            .skip => 2,
+            .pass => if (log_err_count == 0) 0 else 1,
+            .skip => if (log_err_count == 0) 2 else 1,
             .fail => |name| blk: {
                 std.debug.print("isolated failure: {s}: {s}\n", .{ test_fn.name, name });
                 break :blk 1;

@@ -25,3 +25,34 @@ done
 printf 'invalid\n' > "$WORK/prefix/jsbay-build.sha256"
 if "${check[@]}"; then echo 'Invalid native stamp was accepted.' >&2; exit 1; fi
 echo 'PASS native prefix freshness checks'
+
+# Reconstruct the published inventory so native stamp checks cannot depend on unshipped source files.
+python3 - "$ROOT" "$WORK/package" "${PACKAGE_MANIFEST:-$ROOT/build.zig.zon}" <<'PYTHON'
+import pathlib, re, shutil, sys
+root, package, manifest = map(pathlib.Path, sys.argv[1:])
+paths = re.findall(r'"([^"\n]+)"', manifest.read_text().split('.paths = .{', 1)[1].split('},', 1)[0])
+for name in paths:
+    source, target = root / name, package / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, target, symlinks=True)
+    else:
+        shutil.copy2(source, target)
+PYTHON
+for backend in escargot hermes; do
+    mkdir -p "$WORK/package-prefix-$backend"
+    bash "$WORK/package/scripts/native-prefix-stamp.sh" "$backend" write "$WORK/package-prefix-$backend"
+    bash "$WORK/package/scripts/native-prefix-stamp.sh" "$backend" check "$WORK/package-prefix-$backend"
+    if [[ "$backend" == hermes ]]; then
+        for input in scripts/hermes-compilejs-libs.sh vendor/hermes-rejection-timers.patch; do
+            printf '\n' >> "$WORK/package/$input"
+            if bash "$WORK/package/scripts/native-prefix-stamp.sh" hermes check "$WORK/package-prefix-hermes"; then
+                echo "Changed Hermes build input was accepted: $input" >&2
+                exit 1
+            fi
+            bash "$WORK/package/scripts/native-prefix-stamp.sh" hermes write "$WORK/package-prefix-hermes"
+        done
+    fi
+done
+test -f "$WORK/package/scripts/hermes-compilejs-libs.sh"
+echo 'PASS published inventory contains native stamp and rebuild inputs'

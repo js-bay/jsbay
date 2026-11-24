@@ -99,6 +99,7 @@ comptime {
     if (!spike or backend.isEscargotBackend(backend.active_backend) or backend.isHermesBackend(backend.active_backend)) {
         _ = @import("object_ops_tests.zig");
     }
+    _ = @import("host_callback_control_tests.zig");
     if (!spike) {
         _ = @import("runtime_control_tests.zig");
     }

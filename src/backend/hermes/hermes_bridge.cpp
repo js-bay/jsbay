@@ -114,9 +114,6 @@ struct JsbayHermesContextOpaque {
     void *rejection_observer_ud = nullptr;
     int32_t rejection_timer_next = 0x40000000;
     std::unordered_map<int32_t, std::shared_ptr<bool>> rejection_timer_cancelled;
-    bool rejection_timeouts_wrapped = false;
-    std::unique_ptr<jsi::Function> orig_set_timeout;
-    std::unique_ptr<jsi::Function> orig_clear_timeout;
     // Host macrotask pump for sync TLA waits (registered from Zig).
     HermesHostProgressFn host_progress_fn = nullptr;
     void *host_progress_ud = nullptr;
@@ -3487,182 +3484,166 @@ extern "C" void hermes_report_unhandled_rejection(JsbayHermesContext *ctx, const
     hermesEnqueuePendingRejection(ctx, false, message ? message : "Promise rejected", nullptr, nullptr);
 }
 
-// InternalBytecode Promise tracking (01-Promise.js) reports via setTimeout(100) for
-// Reference/Type/RangeError and setTimeout(2000) otherwise — not after the current
-// microtask drain. The host contract (docs/capability.md) is QuickJS/Escargot-shaped:
-// report after drain, keep a same-turn / same-drain .catch silent, and emit handled=true
-// when a later catch lands. Remap only those two delays to a cancellable double-microtask
-// while a host tracker is installed; every other setTimeout delay is forwarded unchanged.
-static void hermesWrapRejectionTimeouts(JsbayHermesContext *ctx) {
-    if (!ctx || !ctx->rt || ctx->rejection_timeouts_wrapped) return;
-    try {
-        auto &rt = *ctx->rt;
-        auto st = rt.global().getProperty(rt, "setTimeout");
-        auto ct = rt.global().getProperty(rt, "clearTimeout");
-        if (!st.isObject() || !st.getObject(rt).isFunction(rt) ||
-            !ct.isObject() || !ct.getObject(rt).isFunction(rt)) {
-            return;
-        }
-        ctx->orig_set_timeout = std::make_unique<jsi::Function>(st.getObject(rt).getFunction(rt));
-        ctx->orig_clear_timeout = std::make_unique<jsi::Function>(ct.getObject(rt).getFunction(rt));
-        auto wrappedST = jsi::Function::createFromHostFunction(
-            rt, jsi::PropNameID::forAscii(rt, "setTimeout"), 2,
-            [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                const bool hasFn = count > 0 && args[0].isObject() && args[0].getObject(rt0).isFunction(rt0);
-                const double delay = (count > 1 && args[1].isNumber()) ? args[1].asNumber() : 0;
-                const bool remap = hermesRejectionListenersActive(ctx) && hasFn && (delay == 100.0 || delay == 2000.0);
-                if (!remap) {
-                    if (!ctx->orig_set_timeout) return jsi::Value::undefined();
-                    std::vector<jsi::Value> argv;
-                    argv.reserve(count);
-                    for (size_t i = 0; i < count; ++i) argv.emplace_back(rt0, args[i]);
-                    return ctx->orig_set_timeout->call(rt0, static_cast<const jsi::Value *>(argv.data()), count);
-                }
-                const int32_t id = ctx->rejection_timer_next++;
-                auto cancelled = std::make_shared<bool>(false);
-                ctx->rejection_timer_cancelled[id] = cancelled;
-                auto cb = std::make_shared<jsi::Function>(args[0].getObject(rt0).getFunction(rt0));
-                auto queueSecond = [ctx, cancelled, cb, id]() {
-                    if (!ctx || !ctx->rt || *cancelled) return;
-                    ctx->rt->queueMicrotask(jsi::Function::createFromHostFunction(
-                        *ctx->rt, jsi::PropNameID::forAscii(*ctx->rt, "jsbayRejectionTimer2"), 0,
-                        [ctx, cancelled, cb, id](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                            if (*cancelled) return jsi::Value::undefined();
-                            *cancelled = true;
-                            ctx->rejection_timer_cancelled.erase(id);
-                            cb->call(rt2);
-                            return jsi::Value::undefined();
-                        }));
-                };
-                rt0.queueMicrotask(jsi::Function::createFromHostFunction(
-                    rt0, jsi::PropNameID::forAscii(rt0, "jsbayRejectionTimer1"), 0,
-                    [cancelled, queueSecond](jsi::Runtime &, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+// Only the internal Promise tracker receives these cancellable double-microtask timers. Application timers retain their original delays and arguments.
+static void hermesSetRejectionTimers(JsbayHermesContext *ctx, jsi::Object &options) {
+    if (!ctx || !ctx->rt) return;
+    auto &rt = *ctx->rt;
+    auto wrappedST = jsi::Function::createFromHostFunction(
+        rt, jsi::PropNameID::forAscii(rt, "setTimeout"), 2,
+        [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            if (count == 0 || !args[0].isObject() || !args[0].getObject(rt0).isFunction(rt0))
+                return jsi::Value::undefined();
+            const int32_t id = ctx->rejection_timer_next++;
+            auto cancelled = std::make_shared<bool>(false);
+            ctx->rejection_timer_cancelled[id] = cancelled;
+            auto cb = std::make_shared<jsi::Function>(args[0].getObject(rt0).getFunction(rt0));
+            auto queueSecond = [ctx, cancelled, cb, id]() {
+                if (!ctx || !ctx->rt || *cancelled) return;
+                ctx->rt->queueMicrotask(jsi::Function::createFromHostFunction(
+                    *ctx->rt, jsi::PropNameID::forAscii(*ctx->rt, "jsbayRejectionTimer2"), 0,
+                    [ctx, cancelled, cb, id](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
                         if (*cancelled) return jsi::Value::undefined();
-                        queueSecond();
+                        *cancelled = true;
+                        ctx->rejection_timer_cancelled.erase(id);
+                        cb->call(rt2);
                         return jsi::Value::undefined();
                     }));
-                return jsi::Value(static_cast<double>(id));
-            });
-        auto wrappedCT = jsi::Function::createFromHostFunction(
-            rt, jsi::PropNameID::forAscii(rt, "clearTimeout"), 1,
-            [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                if (count > 0 && args[0].isNumber()) {
-                    const int32_t id = static_cast<int32_t>(args[0].asNumber());
-                    auto it = ctx->rejection_timer_cancelled.find(id);
-                    if (it != ctx->rejection_timer_cancelled.end()) {
-                        *it->second = true;
-                        ctx->rejection_timer_cancelled.erase(it);
-                        return jsi::Value::undefined();
-                    }
+            };
+            rt0.queueMicrotask(jsi::Function::createFromHostFunction(
+                rt0, jsi::PropNameID::forAscii(rt0, "jsbayRejectionTimer1"), 0,
+                [cancelled, queueSecond](jsi::Runtime &, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                    if (*cancelled) return jsi::Value::undefined();
+                    queueSecond();
+                    return jsi::Value::undefined();
+                }));
+            return jsi::Value(static_cast<double>(id));
+        });
+    auto wrappedCT = jsi::Function::createFromHostFunction(
+        rt, jsi::PropNameID::forAscii(rt, "clearTimeout"), 1,
+        [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            if (count > 0 && args[0].isNumber()) {
+                const int32_t id = static_cast<int32_t>(args[0].asNumber());
+                auto it = ctx->rejection_timer_cancelled.find(id);
+                if (it != ctx->rejection_timer_cancelled.end()) {
+                    *it->second = true;
+                    ctx->rejection_timer_cancelled.erase(it);
+                    return jsi::Value::undefined();
                 }
-                if (!ctx->orig_clear_timeout) return jsi::Value::undefined();
-                std::vector<jsi::Value> argv;
-                argv.reserve(count);
-                for (size_t i = 0; i < count; ++i) argv.emplace_back(rt0, args[i]);
-                return ctx->orig_clear_timeout->call(rt0, static_cast<const jsi::Value *>(argv.data()), count);
-            });
-        rt.global().setProperty(rt, "setTimeout", wrappedST);
-        rt.global().setProperty(rt, "clearTimeout", wrappedCT);
-        ctx->rejection_timeouts_wrapped = true;
-    } catch (...) {
-    }
+            }
+            return jsi::Value::undefined();
+        });
+    options.setProperty(rt, "setTimeout", wrappedST);
+    options.setProperty(rt, "clearTimeout", wrappedCT);
 }
 
 static bool hermesEnsureRejectionHook(JsbayHermesContext *ctx) {
     if (!ctx || !ctx->rt) return false;
-    if (ctx->rejection_hook_installed) {
-        hermesWrapRejectionTimeouts(ctx);
-        return true;
-    }
-        try {
-            auto &rt = *ctx->rt;
-            auto hi = rt.global().getProperty(rt, "HermesInternal");
-            if (!hi.isObject()) {
-                return true;
-            }
-            auto hiObj = hi.getObject(rt);
-            auto enable = hiObj.getProperty(rt, "enablePromiseRejectionTracker");
-            if (enable.isObject() && enable.getObject(rt).isFunction(rt)) {
-                auto hostUnhandled = jsi::Function::createFromHostFunction(
-                    rt, jsi::PropNameID::forAscii(rt, "onUnhandled"), 2,
-                    [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
-                          size_t count) -> jsi::Value {
-                        std::string msg = "Promise rejected";
-                        if (count >= 2) {
-                            try {
-                                if (args[1].isString()) msg = args[1].getString(rt0).utf8(rt0);
-                                else if (args[1].isObject()) {
-                                    auto o = args[1].getObject(rt0);
-                                    if (o.hasProperty(rt0, "message")) {
-                                        auto m = o.getProperty(rt0, "message");
-                                        if (m.isString()) msg = m.getString(rt0).utf8(rt0);
-                                    }
-                                    if (msg == "Promise rejected")
-                                        msg = args[1].toString(rt0).utf8(rt0);
-                                } else {
-                                    msg = args[1].toString(rt0).utf8(rt0);
-                                }
-                            } catch (...) {
-                            }
-                        }
-                        if (hermesRejectionListenersActive(ctx)) {
-                            const jsi::Value *reason_v = (count >= 2) ? &args[1] : nullptr;
-                            const jsi::Value *promise_v = (count >= 3) ? &args[2] : nullptr;
-                            hermesEnqueuePendingRejection(ctx, false, msg, promise_v, reason_v);
-                        }
-                        return jsi::Value::undefined();
-                    });
-                auto hostHandled = jsi::Function::createFromHostFunction(
-                    rt, jsi::PropNameID::forAscii(rt, "onHandled"), 2,
-                    [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
-                          size_t count) -> jsi::Value {
-                        std::string msg = "Promise rejection handled";
-                        if (count >= 2) {
-                            try {
-                                if (args[1].isString()) msg = args[1].getString(rt0).utf8(rt0);
-                                else msg = args[1].toString(rt0).utf8(rt0);
-                            } catch (...) {
-                            }
-                        }
-                        if (hermesRejectionListenersActive(ctx)) {
-                            const jsi::Value *reason_v = (count >= 2) ? &args[1] : nullptr;
-                            const jsi::Value *promise_v = (count >= 3) ? &args[2] : nullptr;
-                            hermesEnqueuePendingRejection(ctx, true, msg, promise_v, reason_v);
-                        }
-                        return jsi::Value::undefined();
-                    });
-                jsi::Object opts(rt);
-                opts.setProperty(rt, "allRejections", true);
-                opts.setProperty(rt, "onUnhandled", hostUnhandled);
-                opts.setProperty(rt, "onHandled", hostHandled);
-                enable.getObject(rt).getFunction(rt).callWithThis(rt, hiObj, opts);
-                ctx->rejection_hook_installed = true;
-                hermesWrapRejectionTimeouts(ctx);
-            }
-        } catch (const std::exception &) {
-        } catch (...) {
+    if (ctx->rejection_hook_installed) return true;
+    try {
+        auto &rt = *ctx->rt;
+        auto hi = rt.global().getProperty(rt, "HermesInternal");
+        if (!hi.isObject()) {
+            return true;
         }
+        auto hiObj = hi.getObject(rt);
+        auto enable = hiObj.getProperty(rt, "enablePromiseRejectionTracker");
+        if (enable.isObject() && enable.getObject(rt).isFunction(rt)) {
+            auto hostUnhandled = jsi::Function::createFromHostFunction(
+                rt, jsi::PropNameID::forAscii(rt, "onUnhandled"), 2,
+                [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
+                      size_t count) -> jsi::Value {
+                    std::string msg = "Promise rejected";
+                    if (count >= 2) {
+                        try {
+                            if (args[1].isString()) msg = args[1].getString(rt0).utf8(rt0);
+                            else if (args[1].isObject()) {
+                                auto o = args[1].getObject(rt0);
+                                if (o.hasProperty(rt0, "message")) {
+                                    auto m = o.getProperty(rt0, "message");
+                                    if (m.isString()) msg = m.getString(rt0).utf8(rt0);
+                                }
+                                if (msg == "Promise rejected")
+                                    msg = args[1].toString(rt0).utf8(rt0);
+                            } else {
+                                msg = args[1].toString(rt0).utf8(rt0);
+                            }
+                        } catch (...) {
+                        }
+                    }
+                    if (hermesRejectionListenersActive(ctx)) {
+                        const jsi::Value *reason_v = (count >= 2) ? &args[1] : nullptr;
+                        const jsi::Value *promise_v = (count >= 3) ? &args[2] : nullptr;
+                        hermesEnqueuePendingRejection(ctx, false, msg, promise_v, reason_v);
+                    }
+                    return jsi::Value::undefined();
+                });
+            auto hostHandled = jsi::Function::createFromHostFunction(
+                rt, jsi::PropNameID::forAscii(rt, "onHandled"), 2,
+                [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
+                      size_t count) -> jsi::Value {
+                    std::string msg = "Promise rejection handled";
+                    if (count >= 2) {
+                        try {
+                            if (args[1].isString()) msg = args[1].getString(rt0).utf8(rt0);
+                            else msg = args[1].toString(rt0).utf8(rt0);
+                        } catch (...) {
+                        }
+                    }
+                    if (hermesRejectionListenersActive(ctx)) {
+                        const jsi::Value *reason_v = (count >= 2) ? &args[1] : nullptr;
+                        const jsi::Value *promise_v = (count >= 3) ? &args[2] : nullptr;
+                        hermesEnqueuePendingRejection(ctx, true, msg, promise_v, reason_v);
+                    }
+                    return jsi::Value::undefined();
+                });
+            jsi::Object opts(rt);
+            hermesSetRejectionTimers(ctx, opts);
+            opts.setProperty(rt, "allRejections", true);
+            opts.setProperty(rt, "onUnhandled", hostUnhandled);
+            opts.setProperty(rt, "onHandled", hostHandled);
+            enable.getObject(rt).getFunction(rt).callWithThis(rt, hiObj, opts);
+            ctx->rejection_hook_installed = true;
+        }
+    } catch (const std::exception &) {
+        return false;
+    } catch (...) {
+        return false;
+    }
     return true;
 }
 
 extern "C" bool hermes_set_rejection_tracker(JsbayHermesContext *ctx, int32_t instance_id,
                                               HermesRejectionTrackerFn fn, void *ud) {
     if (!ctx || !ctx->rt) return false;
+    const auto previous_fn = ctx->rejection_fn;
+    void *previous_ud = ctx->rejection_ud;
+    const int32_t previous_id = ctx->rejection_instance_id;
     ctx->rejection_fn = fn;
     ctx->rejection_ud = ud;
     ctx->rejection_instance_id = instance_id;
-    if (!hermesRejectionListenersActive(ctx)) return true;
-    return hermesEnsureRejectionHook(ctx);
+    if (!hermesRejectionListenersActive(ctx) || hermesEnsureRejectionHook(ctx)) return true;
+    ctx->rejection_fn = previous_fn;
+    ctx->rejection_ud = previous_ud;
+    ctx->rejection_instance_id = previous_id;
+    return false;
 }
 
 extern "C" bool hermes_set_error_observer(JsbayHermesContext *ctx, int32_t instance_id,
                                           HermesErrorObserverFn fn, HermesShouldDeferFn should_defer,
                                           void *ud) {
     if (!ctx || !ctx->rt) return false;
+    const auto previous_fn = ctx->rejection_observer_fn;
+    const auto previous_defer = ctx->rejection_should_defer;
+    void *previous_ud = ctx->rejection_observer_ud;
+    const int32_t previous_id = ctx->rejection_instance_id;
     ctx->rejection_observer_fn = fn;
     ctx->rejection_should_defer = should_defer;
     ctx->rejection_observer_ud = ud;
     ctx->rejection_instance_id = instance_id;
-    if (!hermesRejectionListenersActive(ctx)) return true;
-    return hermesEnsureRejectionHook(ctx);
+    if (!hermesRejectionListenersActive(ctx) || hermesEnsureRejectionHook(ctx)) return true;
+    ctx->rejection_observer_fn = previous_fn;
+    ctx->rejection_should_defer = previous_defer;
+    ctx->rejection_observer_ud = previous_ud;
+    ctx->rejection_instance_id = previous_id;
+    return false;
 }

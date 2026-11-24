@@ -42,7 +42,7 @@ pub const ShutdownStatus = struct { phase: ShutdownPhase, remaining_ms: u64 };
 
 /// Per-instance state shared between public control calls and backend interrupt trampolines. Registry access is serialized; interrupt flags and deadlines use atomic access. The backend extern structs must preserve this layout.
 pub const InterruptState = extern struct {
-    /// Non-zero when an interrupt has been requested. Read by the trampoline on every interrupt check.
+    /// Flags: 1 = user interrupt, 2 = lifecycle stop, 4 = terminal generation cancellation, 8 = host-observer deferral. Backend trampolines retain the first three bit assignments.
     interrupt_requested: u8 = 0,
     _pad: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
     /// Absolute monotonic deadline in ms (from io.monotonicMilliseconds). Zero means "no limit". Read atomically.
@@ -66,32 +66,39 @@ var registry: std.AutoHashMap(i32, *InterruptState) =
     std.AutoHashMap(i32, *InterruptState).init(std.heap.c_allocator);
 var registry_mutex: sync.Mutex = .{};
 
-// Count of in-flight host trampolines per instance. Not part of InterruptState: that extern layout is shared with backend trampolines and must not gain fields.
-var host_callback_depth: std.AutoHashMap(i32, u32) =
-    std.AutoHashMap(i32, u32).init(std.heap.c_allocator);
+// Backend trampolines share InterruptState's extern layout. Host-only bookkeeping lives beside it in the same instance-allocator-owned allocation.
+const OwnedInterruptState = struct {
+    interrupt: InterruptState = .{},
+    allocator: std.mem.Allocator,
+    host_callback_depth: u32 = 0,
+};
 
-/// Entered around a spike (Hermes/Escargot) host-function trampoline.
+fn ownerOf(state: *InterruptState) *OwnedInterruptState {
+    return @fieldParentPtr("interrupt", state);
+}
+
+/// Entered around a spike (Hermes/Escargot) host-function trampoline. No allocation is permitted after callback admission.
 pub fn beginHostCallback(instance_id: i32) void {
     registry_mutex.lock();
     defer registry_mutex.unlock();
-    const gop = host_callback_depth.getOrPut(instance_id) catch return;
-    if (!gop.found_existing) gop.value_ptr.* = 0;
-    gop.value_ptr.* += 1;
+    const state = registry.get(instance_id) orelse return;
+    ownerOf(state).host_callback_depth += 1;
 }
 
 pub fn endHostCallback(instance_id: i32) void {
     registry_mutex.lock();
     defer registry_mutex.unlock();
-    const d = host_callback_depth.getPtr(instance_id) orelse return;
-    std.debug.assert(d.* != 0);
-    d.* -= 1;
-    if (d.* == 0) _ = host_callback_depth.remove(instance_id);
+    const state = registry.get(instance_id) orelse return;
+    const owned = ownerOf(state);
+    std.debug.assert(owned.host_callback_depth != 0);
+    owned.host_callback_depth -= 1;
 }
 
 fn isHostCallbackActive(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
-    return (host_callback_depth.get(instance_id) orelse 0) != 0;
+    const state = registry.get(instance_id) orelse return false;
+    return ownerOf(state).host_callback_depth != 0;
 }
 
 fn takeState(instance_id: i32) ?*InterruptState {
@@ -122,7 +129,9 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     }
     registry_mutex.unlock();
 
-    const state = std.heap.c_allocator.create(InterruptState) catch return false;
+    const owned = inst.allocator.create(OwnedInterruptState) catch return false;
+    owned.* = .{ .allocator = inst.allocator };
+    const state = &owned.interrupt;
     state.* = .{
         .interrupt_requested = 0,
         .deadline_ms = 0,
@@ -137,7 +146,7 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     registry_mutex.lock();
     registry.put(instance_id, state) catch {
         registry_mutex.unlock();
-        std.heap.c_allocator.destroy(state);
+        owned.allocator.destroy(owned);
         return false;
     };
     registry_mutex.unlock();
@@ -188,9 +197,6 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
 
 /// Remove the interrupt trampoline and free the state. Call before `engine.destroy`. Idempotent — returns false if the instance was never initialized (or already torn down).
 pub fn deinit(instance_id: i32) bool {
-    registry_mutex.lock();
-    _ = host_callback_depth.remove(instance_id);
-    registry_mutex.unlock();
     const inst_opt = instance_map.getInstance(instance_id);
 
     const state = takeState(instance_id) orelse return false;
@@ -232,7 +238,8 @@ pub fn deinit(instance_id: i32) bool {
         }
     }
 
-    std.heap.c_allocator.destroy(state);
+    const owned = ownerOf(state);
+    owned.allocator.destroy(owned);
     return true;
 }
 
@@ -325,7 +332,7 @@ pub fn requestInterrupt(instance_id: i32) bool {
         defer registry_mutex.unlock();
         const state = registry.get(instance_id) orelse return false;
         const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
-        _ = p.fetchOr(4, .monotonic);
+        _ = p.fetchOr(8, .monotonic);
         return false;
     }
     registry_mutex.lock();
@@ -348,16 +355,20 @@ pub fn clearInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
-    const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
-    target_ptr.store(0, .monotonic);
-    const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
-    // Clear the mid-script user bit and the spike host-defer bit; leave the lifecycle stop bit.
-    _ = p.fetchAnd(~@as(u8, 1 | 4), .monotonic);
+    clearUserInterruptState(state);
     registry_mutex.unlock();
     // Unwatch only — do not evaluate here (may race a live mid-script eval).
     // Sticky Timeout AsyncBreak from stop/destroy is drained in clearStopInterrupt after join.
     hermesWatchTimeLimit(instance_id, 0);
     return true;
+}
+
+fn clearUserInterruptState(state: *InterruptState) void {
+    const target: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
+    target.store(0, .monotonic);
+    const flags: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+    // Clear user/observer deferral, never lifecycle stop or terminal generation cancellation.
+    _ = flags.fetchAnd(~@as(u8, 1 | 8), .monotonic);
 }
 
 /// Request an interrupt owned by lifecycle shutdown without clearing a caller's explicit interrupt request or a configured deadline.
@@ -665,7 +676,7 @@ pub fn isHostDeferRequested(instance_id: i32) bool {
         return false;
     };
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
-    const requested = (p.load(.monotonic) & 4) != 0;
+    const requested = (p.load(.monotonic) & 8) != 0;
     registry_mutex.unlock();
     return requested;
 }
@@ -934,4 +945,46 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
             return .{};
         },
     }
+}
+
+test "runtime_control: clear preserves terminal cancellation separately from observer deferral" {
+    var state = InterruptState{};
+    cancelShutdownState(&state);
+    state.interrupt_requested |= 1 | 2 | 8;
+    state.interrupt_target = 19;
+    clearUserInterruptState(&state);
+    try std.testing.expectEqual(@as(u8, 2 | 4), state.interrupt_requested);
+    try std.testing.expectEqual(@as(u64, 0), state.interrupt_target);
+    try std.testing.expectEqual(ShutdownPhase.cancelled, state.shutdown_phase);
+    try std.testing.expectEqual(@as(u64, 0), state.shutdown_deadline_ms);
+}
+
+test "runtime_control: admitted callback bookkeeping is allocation-free and nested" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const allocator = failing.allocator();
+    const owned = try allocator.create(OwnedInterruptState);
+    defer allocator.destroy(owned);
+    owned.* = .{ .allocator = allocator };
+    const id = -2_000_001;
+    registry_mutex.lock();
+    registry.put(id, &owned.interrupt) catch |err| {
+        registry_mutex.unlock();
+        return err;
+    };
+    registry_mutex.unlock();
+    defer {
+        registry_mutex.lock();
+        _ = registry.remove(id);
+        registry_mutex.unlock();
+    }
+    beginHostCallback(id);
+    beginHostCallback(id);
+    try std.testing.expectEqual(@as(u32, 2), owned.host_callback_depth);
+    try std.testing.expect(isHostCallbackActive(id));
+    endHostCallback(id);
+    try std.testing.expect(isHostCallbackActive(id));
+    endHostCallback(id);
+    try std.testing.expect(!isHostCallbackActive(id));
+    try std.testing.expectEqual(@as(usize, 1), failing.alloc_index);
+    try std.testing.expectError(error.OutOfMemory, allocator.create(OwnedInterruptState));
 }
