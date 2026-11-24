@@ -9,7 +9,7 @@ root="$(git rev-parse --show-toplevel)"
 output="$1"
 mkdir -p "$output"
 output="$(cd "$output" && pwd -P)"
-for file in coverage.cobertura.xml coverage-tests.json pawl.coverage.yaml; do
+for file in coverage.cobertura.xml coverage-invalid.cobertura.xml coverage-tests.json pawl.coverage.yaml; do
     if [ -e "$output/$file" ]; then
         echo "Coverage output already exists: $output/$file" >&2
         exit 2
@@ -38,7 +38,10 @@ if ! node scripts/quality/zig-coverage-summary.mjs < "$work/tests.log" > "$work/
 fi
 report="$work/kcov/test/cobertura.xml"
 test -s "$report"
-node scripts/quality/zig-coverage-report.mjs < "$report"
+if ! node scripts/quality/zig-coverage-report.mjs < "$report"; then
+    cp "$report" "$output/coverage-invalid.cobertura.xml"
+    exit 2
+fi
 cp "$report" "$output/coverage.cobertura.xml"
 cp "$work/tests.json" "$output/coverage-tests.json"
 cp pawl.coverage.yaml "$output/pawl.coverage.yaml"

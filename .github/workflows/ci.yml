@@ -218,6 +218,14 @@ jobs:
           path: ${{ runner.temp }}/jsbay-coverage/
           if-no-files-found: error
 
+      - name: Upload invalid coverage report
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: invalid-quickjs-ng-engine-coverage
+          path: ${{ runner.temp }}/jsbay-coverage/coverage-invalid.cobertura.xml
+          if-no-files-found: ignore
+
   linux-engine:
     name: linux-engine (${{ matrix.backend }})
     runs-on: ubuntu-24.04
