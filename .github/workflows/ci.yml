@@ -355,6 +355,20 @@ jobs:
       - name: Test repository tools
         run: zig build test-tools --summary all
 
+      - name: Report QuickJS-NG engine coverage
+        run: |
+          set -euo pipefail
+          node --test tests/ci/zig-coverage-summary-test.mjs tests/ci/zig-coverage-report-test.mjs
+          if ! command -v kcov >/dev/null 2>&1; then brew install kcov; fi
+          bash scripts/quality/zig-coverage.sh "$RUNNER_TEMP/jsbay-coverage"
+
+      - name: Upload QuickJS-NG engine coverage
+        uses: actions/upload-artifact@v6
+        with:
+          name: quickjs-ng-engine-coverage
+          path: ${{ runner.temp }}/jsbay-coverage/
+          if-no-files-found: error
+
       - name: Check Zig formatting
         run: |
           set -euo pipefail
