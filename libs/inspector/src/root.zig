@@ -27,6 +27,12 @@ pub const modules = struct {
     pub fn state(comptime Host: type) type {
         return @import("state.zig").Module(Host);
     }
+    pub fn command_queue(comptime Host: type) type {
+        return @import("command_queue.zig").Module(Host);
+    }
+    pub fn console_replay() type {
+        return @import("console_replay.zig").Module;
+    }
     pub fn object_table(comptime Host: type) type {
         return @import("object_table.zig").Module(Host);
     }

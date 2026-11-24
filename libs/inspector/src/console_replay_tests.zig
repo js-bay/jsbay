@@ -1,8 +1,8 @@
-pub fn run(comptime Host: type) !void {
+pub fn run(comptime Host: type, comptime TestApi: type) !void {
     const std = @import("std");
-    const transport_mod = @import("transport.zig");
-    const state_mod = @import("state.zig").Module(Host);
-    const replay = @import("console_replay.zig").Module;
+    const transport_mod = TestApi;
+    const state_mod = TestApi.state(Host);
+    const replay = TestApi.console_replay();
     const testing = std.testing;
 
     const Probe = struct {
@@ -94,10 +94,13 @@ pub fn run(comptime Host: type) !void {
     const canceled = replay.beginReplay(&state, 3);
     defer replay.freeBuffered(&state, canceled);
     replay.failReplay(&state, 3, canceled.generation);
+    replay.closeFailedSessions(&state);
     switch (replay.nextEntry(&state, 3, canceled.generation)) {
         .cancelled => {},
         else => return error.TestUnexpectedResult,
     }
+    try testing.expectEqual(@as(usize, 1), probe.closed.items.len);
+    try testing.expectEqual(@as(transport_mod.SessionId, 3), probe.closed.items[0]);
 
     try testing.expect(state_mod.addSession(&state, 4));
     try testing.expect(replay.beginEnable(&state, 4));
@@ -108,8 +111,8 @@ pub fn run(comptime Host: type) !void {
         defer testing.allocator.free(event);
         try state_mod.bufferConsoleEvent(&state, event, null, &.{}, &live);
     }
-    try testing.expectEqual(@as(usize, 1), probe.closed.items.len);
-    try testing.expectEqual(@as(transport_mod.SessionId, 4), probe.closed.items[0]);
+    try testing.expectEqual(@as(usize, 2), probe.closed.items.len);
+    try testing.expectEqual(@as(transport_mod.SessionId, 4), probe.closed.items[1]);
     switch (replay.nextEntry(&state, 4, bounded.generation)) {
         .cancelled => {},
         else => return error.TestUnexpectedResult,
@@ -133,8 +136,8 @@ pub fn run(comptime Host: type) !void {
     defer testing.allocator.free(huge_event);
     @memset(huge_event, 'x');
     try state_mod.bufferConsoleEvent(&state, huge_event, null, &.{}, &live);
-    try testing.expectEqual(@as(usize, 2), probe.closed.items.len);
-    try testing.expectEqual(@as(transport_mod.SessionId, 6), probe.closed.items[1]);
+    try testing.expectEqual(@as(usize, 3), probe.closed.items.len);
+    try testing.expectEqual(@as(transport_mod.SessionId, 6), probe.closed.items[2]);
     switch (replay.nextEntry(&state, 6, byte_bounded.generation)) {
         .cancelled => {},
         else => return error.TestUnexpectedResult,
