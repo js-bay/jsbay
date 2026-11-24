@@ -1,0 +1,28 @@
+exclude: ["vendor/**", "**/zig-pkg/**", "**/.zig-cache/**", "**/.zig-global-cache/**", "**/zig-out/**", "**/node_modules/**"]
+
+dimensions:
+  - id: zig-core-long-files
+    title: Core Zig files over 500 lines
+    direction: lower-is-better
+    builtin: file-length
+    options:
+      threshold: 500
+      include: ["src/**/*.zig"]
+      min_files: 1
+  - id: zig-libs-long-files
+    title: Library Zig files over 500 lines
+    direction: lower-is-better
+    builtin: file-length
+    options:
+      threshold: 500
+      include: ["libs/**/*.zig"]
+      min_files: 1
+  - id: zig-other-long-files
+    title: Other Zig files over 500 lines
+    direction: lower-is-better
+    builtin: file-length
+    options:
+      threshold: 500
+      include: ["**/*.zig"]
+      exclude: ["src/**", "libs/**"]
+      min_files: 1

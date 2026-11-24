@@ -280,9 +280,9 @@ jobs:
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
-      - uses: tiangong-dev/pawl@v0.8.2
+      - uses: tiangong-dev/pawl@v0.9.0
         with:
-          version: v0.8.2
+          version: v0.9.0
       - name: Official ETS format and lint
         run: make check CHECKS=native-format,harmony-style
       - name: Build and package HAR
