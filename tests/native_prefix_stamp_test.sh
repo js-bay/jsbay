@@ -27,18 +27,18 @@ if "${check[@]}"; then echo 'Invalid native stamp was accepted.' >&2; exit 1; fi
 echo 'PASS native prefix freshness checks'
 
 # Reconstruct the published inventory so native stamp checks cannot depend on unshipped source files.
-python3 - "$ROOT" "$WORK/package" "${PACKAGE_MANIFEST:-$ROOT/build.zig.zon}" <<'PYTHON'
-import pathlib, re, shutil, sys
-root, package, manifest = map(pathlib.Path, sys.argv[1:])
-paths = re.findall(r'"([^"\n]+)"', manifest.read_text().split('.paths = .{', 1)[1].split('},', 1)[0])
-for name in paths:
-    source, target = root / name, package / name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if source.is_dir():
-        shutil.copytree(source, target, symlinks=True)
-    else:
-        shutil.copy2(source, target)
-PYTHON
+node - "$ROOT" "$WORK/package" "${PACKAGE_MANIFEST:-$ROOT/build.zig.zon}" <<'JS'
+const fs = require('node:fs');
+const path = require('node:path');
+const [root, packageRoot, manifest] = process.argv.slice(2);
+const inventory = fs.readFileSync(manifest, 'utf8').split('.paths = .{', 2)[1].split('},', 1)[0];
+for (const match of inventory.matchAll(/"([^"\n]+)"/g)) {
+    const source = path.join(root, match[1]);
+    const target = path.join(packageRoot, match[1]);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.cpSync(source, target, { recursive: true, dereference: false, verbatimSymlinks: true });
+}
+JS
 for backend in escargot hermes; do
     mkdir -p "$WORK/package-prefix-$backend"
     bash "$WORK/package/scripts/native-prefix-stamp.sh" "$backend" write "$WORK/package-prefix-$backend"
