@@ -225,7 +225,7 @@ test "Runtime enable replay queues concurrent events in order and stays bounded"
     try @import("console_replay_tests.zig").run(StateTestHost);
 }
 
-test "command queue bounds and serializes concurrent admission and close" {
+test "command queue bounds concurrent admission and session discard" {
     try @import("command_queue_tests.zig").run(StateTestHost);
 }
 

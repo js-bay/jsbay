@@ -1,5 +1,5 @@
 pub fn run(comptime Host: type) !void {
-    // Includes bounded admission and cross-thread close/drain behavior.
+    // Includes bounded admission and cross-thread session discard/drain behavior.
     const std = @import("std");
     const testing = std.testing;
     const queue_mod = @import("command_queue.zig").Module(Host);
