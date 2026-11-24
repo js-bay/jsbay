@@ -21,7 +21,7 @@ pub fn Module(comptime Host: type) type {
             defer state_mod.releaseStateLease(state);
             state.mutex.lock();
             defer state.mutex.unlock();
-            for (state.sessions.items) |session| if (session.runtime_enabled) return true;
+            for (state.sessions.items) |session| if (session.runtime.enabled) return true;
             return false;
         }
 

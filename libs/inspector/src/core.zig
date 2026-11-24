@@ -57,6 +57,16 @@ pub fn Module(comptime Host: type) type {
 
         pub const TestAllocationFailureStage = Host.test_faults.Stage;
         pub const testFailAllocationOnce = Host.test_faults.arm;
+        pub const RuntimeEnableBarrierForTesting = dispatcher.RuntimeEnableBarrierForTesting;
+        pub const RuntimeReplayBarrierForTesting = console.RuntimeReplayBarrierForTesting;
+
+        pub fn setRuntimeEnableBarrierForTesting(barrier: ?*RuntimeEnableBarrierForTesting) void {
+            dispatcher.setRuntimeEnableBarrierForTesting(barrier);
+        }
+
+        pub fn setRuntimeReplayBarrierForTesting(barrier: ?*RuntimeReplayBarrierForTesting) void {
+            console.setRuntimeReplayBarrierForTesting(barrier);
+        }
 
         var start_capture_hook_for_testing: ?*const fn (?*anyopaque) void = null;
         var start_cleanup_hook_for_testing: ?*const fn (?*anyopaque) void = null;

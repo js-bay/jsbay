@@ -75,25 +75,23 @@ const NativeStopHost = struct {
 };
 
 const PerformanceBoundaryHost = struct {
-    entered: std.atomic.Value(bool) = .init(false),
-    release: std.atomic.Value(bool) = .init(false),
+    entered: std.Io.Semaphore = .{},
+    release: std.Io.Semaphore = .{},
 
     fn call(_: c_int, user_data: ?*anyopaque, _: u32, _: ?[*]const host_value.HostValue, out: *host_value.HostValue) callconv(.c) c_int {
         const self: *PerformanceBoundaryHost = @ptrCast(@alignCast(user_data.?));
-        self.entered.store(true, .seq_cst);
-        while (!self.release.load(.seq_cst)) std.Thread.yield() catch {};
+        self.entered.post(testing.io);
+        self.release.waitUncancelable(testing.io);
         host_value.clear(out);
         return 0;
     }
 };
 
-fn waitForAtomicTrue(value: *std.atomic.Value(bool)) bool {
-    var spins: usize = 0;
-    while (spins < 100_000) : (spins += 1) {
-        if (value.load(.seq_cst)) return true;
-        std.Thread.yield() catch {};
-    }
-    return false;
+const performance_boundary_wait_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } };
+
+fn waitForSignal(value: *std.Io.Semaphore) bool {
+    value.waitTimeout(testing.io, performance_boundary_wait_timeout) catch return false;
+    return true;
 }
 
 fn hostRejectionTracker(
@@ -1237,8 +1235,10 @@ test "cdp regression: Performance configuration acknowledges only after an owner
     var host = PerformanceBoundaryHost{};
     var thread: ?std.Thread = null;
     defer {
-        host.release.store(true, .seq_cst);
-        if (thread) |value| value.join();
+        if (thread) |value| {
+            host.release.post(testing.io);
+            value.join();
+        }
     }
     try testing.expect(engine_thread.hostInstall(session.id, "performanceBoundary", PerformanceBoundaryHost.call, @ptrCast(&host)));
 
@@ -1247,23 +1247,21 @@ test "cdp regression: Performance configuration acknowledges only after an owner
 
     var evaluation = EvalProbe{ .id = session.id, .source = "performanceBoundary()", .filename = "performance-boundary.js" };
     thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&evaluation});
-    try testing.expect(waitForAtomicTrue(&host.entered));
+    try testing.expect(waitForSignal(&host.entered));
     at = try send(&session, "Performance.disable", "", 1702);
     try testing.expect(!(try waitResponseNoTick(&session, at, 1702)));
-    host.release.store(true, .seq_cst);
+    host.release.post(testing.io);
     thread.?.join();
     thread = null;
     try testing.expect(evaluation.ok);
     try testing.expect(responseIsSuccess(try pumpResponse(&session, at, 1702), 1702));
 
-    host.entered.store(false, .seq_cst);
-    host.release.store(false, .seq_cst);
     evaluation = .{ .id = session.id, .source = "performanceBoundary()", .filename = "performance-boundary.js" };
     thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&evaluation});
-    try testing.expect(waitForAtomicTrue(&host.entered));
+    try testing.expect(waitForSignal(&host.entered));
     at = try send(&session, "Performance.enable", "", 1703);
     try testing.expect(!(try waitResponseNoTick(&session, at, 1703)));
-    host.release.store(true, .seq_cst);
+    host.release.post(testing.io);
     thread.?.join();
     thread = null;
     try testing.expect(evaluation.ok);
@@ -1309,13 +1307,15 @@ test "cdp regression: a closed session cannot revive queued Performance measurem
     var host = PerformanceBoundaryHost{};
     var thread: ?std.Thread = null;
     defer {
-        host.release.store(true, .seq_cst);
-        if (thread) |value| value.join();
+        if (thread) |value| {
+            host.release.post(testing.io);
+            value.join();
+        }
     }
     try testing.expect(engine_thread.hostInstall(session.id, "performanceBoundary", PerformanceBoundaryHost.call, @ptrCast(&host)));
     var evaluation = EvalProbe{ .id = session.id, .source = "performanceBoundary()", .filename = "performance-close-queue.js" };
     thread = try std.Thread.spawn(.{}, EvalProbe.run, .{&evaluation});
-    try testing.expect(waitForAtomicTrue(&host.entered));
+    try testing.expect(waitForSignal(&host.entered));
     _ = try send(&session, "Performance.enable", "", 1721);
     const barrier_at = try send(&session, "Runtime.getIsolateId", "", 1722);
     try testing.expect(try waitResponseNoTick(&session, barrier_at, 1722));
@@ -1325,7 +1325,7 @@ test "cdp regression: a closed session cannot revive queued Performance measurem
     try testing.expectEqual(@as(usize, 0), ledger.measurement_users.load(.acquire));
     try testing.expectEqual(@as(usize, 0), ledger.pending_measurement_disables.load(.acquire));
 
-    host.release.store(true, .seq_cst);
+    host.release.post(testing.io);
     thread.?.join();
     thread = null;
     try testing.expect(evaluation.ok);

@@ -3,7 +3,7 @@ pub fn Module(comptime Host: type) type {
     //
     // The state table follows the same pattern as `tsfn.zig` / `console_tap.zig`: a global `AutoHashMap(i32, *InspectorState)` guarded by `inspector_mutex`. Every entry-point that wants to look up state for an `instance_id` goes through here.
     //
-    // Per-session bookkeeping (`addSession` / `removeSession` / `setSessionRuntimeEnabled` / `snapshotEnabledSessions`) lives on the `InspectorState.sessions` list and is guarded by the per-state mutex.
+    // Per-session bookkeeping lives on the `InspectorState.sessions` list and is guarded by the per-state mutex.
     //
     // `console_entries` stores recent `Runtime.consoleAPICalled` payloads collected while Runtime is enabled so later sessions can replay them. `removeStateByPtr` only unlinks the state. `inspector.stop` and `inspector.dropInstance` both free the buffer from `releaseInspector`.
 
@@ -16,6 +16,8 @@ pub fn Module(comptime Host: type) type {
         const transport_mod = @import("transport.zig");
         const object_table_mod = @import("object_table.zig").Module(Host);
         const test_faults = Host.test_faults;
+        const console_replay = @import("console_replay.zig").Module;
+        const command_queue = @import("command_queue.zig").Module(Host);
 
         pub const ObjectTable = object_table_mod.ObjectTable;
 
@@ -27,7 +29,7 @@ pub fn Module(comptime Host: type) type {
 
         pub const Session = struct {
             id: transport_mod.SessionId,
-            runtime_enabled: bool = false,
+            runtime: console_replay.Session = .{},
             debugger_enabled: bool = false,
             /// Requested by this CDP session through Debugger.setAsyncCallStackDepth. The owner thread applies the maximum request across live sessions.
             async_stack_depth: u32 = 0,
@@ -44,17 +46,13 @@ pub fn Module(comptime Host: type) type {
         };
 
         // Oldest entries are dropped once the console buffer reaches this size.
-        pub const console_buffer_cap: usize = 100;
+        pub const console_buffer_cap = console_replay.console_buffer_cap;
 
         // Id written by executionContextCreated, scriptParsed, and consoleAPICalled.
         pub const default_execution_context_id = 1;
 
         // Copied console events for one `Runtime.enable` replay. `owned` is false when `entries` is an empty static slice.
-        pub const BufferedConsole = struct {
-            entries: [][]u8 = &.{},
-            owned: bool = false,
-            failed: bool = false,
-        };
+        pub const BufferedConsole = console_replay.BufferedConsole;
 
         // One buffered console event. `object_ids` names exactly the ObjectTable entries retained while serializing this event; it is never exposed through CDP.
         pub const ConsoleEntry = struct {
@@ -74,6 +72,7 @@ pub fn Module(comptime Host: type) type {
             pub fn deinitSynchronization(self: *InspectorState) void {
                 self.task_wake.deinit();
                 self.task_mutex.deinit();
+                command_queue.deinit(&self.commands, self.allocator);
                 self.mutex.deinit();
             }
 
@@ -88,6 +87,7 @@ pub fn Module(comptime Host: type) type {
 
             /// Per-session bookkeeping. Protected by `mutex`.
             mutex: sync.Mutex = .{},
+            commands: command_queue.Queue = .{},
             /// Protects task admission and the lifetime of tasks holding this state.
             task_mutex: sync.Mutex = .{},
             task_wake: sync.Condition = .init,
@@ -123,6 +123,8 @@ pub fn Module(comptime Host: type) type {
             /// Full `Runtime.consoleAPICalled` JSON texts, oldest first. A group owns only the ObjectTable entries created for that event. Protected by `mutex`.
             console_entries: std.ArrayList(ConsoleEntry) = .empty,
             console_entries_head: usize = 0,
+            /// Bytes copied into Runtime replay snapshots and per-session queues. Protected by `mutex`.
+            runtime_delivery: console_replay.Account = .{},
 
             /// Retained remote objects. Entries live until explicitly released or inspector shutdown. Allocated with `allocator`.
             object_table: ObjectTable,
@@ -194,7 +196,9 @@ pub fn Module(comptime Host: type) type {
         }
 
         fn hasEnabledRuntimeSessionLocked(state: *InspectorState) bool {
-            for (state.sessions.items) |session| if (session.runtime_enabled) return true;
+            for (state.sessions.items) |session| {
+                if (session.runtime.enabled or session.runtime.enabling or session.runtime.replaying) return true;
+            }
             return false;
         }
 
@@ -537,6 +541,7 @@ pub fn Module(comptime Host: type) type {
             var i: usize = 0;
             while (i < state.sessions.items.len) : (i += 1) {
                 if (state.sessions.items[i].id == session_id) {
+                    console_replay.deinitQueue(state, &state.sessions.items[i]);
                     _ = state.sessions.swapRemove(i);
                     requestExecutionCpuMeasurementReconciliationLocked(state);
                     return true;
@@ -561,6 +566,7 @@ pub fn Module(comptime Host: type) type {
             while (i < state.sessions.items.len) : (i += 1) {
                 if (state.sessions.items[i].id != session_id) continue;
                 const removed_debugger = state.sessions.items[i].debugger_enabled;
+                console_replay.deinitQueue(state, &state.sessions.items[i]);
                 _ = state.sessions.swapRemove(i);
                 requestExecutionCpuMeasurementReconciliationLocked(state);
                 var has_debugger = false;
@@ -712,17 +718,6 @@ pub fn Module(comptime Host: type) type {
             }
         }
 
-        pub fn setSessionRuntimeEnabled(state: *InspectorState, session_id: transport_mod.SessionId, enabled: bool) void {
-            state.mutex.lock();
-            defer state.mutex.unlock();
-            for (state.sessions.items) |*s| {
-                if (s.id == session_id) {
-                    s.runtime_enabled = enabled;
-                    return;
-                }
-            }
-        }
-
         pub fn configureSessionPerformance(
             state: *InspectorState,
             session_id: transport_mod.SessionId,
@@ -827,7 +822,7 @@ pub fn Module(comptime Host: type) type {
             state.mutex.lock();
             defer state.mutex.unlock();
             for (state.sessions.items) |s| {
-                if (s.runtime_enabled) {
+                if (s.runtime.enabled) {
                     out.append(state.allocator, s.id) catch {};
                 }
             }
@@ -856,9 +851,9 @@ pub fn Module(comptime Host: type) type {
             };
 
             const enabled_start = enabled_out.items.len;
-            for (state.sessions.items) |s| {
-                if (s.runtime_enabled) {
-                    enabled_out.append(state.allocator, s.id) catch {
+            for (state.sessions.items) |*session| {
+                if (session.runtime.enabled) {
+                    enabled_out.append(state.allocator, session.id) catch {
                         state.mutex.unlock();
                         if (ctx) |js_ctx| {
                             for (enabled_out.items[enabled_start..]) |granted| {
@@ -870,7 +865,7 @@ pub fn Module(comptime Host: type) type {
                         state.allocator.free(ids_copy);
                         return error.OutOfMemory;
                     };
-                    state.object_table.grantConsoleLease(s.id, object_ids) catch {
+                    state.object_table.grantConsoleLease(session.id, object_ids) catch {
                         _ = enabled_out.pop();
                         state.mutex.unlock();
                         if (ctx) |js_ctx| {
@@ -883,6 +878,8 @@ pub fn Module(comptime Host: type) type {
                         state.allocator.free(ids_copy);
                         return error.OutOfMemory;
                     };
+                } else if (session.runtime.replaying and !session.runtime.replay_failed) {
+                    console_replay.queueEventLocked(state, session, json, object_ids);
                 }
             }
 
@@ -908,6 +905,7 @@ pub fn Module(comptime Host: type) type {
             }
             _ = console_entry_live.fetchAdd(1, .monotonic);
             state.mutex.unlock();
+            console_replay.closeFailedSessions(state);
             if (evicted) |old| {
                 freeConsoleEntry(state, old, ctx);
                 _ = console_entry_live.fetchSub(1, .monotonic);
@@ -1026,7 +1024,7 @@ pub fn Module(comptime Host: type) type {
 
                 failing.fail_index = std.math.maxInt(usize);
                 failing.resize_fail_index = std.math.maxInt(usize);
-                setSessionRuntimeEnabled(&state, healthy_session, true);
+                console_replay.setEnabled(&state, healthy_session, true);
                 try bufferConsoleEvent(&state, "healthy-live", ctx, &.{object_id}, &enabled);
                 try testing.expectEqual(healthy_session, enabled.pop().?);
                 state.object_table.drainClosedConsoleSessions(ctx);
@@ -1311,7 +1309,7 @@ pub fn Module(comptime Host: type) type {
             var found_session = false;
             for (state.sessions.items) |*s| {
                 if (s.id == session_id) {
-                    s.runtime_enabled = true;
+                    s.runtime.enabled = true;
                     found_session = true;
                     break;
                 }
@@ -1337,7 +1335,7 @@ pub fn Module(comptime Host: type) type {
                     state.allocator.free(out);
                     for (state.sessions.items) |*session| {
                         if (session.id == session_id) {
-                            session.runtime_enabled = false;
+                            session.runtime.enabled = false;
                             break;
                         }
                     }
@@ -1349,9 +1347,7 @@ pub fn Module(comptime Host: type) type {
         }
 
         pub fn freeBufferedConsole(state: *InspectorState, buffered: BufferedConsole) void {
-            if (!buffered.owned) return;
-            for (buffered.entries) |entry| state.allocator.free(entry);
-            state.allocator.free(buffered.entries);
+            console_replay.freeBuffered(state, buffered);
         }
 
         // Drop every buffered console event. `Runtime.discardConsoleEntries` calls this.

@@ -15,8 +15,34 @@ pub fn Module(comptime Host: type) type {
         const json_writer = @import("json_writer.zig").Module(Host);
         const request_box = @import("request_box.zig").Module(Host);
         const state_mod = @import("state.zig").Module(Host);
+        const runtime_replay = @import("console_replay.zig").Module;
 
         const InspectorState = state_mod.InspectorState;
+
+        pub const RuntimeReplayBarrierForTesting = struct {
+            reached: std.atomic.Value(bool) = .init(false),
+            continue_before_delivery: std.atomic.Value(bool) = .init(false),
+        };
+
+        const RuntimeReplayTestHooks = if (@import("builtin").is_test) struct {
+            var barrier_address: std.atomic.Value(usize) = .init(0);
+        } else struct {};
+
+        pub fn setRuntimeReplayBarrierForTesting(_barrier: ?*RuntimeReplayBarrierForTesting) void {
+            if (comptime @import("builtin").is_test) {
+                RuntimeReplayTestHooks.barrier_address.store(if (_barrier) |value| @intFromPtr(value) else 0, .release);
+            }
+        }
+
+        fn pauseRuntimeReplayBeforeDeliveryForTesting() void {
+            if (comptime @import("builtin").is_test) {
+                const address = RuntimeReplayTestHooks.barrier_address.load(.acquire);
+                if (address == 0) return;
+                const barrier: *RuntimeReplayBarrierForTesting = @ptrFromInt(address);
+                barrier.reached.store(true, .release);
+                while (!barrier.continue_before_delivery.load(.acquire)) std.Thread.yield() catch {};
+            }
+        }
 
         var console_group_counter: std.atomic.Value(u64) = .init(1);
 
@@ -98,16 +124,33 @@ pub fn Module(comptime Host: type) type {
 
         // Mark the session Runtime-enabled and replay buffered console events. Called from `Runtime.enable` after `executionContextCreated`.
         pub fn enableRuntimeAndReplayConsole(state: *InspectorState, session_id: transport_mod.SessionId) void {
-            const buffered = state_mod.enableRuntimeAndCopyConsole(state, session_id);
-            defer state_mod.freeBufferedConsole(state, buffered);
+            const buffered = runtime_replay.beginReplay(state, session_id);
+            defer runtime_replay.freeBuffered(state, buffered);
             if (buffered.failed) {
+                runtime_replay.failReplay(state, session_id, null);
                 state.transport.closeSession(session_id);
                 return;
             }
+            if (!buffered.started) return;
+            pauseRuntimeReplayBeforeDeliveryForTesting();
             for (buffered.entries) |entry| {
                 if (!state.transport.sendText(session_id, entry)) {
+                    runtime_replay.failReplay(state, session_id, buffered.generation);
                     state.transport.closeSession(session_id);
                     return;
+                }
+            }
+            while (true) {
+                switch (runtime_replay.nextEntry(state, session_id, buffered.generation)) {
+                    .entry => |entry| {
+                        defer runtime_replay.freeEntry(state, entry);
+                        if (!state.transport.sendText(session_id, entry)) {
+                            runtime_replay.failReplay(state, session_id, buffered.generation);
+                            state.transport.closeSession(session_id);
+                            return;
+                        }
+                    },
+                    .done, .cancelled => return,
                 }
             }
         }

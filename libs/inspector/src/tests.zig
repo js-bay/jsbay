@@ -221,6 +221,14 @@ test "console buffer releases every partial allocation failure" {
     try inspector.modules.state(StateTestHost).TestCases.consoleBufferReleasesEveryPartialAllocationFailure();
 }
 
+test "Runtime enable replay queues concurrent events in order and stays bounded" {
+    try @import("console_replay_tests.zig").run(StateTestHost);
+}
+
+test "command queue bounds concurrent admission and session discard" {
+    try @import("command_queue_tests.zig").run(StateTestHost);
+}
+
 test "destroy waits while inspector transport startup owns the registered state" {
     try inspector.modules.state(StateTestHost).TestCases.destroyWaitsWhileTransportStartupOwnsRegisteredState();
 }
