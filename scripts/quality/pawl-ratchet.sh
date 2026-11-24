@@ -13,8 +13,11 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/jsbay-pawl-ratchet.XXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 mkdir "$work/base"
 git -C "$root" archive "$base" | tar -xf - -C "$work/base"
-for definition in pawl.ratchet.yaml pawl.length.yaml scripts/quality/pawl-long-lines.mjs; do
+for definition in pawl.ratchet.yaml pawl.length.yaml scripts/quality/pawl-long-lines.mjs scripts/quality/pawl-ratchet.sh scripts/quality/pawl-config-migration.mjs; do
     if git -C "$root" cat-file -e "$base:$definition" 2>/dev/null && ! cmp -s "$root/$definition" "$work/base/$definition"; then
+        if { [ "$definition" = pawl.length.yaml ] || [ "$definition" = scripts/quality/pawl-ratchet.sh ]; } && node "$root/scripts/quality/pawl-config-migration.mjs" "$definition" "$work/base/$definition" "$root/$definition"; then
+            continue
+        fi
         echo "Ratchet definition changed: $definition" >&2
         exit 2
     fi
