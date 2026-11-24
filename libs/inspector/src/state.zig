@@ -939,6 +939,9 @@ pub fn Module(comptime Host: type) type {
         }
 
         pub const TestCases = if (@import("builtin").is_test) struct {
+            pub const CommandQueue = command_queue;
+            pub const ConsoleReplay = console_replay;
+
             pub fn consoleBufferReleasesEveryPartialAllocationFailure() !void {
                 const testing = std.testing;
                 try testing.checkAllAllocationFailures(testing.allocator, exerciseBufferConsoleEventAllocationFailure, .{});

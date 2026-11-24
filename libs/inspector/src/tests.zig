@@ -1,5 +1,14 @@
 const std = @import("std");
 const inspector = @import("inspector");
+const InspectorTestApi = struct {
+    pub const Transport = inspector.Transport;
+    pub const SessionId = inspector.SessionId;
+    pub const EventHandler = inspector.EventHandler;
+
+    pub fn state(comptime Host: type) type {
+        return inspector.modules.state(Host);
+    }
+};
 
 comptime {
     _ = @import("protocol_tests.zig");
@@ -215,6 +224,11 @@ const StateTestHost = struct {
             }
         };
     };
+    pub const test_faults = struct {
+        pub fn take(_: i32, _: anytype) bool {
+            return false;
+        }
+    };
 };
 
 test "console buffer releases every partial allocation failure" {
@@ -222,11 +236,11 @@ test "console buffer releases every partial allocation failure" {
 }
 
 test "Runtime enable replay queues concurrent events in order and stays bounded" {
-    try @import("console_replay_tests.zig").run(StateTestHost);
+    try @import("console_replay_tests.zig").run(StateTestHost, InspectorTestApi);
 }
 
 test "command queue bounds concurrent admission and session discard" {
-    try @import("command_queue_tests.zig").run(StateTestHost);
+    try @import("command_queue_tests.zig").run(StateTestHost, InspectorTestApi);
 }
 
 test "destroy waits while inspector transport startup owns the registered state" {
