@@ -66,6 +66,14 @@ jobs:
         with:
           version: v0.9.0
 
+      - name: Test and run Zig source ratchet
+        env:
+          PAWL_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          node --test tests/ci/pawl-ratchet-test.mjs
+          bash scripts/quality/pawl-ratchet.sh "$PAWL_BASE"
+
       - name: Install ripgrep
         run: |
           sudo apt-get update
