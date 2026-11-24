@@ -62,7 +62,9 @@ DedicatedEngineThread.start(instanceId).use { dedicated ->
 }
 ```
 
-`DedicatedEngineThread.post` / `runOnOwner` marshal work onto the owner thread. `requestClose()` / `close()` request asynchronously; an independent owner task attempts `drainClose()` and only quits its Looper after completion. A pending attempt needs a later retry; `closeStatus()` reports VM progress, not thread-exit proof. Threads without a Looper still use `runLoop()` on the owner thread; never call `runLoop()` on the main/UI thread.
+`DedicatedEngineThread.post` / `runOnOwner` marshal work onto the owner thread. `close()` closes the engine on that thread and quits its Looper. Calling `close(timeoutMillis)` waits for shutdown completion and throws `DedicatedEngineThreadTimeoutException` when the deadline expires before shutdown completes; callers cannot assume the engine is destroyed or that its instance ID is safe for reuse until shutdown completes. Threads without a Looper still use `runLoop()` on the owner thread; never call `runLoop()` on the main/UI thread.
+
+`requestClose()` / no-argument `close()` request asynchronously; an independent owner task attempts `drainClose()` and only quits its Looper after completion. A pending attempt needs a later retry; `closeStatus()` reports VM progress, not thread-exit proof. A timed-out bounded close remains pending until the original creator can unwind and drain.
 
 JavaScript throws are `JsBayException` values. The original thrown `Value` is available through `getValue()` in Java and `value` in Kotlin. Use `describeAndClose()` when only display text is needed: it reads and closes the original value, preserves embedded NUL and Unicode, and returns `"JavaScript exception"` if coercion throws another JavaScript value. Owner-thread, borrowed, and stale-value errors still throw instead of becoming fallback text.
 
