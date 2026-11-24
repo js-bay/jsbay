@@ -429,7 +429,6 @@ pub fn build(b: *std.Build) void {
     wireImports(internal_tools_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
     if (qjs_root) |root| internal_tools_module.addIncludePath(root);
 
-    // --- Unit tests ---
     const test_module = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -449,6 +448,7 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{
         .root_module = test_module,
+        .use_llvm = b.option(bool, "test-llvm", "Use LLVM for engine tests"),
         .filters = if (stress_tests) &.{"stress"} else if (test_filter) |filter| &.{filter} else &.{},
         .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
     });

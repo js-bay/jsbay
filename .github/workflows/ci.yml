@@ -1,6 +1,6 @@
 # JS Bay CI — see docs/testing.md#ci for the matrix rationale.
-# PR jobs: linux (governance) / linux-engine×2 / macos / macos-ios (simulator smoke) / macos-android / windows.
-# Modest splits only: peel iOS and parallelize Linux backends; keep platforms aggregated. Dual-pack (-Dbackends=quickjs_ng,jsc) stays on macos (JSC needs Apple).
+# PR jobs: linux (governance) / linux-coverage / linux-engine×2 / macos / macos-ios (simulator smoke) / macos-android / windows.
+# Modest splits only: isolate coverage tooling, peel iOS, and parallelize Linux backends; keep platform tests aggregated. Dual-pack (-Dbackends=quickjs_ng,jsc) stays on macos (JSC needs Apple).
 name: CI
 
 on:
@@ -174,6 +174,57 @@ jobs:
           if command -v dotnet >/dev/null 2>&1; then
             dotnet build-server shutdown
           fi
+
+  linux-coverage:
+    name: linux-coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install Pawl
+        uses: tiangong-dev/pawl@v0.9.0
+        with:
+          version: v0.9.0
+
+      - name: Add Homebrew to PATH
+        run: echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
+
+      - name: Report QuickJS-NG engine coverage
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          node --test tests/ci/zig-coverage-summary-test.mjs tests/ci/zig-coverage-report-test.mjs
+          if ! command -v kcov >/dev/null 2>&1; then brew install kcov; fi
+          bash scripts/quality/zig-coverage.sh "$RUNNER_TEMP/jsbay-coverage"
+
+      - name: Upload QuickJS-NG engine coverage
+        uses: actions/upload-artifact@v6
+        with:
+          name: quickjs-ng-engine-coverage
+          path: ${{ runner.temp }}/jsbay-coverage/
+          if-no-files-found: error
+
+      - name: Upload invalid coverage report
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: invalid-quickjs-ng-engine-coverage
+          path: ${{ runner.temp }}/jsbay-coverage/
+          if-no-files-found: ignore
 
   linux-engine:
     name: linux-engine (${{ matrix.backend }})
