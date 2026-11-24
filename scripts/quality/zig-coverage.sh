@@ -30,12 +30,10 @@ if [ "${#binaries[@]}" -ne 1 ] || [ ! -x "${binaries[0]}" ]; then
     echo 'Expected exactly one compiled engine test binary' >&2
     exit 2
 fi
-if ! kcov --include-path="$root/src/" --exclude-path="$root/src/tests/" "$work/kcov" "${binaries[0]}" > "$work/tests.log" 2>&1; then
-    cat "$work/tests.log" >&2
+if ! kcov --include-path="$root/src/" --exclude-path="$root/src/tests/" "$work/kcov" "${binaries[0]}" 2>&1 | tee "$work/tests.log" >&2; then
     exit 2
 fi
 if ! node scripts/quality/zig-coverage-summary.mjs < "$work/tests.log" > "$work/tests.json"; then
-    cat "$work/tests.log" >&2
     exit 2
 fi
 report="$work/kcov/test/cobertura.xml"
