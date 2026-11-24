@@ -23,7 +23,7 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/jsbay-coverage.XXXXXX")"
 trap 'rm -rf -- "$work"' EXIT
 
 cd "$root"
-zig build test-compile -Dbackend=quickjs_ng --cache-dir "$work/zig-cache"
+zig build test-compile -Dbackend=quickjs_ng -Dtest-llvm=true --cache-dir "$work/zig-cache"
 shopt -s nullglob
 binaries=("$work"/zig-cache/o/*/test)
 if [ "${#binaries[@]}" -ne 1 ] || [ ! -x "${binaries[0]}" ]; then
