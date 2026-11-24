@@ -17,12 +17,39 @@ pub fn Module(comptime Host: type) type {
         const runtime_eval = @import("runtime_eval.zig").Module(Host);
         const runtime_objects = @import("runtime_objects.zig").Module(Host);
         const state_mod = @import("state.zig").Module(Host);
+        const runtime_replay = @import("console_replay.zig").Module;
+        const command_queue = @import("command_queue.zig").Module(Host);
         const console_cdp = @import("console.zig").Module(Host);
         const debugger_cdp = @import("debugger_cdp.zig").Module(Host);
         const native_cdp = @import("native_cdp.zig").Module(Host);
         const await_promise = @import("await_promise.zig").Module(Host);
 
         const InspectorState = state_mod.InspectorState;
+
+        pub const RuntimeEnableBarrierForTesting = struct {
+            reached: std.atomic.Value(bool) = .init(false),
+            continue_after_context: std.atomic.Value(bool) = .init(false),
+        };
+
+        const RuntimeEnableTestHooks = if (@import("builtin").is_test) struct {
+            var barrier_address: std.atomic.Value(usize) = .init(0);
+        } else struct {};
+
+        pub fn setRuntimeEnableBarrierForTesting(_barrier: ?*RuntimeEnableBarrierForTesting) void {
+            if (comptime @import("builtin").is_test) {
+                RuntimeEnableTestHooks.barrier_address.store(if (_barrier) |value| @intFromPtr(value) else 0, .release);
+            }
+        }
+
+        fn pauseRuntimeEnableAfterContextForTesting() void {
+            if (comptime @import("builtin").is_test) {
+                const address = RuntimeEnableTestHooks.barrier_address.load(.acquire);
+                if (address == 0) return;
+                const barrier: *RuntimeEnableBarrierForTesting = @ptrFromInt(address);
+                barrier.reached.store(true, .release);
+                while (!barrier.continue_after_context.load(.acquire)) std.Thread.yield() catch {};
+            }
+        }
 
         // ---------------------------------------------------------------------------
         // Transport event handler
@@ -57,14 +84,39 @@ pub fn Module(comptime Host: type) type {
                     }
                 },
                 .session_closed => {
+                    command_queue.discardSession(&state.commands, state.allocator, event.session_id);
                     native_cdp.sessionClosed(state, event.session_id);
                     // The debugger owns session removal because it must turn the vanished session's async-depth request into an owner task. Await cleanup may still inspect its pending records afterwards.
                     debugger_cdp.sessionClosed(state, event.session_id);
                     await_promise.closeSession(state, event.session_id);
                     console_cdp.releaseClosedSession(state, event.session_id);
                 },
-                .message => if (!state_mod.isClosing(state)) handleMessage(state, event.session_id, event.payload),
+                .message => handleMessageEvent(state, event.session_id, event.payload),
             }
+        }
+
+        // The queue mutex protects only admission and ownership transfer; protocol dispatch and transport callbacks always run unlocked.
+        fn handleMessageEvent(state: *InspectorState, session_id: transport_mod.SessionId, payload: []const u8) void {
+            const should_drain = command_queue.admit(&state.commands, state.allocator, session_id, payload) catch {
+                state.transport.closeSession(session_id);
+                return;
+            };
+            if (!should_drain) return;
+
+            dispatchMessageIfLive(state, session_id, payload);
+            while (true) {
+                if (state_mod.isClosing(state)) {
+                    command_queue.clear(&state.commands, state.allocator);
+                    return;
+                }
+                const message = command_queue.next(&state.commands) orelse return;
+                dispatchMessageIfLive(state, message.session_id, message.payload);
+                state.allocator.free(message.payload);
+            }
+        }
+
+        fn dispatchMessageIfLive(state: *InspectorState, session_id: transport_mod.SessionId, payload: []const u8) void {
+            if (!state_mod.isClosing(state) and state_mod.hasSession(state, session_id)) handleMessage(state, session_id, payload);
         }
 
         // ---------------------------------------------------------------------------
@@ -139,8 +191,10 @@ pub fn Module(comptime Host: type) type {
             }
             if (std.mem.eql(u8, method, "Runtime.enable")) {
                 // Context first, then buffered console events. Enabling the session is paired with the replay inside enableRuntimeAndReplayConsole so a concurrent console call is delivered once.
+                _ = runtime_replay.beginEnable(state, session_id);
                 json_writer.sendEmptyResult(state, session_id, id);
                 json_writer.sendExecutionContextCreated(state, session_id);
+                pauseRuntimeEnableAfterContextForTesting();
                 console_cdp.enableRuntimeAndReplayConsole(state, session_id);
                 return;
             }
@@ -149,7 +203,7 @@ pub fn Module(comptime Host: type) type {
                 return;
             }
             if (std.mem.eql(u8, method, "Runtime.disable")) {
-                state_mod.setSessionRuntimeEnabled(state, session_id, false);
+                runtime_replay.setEnabled(state, session_id, false);
                 json_writer.sendEmptyResult(state, session_id, id);
                 return;
             }
