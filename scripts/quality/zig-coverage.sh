@@ -41,7 +41,9 @@ test -s "$report"
 if ! node scripts/quality/zig-coverage-report.mjs < "$report"; then
     cp "$report" "$output/coverage-invalid.cobertura.xml"
     if command -v readelf >/dev/null 2>&1; then
-        readelf --debug-dump=rawline "${binaries[0]}" | gzip > "$output/debug-lines.txt.gz" || true
+        readelf --debug-dump=rawline "${binaries[0]}" > "$work/debug-lines.txt" 2>&1 || true
+        awk 'NR <= 80 || (/\.zig/ && count++ < 40)' "$work/debug-lines.txt" > "$output/debug-lines-sample.txt"
+        cat "$output/debug-lines-sample.txt" >&2
     fi
     exit 2
 fi
