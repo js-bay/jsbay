@@ -13,7 +13,7 @@ test('rejects an empty Cobertura report', () => {
 })
 
 test('accepts a Cobertura report with covered lines and a Zig class', () => {
-  const result = validate(`<?xml version="1.0"?><!DOCTYPE coverage SYSTEM 'http://cobertura.sourceforge.net/xml/coverage-04.dtd'><coverage lines-valid="12" lines-covered="10"><packages><package><classes><class filename="src/runtime.zig"/></classes></package></packages></coverage>`)
+  const result = validate(`<?xml version="1.0"?><!DOCTYPE coverage SYSTEM 'http://cobertura.sourceforge.net/xml/coverage-04.dtd'><coverage lines-valid="12" lines-covered="10"><packages><package><classes><class filename="runtime.zig"><lines><line number="1" hits="1"/></lines></class></classes></package></packages></coverage>`)
   assert.equal(result.status, 0, result.stderr)
 })
 
@@ -34,4 +34,21 @@ test('does not join comment boundaries into a fake Zig class', () => {
   const result = validate(report)
   assert.notEqual(result.status, 0)
   assert.match(result.stderr, /at least one Zig class/)
+})
+
+test('rejects a Zig class without any covered Zig lines', () => {
+  const report = '<coverage lines-valid="12" lines-covered="10"><class filename="runtime.zig"><lines><line number="1" hits="0"/></lines></class></coverage>'
+  assert.notEqual(validate(report).status, 0)
+})
+
+test('rejects test source mixed into the coverage scope', () => {
+  const report = '<coverage lines-valid="12" lines-covered="10"><class filename="runtime.zig"><lines><line number="1" hits="1"/></lines></class><class filename="tests/example.zig"><lines><line number="1" hits="1"/></lines></class></coverage>'
+  assert.notEqual(validate(report).status, 0)
+})
+
+test('rejects nested test paths and backslash path escapes', () => {
+  for (const filename of ['src/tests/example.zig', 'foo/tests/example.zig', '..\\outside.zig']) {
+    const report = `<coverage lines-valid="12" lines-covered="10"><class filename="${filename}"><lines><line number="1" hits="1"/></lines></class></coverage>`
+    assert.notEqual(validate(report).status, 0, filename)
+  }
 })

@@ -27,9 +27,20 @@ if (!/^\d+$/.test(linesCoveredText ?? '') || !Number.isSafeInteger(linesCovered)
   process.exit(1)
 }
 
-const hasZigClass = [...xml.matchAll(/<class\b([^>]*)\/?\s*>/g)]
-  .some(([, source]) => (attributes(source).filename ?? '').endsWith('.zig'))
-if (!hasZigClass) {
-  console.error('Cobertura report must contain at least one Zig class')
+const classes = [...xml.matchAll(/<class\b([^>]*)>([\s\S]*?)<\/class\s*>/g)]
+for (const [, source] of classes) {
+  const filename = attributes(source).filename ?? ''
+  const parts = filename.split('/')
+  if (!filename || filename.startsWith('/') || filename.includes('\\') || /^[A-Za-z]:/.test(filename) || parts.some(part => part === 'tests' || part === '.' || part === '..' || !part)) {
+    console.error('Cobertura report contains a file outside the source scope')
+    process.exit(1)
+  }
+}
+const hasCoveredZigLine = classes.some(([, source, body]) => {
+  if (!(attributes(source).filename ?? '').endsWith('.zig')) return false
+  return [...body.matchAll(/<line\b([^>]*)\/?>/g)].some(([, line]) => Number(attributes(line).hits) > 0)
+})
+if (!hasCoveredZigLine) {
+  console.error('Cobertura report must contain at least one Zig class with a covered line')
   process.exit(1)
 }
