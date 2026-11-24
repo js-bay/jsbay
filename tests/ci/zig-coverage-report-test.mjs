@@ -21,3 +21,17 @@ test('rejects a report with no covered lines', () => {
   const result = validate('<coverage lines-valid="12" lines-covered="0"><class filename="runtime.zig"/></coverage>')
   assert.notEqual(result.status, 0)
 })
+
+test('does not count a Zig class inside an XML comment', () => {
+  const report = '<coverage lines-valid="12" lines-covered="10"><!-- <class filename="fake.zig"/> --></coverage>'
+  const result = validate(report)
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /at least one Zig class/)
+})
+
+test('does not join comment boundaries into a fake Zig class', () => {
+  const report = '<coverage lines-valid="12" lines-covered="10"><cla<!-- hidden -->ss filename="fake.zig"/></coverage>'
+  const result = validate(report)
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /at least one Zig class/)
+})

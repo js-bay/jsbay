@@ -1,6 +1,6 @@
 let xml = ''
 for await (const chunk of process.stdin) xml += chunk
-xml = xml.replace(/<!--[\s\S]*?-->/g, '')
+xml = xml.replace(/<!--[\s\S]*?-->/g, ' ')
 
 function attributes(source) {
   return Object.fromEntries([...source.matchAll(/([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)]
