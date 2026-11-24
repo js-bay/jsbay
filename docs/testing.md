@@ -19,6 +19,8 @@ The reusable [`mobile-tests.yml`](../.github/workflows/mobile-tests.yml) still o
 
 Repository-tool and the six independent package suites run once per Linux/macOS PR host, rather than once per backend. Backend steps use `test-engine`, which excludes those package suites. The daily Linux ARM64 job adds package execution for that architecture. Harmony host facade tests already execute the native host consumer, so CI invokes the facade entry once.
 
+The Linux governance job compares Zig file lengths against the PR base or the previous main commit. `pawl.ratchet.yaml` and `pawl.length.yaml` measure all tracked first-party Zig source areas; long files may shrink or be renamed, but new long files and growth of an existing long file fail. The baseline snapshot is generated in a temporary directory and is not committed. Changes to the measurement configuration or adapter require an explicit migration of this check.
+
 Desktop runners have explicit OS and architecture labels. Windows disables the optional POSIX HTTP/WebSocket transport while retaining engine, timer, thread and self-driven loop tests. Its public consumers include C, Zig and .NET. Apple Swift/Objective-C consumers run on ARM64 macOS; Intel macOS extension jobs cover the engine and desktop consumers. Inspector E2E, idle wake and signal shutdown use Node.js 24 on Linux/macOS, including its global WebSocket implementation.
 
 The fixed, digest-verified Test262 manifest remains the declared conformance scope. Broader GC/OOM and concurrency tests are separate daily jobs; they do not turn that subset into a full Test262 claim. Shared-runner benchmark timing is observational. Use fixed hardware before making performance regressions a release gate.

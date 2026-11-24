@@ -1,0 +1,8 @@
+snapshot: .pawl-ratchet.snapshot.json
+
+dimensions:
+  - id: zig-long-files
+    title: Zig files over 500 lines
+    direction: lower-is-better
+    gate: per-file-count
+    command: node scripts/quality/pawl-long-lines.mjs
