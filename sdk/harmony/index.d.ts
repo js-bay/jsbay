@@ -206,10 +206,10 @@ export declare class Engine {
   static shutdownStatus(instanceId: number, generation: bigint): ShutdownStatus | null;
   requestInterrupt(): boolean;
   clearInterrupt(): boolean;
-  setExecutionTimeLimit(milliseconds: bigint): boolean;
-  setExecutionBudget(milliseconds: bigint): boolean;
+  setExecutionTimeLimit(milliseconds: number | bigint): boolean;
+  setExecutionBudget(milliseconds: number | bigint): boolean;
   getValueUsage(): ValueUsage;
-  setMemoryLimit(bytes: bigint): boolean;
+  setMemoryLimit(bytes: number | bigint): boolean;
   setResourceLimits(limits: ResourceLimits): boolean;
   resourceUsage(): ResourceUsage;
   getMemoryUsage(): MemoryUsage;
