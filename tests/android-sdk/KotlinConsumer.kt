@@ -2,6 +2,7 @@ package io.jsbay.consumer
 
 import io.jsbay.CloseStatus
 import io.jsbay.DedicatedEngineThread
+import io.jsbay.DedicatedEngineThreadState
 import io.jsbay.DedicatedEngineThreadTimeoutException
 import io.jsbay.Engine
 import io.jsbay.JsBayException
@@ -16,6 +17,7 @@ import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Drain the current thread's Looper for [milliseconds] of wall-clock time.
@@ -947,7 +949,9 @@ private fun runKotlinSubmissionOperations() {
 }
 
 private fun runKotlinDedicatedThreadParityTests() {
-    DedicatedEngineThread.start(7106).use { dedicated ->
+    DedicatedEngineThread(7106).use { dedicated ->
+        check(dedicated.lifecycleState == DedicatedEngineThreadState.RUNNING) { "Kotlin initial lifecycle running" }
+        check(!dedicated.isClosing && !dedicated.isClosed) { "Kotlin initial isClosing/isClosed" }
         val nestedResult =
             dedicated.runOnOwner { engine1 ->
                 dedicated.runOnOwner { engine2 ->
@@ -1015,12 +1019,46 @@ private fun runKotlinDedicatedThreadParityTests() {
         error("Kotlin blocked creator cannot acknowledge close")
     } catch (_: DedicatedEngineThreadTimeoutException) {
         check(timeoutEngine.closeStatus() == CloseStatus.PENDING) { "Kotlin close timeout remains pending" }
+        check(
+            timeoutDedicated.lifecycleState == DedicatedEngineThreadState.CLOSING,
+        ) { "Kotlin pending drain stays closing" }
+        check(timeoutDedicated.isClosing && !timeoutDedicated.isClosed) { "Kotlin pending drain is not closed" }
+        check(
+            !timeoutDedicated.post {
+                error("Closing dedicated thread admitted new work")
+            },
+        ) { "Kotlin closing rejects new work" }
+        try {
+            timeoutDedicated.runOnOwner { }
+            error("Closing dedicated thread admitted synchronous work")
+        } catch (failure: JsBayException) {
+            check(failure.status == Status.INSTANCE_NOT_FOUND) { "Kotlin closing rejects foreign runOnOwner" }
+        }
+        val asyncError = AtomicReference<Throwable?>(null)
+        val requester =
+            Thread {
+                try {
+                    timeoutDedicated.close()
+                } catch (failure: Throwable) {
+                    asyncError.set(failure)
+                }
+            }
+        requester.start()
+        requester.join(1_000)
+        check(!requester.isAlive && asyncError.get() == null) { "Kotlin default close does not wait for creator" }
+        check(timeoutDedicated.lifecycleState == DedicatedEngineThreadState.CLOSING) {
+            "Kotlin repeated close preserves pending state"
+        }
     } finally {
         timeoutRelease.countDown()
     }
     timeoutOwner.join(5_000)
     check(!timeoutOwner.isAlive) { "Kotlin timed-out close owner exits after drain" }
     check(timeoutEngine.closeStatus() == CloseStatus.COMPLETE) { "Kotlin job cleanup preserves creator drain" }
+    check(
+        timeoutDedicated.lifecycleState == DedicatedEngineThreadState.CLOSED,
+    ) { "Kotlin drained owner publishes closed" }
+    check(timeoutDedicated.isClosed && !timeoutDedicated.isClosing) { "Kotlin drained owner lifecycle flags" }
 
     val userInterruptDedicated = DedicatedEngineThread.start(7109)
     val interruptObserved = AtomicBoolean(false)
@@ -1044,4 +1082,19 @@ private fun runKotlinDedicatedThreadParityTests() {
     check(userInterruptDone.await(5, TimeUnit.SECONDS)) { "Kotlin user interrupt job completed" }
     userInterruptDedicated.close(5_000L)
     check(interruptObserved.get()) { "Kotlin user interrupt preserved across jobs" }
+
+    val directInvokeDedicated = DedicatedEngineThread(7110)
+    check(directInvokeDedicated.lifecycleState == DedicatedEngineThreadState.RUNNING) {
+        "Kotlin DedicatedEngineThread invoke lifecycle running"
+    }
+    check(!directInvokeDedicated.isClosing && !directInvokeDedicated.isClosed) {
+        "Kotlin dedicated initial isClosing/isClosed"
+    }
+    directInvokeDedicated.close(5_000L)
+    check(
+        directInvokeDedicated.lifecycleState == DedicatedEngineThreadState.CLOSED,
+    ) { "Kotlin dedicated lifecycle closed" }
+    check(directInvokeDedicated.isClosed && !directInvokeDedicated.isClosing) {
+        "Kotlin dedicated closed isClosed/isClosing"
+    }
 }

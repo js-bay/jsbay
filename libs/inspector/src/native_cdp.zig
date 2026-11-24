@@ -87,16 +87,19 @@ pub fn Module(comptime Host: type) type {
             return true;
         }
 
-        fn emit(session_id: u64, json: [*]const u8, len: usize, user: ?*anyopaque) callconv(.c) void {
+        fn emit(session_id: u64, json: [*]const u8, len: usize, token: u64, user: ?*anyopaque) callconv(.c) bool {
             const state: *InspectorState = @ptrCast(@alignCast(user.?));
-            if (!state_mod.tryAcquireStateLease(state)) return;
+            if (!state_mod.tryAcquireStateLease(state)) return false;
             var frame: Host.dispatch.TaskOwnerFrame = undefined;
             Host.dispatch.enterTaskOwnerFrame(&frame, state.instance_id, state);
             defer {
                 Host.dispatch.leaveTaskOwnerFrame(&frame);
                 state_mod.releaseStateLease(state);
             }
-            if (state_mod.hasSession(state, session_id)) _ = state.transport.sendText(session_id, json[0..len]);
+            if (state_mod.hasSession(state, session_id)) {
+                return state.transport.sendTrackedText(session_id, json[0..len], token);
+            }
+            return false;
         }
 
         // Native Hermes invokes this only from its dedicated sender thread, after it has stopped accepting replies for the session. The transport owns the matching session_closed callback, which retires the native agent outside Hermes' outbound callback mutex.
@@ -115,8 +118,15 @@ pub fn Module(comptime Host: type) type {
         pub fn start(state: *InspectorState) bool {
             if (comptime !enabled) return true;
             const ctx = Host.engine.getContext(state.instance_id) orelse return false;
-            state.native_debugger = api.hermes_inspector_start(ctx, state.instance_id, emit, close, enqueue, state, parseMessage) orelse return false;
+            state.native_debugger = api.hermes_inspector_start(ctx, state.instance_id, emit, close, enqueue, state, parseMessage, state.transport.maxMessageBytes(), state.transport.maxBacklogBytes()) orelse return false;
             return true;
+        }
+
+        pub fn setDeliveryObserver(state: *InspectorState, observed: bool) void {
+            if (comptime !enabled) return;
+            if (state.native_debugger) |native| {
+                api.jsbay_hermes_inspector_set_delivery_observer(@ptrCast(native), observed);
+            }
         }
 
         pub fn sessionOpened(state: *InspectorState, session_id: u64) bool {
@@ -127,6 +137,13 @@ pub fn Module(comptime Host: type) type {
         pub fn sessionClosed(state: *InspectorState, session_id: u64) void {
             if (comptime !enabled) return;
             api.hermes_inspector_session_close(@ptrCast(state.native_debugger), session_id);
+        }
+
+        pub fn deliveryComplete(state: *InspectorState, session_id: u64, token: u64) void {
+            if (comptime !enabled) return;
+            if (state.native_debugger) |native| {
+                api.jsbay_hermes_inspector_delivery_complete(@ptrCast(native), session_id, token);
+            }
         }
 
         pub fn handle(state: *InspectorState, session_id: u64, request_id: i64, method: []const u8, text: []const u8) bool {

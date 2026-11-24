@@ -524,8 +524,8 @@ test "a reply the transport cannot carry becomes an error for the request that a
     const commands = try harness.relay.commands(arena.allocator());
     try std.testing.expectEqual(@as(usize, 1), commands.items.len);
 
-    // A four megabyte script source would overflow the transport queue, which closes the session instead of reporting a failure.
-    const source = try arena.allocator().alloc(u8, 4 * 1024 * 1024);
+    // A source larger than the transport maximum would overflow the transport queue, which closes the session instead of reporting a failure.
+    const source = try arena.allocator().alloc(u8, transport.default_max_message_bytes + 1024);
     @memset(source, 'x');
     const reply = try std.fmt.allocPrint(arena.allocator(), "{{\"result\":{{\"scriptSource\":\"{s}\"}}}}", .{source});
     try harness.replyTo(0, reply);

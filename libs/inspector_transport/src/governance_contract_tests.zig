@@ -228,23 +228,22 @@ fn writeMaskedText(stream: Stream, text: []const u8) !void {
 
 fn readTextFrame(alloc: std.mem.Allocator, stream: Stream) ![]u8 {
     var header: [2]u8 = undefined;
-    header[0] = try stream.readByte();
-    header[1] = try stream.readByte();
+    try stream.readAll(&header);
     try testing.expectEqual(@as(u8, 0x1), header[0] & 0x0f);
     try testing.expect((header[1] & 0x80) == 0);
     var len: u64 = header[1] & 0x7f;
     if (len == 126) {
         var extended: [2]u8 = undefined;
-        for (&extended) |*byte| byte.* = try stream.readByte();
+        try stream.readAll(&extended);
         len = std.mem.readInt(u16, &extended, .big);
     } else if (len == 127) {
         var extended: [8]u8 = undefined;
-        for (&extended) |*byte| byte.* = try stream.readByte();
+        try stream.readAll(&extended);
         len = std.mem.readInt(u64, &extended, .big);
     }
     const text = try alloc.alloc(u8, @intCast(len));
     errdefer alloc.free(text);
-    for (text) |*byte| byte.* = try stream.readByte();
+    try stream.readAll(text);
     return text;
 }
 
@@ -283,6 +282,141 @@ const Opened = struct {
         while (self.closed < want) self.changed.wait(&self.mutex);
     }
 };
+
+const Delivery = struct {
+    token: std.atomic.Value(u64) = .init(0),
+    calls: std.atomic.Value(usize) = .init(0),
+
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+        const self: *Delivery = @ptrCast(@alignCast(ctx.?));
+        self.token.store(token, .release);
+        _ = self.calls.fetchAdd(1, .acq_rel);
+    }
+};
+
+const SelfUnregisteringDelivery = struct {
+    transport_ptr: *transport.Transport,
+    token: std.atomic.Value(u64) = .init(0),
+
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+        const self: *SelfUnregisteringDelivery = @ptrCast(@alignCast(ctx.?));
+        self.transport_ptr.asTransport().setDeliveryObserver(null, null);
+        self.token.store(token, .release);
+    }
+};
+
+const DestroyingDelivery = struct {
+    transport_ptr: *transport.Transport,
+    completed: std.atomic.Value(bool) = .init(false),
+
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, _: u64) void {
+        const self: *DestroyingDelivery = @ptrCast(@alignCast(ctx.?));
+        self.transport_ptr.asTransport().setDeliveryObserver(null, null);
+        self.transport_ptr.deinit();
+        self.completed.store(true, .release);
+    }
+};
+
+test "transport: tracked delivery reports its token regardless of local backlog threshold" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    var delivery = Delivery{};
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 * 1024 });
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "tracked-delivery-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, Delivery.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "tracked-delivery-peer");
+    const session = opened.wait(1);
+
+    try testing.expect(t.sendTrackedText(session, "tracked-small-frame", 41));
+    const tracked = try readTextFrame(alloc, peer);
+    defer alloc.free(tracked);
+    try testing.expectEqualStrings("tracked-small-frame", tracked);
+    var attempts: usize = 0;
+    while (delivery.calls.load(.acquire) < 1 and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expectEqual(@as(u64, 41), delivery.token.load(.acquire));
+
+    const ordinary_large = try alloc.alloc(u8, 600 * 1024);
+    defer alloc.free(ordinary_large);
+    @memset(ordinary_large, 'o');
+    try testing.expect(t.sendText(session, ordinary_large));
+    const received = try readTextFrame(alloc, peer);
+    defer alloc.free(received);
+    try testing.expectEqualSlices(u8, ordinary_large, received);
+    try testing.expect(t.sendTrackedText(session, "tracked-sentinel", 42));
+    const sentinel = try readTextFrame(alloc, peer);
+    defer alloc.free(sentinel);
+    try testing.expectEqualStrings("tracked-sentinel", sentinel);
+    attempts = 0;
+    while (delivery.calls.load(.acquire) < 2 and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expectEqual(@as(usize, 2), delivery.calls.load(.acquire));
+    try testing.expectEqual(@as(u64, 42), delivery.token.load(.acquire));
+}
+
+test "transport: delivery observer can unregister itself while completing a frame" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
+    defer t.deinit();
+    var delivery = SelfUnregisteringDelivery{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "self-unregister-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, SelfUnregisteringDelivery.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "self-unregister-peer");
+    const session = opened.wait(1);
+
+    try testing.expect(t.sendTrackedText(session, "first-tracked-frame", 73));
+    const first = try readTextFrame(alloc, peer);
+    defer alloc.free(first);
+    try testing.expectEqualStrings("first-tracked-frame", first);
+    var attempts: usize = 0;
+    while (delivery.token.load(.acquire) == 0 and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expectEqual(@as(u64, 73), delivery.token.load(.acquire));
+
+    try testing.expect(t.sendTrackedText(session, "second-tracked-frame", 74));
+    const second = try readTextFrame(alloc, peer);
+    defer alloc.free(second);
+    try testing.expectEqualStrings("second-tracked-frame", second);
+    try testing.expectEqual(@as(u64, 73), delivery.token.load(.acquire));
+}
+
+test "transport: delivery observer can defer transport destruction until its worker exits" {
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(std.heap.page_allocator, 0);
+    var delivery = DestroyingDelivery{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "self-destroy-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, DestroyingDelivery.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "self-destroy-peer");
+    const session = opened.wait(1);
+
+    try testing.expect(t.sendTrackedText(session, "destroy-after-delivery", 91));
+    const received = try readTextFrame(std.heap.page_allocator, peer);
+    defer std.heap.page_allocator.free(received);
+    try testing.expectEqualStrings("destroy-after-delivery", received);
+    var attempts: usize = 0;
+    while (!delivery.completed.load(.acquire) and attempts < 500) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expect(delivery.completed.load(.acquire));
+
+    var byte: [1]u8 = undefined;
+    while (try peer.read(&byte) != 0) {}
+}
 
 /// Records only sockets that finished connect so deferred cleanup never closes an uninitialized handle.
 const PeerList = struct {
@@ -687,6 +821,113 @@ test "transport: a slow session filling its budget does not block a second sessi
     const received = try readTextFrame(alloc, fast);
     defer alloc.free(received);
     try testing.expectEqualStrings("governance-fast-session", received);
+}
+
+test "transport: single message exceeding budget is rejected without dropping session" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_message_bytes = 4 * 1024 * 1024 });
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "oversize-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "oversize-peer");
+    const session = opened.wait(1);
+
+    const large = try alloc.alloc(u8, 5 * 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'z');
+
+    try testing.expect(!t.sendText(session, large));
+    try testing.expect(t.sendText(session, "governance-recovered-after-oversize"));
+    const received = try readTextFrame(alloc, peer);
+    defer alloc.free(received);
+    try testing.expectEqualStrings("governance-recovered-after-oversize", received);
+}
+
+test "transport: large message within 64 MiB limit is delivered successfully and allows concurrent small messages" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "large-deliver-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "large-deliver-peer");
+    const session = opened.wait(1);
+
+    // 10 MiB exceeds default 8 MiB backlog, exercising the large message path (is_large = true).
+    const large = try alloc.alloc(u8, 10 * 1024 * 1024);
+    defer alloc.free(large);
+    @memset(large, 'w');
+
+    try testing.expect(t.sendText(session, large));
+    // Small message sent while large message is in flight must not trigger backlog rejection or close session.
+    try testing.expect(t.sendText(session, "concurrent-small-notification"));
+
+    const received_large = try readTextFrame(alloc, peer);
+    defer alloc.free(received_large);
+    try testing.expectEqualStrings(large, received_large);
+
+    const received_small = try readTextFrame(alloc, peer);
+    defer alloc.free(received_small);
+    try testing.expectEqualStrings("concurrent-small-notification", received_small);
+}
+
+test "transport: at most one large message waits in queue while another is being written" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    // Use smaller limits to test gating deterministically: 64 KiB backlog, 2 MiB max message.
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 64 * 1024, .max_message_bytes = 2 * 1024 * 1024 });
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "large-in-flight-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "large-in-flight-peer");
+    const session = opened.wait(1);
+
+    try peer.setReceiveBuffer(4096);
+    const large1 = try alloc.alloc(u8, 1500 * 1024);
+    defer alloc.free(large1);
+    @memset(large1, 'a');
+
+    const large2 = try alloc.alloc(u8, 128 * 1024);
+    defer alloc.free(large2);
+    @memset(large2, 'b');
+
+    const large3 = try alloc.alloc(u8, 128 * 1024);
+    defer alloc.free(large3);
+    @memset(large3, 'c');
+
+    try testing.expect(t.sendText(session, large1));
+    var queued = false;
+    var attempts: usize = 0;
+    while (!queued and attempts < 500) : (attempts += 1) {
+        queued = t.sendText(session, large2);
+        if (!queued) zev.sleepMilliseconds(1);
+    }
+    try testing.expect(queued);
+    try testing.expect(!t.sendText(session, large3));
+
+    const received1 = try readTextFrame(alloc, peer);
+    defer alloc.free(received1);
+    try testing.expectEqualStrings(large1, received1);
+
+    const received2 = try readTextFrame(alloc, peer);
+    defer alloc.free(received2);
+    try testing.expectEqualStrings(large2, received2);
 }
 
 test "transport: a broadcast snapshot allocation failure releases every retained session" {
@@ -1216,4 +1457,423 @@ test "transport: a late deadline after accepting a peer closes that socket" {
 
     const peer = try connectLoopback(listener.port);
     try testing.expectError(error.HandshakeTimeout, adoptPeerBeforeDeadline(peer, 0));
+}
+
+fn readCloseFrame(stream: Stream) !u16 {
+    var header: [2]u8 = undefined;
+    try stream.readAll(&header);
+    try testing.expectEqual(@as(u8, 0x8), header[0] & 0x0f);
+    const len: u64 = header[1] & 0x7f;
+    if (len >= 2) {
+        var code_bytes: [2]u8 = undefined;
+        try stream.readAll(&code_bytes);
+        if (len > 2) {
+            var rest: [128]u8 = undefined;
+            try stream.readAll(rest[0 .. @as(usize, @intCast(len)) - 2]);
+        }
+        return std.mem.readInt(u16, &code_bytes, .big);
+    }
+    return 1005;
+}
+
+test "transport: control frame with payload exceeding 125 bytes is rejected with 1002" {
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(testing.allocator, 0);
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "control-frame-len-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "control-frame-len-peer");
+    _ = opened.wait(1);
+
+    const mask = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    const ping_hdr = [_]u8{ 0x89, 0xfe, 0x00, 126, mask[0], mask[1], mask[2], mask[3] };
+    try peer.writeAll(&ping_hdr);
+    const close_code = try readCloseFrame(peer);
+    try testing.expectEqual(@as(u16, 1002), close_code);
+}
+
+test "transport: fragmented control frame is rejected with 1002" {
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(testing.allocator, 0);
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "control-frame-fin-peer" });
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "control-frame-fin-peer");
+    _ = opened.wait(1);
+
+    const mask = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    const ping_hdr = [_]u8{ 0x09, 0x84, mask[0], mask[1], mask[2], mask[3], 0, 0, 0, 0 };
+    try peer.writeAll(&ping_hdr);
+    const close_code = try readCloseFrame(peer);
+    try testing.expectEqual(@as(u16, 1002), close_code);
+}
+
+const TokenRecorder = struct {
+    mutex: zev.Mutex = .{},
+    tokens: [8]u64 = @splat(0),
+    count: usize = 0,
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+        const self: *TokenRecorder = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.count < self.tokens.len) self.tokens[self.count] = token;
+        self.count += 1;
+    }
+};
+
+test "transport: peer disconnect drains queued tracked tokens exactly once" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    var recorder = TokenRecorder{};
+    defer recorder.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
+    defer t.deinit();
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "drain-peer" });
+    t.asTransport().setDeliveryObserver(&recorder, TokenRecorder.observer);
+    try t.start(&opened, Opened.handler);
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try peer.setReceiveBuffer(4096);
+    try handshake(peer, "drain-peer");
+    const session = opened.wait(1);
+    const big = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'd');
+    try testing.expect(t.sendText(session, big));
+    try testing.expect(t.sendTrackedText(session, "drain-1", 101));
+    try testing.expect(t.sendTrackedText(session, "drain-2", 102));
+    peer.close();
+    opened.waitClosed(1);
+    zev.sleepMilliseconds(50);
+    recorder.mutex.lock();
+    defer recorder.mutex.unlock();
+    try testing.expectEqual(@as(usize, 2), recorder.count);
+    try testing.expectEqual(@as(u64, 101), recorder.tokens[0]);
+    try testing.expectEqual(@as(u64, 102), recorder.tokens[1]);
+}
+
+test "transport: deferred deinit in a delivery callback skips another session's queued token without deadlock" {
+    const alloc = std.heap.page_allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.init(alloc, 0);
+    var delivery = DestroyingDelivery{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "n1-peer" });
+    try t.start(&opened, Opened.handler);
+    const blocked = try connectLoopback(t.boundPort());
+    defer blocked.close();
+    try blocked.setReceiveBuffer(4096);
+    try handshake(blocked, "n1-peer");
+    const blocked_session = opened.wait(1);
+    const big = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'q');
+    try testing.expect(t.sendText(blocked_session, big));
+    try testing.expect(t.sendTrackedText(blocked_session, "queued-behind-blocked-writer", 501));
+    const trigger = try connectLoopback(t.boundPort());
+    defer trigger.close();
+    try handshake(trigger, "n1-peer");
+    const trigger_session = opened.wait(2);
+    t.asTransport().setDeliveryObserver(&delivery, DestroyingDelivery.observer);
+    try testing.expect(t.sendTrackedText(trigger_session, "trigger-deferred-deinit", 502));
+    var attempts: usize = 0;
+    while (!delivery.completed.load(.acquire) and attempts < 3000) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expect(delivery.completed.load(.acquire));
+}
+
+const ReentrantDeliveryClosure = struct {
+    transport_ptr: *transport.Transport,
+    mutex: zev.Mutex = .{},
+    allow_reentrant: std.atomic.Value(bool) = .init(false),
+    received_tokens: [8]u64 = @splat(0),
+    received_count: usize = 0,
+    overflow_triggered: bool = false,
+
+    fn observer(ctx: ?*anyopaque, session: transport.SessionId, token: u64) void {
+        const self: *ReentrantDeliveryClosure = @ptrCast(@alignCast(ctx.?));
+        if (token == 101) {
+            while (!self.allow_reentrant.load(.acquire)) zev.sleepMilliseconds(1);
+        }
+        self.mutex.lock();
+        if (self.received_count < self.received_tokens.len) {
+            self.received_tokens[self.received_count] = token;
+            self.received_count += 1;
+        }
+        const trigger = !self.overflow_triggered and token == 101;
+        if (trigger) self.overflow_triggered = true;
+        self.mutex.unlock();
+
+        if (trigger) {
+            var overflow_buf: [300]u8 = @splat('x');
+            _ = self.transport_ptr.sendTrackedText(session, &overflow_buf, 999);
+        }
+    }
+};
+
+test "transport: reentrant session closure preserves queued delivery tokens" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 });
+    defer t.deinit();
+    var delivery = ReentrantDeliveryClosure{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "reentrant-close-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, ReentrantDeliveryClosure.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try handshake(peer, "reentrant-close-peer");
+    const session = opened.wait(1);
+
+    var first_buf: [100]u8 = @splat('a');
+    var second_buf: [300]u8 = @splat('b');
+    try testing.expect(t.sendTrackedText(session, &first_buf, 101));
+    try testing.expect(t.sendTrackedText(session, &second_buf, 102));
+
+    delivery.allow_reentrant.store(true, .release);
+
+    var count: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < 1000) : (attempts += 1) {
+        delivery.mutex.lock();
+        count = delivery.received_count;
+        delivery.mutex.unlock();
+        if (count >= 2) break;
+        zev.sleepMilliseconds(1);
+    }
+
+    delivery.mutex.lock();
+    defer delivery.mutex.unlock();
+    try testing.expectEqual(@as(usize, 2), delivery.received_count);
+    try testing.expectEqual(@as(u64, 101), delivery.received_tokens[0]);
+    try testing.expectEqual(@as(u64, 102), delivery.received_tokens[1]);
+}
+
+test "transport: nested delivery queues are isolated between transports" {
+    const alloc = testing.allocator;
+    var opened_a = Opened{};
+    defer opened_a.changed.deinit();
+    defer opened_a.mutex.deinit();
+    var opened_b = Opened{};
+    defer opened_b.changed.deinit();
+    defer opened_b.mutex.deinit();
+
+    const ta = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 });
+    defer ta.deinit();
+    const tb = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 });
+    defer tb.deinit();
+
+    ta.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "peer-a" });
+    tb.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "peer-b" });
+
+    try ta.start(&opened_a, Opened.handler);
+    try tb.start(&opened_b, Opened.handler);
+
+    const peer_a = try connectLoopback(ta.boundPort());
+    defer peer_a.close();
+    try handshake(peer_a, "peer-a");
+    const session_a = opened_a.wait(1);
+
+    const peer_b = try connectLoopback(tb.boundPort());
+    defer peer_b.close();
+    try handshake(peer_b, "peer-b");
+    const session_b = opened_b.wait(1);
+
+    const CrossDelivery = struct {
+        tb_ptr: *transport.Transport,
+        session_b: transport.SessionId,
+        mutex: zev.Mutex = .{},
+        a_tokens: [4]u64 = @splat(0),
+        a_count: usize = 0,
+        b_tokens: [4]u64 = @splat(0),
+        b_count: usize = 0,
+        cross_triggered: bool = false,
+
+        fn observerA(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.mutex.lock();
+            if (self.a_count < self.a_tokens.len) {
+                self.a_tokens[self.a_count] = token;
+                self.a_count += 1;
+            }
+            const should_trigger = !self.cross_triggered and token == 10;
+            if (should_trigger) self.cross_triggered = true;
+            self.mutex.unlock();
+
+            if (should_trigger) {
+                _ = self.tb_ptr.sendTrackedText(self.session_b, "msg-b", 20);
+            }
+        }
+
+        fn observerB(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.b_count < self.b_tokens.len) {
+                self.b_tokens[self.b_count] = token;
+                self.b_count += 1;
+            }
+        }
+
+        fn counts(self: *@This()) struct { a: usize, b: usize } {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            return .{ .a = self.a_count, .b = self.b_count };
+        }
+    };
+
+    var cross = CrossDelivery{ .tb_ptr = tb, .session_b = session_b };
+    ta.asTransport().setDeliveryObserver(&cross, CrossDelivery.observerA);
+    tb.asTransport().setDeliveryObserver(&cross, CrossDelivery.observerB);
+
+    try testing.expect(ta.sendTrackedText(session_a, "msg-a", 10));
+
+    var attempts: usize = 0;
+    while (attempts < 1000) : (attempts += 1) {
+        const c = cross.counts();
+        if (c.a >= 1 and c.b >= 1) break;
+        zev.sleepMilliseconds(1);
+    }
+
+    cross.mutex.lock();
+    defer cross.mutex.unlock();
+    try testing.expectEqual(@as(usize, 1), cross.a_count);
+    try testing.expectEqual(@as(u64, 10), cross.a_tokens[0]);
+    try testing.expectEqual(@as(usize, 1), cross.b_count);
+    try testing.expectEqual(@as(u64, 20), cross.b_tokens[0]);
+}
+
+test "transport: outer delivery callback recognizes active frame during nested cross-transport teardown" {
+    const alloc = std.heap.page_allocator;
+    var opened_a = Opened{};
+    defer opened_a.changed.deinit();
+    var opened_b = Opened{};
+    defer opened_b.changed.deinit();
+
+    const ta = try transport.Transport.init(alloc, 0);
+    const tb = try transport.Transport.initWithOptions(alloc, 0, .{
+        .max_message_bytes = 4096,
+        .max_backlog_bytes = 100,
+    });
+    defer tb.deinit();
+
+    ta.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "peer-a" });
+    tb.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "peer-b" });
+
+    try ta.start(&opened_a, Opened.handler);
+    try tb.start(&opened_b, Opened.handler);
+
+    const peer_a = try connectLoopback(ta.boundPort());
+    defer peer_a.close();
+    try handshake(peer_a, "peer-a");
+    const session_a = opened_a.wait(1);
+
+    const peer_b = try connectLoopback(tb.boundPort());
+    defer peer_b.close();
+    try handshake(peer_b, "peer-b");
+    const session_b = opened_b.wait(1);
+
+    const CrossTeardown = struct {
+        ta_ptr: *transport.Transport,
+        tb_ptr: *transport.Transport,
+        session_b: transport.SessionId,
+        nested_teardown_done: std.atomic.Value(bool) = .init(false),
+
+        fn observerA(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (token == 100) {
+                const overflow_msg: [150]u8 = @splat('x');
+                _ = self.tb_ptr.sendTrackedText(self.session_b, &overflow_msg, 200);
+            }
+        }
+
+        fn observerB(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (token == 200) {
+                self.ta_ptr.asTransport().setDeliveryObserver(null, null);
+                self.ta_ptr.deinit();
+                self.nested_teardown_done.store(true, .release);
+            }
+        }
+    };
+
+    var teardown = CrossTeardown{
+        .ta_ptr = ta,
+        .tb_ptr = tb,
+        .session_b = session_b,
+    };
+    ta.asTransport().setDeliveryObserver(&teardown, CrossTeardown.observerA);
+    tb.asTransport().setDeliveryObserver(&teardown, CrossTeardown.observerB);
+
+    try testing.expect(ta.sendTrackedText(session_a, "trigger-a", 100));
+
+    var attempts: usize = 0;
+    while (!teardown.nested_teardown_done.load(.acquire) and attempts < 1000) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expect(teardown.nested_teardown_done.load(.acquire));
+}
+
+const CallerThreadDeliveryTeardown = struct {
+    transport_ptr: *transport.Transport,
+    completed: std.atomic.Value(bool) = .init(false),
+
+    fn observer(ctx: ?*anyopaque, _: transport.SessionId, token: u64) void {
+        const self: *CallerThreadDeliveryTeardown = @ptrCast(@alignCast(ctx.?));
+        if (token == 201) {
+            self.transport_ptr.asTransport().setDeliveryObserver(null, null);
+            self.transport_ptr.deinit();
+            zev.sleepMilliseconds(20);
+            self.completed.store(true, .release);
+        }
+    }
+};
+
+test "transport: caller-thread delivery callback retains transport lifetime during teardown" {
+    const alloc = std.heap.page_allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 512 });
+    var delivery = CallerThreadDeliveryTeardown{ .transport_ptr = t };
+    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "caller-teardown-peer" });
+    t.asTransport().setDeliveryObserver(&delivery, CallerThreadDeliveryTeardown.observer);
+    try t.start(&opened, Opened.handler);
+
+    const peer = try connectLoopback(t.boundPort());
+    defer peer.close();
+    try peer.setReceiveBuffer(4096);
+    try handshake(peer, "caller-teardown-peer");
+    const session = opened.wait(1);
+
+    const big = try alloc.alloc(u8, 6 * 1024 * 1024);
+    defer alloc.free(big);
+    @memset(big, 'q');
+    try testing.expect(t.sendText(session, big));
+
+    var first_buf: [150]u8 = @splat('m');
+    try testing.expect(t.sendTrackedText(session, &first_buf, 201));
+
+    var second_buf: [150]u8 = @splat('o');
+    try testing.expect(t.sendTrackedText(session, &second_buf, 202));
+
+    var overflow_buf: [300]u8 = @splat('n');
+    try testing.expect(!t.sendTrackedText(session, &overflow_buf, 999));
+
+    var attempts: usize = 0;
+    while (!delivery.completed.load(.acquire) and attempts < 1000) : (attempts += 1) zev.sleepMilliseconds(1);
+    try testing.expect(delivery.completed.load(.acquire));
 }

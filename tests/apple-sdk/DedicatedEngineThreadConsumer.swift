@@ -6,6 +6,10 @@ import JsBaySDK
 struct DedicatedEngineThreadConsumer {
   static func main() async throws {
     let owner = try DedicatedEngineThread.start(id: 81_550)
+    precondition(owner.lifecycleState == .running)
+    precondition(!owner.isClosing && !owner.isClosed)
+    let stateReturned = try owner.runOnOwner { _ in owner.lifecycleState }
+    precondition(stateReturned == .running)
     let ownerName = "jsbay-owner-81550"
     let threadName = try owner.runOnOwner { _ in Thread.current.name ?? "" }
     precondition(threadName == ownerName)
@@ -100,6 +104,9 @@ struct DedicatedEngineThreadConsumer {
 
     let closingReentrantValue = try owner.runOnOwner { _ in
       try owner.close()
+      precondition(owner.isClosing)
+      precondition(!owner.isClosed)
+      precondition(owner.lifecycleState == .closing)
       return try owner.runOnOwner { engine in
         let value = try engine.evaluate("6 * 7")
         defer { try? value.close() }
@@ -111,6 +118,9 @@ struct DedicatedEngineThreadConsumer {
     let concurrentClosers = (0..<4).map { _ in Task.detached { try owner.close() } }
     for closer in concurrentClosers { try await closer.value }
     try owner.close()
+    precondition(owner.isClosed)
+    precondition(!owner.isClosing)
+    precondition(owner.lifecycleState == .closed)
     do {
       _ = try owner.runOnOwner { _ in 1 }
       preconditionFailure("closed owner must reject new work")
@@ -179,6 +189,14 @@ struct DedicatedEngineThreadConsumer {
     try queuedDrainOwner.close(timeout: .seconds(5))
     precondition(queuedDrainResult.get())
 
+    let directInitOwner = try DedicatedEngineThread(id: 81_552)
+    let directValue = try directInitOwner.runOnOwner { engine in
+      let evaluated = try engine.evaluate("10 + 32")
+      defer { try? evaluated.close() }
+      return try evaluated.number()
+    }
+    precondition(directValue == 42)
+    try directInitOwner.close(timeout: .seconds(5))
   }
 }
 

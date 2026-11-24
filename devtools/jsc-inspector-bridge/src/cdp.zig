@@ -143,7 +143,7 @@ pub fn isTargetDisconnect(name: []const u8, info: plist.Value, application: []co
 }
 
 /// The loopback transport refuses a message that would overflow its queue and, for a CDP session, closes it. A reply has to stay below that limit or the client would lose the session instead of seeing an error.
-const max_frontend_bytes: usize = 3 * 1024 * 1024;
+const max_frontend_bytes: usize = transport.default_max_message_bytes;
 
 /// A target that evaluates generated scripts for a long time parses an unbounded number of them, so the script metadata keeps the most recent entries and drops the oldest. An unknown script URL behaves like a script parsed before the bridge attached.
 const max_scripts = 1024;

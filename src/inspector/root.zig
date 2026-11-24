@@ -44,6 +44,8 @@ pub const StartOptions = struct {
     title: []const u8 = "js-bay",
     url: []const u8 = "file:///js-bay",
     target_id: ?[]const u8 = null,
+    max_message_bytes: ?usize = null,
+    max_backlog_bytes: ?usize = null,
 };
 
 /// Calling this transfers `transport` to the inspector, even if startup fails. Its `deinit` must safely stop partial message delivery.
@@ -63,7 +65,10 @@ pub fn startWithTransport(instance_id: i32, transport: *Transport, opts: struct 
 /// Convenience API backed by the optional HTTP/WebSocket package.
 pub fn start(instance_id: i32, opts: StartOptions) StartError!*Handle {
     if (comptime !@import("build_options").inspector_transport) return error.UnsupportedFeature;
-    const endpoint = inspector_transport.Transport.init(std.heap.c_allocator, opts.port) catch return error.OutOfMemory;
+    const endpoint = inspector_transport.Transport.initWithOptions(std.heap.c_allocator, opts.port, .{
+        .max_message_bytes = opts.max_message_bytes orelse inspector_transport.default_max_message_bytes,
+        .max_backlog_bytes = opts.max_backlog_bytes orelse inspector_transport.default_max_backlog_bytes,
+    }) catch return error.OutOfMemory;
     endpoint.setProtocolJson(protocolJson());
     return startWithTransport(instance_id, endpoint.asTransport(), .{
         .title = opts.title,

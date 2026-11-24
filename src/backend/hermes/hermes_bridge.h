@@ -34,8 +34,8 @@ void hermes_context_set_opaque(JsbayHermesContext *ctx, void *opaque);
 void *hermes_context_get_opaque(JsbayHermesContext *ctx);
 
 /* Hermes CDPAgent bridge. Start and stop run on the engine owner thread; session and command admission are thread-safe. Every accepted runtime task calls exactly one of run or cancel. */
-typedef void (*HermesInspectorEmitFn)(uint64_t session_id, const char *json, size_t len,
-                                      void *user_data);
+typedef bool (*HermesInspectorEmitFn)(uint64_t session_id, const char *json, size_t len,
+                                      uint64_t delivery_token, void *user_data);
 typedef void (*HermesInspectorCloseFn)(uint64_t session_id, void *user_data);
 typedef bool (*HermesInspectorEnqueueFn)(void (*run)(void *), void (*cancel)(void *),
                                          void *task_data, void *user_data);
@@ -56,11 +56,16 @@ JsbayHermesInspector *hermes_inspector_start(JsbayHermesContext *ctx, int32_t in
                                              HermesInspectorEmitFn emit,
                                              HermesInspectorCloseFn close,
                                              HermesInspectorEnqueueFn enqueue, void *user_data,
-                                             HermesInspectorParseFn parse);
+                                             HermesInspectorParseFn parse,
+                                             size_t max_message_bytes,
+                                             size_t max_backlog_bytes);
 bool hermes_inspector_session_open(JsbayHermesInspector *inspector, uint64_t session_id);
 bool hermes_inspector_message(JsbayHermesInspector *inspector, uint64_t session_id,
                               const char *json, size_t len);
 void hermes_inspector_session_close(JsbayHermesInspector *inspector, uint64_t session_id);
+void jsbay_hermes_inspector_delivery_complete(JsbayHermesInspector *inspector, uint64_t session_id,
+                                              uint64_t delivery_token);
+void jsbay_hermes_inspector_set_delivery_observer(JsbayHermesInspector *inspector, bool observed);
 void hermes_inspector_close_sessions(JsbayHermesInspector *inspector);
 void hermes_inspector_stop(JsbayHermesInspector *inspector);
 void hermes_inspector_console(JsbayHermesContext *ctx, const HermesValue *args, size_t argc,

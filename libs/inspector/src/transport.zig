@@ -21,6 +21,12 @@ pub const Transport = struct {
         close_session: *const fn (ctx: *anyopaque, session: SessionId) void,
         set_discovery_target: ?*const fn (ctx: *anyopaque, target: DiscoveryTarget) void = null,
         bound_port: ?*const fn (ctx: *anyopaque) u16 = null,
+        max_message_bytes: ?*const fn (ctx: *anyopaque) usize = null,
+        max_backlog_bytes: ?*const fn (ctx: *anyopaque) usize = null,
+        /// An accepted nonzero token is reported to the delivery observer exactly once upon wire delivery, write failure, or frame drop on session close. Not invoked after transport deinit has started or within re-entrant teardown callbacks. Token zero does not request a delivery callback.
+        send_text_tracked: ?*const fn (ctx: *anyopaque, session: SessionId, text: []const u8, token: u64) bool = null,
+        /// Setting the observer to null waits for a running callback to return, except when called by that callback itself.
+        set_delivery_observer: ?*const fn (ctx: *anyopaque, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId, u64) void) void = null,
     };
     pub fn start(self: *Transport, event_ctx: ?*anyopaque, handler: EventHandler) !void {
         return self.vtable.start(self.ctx, event_ctx, handler);
@@ -30,6 +36,15 @@ pub const Transport = struct {
     }
     pub fn sendText(self: *Transport, session: SessionId, text: []const u8) bool {
         return self.vtable.send_text(self.ctx, session, text);
+    }
+    pub fn sendTrackedText(self: *Transport, session: SessionId, text: []const u8, token: u64) bool {
+        if (token != 0 and self.supportsTrackedDelivery()) {
+            return self.vtable.send_text_tracked.?(self.ctx, session, text, token);
+        }
+        return self.sendText(session, text);
+    }
+    pub fn supportsTrackedDelivery(self: *Transport) bool {
+        return self.vtable.send_text_tracked != null and self.vtable.set_delivery_observer != null;
     }
     pub fn broadcastText(self: *Transport, text: []const u8) void {
         self.vtable.broadcast_text(self.ctx, text);
@@ -42,5 +57,16 @@ pub const Transport = struct {
     }
     pub fn boundPort(self: *Transport) u16 {
         return if (self.vtable.bound_port) |f| f(self.ctx) else 0;
+    }
+    pub const default_max_message_bytes: usize = 64 * 1024 * 1024;
+    pub fn maxMessageBytes(self: *Transport) usize {
+        return if (self.vtable.max_message_bytes) |f| f(self.ctx) else default_max_message_bytes;
+    }
+    pub const default_max_backlog_bytes: usize = 8 * 1024 * 1024;
+    pub fn maxBacklogBytes(self: *Transport) usize {
+        return if (self.vtable.max_backlog_bytes) |f| f(self.ctx) else default_max_backlog_bytes;
+    }
+    pub fn setDeliveryObserver(self: *Transport, observer_ctx: ?*anyopaque, observer: ?*const fn (?*anyopaque, SessionId, u64) void) void {
+        if (self.vtable.set_delivery_observer) |f| f(self.ctx, observer_ctx, observer);
     }
 };

@@ -57,10 +57,11 @@ har=sdk/harmony/build/default/outputs/default/jsbay_harmony.har
 test -f "$har"
 
 members="$work/members"
-if tar -tzf "$har" > "$members" 2>/dev/null; then
-  :
-elif command -v unzip >/dev/null && unzip -Z1 "$har" > "$members" 2>/dev/null; then
-  :
+har_format=""
+if command -v unzip >/dev/null && unzip -Z1 "$har" > "$members" 2>/dev/null; then
+  har_format="zip"
+elif tar -tzf "$har" > "$members" 2>/dev/null; then
+  har_format="tar"
 else
   echo "HAR is neither a gzip tar archive nor a ZIP archive: $har" >&2
   exit 1
@@ -79,8 +80,48 @@ if grep -Fq 'ConformanceFixture' "$members" || grep -Eq '(^|/)Quality[^/]*$' "$m
 fi
 
 mkdir -p "$stage_dir"
+stage_dir=$(cd "$stage_dir" && pwd)
 asset="$stage_dir/jsbay-${version}-harmony-${backend}-arm64-v8a.har"
-cp "$har" "$asset"
+rm -f "$asset"
+
+# Strip in-place @ts-nocheck comments from packaged ArkTS declaration files so strict consumer projects pass linter gates.
+repack_dir="$work/repack"
+mkdir -p "$repack_dir"
+if [[ "$har_format" == "zip" ]] && command -v zip >/dev/null; then
+  unzip -q "$har" -d "$repack_dir"
+  for decl in "$repack_dir"/package/src/main/ets/*.d.ets; do
+    if [[ -f "$decl" ]]; then
+      sed '/^[[:space:]]*\/\/[[:space:]]*@ts-nocheck[[:space:]]*$/d' "$decl" > "$decl.tmp"
+      mv "$decl.tmp" "$decl"
+    fi
+  done
+  (cd "$repack_dir" && zip -qr "$asset" package)
+elif [[ "$har_format" == "tar" ]]; then
+  tar -xzf "$har" -C "$repack_dir"
+  for decl in "$repack_dir"/package/src/main/ets/*.d.ets; do
+    if [[ -f "$decl" ]]; then
+      sed '/^[[:space:]]*\/\/[[:space:]]*@ts-nocheck[[:space:]]*$/d' "$decl" > "$decl.tmp"
+      mv "$decl.tmp" "$decl"
+    fi
+  done
+  (cd "$repack_dir" && tar -czf "$asset" package)
+else
+  cp "$har" "$asset"
+fi
+
+for decl_member in package/src/main/ets/JsBay.d.ets package/src/main/ets/index.d.ets; do
+  if [[ "$har_format" == "zip" ]]; then
+    if unzip -p "$asset" "$decl_member" | grep -Eq '^[[:space:]]*//[[:space:]]*@ts-nocheck'; then
+      echo "Staged HAR declaration retains @ts-nocheck: $decl_member" >&2
+      exit 1
+    fi
+  elif [[ "$har_format" == "tar" ]]; then
+    if tar -xOzf "$asset" "$decl_member" | grep -Eq '^[[:space:]]*//[[:space:]]*@ts-nocheck'; then
+      echo "Staged HAR declaration retains @ts-nocheck: $decl_member" >&2
+      exit 1
+    fi
+  fi
+done
 printf '%s\n' "$backend" > "$stage_dir/backend"
 if command -v sha256sum >/dev/null; then
   sha256sum "$asset" > "$stage_dir/SHA256SUMS"

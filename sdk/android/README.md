@@ -48,6 +48,8 @@ Create one `Engine` per instance id on a **dedicated** Looper thread. Do not cre
 
 `requestClose()` / no-argument `close()` request asynchronously; an independent owner task attempts `drainClose()` and only quits its Looper after completion. A pending attempt needs a later retry; `closeStatus()` reports VM progress, not thread-exit proof. A timed-out bounded close remains pending until the original creator can unwind and drain.
 
+`DedicatedEngineThread.lifecycleState` reports `RUNNING`, `CLOSING`, `CLOSED`, or `FAILED`. New `post` and foreign `runOnOwner` admission stops at `CLOSING`; already admitted work and internal creator drain can still finish. `CLOSED` requires native drain completion and exit from the owner Looper. `isClosed` includes `FAILED` as a terminal SDK state, but failure alone does not prove native reclamation: retain `closeStatus()` checks and the original creator requirement. A bounded `close(timeoutMillis)` uses one deadline for drain acknowledgement and thread join; the no-argument overload remains nonblocking.
+
 By default, `new Engine(id)` refuses automatic attach when `Looper.myLooper() == Looper.getMainLooper()` and throws `JsBayException(INVALID_ARGUMENT)`. Opt in only when you intentionally own that risk:
 
 ```kotlin

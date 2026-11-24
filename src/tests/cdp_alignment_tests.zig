@@ -114,13 +114,19 @@ fn openSession(alloc: std.mem.Allocator, target_id: []const u8) !Session {
 }
 
 fn openSessionWithId(alloc: std.mem.Allocator, id: i32, target_id: []const u8) !Session {
+    return openSessionWithOptions(alloc, id, .{ .target_id = target_id });
+}
+
+fn openSessionWithOptions(alloc: std.mem.Allocator, id: i32, opts: inspector.StartOptions) !Session {
     try testing.expect(engine.create(id, .{}));
-    const handle = try inspector.start(id, .{ .port = 0, .target_id = target_id });
+    var start_opts = opts;
+    start_opts.port = 0;
+    const handle = try inspector.start(id, start_opts);
     errdefer engine.destroy(id);
     errdefer inspector.stop(handle);
     const stream = try wire.connect(inspector.boundPort(handle));
     errdefer stream.close();
-    try wire.doWsHandshake(alloc, stream, target_id);
+    try wire.doWsHandshake(alloc, stream, start_opts.target_id orelse "default");
     return .{ .alloc = alloc, .id = id, .handle = handle, .stream = stream, .reader = wire.FrameReader.init(stream) };
 }
 
@@ -2081,4 +2087,83 @@ test "cdp regression: onlySessionId requires a session-opened readiness wait" {
     const session_id = try waitForOnlySessionId(state);
     try testing.expect(sessionPresent(state, session_id));
     try testing.expectEqual(session_id, try onlySessionId(state));
+}
+
+test "cdp alignment: Debugger.getScriptSource handles scripts below and above transport limits" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var session = try openSession(alloc, "cdp-script-source-limits");
+    defer session.deinit();
+    _ = try pumpResponse(&session, try send(&session, "Debugger.enable", "", 101), 101);
+
+    const small_source = "globalThis.__cdpSmallScript = 123;";
+    const small_eval = engine.evalScript(session.id, small_source, "cdp-small-script.js");
+    defer discardEval(small_eval);
+    try testing.expect(small_eval.err == null);
+
+    const large_prefix = "/*";
+    const large_suffix = "*/\nglobalThis.__cdpLargeScript = 456;";
+    const large_repeat_len = 10 * 1024 * 1024;
+    const large_source = try alloc.alloc(u8, large_prefix.len + large_repeat_len + large_suffix.len);
+    defer alloc.free(large_source);
+    @memcpy(large_source[0..large_prefix.len], large_prefix);
+    @memset(large_source[large_prefix.len .. large_prefix.len + large_repeat_len], 'x');
+    @memcpy(large_source[large_prefix.len + large_repeat_len ..], large_suffix);
+
+    const large_eval = engine.evalScript(session.id, large_source, "cdp-large-script.js");
+    defer discardEval(large_eval);
+    try testing.expect(large_eval.err == null);
+
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"cdp-small-script.js\"", 1));
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"cdp-large-script.js\"", 1));
+
+    const small_id = scriptIdForUrl(session.got.items, "\"url\":\"cdp-small-script.js\"") orelse return error.TestUnexpectedResult;
+    const small_params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{small_id});
+    defer alloc.free(small_params);
+    const small_reply = try pumpResponse(&session, try send(&session, "Debugger.getScriptSource", small_params, 102), 102);
+    try testing.expect(std.mem.indexOf(u8, small_reply, "globalThis.__cdpSmallScript = 123;") != null);
+
+    const large_id = scriptIdForUrl(session.got.items, "\"url\":\"cdp-large-script.js\"") orelse return error.TestUnexpectedResult;
+    const large_params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{large_id});
+    defer alloc.free(large_params);
+    const large_reply = try pumpResponse(&session, try send(&session, "Debugger.getScriptSource", large_params, 103), 103);
+    try testing.expect(std.mem.indexOf(u8, large_reply, "globalThis.__cdpLargeScript = 456;") != null);
+
+    const eval_params = "{\"expression\":\"1 + 2\",\"returnByValue\":true}";
+    const eval_reply = try pumpResponse(&session, try send(&session, "Runtime.evaluate", eval_params, 104), 104);
+    try testing.expect(std.mem.indexOf(u8, eval_reply, "\"value\":3") != null);
+}
+
+test "cdp alignment: Debugger.getScriptSource rejects script exceeding configured transport limit" {
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    const id = helpers.nextInstanceId();
+    var session = try openSessionWithOptions(alloc, id, .{ .max_message_bytes = 1024 * 1024, .target_id = "cdp-script-custom-limit" });
+    defer session.deinit();
+    _ = try pumpResponse(&session, try send(&session, "Debugger.enable", "", 101), 101);
+
+    const prefix = "/*";
+    const suffix = "*/\nglobalThis.__cdpCustomLimit = 789;";
+    const repeat_len = 2 * 1024 * 1024;
+    const source = try alloc.alloc(u8, prefix.len + repeat_len + suffix.len);
+    defer alloc.free(source);
+    @memcpy(source[0..prefix.len], prefix);
+    @memset(source[prefix.len .. prefix.len + repeat_len], 'z');
+    @memcpy(source[prefix.len + repeat_len ..], suffix);
+
+    const custom_eval = engine.evalScript(session.id, source, "cdp-custom-limit.js");
+    defer discardEval(custom_eval);
+    try testing.expect(custom_eval.err == null);
+
+    try testing.expect(try waitForScriptIds(&session, "\"url\":\"cdp-custom-limit.js\"", 1));
+    const script_id = scriptIdForUrl(session.got.items, "\"url\":\"cdp-custom-limit.js\"") orelse return error.TestUnexpectedResult;
+    const params = try std.fmt.allocPrint(alloc, "{{\"scriptId\":\"{s}\"}}", .{script_id});
+    defer alloc.free(params);
+    const reply = try pumpResponse(&session, try send(&session, "Debugger.getScriptSource", params, 102), 102);
+    try testing.expect(std.mem.indexOf(u8, reply, "\"code\":-32000") != null);
+    try testing.expect(std.mem.indexOf(u8, reply, "Script source is too large to send") != null);
+
+    const eval_params = "{\"expression\":\"10 + 20\",\"returnByValue\":true}";
+    const eval_reply = try pumpResponse(&session, try send(&session, "Runtime.evaluate", eval_params, 103), 103);
+    try testing.expect(std.mem.indexOf(u8, eval_reply, "\"value\":30") != null);
 }

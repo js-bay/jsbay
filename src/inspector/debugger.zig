@@ -556,6 +556,14 @@ pub fn scriptById(instance_id: i32, id: u32) ?ScriptInfo {
     return binding.journal.snapshotByIdLocked(id);
 }
 
+pub fn scriptSourceLengthById(instance_id: i32, id: u32) ?usize {
+    const binding = lookup(instance_id) orelse return null;
+    binding.mutex.lock();
+    defer binding.mutex.unlock();
+    const script = binding.journal.findByIdLocked(id) orelse return null;
+    return script.source.len;
+}
+
 pub fn freeScriptInfo(info: ScriptInfo) void {
     source_journal.freeScriptInfo(std.heap.c_allocator, info);
 }
