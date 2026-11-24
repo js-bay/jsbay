@@ -7,6 +7,14 @@ public enum DedicatedEngineThreadError: Error, Equatable {
   case javascript(JsExceptionDetails)
 }
 
+/// Represents the observable lifecycle state of a dedicated engine thread.
+public enum DedicatedEngineThreadState: Sendable {
+  case running
+  case closing
+  case closed
+  case failed
+}
+
 /// Marks data-only results that can safely leave a dedicated Engine thread. Custom conformances promise that the value contains no live Engine or Value handles.
 public protocol EngineThreadResult: Sendable {}
 
@@ -32,6 +40,7 @@ extension URL: EngineThreadResult {}
 extension JsBayError: EngineThreadResult {}
 extension JsExceptionDetails: EngineThreadResult {}
 extension DedicatedEngineThreadError: EngineThreadResult {}
+extension DedicatedEngineThreadState: EngineThreadResult {}
 
 extension Optional: EngineThreadResult where Wrapped: EngineThreadResult {}
 extension Array: EngineThreadResult where Element: EngineThreadResult {}
@@ -55,6 +64,22 @@ public final class DedicatedEngineThread: @unchecked Sendable {
   public static func start(id: Int32, limits: ResourceLimits? = nil) throws -> DedicatedEngineThread
   {
     try DedicatedEngineThread(id: id, limits: limits)
+  }
+
+  /// Returns the current lifecycle state of the dedicated engine thread.
+  public var lifecycleState: DedicatedEngineThreadState {
+    worker.lifecycleState
+  }
+
+  /// Indicates whether the dedicated engine thread is currently shutting down.
+  public var isClosing: Bool {
+    lifecycleState == .closing
+  }
+
+  /// Indicates whether the dedicated engine thread has completely shut down.
+  public var isClosed: Bool {
+    let state = lifecycleState
+    return state == .closed || state == .failed
   }
 
   public func runOnOwner<T: EngineThreadResult>(
@@ -248,6 +273,20 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
     }
   }
 
+  var lifecycleState: DedicatedEngineThreadState {
+    lock.lock()
+    defer { lock.unlock() }
+    if shutdownCompleted {
+      return shutdownError == nil ? .closed : .failed
+    }
+    switch state {
+    case .starting, .running:
+      return .running
+    case .closing, .closed:
+      return .closing
+    }
+  }
+
   func requestInterrupt() -> Bool {
     lock.lock()
     let currentEngine = engine
@@ -364,9 +403,9 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
 
   private func finishShutdown() {
     lock.lock()
+    state = .closing
     let currentEngine = engine
     engine = nil
-    state = .closed
     let loop = runLoop
     let source = keepAliveSource
     keepAliveSource = nil
@@ -378,7 +417,9 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
     do { try currentEngine?.close() } catch { closeError = error }
 
     lock.lock()
-    shutdownError = closeError
+    if shutdownError == nil {
+      shutdownError = closeError
+    }
     lock.unlock()
 
     if let loop, let source {
@@ -412,6 +453,7 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
     } catch {
       lock.lock()
       startupError = error
+      shutdownError = error
       state = .closed
       let complete = !shutdownCompleted
       shutdownCompleted = true
@@ -463,6 +505,7 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
 
     var loopCloseError: Error?
     lock.lock()
+    state = .closing
     let lingeringEngine = engine
     engine = nil
     let lingeringSource = keepAliveSource
@@ -478,7 +521,9 @@ private final class DedicatedEngineThreadWorker: @unchecked Sendable {
     }
     lock.lock()
     state = .closed
-    shutdownError = shutdownError ?? loopCloseError
+    if shutdownError == nil {
+      shutdownError = loopCloseError
+    }
     let pending = jobs
     jobs.removeAll(keepingCapacity: false)
     lock.unlock()

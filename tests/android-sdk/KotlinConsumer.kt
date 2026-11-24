@@ -1,6 +1,7 @@
 package io.jsbay.consumer
 
 import io.jsbay.DedicatedEngineThread
+import io.jsbay.DedicatedEngineThreadState
 import io.jsbay.Engine
 import io.jsbay.JsBayException
 import io.jsbay.ShutdownPhase
@@ -753,7 +754,9 @@ private fun runKotlinSubmissionOperations() {
 }
 
 private fun runKotlinDedicatedThreadParityTests() {
-    DedicatedEngineThread.start(7106).use { dedicated ->
+    DedicatedEngineThread(7106).use { dedicated ->
+        check(dedicated.lifecycleState == DedicatedEngineThreadState.RUNNING) { "Kotlin initial lifecycle running" }
+        check(!dedicated.isClosing && !dedicated.isClosed) { "Kotlin initial isClosing/isClosed" }
         val nestedResult =
             dedicated.runOnOwner { engine1 ->
                 dedicated.runOnOwner { engine2 ->
@@ -824,4 +827,19 @@ private fun runKotlinDedicatedThreadParityTests() {
     check(userInterruptDone.await(5, TimeUnit.SECONDS)) { "Kotlin user interrupt job completed" }
     userInterruptDedicated.close(5_000L)
     check(interruptObserved.get()) { "Kotlin user interrupt preserved across jobs" }
+
+    val directInvokeDedicated = DedicatedEngineThread(7110)
+    check(directInvokeDedicated.lifecycleState == DedicatedEngineThreadState.RUNNING) {
+        "Kotlin DedicatedEngineThread invoke lifecycle running"
+    }
+    check(!directInvokeDedicated.isClosing && !directInvokeDedicated.isClosed) {
+        "Kotlin dedicated initial isClosing/isClosed"
+    }
+    directInvokeDedicated.close(5_000L)
+    check(
+        directInvokeDedicated.lifecycleState == DedicatedEngineThreadState.CLOSED,
+    ) { "Kotlin dedicated lifecycle closed" }
+    check(directInvokeDedicated.isClosed && !directInvokeDedicated.isClosing) {
+        "Kotlin dedicated closed isClosed/isClosing"
+    }
 }

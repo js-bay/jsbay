@@ -52,6 +52,22 @@ function requireWellFormedText(value: string): string {
   return value;
 }
 
+function toNonNegativeBigInt(value: number | bigint): bigint {
+  if (typeof value === 'bigint') {
+    if (value < 0n || value > 0xffffffffffffffffn) {
+      throw new JsBayStatusError(JsBayStatus.InvalidArgument);
+    }
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new JsBayStatusError(JsBayStatus.InvalidArgument);
+    }
+    return BigInt(value);
+  }
+  throw new JsBayStatusError(JsBayStatus.InvalidArgument);
+}
+
 /** A non-JavaScript C ABI failure with its stable jsbay_status_t value. */
 export class JsBayStatusError extends Error {
   readonly status: JsBayStatus;
@@ -682,17 +698,20 @@ export class Engine {
   clearInterrupt(): boolean {
     return invoke(() => native.clearInterrupt(this.live()) as boolean);
   }
-  setExecutionTimeLimit(milliseconds: bigint): boolean {
-    return invoke(() => native.setExecutionTimeLimit(this.live(), milliseconds) as boolean);
+  setExecutionTimeLimit(milliseconds: number | bigint): boolean {
+    const millis = toNonNegativeBigInt(milliseconds);
+    return invoke(() => native.setExecutionTimeLimit(this.live(), millis) as boolean);
   }
-  setExecutionBudget(milliseconds: bigint): boolean {
-    return invoke(() => native.setExecutionBudget(this.live(), milliseconds) as boolean);
+  setExecutionBudget(milliseconds: number | bigint): boolean {
+    const millis = toNonNegativeBigInt(milliseconds);
+    return invoke(() => native.setExecutionBudget(this.live(), millis) as boolean);
   }
   getValueUsage(): ValueUsage {
     return invoke(() => native.getValueUsage(this.live()) as ValueUsage);
   }
-  setMemoryLimit(bytes: bigint): boolean {
-    return invoke(() => native.setMemoryLimit(this.live(), bytes) as boolean);
+  setMemoryLimit(bytes: number | bigint): boolean {
+    const limit = toNonNegativeBigInt(bytes);
+    return invoke(() => native.setMemoryLimit(this.live(), limit) as boolean);
   }
   setResourceLimits(limits: ResourceLimits): boolean {
     return invoke(() => native.setResourceLimits(

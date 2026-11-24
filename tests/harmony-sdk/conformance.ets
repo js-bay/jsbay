@@ -235,6 +235,17 @@ export function harmonyConformance(): boolean {
       other.close();
     }
 
+    expect(engine.setExecutionTimeLimit(5000), 'setExecutionTimeLimit with number');
+    expect(engine.setExecutionTimeLimit(5000n), 'setExecutionTimeLimit with bigint');
+    expect(engine.setExecutionBudget(1000), 'setExecutionBudget with number');
+    expect(engine.setExecutionBudget(1000n), 'setExecutionBudget with bigint');
+    expect(engine.setMemoryLimit(1048576), 'setMemoryLimit with number');
+    expect(engine.setMemoryLimit(1048576n), 'setMemoryLimit with bigint');
+    expectStatus(() => engine.setExecutionTimeLimit(-1), JsBayStatus.InvalidArgument, 'negative number limit');
+    expectStatus(() => engine.setExecutionTimeLimit(-1n), JsBayStatus.InvalidArgument, 'negative bigint limit');
+    expectStatus(() => engine.setExecutionTimeLimit(0.5), JsBayStatus.InvalidArgument, 'fractional number limit');
+    expectStatus(() => engine.setExecutionTimeLimit(NaN), JsBayStatus.InvalidArgument, 'NaN limit');
+
     const stale = engine.newNumber(9);
     engine.close();
     engine.close();
