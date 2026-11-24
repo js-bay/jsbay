@@ -1,0 +1,9 @@
+dimensions:
+  - id: quickjs-ng-compiled-line-coverage
+    title: QuickJS-NG engine test coverage of compiled source lines
+    direction: higher-is-better
+    builtin: coverage
+    options:
+      file: coverage.cobertura.xml
+      format: cobertura
+      metric: lines

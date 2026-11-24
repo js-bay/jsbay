@@ -19,6 +19,8 @@ The reusable [`mobile-tests.yml`](../.github/workflows/mobile-tests.yml) still o
 
 Repository-tool and the six independent package suites run once per Linux/macOS PR host, rather than once per backend. Backend steps use `test-engine`, which excludes those package suites. The daily Linux ARM64 job adds package execution for that architecture. Harmony host facade tests already execute the native host consumer, so CI invokes the facade entry once.
 
+The macOS job publishes a QuickJS-NG engine test coverage report and its passing/skipped test counts. It measures compiled source lines under `src`, excluding `src/tests`, with kcov 43. Zig's lazy compilation and backend-specific code mean this is not coverage of all source files or other backends. Pawl reads the Cobertura report, but this first rollout reports the percentage without comparing it to a baseline; CI still fails if the test summary or report is missing or invalid.
+
 Desktop runners have explicit OS and architecture labels. Windows disables the optional POSIX HTTP/WebSocket transport while retaining engine, timer, thread and self-driven loop tests. Its public consumers include C, Zig and .NET. Apple Swift/Objective-C consumers run on ARM64 macOS; Intel macOS extension jobs cover the engine and desktop consumers. Inspector E2E, idle wake and signal shutdown use Node.js 24 on Linux/macOS, including its global WebSocket implementation.
 
 The fixed, digest-verified Test262 manifest remains the declared conformance scope. Broader GC/OOM and concurrency tests are separate daily jobs; they do not turn that subset into a full Test262 claim. Shared-runner benchmark timing is observational. Use fixed hardware before making performance regressions a release gate.
