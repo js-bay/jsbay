@@ -141,33 +141,16 @@ class DedicatedEngineThread private constructor(
     fun setMemoryLimit(bytes: Long): Boolean = runOnOwner { it.setMemoryLimit(bytes) }
 
     fun close(timeoutMillis: Long) {
-        val (shouldSchedule, alreadyClosed) =
-            synchronized(lock) {
-                when (state) {
-                    DedicatedEngineThreadState.CLOSED, DedicatedEngineThreadState.FAILED -> {
-                        Pair(false, true)
-                    }
-                    DedicatedEngineThreadState.CLOSING -> {
-                        Pair(false, false)
-                    }
-                    DedicatedEngineThreadState.RUNNING -> {
-                        state = DedicatedEngineThreadState.CLOSING
-                        Pair(true, false)
-                    }
-                }
-            }
-        if (alreadyClosed) {
-            shutdownError?.let { throw it }
-            return
-        }
-
         if (Thread.currentThread() === thread) {
+            // Reentrant or inline close from owner thread: execute shutdown directly.
             try {
                 val current = engineRef.get()
                 current?.close()
                 engineRef.compareAndSet(current, null)
                 synchronized(lock) {
-                    state = DedicatedEngineThreadState.CLOSED
+                    if (state == DedicatedEngineThreadState.RUNNING) {
+                        state = DedicatedEngineThreadState.CLOSING
+                    }
                 }
             } catch (t: Throwable) {
                 synchronized(lock) {
@@ -177,46 +160,58 @@ class DedicatedEngineThread private constructor(
                 throw t
             } finally {
                 LoopDriver.quitCurrentLooperSafely()
-                shutdownLatch.countDown()
             }
             return
         }
 
         val current = engineRef.get()
-        if (shouldSchedule && current != null) {
-            val posted: Boolean
-            synchronized(lock) {
-                if (isExecutingJob) {
-                    current.requestInterrupt()
-                    shutdownInterruptedJob = true
+        synchronized(lock) {
+            when (state) {
+                DedicatedEngineThreadState.CLOSED, DedicatedEngineThreadState.FAILED -> {
+                    shutdownError?.let { throw it }
+                    return
                 }
-                posted =
-                    postInternal {
-                        try {
-                            if (engineRef.get() === current) {
-                                current.close()
-                                engineRef.compareAndSet(current, null)
+                DedicatedEngineThreadState.CLOSING -> {
+                    if (isExecutingJob && !shutdownInterruptedJob) {
+                        current?.requestInterrupt()
+                        shutdownInterruptedJob = true
+                    }
+                }
+                DedicatedEngineThreadState.RUNNING -> {
+                    state = DedicatedEngineThreadState.CLOSING
+                    if (current != null) {
+                        if (isExecutingJob) {
+                            current.requestInterrupt()
+                            shutdownInterruptedJob = true
+                        }
+                        val posted =
+                            postInternal {
+                                try {
+                                    if (engineRef.get() === current) {
+                                        current.close()
+                                        engineRef.compareAndSet(current, null)
+                                    }
+                                } catch (t: Throwable) {
+                                    synchronized(lock) {
+                                        if (shutdownError == null) {
+                                            shutdownError = t
+                                        }
+                                        state = DedicatedEngineThreadState.FAILED
+                                    }
+                                } finally {
+                                    LoopDriver.quitCurrentLooperSafely()
+                                }
                             }
-                            synchronized(lock) {
-                                state = DedicatedEngineThreadState.CLOSED
+                        if (!posted) {
+                            if (state != DedicatedEngineThreadState.CLOSED &&
+                                state != DedicatedEngineThreadState.FAILED
+                            ) {
+                                state = DedicatedEngineThreadState.RUNNING
                             }
-                        } catch (t: Throwable) {
-                            synchronized(lock) {
-                                shutdownError = t
-                                state = DedicatedEngineThreadState.FAILED
-                            }
-                        } finally {
-                            LoopDriver.quitCurrentLooperSafely()
-                            shutdownLatch.countDown()
+                            throw JsBayException(Status.INSTANCE_NOT_FOUND)
                         }
                     }
-            }
-            if (!posted) {
-                synchronized(lock) {
-                    state = DedicatedEngineThreadState.FAILED
                 }
-                shutdownLatch.countDown()
-                throw JsBayException(Status.INSTANCE_NOT_FOUND)
             }
         }
 
@@ -226,6 +221,43 @@ class DedicatedEngineThread private constructor(
         }
         shutdownError?.let { throw it }
         thread.join(timeoutMillis)
+    }
+
+    private fun onOwnerLoopExited(loopError: Throwable? = null) {
+        val lingeringEngine: Engine? =
+            synchronized(lock) {
+                val current = engineRef.get()
+                if (current != null) {
+                    engineRef.set(null)
+                }
+                if (state == DedicatedEngineThreadState.RUNNING) {
+                    state = DedicatedEngineThreadState.CLOSING
+                }
+                current
+            }
+        var closeError: Throwable? = loopError
+        if (lingeringEngine != null) {
+            try {
+                lingeringEngine.close()
+            } catch (t: Throwable) {
+                if (closeError == null) {
+                    closeError = t
+                }
+            }
+        }
+        synchronized(lock) {
+            if (state != DedicatedEngineThreadState.FAILED) {
+                if (closeError != null) {
+                    shutdownError = closeError
+                    state = DedicatedEngineThreadState.FAILED
+                } else {
+                    state = DedicatedEngineThreadState.CLOSED
+                }
+            } else if (shutdownError == null && closeError != null) {
+                shutdownError = closeError
+            }
+        }
+        shutdownLatch.countDown()
     }
 
     override fun close() {
@@ -252,11 +284,13 @@ class DedicatedEngineThread private constructor(
             options: EngineOptions = EngineOptions(),
         ): DedicatedEngineThread {
             val ready = CountDownLatch(1)
+            val startedLatch = CountDownLatch(1)
             val failure = AtomicReference<Throwable?>(null)
             val engineRef = AtomicReference<Engine?>(null)
             val handlerRef = AtomicReference<Any?>(null)
             val postRef = AtomicReference<java.lang.reflect.Method?>(null)
             val threadRef = AtomicReference<Thread?>(null)
+            val instanceRef = AtomicReference<DedicatedEngineThread?>(null)
             val thread =
                 Thread({
                     try {
@@ -281,7 +315,15 @@ class DedicatedEngineThread private constructor(
                         ready.countDown()
                     }
                     if (failure.get() == null) {
-                        loopCurrentLooper()
+                        startedLatch.await()
+                        var loopError: Throwable? = null
+                        try {
+                            loopError = loopCurrentLooper()
+                        } catch (t: Throwable) {
+                            loopError = t
+                        } finally {
+                            instanceRef.get()?.onOwnerLoopExited(loopError)
+                        }
                     }
                 }, name)
             threadRef.set(thread)
@@ -291,21 +333,25 @@ class DedicatedEngineThread private constructor(
                 thread.join(5_000)
                 throw thrown
             }
-            return DedicatedEngineThread(
-                id,
-                thread,
-                handlerRef.get()!!,
-                postRef.get()!!,
-                engineRef,
-            )
+            val instance =
+                DedicatedEngineThread(
+                    id,
+                    thread,
+                    handlerRef.get()!!,
+                    postRef.get()!!,
+                    engineRef,
+                )
+            instanceRef.set(instance)
+            startedLatch.countDown()
+            return instance
         }
 
-        private fun loopCurrentLooper() {
+        private fun loopCurrentLooper(): Throwable? {
             try {
                 val looperClass = Class.forName("android.os.Looper")
                 try {
                     looperClass.getMethod("loop").invoke(null)
-                    return
+                    return null
                 } catch (_: NoSuchMethodException) {
                     // Host stub: park until quit clears the thread-local Looper.
                 }
@@ -313,10 +359,14 @@ class DedicatedEngineThread private constructor(
                 while (myLooper.invoke(null) != null) {
                     Thread.sleep(10)
                 }
-            } catch (_: InterruptedException) {
+                return null
+            } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
+                return e
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                return e.targetException ?: e
             } catch (_: ReflectiveOperationException) {
-                // No Looper loop available.
+                return null
             }
         }
     }
