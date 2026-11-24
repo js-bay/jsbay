@@ -40,6 +40,9 @@ report="$work/kcov/test/cobertura.xml"
 test -s "$report"
 if ! node scripts/quality/zig-coverage-report.mjs < "$report"; then
     cp "$report" "$output/coverage-invalid.cobertura.xml"
+    if command -v readelf >/dev/null 2>&1; then
+        readelf --debug-dump=rawline "${binaries[0]}" | gzip > "$output/debug-lines.txt.gz" || true
+    fi
     exit 2
 fi
 cp "$report" "$output/coverage.cobertura.xml"

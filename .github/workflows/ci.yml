@@ -223,7 +223,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: invalid-quickjs-ng-engine-coverage
-          path: ${{ runner.temp }}/jsbay-coverage/coverage-invalid.cobertura.xml
+          path: ${{ runner.temp }}/jsbay-coverage/
           if-no-files-found: ignore
 
   linux-engine:
