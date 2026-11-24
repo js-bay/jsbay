@@ -356,6 +356,7 @@ jobs:
         run: zig build test-tools --summary all
 
       - name: Report QuickJS-NG engine coverage
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           node --test tests/ci/zig-coverage-summary-test.mjs tests/ci/zig-coverage-report-test.mjs
