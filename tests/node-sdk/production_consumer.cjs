@@ -7,5 +7,8 @@ assert.ok(addonPath, 'JSBAY_NODE_ADDON must name the production Node-API module'
 const addon = require(addonPath)
 
 assert.deepEqual(Reflect.ownKeys(addon), ['Engine'])
-assert.deepEqual(Reflect.ownKeys(addon.Engine), ['create'])
+assert.deepEqual(Reflect.ownKeys(addon.Engine), [
+  'create', 'capabilities', 'requestInterrupt', 'cancel', 'beginShutdown',
+  'shutdownStatus', 'listEngines', 'globalResourceUsage'
+])
 console.log('production node SDK consumer passed')
