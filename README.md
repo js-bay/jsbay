@@ -4,6 +4,8 @@
 
 # JS Bay
 
+[![QuickJS-NG compiled line coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fjs-bay%2Fjsbay%2Fcoverage-badge%2Fcoverage.json)](https://github.com/js-bay/jsbay/actions/workflows/ci.yml)
+
 JS Bay is a Zig package and typed C ABI for embedding QuickJS-NG, QuickJS, or JavaScriptCore. Choose statically linked backends at build time; multi-engine packs select a backend at instance creation. The C API and platform SDKs share the same instance, value, timer, and callback model.
 
 ### Supported engines

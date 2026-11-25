@@ -1,0 +1,40 @@
+name: Coverage badge
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  publish:
+    name: Publish QuickJS-NG coverage badge
+    if: github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Download QuickJS-NG engine coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: quickjs-ng-engine-coverage
+          path: ${{ runner.temp }}/jsbay-coverage
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Publish coverage badge data
+        env:
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: node scripts/quality/publish-coverage-badge.mjs --repo "$GITHUB_WORKSPACE" --report "$RUNNER_TEMP/jsbay-coverage/coverage.cobertura.xml" --source-sha "$SOURCE_SHA"
