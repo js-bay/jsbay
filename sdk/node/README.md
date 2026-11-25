@@ -73,6 +73,10 @@ main().catch(console.error)
 
 An explicit `instanceId` must be a positive int32 and unique across live engines in the process. Duplicate IDs fail without closing the existing engine. Resource limit options require all five non-negative integer fields: `maxTimers`, `maxTsfnHandles`, `maxPendingCalls`, `maxPendingBytes`, and `maxPendingTasks`. `Engine` is a factory object, not a constructor. `JsBayError` is a TypeScript interface, not an exported Error class; native status errors may carry a numeric `status`. A guest can throw or reject with a primitive value, so callers must not assume every failure is an Error. Optional backend features are reported by `Engine.capabilities()`; `sourceDebugger` reports debugger hooks, while `inspectorStart()` confirms that the build includes a listener transport and can bind the requested port. Other unsupported operations throw an error with status `JSBAY_UNSUPPORTED`.
 
+## JSC on macOS arm64
+
+With the default JSC trap mode, a running script may not respond to an interrupt or execution deadline on macOS arm64. Do not rely on these controls in that configuration. A host that chooses polling traps can set `JSC_usePollingTraps=true` in the process environment before starting Node. This option affects every JavaScriptCore VM in the process. JSC reads its options before creating the first VM and locks them afterward, so setting the variable after any JSC VM has been created is not guaranteed to change the mode. The SDK does not set this process-wide option automatically.
+
 Host callbacks execute on the same owner thread. `bindAsync` does not move CPU work to a worker: the callback starts there and can return a Promise or thenable for later completion. Host callback exceptions and unsupported argument conversions become guest exceptions that JavaScript can catch. `evaluateAsync` rejects for guest throws, rejected thenables, or result conversion failures.
 
 ## Values and lifetime
