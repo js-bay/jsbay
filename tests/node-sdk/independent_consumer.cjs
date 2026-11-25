@@ -153,10 +153,14 @@ async function childMain(mode) {
     return
   }
   if (mode === 'gc-finalizers') {
+    console.log('gc-finalizers: creating engines')
     for (let index = 0; index < 100; index++) Engine.create().evaluate('1', 'gc-finalizer.js')
+    console.log('gc-finalizers: created engines')
     assert.equal(typeof global.gc, 'function', 'child must receive --expose-gc')
     global.gc()
+    console.log('gc-finalizers: first collection returned')
     global.gc()
+    console.log('gc-finalizers: second collection returned')
     return
   }
   let engine = Engine.create({ instanceId: 9024 })

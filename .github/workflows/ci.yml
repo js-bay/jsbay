@@ -103,6 +103,7 @@ jobs:
           zig build test-tools --summary all
           bash tests/native_prefix_stamp_test.sh
           bash tests/ci/swift-package-tag-test.sh
+          bash tests/ci/apple-simulator-diagnostics-test.sh
           bash tests/android-sdk/maven-consumer-auth-test.sh
           node --test tests/ci/github-release-test.mjs tests/ci/npm-visibility-test.mjs tests/ci/node-windows-npm-workflow-test.mjs tests/ci/published-windows-package-test.mjs
 
