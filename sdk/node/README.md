@@ -75,7 +75,9 @@ An explicit `instanceId` must be a positive int32 and unique across live engines
 
 ## JSC on macOS arm64
 
-With the default JSC trap mode, a running script may not respond to an interrupt or execution deadline on macOS arm64. Do not rely on these controls in that configuration. A host that chooses polling traps can set `JSC_usePollingTraps=true` in the process environment before starting Node. This option affects every JavaScriptCore VM in the process. JSC reads its options before creating the first VM and locks them afterward, so setting the variable after any JSC VM has been created is not guaranteed to change the mode. The SDK does not set this process-wide option automatically.
+On macOS arm64, the Node package selects polling traps by setting `JSC_usePollingTraps=true` before loading the native addon when the option is unset. The native addon also applies this default during module initialization so a first load inside a Node Worker reaches the native process environment. An existing value is preserved; values that do not enable polling cause engine creation to fail and `executionLimit` to report `false`.
+
+This JSC option affects every JavaScriptCore VM in the process. JSC reads its options before creating the first VM and locks them afterward. If another component has already created a JavaScriptCore VM, the SDK cannot inspect or change the effective option, and setting the default may be too late. Hosts that initialize JavaScriptCore before loading this package must configure polling traps before the first VM themselves. The SDK does not claim to verify that an already initialized host is using polling traps.
 
 Host callbacks execute on the same owner thread. `bindAsync` does not move CPU work to a worker: the callback starts there and can return a Promise or thenable for later completion. Host callback exceptions and unsupported argument conversions become guest exceptions that JavaScript can catch. `evaluateAsync` rejects for guest throws, rejected thenables, or result conversion failures.
 

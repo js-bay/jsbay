@@ -8,7 +8,8 @@ const { Worker } = require('node:worker_threads')
 
 const addonPath = process.env.JSBAY_NODE_ADDON
 assert.ok(addonPath, 'JSBAY_NODE_ADDON must name the Node-API module')
-const { Engine } = require(addonPath)
+const publicEntry = process.env.JSBAY_NODE_PUBLIC_ENTRY
+const { Engine } = require(publicEntry || addonPath)
 
 function withTimeout(promise, label, milliseconds = 3000) {
   let timer

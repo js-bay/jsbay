@@ -1,6 +1,13 @@
 'use strict'
 
 const { join } = require('node:path')
+const manifest = require('./package.json')
+const backend = manifest.jsbayBackend || process.env.JSBAY_NODE_BACKEND
+
+if (backend === 'jsc' && process.platform === 'darwin' && process.arch === 'arm64' &&
+    process.env.JSC_usePollingTraps === undefined) {
+  process.env.JSC_usePollingTraps = 'true'
+}
 
 if (process.env.JSBAY_NODE_ADDON) {
   module.exports = require(process.env.JSBAY_NODE_ADDON)
@@ -10,8 +17,6 @@ if (process.env.JSBAY_NODE_ADDON) {
     module.exports = require(sourceAddon)
   } catch (error) {
     if (error.code !== 'MODULE_NOT_FOUND') throw error
-    const manifest = require('./package.json')
-    const backend = manifest.jsbayBackend
     if (!['quickjs', 'quickjsng', 'jsc'].includes(backend)) throw error
     const platform = process.platform === 'darwin' ? 'macos' : process.platform
     const arch = process.arch

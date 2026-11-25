@@ -3,9 +3,11 @@
 #include "jsbay_node_embed.h"
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -18,8 +20,74 @@
 #include <unordered_set>
 #include <uv.h>
 #include <vector>
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+#include <stdlib.h>
+#endif
 
 namespace {
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+static std::mutex jsc_polling_configuration_mutex;
+static bool jsc_polling_configuration_initialized = false;
+static bool jsc_polling_configuration_enabled = false;
+
+static bool parseJscBoolean(const char *value) {
+    if (!value) return false;
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return normalized == "true" || normalized == "yes" || normalized == "1";
+}
+
+static bool readNodePollingOption(napi_env env, bool *present, std::string *out) {
+    napi_value global = nullptr, process = nullptr, environment = nullptr, value = nullptr;
+    if (napi_get_global(env, &global) != napi_ok ||
+        napi_get_named_property(env, global, "process", &process) != napi_ok ||
+        napi_get_named_property(env, process, "env", &environment) != napi_ok)
+        return false;
+    *present = false;
+    if (napi_has_named_property(env, environment, "JSC_usePollingTraps", present) != napi_ok)
+        return false;
+    if (!*present) return true;
+    if (napi_get_named_property(env, environment, "JSC_usePollingTraps", &value) != napi_ok)
+        return false;
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type != napi_string)
+        return false;
+    size_t length = 0;
+    if (napi_get_value_string_utf8(env, value, nullptr, 0, &length) != napi_ok || length >= 64)
+        return false;
+    char buffer[64]{};
+    if (napi_get_value_string_utf8(env, value, buffer, sizeof(buffer), &length) != napi_ok)
+        return false;
+    *out = std::string(buffer, length);
+    return true;
+}
+
+static bool configureJscPollingTraps(napi_env env) {
+    if (jsbay_library_backend() != JSBAY_BACKEND_JSC) return true;
+    bool node_value_present = false;
+    std::string node_value;
+    const bool node_value_read = readNodePollingOption(env, &node_value_present, &node_value);
+    const bool node_value_valid = node_value_read &&
+                                  (!node_value_present || parseJscBoolean(node_value.c_str()));
+
+    std::lock_guard<std::mutex> lock(jsc_polling_configuration_mutex);
+    if (!jsc_polling_configuration_initialized) {
+        const char *process_value = std::getenv("JSC_usePollingTraps");
+        if (!process_value && node_value_valid) {
+            if (setenv("JSC_usePollingTraps", "true", 0) == 0)
+                process_value = std::getenv("JSC_usePollingTraps");
+        }
+        jsc_polling_configuration_enabled = parseJscBoolean(process_value);
+        jsc_polling_configuration_initialized = true;
+    }
+    return jsc_polling_configuration_enabled && node_value_valid;
+}
+#else
+static bool configureJscPollingTraps(napi_env) { return true; }
+#endif
+
 #ifdef JSBAY_NODE_TESTING
 static std::atomic_size_t live_engines{0}, live_completions{0};
 static thread_local std::string failure_point;
@@ -2377,6 +2445,7 @@ static napi_value cancelEngine(napi_env env, napi_callback_info info) {
     Engine *engine = engineWithArgs(env, info, &count, args, 0);
     if (!engine || count)
         return throwText(env, "cancel takes no arguments");
+    if (!configureJscPollingTraps(env)) return boolean(env, false);
     return boolean(env, jsbay_engine_cancel(engine->id, engine->core_generation));
 }
 static napi_value interruptEngine(napi_env env, napi_callback_info info) {
@@ -2385,6 +2454,7 @@ static napi_value interruptEngine(napi_env env, napi_callback_info info) {
     Engine *engine = engineWithArgs(env, info, &count, args, 0);
     if (!engine || count)
         return throwText(env, "requestInterrupt takes no arguments");
+    if (!configureJscPollingTraps(env)) return boolean(env, false);
     return boolean(
         env, jsbay_engine_request_interrupt_for_generation(engine->id, engine->core_generation));
 }
@@ -2395,6 +2465,7 @@ static napi_value beginShutdown(napi_env env, napi_callback_info info) {
     uint64_t millis = 0;
     if (!engine || count != 1 || !unsignedArgument(env, args[0], &millis) || millis == 0)
         return throwText(env, "beginShutdown requires a positive grace period in milliseconds");
+    if (!configureJscPollingTraps(env)) return boolean(env, false);
     return boolean(env, jsbay_engine_begin_shutdown(engine->id, engine->core_generation, millis));
 }
 static napi_value shutdownStatus(napi_env env, napi_callback_info info) {
@@ -2750,6 +2821,7 @@ static napi_value staticControl(napi_env env, napi_callback_info info, int opera
     ControlToken token;
     if (count != (operation == 2 ? 2U : 1U) || !readControlToken(env, args[0], &token))
         return throwText(env, "control requires {instanceId, generation: bigint}");
+    if (operation < 3 && !configureJscPollingTraps(env)) return boolean(env, false);
     bool accepted = false;
     if (operation == 0)
         accepted =
@@ -2793,6 +2865,7 @@ static napi_value setExecutionLimit(napi_env env, napi_callback_info info) {
     uint64_t value;
     if (!engine || count != 1 || !unsignedArgument(env, args[0], &value))
         return throwText(env, "limit must be a non-negative safe integer in milliseconds");
+    if (!configureJscPollingTraps(env)) return throwStatus(env, JSBAY_UNSUPPORTED);
     const bool ok = jsbay_engine_set_execution_time_limit(engine->id, value);
     return ok ? undefined(env) : throwStatus(env, JSBAY_UNSUPPORTED);
 }
@@ -2803,6 +2876,7 @@ static napi_value setExecutionBudget(napi_env env, napi_callback_info info) {
     uint64_t value;
     if (!engine || count != 1 || !unsignedArgument(env, args[0], &value))
         return throwText(env, "budget must be a non-negative safe integer in milliseconds");
+    if (!configureJscPollingTraps(env)) return throwStatus(env, JSBAY_UNSUPPORTED);
     const bool ok = jsbay_engine_set_execution_budget(engine->id, value);
     return ok ? undefined(env) : throwStatus(env, JSBAY_UNSUPPORTED);
 }
@@ -2980,6 +3054,7 @@ static napi_value capabilities(napi_env env, napi_callback_info) {
     version.struct_size = sizeof(version);
     if (!jsbay_library_capabilities(&value) || !jsbay_engine_version(&version))
         return throwText(env, "could not read engine capabilities");
+    if (!configureJscPollingTraps(env)) value.flags &= ~JSBAY_CAP_INTERRUPT_DEADLINE;
     napi_value out, backend, flags;
     napi_create_object(env, &out);
     napi_create_string_utf8(env, version.backend, NAPI_AUTO_LENGTH, &backend);
@@ -3006,6 +3081,8 @@ static napi_value createEngine(napi_env env, int32_t id, jsbay_log_handler_t log
                                void *user_data, void (*destroy_callback)(void *),
                                std::shared_ptr<CallbackBridge> bridge = nullptr,
                                const jsbay_resource_limits_t *limits = nullptr) {
+    if (!configureJscPollingTraps(env))
+        return throwText(env, "JSC on macOS arm64 requires JSC_usePollingTraps=true before the first JavaScriptCore VM is created");
     if (id < 1)
         return throwText(env, "instanceId must be a positive int32");
     if (log_handler || bridge) {
@@ -3370,6 +3447,7 @@ static napi_value testState(napi_env env, napi_callback_info) {
 }
 #endif
 static napi_value init(napi_env env, napi_value exports) {
+    (void)configureJscPollingTraps(env);
     napi_value engine, factory;
     napi_create_object(env, &engine);
     napi_create_function(env, "create", NAPI_AUTO_LENGTH, nodeValueBoundary<create>, nullptr,
