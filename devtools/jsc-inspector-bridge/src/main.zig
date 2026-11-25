@@ -13,6 +13,7 @@ test {
     _ = wir;
     _ = cdp;
     _ = @import("cdp_test.zig");
+    _ = @import("cdp_local_reply_test.zig");
 }
 
 const Options = struct {

@@ -26,6 +26,7 @@ pub const Script = struct {
     end_column: i32,
     hash: [16]u8,
     source_map_url: []u8,
+    source_map_borrowed: bool = false,
     // Journal storage is FIFO, but a source can be evaluated again after a newer revision with the same URL has been recorded.
     last_note_generation: u64 = 0,
     // Native bytecode locations are retained independently of source text, which cannot distinguish executable statements from comments or whitespace.
@@ -86,12 +87,27 @@ pub const Journal = struct {
             self.allocator.free(url_copy);
             return .{};
         };
-        const map_copy = self.allocator.dupe(u8, map_text) catch {
-            self.allocator.free(url_copy);
-            self.allocator.free(source_copy);
-            return .{};
+        // PreparedSource can be built directly, so borrow only when map text is a source subslice.
+        const map_offset = sliceOffset(map_text, source);
+        const map_copy = if (map_text.len == 0) source_copy[0..0] else if (map_offset) |offset|
+            source_copy[offset .. offset + map_text.len]
+        else
+            self.allocator.dupe(u8, map_text) catch {
+                self.allocator.free(url_copy);
+                self.allocator.free(source_copy);
+                return .{};
+            };
+        var stored = Script{
+            .id = id,
+            .url = url_copy,
+            .source = source_copy,
+            .end_line = ends.line,
+            .end_column = ends.column,
+            .hash = undefined,
+            .source_map_url = map_copy,
+            .source_map_borrowed = map_text.len == 0 or map_offset != null,
+            .last_note_generation = note_generation,
         };
-        var stored = Script{ .id = id, .url = url_copy, .source = source_copy, .end_line = ends.line, .end_column = ends.column, .hash = undefined, .source_map_url = map_copy, .last_note_generation = note_generation };
         formatHash(source, &stored.hash);
         self.scripts.append(self.allocator, stored) catch {
             freeScript(self.allocator, stored);
@@ -196,9 +212,19 @@ fn scriptStorageBytes(script: Script) usize {
 fn freeScript(allocator: std.mem.Allocator, script: Script) void {
     allocator.free(script.url);
     allocator.free(script.source);
-    allocator.free(script.source_map_url);
+    if (!script.source_map_borrowed) allocator.free(script.source_map_url);
     var owned = script;
     owned.break_locations.deinit(allocator);
+}
+
+fn sliceOffset(slice: []const u8, storage: []const u8) ?usize {
+    if (slice.len == 0 or storage.len == 0) return null;
+    const slice_start = @intFromPtr(slice.ptr);
+    const storage_start = @intFromPtr(storage.ptr);
+    if (slice_start < storage_start) return null;
+    const offset = slice_start - storage_start;
+    if (offset > storage.len or slice.len > storage.len - offset) return null;
+    return offset;
 }
 
 fn cloneScriptInfo(allocator: std.mem.Allocator, script: Script) !ScriptInfo {
@@ -302,6 +328,120 @@ test "source journal: registration and snapshots release partial OOM allocations
             try std.testing.expect(journal.findByTagLocked(registered.id) != null);
         }
     }
+}
+
+test "source journal: stored source-map URL borrows retained source bytes" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    var journal = Journal{ .allocator = allocator };
+    var journal_live = true;
+    defer if (journal_live) journal.deinit();
+    const source = "const answer = 42;\n//# sourceMappingURL=test.map";
+    const registered = journal.registerLocked(prepare("test.js", source));
+    const info = registered.published orelse return error.MissingPublishedInfo;
+    defer freeScriptInfo(allocator, info);
+    try std.testing.expectEqual(@as(usize, 7), failing.allocations);
+    const optimized_allocations = failing.allocations;
+    const optimized_bytes = failing.allocated_bytes;
+    const script = journal.findByIdLocked(registered.id) orelse return error.MissingScript;
+    const offset = @intFromPtr(script.source_map_url.ptr) - @intFromPtr(script.source.ptr);
+    try std.testing.expect(offset <= script.source.len);
+    try std.testing.expect(script.source_map_url.len <= script.source.len - offset);
+    try std.testing.expectEqualStrings("test.map", script.source_map_url);
+    journal.deinit();
+    journal_live = false;
+    try std.testing.expectEqualStrings("test.map", info.source_map_url);
+
+    var baseline_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const baseline_allocator = baseline_failing.allocator();
+    var baseline_journal = Journal{ .allocator = baseline_allocator };
+    var baseline_journal_live = true;
+    defer if (baseline_journal_live) baseline_journal.deinit();
+    var separate_map = [_]u8{ 't', 'e', 's', 't', '.', 'm', 'a', 'p' };
+    const baseline = baseline_journal.registerLocked(.{
+        .url = "test.js",
+        .source = source,
+        .source_map_url = &separate_map,
+        .end = .{ .line = 1, .column = 34 },
+    });
+    if (baseline.published) |baseline_info| freeScriptInfo(baseline_allocator, baseline_info);
+    try std.testing.expectEqual(optimized_allocations + 1, baseline_failing.allocations);
+    try std.testing.expectEqual(optimized_bytes + "test.map".len, baseline_failing.allocated_bytes);
+    baseline_journal.deinit();
+    baseline_journal_live = false;
+}
+
+test "source journal: directly prepared map text keeps independent ownership" {
+    const allocator = std.testing.allocator;
+    var journal = Journal{ .allocator = allocator };
+    defer journal.deinit();
+    var map_text = [_]u8{ 'e', 'x', 't', 'e', 'r', 'n', 'a', 'l', '.', 'm', 'a', 'p' };
+    const registered = journal.registerLocked(.{
+        .url = "test.js",
+        .source = "const answer = 42;",
+        .source_map_url = &map_text,
+        .end = .{ .line = 0, .column = 18 },
+    });
+    if (registered.published) |info| freeScriptInfo(allocator, info);
+    const script = journal.findByIdLocked(registered.id) orelse return error.MissingScript;
+    try std.testing.expect(!script.source_map_borrowed);
+    try std.testing.expectEqualStrings(&map_text, script.source_map_url);
+}
+
+test "source journal: overlapping and empty prepared map text borrows source" {
+    const allocator = std.testing.allocator;
+    var journal = Journal{ .allocator = allocator };
+    defer journal.deinit();
+    const source = "0123456789";
+    const overlapping = journal.registerLocked(.{
+        .url = "overlap.js",
+        .source = source,
+        .source_map_url = source[3..7],
+        .end = .{ .line = 0, .column = 10 },
+    });
+    if (overlapping.published) |info| freeScriptInfo(allocator, info);
+    const overlapping_script = journal.findByIdLocked(overlapping.id) orelse return error.MissingScript;
+    try std.testing.expect(overlapping_script.source_map_borrowed);
+    try std.testing.expectEqualStrings("3456", overlapping_script.source_map_url);
+
+    const empty = journal.registerLocked(prepare("empty-map.js", "plain source"));
+    if (empty.published) |info| freeScriptInfo(allocator, info);
+    const empty_script = journal.findByIdLocked(empty.id) orelse return error.MissingScript;
+    try std.testing.expect(empty_script.source_map_borrowed);
+    try std.testing.expectEqual(@as(usize, 0), empty_script.source_map_url.len);
+}
+
+test "source journal: partially overlapping prepared map text is copied" {
+    const allocator = std.testing.allocator;
+    var journal = Journal{ .allocator = allocator };
+    defer journal.deinit();
+    var input = [_]u8{ '0', '1', '2', '3', '4', '5', '6', '7', '8' };
+    const registered = journal.registerLocked(.{
+        .url = "partial-overlap.js",
+        .source = input[1..5],
+        .source_map_url = input[3..7],
+        .end = .{ .line = 0, .column = 4 },
+    });
+    if (registered.published) |info| freeScriptInfo(allocator, info);
+    const script = journal.findByIdLocked(registered.id) orelse return error.MissingScript;
+    try std.testing.expect(!script.source_map_borrowed);
+    try std.testing.expectEqualStrings("3456", script.source_map_url);
+}
+
+test "source journal: eviction releases scripts with borrowed source-map text" {
+    const allocator = std.testing.allocator;
+    var journal = Journal{ .allocator = allocator };
+    defer journal.deinit();
+    for (0..max_retained_scripts + 1) |index| {
+        const url = try std.fmt.allocPrint(allocator, "script-{d}.js", .{index});
+        defer allocator.free(url);
+        const registered = journal.registerLocked(prepare(url, "//# sourceMappingURL=shared.map"));
+        if (registered.published) |info| freeScriptInfo(allocator, info);
+        try std.testing.expect(registered.id != 0);
+    }
+    try std.testing.expectEqual(max_retained_scripts, journal.scripts.items.len);
+    try std.testing.expect(journal.findByIdLocked(1) == null);
+    try std.testing.expect(journal.findByIdLocked(max_retained_scripts + 1) != null);
 }
 
 test "source journal: tags never guess and location completion retains its protocol" {
