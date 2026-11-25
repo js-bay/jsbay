@@ -45,6 +45,9 @@ jobs:
           java-version: '17'
       - uses: android-actions/setup-android@v4.0.4
 
+      - name: Test repository tools
+        run: zig build test-tools --summary all
+
       - name: Native engine + consumers (quickjs_ng / ReleaseSafe)
         env:
           JSBAY_CI_OPTIMIZE: ReleaseSafe
