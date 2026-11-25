@@ -299,6 +299,27 @@ test "generational_slot_map retires slot on generation exhaustion" {
     try testing.expectEqual(@as(u16, 1), decoded2.generation);
 }
 
+test "generational_slot_map retires detached slot on generation exhaustion" {
+    const testing = std.testing;
+    var map = GenerationalSlotMap(u32).init(testing.allocator);
+    defer map.deinit();
+
+    const handle = try map.insert(7, 99, false);
+    map.slots.items[0].generation = std.math.maxInt(u16);
+    const exhausted_handle = Value.fromHandle(7, std.math.maxInt(u16), 0).raw;
+    try testing.expect(map.get(exhausted_handle) != null);
+
+    const detached = map.detachFirstForInstance(7).?;
+    try testing.expectEqual(@as(u32, 99), detached.value);
+    try testing.expectEqual(@as(u16, 0), map.slots.items[0].generation);
+    try testing.expectEqual(hyper_box.SENTINEL_FREE, map.first_free);
+    try testing.expect(map.get(exhausted_handle) == null);
+    try testing.expect(map.get(handle) == null);
+
+    const replacement = Value{ .raw = try map.insert(7, 100, false) };
+    try testing.expectEqual(@as(u20, 1), replacement.decodeHandle().slot_index);
+}
+
 test "hyper_box64 rejects out-of-range SSO length and corrupt inline tags" {
     const testing = std.testing;
     const corrupt_val = Value{ .raw = 0xFFFE_0700_0000_0000 };
