@@ -22,7 +22,13 @@ const legacy = [
   '@jsbay/quickjsngmacosarm64',
   '@jsbay/quickjsngmacosx64',
 ].sort()
-const current = [...legacy, '@jsbay/quickjsng-win32-x64'].sort()
+const current = [
+  '@jsbay/quickjsng-linux-arm64',
+  '@jsbay/quickjsng-linux-x64',
+  '@jsbay/quickjsng-macos-arm64',
+  '@jsbay/quickjsng-macos-x64',
+  '@jsbay/quickjsng-win32-x64',
+].sort()
 const names = Object.keys(dependencies).sort()
 const hasExactVersions = names.every(name => dependencies[name] === version)
 

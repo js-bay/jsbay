@@ -15,7 +15,7 @@ test "Android release publishes Maven metadata and supports both coordinates" {
     const io = std.testing.io;
     const release = try read(allocator, io, ".github/workflows/release.yml");
     const gradle = try read(allocator, io, "sdk/android/jsbay/build.gradle.kts");
-    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbay-quickjs\"", "\"quickjs_ng\" -> \"jsbay-quickjs-ng\"", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
+    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbay-quickjs\"", "\"quickjs_ng\" -> \"jsbay-quickjs-ng\"", "\"quickjs\" -> \"jsbayquickjs\"", "\"quickjs_ng\" -> \"jsbayquickjsng\"", "if (name == \"releaseVariantReleaseApiPublication\" || name == \"releaseVariantReleaseRuntimePublication\")", "outgoing.capability(\"io.jsbay:$jsbayArtifactId:$version\")", "outgoing.capability(\"io.jsbay:$jsbayLegacyArtifactId:$version\")", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
     const publisher = try read(allocator, io, "scripts/publish-android-maven.sh");
     const consumer = try read(allocator, io, "tests/android-sdk/maven-consumer.sh");
     for ([_][]const u8{ "jsbayquickjs", "jsbayquickjsng", "check-maven \"$module_dir\" \"$version\" \"$backend\" \"$artifact\"" }) |needle| try contains(publisher, needle);
