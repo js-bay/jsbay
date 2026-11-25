@@ -1,8 +1,8 @@
 //! Mechanical Sympathy Architecture Performance Benchmark Suite.
 //!
-//! Empirically measures physical performance across runtime subsystem boundaries on target hardware:
+//! Measures isolated implementation comparisons on target hardware; simulated workloads do not imply runtime integration:
 //! 1. C ABI Invocations: Direct AAPCS64 Register-Pass vs Heap Argument Marshalling
-//! 2. Turn Memory Lifecycle: Cache-Line Aligned Frame Bump Arena vs System Malloc
+//! 2. Simulated Turn Allocation: Bump Arena vs System Malloc
 //! 3. MPSC Task Queue: Cache-Line Isolated Mutex vs Unpadded Mutex under Multi-Producer Contention
 //! 4. Static String Dispatch: Compile-Time Minimal Perfect Hash vs Linear Strcmp Chain
 //! 5. String Transcoding: 16-Byte SIMD NEON Vectorized vs Scalar Byte Loop
@@ -65,7 +65,7 @@ noinline fn mockCallTargetSlice(args: []const u64) u64 {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Frame-Scaffolded Bump Arena per Turn vs Malloc
+// 2. Simulated Bump Arena per Turn vs Malloc
 // ---------------------------------------------------------------------------
 const MockTask = struct {
     id: u32,

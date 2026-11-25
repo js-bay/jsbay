@@ -118,6 +118,7 @@ comptime {
     _ = @import("promise_state_tests.zig");
     // Escargot: PromiseRejectCallback wired. Hermes/JSC: setRejectionTracker returns false (tests no-op).
     _ = @import("rejection_tracker_tests.zig");
+    if (!spike) _ = @import("rejection_tracker_recovery_tests.zig");
     if (!spike) {
         _ = @import("engine_thread_guard_tests.zig");
         _ = @import("finalizer_contract_tests.zig");

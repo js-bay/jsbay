@@ -112,49 +112,6 @@ pub const EngineInstance = struct {
     event_user_data: ?*anyopaque = null,
     /// Bookkeeping list for live Global(T) / Weak(T) references.
     ref_bookkeeping: RefBookkeeping = .{},
-    /// Frame bump arena for per-turn transient memory, bulk-reset at checkpoint boundaries.
-    turn_arena: FrameArena = .{},
-};
-
-/// Fixed-capacity cache-line aligned bump arena for per-turn transient allocations.
-pub const FrameArena = struct {
-    const BUFFER_CAP: usize = 64 * 1024;
-    buffer: [BUFFER_CAP]u8 align(64) = undefined,
-    offset: usize = 0,
-
-    pub fn allocator(self: *FrameArena) std.mem.Allocator {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .alloc = allocFn,
-                .resize = resizeFn,
-                .free = freeFn,
-            },
-        };
-    }
-
-    fn allocFn(ctx: *anyopaque, len: usize, ptr_align: u8, ret_addr: usize) ?[*]u8 {
-        _ = ret_addr;
-        const self: *FrameArena = @ptrCast(@alignCast(ctx));
-        const align_size = @as(usize, 1) << @intCast(ptr_align);
-        const aligned = std.mem.alignForward(usize, self.offset, align_size);
-        if (aligned > BUFFER_CAP or len > BUFFER_CAP - aligned) return null;
-        self.offset = aligned + len;
-        return @ptrCast(&self.buffer[aligned]);
-    }
-
-    fn resizeFn(ctx: *anyopaque, buf: []u8, buf_align: u8, new_len: usize, ret_addr: usize) bool {
-        _ = .{ ctx, buf, buf_align, new_len, ret_addr };
-        return false;
-    }
-
-    fn freeFn(ctx: *anyopaque, buf: []u8, buf_align: u8, ret_addr: usize) void {
-        _ = .{ ctx, buf, buf_align, ret_addr };
-    }
-
-    pub fn reset(self: *FrameArena) void {
-        self.offset = 0;
-    }
 };
 
 /// Queue for dispatched tasks (thread-safe via task_mutex on EngineInstance).
