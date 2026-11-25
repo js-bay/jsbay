@@ -90,7 +90,7 @@ async function main() {
     const interruptReady = await nextMessage(message => message.type === 'ready' && message.name === 'interrupt', 'interrupt worker readiness')
     await nextMessage(message => message.type === 'evaluating' && message.name === 'interrupt', 'interrupt evaluation start')
     const { Engine } = require(entry)
-    assert.equal(process.env.JSC_usePollingTraps, 'true', 'the main entry selects polling traps before loading the addon')
+    assert.equal(process.env.JSC_usePollingTraps, undefined, 'the package entry leaves process configuration to core')
     assert.equal(Engine.capabilities().executionLimit, true)
     assert.equal(Engine.requestInterrupt(interruptReady.token), true)
     const interruptResult = await nextMessage(message => message.type === 'result' && message.name === 'interrupt', 'worker interrupt')
@@ -105,6 +105,36 @@ async function main() {
     await nextMessage(message => message.type === 'closed' && message.name === 'shutdown-deadline', 'shutdown worker close')
   } finally {
     await worker.terminate()
+  }
+
+  const alternateEnvWorker = new Worker(`
+    const { parentPort, workerData } = require('node:worker_threads')
+    const { Engine } = require(workerData.entry)
+    const engine = Engine.create()
+    parentPort.postMessage({ type: 'capability', value: Engine.capabilities().executionLimit })
+    engine.setExecutionTimeLimit(100)
+    try {
+      engine.evaluate('while (true) {}')
+      parentPort.postMessage({ type: 'result', outcome: 'completed' })
+    } catch (error) {
+      parentPort.postMessage({ type: 'result', outcome: 'threw', message: String(error.message) })
+    } finally {
+      engine.close()
+      parentPort.postMessage({ type: 'closed' })
+    }
+  `, {
+    eval: true,
+    workerData: { entry },
+    env: { ...process.env, JSC_usePollingTraps: 'false' },
+  })
+  try {
+    const nextMessage = createInbox(alternateEnvWorker)
+    assert.equal((await nextMessage(message => message.type === 'capability', 'alternate Worker capability')).value, true)
+    const result = await nextMessage(message => message.type === 'result', 'alternate Worker deadline')
+    assert.equal(result.outcome, 'threw', 'the core process configuration governs a Worker with a private environment')
+    await nextMessage(message => message.type === 'closed', 'alternate Worker close')
+  } finally {
+    await alternateEnvWorker.terminate()
   }
 }
 

@@ -263,13 +263,21 @@ fn rearmOneHermesStop(instance_id: i32) void {
 /// Escargot/Hermes spikes: false — user interrupt must not be advertised as mid-script cancel.
 pub fn supportsMidScriptUserInterrupt() bool {
     return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng, .jsc => true,
+        .quickjs, .quickjs_ng => true,
+        .jsc => @import("../backend/jsc/polling_config.zig").supportsInterrupt(),
         .escargot, .hermes => false,
     };
 }
 
+fn jscPollingControlsUnavailable(instance_id: i32) bool {
+    if (comptime !backend.isPacked(.jsc)) return false;
+    const ptrs = instance_map.getPtrs(instance_id) orelse return false;
+    return ptrs.backend_tag == .jsc and !@import("../backend/jsc/polling_config.zig").supportsInterrupt();
+}
+
 /// Request mid-script interrupt when the backend supports it. Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed). Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
+    if (jscPollingControlsUnavailable(instance_id)) return false;
     if (!supportsMidScriptUserInterrupt()) {
         // Refuse to claim mid-script stop. Do not set the user bit (avoids false isInterruptRequested).
         registry_mutex.lock();
@@ -324,6 +332,7 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
 
 /// A generation-scoped host shutdown is terminal for this runtime generation. Engine-thread stop/restart paths may clear their bit, so this uses a separate bit that is cleared only when runtime-control state is destroyed.
 pub fn requestShutdownCancel(instance_id: i32) bool {
+    if (jscPollingControlsUnavailable(instance_id)) return false;
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
@@ -346,6 +355,7 @@ fn refreshShutdown(state: *InterruptState, now: u64) void {
 
 /// Arm the generation's graceful-shutdown deadline without discarding messages already in a host transport. Repeated begins never extend the first deadline; the host sends its final fence through that same transport before sealing core submission.
 pub fn beginShutdown(instance_id: i32, millis: u64) bool {
+    if (jscPollingControlsUnavailable(instance_id)) return false;
     if (millis == 0) return false;
     registry_mutex.lock();
     defer registry_mutex.unlock();
@@ -455,6 +465,7 @@ fn armJscWatchdogShortLimit(instance_id: i32, millis: u64) void {
 ///
 /// Enforcement precision varies by backend: QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops); JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at min(remaining, 50ms) intervals (clamped to >= 5ms).
 pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
+    if (jscPollingControlsUnavailable(instance_id)) return false;
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
@@ -477,6 +488,7 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
 
 /// Configure a deadline applied to each outer VM entry. Zero disables it; idle time never consumes this budget.
 pub fn setExecutionBudget(instance_id: i32, millis: u64) bool {
+    if (jscPollingControlsUnavailable(instance_id)) return false;
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;

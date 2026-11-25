@@ -2,12 +2,7 @@
 
 const { join } = require('node:path')
 const manifest = require('./package.json')
-const backend = manifest.jsbayBackend || process.env.JSBAY_NODE_BACKEND
-
-if (backend === 'jsc' && process.platform === 'darwin' && process.arch === 'arm64' &&
-    process.env.JSC_usePollingTraps === undefined) {
-  process.env.JSC_usePollingTraps = 'true'
-}
+const backend = manifest.jsbayBackend
 
 if (process.env.JSBAY_NODE_ADDON) {
   module.exports = require(process.env.JSBAY_NODE_ADDON)

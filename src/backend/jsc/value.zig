@@ -163,6 +163,7 @@ pub fn isBigIntFunction(ctx: Context) ?jsc.JSObjectRef {
 
 test "JSC context intrinsics remain usable when BigInt is absent" {
     const testing = std.testing;
+    if (!@import("polling_config.zig").prepareBeforeVm()) return error.RuntimeCreationFailed;
     const group = jsc.JSContextGroupCreate() orelse return error.OutOfMemory;
     defer jsc.JSContextGroupRelease(group);
     const ctx = jsc.JSGlobalContextCreateInGroup(group, null) orelse return error.OutOfMemory;

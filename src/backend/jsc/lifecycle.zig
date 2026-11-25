@@ -12,6 +12,7 @@ pub const Runtime = jsc.JSContextGroupRef;
 pub const Context = jsc.JSGlobalContextRef;
 
 pub fn newRuntime() ?Runtime {
+    if (!@import("polling_config.zig").prepareBeforeVm()) return null;
     return jsc.JSContextGroupCreate();
 }
 

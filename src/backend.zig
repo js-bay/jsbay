@@ -142,7 +142,11 @@ pub const CapabilityFlags = struct {
 pub fn libraryCapabilityFlags() u32 {
     var flags: u32 = 0;
     // Interrupt + execution deadline only when mid-script requestInterrupt is real (QJS interrupt handler / JSC time-limit). Escargot/Hermes refuse requestInterrupt — clear CAP_INTERRUPT_DEADLINE so capability discovery matches runtime_control.supportsMidScriptUserInterrupt.
-    if (!isSpikeBackend(active_backend)) {
+    const interrupt_supported = if (active_backend == .jsc)
+        @import("backend/jsc/polling_config.zig").supportsInterrupt()
+    else
+        !isSpikeBackend(active_backend);
+    if (interrupt_supported) {
         flags |= CapabilityFlags.interrupt_deadline;
     }
     if (isQuickJsApiBackend(active_backend)) {

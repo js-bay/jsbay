@@ -40,7 +40,7 @@ run_extended_contract_consumer() {
   local addon=$2
   local -a public_env=(env JSBAY_NODE_ADDON="$addon")
   if [[ ${JSBAY_NODE_BACKEND:-} == jsc && ${JSBAY_NODE_PLATFORM:-} == darwin && ${JSBAY_NODE_ARCH:-} == arm64 ]]; then
-    public_env+=(JSBAY_NODE_BACKEND=jsc JSBAY_NODE_PUBLIC_ENTRY="$root/sdk/node/index.cjs")
+    public_env+=(JSBAY_NODE_PUBLIC_ENTRY="$root/sdk/node/index.cjs")
   fi
   printf 'node SDK stage start: %s\n' "$name"
   local first_status=0
@@ -50,26 +50,16 @@ run_extended_contract_consumer() {
   else
     first_status=$?
   fi
-  if [[ ${JSBAY_NODE_BACKEND:-} == jsc && ${JSBAY_NODE_PLATFORM:-} == darwin && ${JSBAY_NODE_ARCH:-} == arm64 ]]; then
-    printf 'node SDK diagnostic retry start: %s with polling VM traps\n' "$name"
-    local retry_status=0
-    if env JSC_usePollingTraps=true JSBAY_NODE_ADDON="$addon" JSBAY_NODE_BACKEND=jsc JSBAY_NODE_PUBLIC_ENTRY="$root/sdk/node/index.cjs" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"; then
-      printf 'node SDK diagnostic retry passed: %s\n' "$name"
-    else
-      retry_status=$?
-      printf 'node SDK diagnostic retry failed: %s (exit %s)\n' "$name" "$retry_status"
-    fi
-    printf 'node SDK preserving first failure: %s (exit %s)\n' "$name" "$first_status"
-  fi
   return "$first_status"
 }
 run_jsc_arm64_public_entry_contracts() {
   if [[ ${JSBAY_NODE_BACKEND:-} != jsc || ${JSBAY_NODE_PLATFORM:-} != darwin || ${JSBAY_NODE_ARCH:-} != arm64 ]]; then return; fi
   local entry="$root/sdk/node/index.cjs"
-  run_stage 'JSC package entry enables polling by default' env -u JSC_usePollingTraps JSBAY_NODE_ADDON="$addon" JSBAY_NODE_BACKEND=jsc JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/jsc-polling-config-consumer.cjs" true
-  run_stage 'JSC package entry preserves explicit polling opt-in' env JSC_usePollingTraps=1 JSBAY_NODE_ADDON="$addon" JSBAY_NODE_BACKEND=jsc JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/jsc-polling-config-consumer.cjs" 1
-  run_stage 'JSC package entry rejects explicit polling opt-out' env JSC_usePollingTraps=false JSBAY_NODE_ADDON="$addon" JSBAY_NODE_BACKEND=jsc JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/jsc-polling-config-consumer.cjs" false
-  run_stage 'JSC Worker first addon load can interrupt execution' env -u JSC_usePollingTraps JSBAY_NODE_ADDON="$addon" JSBAY_NODE_BACKEND=jsc JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" "$root/tests/node-sdk/jsc-worker-first-load-consumer.cjs"
+  run_stage 'JSC core defaults polling before its first VM' env -u JSC_usePollingTraps JSBAY_NODE_ADDON="$addon" JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/jsc-polling-config-consumer.cjs" true
+  run_stage 'JSC core preserves explicit polling opt-in' env JSC_usePollingTraps=1 JSBAY_NODE_ADDON="$addon" JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/jsc-polling-config-consumer.cjs" 1
+  run_stage 'JSC core disables interrupt controls for explicit opt-out' env JSC_usePollingTraps=false JSBAY_NODE_ADDON="$addon" JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/jsc-polling-config-consumer.cjs" false
+  run_stage 'JSC core rejects an invalid polling option' env JSC_usePollingTraps=maybe JSBAY_NODE_ADDON="$addon" JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/jsc-polling-config-consumer.cjs" maybe
+  run_stage 'JSC Worker first addon load can interrupt execution' env -u JSC_usePollingTraps JSBAY_NODE_ADDON="$addon" JSBAY_NODE_PUBLIC_ENTRY="$entry" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" "$root/tests/node-sdk/jsc-worker-first-load-consumer.cjs"
 }
 case "$(uname -s)" in
   Darwin) flags=(-dynamiclib -undefined dynamic_lookup -framework JavaScriptCore -framework Foundation) ;;
