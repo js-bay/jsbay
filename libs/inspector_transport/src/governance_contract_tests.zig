@@ -521,6 +521,40 @@ const RepeatedSender = struct {
     }
 };
 
+const LargeWriteBarrier = struct {
+    mutex: zev.Mutex = .{},
+    changed: zev.Condition = .init,
+    entered: bool = false,
+    released: bool = false,
+
+    fn observe(ctx: ?*anyopaque, payload: []const u8) void {
+        _ = payload;
+        const self: *LargeWriteBarrier = @ptrCast(@alignCast(ctx.?));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.entered) return;
+        self.entered = true;
+        self.changed.broadcast();
+        while (!self.released) self.changed.wait(&self.mutex);
+    }
+
+    fn waitUntilEntered(self: *LargeWriteBarrier) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.entered) {
+            if (self.changed.waitTimeout(&self.mutex, 10_000) == .timed_out) return false;
+        }
+        return true;
+    }
+
+    fn release(self: *LargeWriteBarrier) void {
+        self.mutex.lock();
+        self.released = true;
+        self.changed.broadcast();
+        self.mutex.unlock();
+    }
+};
+
 const ReentrantDeinitProbe = struct {
     transport_ptr: ?*transport.Transport = null,
     target_event: transport.EventKind,
@@ -884,12 +918,17 @@ test "transport: large message within 64 MiB limit is delivered successfully and
 
 test "transport: at most one large message waits in queue while another is being written" {
     const alloc = testing.allocator;
+    var barrier = LargeWriteBarrier{};
+    defer barrier.changed.deinit();
+    defer barrier.mutex.deinit();
     var opened = Opened{};
     defer opened.changed.deinit();
     defer opened.mutex.deinit();
     // Use smaller limits to test gating deterministically: 64 KiB backlog, 2 MiB max message.
     const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 64 * 1024, .max_message_bytes = 2 * 1024 * 1024 });
     defer t.deinit();
+    defer barrier.release();
+    transport.Transport.test_only.setWriterHook(t, LargeWriteBarrier.observe, &barrier);
     t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "large-in-flight-peer" });
     try t.start(&opened, Opened.handler);
 
@@ -898,7 +937,6 @@ test "transport: at most one large message waits in queue while another is being
     try handshake(peer, "large-in-flight-peer");
     const session = opened.wait(1);
 
-    try peer.setReceiveBuffer(4096);
     const large1 = try alloc.alloc(u8, 1500 * 1024);
     defer alloc.free(large1);
     @memset(large1, 'a');
@@ -912,14 +950,10 @@ test "transport: at most one large message waits in queue while another is being
     @memset(large3, 'c');
 
     try testing.expect(t.sendText(session, large1));
-    var queued = false;
-    var attempts: usize = 0;
-    while (!queued and attempts < 500) : (attempts += 1) {
-        queued = t.sendText(session, large2);
-        if (!queued) zev.sleepMilliseconds(1);
-    }
-    try testing.expect(queued);
+    try testing.expect(barrier.waitUntilEntered());
+    try testing.expect(t.sendText(session, large2));
     try testing.expect(!t.sendText(session, large3));
+    barrier.release();
 
     const received1 = try readTextFrame(alloc, peer);
     defer alloc.free(received1);

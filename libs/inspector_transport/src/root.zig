@@ -12,6 +12,7 @@
 //! Explicitly NOT responsible for CDP protocol semantics; this is pure transport. Higher layers compose JSON-RPC on top.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const inspector = @import("inspector");
 const zev = @import("zev");
 const socket = @import("portable_socket");
@@ -338,6 +339,15 @@ const SessionEntry = struct {
 };
 
 pub const Transport = struct {
+    const WriterHook = *const fn (?*anyopaque, []const u8) void;
+
+    pub const test_only = if (builtin.is_test) struct {
+        pub fn setWriterHook(self: *Transport, hook: WriterHook, context: ?*anyopaque) void {
+            self.testing_writer_hook = hook;
+            self.testing_writer_hook_context = context;
+        }
+    } else struct {};
+
     /// Adapter used by Inspector. The HTTP/WebSocket server remains optional:
     /// callers may instead implement this same Inspector transport interface.
     interface: inspector.Transport = undefined,
@@ -369,6 +379,8 @@ pub const Transport = struct {
     deferred_deinit: bool = false,
     deinit_started: std.atomic.Value(bool) = .init(false),
     callback_leases: usize = 0,
+    testing_writer_hook: if (builtin.is_test) ?WriterHook else void = if (builtin.is_test) null else {},
+    testing_writer_hook_context: if (builtin.is_test) ?*anyopaque else void = if (builtin.is_test) null else {},
 
     /// Monotonic session id counter (starts at 1).
     next_session_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
@@ -1075,6 +1087,10 @@ fn writerLoop(sess: *Session) void {
             sess.large_message_in_flight = false;
         }
         sess.queue_mu.unlock();
+
+        if (builtin.is_test) {
+            if (t.testing_writer_hook) |hook| hook(t.testing_writer_hook_context, frame.bytes);
+        }
 
         const ok = writeFrame(sess, frame.kind, frame.bytes);
         const close_after = frame.kind == .close;
