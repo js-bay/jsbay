@@ -262,6 +262,7 @@ jobs:
 
       - name: Test the release addon
         if: ${{ !inputs.verify_published && matrix.platform != 'win32' }}
+        timeout-minutes: 15
         shell: bash
         run: |
           set -euo pipefail

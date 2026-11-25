@@ -30,6 +30,9 @@ assert.match(ci, /node-npm-version:[\s\S]*?uses: actions\/setup-node@v6[\s\S]*?n
 assert.match(ci, /node-npm-packages:[\s\S]*?if: github\.event_name == 'pull_request'[\s\S]*?needs: node-npm-version[\s\S]*?uses: \.\/\.github\/workflows\/npm-packages\.yml[\s\S]*?tag: \$\{\{ needs\.node-npm-version\.outputs\.tag \}\}/)
 assert.match(ci, /node-npm-packages:[\s\S]*?name: Node npm platform matrix \(Windows MSVC and Electron\)/)
 assert.match(npmWorkflow, /platform: win32[\s\S]*?arch: x64[\s\S]*?runner: windows-2025/)
+const releaseAddonStep = npmWorkflow.match(/      - name: Test the release addon[\s\S]*?(?=\n      - name:|\n  collect-packages:)/)?.[0]
+assert.ok(releaseAddonStep, 'the release addon consumer step exists')
+assert.match(releaseAddonStep, /^        timeout-minutes: 15$/m, 'the release addon consumer step has a finite hard timeout')
 assert.equal(
   [...npmWorkflow.matchAll(/^\s+JSBAY_NPM_PLATFORM:\s+\$\{\{\s*matrix\.platform\s*\}\}\s*$/gm)].length,
   3,

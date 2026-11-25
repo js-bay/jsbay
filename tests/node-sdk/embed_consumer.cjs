@@ -62,9 +62,13 @@ async function main() {
   )
   const raced = addon.create(706)
   try {
+    console.log('embedded generation replacement: starting concurrent destroy')
     assert.equal(addon.raceDestroyAndReplace(706, raced.generation), true)
+    console.log('embedded generation replacement: destroy and replace returned')
     assert.throws(() => raced.evaluate('40 + 2', 'raced-stale.js'))
+    console.log('embedded generation replacement: stale evaluation rejected')
     await raced.closeAsync()
+    console.log('embedded generation replacement: stale Engine closed')
     assert.equal(
       addon.replacementGenerationIsAlive(),
       true,
