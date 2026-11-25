@@ -5,6 +5,7 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/jsbay-maven-consumer-auth-test.XXXXXX")
 trap 'rm -rf "$temporary"' EXIT
 token_marker="consumer-contract-$$"
+node "$root/tests/android-sdk/maven-capability-conflict-test.mjs"
 cat > "$temporary/module-metadata.json" <<'EOF'
 {
   "variants": [

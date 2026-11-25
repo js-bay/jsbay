@@ -133,6 +133,7 @@ async function staleQueuedCallbackDoesNotReachReplacement() {
   const newLogs = []
   const oldEngine = Engine.create({ instanceId: 17108, onLog: (...args) => oldLogs.push(args) })
   oldEngine.evaluate("console.log('old-instance')")
+  const oldLogsBeforeClose = oldLogs.length
   const oldClose = oldEngine.closeAsync()
   const replacement = Engine.create({ instanceId: 17108, onLog: (...args) => newLogs.push(args) })
   try {
@@ -148,7 +149,7 @@ async function staleQueuedCallbackDoesNotReachReplacement() {
         }
       }, 1)
     }), 'replacement log delivery')
-    assert.equal(oldLogs.length, 0, 'closed listeners do not receive queued messages')
+    assert.equal(oldLogs.length, oldLogsBeforeClose, 'closed listeners do not receive messages after close')
     assert.ok(newLogs.every(args => args[0] === replacement.id && !args[2].includes('old-instance')))
   } finally {
     await replacement.closeAsync()

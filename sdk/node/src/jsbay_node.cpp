@@ -1021,6 +1021,7 @@ static void requestClose(Engine *engine) {
         return;
     engine->closed = true;
     engine->destroy_pending = true;
+    releaseBridge(engine->callbacks);
     rejectObservers(engine);
     if (engine->active_operations == 0)
         finishClose(engine);

@@ -55,6 +55,7 @@ assert.match(nodeCmake, /jsbay\.lib on Windows, libjsbay\.a on Unix-like systems
 assert.match(build, /build_support\.linkMathLibrary\(lib_module, os\)/)
 assert.match(buildSupport, /pub fn linkMathLibrary[\s\S]*?if \(os == \.windows\) return;[\s\S]*?linkSystemLibrary\(\"m\"/, 'the core library skips libm on Windows')
 assert.ok(nodeCmake.includes('target_link_libraries(jsbay_node PRIVATE ${NODE_LIBRARY} delayimp ws2_32)'), 'Windows Node addons link Winsock for the bundled Inspector transport')
+assert.match(nodeCmake, /if\(WIN32\)[\s\S]*?target_compile_definitions\(jsbay_node PRIVATE NOMINMAX\)/, 'the Windows addon disables the max macro from its dependencies')
 assert.match(inspectorConsumer, /inspectorStart\(0\)/)
 assert.match(inspectorConsumer, /127\.0\.0\.1/)
 assert.match(inspectorConsumer, /webSocketDebuggerUrl/)

@@ -237,9 +237,9 @@ EOF
         echo 'Expected Gradle to reject mixed legacy and current Maven coordinates' >&2
         exit 1
     fi
-    if ! grep -Fq "Both provide capability 'io.jsbay:$legacy_artifact:$VERSION'" "$OUT/legacy-conflict.log"; then
+    if ! node "$script_dir/check-maven-capability-conflict.mjs" \
+        "$OUT/legacy-conflict.log" "$artifact" "$legacy_artifact" "$VERSION"; then
         cat "$OUT/legacy-conflict.log" >&2
-        echo 'Gradle failed for a reason other than the expected legacy coordinate capability conflict' >&2
         exit 1
     fi
     printf 'PASS: Gradle rejected mixed Maven coordinates through capability %s\n' "io.jsbay:$legacy_artifact:$VERSION"
