@@ -47,7 +47,7 @@ pub fn run(
         cb(user_data);
         return ok_status;
     }
-    var op = switch (Operations.beginGenerationScopeOp(id)) {
+    var op = switch (Operations.beginGenerationScopeOp(id, generation)) {
         .status => |status| return if (instance_map.generationOf(id) != generation) instance_not_found else status,
         .ok => |value| value,
     };

@@ -14,6 +14,10 @@ const ActiveEngine = backend.ActiveEngine;
 const packed_value_bytes = @import("packed_value_bytes.zig");
 const packed_readiness = @import("packed_readiness.zig");
 const packed_generation_scope = @import("packed_generation_scope.zig");
+const admission = @import("value_operation_admission.zig");
+
+pub const setBeforeOwnerCheckHookForTesting = admission.setBeforeOwnerCheckHookForTesting;
+pub const setBeforeBackendEnterHookForTesting = admission.setBeforeBackendEnterHookForTesting;
 
 /// Boundary-owned status numbers and C byte layout are supplied once by c_api; this module never imports the export layer. This is not a backend or handle-store abstraction.
 pub const StatusCodes = struct {
@@ -63,23 +67,30 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
         pub const ApiOpResult = union(enum) { ok: ApiOp, status: c_int };
 
         pub fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
-            return beginApiOpModeWithLoopCheck(id, require_execution, true);
+            return beginApiOpModeWithLoopCheck(id, require_execution, true, null);
         }
 
-        pub fn beginGenerationScopeOp(id: i32) ApiOpResult {
-            return beginApiOpModeWithLoopCheck(id, false, false);
+        pub fn beginGenerationScopeOp(id: i32, expected_generation: u64) ApiOpResult {
+            return beginApiOpModeWithLoopCheck(id, false, false, expected_generation);
         }
 
-        fn beginApiOpModeWithLoopCheck(id: i32, require_execution: bool, check_loop_error: bool) ApiOpResult {
+        fn beginApiOpModeWithLoopCheck(id: i32, require_execution: bool, check_loop_error: bool, expected_generation: ?u64) ApiOpResult {
             if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
             if (@import("../runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
-            if (!api_value.isOwner(id)) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+            admission.runBeforeOwnerCheckHookForTesting();
+            if (!api_value.isOwner(id)) return .{ .status = admission.ownerAdmissionFailureStatus(id, API_WRONG_THREAD, API_INSTANCE_NOT_FOUND) };
             const lease = engine_thread.beginEval(id);
-            if (!lease.allowed) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+            if (!lease.allowed) return .{ .status = admission.ownerAdmissionFailureStatus(id, API_WRONG_THREAD, API_INSTANCE_NOT_FOUND) };
             const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
+            if (expected_generation) |expected| {
+                if (inst.generation != expected or lease.generation != expected) {
+                    engine.finishEvalEntry(id, lease);
+                    return .{ .status = API_INSTANCE_NOT_FOUND };
+                }
+            }
             if (check_loop_error and inst.loop.lastError() != null) {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_LOOP_FAILED };
@@ -88,6 +99,7 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
+            admission.runBeforeBackendEnterHookForTesting();
             const entered_js = if (comptime backend.isQuickJsApiBackend(backend.active_backend)) backend.ActiveEngineModule.lifecycle.enterJs(ctx) else true;
             if (!entered_js) {
                 engine.finishEvalEntry(id, lease);

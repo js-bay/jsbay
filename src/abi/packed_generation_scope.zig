@@ -16,11 +16,13 @@ pub fn begin(
     if (host_wake.isNotifying()) return .{ .status = invalid_argument };
     if (instance_map.isTeardownPending(instance_id)) return .{ .status = instance_not_found };
     if (!api_value.isOwner(instance_id)) {
-        return .{ .status = if (instance_map.getPtrs(instance_id) == null) instance_not_found else wrong_thread };
+        return .{ .status = if (instance_map.isTeardownPending(instance_id) or
+            instance_map.getPtrs(instance_id) == null) instance_not_found else wrong_thread };
     }
     const lease = engine_thread.beginEval(instance_id);
     if (!lease.allowed) {
-        return .{ .status = if (instance_map.getPtrs(instance_id) == null) instance_not_found else wrong_thread };
+        return .{ .status = if (instance_map.isTeardownPending(instance_id) or
+            instance_map.getPtrs(instance_id) == null) instance_not_found else wrong_thread };
     }
     const inst = instance_map.getInstance(instance_id) orelse {
         engine.finishEvalEntry(instance_id, lease);
