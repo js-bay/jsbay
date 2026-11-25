@@ -5,6 +5,7 @@ const wir = @import("wir.zig");
 const plist = @import("plist.zig");
 const transport = @import("inspector_transport");
 const zev = @import("zev");
+const local_reply = @import("local_reply.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -539,22 +540,17 @@ pub const Bridge = struct {
     }
 
     fn localReply(self: *Bridge, session_id: transport.SessionId, id: std.json.Value, name: []const u8) void {
-        if (std.mem.eql(u8, name, "Schema.getDomains")) return self.replyResult(session_id, id, "{\"domains\":[]}");
-        if (std.mem.endsWith(u8, name, ".enable") or std.mem.endsWith(u8, name, ".disable")) return self.replyResult(session_id, id, "{}");
-        if (std.mem.eql(u8, name, "Target.setAutoAttach") or std.mem.eql(u8, name, "Target.setDiscoverTargets")) return self.replyResult(session_id, id, "{}");
-        if (std.mem.eql(u8, name, "Runtime.getHeapUsage")) return self.replyResult(session_id, id, "{\"usedSize\":0,\"totalSize\":0}");
+        if (std.mem.eql(u8, name, "Schema.getDomains")) return self.replyResult(session_id, id, .domains_empty);
+        if (std.mem.endsWith(u8, name, ".enable") or std.mem.endsWith(u8, name, ".disable")) return self.replyResult(session_id, id, .empty);
+        if (std.mem.eql(u8, name, "Target.setAutoAttach") or std.mem.eql(u8, name, "Target.setDiscoverTargets")) return self.replyResult(session_id, id, .empty);
+        if (std.mem.eql(u8, name, "Runtime.getHeapUsage")) return self.replyResult(session_id, id, .heap_usage_zero);
         self.replyError(session_id, id, -32601, "Method not found");
     }
 
-    fn replyResult(self: *Bridge, session_id: transport.SessionId, id: std.json.Value, result_json: []const u8) void {
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer arena.deinit();
-        var object = std.json.ObjectMap{};
-        object.put(arena.allocator(), "id", id) catch return;
-        const result = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), result_json, .{}) catch return;
-        object.put(arena.allocator(), "result", result) catch return;
-        var writer: std.Io.Writer.Allocating = .init(arena.allocator());
-        std.json.Stringify.value(std.json.Value{ .object = object }, .{}, &writer.writer) catch return;
+    fn replyResult(self: *Bridge, session_id: transport.SessionId, id: std.json.Value, result: local_reply.Result) void {
+        var writer: std.Io.Writer.Allocating = .init(self.allocator);
+        defer writer.deinit();
+        local_reply.write(&writer.writer, id, result) catch return;
         _ = self.frontend.sendText(session_id, writer.written());
     }
 
@@ -714,7 +710,7 @@ pub const Bridge = struct {
         var writer: std.Io.Writer.Allocating = .init(allocator);
         defer writer.deinit();
         std.json.Stringify.value(properties, .{}, &writer.writer) catch return null;
-        return allocator.dupe(u8, writer.written()) catch null;
+        return writer.toOwnedSlice() catch null;
     }
 
     /// Routes one relay notification or reply. Exposed so tests can feed scripted relay traffic.
@@ -803,7 +799,7 @@ pub const Bridge = struct {
             return;
         };
         self.mutex.unlock();
-        self.replyResult(pending.value.session, .{ .integer = pending.value.client_id }, "{}");
+        self.replyResult(pending.value.session, .{ .integer = pending.value.client_id }, .empty);
     }
 
     fn take(self: *Bridge, relay_id: u64) ?Pending {
