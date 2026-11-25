@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cstdio>
 #include <node_api.h>
+#include <thread>
 #include <utility>
 
 #include "jsbay_node_embed.h"
@@ -19,6 +20,49 @@ std::atomic<unsigned> task_leaves{0};
 std::atomic<unsigned> close_attempts{0};
 std::atomic<unsigned> destroy_during_log{0};
 std::atomic<bool> log_active{false};
+jsbay_value_t replacement_value = 0;
+int replacement_id = 0;
+
+struct GenerationDestroyRace {
+    int id;
+    uint64_t generation;
+    std::atomic<bool> callback_entered{false};
+    std::atomic<bool> destroy_started{false};
+    std::atomic<int> stale_scope_status{-1};
+    std::atomic<bool> replacement_created{false};
+};
+
+void noopGenerationScope(void *) {}
+
+void generationDestroyCallback(void *opaque) {
+    auto *race = static_cast<GenerationDestroyRace *>(opaque);
+    race->callback_entered.store(true);
+    while (!race->destroy_started.load())
+        std::this_thread::yield();
+    jsbay_status_t status = JSBAY_OK;
+    while (status == JSBAY_OK) {
+        status = jsbay_engine_with_generation_scope(race->id, race->generation, noopGenerationScope,
+                                                    nullptr);
+        if (status == JSBAY_OK)
+            std::this_thread::yield();
+    }
+    race->stale_scope_status.store(status);
+    jsbay_engine_destroy_generation(race->id, race->generation);
+}
+
+void destroyAndReplaceGeneration(GenerationDestroyRace *race) {
+    while (!race->callback_entered.load())
+        std::this_thread::yield();
+    race->destroy_started.store(true);
+    jsbay_engine_destroy_generation(race->id, race->generation);
+    if (!jsbay_engine_create(race->id, nullptr, nullptr))
+        return;
+    replacement_id = race->id;
+    if (jsbay_value_new_number(race->id, 42, &replacement_value) == JSBAY_OK)
+        race->replacement_created.store(true);
+    else
+        jsbay_engine_destroy(race->id);
+}
 
 void log(int, jsbay_log_level_t, const char *, void *data) {
     ++logs;
@@ -143,6 +187,93 @@ napi_value tryDuplicate(napi_env env, napi_callback_info info) {
     napi_get_boolean(env, false, &result);
     return result;
 }
+napi_value destroyAndReplace(napi_env env, napi_callback_info info) {
+    size_t count = 1;
+    napi_value args[1];
+    napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
+    int32_t id = 0;
+    if (count != 1 || napi_get_value_int32(env, args[0], &id) != napi_ok) {
+        napi_throw_type_error(env, nullptr, "instance id is required");
+        return nullptr;
+    }
+    jsbay_engine_destroy(id);
+    if (!jsbay_engine_create(id, nullptr, nullptr)) {
+        napi_throw_error(env, nullptr, "could not recreate the C ABI engine");
+        return nullptr;
+    }
+    replacement_id = id;
+    if (jsbay_value_new_number(id, 42, &replacement_value) != JSBAY_OK) {
+        jsbay_engine_destroy(id);
+        replacement_id = 0;
+        napi_throw_error(env, nullptr, "could not create a replacement-generation value");
+        return nullptr;
+    }
+    napi_value result;
+    napi_get_boolean(env, true, &result);
+    return result;
+}
+napi_value raceDestroyAndReplace(napi_env env, napi_callback_info info) {
+    size_t count = 2;
+    napi_value args[2];
+    napi_get_cb_info(env, info, &count, args, nullptr, nullptr);
+    int32_t id = 0;
+    uint64_t generation = 0;
+    bool lossless = false;
+    if (count != 2 || napi_get_value_int32(env, args[0], &id) != napi_ok ||
+        napi_get_value_bigint_uint64(env, args[1], &generation, &lossless) != napi_ok ||
+        !lossless) {
+        napi_throw_type_error(env, nullptr, "instance id and generation are required");
+        return nullptr;
+    }
+    GenerationDestroyRace race{id, generation};
+    std::thread worker;
+    try {
+        worker = std::thread(destroyAndReplaceGeneration, &race);
+    } catch (...) {
+        napi_throw_error(env, nullptr, "could not start generation replacement thread");
+        return nullptr;
+    }
+    const jsbay_status_t scope_status =
+        jsbay_engine_with_generation_scope(id, generation, generationDestroyCallback, &race);
+    worker.join();
+    napi_value result;
+    napi_get_boolean(env,
+                     scope_status == JSBAY_OK &&
+                         race.stale_scope_status.load() == JSBAY_INSTANCE_NOT_FOUND &&
+                         race.replacement_created.load(),
+                     &result);
+    return result;
+}
+napi_value replacementValueIsAlive(napi_env env, napi_callback_info) {
+    double number = 0;
+    const jsbay_status_t status =
+        replacement_value ? jsbay_value_to_number(replacement_value, &number) : JSBAY_STALE_VALUE;
+    const char source[] = "typeof globalThis.replacementProbe === 'undefined'";
+    const char filename[] = "replacement-check.js";
+    jsbay_value_t probe = 0, exception = 0;
+    const jsbay_status_t probe_status = jsbay_engine_evaluate(
+        replacement_id, {reinterpret_cast<const uint8_t *>(source), sizeof(source) - 1},
+        {reinterpret_cast<const uint8_t *>(filename), sizeof(filename) - 1}, nullptr, &probe,
+        &exception);
+    bool probe_is_untouched = false;
+    if (probe_status == JSBAY_OK)
+        (void)jsbay_value_to_boolean(probe, &probe_is_untouched);
+    if (probe)
+        (void)jsbay_value_release(probe);
+    if (exception)
+        (void)jsbay_value_release(exception);
+    if (replacement_value) {
+        (void)jsbay_value_release(replacement_value);
+        replacement_value = 0;
+    }
+    if (replacement_id) {
+        jsbay_engine_destroy(replacement_id);
+        replacement_id = 0;
+    }
+    napi_value result;
+    napi_get_boolean(env, status == JSBAY_OK && number == 42 && probe_is_untouched, &result);
+    return result;
+}
 napi_value stats(napi_env env, napi_callback_info) {
     napi_value out, value;
     napi_create_object(env, &out);
@@ -169,6 +300,15 @@ napi_value init(napi_env env, napi_value exports) {
     napi_set_named_property(env, exports, "rawCloseOnLog", value);
     napi_create_function(env, "tryDuplicate", NAPI_AUTO_LENGTH, tryDuplicate, nullptr, &value);
     napi_set_named_property(env, exports, "tryDuplicate", value);
+    napi_create_function(env, "destroyAndReplace", NAPI_AUTO_LENGTH, destroyAndReplace, nullptr,
+                         &value);
+    napi_set_named_property(env, exports, "destroyAndReplace", value);
+    napi_create_function(env, "raceDestroyAndReplace", NAPI_AUTO_LENGTH, raceDestroyAndReplace,
+                         nullptr, &value);
+    napi_set_named_property(env, exports, "raceDestroyAndReplace", value);
+    napi_create_function(env, "replacementValueIsAlive", NAPI_AUTO_LENGTH, replacementValueIsAlive,
+                         nullptr, &value);
+    napi_set_named_property(env, exports, "replacementValueIsAlive", value);
     napi_create_function(env, "stats", NAPI_AUTO_LENGTH, stats, nullptr, &value);
     napi_set_named_property(env, exports, "stats", value);
     return exports;

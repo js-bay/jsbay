@@ -118,6 +118,8 @@ pub const c_api = struct {
     pub const jsbay_engine_create = c_api_impl.jsbay_engine_create;
     pub const jsbay_engine_create_with_limits = c_api_impl.jsbay_engine_create_with_limits;
     pub const jsbay_engine_destroy = c_api_impl.jsbay_engine_destroy;
+    pub const jsbay_engine_destroy_generation = c_api_impl.jsbay_engine_destroy_generation;
+    pub const jsbay_engine_with_generation_scope = c_api_impl.jsbay_engine_with_generation_scope;
     pub const jsbay_engine_set_resource_limits = c_api_impl.jsbay_engine_set_resource_limits;
     pub const jsbay_engine_get_resource_usage = c_api_impl.jsbay_engine_get_resource_usage;
     pub const jsbay_resource_global_usage = c_api_impl.jsbay_resource_global_usage;
@@ -131,6 +133,7 @@ pub const c_api = struct {
     pub const jsbay_engine_create_with_options = c_api_impl.jsbay_engine_create_with_options;
     pub const EngineCreateOptionsC = c_api_impl.EngineCreateOptionsC;
     pub const jsbay_engine_request_interrupt = c_api_impl.jsbay_engine_request_interrupt;
+    pub const jsbay_engine_request_interrupt_for_generation = c_api_impl.jsbay_engine_request_interrupt_for_generation;
     pub const jsbay_engine_clear_interrupt = c_api_impl.jsbay_engine_clear_interrupt;
     pub const jsbay_engine_set_execution_time_limit = c_api_impl.jsbay_engine_set_execution_time_limit;
     pub const jsbay_engine_set_execution_budget = c_api_impl.jsbay_engine_set_execution_budget;
@@ -196,6 +199,8 @@ pub const c_api = struct {
 // Force export C API symbols in static/shared library builds
 comptime {
     _ = c_api_impl;
+    _ = @import("abi/interrupt_control.zig");
+    _ = @import("abi/generation_scope.zig");
 }
 
 // Pull in the test aggregator so `zig build test` discovers the suites under src/tests/.

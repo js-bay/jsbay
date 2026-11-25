@@ -8,6 +8,7 @@ import http from 'node:http'
 import { once } from 'node:events'
 import { promisify } from 'node:util'
 import test from 'node:test'
+import { getNpmInvocation } from '../node-sdk/npm-cli-invocation.mjs'
 
 const root = resolve(import.meta.dirname, '../..')
 const helper = join(root, 'tests/node-sdk/wait-for-published-npm.mjs')
@@ -21,6 +22,45 @@ const platformPackages = [
   '@jsbay/quickjslinuxarm64',
   '@jsbay/quickjslinuxx64',
 ]
+
+test('uses npm-cli.js for the default Windows npm invocation and preserves injected npm commands', () => {
+  assert.deepEqual(getNpmInvocation({ platform: 'win32', execPath: 'C:\\node\\node.exe' }), {
+    command: 'C:\\node\\node.exe',
+    args: ['C:\\node\\node_modules\\npm\\bin\\npm-cli.js'],
+  })
+  assert.deepEqual(getNpmInvocation({ platform: 'win32', execPath: 'C:\\node\\node.exe', cli: 'fake-npm.cmd' }), {
+    command: 'fake-npm.cmd',
+    args: [],
+  })
+})
+
+test('writes the exact verified main manifest for consumers and uses configured CLI and registry', async (t) => {
+  const fixtureData = await fixture(t, [
+    { code: 0, stdout: JSON.stringify({ version, optionalDependencies: { [platformPackage]: version } }) },
+    { code: 0, stdout: JSON.stringify(version) },
+  ])
+  const manifestOutput = join(fixtureData.directory, 'main-package.json')
+  const registry = 'https://registry.example.test'
+  const result = spawnSync(process.execPath, [helper, version, join(fixtureData.directory, 'cache'), fixtureData.userConfig, packageName, manifestOutput], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      NPM_CLI: fixtureData.npm,
+      NPM_TEST_FILES: `${join(fixtureData.directory, 'responses.json')}:${fixtureData.logFile}`,
+      NPM_VISIBILITY_TIMEOUT_MS: '5000',
+      NPM_VISIBILITY_INITIAL_BACKOFF_MS: '1',
+      NPM_REGISTRY: registry,
+    },
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(JSON.parse(await readFile(manifestOutput, 'utf8')), {
+    version,
+    optionalDependencies: { [platformPackage]: version },
+  })
+  const calls = (await readFile(fixtureData.logFile, 'utf8')).trim().split('\n').map(JSON.parse)
+  assert.equal(calls.length, 2)
+  for (const args of calls) assert.equal(args[args.indexOf('--registry') + 1], registry)
+})
 
 async function fixture(t, responses) {
   const directory = await mkdtemp(join(tmpdir(), 'jsbay-npm-visibility-'))
@@ -132,7 +172,8 @@ if (args[0] === 'view') {
 } else if (args[0] === 'install') {
   const packageDirectory = process.cwd() + '/node_modules/@jsbay/quickjs'
   mkdirSync(packageDirectory, { recursive: true })
-  writeFileSync(packageDirectory + '/package.json', JSON.stringify({ name: '@jsbay/quickjs', version: process.env.NPM_TEST_VERSION, main: 'index.js' }))
+  const optionalDependencies = JSON.parse(process.env.NPM_TEST_MAIN_MANIFEST).optionalDependencies
+  writeFileSync(packageDirectory + '/package.json', JSON.stringify({ name: '@jsbay/quickjs', version: process.env.NPM_TEST_VERSION, main: 'index.js', optionalDependencies }))
   writeFileSync(packageDirectory + '/index.js', \"throw new Error('deliberate runtime consumer failure')\\n\")
   const platformName = process.env.NPM_TEST_PLATFORM_PACKAGE
   const platformDirectory = process.cwd() + '/node_modules/@jsbay/' + platformName
@@ -141,7 +182,7 @@ if (args[0] === 'view') {
   writeFileSync(platformDirectory + '/jsbay_node.node', '')
   const lockPackages = {
     '': { dependencies: { '@jsbay/quickjs': process.env.NPM_TEST_VERSION } },
-    'node_modules/@jsbay/quickjs': { version: process.env.NPM_TEST_VERSION, resolved: 'https://registry.npmjs.org/@jsbay/quickjs/-/quickjs.tgz', integrity: 'sha512-test' },
+    'node_modules/@jsbay/quickjs': { version: process.env.NPM_TEST_VERSION, resolved: 'https://registry.npmjs.org/@jsbay/quickjs/-/quickjs.tgz', integrity: 'sha512-test', optionalDependencies },
     ['node_modules/@jsbay/' + platformName]: { version: process.env.NPM_TEST_VERSION, resolved: 'https://registry.npmjs.org/@jsbay/' + platformName + '/-/package.tgz', integrity: 'sha512-test', optional: true },
   }
   writeFileSync(process.cwd() + '/package-lock.json', JSON.stringify({ packages: lockPackages }))
@@ -190,6 +231,106 @@ exec "$NPM_TEST_REAL_NODE" "$@"
   assertUniformNpmOption(calls, '--userconfig')
   assert.ok(calls.at(-1).includes('--prefer-offline'))
   await readFile(downstreamFile)
+})
+
+test('published consumer installs and resolves separated npm package names', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'jsbay-npm-separated-names-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const bin = join(directory, 'bin')
+  await mkdir(bin)
+  const callsFile = join(directory, 'calls.jsonl')
+  const backend = 'quickjsng'
+  const platform = process.platform === 'darwin' ? 'macos' : process.platform
+  const platformName = `${backend}-${platform}-${process.arch}`
+  const mainName = `@jsbay/${backend}`
+  const platformPackage = `@jsbay/${platformName}`
+  const manifest = { version, optionalDependencies: { [platformPackage]: version } }
+  const fakeNpm = join(bin, 'npm')
+  await writeFile(fakeNpm, `#!/usr/bin/env node
+import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+const args = process.argv.slice(2)
+appendFileSync(process.env.NPM_TEST_CALLS, JSON.stringify(args) + '\\n')
+if (args[0] === 'view') {
+  process.stdout.write(args[1] === process.env.NPM_TEST_MAIN_LOCATOR ? process.env.NPM_TEST_MAIN_MANIFEST : JSON.stringify(process.env.NPM_TEST_VERSION))
+} else if (args[0] === 'install') {
+  const version = process.env.NPM_TEST_VERSION
+  const mainName = process.env.NPM_TEST_MAIN_NAME
+  const platformName = process.env.NPM_TEST_PLATFORM_NAME
+  const optionalDependencies = JSON.parse(process.env.NPM_TEST_MAIN_MANIFEST).optionalDependencies
+  const mainDirectory = join(process.cwd(), 'node_modules', mainName)
+  const platformDirectory = join(process.cwd(), 'node_modules', platformName)
+  mkdirSync(mainDirectory, { recursive: true })
+  mkdirSync(platformDirectory, { recursive: true })
+  writeFileSync(join(mainDirectory, 'package.json'), JSON.stringify({ name: mainName, version, main: 'index.js', optionalDependencies }))
+  writeFileSync(join(mainDirectory, 'index.js'), "exports.Engine = { create: () => ({ evaluate: () => 42, close() {} }) }\\n")
+  writeFileSync(join(platformDirectory, 'package.json'), JSON.stringify({ name: platformName, version, main: 'jsbay_node.node' }))
+  writeFileSync(join(platformDirectory, 'jsbay_node.node'), '')
+  const packages = {
+    '': { dependencies: { [mainName]: version } },
+    ['node_modules/' + mainName]: { version, resolved: 'https://registry.npmjs.org/' + mainName + '/-/package.tgz', integrity: 'sha512-test', optionalDependencies },
+    ['node_modules/' + platformName]: { version, resolved: 'https://registry.npmjs.org/' + platformName + '/-/package.tgz', integrity: 'sha512-test', optional: true },
+  }
+  writeFileSync(join(process.cwd(), 'package-lock.json'), JSON.stringify({ packages }))
+} else {
+  process.exit(97)
+}
+`)
+  await chmod(fakeNpm, 0o755)
+
+  const realNode = process.execPath
+  const nodeWrapper = join(bin, 'node')
+  await writeFile(nodeWrapper, `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == -e && "$2" == *'const [probe, addon, backend]'* ]]; then
+    test -f "$3"
+    [[ "$4" == *"/node_modules/${platformPackage}/jsbay_node.node" ]]
+    [[ "$5" == ${backend} ]]
+    printf '%s\\n' 'mocked native backend probe resolved the separated platform package'
+    exit 0
+fi
+exec "$NPM_TEST_REAL_NODE" "$@"
+`)
+  await chmod(nodeWrapper, 0o755)
+  const fakeCc = join(bin, 'cc')
+  await writeFile(fakeCc, `#!/usr/bin/env bash
+set -euo pipefail
+while (($#)); do
+    if [[ $1 == -o ]]; then : > "$2"; exit 0; fi
+    shift
+done
+exit 2
+`)
+  await chmod(fakeCc, 0o755)
+
+  const result = spawnSync('bash', [
+    join(root, 'tests/node-sdk/published-package-consumer.sh'), backend, version, process.platform, process.arch,
+  ], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      NPM_CLI: fakeNpm,
+      NPM_TEST_CALLS: callsFile,
+      NPM_TEST_MAIN_LOCATOR: `${mainName}@${version}`,
+      NPM_TEST_MAIN_MANIFEST: JSON.stringify(manifest),
+      NPM_TEST_MAIN_NAME: mainName,
+      NPM_TEST_PLATFORM_NAME: platformPackage,
+      NPM_TEST_VERSION: version,
+      NPM_TEST_REAL_NODE: realNode,
+      NPM_VISIBILITY_TIMEOUT_MS: '5000',
+    },
+  })
+
+  assert.equal(result.status, 0, result.stderr)
+  assert.ok(result.stdout.includes(`${platformPackage}@${version} from the public npm registry`))
+  assert.match(result.stdout, /mocked native backend probe resolved the separated platform package/)
+  const calls = (await readFile(callsFile, 'utf8')).trim().split('\n').map(JSON.parse)
+  assert.deepEqual(calls.map(([command]) => command), ['view', 'view', 'install'])
+  assert.ok(calls.at(-1).includes(`${mainName}@${version}`))
+  assertUniformNpmOption(calls, '--cache')
+  assertUniformNpmOption(calls, '--userconfig')
+  assert.ok(calls.at(-1).includes('--prefer-offline'))
 })
 
 test('real npm install reuses fresh metadata for every optional platform dependency and downloads tarballs', async (t) => {

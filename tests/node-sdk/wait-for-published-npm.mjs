@@ -1,18 +1,19 @@
 import { execFile } from 'node:child_process'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { promisify } from 'node:util'
+import { getNpmInvocation } from './npm-cli-invocation.mjs'
 
 const execFileAsync = promisify(execFile)
 const registry = process.env.NPM_REGISTRY || 'https://registry.npmjs.org'
-const [version, cacheRoot, userConfig, ...packages] = process.argv.slice(2)
+const [version, cacheRoot, userConfig, mainPackage, manifestOutput, ...extra] = process.argv.slice(2)
 const timeoutMs = Number(process.env.NPM_VISIBILITY_TIMEOUT_MS ?? 300_000)
 const initialBackoffMs = Number(process.env.NPM_VISIBILITY_INITIAL_BACKOFF_MS ?? 1_000)
 const maxBackoffMs = Number(process.env.NPM_VISIBILITY_MAX_BACKOFF_MS ?? 10_000)
-const npm = process.env.NPM_CLI || 'npm'
+const npm = getNpmInvocation()
 
 if (!version || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) throw new Error('expected a valid exact npm package version')
-if (!cacheRoot || !userConfig || packages.length !== 1 || !/^@jsbay\/[a-z0-9-]+$/.test(packages[0])) throw new Error('expected a cache directory and one @jsbay main package name')
+if (!cacheRoot || !userConfig || !mainPackage || extra.length || !/^@jsbay\/[a-z0-9-]+$/.test(mainPackage)) throw new Error('expected a cache directory and one @jsbay main package name')
 if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) throw new Error('NPM_VISIBILITY_TIMEOUT_MS must be a positive integer')
 if (!Number.isSafeInteger(initialBackoffMs) || initialBackoffMs <= 0 || !Number.isSafeInteger(maxBackoffMs) || maxBackoffMs < initialBackoffMs) throw new Error('npm visibility backoff values must be positive integers and max must be at least initial')
 
@@ -21,8 +22,8 @@ await mkdir(cache, { recursive: true })
 const deadline = Date.now() + timeoutMs
 console.log(`Waiting for exact npm package versions until ${new Date(deadline).toISOString()}`)
 
-const [mainPackage] = packages
 const mainManifest = await waitForPackage(mainPackage)
+if (manifestOutput) await writeFile(resolve(manifestOutput), `${JSON.stringify(mainManifest)}\n`)
 const optionalDependencies = mainManifest?.optionalDependencies
 if (!optionalDependencies || typeof optionalDependencies !== 'object' || Array.isArray(optionalDependencies) || Object.keys(optionalDependencies).length === 0) throw new Error(`${mainPackage}@${version} does not declare optional platform packages`)
 for (const [packageName, dependencyVersion] of Object.entries(optionalDependencies)) {
@@ -40,7 +41,8 @@ async function waitForPackage(packageName) {
     let failure
     try {
       const query = packageName === mainPackage ? ['view', `${packageName}@${version}`, '--json'] : ['view', `${packageName}@${version}`, 'version', '--json']
-      result = await execFileAsync(npm, [
+      result = await execFileAsync(npm.command, [
+        ...npm.args,
         ...query,
         '--registry', registry,
         '--userconfig', userConfig,

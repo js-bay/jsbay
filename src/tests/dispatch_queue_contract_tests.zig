@@ -4,6 +4,7 @@ const std = @import("std");
 const testing = std.testing;
 const dispatch = @import("../runtime/dispatch.zig");
 const engine = @import("../engine.zig");
+const instance_map = @import("../runtime/instance_map.zig");
 const js_scheduler = @import("../runtime/js_scheduler.zig");
 const helpers = @import("test_helpers.zig");
 
@@ -118,6 +119,27 @@ test "engine destroy cancels a pending dispatch task once and rejects reposting"
     try testing.expectEqual(@as(u8, 1), state.cancels);
     try testing.expect(!state.repost_accepted);
     try testing.expectEqual(@as(u8, 1), completion.calls);
+}
+
+test "destroy requested by a dispatch callback completes after its eval lease unwinds" {
+    const State = struct {
+        id: i32,
+
+        fn run(ctx: ?*anyopaque) void {
+            const self: *State = @ptrCast(@alignCast(ctx.?));
+            engine.destroy(self.id);
+        }
+    };
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+    const generation = instance_map.generationOf(id) orelse return error.MissingGeneration;
+    var state = State{ .id = id };
+    try testing.expect(dispatch.postTask(id, .{ .ctx = &state, .run = State.run }));
+
+    try testing.expectEqual(@as(usize, 1), dispatch.tickInstance(id));
+    try testing.expect(instance_map.isDestroyed(id, generation));
 }
 
 test "dispatch owner cancellation preserves FIFO work for other owners" {

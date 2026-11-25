@@ -98,6 +98,8 @@ pub const EngineInstance = struct {
     native_task_queue: @import("dispatch.zig").NativeTaskQueue = .{},
     /// Blocks new work before destruction can detach engine-thread state.
     teardown_pending: bool = false,
+    teardown_generation: u64 = 0,
+    teardown_owner_claimed: bool = false,
     dispatch_mutex: sync.Mutex = .{},
     dispatch_wake: sync.Condition = .init,
     active_dispatch_tasks: usize = 0,
@@ -200,9 +202,53 @@ pub fn captureGeneration(instance_id: i32) ?u64 {
     return inst.generation;
 }
 
+/// Read a generation while its registry entry is still present, including during teardown.
+pub fn generationOf(instance_id: i32) ?u64 {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return null;
+    return inst.generation;
+}
+
+/// Close admission only if the requested lifetime is still registered.
+pub fn markTeardownPendingForGeneration(instance_id: i32, generation: u64) bool {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return false;
+    if (inst.generation != generation) return false;
+    if (inst.teardown_generation != 0 and inst.teardown_generation != generation) return false;
+    inst.teardown_generation = generation;
+    inst.teardown_pending = true;
+    return true;
+}
+
+pub const TeardownClaim = enum { claimed, already_claimed, stale };
+
+pub fn claimTeardownForGeneration(instance_id: i32, generation: u64) TeardownClaim {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return .stale;
+    if (inst.generation != generation) return .stale;
+    inst.teardown_pending = true;
+    inst.teardown_generation = generation;
+    if (inst.teardown_owner_claimed) return .already_claimed;
+    inst.teardown_owner_claimed = true;
+    return .claimed;
+}
+
 pub fn remove(instance_id: i32) ?*EngineInstance {
     mutex.lock();
     defer mutex.unlock();
+    const kv = instances.fetchRemove(instance_id) orelse return null;
+    return kv.value;
+}
+
+/// Remove an entry only when it still names the expected lifetime.
+pub fn removeGeneration(instance_id: i32, generation: u64) ?*EngineInstance {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return null;
+    if (inst.generation != generation) return null;
     const kv = instances.fetchRemove(instance_id) orelse return null;
     return kv.value;
 }

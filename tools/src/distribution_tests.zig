@@ -192,18 +192,6 @@ test "test_release_builds_and_uploads_verified_android_aar" {
     for ([_][]const u8{ "jni/arm64-v8a/libjsbay_android.so", "jni/x86_64/libjsbay_android.so", "proguard.txt", "jsbay-${{ steps.ver.outputs.label }}-android-${{ matrix.backend }}.aar", "jsbay-*.aar" }) |needle| try contains(release, needle);
 }
 
-test "test_android_release_includes_maven_metadata_and_transitive_kotlin" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const io = testing.io;
-    const cwd = try root(a, io);
-    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
-    const gradle = try read(a, io, cwd, &.{ "sdk", "android", "jsbay", "build.gradle.kts" });
-    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbayquickjs\"", "\"quickjs_ng\" -> \"jsbayquickjsng\"", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
-    for ([_][]const u8{ ":jsbay:publishReleasePublicationToStagingRepository", "-PjsbayVersion=", "-PjsbayBackend=\"$backend\"", "-PjsbayMavenRepo=", "archive=\"jsbay-${ver}-android-${backend}-maven.zip\"", "tests/android-sdk/maven-consumer.sh", "env -u ANDROID_HOME ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"", "-PjsbayVersion=\"${{ steps.ver.outputs.label }}\"", "tool -- check-maven \"$module\" \"$ver\" \"$backend\"" }) |needle| try contains(release, needle);
-}
-
 test "test_android_sdk_distribution_uses_tracked_source_only" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

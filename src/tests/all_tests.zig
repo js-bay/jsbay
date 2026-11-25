@@ -25,8 +25,11 @@ comptime {
     _ = @import("engine_tests.zig");
     // engine_thread: spike smoke already covers start/id/stop/post/wait; import full suite and Skip only cases that need interrupt/heap/bind-sync not yet green on Escargot/Hermes.
     _ = @import("engine_thread_tests.zig");
+    _ = @import("engine_state_admission_tests.zig");
+    _ = @import("engine_thread_value_tests.zig");
     if (!spike) {
         _ = @import("self_driven_loop_tests.zig");
+        _ = @import("generation_scope_loop_failure_tests.zig");
         _ = @import("shutdown_race_tests.zig");
         _ = @import("execution_cpu_runtime_tests.zig");
         _ = @import("internal_thread_safety_tests.zig");
@@ -90,6 +93,8 @@ comptime {
     _ = @import("modules_tests.zig");
     if (!spike) {
         _ = @import("c_api_tests.zig");
+        _ = @import("generation_scope_tests.zig");
+        _ = @import("generation_interrupt_tests.zig");
         _ = @import("submission_tests.zig");
         _ = @import("runtime_boundary_tests.zig");
         _ = @import("borrowed_retain_tests.zig");

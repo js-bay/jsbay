@@ -252,5 +252,23 @@ test "destroy waits for an inspector start reservation before registration" {
 }
 
 test "inspector start admission stays closed during engine runtime teardown" {
-    try inspector.modules.state(StateTestHost).TestCases.startAdmissionStaysClosedDuringEngineRuntimeTeardown();
+    const State = inspector.modules.state(StateTestHost);
+    const instance_id: i32 = 61_770;
+    try std.testing.expect(State.beginEngineDestroy(instance_id, 0));
+    defer State.endEngineDestroy(instance_id, 0);
+    try std.testing.expect(!State.reserveStart(instance_id));
+    State.endEngineDestroy(instance_id, 0);
+    try std.testing.expect(State.reserveStart(instance_id));
+    State.cancelStartReservation(instance_id);
+}
+
+test "engine runtime destroy gate is generation scoped" {
+    const State = inspector.modules.state(StateTestHost);
+    const instance_id: i32 = 61_769;
+    try std.testing.expect(State.beginEngineDestroy(instance_id, 7));
+    try std.testing.expect(State.beginEngineDestroy(instance_id, 8));
+    try std.testing.expect(!State.beginEngineDestroy(instance_id, 7));
+    State.endEngineDestroy(instance_id, 7);
+    try std.testing.expect(!State.beginEngineDestroy(instance_id, 8));
+    State.endEngineDestroy(instance_id, 8);
 }

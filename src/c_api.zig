@@ -23,6 +23,8 @@ const host_wake = @import("js_event_loop").host_wake;
 const submission = @import("runtime/submission.zig");
 const api_async = @import("abi/api_async.zig");
 const value_buffers = @import("value/buffers.zig");
+const interrupt_control = @import("abi/interrupt_control.zig");
+const generation_scope = @import("abi/generation_scope.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -1446,16 +1448,8 @@ fn testSetWakeHandler(instance_id: c_int, handler: ?host_wake.Handler, user_data
     return API_OK;
 }
 
-/// Thread-safe control-plane request. The engine owner observes the flag from its backend interrupt handler and turns the running evaluation into an exception; this function never waits for the JavaScript thread.
-pub export fn jsbay_engine_request_interrupt(instance_id: c_int) bool {
-    const id: i32 = @intCast(instance_id);
-    const accepted = runtime_control.requestInterrupt(id);
-    if (accepted) {
-        native_sync.cancelForInstance(id);
-        @import("runtime/engine_events.zig").fireInterrupted(id, 0, "interrupt requested");
-    }
-    return accepted;
-}
+pub const jsbay_engine_request_interrupt = interrupt_control.jsbay_engine_request_interrupt;
+pub const jsbay_engine_request_interrupt_for_generation = interrupt_control.jsbay_engine_request_interrupt_for_generation;
 
 pub export fn jsbay_engine_cancel(instance_id: c_int, generation: u64) bool {
     const id: i32 = @intCast(instance_id);
@@ -2004,6 +1998,7 @@ const beginApiOpMode = value_operation.beginApiOpMode;
 const beginApiOp = value_operation.beginApiOp;
 
 const beginCleanupApiOp = value_operation.beginCleanupApiOp;
+const beginGenerationScopeOp = value_operation.beginGenerationScopeOp;
 
 const apiContext = value_operation.apiContext;
 
@@ -2660,6 +2655,10 @@ pub export fn jsbay_engine_with_value_scope(instance_id: c_int, callback: ValueS
     cb(user_data);
     return API_OK;
 }
+
+pub const jsbay_engine_with_generation_scope = generation_scope.jsbay_engine_with_generation_scope;
+
+pub const jsbay_engine_destroy_generation = generation_scope.jsbay_engine_destroy_generation;
 
 const PackedValueOp = value_operation.PackedValueOp;
 

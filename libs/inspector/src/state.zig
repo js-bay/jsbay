@@ -15,6 +15,7 @@ pub fn Module(comptime Host: type) type {
         const sync = Host.sync;
         const transport_mod = @import("transport.zig");
         const object_table_mod = @import("object_table.zig").Module(Host);
+        const engine_destroy_gate = @import("state_destroy_gate.zig").Gate(Host);
         const test_faults = Host.test_faults;
         const console_replay = @import("console_replay.zig").Module;
         const command_queue = @import("command_queue.zig").Module(Host);
@@ -77,6 +78,7 @@ pub fn Module(comptime Host: type) type {
             }
 
             instance_id: i32,
+            generation: u64 = 0,
             allocator: std.mem.Allocator,
             transport: *transport_mod.Transport,
             title: []u8,
@@ -280,15 +282,21 @@ pub fn Module(comptime Host: type) type {
         // Number of InspectorStates that have an async-depth transition awaiting an owner-thread application. The zero fast path keeps normal JS admission from taking the inspector registry mutex.
         var pending_async_depth_reconciliations = std.atomic.Value(usize).init(0);
         var starting_ids: ?std.AutoHashMap(i32, void) = null;
-        var destroying_ids: ?std.AutoHashMap(i32, void) = null;
         var retired_states: ?*InspectorState = null;
         var state_changed: sync.Condition = .init;
 
         // Reserve an instance id before start performs context capture or opens a transport. The reservation is serialized with state registration.
         pub fn reserveStart(instance_id: i32) bool {
+            return reserveStartForGeneration(instance_id, 0);
+        }
+
+        pub fn reserveStartForGeneration(instance_id: i32, generation: u64) bool {
+            const key = engine_destroy_gate.EngineGenerationKey{ .instance_id = instance_id, .generation = generation };
             inspector_mutex.lock();
             defer inspector_mutex.unlock();
-            if (destroying_ids) |*destroying| if (destroying.contains(instance_id)) return false;
+            if (generation != 0 and Host.instance_map.generationOf(instance_id) != generation) return false;
+            if (generation != 0 and Host.instance_map.isTeardownPending(instance_id)) return false;
+            if (engine_destroy_gate.destroying_ids) |*destroying| if (destroying.contains(key)) return false;
             if (states) |*map| if (map.contains(instance_id)) return false;
             if (starting_ids == null) starting_ids = std.AutoHashMap(i32, void).init(std.heap.c_allocator);
             const reservations = &starting_ids.?;
@@ -305,20 +313,23 @@ pub fn Module(comptime Host: type) type {
         }
 
         // Close Inspector startup admission for the full engine runtime teardown. The caller holds this gate until the engine context has left instance_map.
-        pub fn beginEngineDestroy(instance_id: i32) bool {
+        pub fn beginEngineDestroy(instance_id: i32, generation: u64) bool {
+            const key = engine_destroy_gate.EngineGenerationKey{ .instance_id = instance_id, .generation = generation };
             inspector_mutex.lock();
             defer inspector_mutex.unlock();
-            if (destroying_ids == null) destroying_ids = std.AutoHashMap(i32, void).init(std.heap.c_allocator);
-            const destroying = &destroying_ids.?;
-            if (destroying.contains(instance_id)) return false;
-            destroying.put(instance_id, {}) catch return false;
+            if (engine_destroy_gate.destroying_ids == null) {
+                engine_destroy_gate.destroying_ids = std.AutoHashMap(engine_destroy_gate.EngineGenerationKey, void).init(std.heap.c_allocator);
+            }
+            const destroying = &engine_destroy_gate.destroying_ids.?;
+            if (destroying.contains(key)) return false;
+            destroying.put(key, {}) catch return true;
             return true;
         }
 
-        pub fn endEngineDestroy(instance_id: i32) void {
+        pub fn endEngineDestroy(instance_id: i32, generation: u64) void {
             inspector_mutex.lock();
             defer inspector_mutex.unlock();
-            if (destroying_ids) |*destroying| _ = destroying.remove(instance_id);
+            if (engine_destroy_gate.destroying_ids) |*destroying| _ = destroying.remove(.{ .instance_id = instance_id, .generation = generation });
             state_changed.broadcast();
         }
 
@@ -1102,17 +1113,6 @@ pub fn Module(comptime Host: type) type {
                     .wait => {},
                     else => return error.DestroyMissedInspectorStartReservation,
                 }
-            }
-
-            pub fn startAdmissionStaysClosedDuringEngineRuntimeTeardown() !void {
-                const testing = std.testing;
-                const instance_id: i32 = 61_770;
-                try testing.expect(beginEngineDestroy(instance_id));
-                defer endEngineDestroy(instance_id);
-                try testing.expect(!reserveStart(instance_id));
-                endEngineDestroy(instance_id);
-                try testing.expect(reserveStart(instance_id));
-                cancelStartReservation(instance_id);
             }
 
             pub fn stateShutdownWaitsForInFlightCallbackLease() !void {

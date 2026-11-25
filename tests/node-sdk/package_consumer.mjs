@@ -6,8 +6,15 @@ const name = process.env.JSBAY_NODE_PACKAGE || '@jsbay/quickjsng'
 const publicVersion = process.env.JSBAY_NODE_PUBLIC_VERSION
 if (publicVersion) {
   const platform = process.platform === 'darwin' ? 'macos' : process.platform
-  const platformPackage = `${name}${platform}${process.arch}`
   const { packages } = require('./package-lock.json')
+  const installedMain = packages[`node_modules/${name}`]
+  const platformCandidates = [
+    `${name}-${platform}-${process.arch}`,
+    `${name}${platform}${process.arch}`,
+  ]
+  const platformPackage = platformCandidates.find(candidate =>
+    Object.hasOwn(installedMain?.optionalDependencies ?? {}, candidate))
+  assert(platformPackage, `The installed ${name} package does not declare a ${platform}-${process.arch} addon`)
   assert.deepEqual(packages[''].dependencies, { [name]: publicVersion })
   for (const dependency of [name, platformPackage]) {
     const locked = packages[`node_modules/${dependency}`]

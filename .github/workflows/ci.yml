@@ -103,7 +103,8 @@ jobs:
           zig build test-tools --summary all
           bash tests/native_prefix_stamp_test.sh
           bash tests/ci/swift-package-tag-test.sh
-          node --test tests/ci/github-release-test.mjs tests/ci/npm-visibility-test.mjs
+          bash tests/android-sdk/maven-consumer-auth-test.sh
+          node --test tests/ci/github-release-test.mjs tests/ci/npm-visibility-test.mjs tests/ci/node-windows-npm-workflow-test.mjs tests/ci/published-windows-package-test.mjs
 
       - name: Check generated CDP protocols
         run: node scripts/generate-cdp-protocol.mjs --fetch --check
@@ -471,6 +472,17 @@ jobs:
           test -f "$node_root/include/node/node_api.h"
           NODE_BIN=node NODE_INCLUDE="$node_root/include/node" JSBAY_LIBRARY="$PWD/artifacts/typed-consumers-qjsng/lib/libjsbay.a" bash tests/node-sdk/run_native_consumer.sh
 
+      - name: Node.js SDK reports debugger hooks without inspector transport
+        run: |
+          set -euo pipefail
+          core="$PWD/artifacts/node-no-inspector-transport-core"
+          addon="$PWD/artifacts/node-no-inspector-transport-addon"
+          node_root="$(dirname "$(dirname "$(command -v node)")")"
+          zig build -Dbackend=quickjs_ng -Dlibrary-only=true -Doptimize=ReleaseFast -Dinspector-transport=false --prefix "$core" --summary all
+          cmake -S sdk/node -B "$addon" -DCMAKE_BUILD_TYPE=Release -DJSBAY_LIBRARY="$core/lib/libjsbay.a" -DNODE_INCLUDE="$node_root/include/node"
+          cmake --build "$addon" --config Release
+          JSBAY_NODE_DISABLE_INSPECTOR_TRANSPORT=1 JSBAY_NODE_ADDON="$addon/jsbay_node.node" node tests/node-sdk/native_consumer.cjs
+
       - name: Swift and Objective-C SDK consumers (quickjs_ng)
         run: bash tests/apple-sdk/run.sh artifacts/typed-consumers-qjsng/lib/libjsbay.a artifacts/apple-sdk-qjsng quickjs_ng macosx
 
@@ -700,6 +712,31 @@ jobs:
           unzip -Z1 "$aar" | grep '^jni/.*\.so$' | sort > "$actual"
           printf '%s\n' jni/arm64-v8a/libjsbay.so jni/arm64-v8a/libjsbay_android.so jni/x86_64/libjsbay.so jni/x86_64/libjsbay_android.so | sort | diff -u - "$actual"
           unzip -p "$aar" proguard.txt | grep -F -- '-keep class io.jsbay.Native { *; }'
+
+  node-npm-version:
+    name: Resolve Node package CI version for PR
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Read the engine version
+        id: version
+        run: node scripts/ci/resolve-npm-ci-tag.mjs
+
+  node-npm-packages:
+    name: Node npm platform matrix (Windows MSVC and Electron)
+    if: github.event_name == 'pull_request'
+    needs: node-npm-version
+    uses: ./.github/workflows/npm-packages.yml
+    with:
+      tag: ${{ needs.node-npm-version.outputs.tag }}
 
   windows:
     name: windows

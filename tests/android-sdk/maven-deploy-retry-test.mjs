@@ -9,11 +9,13 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const [archive, version, backend] = process.argv.slice(2)
-const artifacts = { quickjs: 'jsbayquickjs', quickjs_ng: 'jsbayquickjsng' }
-const artifact = artifacts[backend]
-if (!archive || !version || !artifact) {
+const artifacts = { quickjs: ['jsbay-quickjs', 'jsbayquickjs'], quickjs_ng: ['jsbay-quickjs-ng', 'jsbayquickjsng'] }
+if (!archive || !version || !artifacts[backend]) {
   throw new Error('Usage: maven-deploy-retry-test.mjs <maven.zip> <version> <backend>')
 }
+const members = execFileSync('unzip', ['-Z1', archive], { encoding: 'utf8' }).split(/\r?\n/)
+const artifact = artifacts[backend].find(candidate => members.includes(`io/jsbay/${candidate}/${version}/${candidate}-${version}.aar`))
+if (!artifact) throw new Error(`Maven archive has no recognized ${backend} coordinate`)
 const coordinate = `io/jsbay/${artifact}/${version}`
 const filenames = ['.aar', '.pom', '.module', '-sources.jar'].map((ending) => `${artifact}-${version}${ending}`)
 const files = new Map(filenames.map((filename) => [

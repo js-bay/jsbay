@@ -84,13 +84,14 @@ test('recovery downloads the requested artifact ID and rejects changed ZIP bytes
   }
 });
 
-test('npm publication preflight checks every platform and main tarball before writing', async () => {
+for (const separator of ['', '-']) test(`npm publication preflight checks ${separator ? 'current' : 'legacy'} package names before writing`, async () => {
   const work = await mkdtemp(join(tmpdir(), 'jsbay-recovery-npm-test-'));
   const version = '1.2.3-rc.1';
+  const targets = ['jsc', 'quickjs', 'quickjsng'].flatMap(engine => (engine === 'jsc' ? ['macos'] : ['linux', 'macos']).flatMap(os =>
+    ['arm64', 'x64'].map(arch => [engine, os, arch])))
+  if (separator) targets.push(['quickjsng', 'win32', 'x64'])
   const names = ['main/jsbay-jsc', 'main/jsbay-quickjs', 'main/jsbay-quickjsng',
-    'platform/jsbay-jscmacosarm64', 'platform/jsbay-jscmacosx64',
-    'platform/jsbay-quickjslinuxarm64', 'platform/jsbay-quickjslinuxx64', 'platform/jsbay-quickjsmacosarm64', 'platform/jsbay-quickjsmacosx64',
-    'platform/jsbay-quickjsnglinuxarm64', 'platform/jsbay-quickjsnglinuxx64', 'platform/jsbay-quickjsngmacosarm64', 'platform/jsbay-quickjsngmacosx64'];
+    ...targets.map(([engine, os, arch]) => `platform/jsbay-${engine}${separator}${os}${separator}${arch}`)];
   const preflight = (commit, operation) => execute(process.execPath, ['scripts/publish-npm-release.mjs', work, version, commit, operation], {
     env: { ...process.env, NODE_AUTH_TOKEN: 'fixture-token' },
   });

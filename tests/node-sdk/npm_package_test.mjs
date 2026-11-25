@@ -2,10 +2,11 @@ import assert from 'node:assert/strict'
 import { execFile, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { once } from 'node:events'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 
@@ -13,14 +14,26 @@ const [mainTarball, platformTarball, backend] = process.argv.slice(2)
 assert(mainTarball && platformTarball && backend, 'Pass both package tarballs and the expected backend')
 const npm = process.env.NPM ?? 'npm'
 const run = promisify(execFile)
+const npmCli = process.platform === 'win32' && !process.env.NPM
+  ? join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+  : npm
+const npmPrefix = npmCli === npm ? [] : [npmCli]
+if (npmPrefix.length > 0) assert(existsSync(npmCli), `npm CLI not found at ${npmCli}`)
 const directory = await mkdtemp(join(tmpdir(), 'jsbay-npm-consumer-'))
 const server = createServer()
 
+function readTarball(tarball, mode, member, options = {}) {
+  const absolute = resolve(tarball)
+  const args = [mode, basename(absolute)]
+  if (member) args.push(member)
+  return execFileSync('tar', args, { ...options, cwd: dirname(absolute) })
+}
+
 async function readPackage(tarball) {
   const body = await readFile(tarball)
-  const files = new Set(execFileSync('tar', ['-tf', tarball], { encoding: 'utf8' }).trimEnd().split('\n'))
+  const files = new Set(readTarball(tarball, '-tf', undefined, { encoding: 'utf8' }).trimEnd().split('\n'))
   assert(files.has('package/LICENSE') && files.has('package/THIRD_PARTY_NOTICES.md'), `${tarball} must include legal notices`)
-  const manifest = JSON.parse(execFileSync('tar', ['-xOf', tarball, 'package/package.json'], { encoding: 'utf8' }))
+  const manifest = JSON.parse(readTarball(tarball, '-xOf', 'package/package.json', { encoding: 'utf8' }))
   const integrity = `sha512-${createHash('sha512').update(body).digest('base64')}`
   return { body, files, manifest, integrity }
 }
@@ -32,7 +45,7 @@ try {
   assert.equal(main.manifest.name, `@jsbay/${backend}`)
   assert.equal(main.manifest.jsbayBackend, backend)
   assert(main.files.has('package/index.d.ts'))
-  assert.equal(platform.manifest.name, `@jsbay/${backend}${hostPlatform}${process.arch}`)
+  assert.equal(platform.manifest.name, `@jsbay/${backend}-${hostPlatform}-${process.arch}`)
   assert.equal(platform.manifest.version, main.manifest.version)
   assert.equal(main.manifest.optionalDependencies[platform.manifest.name], platform.manifest.version)
 
@@ -65,12 +78,12 @@ try {
   const registry = `http://127.0.0.1:${server.address().port}/`
   const packageFile = join(directory, 'package.json')
   await writeFile(packageFile, '{"name":"jsbay-consumer","private":true}\n')
-  await run(npm, ['install', '--registry', registry, '--cache', join(directory, 'cache'), '--include=optional',
+  await run(npmCli === npm ? npm : process.execPath, [...npmPrefix, 'install', '--registry', registry, '--cache', join(directory, 'cache'), '--include=optional',
     '--ignore-scripts', '--no-audit', '--no-fund', '--no-package-lock', `${main.manifest.name}@${main.manifest.version}`], { cwd: directory })
   assert.deepEqual([...served].sort(), ['main', 'platform'])
 
   const addonPath = join(directory, 'node_modules', platform.manifest.name, 'jsbay_node.node')
-  const expectedAddon = execFileSync('tar', ['-xOf', platformTarball, 'package/jsbay_node.node'], { maxBuffer: 64 * 1024 * 1024 })
+  const expectedAddon = readTarball(platformTarball, '-xOf', 'package/jsbay_node.node', { maxBuffer: 64 * 1024 * 1024 })
   assert.deepEqual(await readFile(addonPath), expectedAddon)
   const env = { ...process.env, JSBAY_NODE_PACKAGE_ROOT: packageFile, JSBAY_NODE_PACKAGE: main.manifest.name }
   delete env.JSBAY_NODE_ADDON

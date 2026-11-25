@@ -15,14 +15,23 @@ const engines = ['jsc', 'quickjs', 'quickjsng'];
 const operatingSystems = ['linux', 'macos'];
 const architectures = ['arm64', 'x64'];
 const main = [];
-const platform = [];
+const currentPlatform = [];
+const legacyPlatform = [];
 for (const engine of engines) {
   main.push(`jsbay-${engine}-${version}.tgz`);
-  for (const os of operatingSystems) {
-    if (engine === 'jsc' && os === 'linux') continue;
-    for (const arch of architectures) platform.push(`jsbay-${engine}${os}${arch}-${version}.tgz`);
+  const supportedSystems = engine === 'jsc' ? ['macos'] : operatingSystems;
+  for (const os of supportedSystems) {
+    for (const arch of architectures) {
+      currentPlatform.push(`jsbay-${engine}-${os}-${arch}-${version}.tgz`);
+      legacyPlatform.push(`jsbay-${engine}${os}${arch}-${version}.tgz`);
+    }
   }
+  if (engine === 'quickjsng') currentPlatform.push(`jsbay-${engine}-win32-x64-${version}.tgz`);
 }
+const actualPlatform = (await readdir(join(directory, 'platform'))).sort();
+const matches = expected => actualPlatform.join('\n') === [...expected].sort().join('\n');
+const platform = matches(currentPlatform) ? currentPlatform : matches(legacyPlatform) ? legacyPlatform : null;
+if (!platform) throw new Error('unexpected npm platform package set');
 for (const [type, archives] of [['main', main], ['platform', platform]]) {
   const actual = (await readdir(join(directory, type))).sort();
   if (actual.join('\n') !== [...archives].sort().join('\n')) throw new Error(`unexpected npm ${type} package set`);

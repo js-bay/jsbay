@@ -178,11 +178,19 @@ bool jsbay_engine_create(int instance_id, jsbay_log_handler_t log_handler, void 
 bool jsbay_engine_create_with_limits(int instance_id, jsbay_log_handler_t log_handler, void *log_user_data, const jsbay_resource_limits_t *limits);
 /* Thread-safe. Joins teardown: when called off the owner thread it waits until the instance is gone (including waking a blocking run_loop). Prefer owner-thread destroy after releasing values when following the embed shutdown checklist. A destroy requested from a JS/native callback on the owner may defer physical cleanup until that callback unwinds; a later destroy joins that work. */
 void jsbay_engine_destroy(int instance_id);
+/* Destroy only when instance_id still names generation. Safe against id reuse. */
+void jsbay_engine_destroy_generation(int instance_id, uint64_t generation);
 typedef void (*jsbay_value_scope_callback_t)(void *user_data);
 /* Owner-thread synchronous scope for batching typed Value API calls. The return status reports admission; the callback records operation results through user_data. Value handle ownership is unchanged. The callback must return without yielding or crossing threads, and C++ exceptions must not cross the callback boundary; each typed API call keeps its normal validation and error behavior. This is not a transaction and does not roll back changes. A destroy requested by the callback follows the existing deferred-destroy rules and physical teardown waits until the callback returns. Nested scopes for the same instance are supported. */
 jsbay_status_t jsbay_engine_with_value_scope(int instance_id, jsbay_value_scope_callback_t callback,
                                              void *user_data);
+/* Run a synchronous callback only while the requested generation is admitted and pinned. */
+jsbay_status_t jsbay_engine_with_generation_scope(int instance_id, uint64_t generation,
+                                                  jsbay_value_scope_callback_t callback,
+                                                  void *user_data);
 bool jsbay_engine_request_interrupt(int instance_id);
+/* Thread-safe. Refuses stale generations and pins the instance until the request is complete. */
+bool jsbay_engine_request_interrupt_for_generation(int instance_id, uint64_t generation);
 bool jsbay_engine_clear_interrupt(int instance_id);
 bool jsbay_engine_cancel(int instance_id, uint64_t generation);
 /* Shared deadline: now + millis; 0 disables. VM entries do not refresh it. Setting a non-zero time limit establishes a new execution window and automatically clears pending user-interrupt requests. Explicit jsbay_engine_clear_interrupt is also available to clear pending user interrupts on the owner thread. QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops); JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at min(remaining, 50ms) intervals (clamped to >= 5ms). */

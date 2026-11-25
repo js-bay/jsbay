@@ -20,6 +20,8 @@ test {
     _ = @import("r8_tests.zig");
     _ = @import("distribution_tests.zig");
     _ = @import("distribution_runner_tests.zig");
+    _ = @import("android_maven_distribution_tests.zig");
+    _ = @import("maven_artifact.zig");
 }
 
 pub fn main(init: std.process.Init) !void {

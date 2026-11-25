@@ -15,7 +15,7 @@ if (process.env.JSBAY_NODE_ADDON) {
     if (!['quickjs', 'quickjsng', 'jsc'].includes(backend)) throw error
     const platform = process.platform === 'darwin' ? 'macos' : process.platform
     const arch = process.arch
-    const binaryPackage = `@jsbay/${backend}${platform}${arch}`
+    const binaryPackage = `@jsbay/${backend}-${platform}-${arch}`
     try {
       module.exports = require(binaryPackage)
     } catch (binaryError) {

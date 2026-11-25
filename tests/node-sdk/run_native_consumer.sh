@@ -8,7 +8,9 @@ trap 'rm -rf "$package_root"' EXIT
 archive=${JSBAY_LIBRARY:-}
 if [[ -z $archive ]]; then
   build_dir=${JSBAY_NODE_BUILD_DIR:-"$package_root/core"}
-  (cd "$root" && zig build -Dlibrary-only=true -Dbackend=quickjs_ng -Doptimize=ReleaseFast --prefix "$build_dir")
+  zig_args=(-Dlibrary-only=true -Dbackend=quickjs_ng -Doptimize=ReleaseFast --prefix "$build_dir")
+  if [[ ${JSBAY_NODE_DISABLE_INSPECTOR_TRANSPORT:-0} == 1 ]]; then zig_args+=(-Dinspector-transport=false); fi
+  (cd "$root" && zig build "${zig_args[@]}")
   archive="$build_dir/lib/libjsbay.a"
 fi
 if [[ -n ${NODE_INCLUDE:-} ]]; then
@@ -36,13 +38,15 @@ mv -f "$temporary_addon" "$addon"
 JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
 JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
 JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/fault_consumer.cjs"
-for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
+for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer worker-close-async-gc pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine close-async-contract cache-option-reentrancy worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
   JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
 done
 for review_case in cleanup-pending completion-reasons shared-handler-error synchronous-throw-completions call-host-failure; do
   JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
 done
 JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/conversion_fault_consumer.cjs"
+JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"
+JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/value_contract_consumer.cjs"
 embed_addon="$output_dir/jsbay_node_embed.node"
 "${CXX:-c++}" -std=c++17 -DJSBAY_NODE_EMBEDDED=1 "${flags[@]}" -I"$root/include" -I"$root/sdk/node/include" -I"$node_include" -I"$(dirname "$node_include")" "$root/sdk/node/src/jsbay_node.cpp" "$root/tests/node-sdk/embed_consumer.cc" "$archive" -o "$embed_addon"
 JSBAY_NODE_EMBED_ADDON="$embed_addon" "$node_bin" "$root/tests/node-sdk/embed_consumer.cjs"
@@ -58,7 +62,9 @@ fi
 test -s "$production_addon"
 JSBAY_NODE_ADDON="$production_addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
 JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
-for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
+JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"
+JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/value_contract_consumer.cjs"
+for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer worker-close-async-gc pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine close-async-contract cache-option-reentrancy worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
   JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
 done
 JSBAY_NODE_ADDON="$production_addon" "$node_bin" "$root/tests/node-sdk/production_consumer.cjs"

@@ -1448,8 +1448,7 @@ const InspectorEnabledTests5 = if (@import("build_options").inspector) struct {
         if (ran.err) |text| std.heap.c_allocator.free(text);
         _ = dispatch.tickInstance(id);
         try testing.expect(inspector.liveConsoleEntries() > before);
-        engine.destroy(id);
-        try testing.expectEqual(before, inspector.liveConsoleEntries());
+        try @import("inspector_destroy_wait.zig").run(engine.destroy, id, before);
         try testing.expectError(error.ConnectFailed, connect(port));
     }
 };

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Dir = std.Io.Dir;
+const maven_artifact = @import("maven_artifact.zig");
 
 pub fn handles(command: []const u8) bool {
     inline for (.{ "privacy", "release-version", "check-release-assets", "package-apple-release", "export-public-source", "patch-quickjs", "patch-quickjs-ng", "instrument-debug-eval", "check-docs", "check-tooling", "simulator-list", "harmony-facade", "check-maven" }) |name| {
@@ -466,13 +467,8 @@ fn harmonyFacade(c: Context, args: []const []const u8) !void {
 }
 
 fn checkMaven(c: Context, args: []const []const u8) !void {
-    if (args.len != 3 or !safeLabel(args[1])) return error.Usage;
-    const artifact = if (std.mem.eql(u8, args[2], "quickjs"))
-        "jsbayquickjs"
-    else if (std.mem.eql(u8, args[2], "quickjs_ng"))
-        "jsbayquickjsng"
-    else
-        return error.Usage;
+    if ((args.len != 3 and args.len != 4) or !safeLabel(args[1])) return error.Usage;
+    const artifact = maven_artifact.resolve(args[2], if (args.len == 4) args[3] else null) orelse return error.Usage;
     const File = struct { name: []const u8, size: u64, md5: []const u8, sha1: []const u8, sha256: []const u8, sha512: []const u8 };
     const Metadata = struct { variants: []const struct { files: []const File = &.{} } };
     const name = try c.fmt("{s}-{s}.aar", .{ artifact, args[1] });
