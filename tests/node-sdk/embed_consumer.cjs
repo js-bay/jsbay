@@ -32,9 +32,10 @@ async function main() {
   assert.equal(addon.stats().destroys, 3)
   assert.equal(await reused.evaluateAsync('new Promise(resolve => setTimeout(() => resolve(17), 0))', 'reused.js'), 17)
   reused.close()
-  await new Promise(resolve => setImmediate(resolve))
+  await reused.closeAsync()
   const idle = addon.create(704)
   idle.close()
+  await idle.closeAsync()
   assert.equal(addon.stats().destroys, 5)
   const replaced = addon.create(705)
   const staleValues = [replaced.value({ oldGeneration: true }), replaced.evaluateValue('43')]
