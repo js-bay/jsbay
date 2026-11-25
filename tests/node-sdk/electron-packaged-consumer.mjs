@@ -3,8 +3,9 @@ import { spawn, execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { extractPackage } from './extract-npm-package.mjs'
 import { promisify } from 'node:util'
 
 const run = promisify(execFile)
@@ -24,13 +25,6 @@ const work = await mkdtemp(join(tmpdir(), 'jsbay-electron-packaged-'))
 const toolsDir = join(work, 'tools')
 const appDir = join(work, 'app')
 const outputDir = join(work, 'dist')
-
-async function extractPackage(tarball, destination) {
-  await mkdir(destination, { recursive: true })
-  const archive = resolve(tarball)
-  await run('tar', ['-xzf', basename(archive), '-C', destination, '--strip-components=1'], { cwd: dirname(archive) })
-  return JSON.parse(await readFile(join(destination, 'package.json'), 'utf8'))
-}
 
 function runPackagedApp(executable) {
   return new Promise((resolveRun, rejectRun) => {

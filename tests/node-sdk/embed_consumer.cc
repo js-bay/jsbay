@@ -257,7 +257,7 @@ napi_value replacementValueIsAlive(napi_env env, napi_callback_info) {
         &exception);
     bool probe_is_untouched = false;
     if (probe_status == JSBAY_OK)
-        (void)jsbay_value_to_boolean(probe, &probe_is_untouched);
+        (void)jsbay_value_to_bool(probe, &probe_is_untouched);
     if (probe)
         (void)jsbay_value_release(probe);
     if (exception)

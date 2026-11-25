@@ -1,5 +1,7 @@
+import { extractPackage } from '../node-sdk/extract-npm-package.mjs'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -65,6 +67,8 @@ assert.match(inspectorConsumer, /new WebSocket\(/)
 assert.match(inspectorConsumer, /Runtime\.enable/)
 assert.match(inspectorConsumer, /Runtime\.evaluate/)
 assert.match(inspectorConsumer, /inspectorStop\(/)
+assert.match(electronConsumer, /extractPackage\(tarballs\[0\]/)
+assert.doesNotMatch(electronConsumer, /tar['"],[\s\S]*?-C['"],[\s\S]*?destination/, 'tar must not receive an absolute Windows destination argument')
 assert.match(npmConsumer, /function readTarball[\s\S]*?basename\(absolute\)[\s\S]*?cwd: dirname\(absolute\)/)
 
 const manifest = await readFile(join(root, 'build.zig.zon'), 'utf8')
@@ -94,6 +98,26 @@ try {
   const appFile = join(temporary, 'electron-main.cjs')
   await writeFile(appFile, appSource)
   execFileSync(process.execPath, ['--check', appFile])
+
+  const archiveFixture = join(temporary, 'npm-package.tgz')
+  await writeFile(archiveFixture, 'archive fixture')
+  const extractedDirectory = join(temporary, 'extracted-package')
+  let tarInvocation
+  const packageManifest = await extractPackage(archiveFixture, extractedDirectory, async (command, args, options) => {
+    tarInvocation = { command, args, options }
+    assert.equal(await readFile(join(options.cwd, '.jsbay-package.tgz'), 'utf8'), 'archive fixture')
+    await writeFile(join(options.cwd, 'package.json'), JSON.stringify({ name: 'package fixture' }))
+  })
+  assert.deepEqual(packageManifest, { name: 'package fixture' })
+  assert.equal(tarInvocation.command, 'tar')
+  assert.deepEqual(tarInvocation.args, ['-xzf', '.jsbay-package.tgz', '--strip-components=1'])
+  assert.equal(tarInvocation.options.cwd, extractedDirectory)
+  assert.ok(tarInvocation.args.every(argument => !/^[A-Za-z]:[\\/]/.test(argument)), 'tar receives no Windows drive-qualified arguments')
+  assert.equal(existsSync(join(extractedDirectory, '.jsbay-package.tgz')), false, 'the staged archive is removed after extraction')
+
+  const failedDirectory = join(temporary, 'failed-package')
+  await assert.rejects(extractPackage(archiveFixture, failedDirectory, async () => { throw new Error('mock tar failure') }), /mock tar failure/)
+  assert.equal(existsSync(join(failedDirectory, '.jsbay-package.tgz')), false, 'the staged archive is removed after extraction failure')
 
   const source = join(temporary, 'package.tgz')
   const checksum = join(temporary, 'SHA512SUMS')
