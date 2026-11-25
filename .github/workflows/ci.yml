@@ -208,6 +208,7 @@ jobs:
         run: |
           set -euo pipefail
           node --test tests/ci/zig-coverage-summary-test.mjs tests/ci/zig-coverage-report-test.mjs
+          node --test tests/ci/zig-package-coverage-targets-test.mjs tests/ci/zig-libraries-coverage-report-test.mjs tests/ci/zig-inline-test-coverage-test.mjs
           if ! command -v kcov >/dev/null 2>&1; then brew install kcov; fi
           bash scripts/quality/zig-coverage.sh "$RUNNER_TEMP/jsbay-coverage"
 
@@ -225,6 +226,17 @@ jobs:
           name: invalid-quickjs-ng-engine-coverage
           path: ${{ runner.temp }}/jsbay-coverage/
           if-no-files-found: ignore
+
+      - name: Report independent Zig library coverage
+        timeout-minutes: 20
+        run: bash scripts/quality/zig-libraries-coverage.sh "$RUNNER_TEMP/jsbay-zig-libraries-coverage"
+
+      - name: Upload independent Zig library coverage
+        uses: actions/upload-artifact@v6
+        with:
+          name: zig-libraries-coverage
+          path: ${{ runner.temp }}/jsbay-zig-libraries-coverage/
+          if-no-files-found: error
 
   linux-engine:
     name: linux-engine (${{ matrix.backend }})
