@@ -35,6 +35,30 @@ run_stage() {
   "$@"
   printf 'node SDK stage passed: %s\n' "$name"
 }
+run_extended_contract_consumer() {
+  local name=$1
+  local addon=$2
+  printf 'node SDK stage start: %s\n' "$name"
+  local first_status=0
+  if env JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"; then
+    printf 'node SDK stage passed: %s\n' "$name"
+    return 0
+  else
+    first_status=$?
+  fi
+  if [[ ${JSBAY_NODE_BACKEND:-} == jsc && ${JSBAY_NODE_PLATFORM:-} == darwin && ${JSBAY_NODE_ARCH:-} == arm64 ]]; then
+    printf 'node SDK diagnostic retry start: %s with polling VM traps\n' "$name"
+    local retry_status=0
+    if env JSC_usePollingTraps=true JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"; then
+      printf 'node SDK diagnostic retry passed: %s\n' "$name"
+    else
+      retry_status=$?
+      printf 'node SDK diagnostic retry failed: %s (exit %s)\n' "$name" "$retry_status"
+    fi
+    printf 'node SDK preserving first failure: %s (exit %s)\n' "$name" "$first_status"
+  fi
+  return "$first_status"
+}
 case "$(uname -s)" in
   Darwin) flags=(-dynamiclib -undefined dynamic_lookup -framework JavaScriptCore -framework Foundation) ;;
   Linux) flags=(-shared -fPIC -pthread) ;;
@@ -52,7 +76,7 @@ for review_case in cleanup-pending completion-reasons shared-handler-error synch
   run_stage "test addon: review case $review_case" env JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
 done
 run_stage 'test addon: conversion fault consumer' env JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/conversion_fault_consumer.cjs"
-run_stage 'test addon: extended contract consumer' env JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"
+run_extended_contract_consumer 'test addon: extended contract consumer' "$addon"
 run_stage 'test addon: value contract consumer' env JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/value_contract_consumer.cjs"
 embed_addon="$output_dir/jsbay_node_embed.node"
 run_stage 'build embedded addon' "${CXX:-c++}" -std=c++17 -DJSBAY_NODE_EMBEDDED=1 "${flags[@]}" -I"$root/include" -I"$root/sdk/node/include" -I"$node_include" -I"$(dirname "$node_include")" "$root/sdk/node/src/jsbay_node.cpp" "$root/tests/node-sdk/embed_consumer.cc" "$archive" -o "$embed_addon"
@@ -69,7 +93,7 @@ fi
 test -s "$production_addon"
 run_stage 'release addon: native consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
 run_stage 'release addon: independent consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
-run_stage 'release addon: extended contract consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"
+run_extended_contract_consumer 'release addon: extended contract consumer' "$production_addon"
 run_stage 'release addon: value contract consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/value_contract_consumer.cjs"
 for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer worker-close-async-gc pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine close-async-contract cache-option-reentrancy worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
   run_stage "release addon: review case $review_case" env JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"

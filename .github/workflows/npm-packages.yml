@@ -264,6 +264,10 @@ jobs:
         if: ${{ !inputs.verify_published && matrix.platform != 'win32' }}
         timeout-minutes: 15
         shell: bash
+        env:
+          JSBAY_NODE_BACKEND: ${{ matrix.backend }}
+          JSBAY_NODE_PLATFORM: ${{ matrix.platform }}
+          JSBAY_NODE_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           JSBAY_LIBRARY="$JSBAY_NODE_LIBRARY" JSBAY_NODE_RELEASE_ADDON="$JSBAY_NODE_ADDON" bash tests/node-sdk/run_native_consumer.sh
