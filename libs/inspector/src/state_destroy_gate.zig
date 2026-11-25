@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub fn Gate(comptime Host: type) type {
     return struct {
         pub const HostType = Host;
