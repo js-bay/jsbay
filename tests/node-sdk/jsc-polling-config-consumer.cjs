@@ -22,16 +22,25 @@ assert.equal((capabilities.flags & (1 << 2)) !== 0, enabled, 'the flags match th
 if (!invalid) {
   const engine = Engine.create()
   try {
+    if (expected === 'true') {
+      assert.equal(process.env.JSC_usePollingTraps, 'true', 'core initialization is visible through the process environment')
+    }
     assert.equal(engine.evaluate('6 * 7'), 42)
     if (!enabled) {
       assert.throws(() => engine.setExecutionTimeLimit(100), { code: 'JSBAY_UNSUPPORTED' })
       assert.throws(() => engine.setExecutionBudget(100), { code: 'JSBAY_UNSUPPORTED' })
+      assert.doesNotThrow(() => engine.setExecutionTimeLimit(0))
+      assert.doesNotThrow(() => engine.setExecutionBudget(0))
       assert.equal(engine.requestInterrupt(), false)
-      assert.equal(engine.cancel(), false)
-      assert.equal(engine.beginShutdown(100), false)
+      assert.equal(engine.cancel(), true)
     }
   } finally {
     engine.close()
+  }
+  if (!enabled) {
+    const shutdownEngine = Engine.create()
+    assert.equal(shutdownEngine.beginShutdown(100), true)
+    shutdownEngine.close()
   }
 } else {
   assert.throws(() => Engine.create(), /could not create JsBay engine/i)

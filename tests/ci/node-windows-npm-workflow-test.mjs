@@ -55,7 +55,7 @@ assert.match(jscLifecycle, /prepareBeforeVm\(\)[\s\S]*?JSContextGroupCreate\(\)/
 assert.match(backendSource, /polling_config\.zig[\s\S]*?supportsInterrupt\(\)/)
 assert.match(jscPollingConsumer, /capabilities\.executionLimit, enabled/)
 assert.match(jscPollingConsumer, /capabilities\.flags & \(1 << 2\)/)
-assert.match(jscWorkerConsumer, /process\.env\.JSC_usePollingTraps, undefined/)
+assert.match(jscWorkerConsumer, /process\.env\.JSC_usePollingTraps, 'true'/)
 assert.match(jscWorkerConsumer, /new Worker\(/)
 assert.match(jscWorkerConsumer, /require\(entry\)/)
 assert.match(jscWorkerConsumer, /engine\.setExecutionTimeLimit\(100\)/)

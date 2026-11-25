@@ -90,7 +90,7 @@ async function main() {
     const interruptReady = await nextMessage(message => message.type === 'ready' && message.name === 'interrupt', 'interrupt worker readiness')
     await nextMessage(message => message.type === 'evaluating' && message.name === 'interrupt', 'interrupt evaluation start')
     const { Engine } = require(entry)
-    assert.equal(process.env.JSC_usePollingTraps, undefined, 'the package entry leaves process configuration to core')
+    assert.equal(process.env.JSC_usePollingTraps, 'true', 'core initialization is visible process-wide after Worker first load')
     assert.equal(Engine.capabilities().executionLimit, true)
     assert.equal(Engine.requestInterrupt(interruptReady.token), true)
     const interruptResult = await nextMessage(message => message.type === 'result' && message.name === 'interrupt', 'worker interrupt')

@@ -40,7 +40,7 @@ pub const ShutdownPhase = enum(c_int) { open = 0, closing = 1, sealed = 2, drain
 
 pub const ShutdownStatus = struct { phase: ShutdownPhase, remaining_ms: u64 };
 
-/// Per-instance state shared between public control calls and backend interrupt trampolines. Registry access is serialized; interrupt flags and deadlines use atomic access. The backend extern structs must preserve this layout.
+/// Per-instance state shared between public control calls and backend interrupt trampolines. Registry access is serialized; interrupt flags and deadlines use atomic access. Backend trampoline structs preserve their shared field prefix.
 pub const InterruptState = extern struct {
     /// Non-zero when an interrupt has been requested. Read by the trampoline on every interrupt check.
     interrupt_requested: u8 = 0,
@@ -58,6 +58,8 @@ pub const InterruptState = extern struct {
     exec_epoch: u64 = 0,
     /// Monotonic target epoch for user interrupts (via fetchMax).
     interrupt_target: u64 = 0,
+    /// Backend tag used by control-plane calls while holding registry_mutex.
+    backend_tag: backend.BackendC = .primary,
 };
 
 // ---- Module-global state registry --------------------------------------------
@@ -104,6 +106,7 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
         .budget_depth = 0,
         .exec_epoch = 0,
         .interrupt_target = 0,
+        .backend_tag = backend.backendToC(inst.backendTag()),
     };
 
     registry_mutex.lock();
@@ -269,25 +272,34 @@ pub fn supportsMidScriptUserInterrupt() bool {
     };
 }
 
-fn jscPollingControlsUnavailable(instance_id: i32) bool {
+fn supportsMidScriptUserInterruptForBackend(tag: backend.BackendType, jsc_polling_enabled: bool) bool {
+    return switch (tag) {
+        .quickjs, .quickjs_ng => true,
+        .jsc => jsc_polling_enabled,
+        .escargot, .hermes => false,
+    };
+}
+
+fn supportsMidScriptUserInterruptForState(state: *const InterruptState, jsc_polling_enabled: bool) bool {
+    const tag = backend.backendFromC(@backingInt(state.backend_tag)) orelse return false;
+    return supportsMidScriptUserInterruptForBackend(tag, jsc_polling_enabled);
+}
+
+fn jscPollingControlsUnavailable(state: *const InterruptState) bool {
     if (comptime !backend.isPacked(.jsc)) return false;
-    const ptrs = instance_map.getPtrs(instance_id) orelse return false;
-    return ptrs.backend_tag == .jsc and !@import("../backend/jsc/polling_config.zig").supportsInterrupt();
+    return state.backend_tag == .jsc and !@import("../backend/jsc/polling_config.zig").supportsInterrupt();
 }
 
 /// Request mid-script interrupt when the backend supports it. Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed). Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
-    if (jscPollingControlsUnavailable(instance_id)) return false;
-    if (!supportsMidScriptUserInterrupt()) {
-        // Refuse to claim mid-script stop. Do not set the user bit (avoids false isInterruptRequested).
-        registry_mutex.lock();
-        defer registry_mutex.unlock();
-        _ = registry.get(instance_id) orelse return false;
-        return false;
-    }
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    const polling_enabled = if (state.backend_tag == .jsc) blk: {
+        if (comptime backend.isPacked(.jsc)) break :blk @import("../backend/jsc/polling_config.zig").supportsInterrupt();
+        break :blk false;
+    } else true;
+    if (!supportsMidScriptUserInterruptForState(state, polling_enabled)) return false;
     const epoch_ptr: *std.atomic.Value(u64) = @ptrCast(&state.exec_epoch);
     const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
     const cur_epoch = epoch_ptr.load(.monotonic);
@@ -296,6 +308,77 @@ pub fn requestInterrupt(instance_id: i32) bool {
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchOr(1, .monotonic);
     return true;
+}
+
+test "instance interrupt support follows the selected packed backend" {
+    try std.testing.expect(supportsMidScriptUserInterruptForBackend(.quickjs_ng, false));
+    try std.testing.expect(supportsMidScriptUserInterruptForBackend(.quickjs, false));
+    try std.testing.expect(!supportsMidScriptUserInterruptForBackend(.jsc, false));
+    try std.testing.expect(supportsMidScriptUserInterruptForBackend(.jsc, true));
+    try std.testing.expect(!supportsMidScriptUserInterruptForBackend(.escargot, true));
+    try std.testing.expect(!supportsMidScriptUserInterruptForBackend(.hermes, true));
+}
+
+test "reused instance ids use the backend saved with each interrupt state" {
+    const reused_id = std.math.maxInt(i32) - 11;
+    var old_state = InterruptState{ .instance_id = reused_id, .backend_tag = .jsc };
+    var new_state = InterruptState{ .instance_id = reused_id, .backend_tag = .quickjs_ng };
+    try std.testing.expect(!supportsMidScriptUserInterruptForState(&old_state, false));
+    try std.testing.expect(supportsMidScriptUserInterruptForState(&new_state, false));
+    try std.testing.expect(supportsMidScriptUserInterruptForState(
+        &InterruptState{ .instance_id = reused_id, .backend_tag = .jsc },
+        true,
+    ));
+}
+
+test "interrupt request observes a replacement state under the registry lock" {
+    const id = std.math.maxInt(i32) - 12;
+    const old_state = try std.heap.c_allocator.create(InterruptState);
+    old_state.* = .{ .instance_id = id, .backend_tag = .jsc };
+    defer std.heap.c_allocator.destroy(old_state);
+    const replacement = try std.heap.c_allocator.create(InterruptState);
+    replacement.* = .{ .instance_id = id, .backend_tag = .quickjs_ng };
+    defer std.heap.c_allocator.destroy(replacement);
+
+    const Probe = struct {
+        instance_id: i32,
+        accepted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            self.accepted.store(requestInterrupt(self.instance_id), .release);
+        }
+    };
+    var probe = Probe{ .instance_id = id };
+
+    registry_mutex.lock();
+    registry.put(id, old_state) catch {
+        registry_mutex.unlock();
+        return error.OutOfMemory;
+    };
+    const thread = std.Thread.spawn(.{}, Probe.run, .{&probe}) catch {
+        _ = registry.remove(id);
+        registry_mutex.unlock();
+        return error.ThreadSpawnFailed;
+    };
+    if (registry.fetchRemove(id) == null) {
+        registry_mutex.unlock();
+        thread.join();
+        return error.MissingOriginalState;
+    }
+    registry.put(id, replacement) catch {
+        registry_mutex.unlock();
+        thread.join();
+        _ = takeState(id);
+        return error.OutOfMemory;
+    };
+    registry_mutex.unlock();
+    thread.join();
+
+    const current = takeState(id) orelse return error.MissingReplacementState;
+    try std.testing.expect(current == replacement);
+    try std.testing.expect(probe.accepted.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), old_state.interrupt_requested);
+    try std.testing.expectEqual(@as(u8, 1), replacement.interrupt_requested);
 }
 
 /// Clear a pending user interrupt. Lifecycle shutdown owns a separate bit, so this cannot resume a script that is being stopped.
@@ -332,7 +415,6 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
 
 /// A generation-scoped host shutdown is terminal for this runtime generation. Engine-thread stop/restart paths may clear their bit, so this uses a separate bit that is cleared only when runtime-control state is destroyed.
 pub fn requestShutdownCancel(instance_id: i32) bool {
-    if (jscPollingControlsUnavailable(instance_id)) return false;
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
@@ -355,7 +437,6 @@ fn refreshShutdown(state: *InterruptState, now: u64) void {
 
 /// Arm the generation's graceful-shutdown deadline without discarding messages already in a host transport. Repeated begins never extend the first deadline; the host sends its final fence through that same transport before sealing core submission.
 pub fn beginShutdown(instance_id: i32, millis: u64) bool {
-    if (jscPollingControlsUnavailable(instance_id)) return false;
     if (millis == 0) return false;
     registry_mutex.lock();
     defer registry_mutex.unlock();
@@ -465,10 +546,10 @@ fn armJscWatchdogShortLimit(instance_id: i32, millis: u64) void {
 ///
 /// Enforcement precision varies by backend: QuickJS checks interrupts at bytecode safe points (every ~10,000 opcode ticks, sub-millisecond in compute loops); JavaScriptCore (JSC) relies on a watchdog timer checking thread CPU time at min(remaining, 50ms) intervals (clamped to >= 5ms).
 pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
-    if (jscPollingControlsUnavailable(instance_id)) return false;
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (millis != 0 and jscPollingControlsUnavailable(state)) return false;
     const p: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     if (millis == 0) {
         p.store(0, .monotonic);
@@ -488,10 +569,10 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
 
 /// Configure a deadline applied to each outer VM entry. Zero disables it; idle time never consumes this budget.
 pub fn setExecutionBudget(instance_id: i32, millis: u64) bool {
-    if (jscPollingControlsUnavailable(instance_id)) return false;
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (millis != 0 and jscPollingControlsUnavailable(state)) return false;
     state.budget_millis = millis;
     if (millis != 0) {
         const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);

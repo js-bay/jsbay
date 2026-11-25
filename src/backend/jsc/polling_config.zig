@@ -2,6 +2,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const sync = @import("zev");
 
 const applies = builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
 
@@ -10,7 +11,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 
 const State = enum { unknown, enabled, disabled, invalid };
 
-var mutex: std.Thread.Mutex = .{};
+var mutex: sync.Mutex = .{};
 var state: State = .unknown;
 
 fn parse(value: []const u8) State {
