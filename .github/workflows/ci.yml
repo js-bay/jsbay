@@ -203,11 +203,15 @@ jobs:
       - name: Add Homebrew to PATH
         run: echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
 
-      - name: Report QuickJS-NG engine coverage
+      - name: Report Zig engine coverage
         timeout-minutes: 20
         run: |
           set -euo pipefail
           node --test tests/ci/zig-coverage-summary-test.mjs tests/ci/zig-coverage-report-test.mjs
+          node --test tests/ci/zig-coverage-merge-test.mjs
+          node --test tests/ci/zig-coverage-aggregate-test.mjs
+          node --test tests/ci/zig-coverage-inventory-test.mjs
+          node --test tests/ci/zig-package-coverage-targets-test.mjs tests/ci/zig-libraries-coverage-report-test.mjs tests/ci/zig-inline-test-coverage-test.mjs
           if ! command -v kcov >/dev/null 2>&1; then brew install kcov; fi
           bash scripts/quality/zig-coverage.sh "$RUNNER_TEMP/jsbay-coverage"
 
@@ -215,7 +219,37 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: quickjs-ng-engine-coverage
-          path: ${{ runner.temp }}/jsbay-coverage/
+          path: |
+            ${{ runner.temp }}/jsbay-coverage/coverage.cobertura.xml
+            ${{ runner.temp }}/jsbay-coverage/coverage-tests.json
+            ${{ runner.temp }}/jsbay-coverage/pawl.coverage.yaml
+          if-no-files-found: error
+
+      - name: Upload merged Zig engine coverage
+        uses: actions/upload-artifact@v6
+        with:
+          name: quickjs-engines-compiled-zig-coverage
+          path: |
+            ${{ runner.temp }}/jsbay-coverage/quickjs-engines-coverage.cobertura.xml
+            ${{ runner.temp }}/jsbay-coverage/quickjs-engines-coverage.json
+            ${{ runner.temp }}/jsbay-coverage/pawl.quickjs-engines-coverage.yaml
+            ${{ runner.temp }}/jsbay-coverage/coverage-tests.json
+            ${{ runner.temp }}/jsbay-coverage/quickjs-tests.json
+          if-no-files-found: error
+
+      - name: Save QuickJS backend coverage inputs
+        run: echo "$GITHUB_SHA" > "$RUNNER_TEMP/jsbay-coverage/source-commit.txt"
+
+      - name: Upload QuickJS backend coverage inputs
+        uses: actions/upload-artifact@v6
+        with:
+          name: quickjs-engine-coverage-inputs
+          path: |
+            ${{ runner.temp }}/jsbay-coverage/quickjs-coverage.cobertura.xml
+            ${{ runner.temp }}/jsbay-coverage/quickjs-ng-coverage.cobertura.xml
+            ${{ runner.temp }}/jsbay-coverage/quickjs-tests.json
+            ${{ runner.temp }}/jsbay-coverage/coverage-tests.json
+            ${{ runner.temp }}/jsbay-coverage/source-commit.txt
           if-no-files-found: error
 
       - name: Upload invalid coverage report
@@ -223,8 +257,109 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: invalid-quickjs-ng-engine-coverage
-          path: ${{ runner.temp }}/jsbay-coverage/
+          path: |
+            ${{ runner.temp }}/jsbay-coverage/coverage-invalid.cobertura.xml
+            ${{ runner.temp }}/jsbay-coverage/debug-lines-sample.txt
           if-no-files-found: ignore
+
+      - name: Report independent Zig library coverage
+        timeout-minutes: 20
+        run: bash scripts/quality/zig-libraries-coverage.sh "$RUNNER_TEMP/jsbay-zig-libraries-coverage"
+
+      - name: Upload independent Zig library coverage
+        uses: actions/upload-artifact@v6
+        with:
+          name: zig-libraries-coverage
+          path: ${{ runner.temp }}/jsbay-zig-libraries-coverage/
+          if-no-files-found: error
+
+
+  compiled-zig-coverage:
+    name: compiled-zig-coverage
+    needs: [linux-coverage, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: 0.17.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install Pawl
+        uses: tiangong-dev/pawl@v0.10.0
+        with:
+          version: v0.10.0
+
+      - name: Download QuickJS engine coverage inputs
+        uses: actions/download-artifact@v8
+        with:
+          name: quickjs-engine-coverage-inputs
+          path: ${{ runner.temp }}/zig-coverage/quickjs
+
+      - name: Download JSC coverage input
+        uses: actions/download-artifact@v8
+        with:
+          name: jsc-engine-coverage-input
+          path: ${{ runner.temp }}/zig-coverage/jsc
+
+      - name: Download Zig library coverage
+        uses: actions/download-artifact@v8
+        with:
+          name: zig-libraries-coverage
+          path: ${{ runner.temp }}/zig-coverage/libs
+
+      - name: Validate inputs and merge compiled Zig lines
+        env:
+          COVERAGE_INPUT: ${{ runner.temp }}/zig-coverage
+        run: |
+          set -euo pipefail
+          test "$(cat "$COVERAGE_INPUT/quickjs/source-commit.txt")" = "$GITHUB_SHA"
+          test "$(cat "$COVERAGE_INPUT/jsc/source-commit.txt")" = "$GITHUB_SHA"
+          node scripts/quality/zig-coverage-aggregate.mjs \
+            --backend "quickjs=$COVERAGE_INPUT/quickjs/quickjs-coverage.cobertura.xml" \
+            --backend "quickjs_ng=$COVERAGE_INPUT/quickjs/quickjs-ng-coverage.cobertura.xml" \
+            --backend "jsc=$COVERAGE_INPUT/jsc/jsc-coverage.cobertura.xml" \
+            --output "$RUNNER_TEMP/zig-coverage/all-engines-coverage.cobertura.xml" \
+            > "$RUNNER_TEMP/zig-coverage/all-engines-coverage.json"
+          node scripts/quality/zig-coverage-inventory.mjs \
+            --repo "$GITHUB_WORKSPACE" \
+            --report "src=$RUNNER_TEMP/zig-coverage/all-engines-coverage.cobertura.xml" \
+            --report "libs=$COVERAGE_INPUT/libs/zig-libraries-coverage.cobertura.xml" \
+            > "$RUNNER_TEMP/zig-coverage/zig-coverage-inventory.json"
+          cat > "$RUNNER_TEMP/zig-coverage/pawl.all-engines-coverage.yaml" <<'EOF'
+          dimensions:
+            - id: quickjs-engines-jsc-compiled-zig-line-coverage
+              title: QuickJS, QuickJS-NG, and JSC compiled Zig source lines
+              direction: higher-is-better
+              builtin: coverage
+              options:
+                file: all-engines-coverage.cobertura.xml
+                format: cobertura
+                metric: lines
+          EOF
+          pawl measure -c "$RUNNER_TEMP/zig-coverage/pawl.all-engines-coverage.yaml"
+
+      - name: Upload three-engine Zig coverage
+        uses: actions/upload-artifact@v6
+        with:
+          name: quickjs-quickjs-ng-jsc-compiled-zig-coverage
+          path: |
+            ${{ runner.temp }}/zig-coverage/all-engines-coverage.cobertura.xml
+            ${{ runner.temp }}/zig-coverage/all-engines-coverage.json
+            ${{ runner.temp }}/zig-coverage/zig-coverage-inventory.json
+            ${{ runner.temp }}/zig-coverage/pawl.all-engines-coverage.yaml
+            ${{ runner.temp }}/zig-coverage/quickjs/quickjs-tests.json
+            ${{ runner.temp }}/zig-coverage/quickjs/coverage-tests.json
+            ${{ runner.temp }}/zig-coverage/jsc/jsc-tests.json
+          if-no-files-found: error
 
   linux-engine:
     name: linux-engine (${{ matrix.backend }})
@@ -479,6 +614,24 @@ jobs:
 
       - name: Engine tests (jsc)
         run: zig build test-engine -Dbackend=jsc --summary all
+
+      - name: Engine coverage (jsc)
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          if ! command -v kcov >/dev/null 2>&1; then brew install kcov; fi
+          bash scripts/quality/zig-jsc-coverage.sh "$RUNNER_TEMP/jsbay-jsc-coverage"
+          echo "$GITHUB_SHA" > "$RUNNER_TEMP/jsbay-jsc-coverage/source-commit.txt"
+
+      - name: Upload JSC coverage input
+        uses: actions/upload-artifact@v6
+        with:
+          name: jsc-engine-coverage-input
+          path: |
+            ${{ runner.temp }}/jsbay-jsc-coverage/jsc-coverage.cobertura.xml
+            ${{ runner.temp }}/jsbay-jsc-coverage/jsc-tests.json
+            ${{ runner.temp }}/jsbay-jsc-coverage/source-commit.txt
+          if-no-files-found: error
 
       - name: Host CDP transport without HTTP or WebSocket (jsc)
         run: zig build test-engine -Dbackend=jsc -Dinspector-transport=false -Dtest-filter="host transport" --summary all
