@@ -100,6 +100,36 @@ test "timer unification: cancelling ready timers preserves the other due callbac
     try helpers.expectEvalEquals(second_id, "__readyTrace__", "AB");
 }
 
+test "timer unification: microtask cancellation prevents later interval callbacks" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+    try engine.testing.setNow(id, 0);
+    _ = engine.testing.advance(id, 0);
+    try helpers.evalOk(id,
+        \\globalThis.__intervalRuns = 0;
+        \\globalThis.__intervalSiblingRuns = 0;
+        \\let intervalId = setInterval(() => {
+        \\  globalThis.__intervalRuns++;
+        \\  queueMicrotask(() => clearInterval(intervalId));
+        \\}, 10);
+        \\setTimeout(() => globalThis.__intervalSiblingRuns++, 20);
+    );
+
+    _ = engine.testing.advance(id, 10);
+    try helpers.expectEvalEquals(id, "globalThis.__intervalRuns", "1");
+    try helpers.expectEvalEquals(id, "globalThis.__intervalSiblingRuns", "0");
+
+    _ = engine.testing.advance(id, 20);
+    try helpers.expectEvalEquals(id, "globalThis.__intervalRuns", "1");
+    try helpers.expectEvalEquals(id, "globalThis.__intervalSiblingRuns", "1");
+
+    _ = engine.testing.advance(id, 40);
+    _ = engine.testing.advance(id, 80);
+    try helpers.expectEvalEquals(id, "globalThis.__intervalRuns", "1");
+    try helpers.expectEvalEquals(id, "globalThis.__intervalSiblingRuns", "1");
+}
+
 test "timer unification: scheduler OOM keeps ids and caller state intact" {
     const Case = struct {
         fn run(fail_index: usize) !void {

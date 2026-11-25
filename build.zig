@@ -609,14 +609,11 @@ pub fn build(b: *std.Build) void {
         const check_explore_gates = b.addRunArtifact(gate_check_exe);
         check_explore_gates.setCwd(b.path("."));
         const explore_harnesses = [_][]const u8{
-            "src/tests/state_tcas_calendar_harness.zig",
-            "src/tests/state_tcas_engine_harness.zig",
-            "src/tests/state_tcas_event_loop_harness.zig",
-            "src/tests/state_tcas_harness.zig",
-            "src/tests/state_tcas_js_event_loop_driver_harness.zig",
-            "src/tests/state_tcas_js_event_loop_harness.zig",
-            "src/tests/state_tcas_monitor_harness.zig",
-            "src/tests/state_tcas_tla_harness.zig",
+            "src/tests/state_tcas_calendar_harness.zig",             "src/tests/state_tcas_engine_harness.zig",
+            "src/tests/state_tcas_event_loop_harness.zig",           "src/tests/state_tcas_harness.zig",
+            "src/tests/state_tcas_js_event_loop_driver_harness.zig", "src/tests/state_tcas_js_event_loop_harness.zig",
+            "src/tests/state_tcas_scheduler_run_turn_harness.zig",   "src/tests/state_tcas_engine_timer_cancel_harness.zig",
+            "src/tests/state_tcas_monitor_harness.zig",              "src/tests/state_tcas_tla_harness.zig",
         };
         for (explore_harnesses) |harness_path| {
             check_explore_gates.addArgs(&.{
@@ -629,12 +626,9 @@ pub fn build(b: *std.Build) void {
             });
         }
         check_explore_gates.addArgs(&.{
-            "--path",            "src/tests/state_tcas_engine_harness.zig",
-            "--forbid",          "explore.bfs(",
-            "--ignore-comments", "--rule-end",
-            "--path",            "src/tests/state_tcas_js_event_loop_driver_harness.zig",
-            "--forbid",          "explore.bfs(",
-            "--ignore-comments", "--rule-end",
+            "--path", "src/tests/state_tcas_engine_harness.zig",               "--forbid", "explore.bfs(", "--ignore-comments", "--rule-end",
+            "--path", "src/tests/state_tcas_engine_timer_cancel_harness.zig",  "--forbid", "explore.bfs(", "--ignore-comments", "--rule-end",
+            "--path", "src/tests/state_tcas_js_event_loop_driver_harness.zig", "--forbid", "explore.bfs(", "--ignore-comments", "--rule-end",
         });
         const check_explore_gates_step = b.step("check-state-tcas-explore-gates", "Ban L2 Ungated / loop.dispatchEvents* in state_tcas explore harnesses");
         check_explore_gates_step.dependOn(&check_explore_gates.step);

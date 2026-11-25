@@ -136,6 +136,10 @@ zig build test-state-tcas-engine -Dbackend=quickjs_ng --summary all
 
 CI runs `zig build test-state-tcas` on the Linux governance job (Scheduler/Driver suite + explore gates). Engine harnesses ride `test-engine` via `all_tests.zig`.
 
+The Scheduler exploration drives the Scheduler implementation, while the concurrent GC submission exploration uses a separate model. Both explore bounded actions and states; neither establishes that every possible execution is safe. The TLA+ scheduler specification, its projected state, and trace replay are described in [TLA+ specification lock and ITF trace replay](state-tcas-tla.md).
+
+For new concurrency coverage, choose actions and bounds that exercise the relevant implementation and failure paths, and state where a harness uses a separate model. A theorem prover can establish properties for all sequences of an abstract model, but that result alone does not show the implementation follows the model. Use it when the property and a practical way to check the implementation against the model justify the added toolchain and maintenance cost.
+
 The host tooling suite requires `zip` and `unzip` for actual ZIP/HAR packaging fixtures, in addition to the shell, archive and file tools used by the staging scripts. The fixture resolves the host ZIP encoder before applying its test-local PATH and binds that executable into the fixture; it does not emulate an archive encoder. Both TAR and ZIP staging must accept the production-shaped fixture and reject conformance-only content.
 
 ## SDK ABI source gate subset
