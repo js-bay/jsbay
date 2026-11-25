@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -114,6 +114,16 @@ try {
   assert.equal(tarInvocation.options.cwd, extractedDirectory)
   assert.ok(tarInvocation.args.every(argument => !/^[A-Za-z]:[\\/]/.test(argument)), 'tar receives no Windows drive-qualified arguments')
   assert.equal(existsSync(join(extractedDirectory, '.jsbay-package.tgz')), false, 'the staged archive is removed after extraction')
+
+  const archiveRoot = join(temporary, 'archive-root')
+  await mkdir(join(archiveRoot, 'package'), { recursive: true })
+  await writeFile(join(archiveRoot, 'package', 'package.json'), JSON.stringify({ name: 'default runner package' }))
+  const defaultArchive = join(temporary, 'default-runner.tgz')
+  execFileSync('tar', ['-czf', defaultArchive, '-C', archiveRoot, 'package'])
+  const defaultDestination = join(temporary, 'default-runner-package')
+  const defaultManifest = await extractPackage(defaultArchive, defaultDestination)
+  assert.deepEqual(defaultManifest, { name: 'default runner package' }, 'production-style two-argument extraction invokes real tar')
+  assert.equal(existsSync(join(defaultDestination, '.jsbay-package.tgz')), false, 'the default runner also cleans up the staged archive')
 
   const failedDirectory = join(temporary, 'failed-package')
   await assert.rejects(extractPackage(archiveFixture, failedDirectory, async () => { throw new Error('mock tar failure') }), /mock tar failure/)
