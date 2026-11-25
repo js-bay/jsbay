@@ -55,7 +55,6 @@ comptime {
         _ = @import("../backend/quickjs_common/host_abi.zig");
         _ = @import("../backend/quickjs_common/host_keys.zig");
         _ = @import("../backend/quickjs_common/jobs.zig");
-        _ = @import("../backend/quickjs_common/rejection_queue.zig");
         _ = @import("../backend/quickjs_common/weakcb.zig");
         _ = @import("class_id_tests.zig");
         _ = @import("native_handle_handle_tests.zig");
