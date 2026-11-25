@@ -67,6 +67,7 @@ const TimerCancelWorld = struct {
     cancel_task_enqueued: bool = false,
     advances: u8 = 0,
     bad_cancel_delivery: bool = false,
+    bad_started_callback_cancel: bool = false,
     bad_task_checkpoint: bool = false,
     saw_pending_cancel: bool = false,
     saw_cancel_after_sibling: bool = false,
@@ -90,6 +91,7 @@ const TimerCancelWorld = struct {
         if (!engine.create(self.id, .{})) return error.EngineCreateFailed;
         self.created = true;
         installRecorder(self.id);
+        try helpers.expectEvalEquals(self.id, "typeof __stRecord__", "function");
         Trace.reset();
     }
 
@@ -108,16 +110,22 @@ const TimerCancelWorld = struct {
         self.cancel_task_enqueued = false;
         self.advances = 0;
         self.bad_cancel_delivery = false;
+        self.bad_started_callback_cancel = false;
         self.bad_task_checkpoint = false;
         self.cancel_after_sibling_candidate = false;
     }
 
-    fn rebuild(self: *@This()) !void {
+    fn rebuild(self: *@This(), test_only_replay_trace: ?u8) !void {
         self.resetPath();
         const count = self.log_len;
         self.log_len = 0;
         for (self.log[0..count]) |act| {
             try self.apply(act);
+            if (test_only_replay_trace) |byte| {
+                Trace.append(byte);
+                self.observeTrace();
+            }
+            try self.safetyOk();
             self.log[self.log_len] = act;
             self.log_len += 1;
         }
@@ -180,6 +188,7 @@ const TimerCancelWorld = struct {
                     cancelled_before_start = true;
                     if (self.cancel_after_sibling_candidate and saw_a_before_cancel) self.saw_cancel_after_sibling = true;
                 },
+                'D' => self.bad_started_callback_cancel = true,
                 'B' => {
                     b_count += 1;
                     if (cancelled_before_start) self.bad_cancel_delivery = true;
@@ -229,11 +238,12 @@ const TimerCancelWorld = struct {
     pub fn undo(self: *@This(), _: TimerCancelAct) void {
         if (self.log_len == 0) return;
         self.log_len -= 1;
-        self.rebuild() catch unreachable;
+        self.rebuild(null) catch |err| std.debug.panic("timer cancellation exploration replay failed: {s}", .{@errorName(err)});
     }
 
     fn safetyOk(self: *@This()) !void {
         if (self.bad_cancel_delivery) return error.CancelledTimerDelivered;
+        if (self.bad_started_callback_cancel) return error.StartedCallbackWasCancelled;
         if (self.bad_task_checkpoint) return error.TaskCheckpointBroken;
         if (self.advances == 3 and hasTrace('C') and !hasTrace('A')) return error.SurvivingSiblingNotDelivered;
     }
@@ -242,6 +252,14 @@ const TimerCancelWorld = struct {
         self.destroyEngine();
     }
 };
+
+test "state_tcas engine: replay rejects injected cancellation trace drift" {
+    var world = TimerCancelWorld{ .id = helpers.nextInstanceId() };
+    defer world.deinit();
+
+    try world.step(.schedule_timers);
+    try testing.expectError(error.StartedCallbackWasCancelled, world.rebuild(@as(u8, 'D')));
+}
 
 test "state_tcas engine: explores timer cancellation before and after a sibling task" {
     var world = TimerCancelWorld{ .id = helpers.nextInstanceId() };
