@@ -36,6 +36,12 @@ jobs:
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
+      - name: Install repository tool dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+      - name: Check host tool dependencies
+        run: command -v git zig ruby tar zip unzip rg cmake
       - uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json

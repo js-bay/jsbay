@@ -68,7 +68,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
     const tools = try join(allocator, fixture, &.{"tools"});
     var setup = try mustRun(allocator, io, fixture, &.{ "mkdir", "-p", tools, try join(allocator, repo, &.{"scripts"}), try join(allocator, repo, &.{"include"}), try join(allocator, repo, &.{ "tests", "zig-consumer" }) });
     defer setup.deinit();
-    for ([_][]const []const u8{ &.{ try join(allocator, cwd, &.{"build-apple.sh"}), try join(allocator, repo, &.{"build-apple.sh"}) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_probe.c" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_probe.c" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_ios_main.m" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_ios_main.m" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_ios_Info.plist" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_ios_Info.plist" }) } }) |copy| {
+    for ([_][]const []const u8{ &.{ try join(allocator, cwd, &.{"build-apple.sh"}), try join(allocator, repo, &.{"build-apple.sh"}) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_probe.c" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_probe.c" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_ios_main.m" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_ios_main.m" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_ios_Info.plist" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_ios_Info.plist" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_simulator_diagnostics.sh" }), try join(allocator, repo, &.{ "scripts", "apple_simulator_diagnostics.sh" }) } }) |copy| {
         var out = try mustRun(allocator, io, fixture, &.{ "cp", copy[0], copy[1] });
         out.deinit();
     }
@@ -380,7 +380,7 @@ test "test_release_downloads_assets after checkout and builds portable Linux npm
     const checkout = std.mem.indexOf(u8, draft, "uses: actions/checkout@v7") orelse return error.MissingDraftCheckout;
     const download = std.mem.indexOf(u8, draft, "name: jsbay-final-release-assets") orelse return error.MissingReleaseAssetDownload;
     try testing.expect(checkout < download);
-    try contains(npm, "if [[ \"$PLATFORM\" == linux ]]; then\n            zig_args+=(\"-Dcpu=baseline\")\n          fi");
+    try contains(npm, "elif [[ \"$JSBAY_NPM_PLATFORM\" == linux ]]; then\n            cmake_args+=(-DJSBAY_LIBRARY=\"$core/lib/libjsbay.a\")\n            zig_args+=(\"-Dcpu=baseline\")");
 }
 
 test "publication jobs require the release environment" {
