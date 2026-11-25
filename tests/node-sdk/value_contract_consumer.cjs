@@ -97,10 +97,15 @@ try {
   handles.push(global)
   const math = global.get('Math')
   const max = math.get('max')
-  const receiver = first.value(undefined)
-  handles.push(math, max, receiver)
+  const undefinedValue = first.value(undefined)
+  const nullValue = first.value(null)
+  handles.push(math, max, undefinedValue, nullValue)
+  assert.equal(undefinedValue.toHost(), undefined)
+  assert.equal(nullValue.toHost(), null)
+  const receiver = undefinedValue
   assert.equal(max.type(), 'function')
   assert.equal(max.call(receiver, 2, 7, 5).toHost(), 7)
+  assert.equal(max.call(undefined, 2, 7).toHost(), 7)
 
   const add = first.evaluateValue('(left, right) => left + right', 'function.js')
   handles.push(add)

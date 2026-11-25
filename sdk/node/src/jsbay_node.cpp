@@ -638,6 +638,9 @@ static jsbay_utf8_t text(const std::string &value) {
     return {reinterpret_cast<const uint8_t *>(value.data()), value.size()};
 }
 static Engine *unwrap(napi_env env, napi_value value) {
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type != napi_object)
+        return nullptr;
     bool tagged = false;
     if (napi_check_object_type_tag(env, value, &engineTypeTag, &tagged) != napi_ok || !tagged)
         return nullptr;

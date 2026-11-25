@@ -386,7 +386,7 @@ pub fn build(b: *std.Build) void {
         .linkage = if (shared) .dynamic else .static,
         .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
     });
-    if (!shared and (os.isDarwin() or (os == .linux and !target.result.abi.isAndroid() and !ohos)))
+    if (!shared and (os.isDarwin() or (os == .linux and !target.result.abi.isAndroid() and !ohos) or os == .windows))
         lib.bundle_compiler_rt = true;
     b.installArtifact(lib);
 

@@ -143,6 +143,9 @@ static napi_value makeNodeValue(Engine *engine, jsbay_value_t value) {
 }
 
 static NodeValueState *unwrapNodeValue(napi_env env, napi_value value) {
+    napi_valuetype type;
+    if (napi_typeof(env, value, &type) != napi_ok || type != napi_object)
+        return nullptr;
     bool tagged = false;
     if (napi_check_object_type_tag(env, value, &nodeValueTypeTag, &tagged) != napi_ok || !tagged)
         return nullptr;
