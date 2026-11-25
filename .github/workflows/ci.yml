@@ -203,11 +203,13 @@ jobs:
       - name: Add Homebrew to PATH
         run: echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
 
-      - name: Report QuickJS-NG engine coverage
+      - name: Report Zig engine coverage
         timeout-minutes: 20
         run: |
           set -euo pipefail
           node --test tests/ci/zig-coverage-summary-test.mjs tests/ci/zig-coverage-report-test.mjs
+          node --test tests/ci/zig-coverage-merge-test.mjs
+          node --test tests/ci/zig-coverage-inventory-test.mjs
           node --test tests/ci/zig-package-coverage-targets-test.mjs tests/ci/zig-libraries-coverage-report-test.mjs tests/ci/zig-inline-test-coverage-test.mjs
           if ! command -v kcov >/dev/null 2>&1; then brew install kcov; fi
           bash scripts/quality/zig-coverage.sh "$RUNNER_TEMP/jsbay-coverage"
@@ -216,7 +218,22 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: quickjs-ng-engine-coverage
-          path: ${{ runner.temp }}/jsbay-coverage/
+          path: |
+            ${{ runner.temp }}/jsbay-coverage/coverage.cobertura.xml
+            ${{ runner.temp }}/jsbay-coverage/coverage-tests.json
+            ${{ runner.temp }}/jsbay-coverage/pawl.coverage.yaml
+          if-no-files-found: error
+
+      - name: Upload merged Zig engine coverage
+        uses: actions/upload-artifact@v6
+        with:
+          name: quickjs-engines-compiled-zig-coverage
+          path: |
+            ${{ runner.temp }}/jsbay-coverage/quickjs-engines-coverage.cobertura.xml
+            ${{ runner.temp }}/jsbay-coverage/quickjs-engines-coverage.json
+            ${{ runner.temp }}/jsbay-coverage/pawl.quickjs-engines-coverage.yaml
+            ${{ runner.temp }}/jsbay-coverage/coverage-tests.json
+            ${{ runner.temp }}/jsbay-coverage/quickjs-tests.json
           if-no-files-found: error
 
       - name: Upload invalid coverage report
@@ -224,7 +241,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: invalid-quickjs-ng-engine-coverage
-          path: ${{ runner.temp }}/jsbay-coverage/
+          path: |
+            ${{ runner.temp }}/jsbay-coverage/coverage-invalid.cobertura.xml
+            ${{ runner.temp }}/jsbay-coverage/debug-lines-sample.txt
           if-no-files-found: ignore
 
       - name: Report independent Zig library coverage
@@ -236,6 +255,22 @@ jobs:
         with:
           name: zig-libraries-coverage
           path: ${{ runner.temp }}/jsbay-zig-libraries-coverage/
+          if-no-files-found: error
+
+      - name: Build Zig coverage inventory
+        run: |
+          set -euo pipefail
+          node scripts/quality/zig-coverage-inventory.mjs \
+            --repo "$GITHUB_WORKSPACE" \
+            --report "src=$RUNNER_TEMP/jsbay-coverage/quickjs-engines-coverage.cobertura.xml" \
+            --report "libs=$RUNNER_TEMP/jsbay-zig-libraries-coverage/zig-libraries-coverage.cobertura.xml" \
+            > "$RUNNER_TEMP/jsbay-coverage/zig-coverage-inventory.json"
+
+      - name: Upload Zig coverage inventory
+        uses: actions/upload-artifact@v6
+        with:
+          name: zig-coverage-inventory
+          path: ${{ runner.temp }}/jsbay-coverage/zig-coverage-inventory.json
           if-no-files-found: error
 
   linux-engine:

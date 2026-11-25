@@ -52,6 +52,14 @@ for index in "${!binaries[@]}"; do
         cat "$work/kcov-$index.log" >&2
         exit 2
     fi
+    summary="$work/summary-$index.json"
+    if ! node scripts/quality/zig-coverage-summary.mjs --no-skips < "$work/kcov-$index.log" > "$summary"; then
+        cat "$work/kcov-$index.log" >&2
+        echo "Zig package test target $((index + 1)) did not produce a complete zero-skip passing summary" >&2
+        exit 2
+    fi
+    printf 'Validated Zig package test target %s: ' "$((index + 1))" >&2
+    cat "$summary" >&2
     reports=("$coverage_directory"/test.*/cobertura.xml)
     if [ "${#reports[@]}" -ne 1 ] || [ ! -s "${reports[0]}" ]; then
         echo "Expected one non-empty package coverage report for ${binaries[$index]}" >&2

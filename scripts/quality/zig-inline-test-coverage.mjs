@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { closeSync, constants as fsConstants, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, resolve } from 'node:path'
+import { dirname, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
@@ -121,14 +121,14 @@ export function filterCoberturaInlineTests(xml, astLinesByFile) {
   return output
 }
 
-function probeSource(sourceFiles) {
+function probeSource(sourceFiles, sourceRoot = libsRoot) {
   const fileInitializers = sourceFiles.map(({ filename, expression, embedded }) => {
     if (!/^[a-z0-9_/-]+\.zig$/.test(filename) || filename.split('/').some(part => !part || part === '.' || part === '..')) {
       throw new Error(`Unsafe Cobertura source path: ${filename}`)
     }
     if (embedded) {
-      const sourcePath = realpathSync(resolve(libsRoot, filename))
-      if (!sourcePath.startsWith(libsRoot + '/')) throw new Error(`Cobertura source escapes libs/: ${filename}`)
+      const sourcePath = realpathSync(resolve(sourceRoot, filename))
+      if (!sourcePath.startsWith(sourceRoot + '/')) throw new Error(`Cobertura source escapes source root: ${filename}`)
     }
     return `    .{ .filename = ${JSON.stringify(filename)}, .source = ${expression} },`
   }).join('\n')
@@ -136,8 +136,18 @@ function probeSource(sourceFiles) {
 const Source = struct { filename: []const u8, source: [:0]const u8 };
 const sources = [_]Source{\n${fileInitializers}\n};
 
-fn lineNumber(source: []const u8, offset: usize) usize {
-    return 1 + std.mem.count(u8, source[0..offset], "\\n");
+fn lineNumber(line_starts: []const usize, offset: usize) usize {
+    var low: usize = 0;
+    var high: usize = line_starts.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        if (line_starts[middle] <= offset) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    return low;
 }
 
 pub fn main() !void {
@@ -145,10 +155,15 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
     for (sources, 0..) |source, source_index| {
+        var line_starts = std.ArrayList(usize).empty;
+        try line_starts.append(allocator, 0);
+        for (source.source, 0..) |byte, index| {
+            if (byte == '\\n') try line_starts.append(allocator, index + 1);
+        }
         var tree = try std.zig.Ast.parse(allocator, source.source, .{});
         if (tree.errors.len != 0) {
             const error_token = tree.errors[0].token;
-            const error_line = lineNumber(source.source, tree.tokenStart(error_token));
+            const error_line = lineNumber(line_starts.items, tree.tokenStart(error_token));
             std.debug.print("AST parse failed for {s}:{d} ({s}) with {d} errors\\n", .{ source.filename, error_line, @tagName(tree.errors[0].tag), tree.errors.len });
             return error.AstParseFailed;
         }
@@ -161,8 +176,8 @@ pub fn main() !void {
             const start: usize = @intCast(tree.tokenStart(first));
             const end: usize = @intCast(tree.tokenStart(last) + @as(u32, @intCast(tree.tokenSlice(last).len)));
             try ranges.append(allocator, .{ start, end });
-            const start_line = lineNumber(source.source, start);
-            const end_line = lineNumber(source.source, end);
+            const start_line = lineNumber(line_starts.items, start);
+            const end_line = lineNumber(line_starts.items, end);
             for (start_line..end_line + 1) |line| std.debug.print("ASTLINE {d} {d}\\n", .{ source_index, line });
         }
         const token_tags = tree.tokens.items(.tag);
@@ -170,13 +185,13 @@ pub fn main() !void {
             const start: usize = token_start;
             const token: std.zig.Ast.TokenIndex = @intCast(token_index);
             const end = start + tree.tokenSlice(token).len;
-            const first_token_line = lineNumber(source.source, start);
-            const last_token_line = lineNumber(source.source, end);
+            const first_token_line = lineNumber(line_starts.items, start);
+            const last_token_line = lineNumber(line_starts.items, end);
             var on_test_line = false;
             var inside_test = false;
             for (ranges.items) |range| {
-                const first_line = lineNumber(source.source, range[0]);
-                const last_line = lineNumber(source.source, range[1]);
+                const first_line = lineNumber(line_starts.items, range[0]);
+                const last_line = lineNumber(line_starts.items, range[1]);
                 if (last_token_line >= first_line and first_token_line <= last_line) on_test_line = true;
                 if (start >= range[0] and end <= range[1]) inside_test = true;
             }
@@ -191,7 +206,7 @@ pub fn main() !void {
 `
 }
 
-function runAstProbe(sourceFiles, zigBinary) {
+function runAstProbe(sourceFiles, zigBinary, sourceRoot = libsRoot) {
   const sourcePath = resolve(root, `.zig-inline-test-${randomUUID()}.zig`)
   const cachePath = mkdtempSync(resolve(tmpdir(), 'jsbay-zig-ast-'))
   let sourceCreated = false
@@ -199,7 +214,7 @@ function runAstProbe(sourceFiles, zigBinary) {
     const descriptor = openSync(sourcePath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600)
     sourceCreated = true
     try {
-      writeFileSync(descriptor, probeSource(sourceFiles))
+    writeFileSync(descriptor, probeSource(sourceFiles, sourceRoot))
     } finally {
       closeSync(descriptor)
     }
@@ -231,18 +246,30 @@ export function analyzeZigSources(sourceEntries, zigBinary = process.env.ZIG ?? 
   return new Map([...records.values()].map(({ filename, lines, mixed }) => [filename, { lines, mixed }]))
 }
 
-function collectAstLines(xml, zigBinary) {
+export function filterMultipleCoberturaInlineTests(reports, sourceRoot, zigBinary = process.env.ZIG ?? 'zig') {
+  const classes = reports.flatMap(xml => [...xml.matchAll(/<class\b[^>]*>[\s\S]*?<\/class\s*>/g)].map(([block]) => block))
+  const unique = new Map()
+  for (const block of classes) {
+    const filename = attributes(block.match(/<class\b([^>]*)>/)?.[1] ?? '').filename ?? ''
+    if (!unique.has(filename)) unique.set(filename, block)
+  }
+  const probe = `<coverage><packages><package><classes>${[...unique.values()].join('')}</classes></package></packages></coverage>`
+  const astLines = collectAstLines(probe, zigBinary, sourceRoot)
+  return reports.map(xml => filterCoberturaInlineTests(xml, astLines))
+}
+
+function collectAstLines(xml, zigBinary, sourceRoot = libsRoot) {
   const classes = [...xml.matchAll(/<class\b([^>]*)>/g)]
   const sourceFiles = classes.map(([, attrs]) => {
     const filename = attributes(attrs).filename ?? ''
     if (!/^[a-z0-9_/-]+\.zig$/.test(filename) || filename.split('/').some(part => !part || part === '.' || part === '..')) {
       throw new Error(`Unsafe Cobertura source path: ${filename}`)
     }
-    return { filename, embedded: true, expression: `@embedFile(${JSON.stringify(`libs/${filename}`)})` }
+    return { filename, embedded: true, expression: `@embedFile(${JSON.stringify(relative(root, resolve(sourceRoot, filename)))})` }
   })
   const filenames = sourceFiles.map(({ filename }) => filename)
   if (new Set(filenames).size !== filenames.length) throw new Error('Cobertura report contains duplicate source classes')
-  const records = runAstProbe(sourceFiles, zigBinary)
+  const records = runAstProbe(sourceFiles, zigBinary, sourceRoot)
   const map = new Map()
   for (const { filename, lines, mixed } of records.values()) {
     if (mixed.size > 0) throw new Error(`Inline test shares a source line with other code: ${filename}:${Math.min(...mixed)}`)
@@ -254,7 +281,15 @@ function collectAstLines(xml, zigBinary) {
 function runCli() {
   const xml = readFileSync(0, 'utf8')
   const zigBinary = process.env.ZIG ?? 'zig'
-  const astLines = collectAstLines(xml, zigBinary)
+  const option = process.argv[2]
+  const relativeRoot = option?.startsWith('--source-root=') ? option.slice('--source-root='.length) : 'libs'
+  if (process.argv.length > 3 || (option && !option.startsWith('--source-root='))) {
+    throw new Error('Usage: zig-inline-test-coverage.mjs [--source-root=libs|src]')
+  }
+  if (relativeRoot !== 'libs' && relativeRoot !== 'src') throw new Error('Source root must be libs or src')
+  const sourceRoot = realpathSync(resolve(root, relativeRoot))
+  if (!sourceRoot.startsWith(root + '/')) throw new Error('Source root escapes repository')
+  const astLines = collectAstLines(xml, zigBinary, sourceRoot)
   process.stdout.write(filterCoberturaInlineTests(xml, astLines))
 }
 
