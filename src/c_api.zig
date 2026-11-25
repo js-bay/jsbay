@@ -243,52 +243,104 @@ test "c_api: packed-alt typed evaluate number + retain/release (real non-primary
     }
 }
 
-test "c_api: forced packed_alt typed value for the primary backend" {
-    // Build EngineInstance.packed_alt for the pack primary without a second real engine.
-    const helpers = @import("tests/test_helpers.zig");
-    const instance_map = @import("runtime/instance_map.zig");
-    const event_loop = @import("js_event_loop");
-    const timers = @import("runtime/timers.zig");
-    const backend_dispatch = @import("backend_dispatch.zig");
-    const id = helpers.nextInstanceId();
-    const tag = backend.active_backend;
-    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    const handles = backend_dispatch.createPacked(tag) orelse {
-        loop.destroy();
-        return error.CreatePackedFailed;
-    };
-    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        return error.Oom;
-    };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return error.BudgetFailed;
-    };
-    instance.* = .{
-        .allocator = std.heap.c_allocator,
-        .resources = resources,
-        .execution_cpu = null,
-        .instance_id = id,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
-        .loop = loop,
-        .timers = timers.TimerRegistry.init(),
-    };
-    if (!instance_map.insert(instance)) {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        resources.deinit();
-        instance.deinitSynchronization();
-        std.heap.c_allocator.destroy(instance);
-        return error.InsertFailed;
+const TestPackedAltInstance = struct {
+    id: i32,
+    const NoteCreatedFn = *const fn (i32, ?*anyopaque) bool;
+
+    fn create() !TestPackedAltInstance {
+        return createWith(std.heap.c_allocator, registerValueOwner, null);
     }
-    ensureValueRegistry();
-    try std.testing.expect(api_value.noteCreated(id));
-    defer jsbay_engine_destroy(id);
+
+    fn registerValueOwner(id: i32, _: ?*anyopaque) bool {
+        return api_value.noteCreated(id);
+    }
+
+    fn createWith(allocator: std.mem.Allocator, note_created: NoteCreatedFn, note_created_context: ?*anyopaque) !TestPackedAltInstance {
+        const helpers = @import("tests/test_helpers.zig");
+        const instance_map = @import("runtime/instance_map.zig");
+        const event_loop = @import("js_event_loop");
+        const timers = @import("runtime/timers.zig");
+        const backend_dispatch = @import("backend_dispatch.zig");
+        const id = helpers.nextInstanceId();
+        const tag = backend.active_backend;
+
+        const loop = event_loop.Driver.create(allocator) catch return error.LoopCreateFailed;
+
+        const handles = backend_dispatch.createPacked(tag) orelse {
+            loop.destroy();
+            return error.CreatePackedFailed;
+        };
+
+        backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
+        const instance = allocator.create(instance_map.EngineInstance) catch {
+            backend_dispatch.destroyPacked(tag, handles);
+            loop.destroy();
+            return error.Oom;
+        };
+
+        const resources = @import("runtime/resource_limits.zig").Budget.create(allocator, .{}) orelse {
+            backend_dispatch.destroyPacked(tag, handles);
+            loop.destroy();
+            allocator.destroy(instance);
+            return error.BudgetFailed;
+        };
+
+        instance.* = .{
+            .allocator = allocator,
+            .resources = resources,
+            .execution_cpu = null,
+            .instance_id = id,
+            .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
+            .loop = loop,
+            .timers = timers.TimerRegistry.init(),
+        };
+
+        if (!instance_map.insert(instance)) {
+            backend_dispatch.destroyPacked(tag, handles);
+            loop.destroy();
+            resources.deinit();
+            instance.deinitSynchronization();
+            allocator.destroy(instance);
+            return error.InsertFailed;
+        }
+        errdefer if (instance_map.getInstance(id) != null) jsbay_engine_destroy(id);
+
+        ensureValueRegistry();
+        try std.testing.expect(note_created(id, note_created_context));
+        return .{ .id = id };
+    }
+
+    fn deinit(self: TestPackedAltInstance) void {
+        const instance_map = @import("runtime/instance_map.zig");
+        if (instance_map.getInstance(self.id) != null) jsbay_engine_destroy(self.id);
+    }
+};
+
+test "c_api: packed-alt fixture destroys instance when value registration fails" {
+    const instance_map = @import("runtime/instance_map.zig");
+    const RejectedRegistration = struct {
+        id: ?i32 = null,
+
+        fn reject(id: i32, context: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.id = id;
+            return false;
+        }
+    };
+
+    var rejected = RejectedRegistration{};
+    const result = TestPackedAltInstance.createWith(std.testing.allocator, RejectedRegistration.reject, &rejected);
+    try std.testing.expectError(error.TestUnexpectedResult, result);
+    const id = rejected.id orelse return error.RegistrationNotAttempted;
+    defer if (instance_map.getInstance(id) != null) jsbay_engine_destroy(id);
+    try std.testing.expect(instance_map.getInstance(id) == null);
+    try std.testing.expect(!api_value.hasOwner(id));
+}
+
+test "c_api: forced packed_alt typed value for the primary backend" {
+    var fixture = try TestPackedAltInstance.create();
+    defer fixture.deinit();
+    const id = fixture.id;
 
     var value: u64 = 0;
     var exception: u64 = 0;
@@ -331,50 +383,9 @@ test "c_api: forced packed_alt typed value for the primary backend" {
 }
 
 test "c_api: forced packed_alt set/call/construct/new_* for the primary backend" {
-    const helpers = @import("tests/test_helpers.zig");
-    const instance_map = @import("runtime/instance_map.zig");
-    const event_loop = @import("js_event_loop");
-    const timers = @import("runtime/timers.zig");
-    const backend_dispatch = @import("backend_dispatch.zig");
-    const id = helpers.nextInstanceId();
-    const tag = backend.active_backend;
-    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    const handles = backend_dispatch.createPacked(tag) orelse {
-        loop.destroy();
-        return error.CreatePackedFailed;
-    };
-    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        return error.Oom;
-    };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return error.BudgetFailed;
-    };
-    instance.* = .{
-        .allocator = std.heap.c_allocator,
-        .resources = resources,
-        .execution_cpu = null,
-        .instance_id = id,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
-        .loop = loop,
-        .timers = timers.TimerRegistry.init(),
-    };
-    if (!instance_map.insert(instance)) {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        resources.deinit();
-        instance.deinitSynchronization();
-        std.heap.c_allocator.destroy(instance);
-        return error.InsertFailed;
-    }
-    ensureValueRegistry();
-    try std.testing.expect(api_value.noteCreated(id));
-    defer jsbay_engine_destroy(id);
+    var fixture = try TestPackedAltInstance.create();
+    defer fixture.deinit();
+    const id = fixture.id;
 
     var exception: u64 = 0;
 
@@ -634,50 +645,9 @@ test "c_api: direct register call trampolines call_0 through call_4" {
 }
 
 test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/new_error" {
-    const helpers = @import("tests/test_helpers.zig");
-    const instance_map = @import("runtime/instance_map.zig");
-    const event_loop = @import("js_event_loop");
-    const timers = @import("runtime/timers.zig");
-    const backend_dispatch = @import("backend_dispatch.zig");
-    const id = helpers.nextInstanceId();
-    const tag = backend.active_backend;
-    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    const handles = backend_dispatch.createPacked(tag) orelse {
-        loop.destroy();
-        return error.CreatePackedFailed;
-    };
-    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        return error.Oom;
-    };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return error.BudgetFailed;
-    };
-    instance.* = .{
-        .allocator = std.heap.c_allocator,
-        .resources = resources,
-        .execution_cpu = null,
-        .instance_id = id,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
-        .loop = loop,
-        .timers = timers.TimerRegistry.init(),
-    };
-    if (!instance_map.insert(instance)) {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        resources.deinit();
-        instance.deinitSynchronization();
-        std.heap.c_allocator.destroy(instance);
-        return error.InsertFailed;
-    }
-    ensureValueRegistry();
-    try std.testing.expect(api_value.noteCreated(id));
-    defer jsbay_engine_destroy(id);
+    var fixture = try TestPackedAltInstance.create();
+    defer fixture.deinit();
+    const id = fixture.id;
 
     var exception: u64 = 0;
 
@@ -814,52 +784,9 @@ test "c_api: packed-alt to_bool/has/json/buffer when real non-primary packed" {
 }
 
 test "c_api: packed-alt adversarial get exception / bind / empty options / destroy stale" {
-    const helpers = @import("tests/test_helpers.zig");
-    const instance_map = @import("runtime/instance_map.zig");
-    const event_loop = @import("js_event_loop");
-    const timers = @import("runtime/timers.zig");
-    const backend_dispatch = @import("backend_dispatch.zig");
-    const id = helpers.nextInstanceId();
-    const tag = backend.active_backend;
-    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    const handles = backend_dispatch.createPacked(tag) orelse {
-        loop.destroy();
-        return error.CreatePackedFailed;
-    };
-    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        return error.Oom;
-    };
-    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        std.heap.c_allocator.destroy(instance);
-        return error.BudgetFailed;
-    };
-    instance.* = .{
-        .allocator = std.heap.c_allocator,
-        .resources = resources,
-        .execution_cpu = null,
-        .instance_id = id,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
-        .loop = loop,
-        .timers = timers.TimerRegistry.init(),
-    };
-    if (!instance_map.insert(instance)) {
-        backend_dispatch.destroyPacked(tag, handles);
-        loop.destroy();
-        resources.deinit();
-        instance.deinitSynchronization();
-        std.heap.c_allocator.destroy(instance);
-        return error.InsertFailed;
-    }
-    ensureValueRegistry();
-    try std.testing.expect(api_value.noteCreated(id));
-    defer {
-        if (instance_map.getInstance(id) != null) jsbay_engine_destroy(id);
-    }
+    var fixture = try TestPackedAltInstance.create();
+    defer fixture.deinit();
+    const id = fixture.id;
 
     var exception: u64 = 0;
 
@@ -981,44 +908,9 @@ test "c_api: packed-alt adversarial get exception / bind / empty options / destr
     try std.testing.expectEqual(@as(usize, 0), zcopied.len);
 
     // Cross-instance set must reject (STALE), not mix backends/ctx.
-    const id2 = helpers.nextInstanceId();
-    const loop2 = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    const handles2 = backend_dispatch.createPacked(tag) orelse {
-        loop2.destroy();
-        return error.CreatePackedFailed;
-    };
-    backend_dispatch.finishCreate(tag, handles2, id2, 256 * 1024);
-    const instance2 = std.heap.c_allocator.create(instance_map.EngineInstance) catch {
-        backend_dispatch.destroyPacked(tag, handles2);
-        loop2.destroy();
-        return error.Oom;
-    };
-    const resources2 = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse {
-        backend_dispatch.destroyPacked(tag, handles2);
-        loop2.destroy();
-        std.heap.c_allocator.destroy(instance2);
-        return error.BudgetFailed;
-    };
-    instance2.* = .{
-        .allocator = std.heap.c_allocator,
-        .resources = resources2,
-        .execution_cpu = null,
-        .instance_id = id2,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles2.runtime_addr, .ctx_addr = handles2.ctx_addr } },
-        .loop = loop2,
-        .timers = timers.TimerRegistry.init(),
-    };
-    if (!instance_map.insert(instance2)) {
-        backend_dispatch.destroyPacked(tag, handles2);
-        loop2.destroy();
-        resources2.deinit();
-        instance2.deinitSynchronization();
-        std.heap.c_allocator.destroy(instance2);
-        return error.InsertFailed;
-    }
-    ensureValueRegistry();
-    try std.testing.expect(api_value.noteCreated(id2));
-    defer jsbay_engine_destroy(id2);
+    var fixture2 = try TestPackedAltInstance.create();
+    defer fixture2.deinit();
+    const id2 = fixture2.id;
     var obj2: u64 = 0;
     try std.testing.expectEqual(API_OK, jsbay_value_new_object(id2, &obj2));
     defer _ = jsbay_value_release(obj2);
