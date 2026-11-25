@@ -47,3 +47,33 @@ test "c_api: generation scope and destroy refuse a reused instance id" {
     try std.testing.expect(c_api.jsbay_engine_snapshot(id, &after_stale_destroy));
     try std.testing.expectEqual(replacement_snapshot.generation, after_stale_destroy.generation);
 }
+
+test "c_api: stale generation scope rejects a replacement owned by another thread" {
+    const CreateReplacement = struct {
+        id: i32,
+        created: bool = false,
+
+        fn run(self: *@This()) void {
+            self.created = c_api.jsbay_engine_create(self.id, null, null);
+        }
+    };
+    const id = helpers.nextInstanceId();
+    try std.testing.expect(c_api.jsbay_engine_create(id, null, null));
+    var original_snapshot: c_api.InstanceSnapshotC = undefined;
+    original_snapshot.struct_size = @sizeOf(c_api.InstanceSnapshotC);
+    try std.testing.expect(c_api.jsbay_engine_snapshot(id, &original_snapshot));
+    c_api.jsbay_engine_destroy_generation(id, original_snapshot.generation);
+
+    var replacement = CreateReplacement{ .id = id };
+    const thread = try std.Thread.spawn(.{}, CreateReplacement.run, .{&replacement});
+    thread.join();
+    try std.testing.expect(replacement.created);
+    defer c_api.jsbay_engine_destroy(id);
+
+    var probe = GenerationScopeProbe{};
+    try std.testing.expectEqual(
+        api_instance_not_found,
+        c_api.jsbay_engine_with_generation_scope(id, original_snapshot.generation, GenerationScopeProbe.callback, &probe),
+    );
+    try std.testing.expect(!probe.called);
+}

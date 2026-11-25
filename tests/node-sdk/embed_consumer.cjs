@@ -61,14 +61,22 @@ async function main() {
     'old-generation operations and cleanup must not affect the replacement engine'
   )
   const raced = addon.create(706)
-  assert.equal(addon.raceDestroyAndReplace(706, raced.generation), true)
-  assert.throws(() => raced.evaluate('40 + 2', 'raced-stale.js'))
-  await raced.closeAsync()
-  assert.equal(
-    addon.replacementValueIsAlive(),
-    true,
-    'a deferred old-generation destroy must leave a concurrent replacement alive'
-  )
+  try {
+    assert.equal(addon.raceDestroyAndReplace(706, raced.generation), true)
+    assert.throws(() => raced.evaluate('40 + 2', 'raced-stale.js'))
+    await raced.closeAsync()
+    assert.equal(
+      addon.replacementGenerationIsAlive(),
+      true,
+      'closing a stale Engine must leave the replacement generation alive'
+    )
+  } finally {
+    try {
+      await raced.closeAsync()
+    } finally {
+      addon.cleanupReplacement()
+    }
+  }
   const cleanup = execFileSync(process.execPath, [resolve(__dirname, 'embed_cleanup_consumer.cjs')], {
     encoding: 'utf8',
     env: process.env,

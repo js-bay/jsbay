@@ -1,3 +1,5 @@
+import { packageElectronApp } from '../node-sdk/run-electron-packager.mjs'
+import { cleanupTempDirectory } from '../node-sdk/cleanup-temp-directory.mjs'
 import { extractPackage } from '../node-sdk/extract-npm-package.mjs'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
@@ -12,6 +14,9 @@ const root = resolve(fileURLToPath(new URL('../..', import.meta.url)))
 const ci = await readFile(join(root, '.github/workflows/ci.yml'), 'utf8')
 const npmWorkflow = await readFile(join(root, '.github/workflows/npm-packages.yml'), 'utf8')
 const electronConsumer = await readFile(join(root, 'tests/node-sdk/electron-packaged-consumer.mjs'), 'utf8')
+const electronPackagerChild = await readFile(join(root, 'tests/node-sdk/electron-packager-child.mjs'), 'utf8')
+const electronPackagerRunner = await readFile(join(root, 'tests/node-sdk/run-electron-packager.mjs'), 'utf8')
+const cleanupTempDirectorySource = await readFile(join(root, 'tests/node-sdk/cleanup-temp-directory.mjs'), 'utf8')
 const reviewConsumer = await readFile(join(root, 'tests/node-sdk/review_consumer.cjs'), 'utf8')
 const nodeCmake = await readFile(join(root, 'sdk/node/CMakeLists.txt'), 'utf8')
 const build = await readFile(join(root, 'build.zig'), 'utf8')
@@ -68,6 +73,12 @@ assert.match(inspectorConsumer, /Runtime\.enable/)
 assert.match(inspectorConsumer, /Runtime\.evaluate/)
 assert.match(inspectorConsumer, /inspectorStop\(/)
 assert.match(electronConsumer, /extractPackage\(tarballs\[0\]/)
+assert.match(electronConsumer, /packageElectronApp\(/)
+assert.doesNotMatch(electronConsumer, /await import\(pathToFileURL/, 'the parent process does not import Electron Packager')
+assert.match(electronPackagerRunner, /runCommand\(process\.execPath/)
+assert.match(electronPackagerRunner, /electron-packager-child\.mjs/)
+assert.match(electronPackagerChild, /await import\(packagerUrl\)/)
+assert.match(cleanupTempDirectorySource, /if \(!operationError\) throw cleanupError/)
 assert.doesNotMatch(electronConsumer, /tar['"],[\s\S]*?-C['"],[\s\S]*?destination/, 'tar must not receive an absolute Windows destination argument')
 assert.match(npmConsumer, /function readTarball[\s\S]*?basename\(absolute\)[\s\S]*?cwd: dirname\(absolute\)/)
 
@@ -98,6 +109,29 @@ try {
   const appFile = join(temporary, 'electron-main.cjs')
   await writeFile(appFile, appSource)
   execFileSync(process.execPath, ['--check', appFile])
+
+  const fakePackager = join(temporary, 'fake-packager.mjs')
+  await writeFile(fakePackager, "export async function packager(options) { return [{ path: options.out, pid: process.pid }] }\n")
+  const isolatedBundles = await packageElectronApp(fakePackager, temporary, join(temporary, 'packaged'), '44.11.5')
+  assert.equal(isolatedBundles.length, 1)
+  assert.notEqual(isolatedBundles[0].pid, process.pid, 'Electron Packager module executes in a child Node process')
+
+  const failingPackager = join(temporary, 'failing-packager.mjs')
+  await writeFile(failingPackager, "export async function packager() { throw new Error('mock packager failure') }\n")
+  await assert.rejects(packageElectronApp(failingPackager, temporary, join(temporary, 'failed-output'), '44.11.5'), /mock packager failure/)
+
+  const operationError = new Error('primary packaging failure')
+  const cleanupError = new Error('cleanup failure')
+  const cleanupReports = []
+  await assert.rejects((async () => {
+    let failure
+    try { throw operationError } catch (error) { failure = error; throw error }
+    finally {
+      await cleanupTempDirectory('temporary-directory', failure, async () => { throw cleanupError }, message => cleanupReports.push(message))
+    }
+  })(), error => error === operationError)
+  assert.match(cleanupReports[0], /cleanup failure/)
+  await assert.rejects(cleanupTempDirectory('temporary-directory', undefined, async () => { throw cleanupError }, () => {}), error => error === cleanupError)
 
   const archiveFixture = join(temporary, 'npm-package.tgz')
   await writeFile(archiveFixture, 'archive fixture')

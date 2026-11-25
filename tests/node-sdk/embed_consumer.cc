@@ -22,6 +22,19 @@ std::atomic<unsigned> destroy_during_log{0};
 std::atomic<bool> log_active{false};
 jsbay_value_t replacement_value = 0;
 int replacement_id = 0;
+uint64_t replacement_generation = 0;
+
+void cleanupReplacement(bool release_value_on_owner) {
+    const jsbay_value_t value = replacement_value;
+    const int id = replacement_id;
+    replacement_value = 0;
+    replacement_id = 0;
+    replacement_generation = 0;
+    if (release_value_on_owner && value)
+        (void)jsbay_value_release(value);
+    if (id)
+        jsbay_engine_destroy(id);
+}
 
 struct GenerationDestroyRace {
     int id;
@@ -58,10 +71,22 @@ void destroyAndReplaceGeneration(GenerationDestroyRace *race) {
     if (!jsbay_engine_create(race->id, nullptr, nullptr))
         return;
     replacement_id = race->id;
+    jsbay_instance_snapshot_t snapshot{};
+    snapshot.struct_size = sizeof(snapshot);
+    if (!jsbay_engine_snapshot(race->id, &snapshot)) {
+        jsbay_engine_destroy(race->id);
+        replacement_id = 0;
+        replacement_generation = 0;
+        return;
+    }
+    replacement_generation = snapshot.generation;
     if (jsbay_value_new_number(race->id, 42, &replacement_value) == JSBAY_OK)
         race->replacement_created.store(true);
-    else
+    else {
         jsbay_engine_destroy(race->id);
+        replacement_id = 0;
+        replacement_generation = 0;
+    }
 }
 
 void log(int, jsbay_log_level_t, const char *, void *data) {
@@ -225,6 +250,7 @@ napi_value raceDestroyAndReplace(napi_env env, napi_callback_info info) {
         napi_throw_type_error(env, nullptr, "instance id and generation are required");
         return nullptr;
     }
+    cleanupReplacement(false);
     GenerationDestroyRace race{id, generation};
     std::thread worker;
     try {
@@ -235,12 +261,21 @@ napi_value raceDestroyAndReplace(napi_env env, napi_callback_info info) {
     }
     const jsbay_status_t scope_status =
         jsbay_engine_with_generation_scope(id, generation, generationDestroyCallback, &race);
+    if (scope_status != JSBAY_OK && !race.callback_entered.load())
+        race.callback_entered.store(true);
     worker.join();
+    const jsbay_status_t stale_scope_status = race.stale_scope_status.load();
+    const bool replacement_created = race.replacement_created.load();
+    if (scope_status != JSBAY_OK || stale_scope_status != JSBAY_INSTANCE_NOT_FOUND ||
+        !replacement_created) {
+        std::fprintf(stderr,
+                     "generation replacement race: scope=%d stale_scope=%d replacement=%d\n",
+                     scope_status, stale_scope_status, replacement_created ? 1 : 0);
+    }
     napi_value result;
     napi_get_boolean(env,
-                     scope_status == JSBAY_OK &&
-                         race.stale_scope_status.load() == JSBAY_INSTANCE_NOT_FOUND &&
-                         race.replacement_created.load(),
+                     scope_status == JSBAY_OK && stale_scope_status == JSBAY_INSTANCE_NOT_FOUND &&
+                         replacement_created,
                      &result);
     return result;
 }
@@ -262,14 +297,7 @@ napi_value replacementValueIsAlive(napi_env env, napi_callback_info) {
         (void)jsbay_value_release(probe);
     if (exception)
         (void)jsbay_value_release(exception);
-    if (replacement_value) {
-        (void)jsbay_value_release(replacement_value);
-        replacement_value = 0;
-    }
-    if (replacement_id) {
-        jsbay_engine_destroy(replacement_id);
-        replacement_id = 0;
-    }
+    cleanupReplacement(true);
     napi_value result;
     napi_get_boolean(env, status == JSBAY_OK && number == 42 && probe_is_untouched, &result);
     return result;
@@ -309,6 +337,31 @@ napi_value init(napi_env env, napi_value exports) {
     napi_create_function(env, "replacementValueIsAlive", NAPI_AUTO_LENGTH, replacementValueIsAlive,
                          nullptr, &value);
     napi_set_named_property(env, exports, "replacementValueIsAlive", value);
+    napi_create_function(
+        env, "replacementGenerationIsAlive", NAPI_AUTO_LENGTH,
+        [](napi_env env, napi_callback_info) -> napi_value {
+            jsbay_instance_snapshot_t snapshot{};
+            snapshot.struct_size = sizeof(snapshot);
+            const bool alive = replacement_id && replacement_generation &&
+                               jsbay_engine_snapshot(replacement_id, &snapshot) &&
+                               snapshot.generation == replacement_generation;
+            cleanupReplacement(false);
+            napi_value result;
+            napi_get_boolean(env, alive, &result);
+            return result;
+        },
+        nullptr, &value);
+    napi_set_named_property(env, exports, "replacementGenerationIsAlive", value);
+    napi_create_function(
+        env, "cleanupReplacement", NAPI_AUTO_LENGTH,
+        [](napi_env env, napi_callback_info) -> napi_value {
+            cleanupReplacement(false);
+            napi_value result;
+            napi_get_undefined(env, &result);
+            return result;
+        },
+        nullptr, &value);
+    napi_set_named_property(env, exports, "cleanupReplacement", value);
     napi_create_function(env, "stats", NAPI_AUTO_LENGTH, stats, nullptr, &value);
     napi_set_named_property(env, exports, "stats", value);
     return exports;

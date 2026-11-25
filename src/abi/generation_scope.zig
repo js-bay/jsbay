@@ -1,6 +1,7 @@
 const engine = @import("../engine.zig");
 const builtin = @import("builtin");
 const host_wake = @import("js_event_loop").host_wake;
+const instance_map = @import("../runtime/instance_map.zig");
 
 var before_packed_admission_hook: ?*const fn (?*anyopaque) void = null;
 var before_packed_admission_hook_data: ?*anyopaque = null;
@@ -31,11 +32,13 @@ pub fn run(
     user_data: ?*anyopaque,
 ) c_int {
     const cb = callback orelse return invalid_argument;
+    if (host_wake.isNotifying()) return invalid_argument;
     const id: i32 = @intCast(instance_id);
+    if (instance_map.generationOf(id) != generation) return instance_not_found;
     if (Operations.packedTagOf(id) != null) {
         runBeforePackedAdmissionHookForTesting();
         var op = switch (Operations.beginPackedGenerationScopeOp(id, generation)) {
-            .status => |status| return status,
+            .status => |status| return if (instance_map.generationOf(id) != generation) instance_not_found else status,
             .ok => |value| value,
         };
         defer op.deinit();
@@ -45,7 +48,7 @@ pub fn run(
         return ok_status;
     }
     var op = switch (Operations.beginGenerationScopeOp(id)) {
-        .status => |status| return status,
+        .status => |status| return if (instance_map.generationOf(id) != generation) instance_not_found else status,
         .ok => |value| value,
     };
     defer op.deinit();

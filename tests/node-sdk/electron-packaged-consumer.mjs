@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { spawn, execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { cleanupTempDirectory } from './cleanup-temp-directory.mjs'
 import { extractPackage } from './extract-npm-package.mjs'
+import { packageElectronApp } from './run-electron-packager.mjs'
 import { promisify } from 'node:util'
 
 const run = promisify(execFile)
@@ -22,6 +23,7 @@ assert(installedPrefix || tarballs.length === 2, 'Pass either --installed-prefix
 const npmCli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
 assert(existsSync(npmCli), `npm CLI not found at ${npmCli}`)
 const work = await mkdtemp(join(tmpdir(), 'jsbay-electron-packaged-'))
+let operationError
 const toolsDir = join(work, 'tools')
 const appDir = join(work, 'app')
 const outputDir = join(work, 'dist')
@@ -108,20 +110,12 @@ try {
 
   await run(process.execPath, [npmCli, 'install', '--prefix', toolsDir, '--no-save', '--no-audit', '--no-fund',
     '@electron/packager@20.3.0'])
-  const packageModule = await import(pathToFileURL(join(toolsDir, 'node_modules', '@electron', 'packager', 'dist', 'index.js')))
-  const packager = packageModule.packager ?? packageModule.default
-  assert.equal(typeof packager, 'function', 'Electron Packager must expose its packager function')
-  const bundles = await packager({
-    dir: appDir,
-    appName: 'JsBaySmoke',
-    platform: 'win32',
-    arch: 'x64',
+  const bundles = await packageElectronApp(
+    join(toolsDir, 'node_modules', '@electron', 'packager', 'dist', 'index.js'),
+    appDir,
+    outputDir,
     electronVersion,
-    out: outputDir,
-    overwrite: true,
-    prune: false,
-    asar: { unpack: '**/*.node' },
-  })
+  )
   assert.equal(bundles.length, 1)
   const appPath = bundles[0]
   const appAsar = join(appPath, 'resources', 'app.asar')
@@ -132,6 +126,9 @@ try {
   const { output, resultFile } = await runPackagedApp(electronExe)
   assert.equal(await readFile(resultFile, 'utf8'), 'JSBAY_ELECTRON_PACKAGED_OK', output)
   console.log(`Packaged Windows x64 Electron ${electronVersion} loaded ${platform.name} from app.asar.unpacked`)
+} catch (error) {
+  operationError = error
+  throw error
 } finally {
-  await rm(work, { recursive: true, force: true })
+  await cleanupTempDirectory(work, operationError)
 }
