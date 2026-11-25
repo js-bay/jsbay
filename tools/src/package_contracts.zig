@@ -272,6 +272,20 @@ test "published package includes every engine patch build input" {
     try testing.expect(unpacked.succeeded());
     const artifact = try path(allocator, extracted, &.{hash});
     try testing.expect(try exists(io, allocator, artifact, &.{"build.zig"}));
+    const root_build = try read(allocator, io, cwd, &.{"build.zig"});
+    const root_manifest = try read(allocator, io, cwd, &.{"build.zig.zon"});
+    try expectContains(root_build, "@import(\"build_support.zig\")");
+    try expectContains(root_manifest, "\"build_support.zig\"");
+    var imports = root_build;
+    while (std.mem.indexOf(u8, imports, "@import(\"")) |start| {
+        imports = imports[start + "@import(\"".len ..];
+        const end = std.mem.indexOfScalar(u8, imports, '"') orelse break;
+        const imported = imports[0..end];
+        if (std.mem.endsWith(u8, imported, ".zig")) {
+            try testing.expect(try exists(io, allocator, artifact, &.{imported}));
+        }
+        imports = imports[end + 1 ..];
+    }
     // The sixth local package must survive Zig's public package inventory, not merely work in a developer's checkout.
     for ([_][]const u8{ "LICENSE", "readme.md", "build.zig", "build.zig.zon", "src/root.zig", "src/registry.zig", "src/loader.zig", "src/tests.zig" }) |input| {
         try testing.expect(try exists(io, allocator, artifact, &.{ "libs", "commonjs", input }));
