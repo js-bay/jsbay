@@ -5,6 +5,7 @@
 const std = @import("std");
 const c = @import("c_api.zig");
 const qjs = c.qjs;
+const rejection_queue = @import("../quickjs_common/rejection_queue.zig");
 
 fn appendCStringLen(ctx: ?*qjs.JSContext, buf: *std.ArrayList(u8), val: qjs.JSValue) bool {
     var len: usize = 0;
@@ -324,9 +325,7 @@ fn shouldDeferPendingRejections(instance_id: i32) bool {
 }
 
 fn restorePendingTail(ctx: ?*qjs.JSContext, instance_id: i32, queue: *std.ArrayList(Pending), start: usize) void {
-    const tail_len = queue.items.len - start;
-    std.mem.copyForwards(Pending, queue.items[0..tail_len], queue.items[start..]);
-    queue.items.len = tail_len;
+    rejection_queue.compactTail(Pending, queue, start, std.heap.c_allocator);
     while (takeInstanceQueue(instance_id)) |reentrant_value| {
         var reentrant = reentrant_value;
         freeQueue(ctx, &reentrant);

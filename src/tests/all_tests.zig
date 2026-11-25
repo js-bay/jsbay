@@ -55,6 +55,7 @@ comptime {
         _ = @import("../backend/quickjs_common/host_abi.zig");
         _ = @import("../backend/quickjs_common/host_keys.zig");
         _ = @import("../backend/quickjs_common/jobs.zig");
+        _ = @import("../backend/quickjs_common/rejection_queue.zig");
         _ = @import("../backend/quickjs_common/weakcb.zig");
         _ = @import("class_id_tests.zig");
         _ = @import("native_handle_handle_tests.zig");
@@ -118,6 +119,7 @@ comptime {
     _ = @import("promise_state_tests.zig");
     // Escargot: PromiseRejectCallback wired. Hermes/JSC: setRejectionTracker returns false (tests no-op).
     _ = @import("rejection_tracker_tests.zig");
+    if (!spike) _ = @import("rejection_tracker_recovery_tests.zig");
     if (!spike) {
         _ = @import("engine_thread_guard_tests.zig");
         _ = @import("finalizer_contract_tests.zig");
