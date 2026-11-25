@@ -115,7 +115,7 @@ var registry_condition: sync.Condition = .init;
 fn takeState(instance_id: i32) ?*InterruptState {
     registry_mutex.lock();
     while (registry.get(instance_id)) |state| {
-        if (state.handler_status != .installing and state.handler_status != .removing and state.registration_waiters == 0) break;
+        if (state.handler_status != .installing and state.handler_status != .removing and state.handler_status != .failed and state.registration_waiters == 0) break;
         registry_condition.wait(&registry_mutex);
     }
     const kv = registry.fetchRemove(instance_id) orelse {
@@ -139,6 +139,24 @@ pub fn init(instance_id: i32) bool {
 
 /// Install control state while an instance is being published under the instance-map lock. It must not look the instance up again: creation uses it before the instance becomes observable to normal readers.
 pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) bool {
+    return initForInstanceWithHooks(instance_id, inst, std.heap.c_allocator, null, installInterruptHandlerAdapter, null);
+}
+
+const HandlerInstaller = *const fn (*instance_map.EngineInstance, *InterruptState, ?*anyopaque) bool;
+const RegistrationFailureHook = *const fn (?*anyopaque) void;
+
+fn installInterruptHandlerAdapter(inst: *instance_map.EngineInstance, state: *InterruptState, _: ?*anyopaque) bool {
+    return installInterruptHandler(inst, state);
+}
+
+fn initForInstanceWithHooks(
+    instance_id: i32,
+    inst: *instance_map.EngineInstance,
+    allocator: std.mem.Allocator,
+    context: ?*anyopaque,
+    installer: HandlerInstaller,
+    failure_hook: ?RegistrationFailureHook,
+) bool {
     const generation = inst.generation;
     const backend_tag = backend.backendToC(inst.backendTag());
 
@@ -160,6 +178,7 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
             },
             .installing => {
                 existing.registration_waiters += 1;
+                registry_condition.broadcast();
                 while (existing.handler_status == .installing) registry_condition.wait(&registry_mutex);
                 const ready = existing.handler_status == .ready;
                 existing.registration_waiters -= 1;
@@ -171,7 +190,7 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     }
     registry_mutex.unlock();
 
-    const state = std.heap.c_allocator.create(InterruptState) catch return false;
+    const state = allocator.create(InterruptState) catch return false;
     state.* = .{
         .interrupt_requested = 0,
         .deadline_ms = 0,
@@ -190,61 +209,92 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     while (registry.get(instance_id)) |existing| {
         if (existing.generation != state.generation or existing.backend_tag != state.backend_tag) {
             registry_mutex.unlock();
-            std.heap.c_allocator.destroy(state);
+            allocator.destroy(state);
             return false;
         }
         switch (existing.handler_status) {
             .ready => {
                 registry_mutex.unlock();
-                std.heap.c_allocator.destroy(state);
+                allocator.destroy(state);
                 return true;
             },
             .failed => {
                 registry_mutex.unlock();
-                std.heap.c_allocator.destroy(state);
+                allocator.destroy(state);
                 return false;
             },
             .removing => {
                 registry_mutex.unlock();
-                std.heap.c_allocator.destroy(state);
+                allocator.destroy(state);
                 return false;
             },
             .installing => {
                 existing.registration_waiters += 1;
+                registry_condition.broadcast();
                 while (existing.handler_status == .installing) registry_condition.wait(&registry_mutex);
                 const ready = existing.handler_status == .ready;
                 existing.registration_waiters -= 1;
                 registry_condition.broadcast();
                 registry_mutex.unlock();
-                std.heap.c_allocator.destroy(state);
+                allocator.destroy(state);
                 return ready;
             },
         }
     }
     registry.put(instance_id, state) catch {
         registry_mutex.unlock();
-        std.heap.c_allocator.destroy(state);
+        allocator.destroy(state);
         return false;
     };
     registry_mutex.unlock();
 
-    const installed = installInterruptHandler(inst, state);
+    const installed = installer(inst, state, context);
 
     registry_mutex.lock();
-    state.handler_status = if (installed) .ready else .failed;
-    registry_condition.broadcast();
-    if (!installed) {
-        while (state.registration_waiters != 0) registry_condition.wait(&registry_mutex);
-        const owns_state = if (registry.get(instance_id) == state)
-            registry.fetchRemove(instance_id) != null
-        else
-            false;
+    if (installed) {
+        state.handler_status = .ready;
+        registry_condition.broadcast();
         registry_mutex.unlock();
-        if (owns_state) std.heap.c_allocator.destroy(state);
-        return false;
+        return true;
     }
     registry_mutex.unlock();
-    return true;
+    markRegistrationFailed(instance_id, state, context, failure_hook);
+    removeFailedRegistration(allocator, instance_id, state);
+    return false;
+}
+
+/// Publish installation failure while leaving cleanup ownership with the installer.
+fn markRegistrationFailed(
+    instance_id: i32,
+    state: *InterruptState,
+    context: ?*anyopaque,
+    failure_hook: ?RegistrationFailureHook,
+) void {
+    registry_mutex.lock();
+    if (registry.get(instance_id) == state) state.handler_status = .failed;
+    registry_condition.broadcast();
+    registry_mutex.unlock();
+    if (failure_hook) |hook| hook(context);
+}
+
+/// The installer exclusively removes failed state after registered init waiters have left.
+fn removeFailedRegistration(allocator: std.mem.Allocator, instance_id: i32, state: *InterruptState) void {
+    registry_mutex.lock();
+    while (true) {
+        if (registry.get(instance_id) != state) {
+            registry_mutex.unlock();
+            return;
+        }
+        if (state.registration_waiters == 0) break;
+        registry_condition.wait(&registry_mutex);
+    }
+    const owns_state = if (registry.get(instance_id) == state)
+        registry.fetchRemove(instance_id) != null
+    else
+        false;
+    registry_condition.broadcast();
+    registry_mutex.unlock();
+    if (owns_state) allocator.destroy(state);
 }
 
 fn installInterruptHandler(inst: *instance_map.EngineInstance, state: *InterruptState) bool {
@@ -301,9 +351,22 @@ pub fn deinit(instance_id: i32) bool {
 
 /// Remove handler state while the caller owns the instance lifetime, either through a control-plane lease or teardown ownership.
 pub fn deinitForInstance(instance_id: i32, inst: *instance_map.EngineInstance) bool {
+    return deinitForInstanceWithWaitObserver(instance_id, inst, std.heap.c_allocator, null, null);
+}
+
+const DeinitWaitObserver = *const fn (?*anyopaque) void;
+
+fn deinitForInstanceWithWaitObserver(
+    instance_id: i32,
+    inst: *instance_map.EngineInstance,
+    allocator: std.mem.Allocator,
+    observer_context: ?*anyopaque,
+    observer: ?DeinitWaitObserver,
+) bool {
     registry_mutex.lock();
     while (registry.get(instance_id)) |pending| {
-        if (pending.handler_status != .installing and pending.handler_status != .removing and pending.registration_waiters == 0) break;
+        if (pending.handler_status != .installing and pending.handler_status != .removing and pending.handler_status != .failed and pending.registration_waiters == 0) break;
+        if (observer) |notify| notify(observer_context);
         registry_condition.wait(&registry_mutex);
     }
     const state = registry.get(instance_id) orelse {
@@ -362,7 +425,7 @@ pub fn deinitForInstance(instance_id: i32, inst: *instance_map.EngineInstance) b
         false;
     registry_condition.broadcast();
     registry_mutex.unlock();
-    if (owns_state) std.heap.c_allocator.destroy(state);
+    if (owns_state) allocator.destroy(state);
     return owns_state;
 }
 
@@ -642,6 +705,178 @@ test "public deinit lease serializes with engine destruction and id reuse" {
     try std.testing.expect(instance_map.getInstance(id) == null);
     try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
     try std.testing.expect(deinit(id));
+}
+
+test "failed registration cleanup owns state while deinit waits for init waiters" {
+    const id = std.math.maxInt(i32) - 15;
+    try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
+    defer engine.destroy(id);
+    try std.testing.expect(deinit(id));
+
+    const inst = instance_map.getInstance(id) orelse return error.MissingInstance;
+    const Gate = struct {
+        mutex: sync.Mutex = .{},
+        changed: sync.Condition = .init,
+        installer_entered: bool = false,
+        release_installer: bool = false,
+        failure_published: bool = false,
+        release_cleanup: bool = false,
+        deinit_waiting_install: bool = false,
+        deinit_waits_after_failure: usize = 0,
+        deinit_done: bool = false,
+        installer_result: bool = true,
+        init_result: bool = true,
+        deinit_result: bool = true,
+
+        fn failInstall(_: *instance_map.EngineInstance, _: *InterruptState, context: ?*anyopaque) bool {
+            const gate: *@This() = @ptrCast(@alignCast(context.?));
+            gate.mutex.lock();
+            gate.installer_entered = true;
+            gate.changed.broadcast();
+            while (!gate.release_installer) gate.changed.wait(&gate.mutex);
+            gate.mutex.unlock();
+            return false;
+        }
+
+        fn pauseAfterFailure(context: ?*anyopaque) void {
+            const gate: *@This() = @ptrCast(@alignCast(context.?));
+            gate.mutex.lock();
+            gate.failure_published = true;
+            gate.changed.broadcast();
+            while (!gate.release_cleanup) gate.changed.wait(&gate.mutex);
+            gate.mutex.unlock();
+        }
+    };
+    const WaitContext = struct { gate: *Gate, state: *InterruptState };
+    const Probe = struct {
+        id: i32,
+        inst: *instance_map.EngineInstance,
+        gate: *Gate,
+        wait_context: WaitContext,
+
+        fn observeDeinitWait(context: ?*anyopaque) void {
+            const wait_context: *WaitContext = @ptrCast(@alignCast(context.?));
+            const gate = wait_context.gate;
+            gate.mutex.lock();
+            if (wait_context.state.handler_status == .installing) gate.deinit_waiting_install = true;
+            if (wait_context.state.handler_status == .failed and wait_context.state.registration_waiters == 0) {
+                gate.deinit_waits_after_failure += 1;
+            }
+            gate.changed.broadcast();
+            gate.mutex.unlock();
+        }
+
+        fn runInstaller(self: *@This()) void {
+            const installed = initForInstanceWithHooks(
+                self.id,
+                self.inst,
+                std.testing.allocator,
+                @ptrCast(self.gate),
+                Gate.failInstall,
+                Gate.pauseAfterFailure,
+            );
+            self.gate.mutex.lock();
+            self.gate.installer_result = installed;
+            self.gate.changed.broadcast();
+            self.gate.mutex.unlock();
+        }
+
+        fn runInitWaiter(self: *@This()) void {
+            const initialized = initForInstance(self.id, self.inst);
+            self.gate.mutex.lock();
+            self.gate.init_result = initialized;
+            self.gate.changed.broadcast();
+            self.gate.mutex.unlock();
+        }
+
+        fn runDeinitWaiter(self: *@This()) void {
+            const removed = deinitForInstanceWithWaitObserver(
+                self.id,
+                self.inst,
+                std.testing.allocator,
+                @ptrCast(&self.wait_context),
+                observeDeinitWait,
+            );
+            self.gate.mutex.lock();
+            self.gate.deinit_result = removed;
+            self.gate.deinit_done = true;
+            self.gate.changed.broadcast();
+            self.gate.mutex.unlock();
+        }
+    };
+
+    var gate = Gate{};
+    var probe = Probe{ .id = id, .inst = inst, .gate = &gate, .wait_context = undefined };
+    const installer_thread = try std.Thread.spawn(.{}, Probe.runInstaller, .{&probe});
+    gate.mutex.lock();
+    while (!gate.installer_entered) gate.changed.wait(&gate.mutex);
+    gate.mutex.unlock();
+
+    registry_mutex.lock();
+    const state = registry.get(id) orelse {
+        registry_mutex.unlock();
+        gate.mutex.lock();
+        gate.release_installer = true;
+        gate.release_cleanup = true;
+        gate.changed.broadcast();
+        gate.mutex.unlock();
+        installer_thread.join();
+        return error.MissingInterruptState;
+    };
+    probe.wait_context = .{ .gate = &gate, .state = state };
+    registry_mutex.unlock();
+
+    const init_thread = std.Thread.spawn(.{}, Probe.runInitWaiter, .{&probe}) catch {
+        gate.mutex.lock();
+        gate.release_installer = true;
+        gate.changed.broadcast();
+        while (!gate.failure_published) gate.changed.wait(&gate.mutex);
+        gate.release_cleanup = true;
+        gate.changed.broadcast();
+        gate.mutex.unlock();
+        installer_thread.join();
+        return error.ThreadSpawnFailed;
+    };
+    registry_mutex.lock();
+    while (state.registration_waiters != 1) registry_condition.wait(&registry_mutex);
+    registry_mutex.unlock();
+
+    const deinit_thread = std.Thread.spawn(.{}, Probe.runDeinitWaiter, .{&probe}) catch {
+        gate.mutex.lock();
+        gate.release_installer = true;
+        gate.changed.broadcast();
+        while (!gate.failure_published) gate.changed.wait(&gate.mutex);
+        gate.release_cleanup = true;
+        gate.changed.broadcast();
+        gate.mutex.unlock();
+        init_thread.join();
+        installer_thread.join();
+        return error.ThreadSpawnFailed;
+    };
+    gate.mutex.lock();
+    while (!gate.deinit_waiting_install and !gate.deinit_done) gate.changed.wait(&gate.mutex);
+    gate.release_installer = true;
+    gate.changed.broadcast();
+    while (!gate.failure_published) gate.changed.wait(&gate.mutex);
+    while (gate.deinit_waits_after_failure == 0 and !gate.deinit_done) gate.changed.wait(&gate.mutex);
+    const deinit_escaped_cleanup = gate.deinit_done;
+    gate.release_cleanup = true;
+    gate.changed.broadcast();
+    gate.mutex.unlock();
+
+    init_thread.join();
+    deinit_thread.join();
+    installer_thread.join();
+
+    try std.testing.expect(!deinit_escaped_cleanup);
+    try std.testing.expect(gate.deinit_waits_after_failure != 0);
+    try std.testing.expect(!gate.installer_result);
+    try std.testing.expect(!gate.init_result);
+    try std.testing.expect(!gate.deinit_result);
+    registry_mutex.lock();
+    const still_registered = registry.get(id) != null;
+    registry_mutex.unlock();
+    try std.testing.expect(!still_registered);
 }
 
 /// Clear a pending user interrupt. Lifecycle shutdown owns a separate bit, so this cannot resume a script that is being stopped.
