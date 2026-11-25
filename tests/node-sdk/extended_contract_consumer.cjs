@@ -2,6 +2,8 @@
 
 const assert = require('node:assert/strict')
 const { mkdtemp, rm } = require('node:fs/promises')
+const { writeSync } = require('node:fs')
+const { spawnSync } = require('node:child_process')
 const os = require('node:os')
 const path = require('node:path')
 const { Worker } = require('node:worker_threads')
@@ -217,19 +219,24 @@ async function generationControlsAcrossWorker() {
     const { parentPort } = require('node:worker_threads')
     const { Engine } = require(process.env.JSBAY_NODE_ADDON)
     const engine = Engine.create({ instanceId: 17103 })
+    engine.bind('notifyEvaluation', () => parentPort.postMessage({ type: 'evaluating' }))
     parentPort.postMessage({ type: 'ready', token: engine.controlToken })
     try {
-      engine.evaluate('while (true) {}')
+      engine.evaluate('notifyEvaluation(); while (true) {}')
       parentPort.postMessage({ type: 'result', outcome: 'completed' })
     } catch (error) {
       parentPort.postMessage({ type: 'result', outcome: 'interrupted', message: String(error.message) })
     } finally {
+      parentPort.postMessage({ type: 'closing' })
       engine.close()
+      parentPort.postMessage({ type: 'closed' })
     }
   `, { eval: true })
   try {
     const ready = await nextMessage(worker, message => message.type === 'ready', 'worker engine readiness')
     console.log('extended contract: generation control worker ready')
+    await nextMessage(worker, message => message.type === 'evaluating', 'worker evaluation start')
+    console.log('extended contract: worker entered evaluate')
     assert.equal(typeof ready.token.instanceId, 'number')
     assert.equal(typeof ready.token.generation, 'bigint')
     assert.ok(ready.token.generation > 0n)
@@ -238,6 +245,10 @@ async function generationControlsAcrossWorker() {
     const result = await nextMessage(worker, message => message.type === 'result', 'worker execution interruption')
     console.log('extended contract: interrupt result received')
     assert.equal(result.outcome, 'interrupted')
+    await nextMessage(worker, message => message.type === 'closing', 'worker engine close start')
+    console.log('extended contract: worker engine close started')
+    await nextMessage(worker, message => message.type === 'closed', 'worker engine close completion')
+    console.log('extended contract: worker engine close completed')
     await worker.terminate()
     console.log('extended contract: interrupted worker terminated')
 
@@ -411,10 +422,27 @@ async function valueReceiverAndReentrantConversionSafety() {
   }
 }
 
-async function runPhase(name, action) {
+async function runPhase(name, action, watchdogMs = 0) {
   console.log(`extended contract: ${name} starting`)
-  await action()
-  console.log(`extended contract: ${name} passed`)
+  let watchdog
+  if (watchdogMs > 0) {
+    watchdog = setTimeout(() => {
+      writeSync(2, `extended contract: ${name} exceeded its ${watchdogMs}ms diagnostic watchdog\n`)
+      if (process.platform === 'darwin') {
+        const sample = spawnSync('sample', [String(process.pid), '1'], { timeout: 5000, encoding: 'utf8' })
+        if (sample.stdout) writeSync(2, sample.stdout)
+        if (sample.stderr) writeSync(2, sample.stderr)
+        writeSync(2, `extended contract: sample exit status ${sample.status ?? sample.error?.code ?? 'unknown'}\n`)
+      }
+      process.exit(1)
+    }, watchdogMs)
+  }
+  try {
+    await action()
+    console.log(`extended contract: ${name} passed`)
+  } finally {
+    if (watchdog) clearTimeout(watchdog)
+  }
 }
 
 async function main() {
@@ -425,7 +453,7 @@ async function main() {
   await runPhase('worker exit with listener', workerExitsWithListenerRegistered)
   await runPhase('close from host callback', closeFromHostCallback)
   await runPhase('close from host callback repeat', closeFromHostCallback)
-  await runPhase('generation controls across Worker', generationControlsAcrossWorker)
+  await runPhase('generation controls across Worker', generationControlsAcrossWorker, 10_000)
   await runPhase('submission fence and shutdown', submissionsFenceAndShutdown)
   await runPhase('cache pause and GC', cachePauseAndGc)
   await runPhase('value receiver and reentrant conversion', valueReceiverAndReentrantConversionSafety)
