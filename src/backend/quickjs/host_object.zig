@@ -8,6 +8,7 @@ const host_value = @import("../../abi/host_value.zig");
 const c = @import("c_api.zig");
 const qjs = c.qjs;
 const writeEnumerationOrder = @import("../quickjs_common/host_keys.zig").writeEnumerationOrder;
+const helpers = @import("../quickjs_common/host_object_helpers.zig").create(c, host_value);
 
 pub const GetFn = *const fn (instance_id: i32, user_data: ?*anyopaque, name: []const u8, out: *host_value.HostValue) ?[*:0]const u8;
 pub const SetFn = *const fn (instance_id: i32, user_data: ?*anyopaque, name: []const u8, value: host_value.HostValue) ?[*:0]const u8;
@@ -33,40 +34,6 @@ fn boxOf(obj: qjs.JSValue) ?*Box {
     return @ptrCast(@alignCast(raw));
 }
 
-fn throwMsg(ctx: ?*qjs.JSContext, msg: [*:0]const u8) qjs.JSValue {
-    return qjs.JS_ThrowTypeError(ctx, "%s", msg);
-}
-
-/// Plain Error, not a TypeError. `message` is the own message string, so callers that only scan text still see the "TypeError: " prefix.
-fn throwPlainError(ctx: ?*qjs.JSContext, msg: [*:0]const u8) qjs.JSValue {
-    const err = qjs.JS_NewError(ctx);
-    if (c.jsIsException(err)) return err;
-    const msg_val = c.jsbay_qjs_JS_NewString(ctx, msg);
-    if (c.jsIsException(msg_val)) {
-        c.jsbay_qjs_JS_FreeValue(ctx, err);
-        return msg_val;
-    }
-    _ = qjs.JS_DefinePropertyValueStr(
-        ctx,
-        err,
-        "message",
-        msg_val,
-        qjs.JS_PROP_WRITABLE | qjs.JS_PROP_CONFIGURABLE,
-    );
-    return qjs.JS_Throw(ctx, err);
-}
-
-fn hostToJs(ctx: ?*qjs.JSContext, hv: host_value.HostValue) qjs.JSValue {
-    switch (hv.tag) {
-        host_value.tag_number => return c.jsbay_qjs_JS_NewFloat64(ctx, hv.number),
-        host_value.tag_string => {
-            const ptr = hv.ptr orelse return c.JS_UNDEFINED;
-            return qjs.JS_NewStringLen(ctx, ptr, hv.len);
-        },
-        else => return c.JS_UNDEFINED,
-    }
-}
-
 fn readName(ctx: ?*qjs.JSContext, atom: qjs.JSAtom) ?[]const u8 {
     var len: usize = 0;
     const ptr = qjs.JS_AtomToCStringLen(ctx, &len, atom) orelse return null;
@@ -82,9 +49,9 @@ fn callGet(ctx: ?*qjs.JSContext, box: *Box, name: []const u8) qjs.JSValue {
     var out: host_value.HostValue = undefined;
     host_value.clear(&out);
     if (get_fn(box.instance_id, box.user_data, name, &out)) |msg| {
-        return throwMsg(ctx, msg);
+        return helpers.throwMsg(ctx, msg);
     }
-    return hostToJs(ctx, out);
+    return helpers.hostToJs(ctx, out);
 }
 
 fn qjsGetOwn(
@@ -192,7 +159,7 @@ fn qjsSet(
     _ = flags;
     const box = boxOf(obj) orelse return 0;
     const set_fn = box.set_fn orelse {
-        _ = throwPlainError(ctx, "TypeError: cannot set property");
+        _ = helpers.throwPlainError(ctx, "TypeError: cannot set property");
         return -1;
     };
     const name = readName(ctx, atom) orelse return -1;
@@ -217,7 +184,7 @@ fn qjsSet(
     }
 
     if (set_fn(box.instance_id, box.user_data, name, hv)) |msg| {
-        _ = throwMsg(ctx, msg);
+        _ = helpers.throwMsg(ctx, msg);
         return -1;
     }
     return 1;
