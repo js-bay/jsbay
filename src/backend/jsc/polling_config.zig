@@ -11,6 +11,7 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 
 const State = enum { unknown, enabled, disabled, invalid };
 
+// Lock order: runtime_control.registry_mutex may be held before this mutex; never call runtime control or instance-map APIs while holding it.
 var mutex: sync.Mutex = .{};
 var state: State = .unknown;
 

@@ -40,6 +40,8 @@ pub const ShutdownPhase = enum(c_int) { open = 0, closing = 1, sealed = 2, drain
 
 pub const ShutdownStatus = struct { phase: ShutdownPhase, remaining_ms: u64 };
 
+const HandlerStatus = enum(u8) { installing, ready, removing, failed };
+
 /// Per-instance state shared between public control calls and backend interrupt trampolines. Registry access is serialized; interrupt flags and deadlines use atomic access. Backend trampoline structs preserve their shared field prefix.
 pub const InterruptState = extern struct {
     /// Non-zero when an interrupt has been requested. Read by the trampoline on every interrupt check.
@@ -60,39 +62,111 @@ pub const InterruptState = extern struct {
     interrupt_target: u64 = 0,
     /// Backend tag used by control-plane calls while holding registry_mutex.
     backend_tag: backend.BackendC = .primary,
+    generation: u64 = 0,
+    handler_status: HandlerStatus = .ready,
+    registration_waiters: usize = 0,
 };
+
+fn assertTrampolinePrefix(comptime Shadow: type) void {
+    const fields = .{
+        "interrupt_requested",
+        "_pad",
+        "deadline_ms",
+        "instance_id",
+        "budget_millis",
+        "budget_deadline_ms",
+        "budget_depth",
+        "shutdown_deadline_ms",
+        "shutdown_phase",
+        "exec_epoch",
+        "interrupt_target",
+    };
+    inline for (fields) |field| {
+        if (@offsetOf(Shadow, field) != @offsetOf(InterruptState, field)) {
+            @compileError("backend interrupt state field offsets must match InterruptState");
+        }
+    }
+    if (@sizeOf(Shadow) != @offsetOf(InterruptState, "backend_tag")) {
+        @compileError("backend interrupt state must end at the InterruptState shared prefix");
+    }
+}
+
+comptime {
+    if (comptime backend.isPacked(.quickjs)) {
+        assertTrampolinePrefix(@import("../backend/quickjs/runtime_control.zig").QjsInterruptState);
+    }
+    if (comptime backend.isPacked(.quickjs_ng)) {
+        assertTrampolinePrefix(@import("../backend/quickjs_ng/runtime_control.zig").QjsInterruptState);
+    }
+    if (comptime backend.isPacked(.jsc)) {
+        assertTrampolinePrefix(@import("../backend/jsc/runtime_control.zig").JscInterruptState);
+    }
+}
 
 // ---- Module-global state registry --------------------------------------------
 
 var registry: std.AutoHashMap(i32, *InterruptState) =
     std.AutoHashMap(i32, *InterruptState).init(std.heap.c_allocator);
+// Lock order: instance_map.mutex may precede this mutex during engine publication; this mutex may precede polling_config.mutex. Never acquire instance_map.mutex or call JSC while holding this mutex.
 var registry_mutex: sync.Mutex = .{};
+var registry_condition: sync.Condition = .init;
 
 fn takeState(instance_id: i32) ?*InterruptState {
     registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const kv = registry.fetchRemove(instance_id) orelse return null;
+    while (registry.get(instance_id)) |state| {
+        if (state.handler_status != .installing and state.handler_status != .removing and state.registration_waiters == 0) break;
+        registry_condition.wait(&registry_mutex);
+    }
+    const kv = registry.fetchRemove(instance_id) orelse {
+        registry_mutex.unlock();
+        return null;
+    };
+    registry_mutex.unlock();
     return kv.value;
 }
 
 // ---- Public API --------------------------------------------------------------
 
-/// Arm interrupt + time-limit support for the given instance. Must be called after `engine.create` and before any other runtime_control operation on this instance. Idempotent — returns true if already initialized.
+/// Arm interrupt + time-limit support for the given instance. Must be called after `engine.create` and before any other runtime_control operation on this instance. Idempotent for the same instance generation and backend.
 ///
 /// Returns false if the instance does not exist.
 pub fn init(instance_id: i32) bool {
-    const inst = instance_map.getInstance(instance_id) orelse return false;
-    return initForInstance(instance_id, inst);
+    const lease = instance_map.beginControlPlane(instance_id) orelse return false;
+    defer lease.end();
+    return initForInstance(instance_id, lease.inst);
 }
 
 /// Install control state while an instance is being published under the instance-map lock. It must not look the instance up again: creation uses it before the instance becomes observable to normal readers.
 pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) bool {
+    const generation = inst.generation;
+    const backend_tag = backend.backendToC(inst.backendTag());
 
-    // Idempotency check.
+    // Preserve allocation-free idempotence for an already installed handler.
     registry_mutex.lock();
-    if (registry.get(instance_id) != null) {
-        registry_mutex.unlock();
-        return true;
+    if (registry.get(instance_id)) |existing| {
+        if (existing.generation != generation or existing.backend_tag != backend_tag) {
+            registry_mutex.unlock();
+            return false;
+        }
+        switch (existing.handler_status) {
+            .ready => {
+                registry_mutex.unlock();
+                return true;
+            },
+            .failed, .removing => {
+                registry_mutex.unlock();
+                return false;
+            },
+            .installing => {
+                existing.registration_waiters += 1;
+                while (existing.handler_status == .installing) registry_condition.wait(&registry_mutex);
+                const ready = existing.handler_status == .ready;
+                existing.registration_waiters -= 1;
+                registry_condition.broadcast();
+                registry_mutex.unlock();
+                return ready;
+            },
+        }
     }
     registry_mutex.unlock();
 
@@ -106,10 +180,46 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
         .budget_depth = 0,
         .exec_epoch = 0,
         .interrupt_target = 0,
-        .backend_tag = backend.backendToC(inst.backendTag()),
+        .backend_tag = backend_tag,
+        .generation = generation,
+        .handler_status = .installing,
     };
 
     registry_mutex.lock();
+    while (registry.get(instance_id)) |existing| {
+        if (existing.generation != state.generation or existing.backend_tag != state.backend_tag) {
+            registry_mutex.unlock();
+            std.heap.c_allocator.destroy(state);
+            return false;
+        }
+        switch (existing.handler_status) {
+            .ready => {
+                registry_mutex.unlock();
+                std.heap.c_allocator.destroy(state);
+                return true;
+            },
+            .failed => {
+                registry_mutex.unlock();
+                std.heap.c_allocator.destroy(state);
+                return false;
+            },
+            .removing => {
+                registry_mutex.unlock();
+                std.heap.c_allocator.destroy(state);
+                return false;
+            },
+            .installing => {
+                existing.registration_waiters += 1;
+                while (existing.handler_status == .installing) registry_condition.wait(&registry_mutex);
+                const ready = existing.handler_status == .ready;
+                existing.registration_waiters -= 1;
+                registry_condition.broadcast();
+                registry_mutex.unlock();
+                std.heap.c_allocator.destroy(state);
+                return ready;
+            },
+        }
+    }
     registry.put(instance_id, state) catch {
         registry_mutex.unlock();
         std.heap.c_allocator.destroy(state);
@@ -117,6 +227,26 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     };
     registry_mutex.unlock();
 
+    const installed = installInterruptHandler(inst, state);
+
+    registry_mutex.lock();
+    state.handler_status = if (installed) .ready else .failed;
+    registry_condition.broadcast();
+    if (!installed) {
+        while (state.registration_waiters != 0) registry_condition.wait(&registry_mutex);
+        const owns_state = if (registry.get(instance_id) == state)
+            registry.fetchRemove(instance_id) != null
+        else
+            false;
+        registry_mutex.unlock();
+        if (owns_state) std.heap.c_allocator.destroy(state);
+        return false;
+    }
+    registry_mutex.unlock();
+    return true;
+}
+
+fn installInterruptHandler(inst: *instance_map.EngineInstance, state: *InterruptState) bool {
     switch (inst.engine_handles) {
         .mono => |m| switch (backend.active_backend) {
             .quickjs, .quickjs_ng => {
@@ -165,47 +295,66 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
 pub fn deinit(instance_id: i32) bool {
     const inst_opt = instance_map.getInstance(instance_id);
 
-    const state = takeState(instance_id) orelse return false;
+    registry_mutex.lock();
+    while (registry.get(instance_id)) |pending| {
+        if (pending.handler_status != .installing and pending.handler_status != .removing and pending.registration_waiters == 0) break;
+        registry_condition.wait(&registry_mutex);
+    }
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
+    state.handler_status = .removing;
+    registry_mutex.unlock();
 
     // Uninstall from the backend BEFORE freeing the state — otherwise the JS thread could read freed memory if it fires a check between takeState and here.
     if (inst_opt) |inst| {
-        switch (inst.engine_handles) {
-            .mono => |m| switch (backend.active_backend) {
-                .quickjs, .quickjs_ng => {
-                    const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                    qjs_mod.qjsUninstallInterruptHandler(m.runtime);
+        if (inst.generation == state.generation and backend.backendToC(inst.backendTag()) == state.backend_tag) {
+            switch (inst.engine_handles) {
+                .mono => |m| switch (backend.active_backend) {
+                    .quickjs, .quickjs_ng => {
+                        const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                        qjs_mod.qjsUninstallInterruptHandler(m.runtime);
+                    },
+                    .jsc => {
+                        const jsc_mod = @import("../backend/jsc.zig");
+                        const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
+                        jsc_mod.jscUninstallInterruptHandler(group);
+                    },
+                    .escargot, .hermes => {},
                 },
-                .jsc => {
-                    const jsc_mod = @import("../backend/jsc.zig");
-                    const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
-                    jsc_mod.jscUninstallInterruptHandler(group);
-                },
-                .escargot, .hermes => {},
-            },
-            .packed_alt => |a| {
-                inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
-                    if (a.tag == cand) {
-                        if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) break;
-                        if (comptime backend.isQuickJsApiBackend(cand)) {
-                            const E = backend.Engine(cand);
-                            const Mod = backend.EngineModule(cand);
-                            const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
-                            Mod.qjsUninstallInterruptHandler(rt);
-                        } else {
-                            const jsc_mod = @import("../backend/jsc.zig");
-                            const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
-                            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
-                            jsc_mod.jscUninstallInterruptHandler(group);
+                .packed_alt => |a| {
+                    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+                        if (a.tag == cand) {
+                            if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) break;
+                            if (comptime backend.isQuickJsApiBackend(cand)) {
+                                const E = backend.Engine(cand);
+                                const Mod = backend.EngineModule(cand);
+                                const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
+                                Mod.qjsUninstallInterruptHandler(rt);
+                            } else {
+                                const jsc_mod = @import("../backend/jsc.zig");
+                                const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
+                                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
+                                jsc_mod.jscUninstallInterruptHandler(group);
+                            }
+                            break;
                         }
-                        break;
                     }
-                }
-            },
+                },
+            }
         }
     }
 
-    std.heap.c_allocator.destroy(state);
-    return true;
+    registry_mutex.lock();
+    const owns_state = if (registry.get(instance_id) == state)
+        registry.fetchRemove(instance_id) != null
+    else
+        false;
+    registry_condition.broadcast();
+    registry_mutex.unlock();
+    if (owns_state) std.heap.c_allocator.destroy(state);
+    return owns_state;
 }
 
 fn hermesTriggerTimeout(instance_id: i32) void {
@@ -290,11 +439,16 @@ fn jscPollingControlsUnavailable(state: *const InterruptState) bool {
     return state.backend_tag == .jsc and !@import("../backend/jsc/polling_config.zig").supportsInterrupt();
 }
 
+fn isHandlerReady(state: *const InterruptState) bool {
+    return state.handler_status == .ready;
+}
+
 /// Request mid-script interrupt when the backend supports it. Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed). Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     const polling_enabled = if (state.backend_tag == .jsc) blk: {
         if (comptime backend.isPacked(.jsc)) break :blk @import("../backend/jsc/polling_config.zig").supportsInterrupt();
         break :blk false;
@@ -333,12 +487,12 @@ test "reused instance ids use the backend saved with each interrupt state" {
 
 test "interrupt request observes a replacement state under the registry lock" {
     const id = std.math.maxInt(i32) - 12;
-    const old_state = try std.heap.c_allocator.create(InterruptState);
+    const old_state = try std.testing.allocator.create(InterruptState);
     old_state.* = .{ .instance_id = id, .backend_tag = .jsc };
-    defer std.heap.c_allocator.destroy(old_state);
-    const replacement = try std.heap.c_allocator.create(InterruptState);
+    defer std.testing.allocator.destroy(old_state);
+    const replacement = try std.testing.allocator.create(InterruptState);
     replacement.* = .{ .instance_id = id, .backend_tag = .quickjs_ng };
-    defer std.heap.c_allocator.destroy(replacement);
+    defer std.testing.allocator.destroy(replacement);
 
     const Probe = struct {
         instance_id: i32,
@@ -381,6 +535,69 @@ test "interrupt request observes a replacement state under the registry lock" {
     try std.testing.expectEqual(@as(u8, 1), replacement.interrupt_requested);
 }
 
+test "instance control registration rejects stale state and serializes first registration" {
+    const id = std.math.maxInt(i32) - 13;
+    try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
+    defer engine.destroy(id);
+
+    const inst = instance_map.getInstance(id) orelse return error.MissingInstance;
+    registry_mutex.lock();
+    const state = registry.get(id) orelse {
+        registry_mutex.unlock();
+        return error.MissingInterruptState;
+    };
+    const generation = state.generation;
+    const backend_tag = state.backend_tag;
+    state.generation +%= 1;
+    registry_mutex.unlock();
+    try std.testing.expect(!initForInstance(id, inst));
+
+    registry_mutex.lock();
+    state.generation = generation;
+    state.backend_tag = if (backend_tag == .jsc) .quickjs_ng else .jsc;
+    registry_mutex.unlock();
+    try std.testing.expect(!initForInstance(id, inst));
+
+    registry_mutex.lock();
+    state.backend_tag = backend_tag;
+    state.handler_status = .removing;
+    registry_mutex.unlock();
+    try std.testing.expect(!initForInstance(id, inst));
+
+    registry_mutex.lock();
+    state.handler_status = .ready;
+    registry_mutex.unlock();
+    try std.testing.expect(deinit(id));
+
+    const Probe = struct {
+        id: i32,
+        inst: *instance_map.EngineInstance,
+        start: *std.atomic.Value(bool),
+        succeeded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            self.succeeded.store(initForInstance(self.id, self.inst), .release);
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var first = Probe{ .id = id, .inst = inst, .start = &start };
+    var second = Probe{ .id = id, .inst = inst, .start = &start };
+    const first_thread = try std.Thread.spawn(.{}, Probe.run, .{&first});
+    const second_thread = std.Thread.spawn(.{}, Probe.run, .{&second}) catch {
+        start.store(true, .release);
+        first_thread.join();
+        return error.ThreadSpawnFailed;
+    };
+    start.store(true, .release);
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expect(first.succeeded.load(.acquire));
+    try std.testing.expect(second.succeeded.load(.acquire));
+    try std.testing.expect(initForInstance(id, inst));
+}
+
 /// Clear a pending user interrupt. Lifecycle shutdown owns a separate bit, so this cannot resume a script that is being stopped.
 pub fn clearInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
@@ -388,6 +605,10 @@ pub fn clearInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
     target_ptr.store(0, .monotonic);
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
@@ -406,6 +627,10 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchOr(2, .monotonic);
     registry_mutex.unlock();
@@ -418,6 +643,7 @@ pub fn requestShutdownCancel(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     cancelShutdownState(state);
     return true;
 }
@@ -441,6 +667,7 @@ pub fn beginShutdown(instance_id: i32, millis: u64) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     const now: u64 = @intCast(io.monotonicMilliseconds());
     refreshShutdown(state, now);
     if (state.shutdown_phase != .open) return state.shutdown_phase == .closing or state.shutdown_phase == .sealed;
@@ -454,6 +681,7 @@ pub fn shutdownStatus(instance_id: i32) ?ShutdownStatus {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return null;
+    if (!isHandlerReady(state)) return null;
     const now: u64 = @intCast(io.monotonicMilliseconds());
     refreshShutdown(state, now);
     const deadline: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
@@ -471,6 +699,7 @@ pub fn canEnterExecution(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return true;
+    if (!isHandlerReady(state)) return false;
     refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
     return state.shutdown_phase == .open or state.shutdown_phase == .closing or state.budget_depth != 0;
 }
@@ -480,6 +709,7 @@ pub fn sealShutdown(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
     if (state.shutdown_phase != .closing) return false;
     state.shutdown_phase = .sealed;
@@ -491,6 +721,7 @@ pub fn completeShutdownDrain(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
     if (state.shutdown_phase != .sealed) return false;
     state.shutdown_phase = .drained;
@@ -503,6 +734,10 @@ pub fn clearStopInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchAnd(~@as(u8, 2), .monotonic);
     registry_mutex.unlock();
@@ -523,6 +758,7 @@ fn armJscWatchdogShortLimit(instance_id: i32, millis: u64) void {
     const state = registry.get(instance_id);
     registry_mutex.unlock();
     const interrupt_state = state orelse return;
+    if (!isHandlerReady(interrupt_state)) return;
 
     const period_sec = @as(f64, @floatFromInt(millis)) / 1000.0;
     switch (inst.engine_handles) {
@@ -549,6 +785,7 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     if (millis != 0 and jscPollingControlsUnavailable(state)) return false;
     const p: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     if (millis == 0) {
@@ -572,6 +809,7 @@ pub fn setExecutionBudget(instance_id: i32, millis: u64) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     if (millis != 0 and jscPollingControlsUnavailable(state)) return false;
     state.budget_millis = millis;
     if (millis != 0) {
@@ -590,6 +828,10 @@ pub fn beginExecutionBudget(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     var short_budget_millis: u64 = 0;
     if (state.budget_depth == 0) {
         const epoch_ptr: *std.atomic.Value(u64) = @ptrCast(&state.exec_epoch);
@@ -618,6 +860,7 @@ pub fn endExecutionBudget(instance_id: i32) void {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return;
+    if (!isHandlerReady(state)) return;
     std.debug.assert(state.budget_depth != 0);
     state.budget_depth -= 1;
     if (state.budget_depth == 0) {
@@ -645,6 +888,10 @@ pub fn executionDeadlineMillis(instance_id: i32) ?u64 {
         registry_mutex.unlock();
         return null;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return null;
+    }
     const p: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     const deadline = p.load(.monotonic);
     registry_mutex.unlock();
@@ -656,6 +903,7 @@ pub fn effectiveExecutionDeadlineMillis(instance_id: i32) ?u64 {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return null;
+    if (!isHandlerReady(state)) return null;
     const manual_ptr: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     const budget_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
     const manual = manual_ptr.load(.monotonic);
@@ -682,6 +930,10 @@ pub fn isInterruptRequested(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     const requested = (p.load(.monotonic) & 1) != 0;
     registry_mutex.unlock();
@@ -695,6 +947,10 @@ pub fn isStopRequested(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     const requested = (p.load(.monotonic) & 2) != 0;
     registry_mutex.unlock();

@@ -23,6 +23,8 @@ The C ABI sets `JSC_usePollingTraps=true` in the native process environment when
 
 The setting is process-wide and child processes inherit it when launched with the default environment. JavaScriptCore freezes its options on first use, so embedded hosts must configure it before any JavaScriptCore API call. The C ABI cannot inspect whether an external component already initialized JavaScriptCore with a different option. Other option values cause JS Bay runtime creation to fail.
 
+Before JS Bay creates its first JavaScriptCore context group, `jsbay_library_capabilities` reports a preview from the current native environment without freezing the option. The result can change if the environment changes before runtime creation. After the first JS Bay context group is prepared, capability reporting uses that fixed core decision.
+
 ## Zig
 
 Import `jsbay`, choose a backend with `-Dbackend=quickjs_ng`, `quickjs`, or `jsc`, then use the typed `jsbay.c_api` namespace. The instance ID is supplied by the host and must be unique while the instance is alive.
