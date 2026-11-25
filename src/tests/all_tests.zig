@@ -14,6 +14,7 @@ comptime {
     }
     _ = @import("../runtime/submission.zig");
     _ = @import("public_module_tests.zig");
+    _ = @import("value_scope_lifecycle_tests.zig");
     _ = @import("native_cdp_lifecycle_tests.zig");
     if (build_options.inspector and build_options.inspector_transport and backend.supportsDebugger(backend.active_backend)) {
         _ = @import("step_control_tests.zig");

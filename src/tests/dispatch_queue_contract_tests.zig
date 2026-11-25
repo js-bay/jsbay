@@ -123,10 +123,11 @@ test "engine destroy cancels a pending dispatch task once and rejects reposting"
 
 test "destroy requested by a dispatch callback completes after its eval lease unwinds" {
     const State = struct {
+        const Self = @This();
         id: i32,
 
         fn run(ctx: ?*anyopaque) void {
-            const self: *State = @ptrCast(@alignCast(ctx.?));
+            const self: *Self = @ptrCast(@alignCast(ctx.?));
             engine.destroy(self.id);
         }
     };

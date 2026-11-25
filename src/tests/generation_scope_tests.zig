@@ -17,7 +17,7 @@ const GenerationScopeProbe = struct {
 test "c_api: generation scope and destroy refuse a reused instance id" {
     const id = helpers.nextInstanceId();
     try std.testing.expect(c_api.jsbay_engine_create(id, null, null));
-    var original_snapshot = c_api.InstanceSnapshotC{};
+    var original_snapshot: c_api.InstanceSnapshotC = undefined;
     original_snapshot.struct_size = @sizeOf(c_api.InstanceSnapshotC);
     try std.testing.expect(c_api.jsbay_engine_snapshot(id, &original_snapshot));
     var live_probe = GenerationScopeProbe{};
@@ -30,7 +30,7 @@ test "c_api: generation scope and destroy refuse a reused instance id" {
     c_api.jsbay_engine_destroy(id);
     try std.testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer c_api.jsbay_engine_destroy(id);
-    var replacement_snapshot = c_api.InstanceSnapshotC{};
+    var replacement_snapshot: c_api.InstanceSnapshotC = undefined;
     replacement_snapshot.struct_size = @sizeOf(c_api.InstanceSnapshotC);
     try std.testing.expect(c_api.jsbay_engine_snapshot(id, &replacement_snapshot));
     try std.testing.expect(original_snapshot.generation != replacement_snapshot.generation);
@@ -42,7 +42,7 @@ test "c_api: generation scope and destroy refuse a reused instance id" {
     );
     try std.testing.expect(!stale_probe.called);
     c_api.jsbay_engine_destroy_generation(id, original_snapshot.generation);
-    var after_stale_destroy = c_api.InstanceSnapshotC{};
+    var after_stale_destroy: c_api.InstanceSnapshotC = undefined;
     after_stale_destroy.struct_size = @sizeOf(c_api.InstanceSnapshotC);
     try std.testing.expect(c_api.jsbay_engine_snapshot(id, &after_stale_destroy));
     try std.testing.expectEqual(replacement_snapshot.generation, after_stale_destroy.generation);

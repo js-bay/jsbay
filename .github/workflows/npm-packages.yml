@@ -149,9 +149,9 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           BACKEND: ${{ matrix.backend }}
-          PLATFORM: ${{ matrix.platform }}
+          JSBAY_NPM_PLATFORM: ${{ matrix.platform }}
           ARCH: ${{ matrix.arch }}
-        run: bash tests/node-sdk/published-package-consumer.sh "$BACKEND" "${RELEASE_TAG#v}" "$PLATFORM" "$ARCH"
+        run: bash tests/node-sdk/published-package-consumer.sh "$BACKEND" "${RELEASE_TAG#v}" "$JSBAY_NPM_PLATFORM" "$ARCH"
 
       - name: Test the published Windows package in a packaged Electron app
         if: ${{ inputs.verify_published && matrix.platform == 'win32' }}
@@ -216,23 +216,23 @@ jobs:
         env:
           ZIG_BACKEND: ${{ matrix.zig_backend }}
           ZIG_TARGET: ${{ matrix.zig_target }}
-          PLATFORM: ${{ matrix.platform }}
+          JSBAY_NPM_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           core="$RUNNER_TEMP/jsbay-core"
           zig_args=(-Dbackend="$ZIG_BACKEND" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$core" --summary all)
           cmake_args=()
-          if [[ "$PLATFORM" == darwin ]]; then
+          if [[ "$JSBAY_NPM_PLATFORM" == darwin ]]; then
             cmake_args+=(-DJSBAY_LIBRARY="$core/lib/libjsbay.a")
             sysroot="$(xcrun --sdk macosx --show-sdk-path)"
             test -d "$sysroot"
             zig_args+=("-Dtarget=$ZIG_TARGET")
             zig_args+=("-Dapple-sysroot=$sysroot")
             cmake_args+=(-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0)
-          elif [[ "$PLATFORM" == linux ]]; then
+          elif [[ "$JSBAY_NPM_PLATFORM" == linux ]]; then
             cmake_args+=(-DJSBAY_LIBRARY="$core/lib/libjsbay.a")
             zig_args+=("-Dcpu=baseline")
-          elif [[ "$PLATFORM" == win32 ]]; then
+          elif [[ "$JSBAY_NPM_PLATFORM" == win32 ]]; then
             test -f "$NODE_INCLUDE/node_api.h"
             test -f "$NODE_INCLUDE/uv.h"
             cmake_args+=(-DJSBAY_LIBRARY="$core/lib/jsbay.lib")
@@ -240,7 +240,7 @@ jobs:
             zig_args+=("-Dtarget=$ZIG_TARGET" "-Dinspector-transport=false")
           fi
           zig build "${zig_args[@]}"
-          if [[ "$PLATFORM" != win32 ]]; then
+          if [[ "$JSBAY_NPM_PLATFORM" != win32 ]]; then
             node_root="$(dirname "$(dirname "$(command -v node)")")"
             test -f "$node_root/include/node/node_api.h"
             test -f "$node_root/include/node/uv.h"
@@ -249,15 +249,15 @@ jobs:
           cmake -S sdk/node -B "$RUNNER_TEMP/jsbay-node" -DCMAKE_BUILD_TYPE=Release "${cmake_args[@]}"
           cmake --build "$RUNNER_TEMP/jsbay-node" --config Release
           test -s "$RUNNER_TEMP/jsbay-node/jsbay_node.node"
-          if [[ "$PLATFORM" == darwin ]]; then
+          if [[ "$JSBAY_NPM_PLATFORM" == darwin ]]; then
             bash scripts/check-macos-deployment-target.sh 11.0 "$core/lib/libjsbay.a" "$RUNNER_TEMP/jsbay-node/jsbay_node.node"
           fi
           {
             library="$core/lib/libjsbay.a"
-            if [[ "$PLATFORM" == win32 ]]; then library="$core/lib/jsbay.lib"; fi
+            if [[ "$JSBAY_NPM_PLATFORM" == win32 ]]; then library="$core/lib/jsbay.lib"; fi
             echo "JSBAY_NODE_LIBRARY=$library"
             echo "JSBAY_NODE_ADDON=$RUNNER_TEMP/jsbay-node/jsbay_node.node"
-            if [[ "$PLATFORM" != win32 ]]; then echo "NODE_INCLUDE=$node_root/include/node"; fi
+            if [[ "$JSBAY_NPM_PLATFORM" != win32 ]]; then echo "NODE_INCLUDE=$node_root/include/node"; fi
           } >> "$GITHUB_ENV"
 
       - name: Test the release addon
@@ -288,7 +288,7 @@ jobs:
         shell: bash
         env:
           BACKEND: ${{ matrix.backend }}
-          PLATFORM: ${{ matrix.platform }}
+          JSBAY_NPM_PLATFORM: ${{ matrix.platform }}
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ needs.build-main.outputs.version }}
         run: |
@@ -296,16 +296,16 @@ jobs:
           output="$RUNNER_TEMP/npm-package"
           tarballs="$RUNNER_TEMP/npm-platform"
           mkdir -p "$tarballs"
-          node scripts/package-node-npm.mjs platform "$BACKEND" "$VERSION" "$PLATFORM" "$ARCH" "$JSBAY_NODE_ADDON" "$output"
+          node scripts/package-node-npm.mjs platform "$BACKEND" "$VERSION" "$JSBAY_NPM_PLATFORM" "$ARCH" "$JSBAY_NODE_ADDON" "$output"
           package_platform=linux
-          if [[ "$PLATFORM" == darwin ]]; then package_platform=macos; fi
-          if [[ "$PLATFORM" == win32 ]]; then package_platform=win32; fi
+          if [[ "$JSBAY_NPM_PLATFORM" == darwin ]]; then package_platform=macos; fi
+          if [[ "$JSBAY_NPM_PLATFORM" == win32 ]]; then package_platform=win32; fi
           package_name="${BACKEND}-${package_platform}-${ARCH}"
           npm pack --pack-destination "$tarballs" "$output/$package_name"
           platform_tarball="jsbay-$package_name-$VERSION.tgz"
           main_tarball="jsbay-$BACKEND-$VERSION.tgz"
           node tests/node-sdk/npm_package_test.mjs "$RUNNER_TEMP/npm-main/$main_tarball" "$tarballs/$platform_tarball" "$BACKEND"
-          if [[ "$PLATFORM" == win32 ]]; then
+          if [[ "$JSBAY_NPM_PLATFORM" == win32 ]]; then
             node tests/node-sdk/electron-packaged-consumer.mjs \
               "$RUNNER_TEMP/npm-main/$main_tarball" "$tarballs/$platform_tarball"
           fi

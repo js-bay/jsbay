@@ -17,6 +17,13 @@ assert.match(ci, /node-npm-version:[\s\S]*?uses: actions\/setup-node@v6[\s\S]*?n
 assert.match(ci, /node-npm-packages:[\s\S]*?if: github\.event_name == 'pull_request'[\s\S]*?needs: node-npm-version[\s\S]*?uses: \.\/\.github\/workflows\/npm-packages\.yml[\s\S]*?tag: \$\{\{ needs\.node-npm-version\.outputs\.tag \}\}/)
 assert.match(ci, /node-npm-packages:[\s\S]*?name: Node npm platform matrix \(Windows MSVC and Electron\)/)
 assert.match(npmWorkflow, /platform: win32[\s\S]*?arch: x64[\s\S]*?runner: windows-2025/)
+assert.equal(
+  [...npmWorkflow.matchAll(/^\s+JSBAY_NPM_PLATFORM:\s+\$\{\{\s*matrix\.platform\s*\}\}\s*$/gm)].length,
+  3,
+  'each npm step that needs the platform uses the collision-safe environment name',
+)
+assert.doesNotMatch(npmWorkflow, /^\s+PLATFORM:/m, 'Windows toolchains may export Platform with different capitalization')
+assert.doesNotMatch(npmWorkflow, /\$PLATFORM\b/, 'shell steps must not read the colliding PLATFORM name')
 assert.match(npmWorkflow, /node tests\/node-sdk\/npm_package_test\.mjs/)
 assert.match(npmWorkflow, /node tests\/node-sdk\/electron-packaged-consumer\.mjs/)
 assert.doesNotMatch(npmWorkflow, /tar\s+-xzf\s+"\$headers"/, 'Windows tar must not interpret a drive letter as a remote host')

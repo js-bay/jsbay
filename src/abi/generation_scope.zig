@@ -1,11 +1,6 @@
 const engine = @import("../engine.zig");
 const builtin = @import("builtin");
 const host_wake = @import("js_event_loop").host_wake;
-const value_operation = @import("value_operation.zig");
-
-const API_INVALID_ARGUMENT: c_int = 2;
-const API_INSTANCE_NOT_FOUND: c_int = 4;
-const API_OK: c_int = 0;
 
 var before_packed_admission_hook: ?*const fn (?*anyopaque) void = null;
 var before_packed_admission_hook_data: ?*anyopaque = null;
@@ -23,15 +18,6 @@ fn runBeforePackedAdmissionHookForTesting() void {
     before_packed_admission_hook = null;
     before_packed_admission_hook_data = null;
     hook(data);
-}
-
-pub export fn jsbay_engine_with_generation_scope(
-    instance_id: c_int,
-    generation: u64,
-    callback: ?*const fn (?*anyopaque) callconv(.c) void,
-    user_data: ?*anyopaque,
-) c_int {
-    return run(value_operation, API_INVALID_ARGUMENT, API_INSTANCE_NOT_FOUND, API_OK, instance_id, generation, callback, user_data);
 }
 
 pub fn run(
