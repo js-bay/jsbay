@@ -43,6 +43,17 @@ test('draft retries preserve assets and publication pins the verified Swift comm
     const packageSha = git('--git-dir', remote, 'rev-parse', `refs/heads/${legacyTarget}`).trim();
     const runStaged = operation => spawnSync('bash', [resolve('scripts/verify-staged-release.sh'), operation, '1.2.3', sourceSha, '123', assets, pkg], { encoding: 'utf8', cwd: source, env });
     const run = (operation, ...args) => spawnSync(process.execPath, ['scripts/github-release.mjs', operation, '1.2.3', packageSha, assets, pkg, ...args], { encoding: 'utf8', env });
+    writeFileSync(join(assets, 'SHA256SUMS'), '');
+    const missing = run('draft');
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /SHA256SUMS mismatch/);
+    const firstLine = checksums.split('\n')[0];
+    const assetName = firstLine.slice(66);
+    writeFileSync(join(assets, 'SHA256SUMS'), checksums.replace(firstLine, `${'0'.repeat(64)}  ${assetName}`));
+    const corrupt = run('draft');
+    assert.notEqual(corrupt.status, 0);
+    assert.ok(corrupt.stderr.includes(`SHA256SUMS mismatch: ${assetName}`));
+    writeFileSync(join(assets, 'SHA256SUMS'), checksums);
     assert.equal(runStaged('draft').status, 0); assert.equal(runStaged('draft').status, 0);
     let data = JSON.parse(readFileSync(state)); assert.equal(data.release.assets.length, 4); assert.equal(data.release.draft, true);
     assert.equal(data.release.target_commitish, packageSha);

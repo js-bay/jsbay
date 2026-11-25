@@ -176,7 +176,7 @@ const FakeFrontend = struct {
         } };
     }
 
-    fn count(self: *FakeFrontend) usize {
+    pub fn count(self: *FakeFrontend) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.sent.items.len;
@@ -226,7 +226,7 @@ const FakeFrontend = struct {
     }
 };
 
-const Harness = struct {
+pub const Harness = struct {
     /// Scaffolding allocator for parsed replies. The bridge, the relay, and the frontend own memory that a real run would free, so they use the checking allocator and report a leak at the end of the test.
     allocator: Allocator,
     durable: Allocator,
@@ -234,7 +234,7 @@ const Harness = struct {
     frontend: *FakeFrontend,
     bridge: *cdp.Bridge,
 
-    fn create(allocator: Allocator) !Harness {
+    pub fn create(allocator: Allocator) !Harness {
         const durable = std.testing.allocator;
         const relay = try durable.create(FakeRelay);
         errdefer durable.destroy(relay);
@@ -252,7 +252,7 @@ const Harness = struct {
         return .{ .allocator = allocator, .durable = durable, .relay = relay, .frontend = frontend, .bridge = bridge };
     }
 
-    fn deinit(self: *Harness) void {
+    pub fn deinit(self: *Harness) void {
         const target = self.bridge.target;
         self.bridge.deinit();
         self.durable.free(target.application);

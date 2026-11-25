@@ -378,8 +378,7 @@ test "commonjs package owns loading and cache behavior without engine imports" {
             const imported = imports[0..end];
             if (!std.mem.eql(u8, imported, "std") and !std.mem.eql(u8, imported, "builtin")) {
                 const resolved = try std.fs.path.resolve(allocator, &.{ std.fs.path.dirname(name).?, imported });
-                const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{package});
-                try testing.expect(std.mem.startsWith(u8, resolved, prefix));
+                try testing.expect(std.mem.startsWith(u8, resolved, package) and resolved.len > package.len and resolved[package.len] == '/');
             }
             imports = imports[end + 1 ..];
         }

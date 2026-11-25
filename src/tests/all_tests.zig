@@ -171,6 +171,7 @@ comptime {
     _ = @import("native_sync_tests.zig");
     if (!spike) {
         _ = @import("async_promise_tests.zig");
+        _ = @import("async_cancel_admission_tests.zig");
         _ = @import("async_api_boundary_tests.zig");
         _ = @import("async_generation_failure_tests.zig");
         _ = @import("async_budget_tests.zig");
@@ -180,6 +181,7 @@ comptime {
         _ = @import("host_wake_tests.zig");
         _ = @import("js_event_loop_contract_tests.zig");
         _ = @import("state_tcas_engine_harness.zig");
+        _ = @import("state_tcas_engine_timer_cancel_harness.zig");
     }
     _ = @import("browser_event_loop_tests.zig");
     _ = @import("jsc_microtask_contract_tests.zig");
