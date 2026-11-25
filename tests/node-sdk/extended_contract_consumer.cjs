@@ -2,8 +2,6 @@
 
 const assert = require('node:assert/strict')
 const { mkdtemp, rm } = require('node:fs/promises')
-const { writeSync } = require('node:fs')
-const { spawnSync } = require('node:child_process')
 const os = require('node:os')
 const path = require('node:path')
 const { Worker } = require('node:worker_threads')
@@ -422,27 +420,10 @@ async function valueReceiverAndReentrantConversionSafety() {
   }
 }
 
-async function runPhase(name, action, watchdogMs = 0) {
+async function runPhase(name, action) {
   console.log(`extended contract: ${name} starting`)
-  let watchdog
-  if (watchdogMs > 0) {
-    watchdog = setTimeout(() => {
-      writeSync(2, `extended contract: ${name} exceeded its ${watchdogMs}ms diagnostic watchdog\n`)
-      if (process.platform === 'darwin') {
-        const sample = spawnSync('sample', [String(process.pid), '1'], { timeout: 5000, encoding: 'utf8' })
-        if (sample.stdout) writeSync(2, sample.stdout)
-        if (sample.stderr) writeSync(2, sample.stderr)
-        writeSync(2, `extended contract: sample exit status ${sample.status ?? sample.error?.code ?? 'unknown'}\n`)
-      }
-      process.exit(1)
-    }, watchdogMs)
-  }
-  try {
-    await action()
-    console.log(`extended contract: ${name} passed`)
-  } finally {
-    if (watchdog) clearTimeout(watchdog)
-  }
+  await action()
+  console.log(`extended contract: ${name} passed`)
 }
 
 async function main() {
@@ -453,7 +434,7 @@ async function main() {
   await runPhase('worker exit with listener', workerExitsWithListenerRegistered)
   await runPhase('close from host callback', closeFromHostCallback)
   await runPhase('close from host callback repeat', closeFromHostCallback)
-  await runPhase('generation controls across Worker', generationControlsAcrossWorker, 10_000)
+  await runPhase('generation controls across Worker', generationControlsAcrossWorker)
   await runPhase('submission fence and shutdown', submissionsFenceAndShutdown)
   await runPhase('cache pause and GC', cachePauseAndGc)
   await runPhase('value receiver and reentrant conversion', valueReceiverAndReentrantConversionSafety)

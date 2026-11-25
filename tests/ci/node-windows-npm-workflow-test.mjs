@@ -3,7 +3,7 @@ import { createElectronPackagerOptions, electronExecutableName } from '../node-s
 import { cleanupTempDirectory } from '../node-sdk/cleanup-temp-directory.mjs'
 import { extractPackage } from '../node-sdk/extract-npm-package.mjs'
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -24,12 +24,18 @@ const build = await readFile(join(root, 'build.zig'), 'utf8')
 const buildSupport = await readFile(join(root, 'build_support.zig'), 'utf8')
 const npmConsumer = await readFile(join(root, 'tests/node-sdk/npm_package_test.mjs'), 'utf8')
 const inspectorConsumer = await readFile(join(root, 'tests/node-sdk/inspector_consumer.cjs'), 'utf8')
+const nativeConsumerRunner = await readFile(join(root, 'tests/node-sdk/run_native_consumer.sh'), 'utf8')
+const consumerWatchdog = await readFile(join(root, 'tests/node-sdk/run-consumer-with-watchdog.mjs'), 'utf8')
 
 assert.match(ci, /node-npm-version:[\s\S]*?if: github\.event_name == 'pull_request'/)
 assert.match(ci, /node-npm-version:[\s\S]*?uses: actions\/setup-node@v6[\s\S]*?node-version: '24'/)
 assert.match(ci, /node-npm-packages:[\s\S]*?if: github\.event_name == 'pull_request'[\s\S]*?needs: node-npm-version[\s\S]*?uses: \.\/\.github\/workflows\/npm-packages\.yml[\s\S]*?tag: \$\{\{ needs\.node-npm-version\.outputs\.tag \}\}/)
 assert.match(ci, /node-npm-packages:[\s\S]*?name: Node npm platform matrix \(Windows MSVC and Electron\)/)
 assert.match(npmWorkflow, /platform: win32[\s\S]*?arch: x64[\s\S]*?runner: windows-2025/)
+assert.equal([...nativeConsumerRunner.matchAll(/run-consumer-with-watchdog\.mjs"\s+30000[^\n]*extended_contract_consumer\.cjs/g)].length, 2, 'both extended contract consumers run under the external watchdog')
+assert.match(consumerWatchdog, /spawn\(command, args[\s\S]*?process\.exitCode = code/)
+assert.match(consumerWatchdog, /spawn\('sample',[\s\S]*?String\(consumer\.pid\)/)
+assert.match(consumerWatchdog, /sampler\.kill\('SIGKILL'\)[\s\S]*?consumer\.kill\('SIGKILL'\)[\s\S]*?process\.exit\(1\)/)
 const releaseAddonStep = npmWorkflow.match(/      - name: Test the release addon[\s\S]*?(?=\n      - name:|\n  collect-packages:)/)?.[0]
 assert.ok(releaseAddonStep, 'the release addon consumer step exists')
 assert.match(releaseAddonStep, /^        timeout-minutes: 15$/m, 'the release addon consumer step has a finite hard timeout')
@@ -97,6 +103,12 @@ const manifest = await readFile(join(root, 'build.zig.zon'), 'utf8')
 const version = manifest.match(/^\s*\.version\s*=\s*"([^"\s]+)"/m)?.[1]
 assert.ok(version, 'the engine manifest declares a version')
 const temporary = await mkdtemp(join(tmpdir(), 'jsbay-node-windows-ci-contract-'))
+const watchdogPath = join(root, 'tests/node-sdk/run-consumer-with-watchdog.mjs')
+const exitStatus = spawnSync(process.execPath, [watchdogPath, '30000', process.execPath, '-e', 'process.exit(7)'], { encoding: 'utf8' })
+assert.equal(exitStatus.status, 7, 'the watchdog preserves a completed consumer exit code')
+const timeoutStatus = spawnSync(process.execPath, [watchdogPath, '100', process.execPath, '-e', 'setInterval(() => {}, 1000)'], { encoding: 'utf8', timeout: 10000 })
+assert.equal(timeoutStatus.status, 1, 'the watchdog reports a timeout as failure')
+assert.match(timeoutStatus.stderr, /consumer exceeded its 100ms watchdog/)
 try {
   const output = join(temporary, 'github-output')
   execFileSync(process.execPath, [join(root, 'scripts/ci/resolve-npm-ci-tag.mjs')], {

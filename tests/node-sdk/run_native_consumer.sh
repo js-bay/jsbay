@@ -52,7 +52,7 @@ for review_case in cleanup-pending completion-reasons shared-handler-error synch
   run_stage "test addon: review case $review_case" env JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
 done
 run_stage 'test addon: conversion fault consumer' env JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/conversion_fault_consumer.cjs"
-run_stage 'test addon: extended contract consumer' env JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"
+run_stage 'test addon: extended contract consumer' env JSBAY_NODE_ADDON="$addon" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"
 run_stage 'test addon: value contract consumer' env JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/value_contract_consumer.cjs"
 embed_addon="$output_dir/jsbay_node_embed.node"
 run_stage 'build embedded addon' "${CXX:-c++}" -std=c++17 -DJSBAY_NODE_EMBEDDED=1 "${flags[@]}" -I"$root/include" -I"$root/sdk/node/include" -I"$node_include" -I"$(dirname "$node_include")" "$root/sdk/node/src/jsbay_node.cpp" "$root/tests/node-sdk/embed_consumer.cc" "$archive" -o "$embed_addon"
@@ -69,7 +69,7 @@ fi
 test -s "$production_addon"
 run_stage 'release addon: native consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" "$root/tests/node-sdk/native_consumer.cjs"
 run_stage 'release addon: independent consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/independent_consumer.cjs"
-run_stage 'release addon: extended contract consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"
+run_stage 'release addon: extended contract consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" --expose-gc "$root/tests/node-sdk/extended_contract_consumer.cjs"
 run_stage 'release addon: value contract consumer' env JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/value_contract_consumer.cjs"
 for review_case in timer-microtask nested-thenable guest-then-getter explicit-undefined error-properties worker-finalizer worker-close-async-gc pending-engine-gc sparse-array timer-close-observer conversion-rejects conversion-observer-rejects conversion-closes-engine close-async-contract cache-option-reentrancy worker-pending-natural-exit sync-host-throw argument-budget constructor-failure; do
   run_stage "release addon: review case $review_case" env JSBAY_NODE_ADDON="$production_addon" "$node_bin" --expose-gc "$root/tests/node-sdk/review_consumer.cjs" "$review_case"
