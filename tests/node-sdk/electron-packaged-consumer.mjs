@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path'
 import { cleanupTempDirectory } from './cleanup-temp-directory.mjs'
 import { extractPackage } from './extract-npm-package.mjs'
 import { packageElectronApp } from './run-electron-packager.mjs'
+import { electronExecutableName } from './electron-packager-options.mjs'
 import { promisify } from 'node:util'
 
 const run = promisify(execFile)
@@ -120,7 +121,7 @@ try {
   const appPath = bundles[0]
   const appAsar = join(appPath, 'resources', 'app.asar')
   const unpackedAddon = join(appPath, 'resources', 'app.asar.unpacked', 'node_modules', '@jsbay', 'quickjsng-win32-x64', 'jsbay_node.node')
-  const electronExe = join(appPath, 'JsBaySmoke.exe')
+  const electronExe = join(appPath, `${electronExecutableName}.exe`)
   await readFile(appAsar)
   await readFile(unpackedAddon)
   const { output, resultFile } = await runPackagedApp(electronExe)

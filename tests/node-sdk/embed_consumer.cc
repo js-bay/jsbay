@@ -264,7 +264,7 @@ napi_value raceDestroyAndReplace(napi_env env, napi_callback_info info) {
     if (scope_status != JSBAY_OK && !race.callback_entered.load())
         race.callback_entered.store(true);
     worker.join();
-    const jsbay_status_t stale_scope_status = race.stale_scope_status.load();
+    const int stale_scope_status = race.stale_scope_status.load();
     const bool replacement_created = race.replacement_created.load();
     if (scope_status != JSBAY_OK || stale_scope_status != JSBAY_INSTANCE_NOT_FOUND ||
         !replacement_created) {

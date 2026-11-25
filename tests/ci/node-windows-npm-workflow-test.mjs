@@ -1,4 +1,5 @@
 import { packageElectronApp } from '../node-sdk/run-electron-packager.mjs'
+import { createElectronPackagerOptions, electronExecutableName } from '../node-sdk/electron-packager-options.mjs'
 import { cleanupTempDirectory } from '../node-sdk/cleanup-temp-directory.mjs'
 import { extractPackage } from '../node-sdk/extract-npm-package.mjs'
 import assert from 'node:assert/strict'
@@ -78,6 +79,13 @@ assert.doesNotMatch(electronConsumer, /await import\(pathToFileURL/, 'the parent
 assert.match(electronPackagerRunner, /runCommand\(process\.execPath/)
 assert.match(electronPackagerRunner, /electron-packager-child\.mjs/)
 assert.match(electronPackagerChild, /await import\(packagerUrl\)/)
+const electronPackagerOptions = createElectronPackagerOptions('app-directory', 'output-directory', '44.11.5')
+assert.equal(electronPackagerOptions.name, electronExecutableName, 'the packaged directory name comes from the explicit Packager name option')
+assert.equal(electronPackagerOptions.executableName, electronExecutableName, 'the Windows executable name comes from the explicit Packager executableName option')
+assert.equal(electronPackagerOptions.platform, 'win32')
+assert.equal(electronPackagerOptions.arch, 'x64')
+assert.match(electronConsumer, /join\(appPath, `\$\{electronExecutableName\}\.exe`\)/, 'the smoke process uses the exact configured executable name')
+assert.doesNotMatch(electronPackagerChild, /appName:/, 'Electron Packager receives its documented name option')
 assert.match(cleanupTempDirectorySource, /if \(!operationError\) throw cleanupError/)
 assert.doesNotMatch(electronConsumer, /tar['"],[\s\S]*?-C['"],[\s\S]*?destination/, 'tar must not receive an absolute Windows destination argument')
 assert.match(npmConsumer, /function readTarball[\s\S]*?basename\(absolute\)[\s\S]*?cwd: dirname\(absolute\)/)
