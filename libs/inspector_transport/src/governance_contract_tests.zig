@@ -7,6 +7,7 @@ const testing = std.testing;
 const transport = @import("inspector_transport");
 const zev = @import("zev");
 const test_client = @import("test_client");
+const test_helpers = @import("test_helpers.zig");
 
 const socket = @import("portable_socket");
 
@@ -521,40 +522,6 @@ const RepeatedSender = struct {
     }
 };
 
-const LargeWriteBarrier = struct {
-    mutex: zev.Mutex = .{},
-    changed: zev.Condition = .init,
-    entered: bool = false,
-    released: bool = false,
-
-    fn observe(ctx: ?*anyopaque, payload: []const u8) void {
-        _ = payload;
-        const self: *LargeWriteBarrier = @ptrCast(@alignCast(ctx.?));
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (self.entered) return;
-        self.entered = true;
-        self.changed.broadcast();
-        while (!self.released) self.changed.wait(&self.mutex);
-    }
-
-    fn waitUntilEntered(self: *LargeWriteBarrier) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        while (!self.entered) {
-            if (self.changed.waitTimeout(&self.mutex, 10_000) == .timed_out) return false;
-        }
-        return true;
-    }
-
-    fn release(self: *LargeWriteBarrier) void {
-        self.mutex.lock();
-        self.released = true;
-        self.changed.broadcast();
-        self.mutex.unlock();
-    }
-};
-
 const ReentrantDeinitProbe = struct {
     transport_ptr: ?*transport.Transport = null,
     target_event: transport.EventKind,
@@ -918,9 +885,8 @@ test "transport: large message within 64 MiB limit is delivered successfully and
 
 test "transport: at most one large message waits in queue while another is being written" {
     const alloc = testing.allocator;
-    var barrier = LargeWriteBarrier{};
-    defer barrier.changed.deinit();
-    defer barrier.mutex.deinit();
+    var barrier = test_helpers.LargeWriteBarrier{};
+    defer barrier.deinit();
     var opened = Opened{};
     defer opened.changed.deinit();
     defer opened.mutex.deinit();
@@ -928,7 +894,7 @@ test "transport: at most one large message waits in queue while another is being
     const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 64 * 1024, .max_message_bytes = 2 * 1024 * 1024 });
     defer t.deinit();
     defer barrier.release();
-    transport.Transport.test_only.setWriterHook(t, LargeWriteBarrier.observe, &barrier);
+    transport.Transport.test_only.setWriterHook(t, test_helpers.LargeWriteBarrier.observe, &barrier);
     t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "large-in-flight-peer" });
     try t.start(&opened, Opened.handler);
 
