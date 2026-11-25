@@ -62,9 +62,9 @@ jobs:
           node-version: '24'
 
       - name: Install pawl
-        uses: tiangong-dev/pawl@v0.9.0
+        uses: tiangong-dev/pawl@v0.10.0
         with:
-          version: v0.9.0
+          version: v0.10.0
 
       - name: Test and run Zig source ratchet
         env:
@@ -196,9 +196,9 @@ jobs:
           node-version: '24'
 
       - name: Install Pawl
-        uses: tiangong-dev/pawl@v0.9.0
+        uses: tiangong-dev/pawl@v0.10.0
         with:
-          version: v0.9.0
+          version: v0.10.0
 
       - name: Add Homebrew to PATH
         run: echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
@@ -536,9 +536,9 @@ jobs:
           global-json-file: global.json
 
       - name: Install pawl
-        uses: tiangong-dev/pawl@v0.9.0
+        uses: tiangong-dev/pawl@v0.10.0
         with:
-          version: v0.9.0
+          version: v0.10.0
 
       - name: Ensure ripgrep
         run: command -v rg || brew install ripgrep
@@ -793,9 +793,9 @@ jobs:
         uses: android-actions/setup-android@v4.0.4
 
       - name: Install pawl
-        uses: tiangong-dev/pawl@v0.9.0
+        uses: tiangong-dev/pawl@v0.10.0
         with:
-          version: v0.9.0
+          version: v0.10.0
 
       - name: Ensure ripgrep
         run: command -v rg || brew install ripgrep

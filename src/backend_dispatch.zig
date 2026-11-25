@@ -9,18 +9,6 @@ const multi_pack = @import("multi_pack.zig");
 
 pub const Backend = backend.BackendType;
 
-fn erasePtr(p: anytype) usize {
-    const T = @TypeOf(p);
-    switch (@typeInfo(T)) {
-        .optional => {
-            const v = p orelse return 0;
-            return erasePtr(v);
-        },
-        .pointer => return @intFromPtr(p),
-        else => @compileError("erasePtr expects a pointer or optional pointer"),
-    }
-}
-
 fn restorePtr(comptime P: type, addr: usize) P {
     if (addr == 0) {
         switch (@typeInfo(P)) {
@@ -44,29 +32,12 @@ pub const Handles = struct {
     ctx_addr: usize,
 };
 
-fn createReal(comptime tag: Backend) ?Handles {
-    if (comptime !multi_pack.isPacked(tag)) return null;
-    const E = backend.Engine(tag);
-    const rt = E.newRuntime() orelse return null;
-    const ctx = E.newContext(rt) orelse {
-        E.freeRuntime(rt);
-        return null;
-    };
-    return .{
-        .runtime_addr = erasePtr(rt),
-        .ctx_addr = erasePtr(ctx),
-    };
-}
-
 pub fn createPacked(tag: Backend) ?Handles {
-    if (!multi_pack.isPacked(tag)) return null;
-    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
-        if (cand == tag) {
-            if (comptime multi_pack.isPacked(cand)) return createReal(cand);
-            return null;
-        }
-    }
-    return null;
+    const instance = multi_pack.createWithBackend(tag) orelse return null;
+    return .{
+        .runtime_addr = instance.runtime_addr,
+        .ctx_addr = instance.ctx_addr,
+    };
 }
 
 pub fn finishCreate(tag: Backend, handles: Handles, instance_id: i32, max_stack_size: usize) void {

@@ -34,7 +34,7 @@ Shared native format config is `sdk/.clang-format`; Kotlin and C# editor rules l
 | Node.js | Shared native formatter for `sdk/node/src` | C++ compilation, TypeScript declaration consumer when `TSC` is set, and Node.js runtime consumers |
 | C/C++/ObjC | clang-format 20.1.8 | Compiler diagnostics run via the matching platform build |
 
-Quality scripts use Bash. Downloads and report handling use `curl`, `unzip`, `shasum`, `jq`, and similar commands; they do not depend on Python. Kotlin/Java tools download into a user cache and verify a fixed SHA-256. clang-format uses a binary archive pinned by URL and SHA-256 in a lockfile, and `unzip` extracts only the executable; the lockfile is `scripts/quality/native-tools.lock.json`. Set `JSBAY_QUALITY_CACHE` to choose the cache directory. A `CLANG_FORMAT` path override must still pass the version check. CI pins pawl to 0.8.2.
+Quality scripts use Bash. Downloads and report handling use `curl`, `unzip`, `shasum`, `jq`, and similar commands; they do not depend on Python. Kotlin/Java tools download into a user cache and verify a fixed SHA-256. clang-format uses a binary archive pinned by URL and SHA-256 in a lockfile, and `unzip` extracts only the executable; the lockfile is `scripts/quality/native-tools.lock.json`. Set `JSBAY_QUALITY_CACHE` to choose the cache directory. A `CLANG_FORMAT` path override must still pass the version check. CI pins pawl to 0.10.0.
 
 ## Platform environments
 
