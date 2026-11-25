@@ -40,7 +40,7 @@ pub const JscInterruptState = extern struct {
     interrupt_target: u64 = 0,
 };
 
-/// Trampoline for the execution-time-limit watchdog. Explicitly re-arm after a false return so the next interrupt check does not depend on framework-specific callback repetition.
+/// Re-arm both outcomes: JSC consumes a fired timer even when a nested API boundary catches its termination.
 fn jscShouldTerminate(ctx: jsc.JSContextRef, context: ?*anyopaque) callconv(.c) bool {
     const state_ptr = context orelse return false;
     const state: *JscInterruptState = @ptrCast(@alignCast(state_ptr));
@@ -48,16 +48,17 @@ fn jscShouldTerminate(ctx: jsc.JSContextRef, context: ?*anyopaque) callconv(.c) 
     const shutdown_ptr: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
     const now: u64 = @intCast(io.monotonicMilliseconds());
     const shutdown_deadline = shutdown_ptr.load(.monotonic);
-    if (shutdown_deadline != 0 and now >= shutdown_deadline) return true;
 
     const req_ptr: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
-    if (req_ptr.load(.monotonic) != 0) return true;
 
     const deadline_ptr: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     const budget_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
     const deadline = deadline_ptr.load(.monotonic);
     const budget_deadline = budget_ptr.load(.monotonic);
-    if ((deadline != 0 and now >= deadline) or (budget_deadline != 0 and now >= budget_deadline)) return true;
+    const terminate = (shutdown_deadline != 0 and now >= shutdown_deadline) or
+        req_ptr.load(.monotonic) != 0 or
+        (deadline != 0 and now >= deadline) or
+        (budget_deadline != 0 and now >= budget_deadline);
 
     // Dynamically adjust watchdog period if an active deadline is sooner than the default 50ms interval.
     var next_period: f64 = watchdog_period_seconds;
@@ -65,8 +66,8 @@ fn jscShouldTerminate(ctx: jsc.JSContextRef, context: ?*anyopaque) callconv(.c) 
     if (deadline != 0 and deadline < earliest) earliest = deadline;
     if (budget_deadline != 0 and budget_deadline < earliest) earliest = budget_deadline;
     if (shutdown_deadline != 0 and shutdown_deadline < earliest) earliest = shutdown_deadline;
-    if (earliest != std.math.maxInt(u64) and earliest > now) {
-        const remaining_sec = @as(f64, @floatFromInt(earliest - now)) / 1000.0;
+    if (earliest != std.math.maxInt(u64)) {
+        const remaining_sec = @as(f64, @floatFromInt(earliest -| now)) / 1000.0;
         if (remaining_sec < next_period) {
             next_period = @max(remaining_sec, 0.005);
         }
@@ -75,10 +76,10 @@ fn jscShouldTerminate(ctx: jsc.JSContextRef, context: ?*anyopaque) callconv(.c) 
     const group = jsc.JSContextGetGroup(ctx);
     JSContextGroupSetExecutionTimeLimit(group, next_period, jscShouldTerminate, context);
 
-    if (state.instance_id >= 0) {
+    if (!terminate and state.instance_id >= 0) {
         if (@import("../../inspector/sample_hook.zig").load()) |hook| hook(state.instance_id);
     }
-    return false;
+    return terminate;
 }
 
 /// Install the JSC execution-time-limit callback at the fixed 50ms period.

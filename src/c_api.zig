@@ -246,6 +246,7 @@ test "c_api: packed-alt typed evaluate number + retain/release (real non-primary
 test "c_api: forced packed_alt typed value for the primary backend" {
     // Build EngineInstance.packed_alt for the pack primary without a second real engine.
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
     const timers = @import("runtime/timers.zig");
@@ -332,6 +333,7 @@ test "c_api: forced packed_alt typed value for the primary backend" {
 
 test "c_api: forced packed_alt set/call/construct/new_* for the primary backend" {
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
     const timers = @import("runtime/timers.zig");
@@ -635,6 +637,7 @@ test "c_api: direct register call trampolines call_0 through call_4" {
 
 test "c_api: forced packed_alt to_bool/has/delete/keys/instanceof/json/buffer/new_error" {
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
     const timers = @import("runtime/timers.zig");
@@ -815,6 +818,7 @@ test "c_api: packed-alt to_bool/has/json/buffer when real non-primary packed" {
 
 test "c_api: packed-alt adversarial get exception / bind / empty options / destroy stale" {
     const helpers = @import("tests/test_helpers.zig");
+    try helpers.skipUnlessPrimaryPacked();
     const instance_map = @import("runtime/instance_map.zig");
     const event_loop = @import("js_event_loop");
     const timers = @import("runtime/timers.zig");
@@ -1421,9 +1425,40 @@ test "c_api: engine creation keeps recursion below native stack limits" {
     try std.testing.expectEqualStrings("42", std.mem.span(result));
 }
 
+pub export fn jsbay_engine_destroy_protocol_version() u32 {
+    return 2;
+}
+
+fn ownerDestroyErrorStatus(err: engine.OwnerDestroyError) c_int {
+    return switch (err) {
+        error.InvalidGeneration => 3,
+        error.WrongThread => 4,
+        error.StaleGeneration => 5,
+        error.AlreadyClosing => 6,
+    };
+}
+
+pub export fn jsbay_engine_request_destroy(instance_id: c_int, generation: u64) c_int {
+    return @backingInt(engine.requestDestroy(@intCast(instance_id), generation) catch |err| return ownerDestroyErrorStatus(err));
+}
+
+pub export fn jsbay_engine_drain_destroy(instance_id: c_int, generation: u64) c_int {
+    return @backingInt(engine.drainDestroy(@intCast(instance_id), generation) catch |err| return ownerDestroyErrorStatus(err));
+}
+
+pub export fn jsbay_engine_destroy_status(instance_id: c_int, generation: u64) c_int {
+    return @backingInt(engine.destroyProgress(@intCast(instance_id), generation) catch |err| return ownerDestroyErrorStatus(err));
+}
+
 pub export fn jsbay_engine_destroy(instance_id: c_int) void {
     if (host_wake.isNotifying()) return;
     const id: i32 = @intCast(instance_id);
+    if (@import("runtime/instance_map.zig").ownerDestroyInfo(id)) |info| {
+        if (info.requested) {
+            if (info.on_creator) _ = engine.drainDestroy(id, info.generation) catch {};
+            return;
+        }
+    }
     // Owner-thread destroy is the common path (release values first, then destroy). A non-owner may also destroy: it closes admission and joins teardown so "destroy then Worker.terminate" does not kill an owner still inside run_loop or deferred cleanup. Attached-loop detach stays on the owner when this is the owner thread; destroyRuntime detaches after loop scopes have drained when destroy runs elsewhere.
     if (api_value.isOwner(id)) {
         engine.detachLoop(id);
@@ -4694,5 +4729,20 @@ comptime {
             }
         };
         @export(&fault.trigger, .{ .name = "jsbay_test_trigger_native_fault" });
+        const owner_probe = struct {
+            fn reset() callconv(.c) void {
+                engine.testing.resetOwnerDestroyCounters();
+            }
+            fn read(index: u32) callconv(.c) u64 {
+                return switch (index) {
+                    0 => engine.testing.context_free_calls.load(.seq_cst),
+                    1 => engine.testing.vm_free_calls.load(.seq_cst),
+                    2 => engine.testing.last_vm_free_tid.load(.seq_cst),
+                    else => 0,
+                };
+            }
+        };
+        @export(&owner_probe.reset, .{ .name = "jsbay_test_owner_destroy_reset" });
+        @export(&owner_probe.read, .{ .name = "jsbay_test_owner_destroy_read" });
     }
 }

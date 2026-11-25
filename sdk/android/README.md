@@ -1,5 +1,7 @@
 # JsBay Android SDK
 
+> Lifecycle protocol v2: deploy matching core/JNI/classes and migrate close as described in [owner destruction](../../docs/owner-destruction.md#android-lifecycle-migration). `Engine.close()` is owner-only and may defer; `DedicatedEngineThread.close()` is now nonblocking. Check `closeStatus()` and keep the original owner alive until creator drain completes. A new major SDK release is required for this behavioral migration; no release is published here.
+
 `Engine` and `Value` are owner-thread objects. Close each owned `Value` and
 the engine on the thread that created the engine. Callback arguments are
 borrowed; call `retain()` before keeping one after the callback returns.
@@ -8,7 +10,7 @@ borrowed; call `retain()` before keeping one after the callback returns.
 Do **not** create an `Engine` on the UI/main `Looper` in production: synchronous
 `evaluate` will ANR. Prefer `Engine.createOnBackground(id) { engine -> ... }`,
 which starts a `HandlerThread` named `jsbay-<id>` and runs `ready` on that owner
-thread. Quit the returned thread after `engine.close()` on the owner thread.
+thread. Quit the returned thread only after creator drain reports `CloseStatus.COMPLETE`.
 
 Same-process native crashes still kill the host process; time/memory limits and
 wrong-thread checks are soft failures only. Use a separate `android:process` when
@@ -43,6 +45,10 @@ For a USB-connected device, forward the returned loopback port before opening Ch
 ## Owner thread and multi-instance hosts
 
 Create one `Engine` per instance id on a **dedicated** Looper thread. Do not create engines on the process main/UI thread: automatic LoopDriver attach would schedule JavaScript there and share one thread across many instances.
+
+`requestClose()` / no-argument `close()` request asynchronously; an independent owner task attempts `drainClose()` and only quits its Looper after completion. A pending attempt needs a later retry; `closeStatus()` reports VM progress, not thread-exit proof. A timed-out bounded close remains pending until the original creator can unwind and drain.
+
+`DedicatedEngineThread.lifecycleState` reports `RUNNING`, `CLOSING`, `CLOSED`, or `FAILED`. New `post` and foreign `runOnOwner` admission stops at `CLOSING`; already admitted work and internal creator drain can still finish. `CLOSED` requires native drain completion and exit from the owner Looper. `isClosed` includes `FAILED` as a terminal SDK state, but failure alone does not prove native reclamation: retain `closeStatus()` checks and the original creator requirement. A bounded `close(timeoutMillis)` uses one deadline for drain acknowledgement and thread join; the no-argument overload remains nonblocking.
 
 By default, `new Engine(id)` refuses automatic attach when `Looper.myLooper() == Looper.getMainLooper()` and throws `JsBayException(INVALID_ARGUMENT)`. Opt in only when you intentionally own that risk:
 

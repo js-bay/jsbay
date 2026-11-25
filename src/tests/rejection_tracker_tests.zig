@@ -227,7 +227,15 @@ test "error observer: synchronous evaluation and interrupted timer stay quiet" {
     try helpers.evalErr(id, "throw { marker: 101 };");
     try testing.expectEqual(@as(u32, 0), log.count);
     try helpers.evalOk(id, "setTimeout(function () { throw { marker: 102 }; }, 0);");
-    try testing.expect(c_api.jsbay_engine_request_interrupt(id));
+    const interrupt_accepted = c_api.jsbay_engine_request_interrupt(id);
+    if (comptime backend.isHermesBackend(backend.active_backend) or backend.isEscargotBackend(backend.active_backend)) {
+        // Documented spike contract: requestInterrupt returns false and does not set the mid-script bit.
+        //
+        // A host-defer bit still pauses typed observer reports for this turn.
+        try testing.expect(!interrupt_accepted);
+    } else {
+        try testing.expect(interrupt_accepted);
+    }
     engine.runEventLoopOnce(id);
     try testing.expectEqual(@as(u32, 0), log.count);
     try testing.expect(c_api.jsbay_engine_clear_interrupt(id));
@@ -243,7 +251,8 @@ test "error observer: execution budget cancellation stays quiet for timers and m
         try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_set_error_observer(id, EventCount.handler, &log));
         try helpers.evalOk(id, "globalThis.__budget_started = false; globalThis.__budget_finished = false;");
         try testing.expect(c_api.jsbay_engine_set_execution_budget(id, 10));
-        const source: []const u8 = schedule ++ "(function () { globalThis.__budget_started = true; const end = Date.now() + 100; while (Date.now() < end) {} globalThis.__budget_finished = true; }, 0);";
+        // A finite wall-clock loop can end after the owner is descheduled before its next bytecode interrupt poll. Only budget cancellation may end this workload.
+        const source: []const u8 = schedule ++ "(function () { globalThis.__budget_started = true; while (true) {} globalThis.__budget_finished = true; }, 0);";
         var value: u64 = 0;
         var exception: u64 = 0;
         defer {
@@ -338,6 +347,42 @@ test "error observer: interrupted unhandled rejection is reported after recovery
     try helpers.evalOk(id, "void 0;");
     try testing.expectEqual(@as(u32, 1), log.count);
     try testing.expectEqual(types.ErrorKind.unhandled_rejection, log.kind);
+}
+
+test "execution: expired time limit does not drain an unbounded batch of leftover short jobs" {
+    // Product contract for QJS/NG processPendingJobsImpl: an already-expired
+    // execution deadline must still enter leftover jobs so a queued
+    // `queueMicrotask(() => { while (true) {} })` can be aborted in this turn
+    // (do not delete the existing while(true) tests), but it must not keep
+    // starting new short jobs without bound. This is a drain-boundary test,
+    // not a change to the public time-limit API.
+    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
+    const id = helpers.nextInstanceId();
+    try testing.expect(c_api.jsbay_engine_create(id, null, null));
+    defer c_api.jsbay_engine_destroy(id);
+
+    try helpers.evalOk(id,
+        \\globalThis.n = 0;
+        \\setTimeout(function () {
+        \\  const end = Date.now() + 40;
+        \\  while (Date.now() < end) {}
+        \\}, 0);
+        \\setTimeout(function () {
+        \\  var i = 0;
+        \\  while (i < 10000) {
+        \\    queueMicrotask(function () { globalThis.n = (globalThis.n || 0) + 1; });
+        \\    i++;
+        \\  }
+        \\}, 0);
+    );
+    try testing.expect(c_api.jsbay_engine_set_execution_time_limit(id, 20));
+    engine.runEventLoopOnce(id);
+    // A second turn covers helpers that process only one due macrotask per call.
+    engine.runEventLoopOnce(id);
+    // Clear the limit before the probe eval so a leftover-expired interrupt cannot abort the read. expectEvalEquals captures n during eval, then processPendingJobs may drain any remaining short jobs after the value is already recorded.
+    try testing.expect(c_api.jsbay_engine_set_execution_time_limit(id, 0));
+    try helpers.expectEvalEquals(id, "String(globalThis.n < 100)", "true");
+    try helpers.evalOk(id, "void 0;");
 }
 
 test "error observer: interrupt during a batch preserves unreported rejections" {
@@ -562,4 +607,44 @@ test "rejection: a timer callback that catches its own rejection reports nothing
             try helpers.expectEvalEquals(id, "1+1", "2");
         }
     }.run);
+}
+
+test "rejection tracker: application timers keep delays arguments and identity" {
+    for ([_]bool{ false, true }) |typed| {
+        const id = helpers.nextInstanceId();
+        try testing.expect(c_api.jsbay_engine_create(id, null, null));
+        defer c_api.jsbay_engine_destroy(id);
+        try helpers.evalOk(id,
+            \\globalThis.timerCalls = []; globalThis.timerHits = []; globalThis.timerCleared = [];
+            \\globalThis.setTimeout = function (fn, delay) { timerCalls.push([fn, delay, Array.prototype.slice.call(arguments, 2)]); return 1073741824 + timerCalls.length; };
+            \\globalThis.clearTimeout = function (id) { timerCleared.push(id); };
+            \\globalThis.originalTimer = setTimeout; globalThis.originalClear = clearTimeout;
+        );
+        var legacy = RejectionLog{};
+        var observer = EventCount{};
+        if (typed) {
+            const status = c_api.jsbay_engine_set_error_observer(id, EventCount.handler, &observer);
+            if (backend.active_backend == .jsc) {
+                try testing.expectEqual(@as(c_int, 7), status);
+                continue;
+            }
+            try testing.expectEqual(@as(c_int, 0), status);
+        } else if (!install(id, &legacy)) {
+            try testing.expectEqual(backend.BackendType.jsc, backend.active_backend);
+            continue;
+        }
+        try helpers.evalOk(id,
+            \\function onUnhandled(a, b) { timerHits.push(String(a) + ':' + String(b)); }
+            \\globalThis.firstTimer = setTimeout(onUnhandled.bind(null, 7), 100, 9);
+            \\setTimeout(onUnhandled, 2000, 'two', 'args');
+            \\Promise.reject('private-tracker');
+        );
+        try helpers.expectEvalEquals(id, "String(setTimeout === originalTimer && clearTimeout === originalClear)", "true");
+        try helpers.expectEvalEquals(id, "String(timerCalls.length === 2 && timerHits.length === 0 && timerCalls[0][1] === 100 && timerCalls[1][1] === 2000)", "true");
+        try helpers.expectEvalEquals(id, "String(timerCalls[0][2][0] === 9 && timerCalls[1][2].join(':') === 'two:args')", "true");
+        try helpers.evalOk(id, "timerCalls.forEach(function (v) { v[0].apply(undefined, v[2]); }); clearTimeout(firstTimer);");
+        try helpers.expectEvalEquals(id, "timerHits.join(',')", "7:9,two:args");
+        try helpers.expectEvalEquals(id, "String(timerCleared[0] === firstTimer)", "true");
+        try testing.expectEqual(@as(u32, 1), if (typed) observer.count else legacy.count);
+    }
 }

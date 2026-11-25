@@ -13,14 +13,12 @@ if [[ ! -f "$SRC/CMakeLists.txt" ]]; then
   exit 1
 fi
 
-PATCH="$ROOT/vendor/escargot-debugger.patch"
-if [[ -f "$PATCH" ]]; then
-  if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
-    echo "Escargot debugger patch already applied"
-  else
-    patch -d "$SRC" -p1 --forward --batch < "$PATCH"
-  fi
-fi
+for patch_name in escargot-debugger.patch escargot-default-async.patch escargot-module-bindings.patch escargot-execution-termination.patch; do
+    PATCH="$ROOT/vendor/$patch_name"
+    if ! patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
+        patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+    fi
+done
 
 mkdir -p "$BUILD" "$PREFIX/lib" "$PREFIX/include"
 cmake -S "$SRC" -B "$BUILD" -G Ninja \

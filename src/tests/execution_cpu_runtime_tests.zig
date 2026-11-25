@@ -420,7 +420,10 @@ const YieldProbe = struct {
     valid: std.atomic.Value(bool) = .init(true),
 
     fn waitFor(flag: *const std.atomic.Value(bool)) bool {
-        const deadline = io.monotonicMilliseconds() + 5_000;
+        // Latch for the foreign eval thread, not a product CPU-time SLA.
+        //
+        // The deadline must outlast a 4e6-iteration busy_script plus thread handoff on a slow emulator; it is not a CPU-budget measurement.
+        const deadline = io.monotonicMilliseconds() + 20_000;
         while (!flag.load(.seq_cst)) {
             if (io.monotonicMilliseconds() >= deadline) return false;
             io.sleepMs(1);

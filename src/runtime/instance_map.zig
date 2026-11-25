@@ -3,6 +3,7 @@
 //! Design: The global Mutex protects only the HashMap. All accessors either:
 //! - getPtrs(): copy raw pointers out and release the lock (does not refuse teardown)
 //! - beginControlPlane(): lease ptrs while refusing teardown_pending; destroy waits
+//! - beginLifecycleControlPlane(): same lease, admitted after teardown so stop/destroy can still trigger Hermes interrupts; destroyRuntime still waits on active_control_ops
 //! - withInstance(): hold the lock for a short closure (no JS callbacks inside)
 
 const std = @import("std");
@@ -103,6 +104,21 @@ pub const EngineInstance = struct {
     active_dispatch_tasks: usize = 0,
     /// In-flight cross-thread control-plane ops (suspend/resume/stop/is_suspended). Destroy waits before freeing the Driver.
     active_control_ops: usize = 0,
+    /// OS thread that created the JS runtime/context. Escargot Context is affine to this thread: `delete ctx` on another thread SIGSEGVs even after threadEnter.
+    js_owner_tid: std.Thread.Id = undefined,
+    js_owner_incarnation: u64 = 0,
+    owner_destroy_requested: bool = false,
+    owner_destroy_draining: bool = false,
+    error_observer: ?types.ErrorObserver = null,
+    error_observer_userdata: ?*anyopaque = null,
+    /// Set only after owner (or destroyer) JS teardown has returned, not when cleanup is merely claimed.
+    ///
+    /// Together with `js_teardown_in_progress` this is the wait handshake: destroyers may not `allocator.destroy` the instance until cleanup finishes. This is also the anti-double-free claim after the wait.
+    js_teardown_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Touched only under `dispatch_mutex`. Set before the owner drops the mutex to run `releaseJsResources`, and cleared after that call returns (and after `js_teardown_done` is published).
+    ///
+    /// `waitForControlOps` waits on this as well as `active_control_ops`, so a destroyer that enters wait after the last lease hits zero still cannot proceed during owner cleanup.
+    js_teardown_in_progress: bool = false,
     /// Coalesces concurrent cross-thread post_gc requests before the scheduled run executes.
     gc_state: std.atomic.Value(GcSubmissionState) = std.atomic.Value(GcSubmissionState).init(.idle),
     // Extension points for host apps
@@ -209,6 +225,8 @@ const InstanceMap = std.AutoHashMap(i32, *EngineInstance);
 var instances: InstanceMap = InstanceMap.init(std.heap.c_allocator);
 var mutex: sync.Mutex = .{};
 var next_generation: u64 = 1;
+var next_owner_incarnation: u64 = 1;
+threadlocal var owner_incarnation: u64 = 0;
 
 pub fn insert(instance: *EngineInstance) bool {
     return insertWith(instance, struct {
@@ -226,6 +244,13 @@ pub fn insertWith(instance: *EngineInstance, on_inserted: anytype) bool {
     if (next_generation == 0) return false;
     instance.generation = next_generation;
     next_generation +%= 1;
+    if (owner_incarnation == 0) {
+        if (next_owner_incarnation == 0) return false;
+        owner_incarnation = next_owner_incarnation;
+        next_owner_incarnation +%= 1;
+    }
+    instance.js_owner_tid = std.Thread.getCurrentId();
+    instance.js_owner_incarnation = owner_incarnation;
     instances.put(instance.instance_id, instance) catch return false;
     if (!on_inserted.call(instance)) {
         _ = instances.fetchRemove(instance.instance_id);
@@ -257,6 +282,56 @@ pub fn isDestroyed(instance_id: i32, generation: u64) bool {
     defer mutex.unlock();
     const inst = instances.get(instance_id) orelse return true;
     return inst.generation != generation;
+}
+
+pub const OwnerDestroyError = error{ InvalidGeneration, StaleGeneration, WrongThread, AlreadyClosing };
+pub const OwnerDestroyProgress = enum(c_int) { live = 0, pending = 1, complete = 2 };
+pub const OwnerDestroyClaim = enum { live, pending, complete, ready };
+pub const OwnerDestroyInfo = struct { generation: u64, requested: bool, draining: bool, on_creator: bool };
+
+pub fn ownerDestroyInfo(instance_id: i32) ?OwnerDestroyInfo {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return null;
+    return .{ .generation = inst.generation, .requested = inst.owner_destroy_requested, .draining = inst.owner_destroy_draining, .on_creator = owner_incarnation != 0 and inst.js_owner_incarnation == owner_incarnation and inst.js_owner_tid == std.Thread.getCurrentId() };
+}
+
+pub const OwnerDestroyRequest = struct { progress: OwnerDestroyProgress, lease: ?ControlLease = null };
+
+/// Close admission without transferring VM ownership or allocating a teardown task.
+pub fn requestOwnerDestroy(instance_id: i32, generation: u64) OwnerDestroyError!OwnerDestroyRequest {
+    if (generation == 0) return error.InvalidGeneration;
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return .{ .progress = .complete };
+    if (inst.generation != generation) return error.StaleGeneration;
+    inst.dispatch_mutex.lock();
+    defer inst.dispatch_mutex.unlock();
+    if (inst.owner_destroy_requested) return .{ .progress = .pending };
+    if (inst.teardown_pending or inst.js_teardown_in_progress or inst.js_teardown_done.load(.acquire)) return error.AlreadyClosing;
+    inst.owner_destroy_requested = true;
+    inst.teardown_pending = true;
+    inst.active_control_ops += 1;
+    return .{ .progress = .pending, .lease = .{ .inst = inst, .ptrs = switch (inst.engine_handles) {
+        .mono => |m| .{ .ctx = m.ctx, .loop = inst.loop, .backend_tag = backend.active_backend },
+        .packed_alt => |a| .{ .ctx = @ptrFromInt(0), .loop = inst.loop, .backend_tag = a.tag },
+    } } };
+}
+
+/// Claim only from the creator outside admitted work; never wait on a lease held by the caller.
+pub fn claimOwnerDestroy(instance_id: i32, generation: u64) OwnerDestroyError!OwnerDestroyClaim {
+    if (generation == 0) return error.InvalidGeneration;
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return .complete;
+    if (inst.generation != generation) return error.StaleGeneration;
+    if (owner_incarnation == 0 or inst.js_owner_incarnation != owner_incarnation or inst.js_owner_tid != std.Thread.getCurrentId()) return error.WrongThread;
+    inst.dispatch_mutex.lock();
+    defer inst.dispatch_mutex.unlock();
+    if (!inst.owner_destroy_requested) return .live;
+    if (inst.owner_destroy_draining or inst.active_control_ops != 0 or inst.active_dispatch_tasks != 0 or inst.js_teardown_in_progress) return .pending;
+    inst.owner_destroy_draining = true;
+    return .ready;
 }
 
 pub const InstancePtrs = struct {
@@ -294,10 +369,23 @@ pub const ControlLease = struct {
 };
 
 pub fn beginControlPlane(instance_id: i32) ?ControlLease {
+    return beginControlPlaneInner(instance_id, false);
+}
+
+/// Like `beginControlPlane`, but still admitted after `markTeardownPending`.
+///
+/// Hide/Show and public stop must keep using `beginControlPlane` so they cannot start after admission closes.
+///
+/// Stop/destroy interrupt (`asyncTriggerTimeout`, `watchTimeLimit`, idle drain) must use this lease: `destroyNow` marks teardown first, and `destroyRuntime` already waits on `active_control_ops` before freeing the runtime.
+pub fn beginLifecycleControlPlane(instance_id: i32) ?ControlLease {
+    return beginControlPlaneInner(instance_id, true);
+}
+
+fn beginControlPlaneInner(instance_id: i32, allow_teardown: bool) ?ControlLease {
     mutex.lock();
     defer mutex.unlock();
     const inst = instances.get(instance_id) orelse return null;
-    if (inst.teardown_pending) return null;
+    if (!allow_teardown and inst.teardown_pending) return null;
     inst.dispatch_mutex.lock();
     inst.active_control_ops += 1;
     inst.dispatch_mutex.unlock();
@@ -318,23 +406,48 @@ pub fn endControlPlane(inst: *EngineInstance) void {
     inst.dispatch_mutex.lock();
     std.debug.assert(inst.active_control_ops != 0);
     inst.active_control_ops -= 1;
-    inst.dispatch_wake.broadcast();
+    const last = inst.active_control_ops == 0;
+    // Escargot: if this last lease is dropped on the JS owner thread after
+    // teardown started, free the Context here *before* waking destroyRuntime.
+    // The crash test holds the reservation on the creator thread, drops it,
+    // then join()s the foreign destroyer — hopping delete after join starts
+    // would deadlock, and threadEnter on the destroyer is not enough.
+    const owner_js = (comptime backend.isEscargotBackend(backend.active_backend)) and last and inst.teardown_pending and !inst.owner_destroy_requested and inst.js_owner_tid == std.Thread.getCurrentId() and !inst.js_teardown_done.load(.acquire);
+    if (!owner_js) {
+        inst.dispatch_wake.broadcast();
+        inst.dispatch_mutex.unlock();
+        return;
+    }
+    // Publish in-progress under the same lock as the decrement so a late waitForControlOps cannot observe ops==0 with cleanup not yet started (and must not observe in_progress==false before cleanup returns).
+    inst.js_teardown_in_progress = true;
     inst.dispatch_mutex.unlock();
+    defer {
+        inst.dispatch_mutex.lock();
+        inst.js_teardown_in_progress = false;
+        inst.dispatch_wake.broadcast();
+        inst.dispatch_mutex.unlock();
+    }
+    @import("../engine.zig").finishOwnerThreadJsTeardown(inst.instance_id);
 }
 
-/// Wait until control-plane leases admitted before teardown have completed. Instance stays in the map until this returns.
+/// Wait until control-plane leases admitted before teardown have completed, and until any owner JS cleanup started on last-lease drop has returned.
+///
+/// The instance stays in the map until this returns.
 pub fn waitForControlOps(instance_id: i32) void {
+    if (comptime @import("builtin").is_test) testing.parkBeforeWaitIfHooked();
     mutex.lock();
     const inst = instances.get(instance_id) orelse {
         mutex.unlock();
+        if (comptime @import("builtin").is_test) testing.markWaitReturnedIfHooked();
         return;
     };
     mutex.unlock();
     inst.dispatch_mutex.lock();
-    while (inst.active_control_ops != 0) {
+    while (inst.active_control_ops != 0 or inst.js_teardown_in_progress) {
         inst.dispatch_wake.wait(&inst.dispatch_mutex);
     }
     inst.dispatch_mutex.unlock();
+    if (comptime @import("builtin").is_test) testing.markWaitReturnedIfHooked();
 }
 
 /// Return the EngineInstance pointer for the given id, or null if missing. The pointer is stable between insert and remove; callers that need to mutate shared state on the instance must use their own synchronisation (e.g. RefBookkeeping.mutex for the ref list).
@@ -349,6 +462,9 @@ pub fn markTeardownPending(instance_id: i32) void {
     mutex.lock();
     defer mutex.unlock();
     const inst = instances.get(instance_id) orelse return;
+    // Admission readers hold the registry mutex; owner lease release reads this flag under dispatch_mutex. Writers hold both in registry-to-dispatch order.
+    inst.dispatch_mutex.lock();
+    defer inst.dispatch_mutex.unlock();
     inst.teardown_pending = true;
 }
 
@@ -456,3 +572,84 @@ pub fn findByContextAddr(ctx_addr: usize) ?i32 {
 pub fn instanceIdFromCtx(ctx: ActiveEngine.Context) i32 {
     return ActiveEngine.instanceIdFromCtx(ctx);
 }
+
+pub const testing = if (@import("builtin").is_test) struct {
+    /// Deterministic overlap barrier for last-lease owner JS teardown vs a destroyer that has marked teardown but has not yet entered `waitForControlOps`.
+    pub const Gate = struct {
+        mutex: sync.Mutex = .{},
+        cond: sync.Condition = .init,
+        arrived: bool = false,
+        allowed: bool = false,
+
+        pub fn deinit(self: *Gate) void {
+            self.cond.deinit();
+            self.mutex.deinit();
+        }
+
+        pub fn arriveAndWait(self: *Gate) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.arrived = true;
+            self.cond.broadcast();
+            while (!self.allowed) self.cond.wait(&self.mutex);
+        }
+
+        pub fn signalArrived(self: *Gate) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.arrived = true;
+            self.cond.broadcast();
+        }
+
+        pub fn waitArrived(self: *Gate) error{Timeout}!void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            while (!self.arrived) {
+                if (self.cond.waitTimeout(&self.mutex, 8_000) == .timed_out and !self.arrived) return error.Timeout;
+            }
+        }
+
+        pub fn allow(self: *Gate) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.allowed = true;
+            self.cond.broadcast();
+        }
+    };
+
+    pub const TeardownOverlapHook = struct {
+        before_wait: Gate = .{},
+        cleanup: Gate = .{},
+        entered_gate: Gate = .{},
+        entered_wait: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        wait_returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        pub fn deinit(self: *TeardownOverlapHook) void {
+            self.before_wait.deinit();
+            self.cleanup.deinit();
+            self.entered_gate.deinit();
+        }
+    };
+
+    var overlap_hook: ?*TeardownOverlapHook = null;
+
+    pub fn installTeardownOverlapHook(hook: ?*TeardownOverlapHook) void {
+        overlap_hook = hook;
+    }
+
+    pub fn parkBeforeWaitIfHooked() void {
+        if (overlap_hook) |h| {
+            h.before_wait.arriveAndWait();
+            h.entered_wait.store(true, .release);
+            h.entered_gate.signalArrived();
+        }
+    }
+
+    pub fn markWaitReturnedIfHooked() void {
+        if (overlap_hook) |h| h.wait_returned.store(true, .release);
+    }
+
+    pub fn parkOwnerCleanupIfHooked() void {
+        if (overlap_hook) |h| h.cleanup.arriveAndWait();
+    }
+} else struct {};

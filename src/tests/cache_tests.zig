@@ -369,3 +369,67 @@ test "cache: repeated fresh writes leave valid artifacts, no stray temp names" {
         }
     }.run);
 }
+
+/// Keep legal HBC magic and layout; retarget only the version field to a
+/// different value read from this same-pin artifact (never a hard-coded 96 or 100).
+fn retargetHbcVersionInArtifacts(rel_dir: []const u8) !usize {
+    const kHbcMagic: u64 = 0x1F1903C103BC1FC6;
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(testing.io, rel_dir, .{ .iterate = true }) catch return error.NoCacheDir;
+    defer dir.close(testing.io);
+    var n: usize = 0;
+    var it = dir.iterate();
+    while (it.next(testing.io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".bc")) continue;
+        const data = try dir.readFileAlloc(testing.io, entry.name, testing.allocator, .limited(8 * 1024 * 1024));
+        defer testing.allocator.free(data);
+        if (data.len < 12) return error.HeaderTooShort;
+        const magic = std.mem.readInt(u64, data[0..8], .little);
+        if (magic != kHbcMagic) return error.NotHbcMagic;
+        const compiled_version = std.mem.readInt(u32, data[8..12], .little);
+        std.mem.writeInt(u32, data[8..12], compiled_version +% 1, .little);
+        if (std.mem.readInt(u32, data[8..12], .little) == compiled_version) return error.VersionUnchanged;
+        dir.writeFile(testing.io, .{ .sub_path = entry.name, .data = data }) catch return error.WriteFailed;
+        n += 1;
+    }
+    return n;
+}
+
+test "cache: Hermes same-pin HBC version mismatch rebuilds once and runs side effects exactly once more" {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return error.SkipZigTest;
+
+    const abs = try makeCacheDir(testing.allocator);
+    defer cleanCacheDir(testing.allocator, abs);
+
+    try helpers.withDefaultEngine(struct {
+        fn run(id: i32) !void {
+            const src = bigScript("globalThis.__mismatchCount__ = (globalThis.__mismatchCount__||0)+1; ");
+            const c1 = cache.evalCached(id, &src, "hbc-version.js", g_cache_dir, kVersion);
+            defer freeCached(testing.allocator, c1);
+            try testing.expect(c1.err == null);
+            try testing.expect(!c1.cache_hit);
+            try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__mismatchCount__"));
+            try testing.expectEqual(@as(usize, 1), fileCount(g_cache_dir));
+
+            try testing.expectEqual(@as(usize, 1), try retargetHbcVersionInArtifacts(g_cache_dir));
+            try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__mismatchCount__"));
+
+            const c2 = cache.evalCached(id, &src, "hbc-version.js", g_cache_dir, kVersion);
+            defer freeCached(testing.allocator, c2);
+            try testing.expect(c2.err == null);
+            try testing.expect(!c2.cache_hit);
+            // Stale bytes must not have executed (that would make the count 2 before rebuild, then 3).
+            //
+            // decode_failed → delete → compile → run source once more.
+            try testing.expectEqual(@as(i64, 2), try helpers.evalInt(id, "globalThis.__mismatchCount__"));
+
+            const c3 = cache.evalCached(id, &src, "hbc-version.js", g_cache_dir, kVersion);
+            defer freeCached(testing.allocator, c3);
+            try testing.expect(c3.err == null);
+            try testing.expect(c3.cache_hit);
+            // A cache hit re-executes the payload (see cold-write test comment).
+            try testing.expectEqual(@as(i64, 3), try helpers.evalInt(id, "globalThis.__mismatchCount__"));
+        }
+    }.run);
+}

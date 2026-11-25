@@ -56,13 +56,21 @@ if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
 else
   patch -d "$SRC" -p1 --forward --batch < "$PATCH"
 fi
+PATCH="$ROOT/vendor/hermes-rejection-timers.patch"
+if ! patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
+  patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+fi
+# libicuuc.so.73 DT_NEEDED libicudata.so.73 is not transitive through RUNPATH of libhermesvm.so. Without -rpath-link, linking tools such as bin/hdb fails with "libicudata.so.73 ... not found" / undefined `icudt73_dat`.
+ICU_LINK_FLAGS="-Wl,-rpath-link,${ICU}/lib -Wl,-rpath,${ICU}/lib"
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$PREFIX" \
   -DHERMES_ENABLE_TEST=OFF \
   -DHERMES_ENABLE_DEBUGGER=ON \
   -DICU_ROOT="$ICU" \
-  -DCMAKE_PREFIX_PATH="$ICU"
+  -DCMAKE_PREFIX_PATH="$ICU" \
+  -DCMAKE_EXE_LINKER_FLAGS="${CMAKE_EXE_LINKER_FLAGS:-} ${ICU_LINK_FLAGS}" \
+  -DCMAKE_SHARED_LINKER_FLAGS="${CMAKE_SHARED_LINKER_FLAGS:-} ${ICU_LINK_FLAGS}"
 ninja -C "$BUILD" -j"$JOBS"
 ninja -C "$BUILD" install
 
@@ -78,6 +86,11 @@ cp -f "$JSI_LIB" "$PREFIX/lib/"
 
 : "${CXX:=g++}"
 export JSBAY_ICU_LIB_DIR="${JSBAY_ICU_LIB_DIR:-$ICU/lib}"
+# hermes::compileJS (in-process .hbc) — required so the public bytecode ABI
+# works without a hermesc binary (Android / any host without JSBAY_HERMESC).
+# shellcheck disable=SC1091
+source "$ROOT/scripts/hermes-compilejs-libs.sh"
+mapfile -t HERMES_COMPILEJS_LIBS < <(hermes_compilejs_static_libs "$BUILD")
 "$CXX" -DHERMES_ENABLE_DEBUGGER -shared -fPIC -std=c++17 -O0 -g \
   -I "$ROOT/src/backend/hermes" -I "$PREFIX/include" \
   -L "$PREFIX/lib" -L "$JSBAY_ICU_LIB_DIR" \
@@ -85,6 +98,7 @@ export JSBAY_ICU_LIB_DIR="${JSBAY_ICU_LIB_DIR:-$ICU/lib}"
   -o "$PREFIX/lib/libhermes_bridge.so" \
   "$ROOT/src/backend/hermes/hermes_bridge.cpp" "$ROOT/src/backend/hermes/hermes_esm.cpp" \
   "$ROOT/src/backend/hermes/hermes_inspector.cpp" \
+  "${HERMES_COMPILEJS_LIBS[@]}" \
   -lhermesvm -ljsi -lgcc_s
 
 bash "$ROOT/scripts/native-prefix-stamp.sh" hermes write "$PREFIX"

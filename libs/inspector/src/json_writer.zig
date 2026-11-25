@@ -113,11 +113,30 @@ pub fn Module(comptime Host: type) type {
             code: i32,
             message: []const u8,
         ) void {
+            sendErrorWithData(state, session_id, request_id, code, message, null);
+        }
+
+        /// Optional `data` is a JSON string value on the error object (e.g. "cycle"
+        /// vs "depth"). The user-facing `message` is unchanged so existing CDP
+        /// clients keep working; tests can distinguish ByValueCycle from ByValueDepth
+        /// without relying on the shared "Object reference chain is too long" text.
+        pub fn sendErrorWithData(
+            state: *InspectorState,
+            session_id: transport_mod.SessionId,
+            request_id: i64,
+            code: i32,
+            message: []const u8,
+            data: ?[]const u8,
+        ) void {
             var aw: std.Io.Writer.Allocating = .init(state.allocator);
             defer aw.deinit();
             const w = &aw.writer;
             w.print("{{\"id\":{d},\"error\":{{\"code\":{d},\"message\":", .{ request_id, code }) catch return;
             writeJsonString(w, message) catch return;
+            if (data) |d| {
+                w.writeAll(",\"data\":") catch return;
+                writeJsonString(w, d) catch return;
+            }
             w.writeAll("}}") catch return;
             sendJson(state, session_id, aw.written());
         }

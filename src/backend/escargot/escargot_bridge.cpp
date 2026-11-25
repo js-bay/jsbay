@@ -13,6 +13,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <pthread.h>
 
 using namespace Escargot;
 
@@ -88,10 +89,16 @@ struct EscargotContextOpaque {
     struct PendingRejection {
         ValueRef *promise = nullptr; // retained via protect map
         ValueRef *reason = nullptr;
+        bool handled = false;
+        bool reported = false;
+        bool canceled = false;
     };
     std::mutex rejection_mu;
     std::vector<PendingRejection> pending_rejections;
     using RejectionTrackerFn = void (*)(int32_t, bool, const char *, size_t, void *);
+    EscargotErrorObserverFn error_observer = nullptr;
+    EscargotShouldDeferFn defer_observer = nullptr;
+    std::vector<PendingRejection> *flushing_batch = nullptr;
     RejectionTrackerFn rejection_fn = nullptr;
     void *rejection_userdata = nullptr;
     int32_t rejection_instance_id = 0;
@@ -320,39 +327,33 @@ static void onPromiseRejectCallback(ExecutionStateRef *state, PromiseObjectRef *
                                     VMInstanceRef::PromiseRejectEvent event) {
     if (!state || !promise) return;
     EscargotContextOpaque *c = lookupCtx(state->context());
-    if (!c) return;
-    std::unique_lock<std::mutex> lock(c->rejection_mu);
-    if (event == VMInstanceRef::PromiseRejectWithNoHandler) {
-        ValueRef *p = static_cast<ValueRef *>(promise);
-        ValueRef *r = value ? value : ValueRef::createUndefined();
-        retain(c, p);
-        retain(c, r);
-        c->pending_rejections.push_back({p, r});
-        return;
-    }
+    if (!c || (!c->rejection_fn && !c->error_observer)) return;
+    std::lock_guard<std::mutex> lock(c->rejection_mu);
+    ValueRef *p = static_cast<ValueRef *>(promise);
+    ValueRef *r = value ? value : ValueRef::createUndefined();
     if (event == VMInstanceRef::PromiseHandlerAddedAfterReject) {
-        ValueRef *p = static_cast<ValueRef *>(promise);
-        for (size_t i = 0; i < c->pending_rejections.size(); ++i) {
-            if (c->pending_rejections[i].promise == p) {
-                release(c, c->pending_rejections[i].promise);
-                release(c, c->pending_rejections[i].reason);
-                c->pending_rejections.erase(c->pending_rejections.begin() + static_cast<std::ptrdiff_t>(i));
-                return; // caught before flush — stay quiet
+        for (auto it = c->pending_rejections.begin(); it != c->pending_rejections.end(); ++it) {
+            if (it->promise == p && !it->handled) {
+                release(c, it->promise);
+                release(c, it->reason);
+                c->pending_rejections.erase(it);
+                return;
             }
         }
-        EscargotContextOpaque::RejectionTrackerFn fn = c->rejection_fn;
-        int32_t id = c->rejection_instance_id;
-        void *ud = c->rejection_userdata;
-        ValueRef *r = value ? value : ValueRef::createUndefined();
-        std::string reason_text;
-        if (fn) {
-            StringRef *s = r->toStringWithoutException(c->ctx.get());
-            if (s) reason_text = s->toStdUTF8String();
-            lock.unlock();
-            fn(id, true, reason_text.data(), reason_text.size(), ud);
+        if (c->flushing_batch) {
+            for (auto &item : *c->flushing_batch) {
+                if (item.promise == p && !item.reported) {
+                    item.canceled = true;
+                    return;
+                }
+            }
         }
+    } else if (event != VMInstanceRef::PromiseRejectWithNoHandler) {
         return;
     }
+    retain(c, p);
+    retain(c, r);
+    c->pending_rejections.push_back({p, r, event == VMInstanceRef::PromiseHandlerAddedAfterReject});
 }
 
 static void flushPendingRejections(EscargotContextOpaque *c) {
@@ -362,16 +363,29 @@ static void flushPendingRejections(EscargotContextOpaque *c) {
     {
         std::lock_guard<std::mutex> lock(c->rejection_mu);
         queued.swap(c->pending_rejections);
+        c->flushing_batch = &queued;
     }
-    for (auto &item : queued) {
-        dispatchRejection(c, false, item.reason);
+    size_t index = 0;
+    for (; index < queued.size(); ++index) {
+        auto &item = queued[index];
+        if (!item.canceled) {
+            if (c->defer_observer && c->defer_observer(c->rejection_instance_id)) break;
+            item.reported = true;
+            if (c->error_observer && !c->error_observer(c->rejection_instance_id, item.handled ? 2 : 1, item.promise, item.reason, nullptr)) {
+                item.reported = false;
+                break;
+            }
+            dispatchRejection(c, item.handled, item.reason);
+        }
         release(c, item.promise);
         release(c, item.reason);
+        item.promise = nullptr;
+        item.reason = nullptr;
     }
-    // Drop anything queued re-entrantly during dispatch without another convert loop.
     {
         std::lock_guard<std::mutex> lock(c->rejection_mu);
-        clearPendingRejectionsLocked(c);
+        c->flushing_batch = nullptr;
+        c->pending_rejections.insert(c->pending_rejections.begin(), queued.begin() + static_cast<std::ptrdiff_t>(index), queued.end());
     }
     c->flushing_rejections = false;
 }
@@ -380,8 +394,18 @@ extern "C" void escargot_globals_ensure(void) { ensureGlobals(); }
 
 // Depth of nested enter/leave on this OS thread. Threaded Escargot keeps TLS/GC state per thread; runtime_new enters so VMInstanceRef::create is safe on any caller thread, and runtime_free leaves once the VM is destroyed. engine_thread also enter/leaves.
 static thread_local int g_escargot_thread_depth = 0;
+static void escargotTrace(const char *msg) {
+    const char *e = std::getenv("JSBAY_ESCARGOT_TRACE");
+    if (!e || !*e) return;
+    fprintf(stderr, "escargot-trace tid=%lu %s\n", (unsigned long)pthread_self(), msg);
+    fflush(stderr);
+}
+
 
 extern "C" void escargot_thread_enter(void) {
+    // A no-op lifecycle call can enter before the first runtime exists; per-thread initialization requires process globals first.
+    ensureGlobals();
+    escargotTrace("thread_enter");
     // ENABLE_THREADING: g_globalsInited is thread_local; each OS thread that touches Escargot must initializeThread (Shell/cctest pattern). No-op when vendor is non-threaded (supportsThreading()==false).
     if (!Globals::supportsThreading()) return;
     if (g_escargot_thread_depth == 0 && !Globals::isInitialized()) {
@@ -391,6 +415,7 @@ extern "C" void escargot_thread_enter(void) {
 }
 
 extern "C" void escargot_thread_leave(void) {
+    escargotTrace("thread_leave");
     if (!Globals::supportsThreading()) return;
     if (g_escargot_thread_depth <= 0) return;
     if (--g_escargot_thread_depth == 0 && Globals::isInitialized()) {
@@ -418,6 +443,7 @@ extern "C" EscargotRuntime *escargot_runtime_new(void) {
 }
 
 extern "C" void escargot_runtime_free(EscargotRuntime *rt) {
+    escargotTrace("runtime_free");
     if (!rt) return;
     // Destroy the VM while this thread's Escargot TLS/GC is still initialized.
     delete rt;
@@ -462,10 +488,15 @@ extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
 }
 
 extern "C" void escargot_context_free(EscargotContext *ctx) {
+    if (ctx && ctx->rt && ctx->rt->vm.get()) ctx->rt->vm.get()->setExecutionTerminationCallback(nullptr, nullptr);
+    escargotTrace("context_free");
     if (!ctx) return;
 #ifdef ESCARGOT_DEBUGGER
+    escargotTrace("context_free debugger_detach");
     escargot_debugger_detach(ctx);
+    escargotTrace("context_free debugger_detach done");
 #endif
+    escargotTrace("context_free clear pending");
     ctx->pending_throw.clear();
     ctx->pending_throw_set = false;
     if (ctx->pending_throw_value) {
@@ -491,8 +522,11 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
         ctx->protect.clear();
     }
     // Drop PersistentRefs then GC so BackingStore deleters can run.
+    escargotTrace("context_free gc1");
     Memory::gc();
+    escargotTrace("context_free gc2");
     Memory::gc();
+    escargotTrace("context_free gc done");
     // Force any remaining no-copy buffer finalizers (engine teardown contract).
     std::vector<NoCopyPack *> leftover;
     {
@@ -521,6 +555,7 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
         std::lock_guard<std::mutex> lock(ctx->finals_mu);
         leftover_finals.swap(ctx->pending_finals);
     }
+    escargotTrace("context_free finals");
     for (auto *pf : leftover_finals) {
         if (!pf) continue;
         if (!pf->fired) {
@@ -530,11 +565,21 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
         delete pf;
     }
 
+    escargotTrace("context_free delete ctx");
     delete ctx;
+    escargotTrace("context_free done");
 }
 
+extern "C" bool jsbay_escargot_should_terminate_execution(int32_t instance_id);
+
 extern "C" void escargot_context_set_opaque(EscargotContext *ctx, void *opaque) {
-    if (ctx) ctx->opaque = opaque;
+    if (!ctx) return;
+    ctx->opaque = opaque;
+    ctx->rt->vm.get()->setExecutionTerminationCallback([](void *raw) -> bool {
+        auto *context = static_cast<EscargotContext *>(raw);
+        const auto id = static_cast<int32_t>(reinterpret_cast<uintptr_t>(context->opaque) & 0xffffffffu);
+        return id != 0 && jsbay_escargot_should_terminate_execution(id);
+    }, ctx);
 }
 extern "C" void *escargot_context_get_opaque(EscargotContext *ctx) {
     return ctx ? ctx->opaque : nullptr;
@@ -621,44 +666,57 @@ extern "C" bool escargot_debugger_location_is_breakpoint_target(EscargotContext 
 
 extern "C" EscargotValue escargot_debugger_scope(EscargotContext *ctx, int frame, int scope_index) {
     if (!ctx || !ctx->debug_operations || frame < 0 || scope_index < 0) return nullptr;
-    DebuggerOperationsRef::DebuggerStackTraceDataVector stack;
-    ctx->debug_operations->getStackTrace(stack);
-    if (static_cast<size_t>(frame) >= stack.size() || stack[frame].depth == SIZE_MAX) return nullptr;
-    const uint32_t state_index = static_cast<uint32_t>(stack[frame].depth);
-    DebuggerOperationsRef::LexicalScopeChainVector kinds;
-    ctx->debug_operations->getLexicalScopeChain(state_index, kinds);
-    auto *state = ctx->debug_operations->executionState();
-    auto *object = ObjectRef::create(state, nullptr);
-    for (size_t reverse = kinds.size(); reverse > 0; --reverse) {
-        const uint32_t index = static_cast<uint32_t>(reverse - 1);
-        const auto kind = kinds[index];
-        bool seen_function = false;
-        for (uint32_t prior = 0; prior < index; ++prior) {
-            if (kinds[prior] == DebuggerOperationsRef::FUNCTION_ENVIRONMENT) {
-                seen_function = true;
-                break;
+    struct ScopePack {
+        EscargotContext *ctx;
+        int frame;
+        int scope_index;
+    } pack{ctx, frame, scope_index};
+    // Reading a global or object scope can execute accessor code; contain its termination before returning to the host.
+    const auto scoped = Evaluator::execute(ctx->ctx.get(), [](ExecutionStateRef *, ScopePack *p) -> ValueRef * {
+        auto *ctx = p->ctx;
+        const int frame = p->frame;
+        const int scope_index = p->scope_index;
+        DebuggerOperationsRef::DebuggerStackTraceDataVector stack;
+        ctx->debug_operations->getStackTrace(stack);
+        if (static_cast<size_t>(frame) >= stack.size() || stack[frame].depth == SIZE_MAX) return nullptr;
+        const uint32_t state_index = static_cast<uint32_t>(stack[frame].depth);
+        DebuggerOperationsRef::LexicalScopeChainVector kinds;
+        ctx->debug_operations->getLexicalScopeChain(state_index, kinds);
+        auto *state = ctx->debug_operations->executionState();
+        auto *object = ObjectRef::create(state, nullptr);
+        for (size_t reverse = kinds.size(); reverse > 0; --reverse) {
+            const uint32_t index = static_cast<uint32_t>(reverse - 1);
+            const auto kind = kinds[index];
+            bool seen_function = false;
+            for (uint32_t prior = 0; prior < index; ++prior) {
+                if (kinds[prior] == DebuggerOperationsRef::FUNCTION_ENVIRONMENT) {
+                    seen_function = true;
+                    break;
+                }
             }
-        }
-        bool include = false;
-        if (scope_index == 0) {
-            include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && !seen_function;
-        } else if (scope_index == 1) {
-            include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && seen_function;
-        } else if (scope_index == 2) {
-            include = kind == DebuggerOperationsRef::GLOBAL_ENVIRONMENT;
-        }
-        if (include) {
-            const auto properties = ctx->debug_operations->getLexicalScopeChainProperties(state_index, index);
-            for (size_t property_index = 0; property_index < properties.size(); ++property_index) {
-                const auto &property = properties[property_index];
-                if (property.key && property.value.hasValue()) {
-                    // Walk outward-to-inward so inner bindings replace outer ones.
-                    object->defineDataProperty(state, property.key, const_cast<ValueRef *>(property.value.value()), true, true, true);
+            bool include = false;
+            if (scope_index == 0) {
+                include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && !seen_function;
+            } else if (scope_index == 1) {
+                include = kind != DebuggerOperationsRef::GLOBAL_ENVIRONMENT && seen_function;
+            } else if (scope_index == 2) {
+                include = kind == DebuggerOperationsRef::GLOBAL_ENVIRONMENT;
+            }
+            if (include) {
+                const auto properties = ctx->debug_operations->getLexicalScopeChainProperties(state_index, index);
+                for (size_t property_index = 0; property_index < properties.size(); ++property_index) {
+                    const auto &property = properties[property_index];
+                    if (property.key && property.value.hasValue()) {
+                        // Walk outward-to-inward so inner bindings replace outer ones.
+                        object->defineDataProperty(state, property.key, const_cast<ValueRef *>(property.value.value()), true, true, true);
+                    }
                 }
             }
         }
-    }
-    return retain(ctx, object);
+        return object;
+    }, &pack);
+    if (!scoped.isSuccessful()) return nullptr;
+    return retain(ctx, scoped.result);
 }
 
 extern "C" EscargotValue escargot_debugger_this(EscargotContext *ctx, int frame) {
@@ -679,7 +737,16 @@ extern "C" EscargotValue escargot_debugger_eval_frame(EscargotContext *ctx, int 
         return nullptr;
     }
     ValueRef *exception = nullptr;
-    ValueRef *result = ctx->debug_operations->evalValue(StringRef::createFromUTF8(expr, expr_len), exception);
+    struct EvalPack {
+        EscargotContext *ctx;
+        StringRef *expression;
+        ValueRef **exception;
+    } pack{ctx, StringRef::createFromUTF8(expr, expr_len), &exception};
+    const auto evaluated = Evaluator::execute(ctx->ctx.get(), [](ExecutionStateRef *, EvalPack *p) -> ValueRef * {
+        return p->ctx->debug_operations->evalValue(p->expression, *p->exception);
+    }, &pack);
+    if (evaluated.wasTerminated) return nullptr;
+    ValueRef *result = evaluated.result;
     if (exception) {
         if (out_exception) *out_exception = retain(ctx, exception);
         return nullptr;
@@ -706,6 +773,7 @@ extern "C" EscargotValue escargot_debugger_eval_frame(EscargotContext *, int, co
 
 extern "C" EscargotEvalResult escargot_eval(EscargotContext *c, const char *src, size_t src_len,
                                             const char *filename, size_t filename_len) {
+    escargotTrace("eval");
     EscargotEvalResult out{};
     if (!c || !c->ctx.get() || !src) {
         escargotEvalSetErrStr(out, "invalid context");
@@ -816,9 +884,9 @@ extern "C" bool escargot_is_function(EscargotContext *, EscargotValue v) {
     return v && (asVal(v)->isFunctionObject() || asVal(v)->isCallable());
 }
 
+// ES IsConstructor: use ValueRef::isConstructible so Proxy/BoundFunction with [[Construct]] are reported without reading `prototype` (a get trap may throw). FunctionObject-only checks miss constructible Proxies.
 extern "C" bool escargot_is_constructor(EscargotContext *, EscargotValue v) {
-    if (!v || !asVal(v)->isFunctionObject()) return false;
-    return asVal(v)->asFunctionObject()->isConstructor();
+    return v && asVal(v)->isConstructible();
 }
 
 // ECMAScript ToBoolean. Objects/symbols are always true; 0/NaN/-0, "", 0n, null, undefined are false.
@@ -1071,14 +1139,31 @@ extern "C" void escargot_set_rejection_tracker(EscargotContext *c, int32_t insta
     if (!fn) {
         c->rejection_fn = nullptr;
         c->rejection_userdata = nullptr;
-        c->rejection_instance_id = 0;
-        clearPendingRejectionsLocked(c);
+        if (!c->error_observer) {
+            c->rejection_instance_id = 0;
+            clearPendingRejectionsLocked(c);
+        }
         return;
     }
     c->rejection_fn = fn;
     c->rejection_userdata = userdata;
     c->rejection_instance_id = instance_id;
     if (!c->rejection_hook_on_vm && c->rt && c->rt->vm.get()) {
+        c->rt->vm.get()->registerPromiseRejectCallback(&onPromiseRejectCallback);
+        c->rejection_hook_on_vm = true;
+    }
+}
+
+
+extern "C" void escargot_set_error_observer(EscargotContext *c, int32_t instance_id,
+                                             EscargotErrorObserverFn observer, EscargotShouldDeferFn should_defer) {
+    if (!c) return;
+    std::lock_guard<std::mutex> lock(c->rejection_mu);
+    c->error_observer = observer;
+    c->defer_observer = should_defer;
+    c->rejection_instance_id = instance_id;
+    if (!observer && !c->rejection_fn) clearPendingRejectionsLocked(c);
+    if (observer && !c->rejection_hook_on_vm && c->rt && c->rt->vm.get()) {
         c->rt->vm.get()->registerPromiseRejectCallback(&onPromiseRejectCallback);
         c->rejection_hook_on_vm = true;
     }
@@ -1949,7 +2034,8 @@ extern "C" EscargotValue escargot_new_error(EscargotContext *c, int kind, const 
 
 static EscargotOpResult opFail(EscargotContextOpaque *c, ValueRef *exc) {
     EscargotOpResult out{nullptr, nullptr};
-    if (exc) out.exception = retain(c, exc);
+    // A null ValueRef is the undefined sentinel. `throw undefined` must still produce a non-null exception handle so Zig result APIs do not treat it as "no throw".
+    out.exception = retain(c, exc ? exc : ValueRef::createUndefined());
     return out;
 }
 static EscargotOpResult opOk(EscargotContextOpaque *c, ValueRef *v) {
@@ -1959,7 +2045,7 @@ static EscargotOpResult opOk(EscargotContextOpaque *c, ValueRef *v) {
 }
 static EscargotBoolOpResult boolFail(EscargotContextOpaque *c, ValueRef *exc) {
     EscargotBoolOpResult out{false, nullptr};
-    if (exc) out.exception = retain(c, exc);
+    out.exception = retain(c, exc ? exc : ValueRef::createUndefined());
     return out;
 }
 static EscargotBoolOpResult boolOk(bool v) {
@@ -2722,11 +2808,13 @@ extern "C" void escargot_uninstall_module_loader(EscargotContext *ctx) {
 static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *source,
                                            StringRef *fname, const std::string &cache_key) {
     EscargotEvalResult out{};
+    escargotTrace("initializeScript module");
     auto parsed = c->ctx.get()->scriptParser()->initializeScript(source, fname, true);
     if (!parsed.isSuccessful()) {
         std::string __em;
         if (auto *__sr = parsed.parseErrorMessage) __em = __sr->toStdUTF8String();
         if (__em.empty()) __em = "module parse error";
+        escargotTrace(("initializeScript parse error: " + __em).c_str());
         escargotEvalSetErrStr(out, __em);
         return out;
     }
@@ -2741,6 +2829,7 @@ static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *
         std::string __em;
         if (auto *__sr = er.resultOrErrorToString(c->ctx.get())) __em = __sr->toStdUTF8String();
         if (__em.empty()) __em = "module evaluation error";
+        escargotTrace(("evalModuleScript execute error: " + __em).c_str());
         escargotEvalSetErrStr(out, __em);
         return out;
     }

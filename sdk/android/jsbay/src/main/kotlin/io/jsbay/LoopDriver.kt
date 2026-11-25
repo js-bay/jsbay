@@ -4,6 +4,7 @@ package io.jsbay
 internal class LoopDriver(
     private val nativeBinding: Long,
     private val engineId: Int,
+    private val engineGeneration: Long,
 ) {
     private val handler: Any
     private val removeCallbacks: java.lang.reflect.Method
@@ -61,6 +62,7 @@ internal class LoopDriver(
         synchronized(this) {
             if (closed) return
         }
+        if (Native.destroyStatus(engineId, engineGeneration) != CloseStatus.LIVE.native) return
         val loopStatus = Status.of(Native.loopStatus(engineId))
         if (loopStatus != Status.OK) throw JsBayException(loopStatus)
     }

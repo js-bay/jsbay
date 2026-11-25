@@ -1,8 +1,10 @@
 #include "hermes_bridge.h"
 
 #include <hermes/hermes.h>
+#include <hermes/CompileJS.h>
 #include <jsi/instrumentation.h>
 #include <jsi/jsi.h>
+#include <optional>
 
 #include <algorithm>
 #include <atomic>
@@ -98,9 +100,19 @@ struct JsbayHermesContextOpaque {
     HermesRejectionTrackerFn rejection_fn = nullptr;
     void *rejection_ud = nullptr;
     int32_t rejection_instance_id = 0;
-    std::vector<std::pair<bool, std::string>> pending_rejections;
+    struct PendingRejection {
+        bool handled = false;
+        int32_t kind = 1;
+        std::string msg;
+        HermesValue promise = nullptr;
+        HermesValue reason = nullptr;
+    };
+    std::vector<PendingRejection> pending_rejections;
     bool rejection_hook_installed = false;
-    int32_t rejection_timer_next = 1;
+    HermesErrorObserverFn rejection_observer_fn = nullptr;
+    HermesShouldDeferFn rejection_should_defer = nullptr;
+    void *rejection_observer_ud = nullptr;
+    int32_t rejection_timer_next = 0x40000000;
     std::unordered_map<int32_t, std::shared_ptr<bool>> rejection_timer_cancelled;
     // Host macrotask pump for sync TLA waits (registered from Zig).
     HermesHostProgressFn host_progress_fn = nullptr;
@@ -111,6 +123,9 @@ struct JsbayHermesContextOpaque {
 };
 
 static void hermes_flush_pending_rejections(JsbayHermesContext *c);
+static bool hermesRejectionListenersActive(const JsbayHermesContext *c);
+static void hermesEnqueuePendingRejection(JsbayHermesContext *c, bool handled, std::string msg,
+                                          const jsi::Value *promise, const jsi::Value *reason);
 
 static jsi::Value *asVal(HermesValue v) { return static_cast<jsi::Value *>(v); }
 
@@ -592,6 +607,11 @@ extern "C" void hermes_context_free(JsbayHermesContext *ctx) {
         }
         ctx->promise_state.clear();
     }
+    for (auto &p : ctx->pending_rejections) {
+        if (p.promise) hermes_free_value(ctx, p.promise);
+        if (p.reason) hermes_free_value(ctx, p.reason);
+    }
+    ctx->pending_rejections.clear();
     delete ctx;
 }
 extern "C" void hermes_context_set_opaque(JsbayHermesContext *ctx, void *opaque) {
@@ -2476,7 +2496,7 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                     return jsi::Value::undefined();
                 }
                 recordPromiseState(key, 2, new_res);
-                if (requeue_host_unhandled && c->rejection_fn) {
+                if (requeue_host_unhandled && hermesRejectionListenersActive(c)) {
                     // Our observer alone leaves Hermes Promise `_h == 1`; a prior/sibling application handler yields `_h >= 2` — skip the compensatory unhandled report so `.catch()` suppresses it.
                     bool app_handled = false;
                     try {
@@ -2504,7 +2524,9 @@ extern "C" void hermes_promise_note_settled(JsbayHermesContext *c, HermesValue p
                             }
                         } catch (...) {
                         }
-                        c->pending_rejections.emplace_back(false, msg);
+                        const jsi::Value *promise_v = (deferred_keep && deferred_keep->isObject()) ? deferred_keep.get() : nullptr;
+                        const jsi::Value *reason_v = (count >= 1) ? &args[0] : nullptr;
+                        hermesEnqueuePendingRejection(c, false, msg, promise_v, reason_v);
                     }
                 }
                 return jsi::Value::undefined();
@@ -2978,19 +3000,59 @@ struct HbcBuffer : public jsi::Buffer {
     const uint8_t *data() const override { return data_.data(); }
 };
 
-static std::string findHermesc() {
-    if (const char *env = std::getenv("JSBAY_HERMESC")) {
-        if (env[0]) return std::string(env);
+struct JsbayCompileJSDiag final : hermes::DiagnosticHandler {
+    std::string err;
+    void handle(const Diagnostic &d) override {
+        if (d.kind != Kind::Error)
+            return;
+        if (!err.empty())
+            err += "\n";
+        err += d.message;
+        if (d.line > 0) {
+            err += " (line ";
+            err += std::to_string(d.line);
+            err += ")";
+        }
     }
-    // Relative to repo root (cwd for `zig build test`). Override with JSBAY_HERMESC.
-    const char *candidates[] = {
-        "vendor/hermes-install/bin/hermesc",
-        nullptr,
-    };
-    for (int i = 0; candidates[i]; ++i) {
-        if (access(candidates[i], X_OK) == 0) return candidates[i];
+};
+
+// In-process hermes::compileJS produces the same .hbc format as hermesc -O0 -g1 -emit-binary.
+// Required on Android (no hermesc on device; /tmp is often unusable). Used on every OS so the
+// public compile/run bytecode ABI does not depend on fork/exec of a host compiler.
+static bool compileBytecodeInProcess(const char *src, size_t src_len,
+                                     const char *filename, size_t filename_len,
+                                     HermesCompileResult *out) {
+    std::string source(src, src_len);
+    std::string url = "script.js";
+    if (filename && filename_len)
+        url.assign(filename, filename_len);
+    std::string bytecode;
+    JsbayCompileJSDiag diag;
+    const bool ok = hermes::compileJS(
+        source,
+        url,
+        bytecode,
+        /*optimize=*/false,
+        /*emitAsyncBreakCheck=*/false,
+        &diag,
+        std::nullopt,
+        /*debug=*/true);
+    if (!ok) {
+        out->err = dupCString(diag.err.empty() ? "compileJS failed" : diag.err.c_str());
+        return true; // handled (error is in *out)
     }
-    return "hermesc";
+    if (bytecode.empty()) {
+        out->err = dupCString("empty compileJS output");
+        return true;
+    }
+    out->bytes = static_cast<uint8_t *>(std::malloc(bytecode.size()));
+    if (!out->bytes) {
+        out->err = dupCString("oom");
+        return true;
+    }
+    std::memcpy(out->bytes, bytecode.data(), bytecode.size());
+    out->len = bytecode.size();
+    return true;
 }
 
 extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t src_len,
@@ -3000,140 +3062,7 @@ extern "C" HermesCompileResult hermes_compile_bytecode(const char *src, size_t s
         out.err = dupCString("null source");
         return out;
     }
-    // Prefer a temp path whose basename matches the caller's filename so -g1 debug info / stack traces carry "my-module.js" etc.
-    std::string base = "script.js";
-    if (filename && filename_len) {
-        std::string f(filename, filename_len);
-        auto slash = f.find_last_of("/\\");
-        base = (slash == std::string::npos) ? f : f.substr(slash + 1);
-        if (base.empty()) base = "script.js";
-        // Sanitize for shell / filesystem: strip <>:"|?* and whitespace.
-        std::string clean;
-        for (char ch : base) {
-            if (ch == '<' || ch == '>' || ch == ':' || ch == '"' || ch == '|' ||
-                ch == '?' || ch == '*' || ch == ' ' || ch == '\t' || ch == '\n') {
-                clean.push_back('_');
-            } else {
-                clean.push_back(ch);
-            }
-        }
-        base = clean.empty() ? "script.js" : clean;
-    }
-    // Private mode-0700 directory avoids shared-/tmp TOCTOU on hermesc -out= (no pre-unlinked public name).
-    char dir_tmpl[] = "/tmp/jsbay-hbc-XXXXXX";
-    if (!mkdtemp(dir_tmpl)) {
-        out.err = dupCString("mkdtemp failed");
-        return out;
-    }
-    std::string dir = dir_tmpl;
-    std::string js_path = dir + "/" + base;
-    std::string hbc_path = dir + "/out.hbc";
-    std::string err_path = dir + "/hermesc.err";
-    auto cleanupDir = [&]() {
-        unlink(js_path.c_str());
-        unlink(hbc_path.c_str());
-        unlink(err_path.c_str());
-        rmdir(dir.c_str());
-    };
-
-    int js_fd = open(js_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    if (js_fd < 0) {
-        cleanupDir();
-        out.err = dupCString("open js temp failed");
-        return out;
-    }
-    ssize_t wrote = write(js_fd, src, src_len);
-    close(js_fd);
-    if (wrote < 0 || (size_t)wrote != src_len) {
-        cleanupDir();
-        out.err = dupCString("write source failed");
-        return out;
-    }
-
-    std::string hermesc = findHermesc();
-    // -g1 embeds location info (incl. source path basename) for stack traces. Use fork/exec (not system()) so filenames with shell metacharacters are safe.
-    std::string out_arg = std::string("-out=") + hbc_path;
-    int err_fd = open(err_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    pid_t pid = fork();
-    int rc = -1;
-    if (pid == 0) {
-        if (err_fd >= 0) {
-            dup2(err_fd, 2);
-            close(err_fd);
-        }
-        // execlp searches PATH when findHermesc() returns a bare "hermesc".
-        execlp(hermesc.c_str(), hermesc.c_str(), "-O0", "-g1", "-emit-binary",
-               out_arg.c_str(), js_path.c_str(), (char *)nullptr);
-        _exit(127);
-    } else if (pid > 0) {
-        if (err_fd >= 0) close(err_fd);
-        int status = 0;
-        // Retry waitpid on EINTR so a non-SA_RESTART signal cannot leave hermesc unreaped while we treat status 0 as success and read a still-incomplete output file.
-        pid_t waited;
-        do {
-            waited = waitpid(pid, &status, 0);
-        } while (waited < 0 && errno == EINTR);
-        if (waited != pid) {
-            cleanupDir();
-            out.err = dupCString("waitpid hermesc failed");
-            return out;
-        }
-        rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    } else {
-        if (err_fd >= 0) close(err_fd);
-        cleanupDir();
-        out.err = dupCString("fork hermesc failed");
-        return out;
-    }
-    if (rc != 0) {
-        std::string err = "hermesc failed";
-        std::ifstream ef(err_path);
-        if (ef) {
-            std::ostringstream ss;
-            ss << ef.rdbuf();
-            std::string body = ss.str();
-            if (!body.empty()) err = body;
-        }
-        cleanupDir();
-        out.err = dupCString(err);
-        return out;
-    }
-    // Prefer O_NOFOLLOW so a replaced symlink/FIFO inside the private dir cannot redirect the read.
-    int hbc_fd = open(hbc_path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (hbc_fd < 0) {
-        cleanupDir();
-        out.err = dupCString("failed to read hermesc output");
-        return out;
-    }
-    std::vector<uint8_t> bytes;
-    {
-        uint8_t buf[8192];
-        for (;;) {
-            ssize_t n = read(hbc_fd, buf, sizeof(buf));
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                close(hbc_fd);
-                cleanupDir();
-                out.err = dupCString("failed to read hermesc output");
-                return out;
-            }
-            if (n == 0) break;
-            bytes.insert(bytes.end(), buf, buf + n);
-        }
-    }
-    close(hbc_fd);
-    cleanupDir();
-    if (bytes.empty()) {
-        out.err = dupCString("empty hermesc output");
-        return out;
-    }
-    out.bytes = static_cast<uint8_t *>(std::malloc(bytes.size()));
-    if (!out.bytes) {
-        out.err = dupCString("oom");
-        return out;
-    }
-    std::memcpy(out.bytes, bytes.data(), bytes.size());
-    out.len = bytes.size();
+    compileBytecodeInProcess(src, src_len, filename, filename_len, &out);
     return out;
 }
 
@@ -3461,18 +3390,72 @@ facebook::jsi::Value hermes_context_pristine_define_property(JsbayHermesContext 
     }
     return facebook::jsi::Value::undefined();
 }
+static void hermesFreePendingRejection(JsbayHermesContext *c, JsbayHermesContextOpaque::PendingRejection &p) {
+    if (p.promise) {
+        hermes_free_value(c, p.promise);
+        p.promise = nullptr;
+    }
+    if (p.reason) {
+        hermes_free_value(c, p.reason);
+        p.reason = nullptr;
+    }
+}
+
+static void hermesEnqueuePendingRejection(JsbayHermesContext *c, bool handled, std::string msg,
+                                          const jsi::Value *promise, const jsi::Value *reason) {
+    if (!c) return;
+    JsbayHermesContextOpaque::PendingRejection p;
+    p.handled = handled;
+    p.kind = handled ? 2 : 1;
+    p.msg = std::move(msg);
+    try {
+        if (promise && c->rt) p.promise = retainMove(c, jsi::Value(*c->rt, *promise));
+        if (reason && c->rt) p.reason = retainMove(c, jsi::Value(*c->rt, *reason));
+    } catch (...) {
+        hermesFreePendingRejection(c, p);
+        return;
+    }
+    c->pending_rejections.push_back(std::move(p));
+}
+
+static bool hermesRejectionListenersActive(const JsbayHermesContext *c) {
+    return c && (c->rejection_fn || c->rejection_observer_fn);
+}
+
 static void hermes_flush_pending_rejections(JsbayHermesContext *c) {
-    if (!c || !c->rejection_fn) return;
+    if (!hermesRejectionListenersActive(c)) return;
+    if (c->rejection_should_defer && c->rejection_should_defer(c->rejection_instance_id)) return;
     auto pending = std::move(c->pending_rejections);
     c->pending_rejections.clear();
-    for (auto &p : pending) {
-        // Host may unregister via promise.setRejectionTracker(..., null, null) during a callback.
-        if (!c->rejection_fn) break;
-        try {
-            c->rejection_fn(c->rejection_instance_id, p.first, p.second.c_str(), p.second.size(),
-                            c->rejection_ud);
-        } catch (...) {
+    for (size_t i = 0; i < pending.size(); ++i) {
+        auto &p = pending[i];
+        if (c->rejection_should_defer && c->rejection_should_defer(c->rejection_instance_id)) {
+            for (size_t j = i; j < pending.size(); ++j)
+                c->pending_rejections.push_back(std::move(pending[j]));
+            return;
         }
+        if (c->rejection_observer_fn) {
+            bool cont = true;
+            try {
+                cont = c->rejection_observer_fn(c->rejection_instance_id, p.kind, p.promise, p.reason,
+                                                c->rejection_observer_ud);
+            } catch (...) {
+                cont = true;
+            }
+            if (!cont) {
+                for (size_t j = i; j < pending.size(); ++j)
+                    c->pending_rejections.push_back(std::move(pending[j]));
+                return;
+            }
+        }
+        if (c->rejection_fn) {
+            try {
+                c->rejection_fn(c->rejection_instance_id, p.handled, p.msg.c_str(), p.msg.size(),
+                                c->rejection_ud);
+            } catch (...) {
+            }
+        }
+        hermesFreePendingRejection(c, p);
     }
 }
 
@@ -3497,81 +3480,170 @@ void hermes_context_pump_host_tasks(JsbayHermesContext *c) {
 }
 
 extern "C" void hermes_report_unhandled_rejection(JsbayHermesContext *ctx, const char *message) {
-    if (!ctx || !ctx->rejection_fn) return;
-    ctx->pending_rejections.emplace_back(false, message ? message : "Promise rejected");
+    if (!hermesRejectionListenersActive(ctx)) return;
+    hermesEnqueuePendingRejection(ctx, false, message ? message : "Promise rejected", nullptr, nullptr);
+}
+
+// Only the internal Promise tracker receives these cancellable double-microtask timers. Application timers retain their original delays and arguments.
+static void hermesSetRejectionTimers(JsbayHermesContext *ctx, jsi::Object &options) {
+    if (!ctx || !ctx->rt) return;
+    auto &rt = *ctx->rt;
+    auto wrappedST = jsi::Function::createFromHostFunction(
+        rt, jsi::PropNameID::forAscii(rt, "setTimeout"), 2,
+        [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            if (count == 0 || !args[0].isObject() || !args[0].getObject(rt0).isFunction(rt0))
+                return jsi::Value::undefined();
+            const int32_t id = ctx->rejection_timer_next++;
+            auto cancelled = std::make_shared<bool>(false);
+            ctx->rejection_timer_cancelled[id] = cancelled;
+            auto cb = std::make_shared<jsi::Function>(args[0].getObject(rt0).getFunction(rt0));
+            auto queueSecond = [ctx, cancelled, cb, id]() {
+                if (!ctx || !ctx->rt || *cancelled) return;
+                ctx->rt->queueMicrotask(jsi::Function::createFromHostFunction(
+                    *ctx->rt, jsi::PropNameID::forAscii(*ctx->rt, "jsbayRejectionTimer2"), 0,
+                    [ctx, cancelled, cb, id](jsi::Runtime &rt2, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                        if (*cancelled) return jsi::Value::undefined();
+                        *cancelled = true;
+                        ctx->rejection_timer_cancelled.erase(id);
+                        cb->call(rt2);
+                        return jsi::Value::undefined();
+                    }));
+            };
+            rt0.queueMicrotask(jsi::Function::createFromHostFunction(
+                rt0, jsi::PropNameID::forAscii(rt0, "jsbayRejectionTimer1"), 0,
+                [cancelled, queueSecond](jsi::Runtime &, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                    if (*cancelled) return jsi::Value::undefined();
+                    queueSecond();
+                    return jsi::Value::undefined();
+                }));
+            return jsi::Value(static_cast<double>(id));
+        });
+    auto wrappedCT = jsi::Function::createFromHostFunction(
+        rt, jsi::PropNameID::forAscii(rt, "clearTimeout"), 1,
+        [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+            if (count > 0 && args[0].isNumber()) {
+                const int32_t id = static_cast<int32_t>(args[0].asNumber());
+                auto it = ctx->rejection_timer_cancelled.find(id);
+                if (it != ctx->rejection_timer_cancelled.end()) {
+                    *it->second = true;
+                    ctx->rejection_timer_cancelled.erase(it);
+                    return jsi::Value::undefined();
+                }
+            }
+            return jsi::Value::undefined();
+        });
+    options.setProperty(rt, "setTimeout", wrappedST);
+    options.setProperty(rt, "clearTimeout", wrappedCT);
+}
+
+static bool hermesEnsureRejectionHook(JsbayHermesContext *ctx) {
+    if (!ctx || !ctx->rt) return false;
+    if (ctx->rejection_hook_installed) return true;
+    try {
+        auto &rt = *ctx->rt;
+        auto hi = rt.global().getProperty(rt, "HermesInternal");
+        if (!hi.isObject()) {
+            return true;
+        }
+        auto hiObj = hi.getObject(rt);
+        auto enable = hiObj.getProperty(rt, "enablePromiseRejectionTracker");
+        if (enable.isObject() && enable.getObject(rt).isFunction(rt)) {
+            auto hostUnhandled = jsi::Function::createFromHostFunction(
+                rt, jsi::PropNameID::forAscii(rt, "onUnhandled"), 2,
+                [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
+                      size_t count) -> jsi::Value {
+                    std::string msg = "Promise rejected";
+                    if (count >= 2) {
+                        try {
+                            if (args[1].isString()) msg = args[1].getString(rt0).utf8(rt0);
+                            else if (args[1].isObject()) {
+                                auto o = args[1].getObject(rt0);
+                                if (o.hasProperty(rt0, "message")) {
+                                    auto m = o.getProperty(rt0, "message");
+                                    if (m.isString()) msg = m.getString(rt0).utf8(rt0);
+                                }
+                                if (msg == "Promise rejected")
+                                    msg = args[1].toString(rt0).utf8(rt0);
+                            } else {
+                                msg = args[1].toString(rt0).utf8(rt0);
+                            }
+                        } catch (...) {
+                        }
+                    }
+                    if (hermesRejectionListenersActive(ctx)) {
+                        const jsi::Value *reason_v = (count >= 2) ? &args[1] : nullptr;
+                        const jsi::Value *promise_v = (count >= 3) ? &args[2] : nullptr;
+                        hermesEnqueuePendingRejection(ctx, false, msg, promise_v, reason_v);
+                    }
+                    return jsi::Value::undefined();
+                });
+            auto hostHandled = jsi::Function::createFromHostFunction(
+                rt, jsi::PropNameID::forAscii(rt, "onHandled"), 2,
+                [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
+                      size_t count) -> jsi::Value {
+                    std::string msg = "Promise rejection handled";
+                    if (count >= 2) {
+                        try {
+                            if (args[1].isString()) msg = args[1].getString(rt0).utf8(rt0);
+                            else msg = args[1].toString(rt0).utf8(rt0);
+                        } catch (...) {
+                        }
+                    }
+                    if (hermesRejectionListenersActive(ctx)) {
+                        const jsi::Value *reason_v = (count >= 2) ? &args[1] : nullptr;
+                        const jsi::Value *promise_v = (count >= 3) ? &args[2] : nullptr;
+                        hermesEnqueuePendingRejection(ctx, true, msg, promise_v, reason_v);
+                    }
+                    return jsi::Value::undefined();
+                });
+            jsi::Object opts(rt);
+            hermesSetRejectionTimers(ctx, opts);
+            opts.setProperty(rt, "allRejections", true);
+            opts.setProperty(rt, "onUnhandled", hostUnhandled);
+            opts.setProperty(rt, "onHandled", hostHandled);
+            enable.getObject(rt).getFunction(rt).callWithThis(rt, hiObj, opts);
+            ctx->rejection_hook_installed = true;
+        }
+    } catch (const std::exception &) {
+        return false;
+    } catch (...) {
+        return false;
+    }
+    return true;
 }
 
 extern "C" bool hermes_set_rejection_tracker(JsbayHermesContext *ctx, int32_t instance_id,
                                               HermesRejectionTrackerFn fn, void *ud) {
     if (!ctx || !ctx->rt) return false;
+    const auto previous_fn = ctx->rejection_fn;
+    void *previous_ud = ctx->rejection_ud;
+    const int32_t previous_id = ctx->rejection_instance_id;
     ctx->rejection_fn = fn;
     ctx->rejection_ud = ud;
     ctx->rejection_instance_id = instance_id;
-    if (!fn) return true;
+    if (!hermesRejectionListenersActive(ctx) || hermesEnsureRejectionHook(ctx)) return true;
+    ctx->rejection_fn = previous_fn;
+    ctx->rejection_ud = previous_ud;
+    ctx->rejection_instance_id = previous_id;
+    return false;
+}
 
-    if (!ctx->rejection_hook_installed) {
-        try {
-            auto &rt = *ctx->rt;
-            auto hi = rt.global().getProperty(rt, "HermesInternal");
-            if (!hi.isObject()) {
-                return true;
-            }
-            auto hiObj = hi.getObject(rt);
-            // Do not wrap global setTimeout/clearTimeout. allRejections delivers onUnhandled/onHandled directly; timer interception would accelerate ordinary application delays of 100/2000ms into microtasks.
-            auto enable = hiObj.getProperty(rt, "enablePromiseRejectionTracker");
-            if (enable.isObject() && enable.getObject(rt).isFunction(rt)) {
-                auto hostUnhandled = jsi::Function::createFromHostFunction(
-                    rt, jsi::PropNameID::forAscii(rt, "onUnhandled"), 2,
-                    [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
-                          size_t count) -> jsi::Value {
-                        std::string msg = "Promise rejected";
-                        if (count >= 2) {
-                            try {
-                                if (args[1].isString()) msg = args[1].getString(rt0).utf8(rt0);
-                                else if (args[1].isObject()) {
-                                    auto o = args[1].getObject(rt0);
-                                    if (o.hasProperty(rt0, "message")) {
-                                        auto m = o.getProperty(rt0, "message");
-                                        if (m.isString()) msg = m.getString(rt0).utf8(rt0);
-                                    }
-                                    if (msg == "Promise rejected")
-                                        msg = args[1].toString(rt0).utf8(rt0);
-                                } else {
-                                    msg = args[1].toString(rt0).utf8(rt0);
-                                }
-                            } catch (...) {
-                            }
-                        }
-                        if (ctx->rejection_fn)
-                            ctx->pending_rejections.emplace_back(false, msg);
-                        return jsi::Value::undefined();
-                    });
-                auto hostHandled = jsi::Function::createFromHostFunction(
-                    rt, jsi::PropNameID::forAscii(rt, "onHandled"), 2,
-                    [ctx](jsi::Runtime &rt0, const jsi::Value &, const jsi::Value *args,
-                          size_t count) -> jsi::Value {
-                        std::string msg = "Promise rejection handled";
-                        if (count >= 2) {
-                            try {
-                                if (args[1].isString()) msg = args[1].getString(rt0).utf8(rt0);
-                                else msg = args[1].toString(rt0).utf8(rt0);
-                            } catch (...) {
-                            }
-                        }
-                        if (ctx->rejection_fn)
-                            ctx->pending_rejections.emplace_back(true, msg);
-                        return jsi::Value::undefined();
-                    });
-                jsi::Object opts(rt);
-                opts.setProperty(rt, "allRejections", true);
-                opts.setProperty(rt, "onUnhandled", hostUnhandled);
-                opts.setProperty(rt, "onHandled", hostHandled);
-                enable.getObject(rt).getFunction(rt).callWithThis(rt, hiObj, opts);
-                ctx->rejection_hook_installed = true;
-            }
-        } catch (const std::exception &) {
-        } catch (...) {
-        }
-    }
-    return true;
+extern "C" bool hermes_set_error_observer(JsbayHermesContext *ctx, int32_t instance_id,
+                                          HermesErrorObserverFn fn, HermesShouldDeferFn should_defer,
+                                          void *ud) {
+    if (!ctx || !ctx->rt) return false;
+    const auto previous_fn = ctx->rejection_observer_fn;
+    const auto previous_defer = ctx->rejection_should_defer;
+    void *previous_ud = ctx->rejection_observer_ud;
+    const int32_t previous_id = ctx->rejection_instance_id;
+    ctx->rejection_observer_fn = fn;
+    ctx->rejection_should_defer = should_defer;
+    ctx->rejection_observer_ud = ud;
+    ctx->rejection_instance_id = instance_id;
+    if (!hermesRejectionListenersActive(ctx) || hermesEnsureRejectionHook(ctx)) return true;
+    ctx->rejection_observer_fn = previous_fn;
+    ctx->rejection_should_defer = previous_defer;
+    ctx->rejection_observer_ud = previous_ud;
+    ctx->rejection_instance_id = previous_id;
+    return false;
 }

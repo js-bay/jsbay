@@ -5,6 +5,7 @@ const value_mod = @import("hermes/value.zig");
 pub const c_api = @import("hermes/c_api.zig");
 const console_mod = @import("hermes/console.zig");
 const timers_mod = @import("hermes/timers.zig");
+pub const exception = @import("hermes/exception.zig");
 
 pub const c_api_mod = c_api;
 
@@ -43,6 +44,7 @@ pub const HermesBackend = struct {
     pub const isFunction = value_mod.isFunction;
     pub const isConstructor = value_mod.isConstructor;
     pub const callFunctionNoArgs = value_mod.callFunctionNoArgs;
+    pub const callFunctionNoArgsObserved = value_mod.callFunctionNoArgsObserved;
     pub const getGlobalObject = value_mod.getGlobalObject;
     pub const newObject = value_mod.newObject;
     pub fn setProperty(ctx: Context, obj: Value, key: []const u8, val: Value) bool {
@@ -104,6 +106,7 @@ pub const HermesBackend = struct {
     pub const isObjectVal = value_mod.isObjectVal;
     pub const isArray = value_mod.isArray;
     pub const sameValue = value_mod.sameValue;
+    pub const objectIdentity = value_mod.objectIdentity;
     pub const strictEqual = value_mod.strictEqual;
     pub const toBool = value_mod.toBool;
     pub const toInt32 = value_mod.toInt32;

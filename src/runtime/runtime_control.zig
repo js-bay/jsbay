@@ -11,7 +11,7 @@
 //!
 //! Backend notes:
 //! - QuickJS: full native support via `JS_SetInterruptHandler`. The JS VM throws an InternalError on the next interrupt check.
-//! - JSC: uses the private `JSContextGroupSetExecutionTimeLimit` API exported by JavaScriptCore.framework. The callback explicitly re-arms its next 50ms check after returning false so interrupts and deadlines do not depend on framework-specific callback repetition. `runGc` requests collection through the public `JSGarbageCollect` API; completion timing is controlled by the framework. Memory usage is not queryable through JSC's public C API and is reported as zeros.
+//! - JSC: uses the private `JSContextGroupSetExecutionTimeLimit` API exported by JavaScriptCore.framework. The callback re-arms its next check on both outcomes so a protected nested API boundary cannot consume the only watchdog timer while its caller remains active. `runGc` requests collection through the public `JSGarbageCollect` API; completion timing is controlled by the framework. Memory usage is not queryable through JSC's public C API and is reported as zeros.
 //! - Escargot: `runGc` → `Memory::gc`. Soft `getMemoryUsage` via `Memory::heapSize`/`totalSize`. No public heap cap (`setMemoryLimit` false). No mid-script interrupt in this pin.
 //! - Hermes: `runGc` via `instrumentation().collectGarbage`. Soft `getMemoryUsage` via `getHeapInfo` (`hermes_allocatedBytes`/`hermes_heapSize`). `setMemoryLimit` false (use EngineConfig.max_heap_size / -Dhermes-max-heap at create; GCConfig.MaxHeapSize create-time only). User `requestInterrupt` sets a bit only (does **not** call `asyncTriggerTimeout` — sticky Timeout AsyncBreak would poison later evals); mid-script abort is via stop/destroy → `requestStopInterrupt` + softRearm/drain. Escargot: bit only, **no** mid-script abort.
 
@@ -42,7 +42,7 @@ pub const ShutdownStatus = struct { phase: ShutdownPhase, remaining_ms: u64 };
 
 /// Per-instance state shared between public control calls and backend interrupt trampolines. Registry access is serialized; interrupt flags and deadlines use atomic access. The backend extern structs must preserve this layout.
 pub const InterruptState = extern struct {
-    /// Non-zero when an interrupt has been requested. Read by the trampoline on every interrupt check.
+    /// Flags: 1 = user interrupt, 2 = lifecycle stop, 4 = terminal generation cancellation, 8 = host-observer deferral. Backend trampolines retain the first three bit assignments.
     interrupt_requested: u8 = 0,
     _pad: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
     /// Absolute monotonic deadline in ms (from io.monotonicMilliseconds). Zero means "no limit". Read atomically.
@@ -65,6 +65,41 @@ pub const InterruptState = extern struct {
 var registry: std.AutoHashMap(i32, *InterruptState) =
     std.AutoHashMap(i32, *InterruptState).init(std.heap.c_allocator);
 var registry_mutex: sync.Mutex = .{};
+
+// Backend trampolines share InterruptState's extern layout. Host-only bookkeeping lives beside it in the same instance-allocator-owned allocation.
+const OwnedInterruptState = struct {
+    interrupt: InterruptState = .{},
+    allocator: std.mem.Allocator,
+    host_callback_depth: u32 = 0,
+};
+
+fn ownerOf(state: *InterruptState) *OwnedInterruptState {
+    return @fieldParentPtr("interrupt", state);
+}
+
+/// Entered around a spike (Hermes/Escargot) host-function trampoline. No allocation is permitted after callback admission.
+pub fn beginHostCallback(instance_id: i32) void {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return;
+    ownerOf(state).host_callback_depth += 1;
+}
+
+pub fn endHostCallback(instance_id: i32) void {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return;
+    const owned = ownerOf(state);
+    std.debug.assert(owned.host_callback_depth != 0);
+    owned.host_callback_depth -= 1;
+}
+
+fn isHostCallbackActive(instance_id: i32) bool {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    const state = registry.get(instance_id) orelse return false;
+    return ownerOf(state).host_callback_depth != 0;
+}
 
 fn takeState(instance_id: i32) ?*InterruptState {
     registry_mutex.lock();
@@ -94,7 +129,9 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     }
     registry_mutex.unlock();
 
-    const state = std.heap.c_allocator.create(InterruptState) catch return false;
+    const owned = inst.allocator.create(OwnedInterruptState) catch return false;
+    owned.* = .{ .allocator = inst.allocator };
+    const state = &owned.interrupt;
     state.* = .{
         .interrupt_requested = 0,
         .deadline_ms = 0,
@@ -109,7 +146,7 @@ pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) boo
     registry_mutex.lock();
     registry.put(instance_id, state) catch {
         registry_mutex.unlock();
-        std.heap.c_allocator.destroy(state);
+        owned.allocator.destroy(owned);
         return false;
     };
     registry_mutex.unlock();
@@ -201,14 +238,15 @@ pub fn deinit(instance_id: i32) bool {
         }
     }
 
-    std.heap.c_allocator.destroy(state);
+    const owned = ownerOf(state);
+    owned.allocator.destroy(owned);
     return true;
 }
 
 fn hermesTriggerTimeout(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Control-plane lease: refuse teardown_pending and keep destroyRuntime waiting so asyncTriggerTimeout cannot touch a freed Hermes runtime.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    // Lifecycle lease: admitted after teardown_pending so destroy/stop can still fire asyncTriggerTimeout. destroyRuntime waits on the lease before freeing the runtime.
+    const lease = instance_map.beginLifecycleControlPlane(instance_id) orelse return;
     defer lease.end();
     const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
@@ -217,8 +255,8 @@ fn hermesTriggerTimeout(instance_id: i32) void {
 
 fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Lease across watch/unwatch so clear_interrupt cannot race destroyRuntime freeing the Hermes runtime while the map entry still exists.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    // Lifecycle lease: softRearm after a host destroy/stop must still watch while teardown is already marked.
+    const lease = instance_map.beginLifecycleControlPlane(instance_id) orelse return;
     defer lease.end();
     const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
@@ -232,25 +270,43 @@ fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
 
 fn hermesDrainAsyncTimeout(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Same lease as watch/trigger: drain touches native Hermes timeout state that destroyRuntime frees.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
+    // Lifecycle lease, idle only. Must not run from a host trampoline: drain uses a nested evaluateJavaScript and will hang inside an active eval.
+    const lease = instance_map.beginLifecycleControlPlane(instance_id) orelse return;
     defer lease.end();
     const rt = lease.inst.monoRuntime() orelse return;
     const her = @import("../backend/hermes.zig");
     her.c_api_mod.hermes_runtime_drain_async_timeout(rt);
 }
 
-/// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from requestStopInterrupt (destroy/stop) therefore kills finite work after a host callback (`hostDestroy(); 42`). Call from the host trampoline on the way back into JS: clear sticky bits on every eval-active instance on this thread (nested destroy can arm outer frames too), then arm a short watch so loops still abort soon.
+/// Arm a non-sticky IHermes watch for the remaining execution deadline around a job/microtask drain.
+///
+/// Unwatch and drain afterwards so an expired watch cannot poison later evals.
+pub fn armHermesDeadlineWatch(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const rem = remainingEffectiveExecutionLimitMillis(instance_id) orelse return;
+    hermesWatchTimeLimit(instance_id, if (rem == 0) 1 else rem);
+}
+
+pub fn disarmHermesDeadlineWatch(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    hermesWatchTimeLimit(instance_id, 0);
+    if (isHostCallbackActive(instance_id)) return;
+    hermesDrainAsyncTimeout(instance_id);
+}
+
+/// Rearm shutdown cancellation only for the runtime returning from its host callback. An outer runtime remains suspended while a nested eval unwinds and destroys its deferred instance; arming its watch here would charge native cleanup time and poison its eventual finite return. Its own host trampoline rearms the watch when it is ready to resume JavaScript.
 pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    const et = @import("engine_thread.zig");
     rearmOneHermesStop(instance_id);
-    et.forEachEvalActiveOnCurrentThread(rearmOneHermesStop);
 }
 
 fn rearmOneHermesStop(instance_id: i32) void {
     if (!isStopRequested(instance_id)) return;
-    hermesDrainAsyncTimeout(instance_id);
+    // Do not call hermesDrainAsyncTimeout here. That helper runs a nested evaluateJavaScript
+    // to clear a sticky Timeout AsyncBreak; doing so from the host trampoline (already inside
+    // an eval) hangs the engine thread and then live.close()/destroy. requestStopInterrupt
+    // skips the sticky trigger while this eval is on the stack; a short watch aborts a
+    // follow-on loop without killing finite work such as `hostDestroy(); 42`.
     hermesWatchTimeLimit(instance_id, 25);
 }
 
@@ -271,10 +327,12 @@ pub fn supportsMidScriptUserInterrupt() bool {
 /// Request mid-script interrupt when the backend supports it. Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed). Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
     if (!supportsMidScriptUserInterrupt()) {
-        // Refuse to claim mid-script stop. Do not set the user bit (avoids false isInterruptRequested).
+        // Refuse mid-script stop: do not set the user bit (engine_thread/spike honesty: requestInterrupt returns false and isInterruptRequested stays false). Still record a host-defer bit so typed error-observer flush can pause remaining events, matching the existing observer contract without claiming a mid-script abort.
         registry_mutex.lock();
         defer registry_mutex.unlock();
-        _ = registry.get(instance_id) orelse return false;
+        const state = registry.get(instance_id) orelse return false;
+        const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+        _ = p.fetchOr(8, .monotonic);
         return false;
     }
     registry_mutex.lock();
@@ -297,15 +355,20 @@ pub fn clearInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
-    const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
-    target_ptr.store(0, .monotonic);
-    const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
-    _ = p.fetchAnd(~@as(u8, 1), .monotonic);
+    clearUserInterruptState(state);
     registry_mutex.unlock();
     // Unwatch only — do not evaluate here (may race a live mid-script eval).
     // Sticky Timeout AsyncBreak from stop/destroy is drained in clearStopInterrupt after join.
     hermesWatchTimeLimit(instance_id, 0);
     return true;
+}
+
+fn clearUserInterruptState(state: *InterruptState) void {
+    const target: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
+    target.store(0, .monotonic);
+    const flags: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+    // Clear user/observer deferral, never lifecycle stop or terminal generation cancellation.
+    _ = flags.fetchAnd(~@as(u8, 1 | 8), .monotonic);
 }
 
 /// Request an interrupt owned by lifecycle shutdown without clearing a caller's explicit interrupt request or a configured deadline.
@@ -318,7 +381,17 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchOr(2, .monotonic);
     registry_mutex.unlock();
-    hermesTriggerTimeout(instance_id);
+    // Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout while a
+    // host trampoline is on the stack would abort finite work after the callback
+    // (`holdEval(); 42`, `hostDestroy(); 42`). It would also tempt softRearm to peel
+    // the bit with a nested evaluateJavaScript, which hangs. Skip the sticky trigger
+    // only while a host callback is in flight; the trampoline then arms a short watch.
+    // External stop/destroy of a tight `while (true) {}` (no host frame) still triggers
+    // immediately. "Eval active on this thread" is not the right test: an external
+    // destroy thread is never inside the eval, but may arrive during holdEval().
+    if (!isHostCallbackActive(instance_id)) {
+        hermesTriggerTimeout(instance_id);
+    }
     return true;
 }
 
@@ -595,6 +668,19 @@ pub fn isInterruptRequested(instance_id: i32) bool {
     return requested;
 }
 
+/// Host-side observer/flush deferral recorded by requestInterrupt on spikes that cannot abort mid-script JS.
+pub fn isHostDeferRequested(instance_id: i32) bool {
+    registry_mutex.lock();
+    const state = registry.get(instance_id) orelse {
+        registry_mutex.unlock();
+        return false;
+    };
+    const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
+    const requested = (p.load(.monotonic) & 8) != 0;
+    registry_mutex.unlock();
+    return requested;
+}
+
 /// True when lifecycle shutdown has requested an interrupt. This is separate from a caller-requested interrupt so waiters can report instance teardown rather than treating a stopped runtime as a user cancellation.
 pub fn isStopRequested(instance_id: i32) bool {
     registry_mutex.lock();
@@ -859,4 +945,46 @@ pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
             return .{};
         },
     }
+}
+
+test "runtime_control: clear preserves terminal cancellation separately from observer deferral" {
+    var state = InterruptState{};
+    cancelShutdownState(&state);
+    state.interrupt_requested |= 1 | 2 | 8;
+    state.interrupt_target = 19;
+    clearUserInterruptState(&state);
+    try std.testing.expectEqual(@as(u8, 2 | 4), state.interrupt_requested);
+    try std.testing.expectEqual(@as(u64, 0), state.interrupt_target);
+    try std.testing.expectEqual(ShutdownPhase.cancelled, state.shutdown_phase);
+    try std.testing.expectEqual(@as(u64, 0), state.shutdown_deadline_ms);
+}
+
+test "runtime_control: admitted callback bookkeeping is allocation-free and nested" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const allocator = failing.allocator();
+    const owned = try allocator.create(OwnedInterruptState);
+    defer allocator.destroy(owned);
+    owned.* = .{ .allocator = allocator };
+    const id = -2_000_001;
+    registry_mutex.lock();
+    registry.put(id, &owned.interrupt) catch |err| {
+        registry_mutex.unlock();
+        return err;
+    };
+    registry_mutex.unlock();
+    defer {
+        registry_mutex.lock();
+        _ = registry.remove(id);
+        registry_mutex.unlock();
+    }
+    beginHostCallback(id);
+    beginHostCallback(id);
+    try std.testing.expectEqual(@as(u32, 2), owned.host_callback_depth);
+    try std.testing.expect(isHostCallbackActive(id));
+    endHostCallback(id);
+    try std.testing.expect(isHostCallbackActive(id));
+    endHostCallback(id);
+    try std.testing.expect(!isHostCallbackActive(id));
+    try std.testing.expectEqual(@as(usize, 1), failing.alloc_index);
+    try std.testing.expectError(error.OutOfMemory, allocator.create(OwnedInterruptState));
 }

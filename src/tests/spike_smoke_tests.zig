@@ -7,6 +7,7 @@ const engine = @import("../engine.zig");
 const engine_thread = @import("../runtime/engine_thread.zig");
 const c_api = @import("../c_api.zig");
 const runtime_control = @import("../runtime/runtime_control.zig");
+const sync = @import("zev");
 
 test "spike smoke: Global survives unrelated eval" {
     if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
@@ -160,9 +161,25 @@ test "spike smoke: public bind mutates userdata counter" {
     try testing.expectEqual(@as(i32, 2), counter);
 }
 
+// Startup returns after spawn, not after the worker publishes its id. A native
+// task runs after that publication; wait for its receipt rather than scheduling
+// the parent a guessed number of times. Use the existing smoke post/wait bound.
+fn awaitStartupPublication(id: i32, ready: *sync.Waiter) !void {
+    const generation = ready.generation();
+    try testing.expect(engine_thread.postToEngineThread(id, struct {
+        fn notify(raw: ?*anyopaque) void {
+            const waiter: *sync.Waiter = @ptrCast(@alignCast(raw.?));
+            waiter.signal();
+        }
+    }.notify, ready));
+    try testing.expect(ready.waitUntilChange(generation, 2000));
+}
+
 test "spike smoke: engine_thread start / id / stop" {
     if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
-    // Minimal contract only: post/wait still throws on Escargot spike (status=exception) — leave full suite to non-spike.
+    // Minimal contract only: post/wait still throws on Escargot spike (status=exception) — leave full suite to non-spike. Keep the receipt alive until stop has joined the worker on every path.
+    var ready: sync.Waiter = .init;
+    defer ready.deinit();
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer {
@@ -170,6 +187,7 @@ test "spike smoke: engine_thread start / id / stop" {
         engine.destroy(id);
     }
     try testing.expect(engine_thread.threadStart(id));
+    try awaitStartupPublication(id, &ready);
     var spins: usize = 0;
     while (engine_thread.threadId(id) == 0 and spins < 10_000) : (spins += 1) {
         std.Thread.yield() catch {};
@@ -183,6 +201,9 @@ test "spike smoke: engine_thread post/wait eval" {
     if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
     // Escargot: vendor rebuilt with ENABLE_THREADING + TLS_ACCESS_BY_PTHREAD_KEY;
     // escargot_thread_enter/leave call Globals::initializeThread/finalizeThread.
+    // Keep the receipt alive until stop has joined the worker on every path.
+    var ready: sync.Waiter = .init;
+    defer ready.deinit();
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     defer {
@@ -190,6 +211,7 @@ test "spike smoke: engine_thread post/wait eval" {
         engine.destroy(id);
     }
     try testing.expect(engine_thread.threadStart(id));
+    try awaitStartupPublication(id, &ready);
     var spins: usize = 0;
     while (engine_thread.threadId(id) == 0 and spins < 10_000) : (spins += 1) {
         std.Thread.yield() catch {};

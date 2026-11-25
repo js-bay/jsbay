@@ -1,0 +1,440 @@
+diff --git a/src/api/EscargotPublic.cpp b/src/api/EscargotPublic.cpp
+index 7eb5910..a38ecf2 100644
+--- a/src/api/EscargotPublic.cpp
++++ b/src/api/EscargotPublic.cpp
+@@ -1353,7 +1353,8 @@ Evaluator::EvaluatorResult::EvaluatorResult()
+ }
+ 
+ Evaluator::EvaluatorResult::EvaluatorResult(const EvaluatorResult& src)
+-    : result(src.result)
++    : wasTerminated(src.wasTerminated)
++    , result(src.result)
+     , error(src.error)
+     , stackTrace(src.stackTrace)
+ {
+@@ -1361,6 +1362,7 @@ Evaluator::EvaluatorResult::EvaluatorResult(const EvaluatorResult& src)
+ 
+ const Evaluator::EvaluatorResult& Evaluator::EvaluatorResult::operator=(Evaluator::EvaluatorResult& src)
+ {
++    wasTerminated = src.wasTerminated;
+     result = src.result;
+     error = src.error;
+     stackTrace = src.stackTrace;
+@@ -1368,7 +1370,8 @@ const Evaluator::EvaluatorResult& Evaluator::EvaluatorResult::operator=(Evaluato
+ }
+ 
+ Evaluator::EvaluatorResult::EvaluatorResult(EvaluatorResult&& src)
+-    : result(src.result)
++    : wasTerminated(src.wasTerminated)
++    , result(src.result)
+     , error(src.error)
+     , stackTrace(std::move(src.stackTrace))
+ {
+@@ -1378,6 +1381,9 @@ Evaluator::EvaluatorResult::EvaluatorResult(EvaluatorResult&& src)
+ 
+ StringRef* Evaluator::EvaluatorResult::resultOrErrorToString(ContextRef* ctx) const
+ {
++    if (wasTerminated) {
++        return StringRef::createFromASCII("Execution terminated");
++    }
+     if (isSuccessful()) {
+         return result->toStringWithoutException(ctx);
+     } else {
+@@ -1394,6 +1400,7 @@ StringRef* Evaluator::EvaluatorResult::resultOrErrorToString(ContextRef* ctx) co
+ static Evaluator::EvaluatorResult toEvaluatorResultRef(SandBox::SandBoxResult& result)
+ {
+     Evaluator::EvaluatorResult r;
++    r.wasTerminated = result.wasTerminated;
+     r.error = toOptionalValue(result.error);
+     r.result = toRef(result.result);
+ 
+@@ -1423,7 +1430,7 @@ static Evaluator::EvaluatorResult toEvaluatorResultRef(SandBox::SandBoxResult& r
+ 
+ Evaluator::EvaluatorResult Evaluator::executeFunction(ContextRef* ctx, ValueRef* (*runner)(ExecutionStateRef* state, void* passedData), void* data)
+ {
+-    SandBox sb(toImpl(ctx));
++    SandBox sb(toImpl(ctx), true);
+ 
+     struct DataSender {
+         void* fn;
+@@ -1444,7 +1451,7 @@ Evaluator::EvaluatorResult Evaluator::executeFunction(ContextRef* ctx, ValueRef*
+ 
+ Evaluator::EvaluatorResult Evaluator::executeFunction(ContextRef* ctx, ValueRef* (*runner)(ExecutionStateRef* state, void* passedData, void* passedData2), void* data, void* data2)
+ {
+-    SandBox sb(toImpl(ctx));
++    SandBox sb(toImpl(ctx), true);
+ 
+     struct DataSender {
+         void* fn;
+@@ -1467,7 +1474,7 @@ Evaluator::EvaluatorResult Evaluator::executeFunction(ContextRef* ctx, ValueRef*
+ 
+ Evaluator::EvaluatorResult Evaluator::executeFunction(ExecutionStateRef* parentState, ValueRef* (*runner)(ExecutionStateRef* state, void* passedData, void* passedData2), void* data, void* data2)
+ {
+-    SandBox sb(toImpl(parentState)->context());
++    SandBox sb(toImpl(parentState)->context(), true);
+ 
+     struct DataSender {
+         void* fn;
+@@ -1564,6 +1571,11 @@ void VMInstanceRef::registerPromiseRejectCallback(PromiseRejectCallback rejectCa
+                                                 (void*)rejectCallback);
+ }
+ 
++void VMInstanceRef::setExecutionTerminationCallback(bool (*callback)(void*), void* data)
++{
++    toImpl(this)->setExecutionTerminationCallback(callback, data);
++}
++
+ void VMInstanceRef::unregisterPromiseRejectCallback()
+ {
+     toImpl(this)->unregisterPromiseRejectCallback();
+@@ -1604,8 +1616,15 @@ bool VMInstanceRef::hasPendingJob()
+ 
+ Evaluator::EvaluatorResult VMInstanceRef::executePendingJob()
+ {
+-    auto result = toImpl(this)->executePendingJob();
+-    return toEvaluatorResultRef(result);
++    try {
++        auto result = toImpl(this)->executePendingJob();
++        return toEvaluatorResultRef(result);
++    } catch (const ExecutionTermination&) {
++        toImpl(this)->clearExecutionTermination();
++        Evaluator::EvaluatorResult result;
++        result.wasTerminated = true;
++        return result;
++    }
+ }
+ 
+ void VMInstanceRef::enqueueEvaluateJob(ContextRef* relalatedContext, EvaluateJobCallback callback, void* data)
+@@ -4198,10 +4217,14 @@ StringRef* ValueRef::toString(ExecutionStateRef* es)
+ 
+ StringRef* ValueRef::toStringWithoutException(ContextRef* ctx)
+ {
+-    // declare temporal ExecutionState and SandBox
+-    ExecutionState state(toImpl(ctx));
+-    SandBox sb(toImpl(ctx));
+-    return toRef(toImpl(this).toStringWithoutException(state));
++    SandBox sb(toImpl(ctx), true);
++    auto result = sb.run([](ExecutionState& state, void* data) -> Value {
++        return toImpl(static_cast<ValueRef*>(data)).toStringWithoutException(state);
++    }, this);
++    if (result.wasTerminated) {
++        return StringRef::createFromASCII("Execution terminated");
++    }
++    return toRef(result.result.asString());
+ }
+ 
+ ObjectRef* ValueRef::toObject(ExecutionStateRef* es)
+@@ -5510,7 +5533,7 @@ ValueRef* SerializerRef::deserializeFrom(ContextRef* context, const char* data,
+         return ValueRef::createUndefined();
+     }
+ 
+-    SandBox sb(toImpl(context));
++    SandBox sb(toImpl(context), true);
+     auto result = sb.run([](ExecutionState& state, void* data) -> Value {
+         std::unique_ptr<SerializedValue>* value = (std::unique_ptr<SerializedValue>*)data;
+         return value->get()->toValue(state);
+diff --git a/src/api/EscargotPublic.h b/src/api/EscargotPublic.h
+index 0965c2c..227bd1a 100644
+--- a/src/api/EscargotPublic.h
++++ b/src/api/EscargotPublic.h
+@@ -668,11 +668,12 @@ public:
+ 
+         bool isSuccessful() const
+         {
+-            return !error.hasValue();
++            return !wasTerminated && !error.hasValue();
+         }
+ 
+         StringRef* resultOrErrorToString(ContextRef* ctx) const;
+ 
++        bool wasTerminated = false;
+         ValueRef* result;
+         OptionalRef<ValueRef> error;
+         GCManagedVector<StackTraceData> stackTrace;
+@@ -792,6 +793,9 @@ public:
+     void registerPromiseRejectCallback(PromiseRejectCallback);
+     void unregisterPromiseRejectCallback();
+ 
++    // The callback returns normally; termination is raised and caught only inside C++ evaluator boundaries.
++    void setExecutionTerminationCallback(bool (*callback)(void*), void* data);
++
+     enum class ConfigFlag {
+         CompressCompressibleStringsWhileGC = 1,
+         PruneCompiledByteCodesWhileGC = 1 << 1,
+diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeInterpreter.cpp
+index f9147c3..8d551ec 100644
+--- a/src/interpreter/ByteCodeInterpreter.cpp
++++ b/src/interpreter/ByteCodeInterpreter.cpp
+@@ -602,6 +602,9 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
+     CageBaseRegisterScope cageBaseRegisterScope;
+ #endif
+     state->m_programCounter = &programCounter;
++    if (byteCodeBlock) {
++        state->context()->vmInstance()->checkExecutionTermination(true);
++    }
+ #ifdef ESCARGOT_DEBUGGER
+     if (byteCodeBlock && (state->debuggerFrameToken() == 0 || (!state->debuggerFrameTokenOwned() && state->parent() && state->parent()->debuggerByteCodeBlock() != byteCodeBlock))) {
+         state->setDebuggerFrameToken(state->context()->nextDebuggerFrameToken());
+@@ -643,6 +646,7 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
+     goto opcode##OpcodeLbl;
+ 
+     NextInstruction:
++        state->context()->vmInstance()->checkExecutionTermination();
+         /* Execute first instruction. */
+         goto*(((ByteCode*)programCounter)->m_opcodeInAddress);
+ #else
+@@ -662,6 +666,7 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
+         Opcode currentOpcode = ((ByteCode*)programCounter)->m_opcode;
+ 
+     NextInstructionWithoutFetchOpcode:
++        state->context()->vmInstance()->checkExecutionTermination();
+         switch (currentOpcode) {
+ #endif
+ 
+diff --git a/src/runtime/ExecutionPauser.cpp b/src/runtime/ExecutionPauser.cpp
+index 37f4c45..955767a 100644
+--- a/src/runtime/ExecutionPauser.cpp
++++ b/src/runtime/ExecutionPauser.cpp
+@@ -218,6 +218,17 @@ Value ExecutionPauser::start(ExecutionState& state, ExecutionPauser* self, Objec
+             activeSavedStackTrace = debugger->activeSavedStackTrace();
+             debugger->setActiveSavedStackTrace(&state, self->m_savedStackTrace);
+         }
++        struct SavedStackTraceRestore {
++            Debugger* debugger;
++            ExecutionState*& previousState;
++            Debugger::SavedStackTraceDataVector* previousTrace;
++            ~SavedStackTraceRestore()
++            {
++                if (previousState != ESCARGOT_DEBUGGER_NO_STACK_TRACE_RESTORE) {
++                    debugger->setActiveSavedStackTrace(previousState, previousTrace);
++                }
++            }
++        } restoreTrace { debugger, activeSavedStackTraceExecutionState, activeSavedStackTrace };
+ #endif /* ESCARGOT_DEBUGGER */
+ 
+         result = Interpreter::interpret(es, self->m_byteCodeBlock, startPos, self->m_registerFile);
+@@ -225,6 +236,7 @@ Value ExecutionPauser::start(ExecutionState& state, ExecutionPauser* self, Objec
+ #ifdef ESCARGOT_DEBUGGER
+         if (activeSavedStackTraceExecutionState != ESCARGOT_DEBUGGER_NO_STACK_TRACE_RESTORE) {
+             debugger->setActiveSavedStackTrace(activeSavedStackTraceExecutionState, activeSavedStackTrace);
++            activeSavedStackTraceExecutionState = ESCARGOT_DEBUGGER_NO_STACK_TRACE_RESTORE;
+         }
+ 
+         debugger = state.context()->debugger();
+@@ -276,6 +288,18 @@ Value ExecutionPauser::start(ExecutionState& state, ExecutionPauser* self, Objec
+             }
+             self->release();
+         }
++    } catch (const ExecutionTermination&) {
++        if (self->m_executionState) {
++            self->m_executionState->m_programCounter = nullptr;
++        }
++        self->release();
++        if (from == StartFrom::Generator) {
++            source->asGeneratorObject()->m_generatorState = GeneratorObject::CompletedReturn;
++        } else if (from == StartFrom::AsyncGenerator) {
++            source->asAsyncGeneratorObject()->m_asyncGeneratorState = AsyncGeneratorObject::Completed;
++        }
++        // Release suspended roots without rejecting or resolving the interrupted capability.
++        throw;
+     } catch (const Value& thrownValue) {
+         auto promiseCapability = self->m_promiseCapability;
+         self->release();
+diff --git a/src/runtime/FunctionObjectInlines.h b/src/runtime/FunctionObjectInlines.h
+index e1f6a40..60d2d9e 100644
+--- a/src/runtime/FunctionObjectInlines.h
++++ b/src/runtime/FunctionObjectInlines.h
+@@ -305,12 +305,14 @@ Value NativeFunctionObject::processNativeFunctionCall(ExecutionState& state, con
+     Value result;
+     if (isConstruct) {
+         result = nativeFunc(newState, receiver, argc, argv, newTarget);
++        ctx->vmInstance()->checkExecutionTermination(true);
+         if (shouldReturnsObjectOnConstructCall && UNLIKELY(!result.isObject())) {
+             ErrorObject::throwBuiltinError(newState, ErrorCode::TypeError, "Native Constructor must returns constructed new object");
+         }
+     } else {
+         ASSERT(!newTarget);
+         result = nativeFunc(newState, receiver, argc, argv, nullptr);
++        ctx->vmInstance()->checkExecutionTermination(true);
+     }
+ 
+ #ifdef ESCARGOT_DEBUGGER
+diff --git a/src/runtime/SandBox.cpp b/src/runtime/SandBox.cpp
+index 147e11c..ee491a1 100644
+--- a/src/runtime/SandBox.cpp
++++ b/src/runtime/SandBox.cpp
+@@ -39,8 +39,9 @@ String* StackTraceDataOnStack::materializedSourceCode() const
+     return scriptSource ? scriptSource->string() : sourceCode;
+ }
+ 
+-SandBox::SandBox(Context* s)
+-    : m_context(s)
++SandBox::SandBox(Context* s, bool catchesExecutionTermination)
++    : m_catchesExecutionTermination(catchesExecutionTermination)
++    , m_context(s)
+ {
+     m_oldSandBox = m_context->vmInstance()->m_currentSandBox;
+     m_context->vmInstance()->m_currentSandBox = this;
+@@ -50,6 +51,9 @@ SandBox::~SandBox()
+ {
+     ASSERT(m_context->vmInstance()->m_currentSandBox == this);
+     m_context->vmInstance()->m_currentSandBox = m_oldSandBox;
++    if (!m_oldSandBox) {
++        m_context->vmInstance()->clearExecutionTermination();
++    }
+ }
+ 
+ void SandBox::processCatch(const Value& error, SandBoxResult& result)
+@@ -117,10 +121,26 @@ SandBox::SandBoxResult SandBox::run(Value (*scriptRunner)(ExecutionState&, void*
+ {
+     SandBox::SandBoxResult result;
+     try {
+-        ExecutionState state(m_context);
+-        result.result = scriptRunner(state, data);
+-    } catch (const Value& err) {
+-        processCatch(err, result);
++        try {
++            ExecutionState state(m_context);
++            result.result = scriptRunner(state, data);
++        } catch (const Value& err) {
++            // Exception formatting can itself execute script and terminate.
++            processCatch(err, result);
++        }
++    } catch (const ExecutionTermination&) {
++        if (!m_catchesExecutionTermination) {
++            throw;
++        }
++        result.result = Value();
++        result.error = Value(Value::EmptyValue);
++        result.stackTrace.clear();
++        result.wasTerminated = true;
++#ifdef ESCARGOT_DEBUGGER
++        m_context->setStoppingOnExceptionInProgress(false);
++#endif
++        // A protected host boundary owns the outcome. The unchanged host deadline is polled again before JS resumes.
++        m_context->vmInstance()->clearExecutionTermination();
+     }
+     return result;
+ }
+@@ -129,10 +149,26 @@ SandBox::SandBoxResult SandBox::run(ExecutionState& parentState, Value (*runner)
+ {
+     SandBox::SandBoxResult result;
+     try {
+-        ExecutionState state(m_context, &parentState, reinterpret_cast<LexicalEnvironment*>(NULL), 0, nullptr, false);
+-        result.result = runner(state, data);
+-    } catch (const Value& err) {
+-        processCatch(err, result);
++        try {
++            ExecutionState state(m_context, &parentState, reinterpret_cast<LexicalEnvironment*>(NULL), 0, nullptr, false);
++            result.result = runner(state, data);
++        } catch (const Value& err) {
++            // Exception formatting can itself execute script and terminate.
++            processCatch(err, result);
++        }
++    } catch (const ExecutionTermination&) {
++        if (!m_catchesExecutionTermination) {
++            throw;
++        }
++        result.result = Value();
++        result.error = Value(Value::EmptyValue);
++        result.stackTrace.clear();
++        result.wasTerminated = true;
++#ifdef ESCARGOT_DEBUGGER
++        m_context->setStoppingOnExceptionInProgress(false);
++#endif
++        // A protected host boundary owns the outcome. The unchanged host deadline is polled again before JS resumes.
++        m_context->vmInstance()->clearExecutionTermination();
+     }
+     return result;
+ }
+diff --git a/src/runtime/SandBox.h b/src/runtime/SandBox.h
+index 1b687ed..cd748cb 100644
+--- a/src/runtime/SandBox.h
++++ b/src/runtime/SandBox.h
+@@ -98,12 +98,13 @@ class SandBox : public gc {
+     friend class ErrorObject;
+ 
+ public:
+-    explicit SandBox(Context* s);
++    explicit SandBox(Context* s, bool catchesExecutionTermination = false);
+     ~SandBox();
+ 
+     struct SandBoxResult {
+         Value result;
+         Value error;
++        bool wasTerminated = false;
+         StackTraceDataOnStackVector stackTrace;
+ 
+         SandBoxResult()
+@@ -136,6 +137,7 @@ protected:
+     void fillStackDataIntoErrorObject(const Value& e);
+ 
+ private:
++    bool m_catchesExecutionTermination;
+     Context* m_context;
+     SandBox* m_oldSandBox;
+     StackTraceDataOnStackVector m_stackTraceDataVector;
+diff --git a/src/runtime/VMInstance.h b/src/runtime/VMInstance.h
+index 69da9c2..91f39fb 100644
+--- a/src/runtime/VMInstance.h
++++ b/src/runtime/VMInstance.h
+@@ -30,6 +30,10 @@
+ 
+ namespace Escargot {
+ 
++// This is not an ECMAScript Value and must bypass script handlers and Promise rejection conversion.
++struct ExecutionTermination { };
++
++
+ class Context;
+ class CodeBlock;
+ class JobQueue;
+@@ -537,12 +541,48 @@ public:
+     }
+ #endif
+ 
++    // Owner-thread configuration; callback data is borrowed until the host clears the hook.
++    void setExecutionTerminationCallback(bool (*callback)(void*), void* data)
++    {
++        m_executionTerminationCallback = callback;
++        m_executionTerminationData = data;
++        m_executionTerminationCountdown = 1;
++    }
++
++    void checkExecutionTermination(bool force = false)
++    {
++        if (UNLIKELY(m_executionTerminated)) {
++            throw ExecutionTermination();
++        }
++        if (!m_executionTerminationCallback) {
++            return;
++        }
++        if (!force && --m_executionTerminationCountdown != 0) {
++            return;
++        }
++        m_executionTerminationCountdown = 1024;
++        if (m_executionTerminationCallback(m_executionTerminationData)) {
++            m_executionTerminated = true;
++            throw ExecutionTermination();
++        }
++    }
++
++    void clearExecutionTermination()
++    {
++        m_executionTerminated = false;
++        m_executionTerminationCountdown = 1;
++    }
++
+ private:
+     StaticStrings m_staticStrings;
+     AtomicStringMap m_atomicStringMap;
+     GlobalSymbols m_globalSymbols;
+     GlobalSymbolRegistryVector m_globalSymbolRegistry;
+     SandBox* m_currentSandBox;
++    bool (*m_executionTerminationCallback)(void*) = nullptr;
++    void* m_executionTerminationData = nullptr;
++    uint32_t m_executionTerminationCountdown = 1;
++    bool m_executionTerminated = false;
+ 
+     bool m_isFinalized;
+     bool m_inIdleMode;

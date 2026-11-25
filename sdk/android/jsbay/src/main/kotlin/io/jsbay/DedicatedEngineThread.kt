@@ -2,6 +2,7 @@ package io.jsbay
 
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 open class DedicatedEngineThreadTimeoutException(
@@ -16,7 +17,7 @@ enum class DedicatedEngineThreadState {
     FAILED,
 }
 
-/** One [Engine] owned by a dedicated Looper thread. Matches the multi-instance host pattern: one owner thread per instance id, never the process main/UI thread. Construct with [start], post work with [post], and [close] on any thread (close runs on the owner thread). */
+/** One [Engine] owned by a dedicated Looper thread. Matches the multi-instance host pattern: one owner thread per instance id, never the process main/UI thread. Construct with [start], post work with [post], and request [close] on any thread (nonblocking; creator drain completes teardown). */
 class DedicatedEngineThread private constructor(
     val id: Int,
     private val thread: Thread,
@@ -29,7 +30,6 @@ class DedicatedEngineThread private constructor(
     private var isExecutingJob = false
     private var shutdownInterruptedJob = false
     private var shutdownError: Throwable? = null
-    private val shutdownLatch = CountDownLatch(1)
 
     /** Returns the current lifecycle state of the dedicated engine thread. */
     val lifecycleState: DedicatedEngineThreadState
@@ -39,7 +39,7 @@ class DedicatedEngineThread private constructor(
     val isClosing: Boolean
         get() = lifecycleState == DedicatedEngineThreadState.CLOSING
 
-    /** Indicates whether the dedicated engine thread has completely shut down. */
+    /** Indicates a terminal SDK lifecycle state (CLOSED or FAILED). FAILED does not certify native reclamation; inspect [closeStatus] separately. */
     val isClosed: Boolean
         get() =
             when (lifecycleState) {
@@ -74,7 +74,7 @@ class DedicatedEngineThread private constructor(
                             isExecutingJob = false
                             if (shutdownInterruptedJob) {
                                 shutdownInterruptedJob = false
-                                engineRef.get()?.clearInterrupt()
+                                engineRef.get()?.clearJobInterrupt()
                             }
                         }
                     }
@@ -140,128 +140,129 @@ class DedicatedEngineThread private constructor(
     /** Sets the memory limit in bytes. Must run on the owner thread. */
     fun setMemoryLimit(bytes: Long): Boolean = runOnOwner { it.setMemoryLimit(bytes) }
 
+    /** Explicit bounded compatibility wait. Never call from a requester that the creator is joining; prefer requestClose. Timeout is not completion. */
     fun close(timeoutMillis: Long) {
+        require(timeoutMillis > 0) { "A positive close timeout is required" }
+        synchronized(lock) { shutdownError?.let { throw it } }
         if (Thread.currentThread() === thread) {
-            // Reentrant or inline close from owner thread: execute shutdown directly.
-            try {
-                val current = engineRef.get()
-                current?.close()
-                engineRef.compareAndSet(current, null)
-                synchronized(lock) {
-                    if (state == DedicatedEngineThreadState.RUNNING) {
-                        state = DedicatedEngineThreadState.CLOSING
-                    }
-                }
-            } catch (t: Throwable) {
-                synchronized(lock) {
-                    shutdownError = t
-                    state = DedicatedEngineThreadState.FAILED
-                }
-                throw t
-            } finally {
-                LoopDriver.quitCurrentLooperSafely()
+            close()
+            if (closeStatus() != CloseStatus.COMPLETE) {
+                throw DedicatedEngineThreadTimeoutException(
+                    "Creator callback cannot wait for its own drain; destruction pending",
+                )
             }
             return
         }
-
-        val current = engineRef.get()
-        synchronized(lock) {
-            when (state) {
-                DedicatedEngineThreadState.CLOSED, DedicatedEngineThreadState.FAILED -> {
-                    shutdownError?.let { throw it }
-                    return
-                }
-                DedicatedEngineThreadState.CLOSING -> {
-                    if (isExecutingJob && !shutdownInterruptedJob) {
-                        current?.requestInterrupt()
-                        shutdownInterruptedJob = true
-                    }
-                }
-                DedicatedEngineThreadState.RUNNING -> {
-                    state = DedicatedEngineThreadState.CLOSING
-                    if (current != null) {
-                        if (isExecutingJob) {
-                            current.requestInterrupt()
-                            shutdownInterruptedJob = true
-                        }
-                        val posted =
-                            postInternal {
-                                try {
-                                    if (engineRef.get() === current) {
-                                        current.close()
-                                        engineRef.compareAndSet(current, null)
-                                    }
-                                } catch (t: Throwable) {
-                                    synchronized(lock) {
-                                        if (shutdownError == null) {
-                                            shutdownError = t
-                                        }
-                                        state = DedicatedEngineThreadState.FAILED
-                                    }
-                                } finally {
-                                    LoopDriver.quitCurrentLooperSafely()
-                                }
-                            }
-                        if (!posted) {
-                            if (state != DedicatedEngineThreadState.CLOSED &&
-                                state != DedicatedEngineThreadState.FAILED
-                            ) {
-                                state = DedicatedEngineThreadState.RUNNING
-                            }
-                            throw JsBayException(Status.INSTANCE_NOT_FOUND)
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!shutdownLatch.await(timeoutMillis, TimeUnit.MILLISECONDS)) {
-            current?.cancel()
-            throw DedicatedEngineThreadTimeoutException("Timed out waiting for dedicated engine thread shutdown")
-        }
-        shutdownError?.let { throw it }
-        thread.join(timeoutMillis)
-    }
-
-    private fun onOwnerLoopExited(loopError: Throwable? = null) {
-        val lingeringEngine: Engine? =
+        val budget = TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        val started = System.nanoTime()
+        val done = CountDownLatch(1)
+        val error = AtomicReference<Throwable?>(null)
+        val posted =
             synchronized(lock) {
-                val current = engineRef.get()
-                if (current != null) {
-                    engineRef.set(null)
-                }
                 if (state == DedicatedEngineThreadState.RUNNING) {
                     state = DedicatedEngineThreadState.CLOSING
                 }
-                current
-            }
-        var closeError: Throwable? = loopError
-        if (lingeringEngine != null) {
-            try {
-                lingeringEngine.close()
-            } catch (t: Throwable) {
-                if (closeError == null) {
-                    closeError = t
+                val current = engineRef.get()
+                if (isExecutingJob && current != null) {
+                    current.requestInterrupt()
+                    shutdownInterruptedJob = true
                 }
+                postInternal {
+                    try {
+                        close()
+                    } catch (failure: Throwable) {
+                        error.set(failure)
+                    } finally {
+                        done.countDown()
+                    }
+                }
+            }
+        if (!posted) {
+            if (closeStatus() != CloseStatus.COMPLETE) {
+                requestClose()
+                throw DedicatedEngineThreadTimeoutException("Owner unavailable; destruction pending")
+            }
+        }
+        val remaining = budget - (System.nanoTime() - started)
+        if (posted && (remaining <= 0 || !done.await(remaining, TimeUnit.NANOSECONDS))) {
+            requestClose()
+            throw DedicatedEngineThreadTimeoutException(
+                "Timed out awaiting creator drain; completion is not acknowledged",
+            )
+        }
+        error.get()?.let { throw it }
+        val joinRemaining = budget - (System.nanoTime() - started)
+        if (joinRemaining > 0 && thread.isAlive) {
+            thread.join(joinRemaining / 1_000_000, (joinRemaining % 1_000_000).toInt())
+        }
+        synchronized(lock) { shutdownError?.let { throw it } }
+        if (thread.isAlive || closeStatus() != CloseStatus.COMPLETE) {
+            throw DedicatedEngineThreadTimeoutException("Creator drain or thread-exit acknowledgement pending")
+        }
+    }
+
+    private val closePosted = AtomicBoolean(false)
+
+    /** Nonblocking on every thread. A stopped owner leaves the native generation pending. */
+    fun requestClose(): CloseStatus {
+        synchronized(lock) {
+            if (state == DedicatedEngineThreadState.RUNNING) {
+                state = DedicatedEngineThreadState.CLOSING
+            }
+        }
+        val current = engineRef.get() ?: return CloseStatus.COMPLETE
+        val status = current.requestClose()
+        if (closePosted.compareAndSet(false, true)) {
+            if (!postInternal {
+                    closePosted.set(false)
+                    finishClose(current)
+                }
+            ) {
+                closePosted.set(false)
+            }
+        }
+        return status
+    }
+
+    /** Data-only VM progress, not proof that the Looper thread has exited. */
+    fun closeStatus(): CloseStatus = engineRef.get()?.closeStatus() ?: CloseStatus.COMPLETE
+
+    private fun finishClose(current: Engine) {
+        if (current.drainClose() == CloseStatus.COMPLETE) {
+            engineRef.compareAndSet(current, null)
+            LoopDriver.quitCurrentLooperSafely()
+        }
+    }
+
+    /** Migration: close requests asynchronously; use closeStatus, never block the creator joining a requester. */
+    override fun close() {
+        val current = engineRef.get() ?: return
+        requestClose()
+        if (Thread.currentThread() === thread) finishClose(current)
+    }
+
+    private fun onOwnerLoopExited(loopError: Throwable? = null) {
+        val current = engineRef.get()
+        var closeError = loopError
+        var complete = current == null
+        if (current != null) {
+            try {
+                current.requestClose()
+                complete = current.drainClose() == CloseStatus.COMPLETE
+                if (complete) engineRef.compareAndSet(current, null)
+            } catch (failure: Throwable) {
+                if (closeError == null) closeError = failure
             }
         }
         synchronized(lock) {
-            if (state != DedicatedEngineThreadState.FAILED) {
-                if (closeError != null) {
-                    shutdownError = closeError
-                    state = DedicatedEngineThreadState.FAILED
-                } else {
-                    state = DedicatedEngineThreadState.CLOSED
-                }
-            } else if (shutdownError == null && closeError != null) {
-                shutdownError = closeError
+            if (closeError != null) {
+                if (shutdownError == null) shutdownError = closeError
+                state = DedicatedEngineThreadState.FAILED
+            } else if (state != DedicatedEngineThreadState.FAILED) {
+                // Never erase a PENDING generation just because its Looper exited.
+                state = if (complete) DedicatedEngineThreadState.CLOSED else DedicatedEngineThreadState.CLOSING
             }
         }
-        shutdownLatch.countDown()
-    }
-
-    override fun close() {
-        close(30_000L)
     }
 
     companion object {

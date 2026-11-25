@@ -190,6 +190,7 @@ public final class JavaConsumer {
         "Java status-only exception constructor");
     final int mainInstanceId = 7101;
     try (Engine engine = new Engine(mainInstanceId)) {
+      require(engine.setEventHandler(null), "Java creator thread can update native event handler");
       rejected(
           () -> new Engine(mainInstanceId),
           io.jsbay.Status.INVALID_ARGUMENT,

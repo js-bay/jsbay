@@ -1,0 +1,141 @@
+diff --git a/src/parser/Script.cpp b/src/parser/Script.cpp
+index 5bdbd06c..9b37adae 100644
+--- a/src/parser/Script.cpp
++++ b/src/parser/Script.cpp
+@@ -1102,9 +1102,9 @@ Value Script::moduleInitializeEnvironment(ExecutionState& state)
+                 // Call env.InitializeBinding(in.[[LocalName]], namespace).
+                 moduleRecord->initializeBinding(state, in.m_localName, namespaceObject);
+             } else {
+-                ASSERT(std::get<0>(resolution.m_record.value())->moduleData()->m_moduleRecord != nullptr);
++                // Retain the module identity: its environment can still be absent while linking a cycle.
+                 // Call envRec.CreateImportBinding(in.[[LocalName]], resolution.[[module]], resolution.[[bindingName]]).
+-                moduleRecord->createImportBinding(state, in.m_localName, std::get<0>(resolution.m_record.value())->moduleData()->m_moduleRecord, std::get<1>(resolution.m_record.value()));
++                moduleRecord->createImportBinding(state, in.m_localName, std::get<0>(resolution.m_record.value()), std::get<1>(resolution.m_record.value()));
+             }
+         }
+     }
+diff --git a/src/runtime/EnvironmentRecord.cpp b/src/runtime/EnvironmentRecord.cpp
+index 2b8e475f..91545350 100644
+--- a/src/runtime/EnvironmentRecord.cpp
++++ b/src/runtime/EnvironmentRecord.cpp
+@@ -26,6 +26,7 @@
+ #include "runtime/GlobalObject.h"
+ #include "runtime/ModuleNamespaceObject.h"
+ #include "parser/CodeBlock.h"
++#include "parser/Script.h"
+ 
+ namespace Escargot {
+ 
+@@ -473,7 +474,7 @@ void ModuleEnvironmentRecord::createBinding(ExecutionState& state, const AtomicS
+     record.m_localName = name;
+     record.m_isMutable = isMutable;
+     record.m_isVarDeclaration = isVarDeclaration;
+-    record.m_targetRecord = nullptr;
++    record.m_targetModule = nullptr;
+     record.m_value = isVarDeclaration ? Value() : Value(Value::EmptyValue);
+     m_moduleBindings.pushBack(record);
+ }
+@@ -482,7 +483,7 @@ void ModuleEnvironmentRecord::initializeBinding(ExecutionState& state, const Ato
+ {
+     for (size_t i = 0; i < m_moduleBindings.size(); i++) {
+         if (m_moduleBindings[i].m_localName == name) {
+-            ASSERT(m_moduleBindings[i].m_targetRecord == nullptr);
++            ASSERT(m_moduleBindings[i].m_targetModule == nullptr);
+             m_moduleBindings[i].m_value = V;
+             return;
+         }
+@@ -505,21 +506,21 @@ void ModuleEnvironmentRecord::setMutableBinding(ExecutionState& state, const Ato
+ 
+ void ModuleEnvironmentRecord::setMutableBindingByBindingSlot(ExecutionState& state, const BindingSlot& slot, const AtomicString& name, const Value& v)
+ {
+-    ASSERT(m_moduleBindings[slot.m_index].m_targetRecord == nullptr);
++    ASSERT(m_moduleBindings[slot.m_index].m_targetModule == nullptr);
+     writeCheck(state, slot.m_index);
+     m_moduleBindings[slot.m_index].m_value = v;
+ }
+ 
+ void ModuleEnvironmentRecord::setMutableBindingByIndex(ExecutionState& state, const size_t i, const Value& v)
+ {
+-    ASSERT(m_moduleBindings[i].m_targetRecord == nullptr);
++    ASSERT(m_moduleBindings[i].m_targetModule == nullptr);
+     writeCheck(state, i);
+     m_moduleBindings[i].m_value = v;
+ }
+ 
+ void ModuleEnvironmentRecord::initializeBindingByIndex(ExecutionState& state, const size_t idx, const Value& v)
+ {
+-    ASSERT(m_moduleBindings[idx].m_targetRecord == nullptr);
++    ASSERT(m_moduleBindings[idx].m_targetModule == nullptr);
+     m_moduleBindings[idx].m_value = v;
+ }
+ 
+@@ -528,8 +529,8 @@ EnvironmentRecord::GetBindingValueResult ModuleEnvironmentRecord::getBindingValu
+     size_t len = m_moduleBindings.size();
+     for (size_t i = 0; i < len; i++) {
+         if (m_moduleBindings[i].m_localName == name) {
+-            if (m_moduleBindings[i].m_targetRecord) {
+-                return m_moduleBindings[i].m_targetRecord->getBindingValue(state, m_moduleBindings[i].m_targetBindingName);
++            if (m_moduleBindings[i].m_targetModule) {
++                return m_moduleBindings[i].m_targetModule->moduleData()->m_moduleRecord->getBindingValue(state, m_moduleBindings[i].m_targetBindingName);
+             } else {
+                 readCheck(state, i);
+                 return GetBindingValueResult(m_moduleBindings[i].m_value);
+@@ -542,21 +543,21 @@ EnvironmentRecord::GetBindingValueResult ModuleEnvironmentRecord::getBindingValu
+ void ModuleEnvironmentRecord::setHeapValueByIndex(ExecutionState& state, const size_t idx, const Value& v)
+ {
+     writeCheck(state, idx);
+-    ASSERT(m_moduleBindings[idx].m_targetRecord == nullptr);
++    ASSERT(m_moduleBindings[idx].m_targetModule == nullptr);
+     m_moduleBindings[idx].m_value = v;
+ }
+ 
+ Value ModuleEnvironmentRecord::getHeapValueByIndex(ExecutionState& state, const size_t i)
+ {
+-    if (m_moduleBindings[i].m_targetRecord) {
+-        return m_moduleBindings[i].m_targetRecord->getBindingValue(state, m_moduleBindings[i].m_targetBindingName).m_value;
++    if (m_moduleBindings[i].m_targetModule) {
++        return m_moduleBindings[i].m_targetModule->moduleData()->m_moduleRecord->getBindingValue(state, m_moduleBindings[i].m_targetBindingName).m_value;
+     } else {
+         readCheck(state, i);
+         return m_moduleBindings[i].m_value;
+     }
+ }
+ 
+-void ModuleEnvironmentRecord::createImportBinding(ExecutionState& state, AtomicString localName, ModuleEnvironmentRecord* targetRecord, AtomicString targetBindingName)
++void ModuleEnvironmentRecord::createImportBinding(ExecutionState& state, AtomicString localName, Script* targetModule, AtomicString targetBindingName)
+ {
+     // Let envRec be the module Environment Record for which the method was invoked.
+     // Assert: envRec does not already have a binding for N.
+@@ -567,8 +568,8 @@ void ModuleEnvironmentRecord::createImportBinding(ExecutionState& state, AtomicS
+     size_t len = m_moduleBindings.size();
+     for (size_t i = 0; i < len; i++) {
+         if (m_moduleBindings[i].m_localName == localName) {
+-            ASSERT(m_moduleBindings[i].m_targetRecord == nullptr);
+-            m_moduleBindings[i].m_targetRecord = targetRecord;
++            ASSERT(m_moduleBindings[i].m_targetModule == nullptr);
++            m_moduleBindings[i].m_targetModule = targetModule;
+             m_moduleBindings[i].m_targetBindingName = targetBindingName;
+             return;
+         }
+diff --git a/src/runtime/EnvironmentRecord.h b/src/runtime/EnvironmentRecord.h
+index 94bb9ad3..d3995701 100644
+--- a/src/runtime/EnvironmentRecord.h
++++ b/src/runtime/EnvironmentRecord.h
+@@ -1254,7 +1254,7 @@ public:
+         bool m_isVarDeclaration;
+         AtomicString m_localName;
+         EncodedValue m_value;
+-        ModuleEnvironmentRecord* m_targetRecord;
++        Script* m_targetModule;
+         AtomicString m_targetBindingName;
+     };
+ 
+@@ -1314,7 +1314,7 @@ public:
+         return GC_MALLOC_EXPLICITLY_TYPED(size, descr);
+     }
+ 
+-    void createImportBinding(ExecutionState& state, AtomicString localName, ModuleEnvironmentRecord* targetRecord, AtomicString targetBindingName);
++    void createImportBinding(ExecutionState& state, AtomicString localName, Script* targetModule, AtomicString targetBindingName);
+ 
+ protected:
+     const ModuleBindingRecordVector& moduleBindings()

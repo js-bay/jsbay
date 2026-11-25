@@ -76,6 +76,7 @@ fn jsClearTimer(ctx: ?*c_api.Context, _: Value, args: ?[*]const Value, argc: usi
 fn jsReportUncaughtMicrotask(ctx: ?*c_api.Context, _: Value, args: ?[*]const Value, argc: usize, _: ?*anyopaque) callconv(.c) Value {
     const c = ctx orelse return null;
     if (argc > 0 and args != null) {
+        @import("exception.zig").reportAsyncUncaught(c, instanceIdFromCtx(c), args.?[0]);
         if (value_mod.valueToStringAlloc(std.heap.c_allocator, c, args.?[0])) |message| {
             defer std.heap.c_allocator.free(message);
             @import("../../inspector/root.zig").exceptions.reportUncaught(instanceIdFromCtx(c), message, "");

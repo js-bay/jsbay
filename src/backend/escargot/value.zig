@@ -55,6 +55,15 @@ pub fn isConstructor(ctx: Context, v: Value) bool {
 pub fn sameValue(ctx: Context, a: Value, b: Value) bool {
     return c_api.escargot_strict_equal(ctx, a, b);
 }
+
+/// Heap ValueRef* is stable object identity (retain returns the same pointer).
+/// A null handle is not an object; 0 is reserved as "unnamed".
+pub fn objectIdentity(_: Context, v: Value) ?u64 {
+    if (v == null) return null;
+    const p = @intFromPtr(v);
+    return if (p == 0) null else p;
+}
+
 pub fn strictEqual(ctx: Context, a: Value, b: Value) bool {
     return c_api.escargot_strict_equal(ctx, a, b);
 }
@@ -264,4 +273,15 @@ pub fn makeFunction(ctx: Context, name: []const u8, fn_ptr: c_api.NativeFn, user
     @memcpy(buf[0..name.len], name);
     buf[name.len] = 0;
     return c_api.escargot_make_function(ctx, @ptrCast(&buf), fn_ptr, user_data);
+}
+
+pub fn callFunctionNoArgsObserved(ctx: Context, fn_val: Value, instance_id: i32) ?[]const u8 {
+    const result = c_api.escargot_call_result(ctx, fn_val, null, null, 0);
+    defer freeValue(ctx, result.value);
+    defer freeValue(ctx, result.exception);
+    if (result.exception) |reason| {
+        @import("exception.zig").reportAsyncUncaught(ctx, instance_id, reason);
+        return valueToStringAlloc(std.heap.c_allocator, ctx, reason);
+    }
+    return null;
 }

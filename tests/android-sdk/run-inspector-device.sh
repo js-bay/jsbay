@@ -13,9 +13,18 @@ mkdir -p "$OUT/classes" "$OUT/dex"
 KOTLIN_STDLIB="$(find "$GRADLE_LIB" -maxdepth 1 -name 'kotlin-stdlib-*.jar' -print -quit)"
 KOTLIN_ANNOTATIONS="$(find "$GRADLE_LIB" -maxdepth 1 -name 'annotations-*.jar' -print -quit)"
 test -f "$KOTLIN_STDLIB" && test -f "$KOTLIN_ANNOTATIONS"
+SDK_JAR="${JSBAY_ANDROID_CLASSES_JAR:-}"
+SOURCES=("$ROOT/tests/android-sdk/InspectorMain.kt")
+SDK_INPUTS=()
+if [ -n "$SDK_JAR" ]; then
+    test -f "$SDK_JAR"
+    SDK_INPUTS=("$SDK_JAR")
+else
+    SOURCES=("$ROOT"/sdk/android/jsbay/src/main/kotlin/io/jsbay/*.kt "${SOURCES[@]}")
+fi
 "$JDK_HOME/bin/java" -cp "$GRADLE_LIB/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib \
-    -classpath "$SDK_ROOT/platforms/android-35/android.jar:$KOTLIN_STDLIB:$KOTLIN_ANNOTATIONS" \
-    -d "$OUT/classes" "$ROOT"/sdk/android/jsbay/src/main/kotlin/io/jsbay/*.kt "$ROOT/tests/android-sdk/InspectorMain.kt"
+    -classpath "$SDK_ROOT/platforms/android-35/android.jar:$KOTLIN_STDLIB:$KOTLIN_ANNOTATIONS:$SDK_JAR" \
+    -d "$OUT/classes" "${SOURCES[@]}"
 "$JDK_HOME/bin/jar" --create --file "$OUT/inspector.jar" -C "$OUT/classes" .
-"$BUILD_TOOLS/d8" --min-api 24 --output "$OUT/dex" "$OUT/inspector.jar" "$KOTLIN_STDLIB" "$KOTLIN_ANNOTATIONS"
+"$BUILD_TOOLS/d8" --min-api 24 --output "$OUT/dex" "$OUT/inspector.jar" "${SDK_INPUTS[@]}" "$KOTLIN_STDLIB" "$KOTLIN_ANNOTATIONS"
 node "$ROOT/tests/inspector/android_driver.cjs" "$JNI_LIBS" "$OUT/dex/classes.dex"

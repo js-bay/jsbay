@@ -18,10 +18,15 @@ pub fn newContext(rt: Runtime) ?Context {
 }
 
 pub fn freeContext(ctx: Context) void {
+    // Thread registration does not remove Context thread affinity; the engine frees contexts only on their creating thread.
+    c_api.escargot_thread_enter();
+    defer c_api.escargot_thread_leave();
     c_api.escargot_context_free(ctx);
 }
 
 pub fn freeRuntime(rt: Runtime) void {
+    c_api.escargot_thread_enter();
+    defer c_api.escargot_thread_leave();
     c_api.escargot_runtime_free(rt);
 }
 
@@ -39,6 +44,12 @@ fn shouldStopPendingJobDrain(instance_id: i32) bool {
 /// C bridge job drains call this between `executePendingJob` so stop/budget can finish joining the engine thread.
 export fn jsbay_escargot_should_stop_pending_job_drain(instance_id: c_int) callconv(.c) bool {
     return shouldStopPendingJobDrain(@intCast(instance_id));
+}
+
+/// Poll execution deadlines only; unsupported user-interrupt and lifecycle-stop APIs retain their existing capability contract.
+export fn jsbay_escargot_should_terminate_execution(instance_id: c_int) callconv(.c) bool {
+    const control = @import("../../runtime/runtime_control.zig");
+    return if (control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| remaining == 0 else false;
 }
 
 pub fn processPendingJobs(ctx: Context) void {

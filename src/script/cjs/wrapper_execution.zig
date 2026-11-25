@@ -40,6 +40,34 @@ pub fn invoke(ctx: ActiveEngine.Context, wrapper_fn: ActiveEngine.Value, require
 }
 
 fn callWrapper(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []const ActiveEngine.Value, exception_sink: ExceptionSink) error{CallFailed}!ActiveEngine.Value {
+    if (comptime backend.isHermesBackend(backend.active_backend)) {
+        // hermes_call only keeps an error string. hermes_call_result preserves the thrown JS value (including non-Error / undefined) so require() can rethrow with identity.
+        const c_api = @import("../../backend/hermes/c_api.zig");
+        const result = c_api.hermes_call_result(
+            ctx,
+            function,
+            ActiveEngine.undefinedValue(),
+            if (args.len > 0) args.ptr else null,
+            args.len,
+        );
+        if (result.exception != null) {
+            exception_sink(ctx, result.exception);
+            if (result.value != null) ActiveEngine.freeValue(ctx, result.value);
+            return error.CallFailed;
+        }
+        if (result.value == null) return ActiveEngine.newUndefinedVal(ctx);
+        return result.value;
+    }
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        const c_api = @import("../../backend/escargot/c_api.zig");
+        const result = c_api.escargot_call_result(ctx, function, ActiveEngine.undefinedValue(), if (args.len > 0) args.ptr else null, args.len);
+        if (result.exception != null) {
+            exception_sink(ctx, result.exception);
+            if (result.value != null) ActiveEngine.freeValue(ctx, result.value);
+            return error.CallFailed;
+        }
+        return if (result.value == null) ActiveEngine.newUndefinedVal(ctx) else result.value;
+    }
     if (comptime backend.active_backend == .jsc) {
         const jsc = @import("../../backend/jsc.zig").jsc;
         const ctx_ref: jsc.JSContextRef = @ptrCast(ctx);
@@ -133,7 +161,32 @@ pub fn readFinalExports(
         jsc.JSValueProtect(ctx_ref, val);
         return val;
     }
-    // Hermes and Escargot use the optional-property helper: return its value when present, otherwise duplicate the initial exports value. This path has no separate error result for accessor failure.
+    if (comptime backend.isHermesBackend(backend.active_backend)) {
+        // getPropertyVal treats undefined as missing and swallows accessor exceptions. Use the
+        // result API so `module.exports = undefined`, a deleted property, and a throwing getter
+        // stay distinct; the thrown value is handed to the sink for identity-preserving rethrow.
+        const c_api = @import("../../backend/hermes/c_api.zig");
+        const result = c_api.hermes_get_property_result(ctx, module_obj, "exports");
+        if (result.exception != null) {
+            exception_sink(ctx, result.exception);
+            if (result.value != null) ActiveEngine.freeValue(ctx, result.value);
+            return error.CallFailed;
+        }
+        if (result.value == null) return ActiveEngine.newUndefinedVal(ctx);
+        return result.value;
+    }
+    if (comptime backend.isEscargotBackend(backend.active_backend)) {
+        // Same contract as Hermes: getPropertyVal maps undefined to missing and can swallow a throwing exports getter. The existing result API keeps those cases distinct.
+        const c_api = @import("../../backend/escargot/c_api.zig");
+        const result = c_api.escargot_get_property_result(ctx, module_obj, "exports");
+        if (result.exception != null) {
+            exception_sink(ctx, result.exception);
+            if (result.value != null) ActiveEngine.freeValue(ctx, result.value);
+            return error.CallFailed;
+        }
+        if (result.value == null) return ActiveEngine.newUndefinedVal(ctx);
+        return result.value;
+    }
     return ActiveEngine.getPropertyVal(ctx, module_obj, "exports") orelse
         ActiveEngine.dupValue(ctx, fallback_exports);
 }

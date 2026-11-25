@@ -193,10 +193,11 @@ pub fn build(b: *std.Build) void {
     const stress_tests = b.option(bool, "stress-tests", "Run tests whose names include stress, including high-load event-loop and timer tests") orelse false;
     // Test-only: exports jsbay_test_trigger_native_fault. NEVER enable for publish / library-only ReleaseFast product builds.
     const fault_injection = b.option(bool, "fault-injection", "Export test-only native fault probe (jsbay_test_trigger_native_fault); default OFF") orelse false;
-    const asan = b.option(bool, "asan", "Compile QuickJS/NG C sources with -fsanitize=address for harsh ASan consumers") orelse false;
+    const asan = b.option(bool, "asan", "Instrument QuickJS/NG C with -fsanitize=address; on host linux-x86_64, also link GCC libasan (Zig 0.17 ships no ASan RT)") orelse false;
     const apple_package = b.option(bool, "apple-package", "Build a stripped Apple XCFramework library without Zig error tracing") orelse false;
     const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const android_sysroot = b.option([]const u8, "android-sysroot", "NDK sysroot whose usr/include provides Bionic headers");
+    const android_libc = b.option([]const u8, "android-libc", "NDK libc description for the Android library only, not host build tools");
     const android_lib_dir = b.option([]const u8, "android-lib-dir", "Directory of static stubs Zig can resolve while linking a static archive. The NDK clang step links the real Bionic libraries.");
     const ohos_sysroot = b.option([]const u8, "ohos-sysroot", "OpenHarmony native sysroot (the native/sysroot directory from the SDK)");
 
@@ -362,15 +363,15 @@ pub fn build(b: *std.Build) void {
             lib_module.addSystemIncludePath(.{
                 .cwd_relative = b.fmt("{s}/usr/include", .{sysroot}),
             });
-            // A real NDK libm.so in this path gets archived into the static library and corrupts the shared object. Callers pass a directory that contains a static stub instead.
-            if (android_lib_dir) |lib_dir| {
-                lib_module.addLibraryPath(.{ .cwd_relative = lib_dir });
-            } else {
+            // A real NDK libm.so must not be archived into the static library.
+            if (android_lib_dir == null) {
                 lib_module.addLibraryPath(.{
                     .cwd_relative = b.fmt("{s}/usr/lib/{s}/{d}", .{ sysroot, triple, api }),
                 });
             }
         }
+        // Static stubs are also valid with Zig's target headers; header selection must not discard the explicit link path.
+        if (android_lib_dir) |lib_dir| lib_module.addLibraryPath(.{ .cwd_relative = lib_dir });
     }
 
     if (ohos) {
@@ -402,6 +403,10 @@ pub fn build(b: *std.Build) void {
     });
     if (!shared and (os.isDarwin() or (os == .linux and !target.result.abi.isAndroid() and !ohos)))
         lib.bundle_compiler_rt = true;
+    if (android_libc) |libc| {
+        if (!target.result.abi.isAndroid()) std.process.fatal("-Dandroid-libc requires Android", .{});
+        lib.setLibCFile(.{ .cwd_relative = libc });
+    }
     b.installArtifact(lib);
 
     // Install C header
@@ -446,14 +451,53 @@ pub fn build(b: *std.Build) void {
     addPlatformCompatSources(b, test_module);
     addBackendSources(b, test_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
 
+    const android_test_libc = b.option([]const u8, "android-test-libc", "NDK libc description for the Android device test executable");
+    const android_test_libdir = b.option([]const u8, "android-test-libdir", "NDK link directory for the Android device test executable");
+    const android_test_probe_stack = b.option([]const u8, "android-test-probe-stack", "Stack probe object for Android Escargot tests using NDK compiler runtime");
+    if (android_test_libc != null and (os != .linux or target.result.abi != .android)) {
+        std.process.fatal("-Dandroid-test-libc requires an Android target", .{});
+    }
+    if ((android_test_libc == null) != (android_test_libdir == null)) {
+        std.process.fatal("-Dandroid-test-libc and -Dandroid-test-libdir must be provided together", .{});
+    }
+    if (android_test_probe_stack != null and (android_test_libc == null or backend != .escargot)) {
+        std.process.fatal("-Dandroid-test-probe-stack requires Android Escargot device tests", .{});
+    }
     const unit_tests = b.addTest(.{
+        // The self-hosted x86 backend emits native ELF TLS in Debug even for
+        // Android API 24. Bionic before API 29 requires emulated TLS; LLVM
+        // honors the target API and avoids writes into the read-only TCB page.
+        .use_llvm = if (android_test_libc != null) true else null,
         .root_module = test_module,
         .use_llvm = b.option(bool, "test-llvm", "Use LLVM for engine tests"),
         .filters = if (stress_tests) &.{"stress"} else if (test_filter) |filter| &.{filter} else &.{},
         .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
+        .test_runner = if (android_test_libc != null) .{ .path = b.path("scripts/android-unit-tests/android_test_runner.zig"), .mode = .simple } else null,
     });
+    if (android_test_libc) |libc| {
+        unit_tests.linkage = .dynamic;
+        unit_tests.pie = true;
+        test_module.addCSourceFile(.{ .file = b.path("scripts/android-unit-tests/android_phdr_compat.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+        unit_tests.setLibCFile(.{ .cwd_relative = libc });
+        test_module.addLibraryPath(.{ .cwd_relative = android_test_libdir.? });
+        if (backend == .escargot) {
+            const probe_stack = android_test_probe_stack orelse std.process.fatal("Android Escargot tests require -Dandroid-test-probe-stack", .{});
+            test_module.addObjectFile(.{ .cwd_relative = probe_stack });
+            for ([_][]const u8{ "c++abi", "log", "unwind", "clang_rt.builtins-x86_64-android" }) |name| {
+                test_module.linkSystemLibrary(name, .{ .use_pkg_config = .no });
+            }
+            unit_tests.bundle_compiler_rt = false;
+        }
+        const install_android_tests = b.addInstallFile(unit_tests.getEmittedBin(), "unit_tests");
+        b.step("android-test-compile", "Build and install official Android device tests without running them").dependOn(&install_android_tests.step);
+    }
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    if (asan) {
+        // Do not set detect_leaks=0 or halt_on_error=0: a silent ASan/UBSan pass is not a pass.
+        run_unit_tests.setEnvironmentVariable("ASAN_OPTIONS", "halt_on_error=1:abort_on_error=0:detect_leaks=1");
+        run_unit_tests.setEnvironmentVariable("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1");
+    }
     const test_step = b.step("test", "Run js-bay unit tests");
     test_step.dependOn(&run_unit_tests.step);
     b.step("test-engine", "Run engine tests without independent package suites").dependOn(&run_unit_tests.step);
@@ -989,6 +1033,9 @@ fn preparePatchedQuickJsNg(b: *std.Build, tool: *std.Build.Step.Compile) std.Bui
     run.addFileArg(b.path("vendor/quickjs-ng-debug-step.patch"));
     run.addFileArg(b.path("vendor/quickjs-ng-debug-eval-cache.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-unresolve-modules.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-pending-tla-module.patch"));
+    run.addFileArg(b.path("vendor/quickjs-ng-promise-interrupt.patch"));
     return out;
 }
 
@@ -1014,6 +1061,7 @@ fn preparePatchedQuickJs(b: *std.Build, tool: *std.Build.Step.Compile) std.Build
     run.addFileArg(b.path("vendor/quickjs-debug-receiver.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-step.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
+    run.addFileArg(b.path("vendor/quickjs-promise-interrupt.patch"));
     return out;
 }
 
@@ -1165,7 +1213,10 @@ fn addQuickJsCSources(
         .safe => "-O2",
         .fast, .small => "-O3",
     };
-    // ASan instruments QuickJS C and wrappers; the final consumer must link -fsanitize=address.
+    // ASan instruments QuickJS C and wrappers. Zig 0.17's bundled Clang does not ship
+    // libclang_rt.asan, so host linux-x86_64 consumers are linked against GCC libasan
+    // (ABI __asan_version_mismatch_check_v8). Other targets still require the consumer
+    // to link a matching ASan runtime; -Dasan is never silently ignored.
     const c_flags: []const []const u8 = blk: {
         if (asan and gc_stress)
             break :blk &.{ b.fmt("-DCONFIG_VERSION=\"{s}\"", .{version}), "-DFORCE_GC_AT_MALLOC=1", "-fwrapv", "-w", c_opt, "-fsanitize=address", "-fno-omit-frame-pointer" };
@@ -1182,6 +1233,39 @@ fn addQuickJsCSources(
         });
     }
     m.addIncludePath(qjs_root);
+    if (asan and hostLinuxX64CanLinkGccAsan(m)) linkHostLinuxAsanRuntime(b, m);
+}
+
+fn hostLinuxX64CanLinkGccAsan(m: *std.Build.Module) bool {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) return false;
+    const target = m.resolved_target orelse return false;
+    const r = target.result;
+    if (r.os.tag != .linux or r.cpu.arch != .x86_64) return false;
+    if (r.abi.isAndroid() or r.abi == .ohos or r.abi == .ohoseabi) return false;
+    return true;
+}
+
+/// Zig 0.17 / Clang 22 emit ASan hooks but do not ship an ASan runtime. Resolve GCC's libasan.so (SONAME libasan.so.8) via `gcc -print-file-name` and link it.
+///
+/// Missing toolchain is a hard build failure, never a silent disable.
+fn linkHostLinuxAsanRuntime(b: *std.Build, m: *std.Build.Module) void {
+    const printed = b.run(&.{ "gcc", "-print-file-name=libasan.so" });
+    const asan_so = std.mem.trim(u8, printed, " \t\r\n");
+    if (asan_so.len == 0 or std.mem.eql(u8, asan_so, "libasan.so") or !std.fs.path.isAbsolute(asan_so)) {
+        std.process.fatal("-Dasan=true: gcc -print-file-name=libasan.so did not yield an absolute library path (got '{s}'). Install GCC libasan (e.g. Debian libasan8) or a Clang-matching compiler-rt; refusing to silently disable ASan.", .{asan_so});
+    }
+    const dir = std.fs.path.dirname(asan_so) orelse std.process.fatal("-Dasan=true: cannot take dirname of '{s}'", .{asan_so});
+    // Static archive + preinit so libasan does not end up after libc in DT_NEEDED ("ASan runtime does not come first in initial library list"). Dynamic libasan.so.8 remains a documented LD_PRELOAD fallback, not used here.
+    const preinit = b.fmt("{s}/libasan_preinit.o", .{dir});
+    const archive = b.fmt("{s}/libasan.a", .{dir});
+    m.addObjectFile(.{ .cwd_relative = preinit });
+    m.addObjectFile(.{ .cwd_relative = archive });
+    m.addLibraryPath(.{ .cwd_relative = dir });
+    m.linkSystemLibrary("gcc_s", .{
+        .needed = true,
+        .use_pkg_config = .no,
+    });
 }
 
 fn addPlatformCompatSources(b: *std.Build, m: *std.Build.Module) void {
@@ -1244,6 +1328,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-dataview-native.patch"));
             hash.update(@embedFile("vendor/quickjs-heap-labels.patch"));
             hash.update(@embedFile("vendor/quickjs-promise-then.patch"));
+            hash.update(@embedFile("vendor/quickjs-promise-interrupt.patch"));
             hash.update(@embedFile("vendor/quickjs-inspector-off.patch"));
             hash.update(@embedFile("vendor/quickjs-transfer-neuter.patch"));
             hash.update(@embedFile("vendor/quickjs-error-stack-header.patch"));
@@ -1274,6 +1359,9 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-ng-debug-step.patch"));
             hash.update(@embedFile("vendor/quickjs-ng-debug-eval-cache.patch"));
             hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-unresolve-modules.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-pending-tla-module.patch"));
+            hash.update(@embedFile("vendor/quickjs-ng-promise-interrupt.patch"));
             hash.update(@embedFile("src/backend/quickjs_ng/qjs_wrapper_ng.c"));
             hash.update(@embedFile("src/backend/quickjs_ng/bytecode.zig"));
             hash.update(@embedFile("src/backend/quickjs_common/bytecode.zig"));

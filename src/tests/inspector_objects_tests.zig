@@ -190,16 +190,42 @@ fn waitForReply(
     needle: []const u8,
     timeout_ms: u64,
 ) !?Frame {
-    const deadline = io.monotonicMilliseconds() + @as(i64, @intCast(timeout_ms));
-    while (io.monotonicMilliseconds() < deadline) {
-        _ = dispatch.tickInstance(instance_id);
-        const frame_opt = try readFrameUntil(alloc, stream, 50, deadline);
+    var wait_ms = timeout_ms;
+    if (std.c.getenv("JSBAY_TEST_INSPECTOR_WAIT_MS")) |raw| {
+        if (std.fmt.parseInt(u64, std.mem.span(raw), 10)) |override_ms| {
+            if (override_ms > 0) wait_ms = override_ms;
+        } else |_| {}
+    }
+    const started = io.monotonicMilliseconds();
+    const deadline = started + @as(i64, @intCast(wait_ms));
+    // wait_ms is a poll / "start another tick" deadline, not a product guarantee
+    // that the CDP frame arrives within wait_ms. tickInstance may run a long
+    // CDP returnByValue synchronously and overrun the helper budget (measured
+    // ~10s on API35 TCG for a 1000-value chain with the default 3000). If a tick
+    // that started *before* the deadline completes after it, drain one already-
+    // ready frame (50ms cap). Do not start another tick once the deadline has
+    // passed; that would ignore the wait contract without bound.
+    // Official product execution budgets are asserted elsewhere. Do not raise
+    // this default to hide a slow walk, and leave JSBAY_TEST_INSPECTOR_WAIT_MS
+    // unset for official sign-off.
+    var may_tick = true;
+    while (true) {
+        const now = io.monotonicMilliseconds();
+        if (now >= deadline) may_tick = false;
+        if (may_tick) {
+            _ = dispatch.tickInstance(instance_id);
+            may_tick = io.monotonicMilliseconds() < deadline;
+        }
+        const after = io.monotonicMilliseconds();
+        const read_deadline = if (after >= deadline) after + 50 else deadline;
+        const frame_opt = try readFrameUntil(alloc, stream, 50, read_deadline);
         if (frame_opt) |frame| {
             if (frame.opcode == 0x1 and std.mem.indexOf(u8, frame.payload, needle) != null) {
                 return frame;
             }
             alloc.free(frame.payload);
         }
+        if (after >= deadline or !may_tick) break;
     }
     return null;
 }
@@ -424,8 +450,9 @@ test "inspector: Runtime.evaluate returnByValue rejects unsupported and cyclic v
     const s = try openSession(alloc, "objects-evaluate-return-by-value-errors");
     defer s.close();
 
-    const cases = [_]struct { id: u8, expression: []const u8, message: []const u8, code: []const u8 }{
-        .{ .id = 1, .expression = "(() => { const value = {}; value.self = value; return value; })()", .message = "Object reference chain is too long", .code = "\"code\":-32000" },
+    const cases = [_]struct { id: u8, expression: []const u8, message: []const u8, code: []const u8, data: ?[]const u8 = null, forbidden_data: ?[]const u8 = null, max_elapsed_ms: ?u64 = null }{
+        // Cycle must be distinguished from the 1000-value depth cap: both share the CDP message, so tests cannot pass on that string alone.
+        .{ .id = 1, .expression = "(() => { const value = {}; value.self = value; return value; })()", .message = "Object reference chain is too long", .code = "\"code\":-32000", .data = "\"data\":\"cycle\"", .forbidden_data = "\"data\":\"depth\"", .max_elapsed_ms = 4000 },
         .{ .id = 2, .expression = "({value:123n})", .message = "Object couldn't be returned by value", .code = "\"code\":-32000" },
         .{ .id = 3, .expression = "({value:Symbol('x')})", .message = "Object couldn't be returned by value", .code = "\"code\":-32000" },
         .{ .id = 4, .expression = "new Proxy({}, {ownKeys(){throw new Error('boom')}})", .message = "Internal error", .code = "\"code\":-32603" },
@@ -440,10 +467,22 @@ test "inspector: Runtime.evaluate returnByValue rejects unsupported and cyclic v
         try s.send(request);
         const marker = try std.fmt.allocPrint(alloc, "\"id\":{d}", .{case.id});
         defer alloc.free(marker);
+        const started = io.monotonicMilliseconds();
         const response = try s.wait(alloc, marker, 3000);
         defer alloc.free(response.payload);
+        const elapsed: u64 = @intCast(@max(@as(i64, 0), io.monotonicMilliseconds() - started));
         try testing.expect(std.mem.indexOf(u8, response.payload, case.message) != null);
         try testing.expect(std.mem.indexOf(u8, response.payload, case.code) != null);
+        if (case.data) |data| {
+            try testing.expect(std.mem.indexOf(u8, response.payload, data) != null);
+        }
+        if (case.forbidden_data) |data| {
+            try testing.expect(std.mem.indexOf(u8, response.payload, data) == null);
+        }
+        if (case.max_elapsed_ms) |limit| {
+            // A failed identity walk can still hit the 1000-depth cap and return the shared error text, so the cycle case is distinguished by the cycle data flag and by finishing well below that depth timeout.
+            try testing.expect(elapsed < limit);
+        }
     }
 
     try s.send("{\"id\":5,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"42\",\"returnByValue\":true}}");
@@ -472,6 +511,8 @@ test "inspector: returnByValue rejects a primitive leaf at the 1000-value depth 
         const response = try s.wait(alloc, marker, 3000);
         defer alloc.free(response.payload);
         try testing.expect(std.mem.indexOf(u8, response.payload, "Object reference chain is too long") != null);
+        try testing.expect(std.mem.indexOf(u8, response.payload, "\"data\":\"depth\"") != null);
+        try testing.expect(std.mem.indexOf(u8, response.payload, "\"data\":\"cycle\"") == null);
     }
 
     try s.send("{\"id\":3,\"method\":\"Runtime.evaluate\",\"params\":{\"expression\":\"42\",\"returnByValue\":true}}");
@@ -499,6 +540,35 @@ test "inspector: returnByValue serializes a 999-value object chain" {
         defer alloc.free(response.payload);
         try testing.expect(std.mem.indexOf(u8, response.payload, "\"value\":1") != null);
         try testing.expect(std.mem.indexOf(u8, response.payload, "\"error\"") == null);
+    }
+}
+
+test "inspector: returnByValue serializes shared references as a DAG, not a cycle" {
+    const alloc = testing.allocator;
+    const s = try openSession(alloc, "objects-return-by-value-shared-ref");
+    defer s.close();
+
+    // {a:s,b:s} and [s,s] share a child but are not cycles. Both copies must
+    // appear; the path-ancestor set must not treat a diamond as ByValueCycle.
+    const requests = [_]struct { id: u8, expression: []const u8, expect: []const u8 }{
+        .{ .id = 1, .expression = "(()=>{const s={k:1};return {a:s,b:s}})()", .expect = "{\"a\":{\"k\":1},\"b\":{\"k\":1}}" },
+        .{ .id = 2, .expression = "(()=>{const s={k:1};return [s,s]})()", .expect = "[{\"k\":1},{\"k\":1}]" },
+    };
+    for (requests) |request| {
+        const wire = try std.fmt.allocPrint(
+            alloc,
+            "{{\"id\":{d},\"method\":\"Runtime.evaluate\",\"params\":{{\"expression\":\"{s}\",\"returnByValue\":true}}}}",
+            .{ request.id, request.expression },
+        );
+        defer alloc.free(wire);
+        try s.send(wire);
+        const marker = try std.fmt.allocPrint(alloc, "\"id\":{d}", .{request.id});
+        defer alloc.free(marker);
+        const response = try s.wait(alloc, marker, 3000);
+        defer alloc.free(response.payload);
+        try testing.expect(std.mem.indexOf(u8, response.payload, "Object reference chain is too long") == null);
+        try testing.expect(std.mem.indexOf(u8, response.payload, "\"error\"") == null);
+        try testing.expect(std.mem.indexOf(u8, response.payload, request.expect) != null);
     }
 }
 

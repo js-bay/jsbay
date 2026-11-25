@@ -18,7 +18,21 @@ case "$QUICKJS_BACKEND" in
         ;;
 esac
 # Product Android archives must NEVER pass -Dfault-injection=true (keeps jsbay_test_* out of jniLibs).
-COMMON_FLAGS="-Dbackend=$QUICKJS_BACKEND -Dshared=false -Doptimize=ReleaseFast -Dlibrary-only=true"
+# Pin identity outside Zig's cached command graph; release metadata must use the same input.
+BUILD_COMMIT="${RELEASE_COMMIT:-$(git -C "$SCRIPT_DIR" rev-parse HEAD)}"
+if [[ ! "$BUILD_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    echo "ERROR: RELEASE_COMMIT must be a full git commit." >&2
+    exit 2
+fi
+if [ -n "${RELEASE_VERSION:-}" ] && [ -z "${RELEASE_COMMIT:-}" ]; then
+    echo "ERROR: release builds require RELEASE_COMMIT." >&2
+    exit 2
+fi
+if SOURCE_HEAD="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null)" && [ "$BUILD_COMMIT" != "$SOURCE_HEAD" ]; then
+    echo "ERROR: RELEASE_COMMIT differs from checked-out HEAD." >&2
+    exit 1
+fi
+COMMON_FLAGS="-Dgit-commit=$BUILD_COMMIT -Dbackend=$QUICKJS_BACKEND -Dshared=false -Doptimize=ReleaseFast -Dlibrary-only=true"
 TEMP_BUILD="$(mktemp -d)"
 STAGING_ROOT="$(mktemp -d)"
 STAGING_OUTPUT="$STAGING_ROOT/jniLibs"
@@ -104,7 +118,7 @@ link_android_so() {
     "$clang" -shared "$objs"/*.o -Wl,-z,defs -Wl,-soname,libjsbay.so "-Wl,--version-script=$TEMP_BUILD/exports.map" -lm -ldl -o "$out"
     # Hide QuickJS C wrappers from the public ABI (names match jsbay_* but are not in public headers).
     "$NDK_BIN/llvm-objcopy" --wildcard --localize-symbol='jsbay_qjs_*' "$out"
-    (cd "$SCRIPT_DIR" && zig build tool -- check-c-abi "$out" --nm "$NDK_BIN/llvm-nm")
+    (cd "$SCRIPT_DIR" && zig build tool -- check-c-abi "$out" --nm "$NDK_BIN/llvm-nm" --zig "$(command -v zig)")
     rm -rf "$objs"
 }
 
@@ -145,6 +159,4 @@ printf '%s\n' "$QUICKJS_BACKEND" > "$META_DIR/backend"
 if [ -n "${RELEASE_VERSION:-}" ]; then
     printf '%s\n' "$RELEASE_VERSION" > "$META_DIR/VERSION"
 fi
-if [ -n "${RELEASE_COMMIT:-}" ]; then
-    printf '%s\n' "$RELEASE_COMMIT" > "$META_DIR/COMMIT"
-fi
+printf '%s\n' "$BUILD_COMMIT" > "$META_DIR/COMMIT"

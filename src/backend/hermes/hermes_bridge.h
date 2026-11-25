@@ -301,8 +301,8 @@ typedef struct {
     char *err;      /* heap; caller frees; NULL on success */
 } HermesCompileResult;
 
-/* Compile JS source to Hermes bytecode (.hbc). Uses hermesc at
-   JSBAY_HERMESC or vendor/hermes-install/bin/hermesc relative to cwd. */
+/* Compile JS source to Hermes bytecode (.hbc). Uses in-process hermes::compileJS
+   (same format as hermesc -O0 -g1 -emit-binary). Does not require a hermesc binary. */
 HermesCompileResult hermes_compile_bytecode(const char *src, size_t src_len,
                                             const char *filename, size_t filename_len);
 void hermes_compile_result_free(HermesCompileResult r);
@@ -343,6 +343,13 @@ typedef void (*HermesRejectionTrackerFn)(int32_t instance_id, bool handled,
 bool hermes_set_rejection_tracker(JsbayHermesContext *ctx, int32_t instance_id,
                                   HermesRejectionTrackerFn fn, void *ud);
 void hermes_report_unhandled_rejection(JsbayHermesContext *ctx, const char *message);
+/* Typed error observer. kind: 0 async_uncaught, 1 unhandled_rejection, 2 rejection_handled.
+   promise/reason handles are borrowed for the callback; return false to defer this and later events. */
+typedef bool (*HermesErrorObserverFn)(int32_t instance_id, int32_t kind,
+                                      HermesValue promise, HermesValue reason, void *ud);
+typedef bool (*HermesShouldDeferFn)(int32_t instance_id);
+bool hermes_set_error_observer(JsbayHermesContext *ctx, int32_t instance_id,
+                               HermesErrorObserverFn fn, HermesShouldDeferFn should_defer, void *ud);
 
 /* Host macrotask progress during sync TLA waits (timers / host scripts / native). Zig registers this so awaitThenable can settle `await new Promise(r => setTimeout(r, 0))`. */
 typedef void (*HermesHostProgressFn)(void *ud);

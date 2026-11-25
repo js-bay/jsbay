@@ -117,6 +117,12 @@ grep -Eq 'org\.jetbrains\.kotlin:kotlin-stdlib(:|[^[:space:]]*:)1\.9\.22' "$LOG"
 
 JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_REPOSITORY_AUTH="$repository_auth_mode" \
 JSBAY_MAVEN_VERSION="$VERSION" JSBAY_MAVEN_ARTIFACT="$artifact" \
+    "$GRADLE_BIN" --no-daemon --console=plain -p "$OUT" \
+    :app:dependencies --configuration debugCompileClasspath >"$OUT/compile-classpath.log" 2>&1
+grep -Eq 'org\.jetbrains\.kotlin:kotlin-stdlib(:|[^[:space:]]*:)1\.9\.22' "$OUT/compile-classpath.log"
+
+JSBAY_MAVEN_REPO="$MAVEN_REPO" JSBAY_MAVEN_REPOSITORY_AUTH="$repository_auth_mode" \
+JSBAY_MAVEN_VERSION="$VERSION" JSBAY_MAVEN_ARTIFACT="$artifact" \
     "$GRADLE_BIN" --no-daemon --console=plain -p "$OUT" :app:assembleDebug >>"$LOG" 2>&1
 APK="$OUT/app/build/outputs/apk/debug/app-debug.apk"
 test -f "$APK"
@@ -134,6 +140,8 @@ if [[ "$device_mode" == --run-on-device ]]; then
         "$application_id/.MavenConsumerInstrumentation" > "$OUT/instrumentation.log" 2>&1
     cat "$OUT/instrumentation.log"
     grep -Eq "^INSTRUMENTATION_RESULT: jsbayResult=$BACKEND:42[[:space:]]*$" "$OUT/instrumentation.log"
+    grep -Eq '^INSTRUMENTATION_RESULT: jsbayAsyncClose=creator-drained[[:space:]]*$' "$OUT/instrumentation.log"
+    grep -Eq '^INSTRUMENTATION_RESULT: jsbayBoundedClose=callback-pending-owner-complete[[:space:]]*$' "$OUT/instrumentation.log"
     grep -Eq '^INSTRUMENTATION_CODE: -1[[:space:]]*$' "$OUT/instrumentation.log"
     printf 'PASS: installed Maven consumer ran %s on ART\n' "$BACKEND"
 fi

@@ -63,11 +63,29 @@ pub fn readUntilEof(alloc: std.mem.Allocator, stream: TestStream, out: *std.Arra
 }
 
 pub fn readHttpHeaders(alloc: std.mem.Allocator, stream: TestStream) ![]u8 {
+    return readHttpHeadersImpl(alloc, stream, null);
+}
+
+/// SO_RCVTIMEO is a polling interval, not the complete HTTP upgrade budget.
+pub fn readHttpHeadersUntil(alloc: std.mem.Allocator, stream: TestStream, deadline: i64) ![]u8 {
+    return readHttpHeadersImpl(alloc, stream, deadline);
+}
+
+fn readHttpHeadersImpl(alloc: std.mem.Allocator, stream: TestStream, deadline: ?i64) ![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(alloc);
     var buf: [1]u8 = undefined;
     while (true) {
-        const n = try stream.read(&buf);
+        if (deadline) |end| {
+            const remaining = end - io.monotonicMilliseconds();
+            if (remaining <= 0) return error.HeaderTimeout;
+            var fds = [_]std.posix.pollfd{.{ .fd = stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            if (try std.posix.poll(&fds, @intCast(@min(remaining, 50))) == 0) continue;
+        }
+        const n = stream.read(&buf) catch |err| switch (err) {
+            error.WouldBlock => if (deadline != null) continue else return err,
+            else => return err,
+        };
         if (n == 0) return error.EndOfStream;
         try list.append(alloc, buf[0]);
         if (list.items.len >= 4) {
@@ -205,6 +223,14 @@ pub const FrameReader = struct {
 };
 
 pub fn doWsHandshake(alloc: std.mem.Allocator, stream: TestStream, target_id: []const u8) !void {
+    return doWsHandshakeImpl(alloc, stream, target_id, null);
+}
+
+pub fn doWsHandshakeUntil(alloc: std.mem.Allocator, stream: TestStream, target_id: []const u8, deadline: i64) !void {
+    return doWsHandshakeImpl(alloc, stream, target_id, deadline);
+}
+
+fn doWsHandshakeImpl(alloc: std.mem.Allocator, stream: TestStream, target_id: []const u8, deadline: ?i64) !void {
     const req = try std.fmt.allocPrint(
         alloc,
         "GET /{s} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
@@ -213,7 +239,61 @@ pub fn doWsHandshake(alloc: std.mem.Allocator, stream: TestStream, target_id: []
     defer alloc.free(req);
     try stream.writeAll(req);
 
-    const hdrs = try readHttpHeaders(alloc, stream);
+    const hdrs = try readHttpHeadersImpl(alloc, stream, deadline);
     defer alloc.free(hdrs);
     try testing.expect(std.mem.startsWith(u8, hdrs, "HTTP/1.1 101"));
+}
+
+extern "c" fn socketpair(domain: c_int, kind: c_int, protocol: c_int, pair: *[2]std.posix.fd_t) c_int;
+
+fn headerTestPair() ![2]TestStream {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds) != 0) return error.SocketFailed;
+    errdefer {
+        _ = std.posix.system.close(fds[0]);
+        _ = std.posix.system.close(fds[1]);
+    }
+    var tv: std.posix.timeval = .{ .sec = 0, .usec = 50_000 };
+    try std.posix.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    return .{ .{ .handle = fds[0] }, .{ .handle = fds[1] } };
+}
+
+test "wire: HTTP legacy reader exposes the exact polling negative control" {
+    for ([_][]const u8{ "", "HTTP/1.1 101" }) |prefix| {
+        const pair = try headerTestPair();
+        defer pair[0].close();
+        defer pair[1].close();
+        try pair[1].writeAll(prefix);
+        // No writer exists: this negative control cannot race an arbitrary sleep.
+        try testing.expectError(error.WouldBlock, readHttpHeaders(testing.allocator, pair[0]));
+    }
+}
+
+test "wire: HTTP upgrade retains first-byte and partial-header polls" {
+    const headers = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+    for ([_]usize{ 0, 12 }) |prefix_len| {
+        const pair = try headerTestPair();
+        defer pair[0].close();
+        defer pair[1].close();
+        try pair[1].writeAll(headers[0..prefix_len]);
+        const Sender = struct {
+            fn run(stream: TestStream, tail: []const u8) void {
+                io.sleepMs(120);
+                stream.writeAll(tail) catch @panic("HTTP fixture writer failed");
+            }
+        };
+        const sender = try std.Thread.spawn(.{}, Sender.run, .{ pair[1], headers[prefix_len..] });
+        defer sender.join();
+        const actual = try readHttpHeadersUntil(testing.allocator, pair[0], io.monotonicMilliseconds() + 10_000);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualStrings(headers, actual);
+    }
+}
+
+test "wire: HTTP upgrade enforces the existing absolute deadline" {
+    const pair = try headerTestPair();
+    defer pair[0].close();
+    defer pair[1].close();
+    try testing.expectError(error.HeaderTimeout, readHttpHeadersUntil(testing.allocator, pair[0], io.monotonicMilliseconds()));
+    try testing.expectError(error.HeaderTimeout, readHttpHeadersUntil(testing.allocator, pair[0], io.monotonicMilliseconds() + 40));
 }

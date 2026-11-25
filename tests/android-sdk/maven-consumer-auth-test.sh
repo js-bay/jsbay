@@ -59,6 +59,8 @@ if [[ $1 == shell ]]; then
         if [[ $1 == backend ]]; then backend=$2; shift 2; else shift; fi
     done
     printf 'INSTRUMENTATION_RESULT: jsbayResult=%s:42\n' "$backend"
+    printf 'INSTRUMENTATION_RESULT: jsbayAsyncClose=creator-drained\n'
+    printf 'INSTRUMENTATION_RESULT: jsbayBoundedClose=callback-pending-owner-complete\n'
     printf 'INSTRUMENTATION_CODE: -1\n'
 fi
 EOF

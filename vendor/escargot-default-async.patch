@@ -1,0 +1,23 @@
+diff --git a/src/parser/esprima_cpp/esprima.cpp b/src/parser/esprima_cpp/esprima.cpp
+index d5bf5e15..555cbd6e 100644
+--- a/src/parser/esprima_cpp/esprima.cpp
++++ b/src/parser/esprima_cpp/esprima.cpp
+@@ -6895,7 +6895,7 @@ public:
+             }
+ 
+             this->nextToken();
+-            if (this->matchKeyword(KeywordKind::FunctionKeyword)) {
++            if (this->matchKeyword(KeywordKind::FunctionKeyword) || this->matchAsyncFunction()) {
+                 // export default function foo () {}
+                 // export default function () {}
+                 ASTNode declaration = this->parseFunctionDeclaration<ASTBuilder, true>(builder);
+@@ -6925,9 +6925,6 @@ public:
+ 
+                     exportDeclaration = this->finalize(node, builder.createExportDefaultDeclarationNode(classNode, entry.m_exportName.value(), entry.m_localName.value()));
+                 }
+-            } else if (this->matchContextualKeyword(AsyncKeyword)) {
+-                // TODO
+-                this->throwUnexpectedToken(this->lookahead, "async keyword in export is not supported yet");
+             } else {
+                 if (this->matchContextualKeyword(FromKeyword)) {
+                     this->throwUnexpectedToken(this->lookahead);

@@ -1,6 +1,7 @@
 //! Generation-scoped source submissions executed by the owner's native dispatch queue.
 
 const std = @import("std");
+const backend = @import("../backend.zig");
 const engine = @import("../engine.zig");
 const dispatch = @import("dispatch.zig");
 const engine_thread = @import("engine_thread.zig");
@@ -402,6 +403,11 @@ test "submission: close between reserve and commit releases the reservation" {
     const submission = try Submission.fromSourceWithAllocator(testing.allocator, instance_id, token.generation, source, filename, null, null);
     var submission_destroyed = false;
     defer if (!submission_destroyed) submission.destroy();
+    var hook: instance_map.testing.TeardownOverlapHook = .{};
+    defer hook.deinit();
+    hook.cleanup.allow();
+    instance_map.testing.installTeardownOverlapHook(&hook);
+    defer instance_map.testing.installTeardownOverlapHook(null);
     var destroy_done = std.atomic.Value(bool).init(false);
     const Destroyer = struct {
         fn run(id: i32, done: *std.atomic.Value(bool)) void {
@@ -411,10 +417,20 @@ test "submission: close between reserve and commit releases the reservation" {
     };
     const destroyer = try std.Thread.spawn(.{}, Destroyer.run, .{ instance_id, &destroy_done });
     var joined = false;
-    defer if (!joined) destroyer.join();
+    defer if (!joined) {
+        if (!submission_destroyed) {
+            submission.destroy();
+            submission_destroyed = true;
+        }
+        if (!released) {
+            reservation.deinit();
+            released = true;
+        }
+        hook.before_wait.allow();
+        destroyer.join();
+    };
 
-    var spins: usize = 0;
-    while (spins < 10_000 and !instance_map.isTeardownPending(instance_id)) : (spins += 1) std.Thread.yield() catch {};
+    try hook.before_wait.waitArrived();
     try testing.expect(instance_map.isTeardownPending(instance_id));
     try testing.expect(!destroy_done.load(.seq_cst));
     const usage = reservation.resources.?.usage();
@@ -433,8 +449,93 @@ test "submission: close between reserve and commit releases the reservation" {
     submission_destroyed = true;
     reservation.deinit();
     released = true;
+    hook.before_wait.allow();
     destroyer.join();
     joined = true;
+    try testing.expect(destroy_done.load(.seq_cst));
+    try testing.expect(engine.getContext(instance_id) == null);
+}
+
+test "escargot: late waitForControlOps cannot pass in-progress owner JS teardown" {
+    // Deterministic barrier: teardown is marked, the destroyer is parked before waitForControlOps, then the owner drops the last lease and is held inside cleanup. The destroyer must enter the wait and must not return or destroy the instance until cleanup is released.
+    if (comptime !backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
+    const instance_id: i32 = 58_320;
+    try testing.expect(engine.create(instance_id, .{}));
+    var hook: instance_map.testing.TeardownOverlapHook = .{};
+    defer hook.deinit();
+    instance_map.testing.installTeardownOverlapHook(&hook);
+    defer instance_map.testing.installTeardownOverlapHook(null);
+
+    const lease = instance_map.beginControlPlane(instance_id) orelse return error.MissingControlLease;
+    var lease_ended = false;
+    defer if (!lease_ended) lease.end();
+
+    var destroy_done = std.atomic.Value(bool).init(false);
+    const Destroyer = struct {
+        fn run(id: i32, done: *std.atomic.Value(bool)) void {
+            engine.destroy(id);
+            done.store(true, .seq_cst);
+        }
+    };
+    const destroyer = try std.Thread.spawn(.{}, Destroyer.run, .{ instance_id, &destroy_done });
+    var joined = false;
+    defer if (!joined) {
+        hook.cleanup.allow();
+        hook.before_wait.allow();
+        if (!lease_ended) {
+            lease.end();
+            lease_ended = true;
+        }
+        destroyer.join();
+    };
+
+    try hook.before_wait.waitArrived();
+    try testing.expect(instance_map.isTeardownPending(instance_id));
+    try testing.expect(!destroy_done.load(.seq_cst));
+    try testing.expect(!hook.entered_wait.load(.acquire));
+
+    const Watcher = struct {
+        fn run(h: *instance_map.testing.TeardownOverlapHook, done: *std.atomic.Value(bool), id: i32) void {
+            h.cleanup.waitArrived() catch @panic("owner cleanup did not arrive");
+            h.before_wait.allow();
+            h.entered_gate.waitArrived() catch @panic("destroyer did not enter waitForControlOps");
+            // Zig 0.17 has no std.Thread.sleep; a short pause lets a buggy
+            // early wait return become visible before we release cleanup.
+            var req = std.os.linux.timespec{ .sec = 0, .nsec = 20 * std.time.ns_per_ms };
+            _ = std.os.linux.nanosleep(&req, null);
+            if (h.wait_returned.load(.acquire) or done.load(.seq_cst) or engine.getContext(id) == null) {
+                @panic("destroyer passed waitForControlOps while owner JS cleanup was still in progress");
+            }
+            h.cleanup.allow();
+        }
+    };
+    const watcher = try std.Thread.spawn(.{}, Watcher.run, .{ &hook, &destroy_done, instance_id });
+    var watcher_joined = false;
+    defer if (!watcher_joined) watcher.join();
+
+    lease.end();
+    lease_ended = true;
+    watcher.join();
+    watcher_joined = true;
+    destroyer.join();
+    joined = true;
+    try testing.expect(destroy_done.load(.seq_cst));
+    try testing.expect(hook.wait_returned.load(.acquire));
+    try testing.expect(engine.getContext(instance_id) == null);
+}
+
+test "escargot: foreign destroy with no remaining owner lease does not delete ctx off-owner" {
+    const instance_id: i32 = 58_321;
+    try testing.expect(engine.create(instance_id, .{}));
+    var destroy_done = std.atomic.Value(bool).init(false);
+    const Destroyer = struct {
+        fn run(id: i32, done: *std.atomic.Value(bool)) void {
+            engine.destroy(id);
+            done.store(true, .seq_cst);
+        }
+    };
+    const destroyer = try std.Thread.spawn(.{}, Destroyer.run, .{ instance_id, &destroy_done });
+    destroyer.join();
     try testing.expect(destroy_done.load(.seq_cst));
     try testing.expect(engine.getContext(instance_id) == null);
 }
@@ -534,4 +635,45 @@ test "submission: postGcWithAllocator error propagation" {
     try testing.expect(runtime_control.sealShutdown(instance_id));
     try testing.expectError(error.ShutdownInProgress, postGcWithAllocator(testing.allocator, instance_id, token.generation));
     _ = runtime_control.requestShutdownCancel(instance_id);
+}
+
+test "submission: teardown marking waits for an owner control critical section" {
+    const instance_id: i32 = 58_322;
+    try testing.expect(engine.create(instance_id, .{}));
+    defer engine.destroy(instance_id);
+    const inst = instance_map.getInstance(instance_id) orelse return error.MissingInstance;
+    var gate: instance_map.testing.Gate = .{};
+    defer gate.deinit();
+    var done = std.atomic.Value(bool).init(false);
+    const Marker = struct {
+        fn run(id: i32, started: *instance_map.testing.Gate, completed: *std.atomic.Value(bool)) void {
+            started.arriveAndWait();
+            instance_map.markTeardownPending(id);
+            completed.store(true, .release);
+        }
+    };
+    inst.dispatch_mutex.lock();
+    var locked = true;
+    defer if (locked) inst.dispatch_mutex.unlock();
+    const marker = try std.Thread.spawn(.{}, Marker.run, .{ instance_id, &gate, &done });
+    var joined = false;
+    defer if (!joined) {
+        gate.allow();
+        if (locked) {
+            inst.dispatch_mutex.unlock();
+            locked = false;
+        }
+        marker.join();
+    };
+    try gate.waitArrived();
+    gate.allow();
+    @import("../platform/io.zig").sleepMs(50);
+    const marked_while_owner_locked = done.load(.acquire);
+    inst.dispatch_mutex.unlock();
+    locked = false;
+    marker.join();
+    joined = true;
+    try testing.expect(!marked_while_owner_locked);
+    try testing.expect(done.load(.acquire));
+    try testing.expect(instance_map.beginControlPlane(instance_id) == null);
 }

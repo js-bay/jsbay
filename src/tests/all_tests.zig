@@ -20,6 +20,7 @@ comptime {
     }
     _ = @import("../script/typed_eval.zig");
     _ = @import("test_helpers.zig");
+    _ = @import("owner_destroy_tests.zig");
     _ = @import("value_tests.zig");
     _ = @import("string_roundtrip_tests.zig");
     _ = @import("engine_tests.zig");
@@ -98,8 +99,12 @@ comptime {
     if (!spike or backend.isEscargotBackend(backend.active_backend) or backend.isHermesBackend(backend.active_backend)) {
         _ = @import("object_ops_tests.zig");
     }
+    _ = @import("host_callback_control_tests.zig");
     if (!spike) {
         _ = @import("runtime_control_tests.zig");
+    }
+    if (!spike or backend.isEscargotBackend(backend.active_backend)) {
+        _ = @import("execution_cancellation_tests.zig");
     }
     // buffers_tests: basic + finalizer in spike scope; advanced cases Skip inside the suite. Transfer: Escargot native; Hermes polyfill (detachArrayBuffer + copy). Tight-cap case still QJS-only Skip inside.
     _ = @import("buffers_tests.zig");

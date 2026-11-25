@@ -1,3 +1,7 @@
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "jsbay.h"
 #include "jsbay_sync.h"
 #include <jni.h>
@@ -7,6 +11,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 /* This adapter is deliberately separate from libjsbay: RegisterNatives binds the library-owned io.jsbay.Native class and the core exports no Java symbol. */
 static jlongArray result(JNIEnv *e, int status, uint64_t value, uint64_t exception) {
@@ -49,6 +54,8 @@ static void done(JNIEnv *e, jbyteArray h, jsbay_utf8_t v) {
 }
 typedef struct {
     JavaVM *vm;
+    uint64_t generation;
+    pthread_t owner;
     jobject log;   /* global ref or NULL */
     jobject event; /* global ref or NULL */
     jmethodID log_mid;
@@ -77,15 +84,17 @@ static host_hooks *hooks_alloc(int id) {
             g_hook_used[i] = 1;
             g_hook_ids[i] = id;
             memset(&g_hooks[i], 0, sizeof(g_hooks[i]));
+            g_hooks[i].owner = pthread_self();
             return &g_hooks[i];
         }
     }
     return NULL;
 }
-static void hooks_clear(JNIEnv *e, int id) {
+static void hooks_clear_generation(JNIEnv *e, int id, uint64_t generation) {
     pthread_mutex_lock(&g_hooks_lock);
     for (int i = 0; i < HOST_HOOKS_CAP; i++) {
-        if (!g_hook_used[i] || g_hook_ids[i] != id)
+        if (!g_hook_used[i] || g_hook_ids[i] != id || g_hooks[i].generation != generation ||
+            !pthread_equal(g_hooks[i].owner, pthread_self()))
             continue;
         if (g_hooks[i].log)
             (*e)->DeleteGlobalRef(e, g_hooks[i].log);
@@ -278,7 +287,7 @@ static jboolean create_with_handlers(JNIEnv *e, jclass c, jint id, jobject logHa
     if ((*e)->GetJavaVM(e, &vm) != JNI_OK)
         return JNI_FALSE;
     pthread_mutex_lock(&g_hooks_lock);
-    host_hooks *h = hooks_alloc(id);
+    host_hooks *h = hooks_find(id) ? NULL : hooks_alloc(id);
     if (!h) {
         pthread_mutex_unlock(&g_hooks_lock);
         return JNI_FALSE;
@@ -293,13 +302,13 @@ static jboolean create_with_handlers(JNIEnv *e, jclass c, jint id, jobject logHa
             (*e)->DeleteLocalRef(e, cls);
         if (!h->log_mid) {
             pthread_mutex_unlock(&g_hooks_lock);
-            hooks_clear(e, id);
+            hooks_clear_generation(e, id, 0);
             return JNI_FALSE;
         }
         h->log = (*e)->NewGlobalRef(e, logHandler);
         if (!h->log) {
             pthread_mutex_unlock(&g_hooks_lock);
-            hooks_clear(e, id);
+            hooks_clear_generation(e, id, 0);
             return JNI_FALSE;
         }
         log_cb = jni_log_handler;
@@ -307,9 +316,18 @@ static jboolean create_with_handlers(JNIEnv *e, jclass c, jint id, jobject logHa
     }
     pthread_mutex_unlock(&g_hooks_lock);
     if (!jsbay_engine_create(id, log_cb, log_ud)) {
-        hooks_clear(e, id);
+        hooks_clear_generation(e, id, 0);
         return JNI_FALSE;
     }
+    jsbay_instance_snapshot_t snapshot = {.struct_size = sizeof(snapshot)};
+    if (!jsbay_engine_snapshot(id, &snapshot)) {
+        jsbay_engine_destroy(id);
+        hooks_clear_generation(e, id, 0);
+        return JNI_FALSE;
+    }
+    pthread_mutex_lock(&g_hooks_lock);
+    h->generation = snapshot.generation;
+    pthread_mutex_unlock(&g_hooks_lock);
     if (eventHandler) {
         pthread_mutex_lock(&g_hooks_lock);
         h = hooks_find(id);
@@ -317,7 +335,7 @@ static jboolean create_with_handlers(JNIEnv *e, jclass c, jint id, jobject logHa
         pthread_mutex_unlock(&g_hooks_lock);
         if (!ok) {
             jsbay_engine_destroy(id);
-            hooks_clear(e, id);
+            hooks_clear_generation(e, id, snapshot.generation);
             return JNI_FALSE;
         }
     }
@@ -325,16 +343,46 @@ static jboolean create_with_handlers(JNIEnv *e, jclass c, jint id, jobject logHa
 }
 static void destroy(JNIEnv *e, jclass c, jint id) {
     (void)c;
-    jsbay_engine_destroy(id);
-    hooks_clear(e, id);
+    jsbay_instance_snapshot_t snapshot = {.struct_size = sizeof(snapshot)};
+    if (!jsbay_engine_snapshot(id, &snapshot))
+        return;
+    (void)jsbay_engine_request_destroy(id, snapshot.generation);
+    if (jsbay_engine_drain_destroy(id, snapshot.generation) == JSBAY_DESTROY_COMPLETE)
+        hooks_clear_generation(e, id, snapshot.generation);
 }
+static jint request_destroy(JNIEnv *e, jclass c, jint id, jlong generation) {
+    (void)e;
+    (void)c;
+    return jsbay_engine_request_destroy(id, (uint64_t)generation);
+}
+static jint destroy_status(JNIEnv *e, jclass c, jint id, jlong generation) {
+    (void)e;
+    (void)c;
+    return jsbay_engine_destroy_status(id, (uint64_t)generation);
+}
+// Match std.Thread.getCurrentId() rather than the opaque pthread_t representation.
+static int is_current_owner_thread(uint64_t owner_thread_id) {
+#if defined(__APPLE__)
+    uint64_t thread_id = 0;
+    return pthread_threadid_np(NULL, &thread_id) == 0 && owner_thread_id == thread_id;
+#else
+    return owner_thread_id == (uint64_t)gettid();
+#endif
+}
+
 static jboolean set_event_handler(JNIEnv *e, jclass c, jint id, jobject eventHandler) {
     (void)c;
     JavaVM *vm = NULL;
-    if ((*e)->GetJavaVM(e, &vm) != JNI_OK)
+    jsbay_instance_snapshot_t snapshot = {.struct_size = sizeof(snapshot)};
+    if ((*e)->GetJavaVM(e, &vm) != JNI_OK || !jsbay_engine_snapshot(id, &snapshot) ||
+        !is_current_owner_thread(snapshot.owner_thread_id))
         return JNI_FALSE;
     pthread_mutex_lock(&g_hooks_lock);
     host_hooks *h = hooks_find(id);
+    if (h && (h->generation != snapshot.generation || !pthread_equal(h->owner, pthread_self()))) {
+        pthread_mutex_unlock(&g_hooks_lock);
+        return JNI_FALSE;
+    }
     if (!h) {
         h = hooks_alloc(id);
         if (!h) {
@@ -342,6 +390,7 @@ static jboolean set_event_handler(JNIEnv *e, jclass c, jint id, jobject eventHan
             return JNI_FALSE;
         }
         h->vm = vm;
+        h->generation = snapshot.generation;
     }
     jboolean ok = install_event_handler(e, h, id, eventHandler);
     pthread_mutex_unlock(&g_hooks_lock);
@@ -539,8 +588,13 @@ static jboolean cancel_generation(JNIEnv *env, jclass c, jint id, jlong generati
     (void)c;
     return jsbay_engine_cancel(id, (uint64_t)generation);
 }
-typedef struct {
+typedef struct loop_binding {
+    struct loop_binding *registry_next;
     JavaVM *vm;
+    uint64_t handle;
+    int instance_id;
+    uint64_t engine_generation;
+    pthread_t owner;
     jobject driver;
     jmethodID schedule, cancel, shutdown;
     pthread_mutex_t lock;
@@ -549,6 +603,45 @@ typedef struct {
     jsbay_loop_task_t task;
     void *task_data;
 } loop_binding;
+static loop_binding *g_loop_bindings;
+static pthread_mutex_t g_loop_bindings_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_next_loop_handle = 1;
+
+/* Opaque handles do not alias addresses; all lookup users are the original creator. */
+static loop_binding *loop_lookup(jlong handle) {
+    pthread_mutex_lock(&g_loop_bindings_lock);
+    loop_binding *found = NULL;
+    for (loop_binding *b = g_loop_bindings; b; b = b->registry_next) {
+        if (b->handle == (uint64_t)handle && pthread_equal(b->owner, pthread_self())) {
+            found = b;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_loop_bindings_lock);
+    return found;
+}
+static bool loop_publish(loop_binding *binding) {
+    pthread_mutex_lock(&g_loop_bindings_lock);
+    bool ok = g_next_loop_handle != 0;
+    if (ok) {
+        binding->handle = g_next_loop_handle++;
+        binding->registry_next = g_loop_bindings;
+        g_loop_bindings = binding;
+    }
+    pthread_mutex_unlock(&g_loop_bindings_lock);
+    return ok;
+}
+static void loop_unpublish(loop_binding *binding) {
+    pthread_mutex_lock(&g_loop_bindings_lock);
+    loop_binding **cursor = &g_loop_bindings;
+    while (*cursor && *cursor != binding)
+        cursor = &(*cursor)->registry_next;
+    if (*cursor)
+        *cursor = binding->registry_next;
+    binding->registry_next = NULL;
+    pthread_mutex_unlock(&g_loop_bindings_lock);
+}
+
 static loop_binding *loop_binding_freelist;
 static atomic_flag loop_binding_freelist_lock = ATOMIC_FLAG_INIT;
 static void loop_binding_freelist_acquire(void) {
@@ -669,20 +762,31 @@ static jlong attach_loop(JNIEnv *env, jclass c, jint id) {
         return 0;
     }
     binding->vm = vm;
+    binding->owner = pthread_self();
+    binding->instance_id = id;
+    jsbay_instance_snapshot_t snapshot = {.struct_size = sizeof(snapshot)};
+    if (!jsbay_engine_snapshot(id, &snapshot) || !loop_publish(binding)) {
+        loop_binding_release(binding);
+        return 0;
+    }
+    binding->engine_generation = snapshot.generation;
     binding->active = true;
     pthread_mutex_init(&binding->lock, NULL);
     jclass cls = (*env)->FindClass(env, "io/jsbay/LoopDriver");
-    jmethodID init = cls ? (*env)->GetMethodID(env, cls, "<init>", "(JI)V") : NULL;
+    jmethodID init = cls ? (*env)->GetMethodID(env, cls, "<init>", "(JIJ)V") : NULL;
     binding->schedule = cls ? (*env)->GetMethodID(env, cls, "schedule", "(JJ)Z") : NULL;
     binding->cancel = cls ? (*env)->GetMethodID(env, cls, "cancel", "()V") : NULL;
     binding->shutdown = cls ? (*env)->GetMethodID(env, cls, "shutdown", "()V") : NULL;
-    jobject local = init ? (*env)->NewObject(env, cls, init, (jlong)(intptr_t)binding, id) : NULL;
+    jobject local = init ? (*env)->NewObject(env, cls, init, (jlong)binding->handle, id,
+                                             (jlong)binding->engine_generation)
+                         : NULL;
     if (cls)
         (*env)->DeleteLocalRef(env, cls);
     if (!local || !binding->schedule || !binding->cancel || !binding->shutdown ||
         (*env)->ExceptionCheck(env)) {
         if ((*env)->ExceptionCheck(env))
             (*env)->ExceptionClear(env);
+        loop_unpublish(binding);
         pthread_mutex_destroy(&binding->lock);
         loop_binding_release(binding);
         return 0;
@@ -695,25 +799,49 @@ static jlong attach_loop(JNIEnv *env, jclass c, jint id) {
             loop_shutdown(env, binding);
             (*env)->DeleteGlobalRef(env, binding->driver);
         }
+        loop_unpublish(binding);
         pthread_mutex_destroy(&binding->lock);
         loop_binding_release(binding);
         return 0;
     }
-    return (jlong)(intptr_t)binding;
+    return (jlong)binding->handle;
 }
 static jint detach_loop(JNIEnv *env, jclass c, jint id, jlong raw) {
     (void)c;
-    loop_binding *binding = (loop_binding *)(intptr_t)raw;
+    loop_binding *binding = loop_lookup(raw);
+    if (!binding || binding->instance_id != id)
+        return JSBAY_INVALID_ARGUMENT;
     jsbay_status_t status = jsbay_engine_detach_loop(id);
     if (status != JSBAY_OK)
         return status;
     if (binding) {
+        loop_unpublish(binding);
         loop_shutdown(env, binding);
         (*env)->DeleteGlobalRef(env, binding->driver);
         pthread_mutex_destroy(&binding->lock);
         loop_binding_release(binding);
     }
     return status;
+}
+/* VM/callback teardown completes first; only its creator may retire matching JNI state. */
+static jint drain_destroy(JNIEnv *env, jclass c, jint id, jlong generation, jlong raw) {
+    (void)c;
+    loop_binding *binding = raw ? loop_lookup(raw) : NULL;
+    if (raw && (!binding || binding->instance_id != id ||
+                binding->engine_generation != (uint64_t)generation))
+        return JSBAY_DESTROY_STALE;
+    jsbay_destroy_status_t progress = jsbay_engine_drain_destroy(id, (uint64_t)generation);
+    if (progress != JSBAY_DESTROY_COMPLETE)
+        return progress;
+    if (binding) {
+        loop_unpublish(binding);
+        loop_shutdown(env, binding);
+        (*env)->DeleteGlobalRef(env, binding->driver);
+        pthread_mutex_destroy(&binding->lock);
+        loop_binding_release(binding);
+    }
+    hooks_clear_generation(env, id, (uint64_t)generation);
+    return progress;
 }
 static jint loop_status(JNIEnv *env, jclass c, jint id) {
     (void)env;
@@ -761,7 +889,7 @@ static jint get_admission_class(JNIEnv *env, jclass c, jint id) {
 static void run_loop_task(JNIEnv *env, jclass c, jlong raw, jlong expected) {
     (void)env;
     (void)c;
-    loop_binding *binding = (loop_binding *)(intptr_t)raw;
+    loop_binding *binding = loop_lookup(raw);
     if (!binding)
         return;
     pthread_mutex_lock(&binding->lock);
@@ -1686,6 +1814,9 @@ static JNINativeMethod methods[] = {
     {"createWithHandlers", "(ILio/jsbay/LogHandler;Lio/jsbay/EventHandler;)Z",
      create_with_handlers},
     {"destroy", "(I)V", destroy},
+    {"requestDestroy", "(IJ)I", request_destroy},
+    {"destroyStatus", "(IJ)I", destroy_status},
+    {"drainDestroy", "(IJJ)I", drain_destroy},
     {"setEventHandler", "(ILio/jsbay/EventHandler;)Z", set_event_handler},
     {"getMemoryUsage", "(I)[J", get_memory_usage},
     {"runGc", "(I)Z", run_gc},
@@ -1748,6 +1879,8 @@ static JNINativeMethod methods[] = {
 };
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *x) {
     (void)x;
+    if (jsbay_engine_destroy_protocol_version() != JSBAY_DESTROY_PROTOCOL_VERSION)
+        return JNI_ERR;
     JNIEnv *e = NULL;
     if ((*vm)->GetEnv(vm, (void **)&e, JNI_VERSION_1_6) != JNI_OK)
         return JNI_ERR;

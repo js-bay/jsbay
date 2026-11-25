@@ -121,6 +121,9 @@ void escargot_process_pending_jobs(EscargotContext *ctx);
 /* Host promise rejection tracker. fn=NULL clears. Reports after microtask drain. */
 typedef void (*EscargotRejectionTrackerFn)(int32_t instance_id, bool handled,
                                            const char *reason, size_t reason_len, void *userdata);
+typedef bool (*EscargotErrorObserverFn)(int32_t instance_id, int32_t kind, EscargotValue promise, EscargotValue reason, void *userdata);
+typedef bool (*EscargotShouldDeferFn)(int32_t instance_id);
+void escargot_set_error_observer(EscargotContext *ctx, int32_t instance_id, EscargotErrorObserverFn observer, EscargotShouldDeferFn should_defer);
 void escargot_set_rejection_tracker(EscargotContext *ctx, int32_t instance_id,
                                     EscargotRejectionTrackerFn fn, void *userdata);
 

@@ -1,0 +1,29 @@
+--- a/lib/InternalBytecode/01-Promise.js
++++ b/lib/InternalBytecode/01-Promise.js
+@@ -425,6 +425,8 @@
+   var enable_1 = enable;
+   function enable(options) {
+     options = options || {};
++    var setRejectionTimeout = options.setTimeout || setTimeout;
++    var clearRejectionTimeout = options.clearTimeout || clearTimeout;
+     if (enabled) disable();
+     enabled = true;
+     var id = 0;
+@@ -438,7 +440,7 @@
+         if (rejections[promise._o].logged) {
+           onHandled(promise._o);
+         } else {
+-          clearTimeout(rejections[promise._o].timeout);
++          clearRejectionTimeout(rejections[promise._o].timeout);
+         }
+         delete rejections[promise._o];
+       }
+@@ -450,7 +452,7 @@
+           displayId: null,
+           error: err,
+           promise: promise,
+-          timeout: setTimeout(
++          timeout: setRejectionTimeout(
+             onUnhandled.bind(null, promise._o),
+             // For reference errors and type errors, this almost always
+             // means the programmer made a mistake, so log them after just

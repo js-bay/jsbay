@@ -43,13 +43,25 @@ async function main() {
     });
     child.stderr.on('data', bytes => { output += bytes.toString(); });
     child.once('close', code => readyReject(new Error(`Android inspector exited ${code}: ${output}`)));
-    const port = await within(ready, 15000, 'Android SDK inspector did not start');
+    // Measured on the 14f9891 JNI payload with official `adb shell -T` and
+    // stdin held: READY arrived in 4.2–5.0s. The 15s contract is enough; the
+    // 60s default is reverted. Timeout errors include captured stdio.
+    let port;
+    try {
+      port = await within(ready, 15000, 'Android SDK inspector did not start');
+    } catch (error) {
+      throw new Error(`${error.message}: ${output || '(no stdio)'}`);
+    }
     forwarded = run('forward', 'tcp:0', `tcp:${port}`);
     assert.match(forwarded, /^\d+$/);
     const test = spawn(process.execPath, [resolve(__dirname, 'e2e.cjs'), '--host', '127.0.0.1', '--port', forwarded, '--debugger-flow'], { stdio: 'inherit' });
     const [code, signal] = await once(test, 'close');
     assert.equal(signal, null);
     assert.equal(code, 0);
+  } catch (error) {
+    // Preserve the primary failure when bounded process cleanup also fails.
+    console.error(error.stack || error);
+    throw error;
   } finally {
     if (child && child.exitCode === null && child.signalCode === null) {
       const exited = once(child, 'close');
