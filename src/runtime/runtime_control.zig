@@ -92,13 +92,13 @@ fn assertTrampolinePrefix(comptime Shadow: type) void {
 }
 
 comptime {
-    if (comptime backend.isPacked(.quickjs)) {
+    if (backend.isPacked(.quickjs)) {
         assertTrampolinePrefix(@import("../backend/quickjs/runtime_control.zig").QjsInterruptState);
     }
-    if (comptime backend.isPacked(.quickjs_ng)) {
+    if (backend.isPacked(.quickjs_ng)) {
         assertTrampolinePrefix(@import("../backend/quickjs_ng/runtime_control.zig").QjsInterruptState);
     }
-    if (comptime backend.isPacked(.jsc)) {
+    if (backend.isPacked(.jsc)) {
         assertTrampolinePrefix(@import("../backend/jsc/runtime_control.zig").JscInterruptState);
     }
 }
