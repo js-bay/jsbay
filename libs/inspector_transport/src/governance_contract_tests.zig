@@ -916,7 +916,7 @@ test "transport: at most one large message waits in queue while another is being
     @memset(large3, 'c');
 
     try testing.expect(t.sendText(session, large1));
-    try testing.expect(barrier.waitUntilEntered());
+    try barrier.waitUntilEntered(10_000);
     try testing.expect(t.sendText(session, large2));
     try testing.expect(!t.sendText(session, large3));
     barrier.release();

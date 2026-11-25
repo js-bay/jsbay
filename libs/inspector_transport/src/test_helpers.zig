@@ -16,13 +16,12 @@ pub const LargeWriteBarrier = struct {
         while (!self.released) self.changed.wait(&self.mutex);
     }
 
-    pub fn waitUntilEntered(self: *LargeWriteBarrier) bool {
+    pub fn waitUntilEntered(self: *LargeWriteBarrier, timeout_ms: u64) error{TimedOut}!void {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (!self.entered) {
-            if (self.changed.waitTimeout(&self.mutex, 10_000) == .timed_out) return false;
+            if (self.changed.waitTimeout(&self.mutex, timeout_ms) == .timed_out) return error.TimedOut;
         }
-        return true;
     }
 
     pub fn release(self: *LargeWriteBarrier) void {
@@ -37,3 +36,9 @@ pub const LargeWriteBarrier = struct {
         self.mutex.deinit();
     }
 };
+
+test "barrier reports a timeout" {
+    var barrier = LargeWriteBarrier{};
+    defer barrier.deinit();
+    try @import("std").testing.expectError(error.TimedOut, barrier.waitUntilEntered(0));
+}
