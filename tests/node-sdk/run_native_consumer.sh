@@ -83,7 +83,7 @@ run_extended_contract_consumer 'test addon: extended contract consumer' "$addon"
 run_stage 'test addon: value contract consumer' env JSBAY_NODE_ADDON="$addon" "$node_bin" --expose-gc "$root/tests/node-sdk/value_contract_consumer.cjs"
 embed_addon="$output_dir/jsbay_node_embed.node"
 run_stage 'build embedded addon' "${CXX:-c++}" -std=c++17 -DJSBAY_NODE_EMBEDDED=1 "${flags[@]}" -I"$root/include" -I"$root/sdk/node/include" -I"$node_include" -I"$(dirname "$node_include")" "$root/sdk/node/src/jsbay_node.cpp" "$root/tests/node-sdk/embed_consumer.cc" "$archive" -o "$embed_addon"
-run_stage 'embedded addon consumer' env JSBAY_NODE_EMBED_ADDON="$embed_addon" "$node_bin" "$root/tests/node-sdk/embed_consumer.cjs"
+run_stage 'embedded addon consumer' env -u JSC_usePollingTraps JSBAY_NODE_EMBED_ADDON="$embed_addon" "$node_bin" "$root/tests/node-sdk/run-consumer-with-watchdog.mjs" 30000 "$node_bin" "$root/tests/node-sdk/embed_consumer.cjs"
 production_addon=${JSBAY_NODE_RELEASE_ADDON:-}
 if [[ -z $production_addon ]]; then
   cmake_bin=${CMAKE:-cmake}

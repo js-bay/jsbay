@@ -5,7 +5,13 @@ const { resolve } = require('node:path')
 const addon = require(process.env.JSBAY_NODE_EMBED_ADDON)
 
 async function main() {
+  assert.equal(addon.createCoreEngineBeforeEmbedded(), true)
   const engine = addon.create(701)
+  if (process.env.JSBAY_NODE_BACKEND === 'jsc' && process.platform === 'darwin' && process.arch === 'arm64') {
+    engine.setExecutionTimeLimit(100)
+    assert.throws(() => engine.evaluate('while (true) {}'))
+    engine.setExecutionTimeLimit(0)
+  }
   assert.equal(addon.tryDuplicate(701), false)
   assert.equal(addon.stats().destroys, 0)
   engine.bindAsync('value', async () => 42)

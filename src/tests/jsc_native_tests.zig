@@ -6,6 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 
 const native_handle = @import("../backend/jsc/native_handle.zig");
+const polling_config = @import("../backend/jsc/polling_config.zig");
 const jsc = native_handle.jsc;
 
 // JSSynchronousGarbageCollectForDebugging is exported by JavaScriptCore.framework but absent from the public header. It runs an immediate, synchronous full collection — indispensable for deterministic finalizer tests.
@@ -24,6 +25,7 @@ const Fixture = struct {
     global: jsc.JSObjectRef,
 
     fn init() !Fixture {
+        if (!polling_config.prepareBeforeVm()) return error.PollingConfigFailed;
         // Initialize the NativeHandle class once (idempotent).
         native_handle.init();
 

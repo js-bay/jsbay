@@ -149,6 +149,17 @@ napi_value createEngine(napi_env env, napi_callback_info info, bool close_on_log
 napi_value create(napi_env env, napi_callback_info info) {
     return createEngine(env, info, false, false);
 }
+napi_value createCoreEngineBeforeEmbedded(napi_env env, napi_callback_info) {
+    constexpr int32_t id = 700;
+    if (!jsbay_engine_create(id, nullptr, nullptr)) {
+        napi_throw_error(env, nullptr, "could not create the core engine before embedded setup");
+        return nullptr;
+    }
+    jsbay_engine_destroy(id);
+    napi_value result;
+    napi_get_boolean(env, true, &result);
+    return result;
+}
 napi_value createCloseOnLog(napi_env env, napi_callback_info info) {
     return createEngine(env, info, true, false);
 }
@@ -317,6 +328,9 @@ napi_value stats(napi_env env, napi_callback_info) {
 }
 napi_value init(napi_env env, napi_value exports) {
     napi_value value;
+    napi_create_function(env, "createCoreEngineBeforeEmbedded", NAPI_AUTO_LENGTH,
+                         createCoreEngineBeforeEmbedded, nullptr, &value);
+    napi_set_named_property(env, exports, "createCoreEngineBeforeEmbedded", value);
     napi_create_function(env, "create", NAPI_AUTO_LENGTH, create, nullptr, &value);
     napi_set_named_property(env, exports, "create", value);
     napi_create_function(env, "createCloseOnLog", NAPI_AUTO_LENGTH, createCloseOnLog, nullptr,
