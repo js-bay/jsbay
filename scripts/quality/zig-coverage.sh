@@ -9,7 +9,7 @@ root="$(git rev-parse --show-toplevel)"
 output="$1"
 mkdir -p "$output"
 output="$(cd "$output" && pwd -P)"
-for file in coverage.cobertura.xml coverage-invalid.cobertura.xml coverage-tests.json quickjs-tests.json pawl.coverage.yaml quickjs-engines-coverage.cobertura.xml pawl.quickjs-engines-coverage.yaml quickjs-engines-coverage.json zig-coverage-inventory.json; do
+for file in coverage.cobertura.xml coverage-invalid.cobertura.xml coverage-tests.json quickjs-tests.json pawl.coverage.yaml quickjs-coverage.cobertura.xml quickjs-ng-coverage.cobertura.xml quickjs-engines-coverage.cobertura.xml pawl.quickjs-engines-coverage.yaml quickjs-engines-coverage.json zig-coverage-inventory.json; do
     if [ -e "$output/$file" ]; then
         echo "Coverage output already exists: $output/$file" >&2
         exit 2
@@ -75,6 +75,8 @@ done
 
 quickjs_dir="$(dirname "${backend_reports[0]}")"
 quickjs_ng_dir="$(dirname "${backend_reports[1]}")"
+cp "${backend_reports[0]}" "$output/quickjs-coverage.cobertura.xml"
+cp "${backend_reports[1]}" "$output/quickjs-ng-coverage.cobertura.xml"
 if ! kcov --merge "$work/merged" "$quickjs_dir" "$quickjs_ng_dir" > "$work/merge.log" 2>&1; then
     cat "$work/merge.log" >&2
     exit 2

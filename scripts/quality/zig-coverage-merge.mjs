@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { filterMultipleCoberturaInlineTests } from './zig-inline-test-coverage.mjs'
@@ -19,7 +19,7 @@ function parseReport(xml, name) {
   for (const [, rawAttributes, body] of classes) {
     const filename = attributes(rawAttributes).filename ?? ''
     const parts = filename.split('/')
-    if (!/^[a-zA-Z0-9_./-]+\.(?:zig|c)$/.test(filename) || filename.startsWith('/') || parts.some(part => !part || part === '.' || part === '..' || part === 'tests')) {
+    if (!/^[a-zA-Z0-9_./-]+\.(?:zig|c|m)$/.test(filename) || filename.startsWith('/') || parts.some(part => !part || part === '.' || part === '..' || part === 'tests')) {
       throw new Error(`${name} report contains a path outside the Zig source scope: ${filename}`)
     }
     if (lines.has(`${filename}:class`)) throw new Error(`${name} report contains duplicate source classes: ${filename}`)
@@ -115,6 +115,93 @@ function filterToZig(xml) {
   const root = output.match(/<coverage\b([^>]*)>([\s\S]*?)<\/coverage\s*>/)
   if (!root) throw new Error('Merged report has no Cobertura root')
   return output.replace(root[0], rewriteCounts('coverage', root[1], root[2], lineCounts(root[2])))
+}
+
+function validateSourceLineBounds(xml) {
+  const classes = [...xml.matchAll(/<class\b([^>]*)>([\s\S]*?)<\/class\s*>/g)]
+  for (const [, rawAttributes, body] of classes) {
+    const filename = attributes(rawAttributes).filename
+    const path = realpathSync(resolve(repositoryRoot, 'src', filename))
+    const source = readFileSync(path, 'utf8')
+    const lineCount = sourceLineCount(source)
+    for (const [, raw] of body.matchAll(/<line\b([^>]*)\/?\s*>/g)) {
+      const number = integer(attributes(raw).number, 'source line')
+      if (number > lineCount) throw new Error(`Report source line exceeds the current file: ${filename}:${number}`)
+    }
+  }
+}
+
+export function sourceLineCount(source) {
+  if (source.length === 0) return 0
+  const newlineCount = source.match(/\n/g)?.length ?? 0
+  return newlineCount + (source.endsWith('\n') ? 0 : 1)
+}
+
+function escapeXml(value) {
+  return value.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+}
+
+function mergedCobertura(lines) {
+  const files = new Map()
+  for (const [key, hit] of lines) {
+    const separator = key.lastIndexOf(':')
+    const filename = key.slice(0, separator)
+    const number = Number(key.slice(separator + 1))
+    if (!files.has(filename)) files.set(filename, new Map())
+    files.get(filename).set(number, hit)
+  }
+  let covered = 0
+  let valid = 0
+  const classes = [...files].sort(([left], [right]) => left.localeCompare(right)).map(([filename, sourceLines]) => {
+    const lineCount = sourceLines.size
+    const lineCovered = [...sourceLines.values()].filter(Boolean).length
+    const rate = lineCount === 0 ? '1.000' : (lineCovered / lineCount).toFixed(3)
+    covered += lineCovered
+    valid += lineCount
+    const name = filename.slice(filename.lastIndexOf('/') + 1, -4)
+    const lineXml = [...sourceLines].sort(([left], [right]) => left - right)
+      .map(([number, hit]) => `<line number="${number}" hits="${hit ? 1 : 0}"/>`).join('')
+    return `<class name="${escapeXml(name)}" filename="${escapeXml(filename)}" line-rate="${rate}" lines-covered="${lineCovered}" lines-valid="${lineCount}" complexity="0"><lines>${lineXml}</lines></class>`
+  }).join('')
+  const rate = valid === 0 ? '1.000' : (covered / valid).toFixed(3)
+  return `<coverage line-rate="${rate}" lines-covered="${covered}" lines-valid="${valid}" complexity="0" version="1.9"><sources><source>src</source></sources><packages><package name="compiled-zig" line-rate="${rate}" lines-covered="${covered}" lines-valid="${valid}" complexity="0"><classes>${classes}</classes></package></packages></coverage>`
+}
+
+export function mergeZigBackendReports(backendReports) {
+  const requiredBackends = ['quickjs', 'quickjs_ng', 'jsc']
+  const actualBackends = Object.keys(backendReports).sort()
+  if (actualBackends.length !== requiredBackends.length || requiredBackends.some(name => !Object.hasOwn(backendReports, name))) {
+    throw new Error(`Expected reports for exactly: ${requiredBackends.join(', ')}`)
+  }
+
+  const names = requiredBackends
+  const rawReports = names.map(name => {
+    if (typeof backendReports[name] !== 'string' || backendReports[name].length === 0) {
+      throw new Error(`${name} report is missing or empty`)
+    }
+    parseReport(backendReports[name], name)
+    return filterToZig(backendReports[name])
+  })
+  const filteredReports = filterMultipleCoberturaInlineTests(rawReports, resolve(repositoryRoot, 'src'))
+  for (const report of filteredReports) validateSourceLineBounds(report)
+  const perBackend = Object.fromEntries(names.map((name, index) => [name, parseReport(filteredReports[index], name)]))
+  const union = new Map()
+  for (const name of names) {
+    for (const [key, hit] of perBackend[name].lines) {
+      union.set(key, (union.get(key) ?? false) || hit)
+    }
+  }
+  const report = mergedCobertura(union)
+  const merged = parseReport(report, 'Merged')
+  if (merged.lines.size !== union.size) throw new Error('Merged report does not match the backend source-line union')
+  for (const [key, hit] of union) {
+    if (merged.lines.get(key) !== hit) throw new Error(`Merged report does not match the backend hit union at ${key}`)
+  }
+  return {
+    backends: Object.fromEntries(names.map(name => [name, perBackend[name].summary])),
+    merged: merged.summary,
+    report,
+  }
 }
 
 export function validateMergedCoverage(quickjsXml, quickjsNgXml, mergedXml) {
