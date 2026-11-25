@@ -571,10 +571,10 @@ static napi_value throwText(napi_env env, const char *text) {
     napi_throw_error(env, nullptr, text);
     return nullptr;
 }
-static napi_value throwStatus(napi_env env, jsbay_status_t status) {
+static napi_value throwStatusWithMessage(napi_env env, jsbay_status_t status,
+                                         const char *message_text) {
     napi_value message, error, code;
-    std::string text = "js-bay status " + std::to_string(static_cast<int>(status));
-    napi_create_string_utf8(env, text.c_str(), NAPI_AUTO_LENGTH, &message);
+    napi_create_string_utf8(env, message_text, NAPI_AUTO_LENGTH, &message);
     napi_create_error(env, nullptr, message, &error);
     napi_create_int32(env, status, &code);
     napi_set_named_property(env, error, "status", code);
@@ -614,6 +614,10 @@ static napi_value throwStatus(napi_env env, jsbay_status_t status) {
     napi_throw(env, error);
     return nullptr;
 }
+static napi_value throwStatus(napi_env env, jsbay_status_t status) {
+    std::string message = "js-bay status " + std::to_string(static_cast<int>(status));
+    return throwStatusWithMessage(env, status, message.c_str());
+}
 static bool string(napi_env env, napi_value input, std::string *out) {
     size_t size = 0, copied = 0;
     if (napi_get_value_string_utf8(env, input, nullptr, 0, &size) != napi_ok)
@@ -641,8 +645,12 @@ static Engine *unwrap(napi_env env, napi_value value) {
     return napi_unwrap(env, value, reinterpret_cast<void **>(&out)) == napi_ok ? out : nullptr;
 }
 static bool requireEngine(napi_env env, Engine *engine) {
-    if (!engine || engine->closed) {
+    if (!engine) {
         throwStatus(env, JSBAY_INSTANCE_NOT_FOUND);
+        return false;
+    }
+    if (engine->closed) {
+        throwStatusWithMessage(env, JSBAY_INSTANCE_NOT_FOUND, "JsBay engine closed");
         return false;
     }
     if (engine->owner != std::this_thread::get_id()) {

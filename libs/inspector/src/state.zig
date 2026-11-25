@@ -15,12 +15,14 @@ pub fn Module(comptime Host: type) type {
         const sync = Host.sync;
         const transport_mod = @import("transport.zig");
         const object_table_mod = @import("object_table.zig").Module(Host);
-        const engine_destroy_gate = @import("state_destroy_gate.zig").Gate(Host);
+        const engine_destroy_gate_module = @import("state_destroy_gate.zig");
+        const engine_destroy_gate = engine_destroy_gate_module.Gate(Host);
         const test_faults = Host.test_faults;
         const console_replay = @import("console_replay.zig").Module;
         const command_queue = @import("command_queue.zig").Module(Host);
 
         pub const ObjectTable = object_table_mod.ObjectTable;
+        pub const EngineDestroyLease = engine_destroy_gate.DestroyLease;
 
         pub const ReportedRejection = struct {
             identity: usize,
@@ -296,7 +298,7 @@ pub fn Module(comptime Host: type) type {
             defer inspector_mutex.unlock();
             if (generation != 0 and Host.instance_map.generationOf(instance_id) != generation) return false;
             if (generation != 0 and Host.instance_map.isTeardownPending(instance_id)) return false;
-            if (engine_destroy_gate.destroying_ids) |*destroying| if (destroying.contains(key)) return false;
+            if (engine_destroy_gate_module.isDestroying(engine_destroy_gate, key)) return false;
             if (states) |*map| if (map.contains(instance_id)) return false;
             if (starting_ids == null) starting_ids = std.AutoHashMap(i32, void).init(std.heap.c_allocator);
             const reservations = &starting_ids.?;
@@ -313,24 +315,12 @@ pub fn Module(comptime Host: type) type {
         }
 
         // Close Inspector startup admission for the full engine runtime teardown. The caller holds this gate until the engine context has left instance_map.
-        pub fn beginEngineDestroy(instance_id: i32, generation: u64) bool {
-            const key = engine_destroy_gate.EngineGenerationKey{ .instance_id = instance_id, .generation = generation };
-            inspector_mutex.lock();
-            defer inspector_mutex.unlock();
-            if (engine_destroy_gate.destroying_ids == null) {
-                engine_destroy_gate.destroying_ids = std.AutoHashMap(engine_destroy_gate.EngineGenerationKey, void).init(std.heap.c_allocator);
-            }
-            const destroying = &engine_destroy_gate.destroying_ids.?;
-            if (destroying.contains(key)) return false;
-            destroying.put(key, {}) catch return true;
-            return true;
+        pub fn beginEngineDestroy(instance_id: i32, generation: u64, lease: *EngineDestroyLease) bool {
+            return engine_destroy_gate_module.begin(engine_destroy_gate, &inspector_mutex, instance_id, generation, lease);
         }
 
-        pub fn endEngineDestroy(instance_id: i32, generation: u64) void {
-            inspector_mutex.lock();
-            defer inspector_mutex.unlock();
-            if (engine_destroy_gate.destroying_ids) |*destroying| _ = destroying.remove(.{ .instance_id = instance_id, .generation = generation });
-            state_changed.broadcast();
+        pub fn endEngineDestroy(lease: *EngineDestroyLease) void {
+            engine_destroy_gate_module.end(engine_destroy_gate, &inspector_mutex, &state_changed, lease);
         }
 
         pub fn registerReservedStart(instance_id: i32, state: *InspectorState) bool {

@@ -21,6 +21,7 @@ const types = @import("../types.zig");
 const teardown_gate = @import("teardown_gate.zig");
 const state_admission_hook = @import("state_admission_hook.zig");
 const thread_value = @import("engine_thread_value.zig");
+const generation_thread = @import("generation_thread.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -66,7 +67,6 @@ const Job = struct {
 const DestroyOwner = enum(u8) { none, external, engine };
 
 pub const DestroyGateLease = teardown_gate.DestroyGateLease;
-const TeardownOwner = teardown_gate.TeardownOwner;
 pub const TeardownOwnerLease = teardown_gate.TeardownOwnerLease;
 pub const enterTeardownOwner = teardown_gate.enterTeardownOwner;
 pub const leaveTeardownOwner = teardown_gate.leaveTeardownOwner;
@@ -107,6 +107,8 @@ const State = struct {
     release_hook_data_for_testing: ?*anyopaque = null,
     shutdown_before_life_hook_for_testing: ?*const fn (?*anyopaque) void = null,
     shutdown_before_life_hook_data_for_testing: ?*anyopaque = null,
+    deferred_stop_hook_for_testing: ?*const fn (?*anyopaque) void = null,
+    deferred_stop_hook_data_for_testing: ?*anyopaque = null,
     /// Engine thread has dropped its claim so another thread may eval. Nesting is `yield_depth`, touched only by the engine thread.
     yielded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     yield_depth: u32 = 0,
@@ -161,9 +163,7 @@ pub fn ownerHasYielded(instance_id: i32) bool {
 }
 
 pub fn isEngineThreadForGeneration(instance_id: i32, generation: u64) bool {
-    const state = retain(instance_id) orelse return false;
-    defer release(state);
-    return state.generation == generation and isEngineThread(state);
+    return generation_thread.isEngineThreadForGeneration(instance_id, generation, retain, release, isEngineThread);
 }
 
 fn teardownClaimed(state: *State) bool {
@@ -303,18 +303,34 @@ pub fn threadStop(instance_id: i32) void {
     state.life_mu.unlock();
     shutdown(state);
 
-    const deferred = state.deferred_destroy.load(.seq_cst);
-    const owner = state.destroy_owner.load(.seq_cst);
-    const generation = state.generation;
+    const on_engine_thread = isEngineThread(state);
+    state.queue_mu.lock();
+    const hook = state.deferred_stop_hook_for_testing;
+    const hook_data = state.deferred_stop_hook_data_for_testing;
+    state.queue_mu.unlock();
+    if (hook) |callback| callback(hook_data);
+
     state.life_mu.lock();
     std.debug.assert(state.stop_requests != 0);
     state.stop_requests -= 1;
+    const deferred = state.deferred_destroy.load(.seq_cst);
+    const owner = state.destroy_owner.load(.seq_cst);
+    const generation = state.generation;
+    const deferred_owner_claimed = if (!deferred or owner != @backingInt(DestroyOwner.none)) false else if (on_engine_thread)
+        claimDestroyOwner(state, .engine)
+    else
+        claimDestroyOwner(state, .external);
     state.life_mu.unlock();
+
+    if (deferred_owner_claimed and !on_engine_thread) {
+        finishBeforeDestroyClaimed(instance_id, generation, state, true);
+        return;
+    }
     release(state);
 
-    // A host callback may request destruction while this caller owns the join. Let the joiner finish first, then take the ordinary external teardown path after dropping this State reference.
-    if (deferred and owner == @backingInt(DestroyOwner.none))
-        beforeDestroyClaimed(instance_id, generation);
+    // A self-stop cannot free the runtime while its host callback still holds a JS stack; threadMain consumes the engine-owned deferred teardown after the callback unwinds.
+    if (deferred_owner_claimed and on_engine_thread) return;
+    if (deferred and owner == @backingInt(DestroyOwner.none) and !on_engine_thread) waitGenerationGone(instance_id, generation);
 }
 
 pub fn threadId(instance_id: i32) u64 {
@@ -387,6 +403,14 @@ pub fn setShutdownBeforeLifeHookForTesting(
     state.shutdown_before_life_hook_data_for_testing = data;
     state.queue_mu.unlock();
     return true;
+}
+
+pub fn setDeferredStopHookForTesting(
+    instance_id: i32,
+    hook: *const fn (?*anyopaque) void,
+    data: ?*anyopaque,
+) bool {
+    return state_admission_hook.setDeferredStopForTesting(instance_id, hook, data, retain, release);
 }
 
 pub fn destroyGateWaitersForTesting(instance_id: i32) u32 {
@@ -752,19 +776,8 @@ pub fn foreignEvalBlocked(instance_id: i32) bool {
 }
 
 /// True only while `engine.destroy` is tearing this instance's runtime down on this thread. Ordinary `runGc` does not set it. Duktape's `FINALIZER_NORESCUE` / heap-destruct flag.
-threadlocal var destroying_generation: ?TeardownOwner = null;
-
-pub fn isDestroying(instance_id: i32) bool {
-    if (destroying_generation) |current| if (current.instance_id == instance_id) return true;
-    return isTeardownOwnerInstance(instance_id);
-}
-
-pub fn isDestroyingGeneration(instance_id: i32, generation: u64) bool {
-    if (destroying_generation) |current| {
-        if (current.instance_id == instance_id and current.generation == generation) return true;
-    }
-    return isTeardownOwnerThread(instance_id, generation);
-}
+pub const isDestroying = teardown_gate.isDestroying;
+pub const isDestroyingGeneration = teardown_gate.isDestroyingGeneration;
 
 /// Let another thread `evalScript` this instance. Only the engine thread may call it, and only after `threadStart`. Before the engine thread exists this is a no-op and returns true. A foreign caller returns false and does not abort.
 ///
@@ -843,8 +856,7 @@ pub fn setDeferredDrain(f: *const fn (instance_id: i32, generation: u64) void) v
 }
 
 pub fn runDeferredDrain(instance_id: i32) void {
-    const generation = instance_map.generationOf(instance_id) orelse return;
-    runDeferredDrainGeneration(instance_id, generation);
+    generation_thread.runDeferredDrain(instance_id, instance_map.generationOf, runDeferredDrainGeneration);
 }
 
 pub fn runDeferredDrainGeneration(instance_id: i32, generation: u64) void {
@@ -888,9 +900,8 @@ fn takeNative(state: *State) ?NativeTask {
 }
 
 fn freeRuntimeArmed(instance_id: i32, generation: u64) void {
-    const prev = destroying_generation;
-    destroying_generation = .{ .instance_id = instance_id, .generation = generation };
-    defer destroying_generation = prev;
+    const previous = teardown_gate.enterGenerationDestroy(instance_id, generation);
+    defer teardown_gate.leaveGenerationDestroy(previous);
     engine.destroyRuntimeGeneration(instance_id, generation);
     // Finalizers may have enqueued deferred work while the runtime was already going away. Drop it; the context is gone, so it must not run JS.
     runDeferredDrainGeneration(instance_id, generation);
@@ -1127,8 +1138,9 @@ pub fn beginDestroy(instance_id: i32, generation: u64) bool {
     // This thread may still hold an API ref, and the JS call has not returned. Waiting for refs here would deadlock.
     state.life_mu.lock();
     if (state.stop_requests == 0) _ = claimDestroyOwner(state, .engine);
+    const first_deferred_destroy = !state.deferred_destroy.swap(true, .seq_cst);
     state.life_mu.unlock();
-    if (!state.deferred_destroy.swap(true, .seq_cst)) {
+    if (first_deferred_destroy) {
         state.stopping.store(true, .seq_cst);
         _ = @import("runtime_control.zig").requestStopInterrupt(instance_id);
         cancelAll(state);
@@ -1180,11 +1192,11 @@ pub fn beforeDestroyGeneration(instance_id: i32, generation: u64) void {
 /// Finish teardown after the instance map has assigned this generation's unique teardown owner.
 pub fn beforeDestroyClaimed(instance_id: i32, generation: u64) void {
     if (instance_map.generationOf(instance_id) != generation) return;
-    var owner_lease: TeardownOwnerLease = undefined;
-    enterTeardownOwner(&owner_lease, instance_id, generation);
-    defer leaveTeardownOwner(&owner_lease);
-    instance_map.waitForControlOps(instance_id);
     const state = retain(instance_id) orelse {
+        var owner_lease: TeardownOwnerLease = undefined;
+        enterTeardownOwner(&owner_lease, instance_id, generation);
+        defer leaveTeardownOwner(&owner_lease);
+        instance_map.waitForControlOps(instance_id);
         releaseHostBindings(instance_id);
         freeRuntimeArmed(instance_id, generation);
         return;
@@ -1193,9 +1205,17 @@ pub fn beforeDestroyClaimed(instance_id: i32, generation: u64) void {
         release(state);
         return;
     }
+    finishBeforeDestroyClaimed(instance_id, generation, state, false);
+}
+
+fn finishBeforeDestroyClaimed(instance_id: i32, generation: u64, state: *State, owner_already_claimed: bool) void {
+    var owner_lease: TeardownOwnerLease = undefined;
+    enterTeardownOwner(&owner_lease, instance_id, generation);
+    defer leaveTeardownOwner(&owner_lease);
+    instance_map.waitForControlOps(instance_id);
     // A direct evaluator may have a State but no library-owned thread. The interrupt handler was installed at engine creation, so destruction can still break its currently executing JS before we wait for its lease.
     _ = @import("runtime_control.zig").requestStopInterrupt(instance_id);
-    if (!claimDestroyOwner(state, .external)) {
+    if (!owner_already_claimed and !claimDestroyOwner(state, .external)) {
         release(state);
         waitGenerationGone(instance_id, generation);
         return;
@@ -1358,6 +1378,8 @@ fn finishStoppedThread(state: *State) void {
 fn finishDeferredDestroy(state: *State) void {
     const instance_id = state.instance_id;
     const generation = state.generation;
+    var destroy_gate_lease: DestroyGateLease = undefined;
+    if (!lockDestroyGateForGeneration(instance_id, generation, &destroy_gate_lease)) @panic("deferred teardown lost its generation gate");
     var owner_lease: TeardownOwnerLease = undefined;
     enterTeardownOwner(&owner_lease, instance_id, generation);
     defer leaveTeardownOwner(&owner_lease);
@@ -1382,13 +1404,15 @@ fn finishDeferredDestroy(state: *State) void {
     const hook_data = state.detached_hook_data_for_testing;
     state.queue_mu.unlock();
     if (hook) |callback| callback(hook_data);
+    // Serialize destroy callers through State detachment, but release the bucketed gate before waiting for references that may themselves initiate teardown.
+    unlockGenerationDestroyGate(&destroy_gate_lease);
     waitRefsDrain(state);
 
     freeJobs(state);
     state.jobs.deinit();
     deinitStateSynchronization(state);
     std.heap.c_allocator.destroy(state);
-    // Teardown ownership prevents a replacement generation from being removed; release the ID gate before host callbacks run during runtime detach.
+    // Host finalizers run only after the generation gate is released.
     releaseHostBindings(instance_id);
     freeRuntimeArmed(instance_id, generation);
     // Runtime map drops in freeRuntimeArmed. Wake waitInstanceGone.

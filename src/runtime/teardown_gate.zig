@@ -29,6 +29,29 @@ pub const TeardownOwnerLease = struct {
     previous: ?*TeardownOwnerLease,
 };
 threadlocal var g_teardown_owner: ?*TeardownOwnerLease = null;
+threadlocal var g_destroying_generation: ?TeardownOwner = null;
+
+pub fn isDestroying(instance_id: i32) bool {
+    if (g_destroying_generation) |current| if (current.instance_id == instance_id) return true;
+    return isTeardownOwnerInstance(instance_id);
+}
+
+pub fn isDestroyingGeneration(instance_id: i32, generation: u64) bool {
+    if (g_destroying_generation) |current| {
+        if (current.instance_id == instance_id and current.generation == generation) return true;
+    }
+    return isTeardownOwnerThread(instance_id, generation);
+}
+
+pub fn enterGenerationDestroy(instance_id: i32, generation: u64) ?TeardownOwner {
+    const previous = g_destroying_generation;
+    g_destroying_generation = .{ .instance_id = instance_id, .generation = generation };
+    return previous;
+}
+
+pub fn leaveGenerationDestroy(previous: ?TeardownOwner) void {
+    g_destroying_generation = previous;
+}
 
 pub fn enterTeardownOwner(lease: *TeardownOwnerLease, instance_id: i32, generation: u64) void {
     lease.* = .{ .instance_id = instance_id, .generation = generation, .previous = g_teardown_owner };

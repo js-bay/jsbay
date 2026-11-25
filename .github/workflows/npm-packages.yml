@@ -237,7 +237,7 @@ jobs:
             test -f "$NODE_INCLUDE/uv.h"
             cmake_args+=(-DJSBAY_LIBRARY="$core/lib/jsbay.lib")
             cmake_args+=(-DNODE_INCLUDE="$NODE_INCLUDE" -DNODE_LIBRARY="$NODE_LIBRARY")
-            zig_args+=("-Dtarget=$ZIG_TARGET" "-Dinspector-transport=false")
+            zig_args+=("-Dtarget=$ZIG_TARGET")
           fi
           zig build "${zig_args[@]}"
           if [[ "$JSBAY_NPM_PLATFORM" != win32 ]]; then
@@ -273,8 +273,12 @@ jobs:
         run: |
           set -euo pipefail
           JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node tests/node-sdk/native_consumer.cjs
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node tests/node-sdk/inspector_consumer.cjs
           JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/extended_contract_consumer.cjs
           JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/value_contract_consumer.cjs
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/review_consumer.cjs close-async-contract
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/review_consumer.cjs worker-close-async-gc
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/review_consumer.cjs pending-engine-gc
 
       - uses: actions/download-artifact@v4
         if: ${{ !inputs.verify_published }}

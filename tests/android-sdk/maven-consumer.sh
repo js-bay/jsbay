@@ -198,22 +198,8 @@ if [[ "$check_legacy_conflict" == true ]]; then
     conflict_repo="$OUT/legacy-conflict-repository"
     new_module="$MAVEN_REPO/io/jsbay/$artifact/$VERSION"
     test -s "$new_module/$artifact-$VERSION.module"
-    node - "$new_module/$artifact-$VERSION.module" "$artifact" "$legacy_artifact" "$VERSION" <<'NODE'
-const { readFileSync } = require('node:fs')
-const [moduleFile, primaryName, legacyName, version] = process.argv.slice(2)
-const metadata = JSON.parse(readFileSync(moduleFile, 'utf8'))
-for (const usage of ['java-api', 'java-runtime']) {
-  const variants = metadata.variants.filter(variant => variant.attributes?.['org.gradle.usage'] === usage)
-  if (variants.length === 0) throw new Error(`Gradle module metadata has no ${usage} variant`)
-  for (const variant of variants) {
-    for (const name of [primaryName, legacyName]) {
-      if (!variant.capabilities?.some(capability => capability.group === 'io.jsbay' && capability.name === name && capability.version === version)) {
-        throw new Error(`${variant.name} does not declare capability io.jsbay:${name}:${version}`)
-      }
-    }
-  }
-}
-NODE
+    node "$script_dir/check-maven-capabilities.mjs" \
+        "$new_module/$artifact-$VERSION.module" "$artifact" "$legacy_artifact" "$VERSION"
     mkdir -p "$conflict_repo/io/jsbay" "$conflict_repo/io/jsbay/$legacy_artifact/$VERSION" \
         "$conflict_repo/io/jsbay/test/legacy-client/1.0"
     cp -R "$MAVEN_REPO/io/jsbay/$artifact" "$conflict_repo/io/jsbay/"

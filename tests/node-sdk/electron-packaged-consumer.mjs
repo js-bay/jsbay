@@ -35,7 +35,7 @@ async function extractPackage(tarball, destination) {
 function runPackagedApp(executable) {
   return new Promise((resolveRun, rejectRun) => {
     const resultFile = join(work, 'electron-result.txt')
-    const child = spawn(executable, ['--no-sandbox', '--disable-gpu'], {
+    const child = spawn(executable, ['--no-sandbox', '--disable-gpu', '--js-flags=--expose-gc'], {
       windowsHide: true,
       env: { ...process.env, JSBAY_ELECTRON_RESULT: resultFile },
     })
@@ -57,6 +57,8 @@ function runPackagedApp(executable) {
     })
   })
 }
+
+const electronWorkerSource = "const { parentPort, workerData } = require('node:worker_threads'); const { Engine } = require(workerData.addonPath); let engine = Engine.create(); const closed = engine.closeAsync(); engine = null; global.gc(); closed.then(() => { global.gc(); parentPort.postMessage('closed') }, error => { throw error })"
 
 try {
   let main
@@ -86,20 +88,28 @@ try {
   }, null, 2))
   await writeFile(join(appDir, 'main.cjs'), [
     "const { app } = require('electron')",
+    "const assert = require('node:assert/strict')",
     "const { writeFileSync } = require('node:fs')",
+    "const { Worker } = require('node:worker_threads')",
     "const { Engine } = require('@jsbay/quickjsng')",
-    'app.whenReady().then(() => {',
-    '  try {',
-    '    const engine = Engine.create()',
-    "    if (engine.evaluate('6 * 7') !== 42) throw new Error('unexpected engine result')",
-    '    engine.close()',
-    "    writeFileSync(process.env.JSBAY_ELECTRON_RESULT, 'JSBAY_ELECTRON_PACKAGED_OK')",
-    '    app.exit(0)',
-    '  } catch (error) {',
-    '    console.error(error)',
-    '    app.exit(1)',
-    '  }',
-    '})',
+    'function workerCloseAsyncGc(addonPath) {',
+    '  return new Promise((resolve, reject) => {',
+    `    const worker = new Worker(${JSON.stringify(electronWorkerSource)}, { eval: true, workerData: { addonPath } })`,
+    "    const timer = setTimeout(() => { void worker.terminate(); reject(new Error('Electron worker closeAsync timed out')) }, 5000)",
+    "    worker.once('error', error => { clearTimeout(timer); reject(error) })",
+    "    worker.once('message', message => { clearTimeout(timer); assert.equal(message, 'closed'); resolve() })",
+    '  })',
+    '}',
+    'async function run() {',
+    "  const engine = Engine.create()",
+    "  assert.equal(engine.evaluate('6 * 7'), 42, 'packaged addon evaluates JavaScript')",
+    '  await engine.closeAsync()',
+    "  assert.throws(() => engine.evaluate('1'), /closed/, 'closed engines reject later calls')",
+    "  await workerCloseAsyncGc(require.resolve('@jsbay/quickjsng'))",
+    '  for (let index = 0; index < 3; index++) { global.gc(); await new Promise(resolve => setImmediate(resolve)) }',
+    "  writeFileSync(process.env.JSBAY_ELECTRON_RESULT, 'JSBAY_ELECTRON_PACKAGED_OK')",
+    '}',
+    "app.whenReady().then(() => run().then(() => app.exit(0), error => { console.error(error); app.exit(1) }))",
   ].join('\n'))
 
   await run(process.execPath, [npmCli, 'install', '--prefix', toolsDir, '--no-save', '--no-audit', '--no-fund',

@@ -8,8 +8,9 @@ const ActiveEngine = backend.ActiveEngine;
 pub fn destroyRuntimeGeneration(instance_id: i32, generation: u64) void {
     if (instance_map.generationOf(instance_id) != generation) return;
     const inspector_state = @import("../inspector/root.zig").state;
-    if (!inspector_state.beginEngineDestroy(instance_id, generation)) @panic("engine generation teardown already active");
-    defer inspector_state.endEngineDestroy(instance_id, generation);
+    var inspector_destroy_lease: inspector_state.EngineDestroyLease = .{};
+    if (!inspector_state.beginEngineDestroy(instance_id, generation, &inspector_destroy_lease)) @panic("engine generation teardown already active");
+    defer inspector_state.endEngineDestroy(&inspector_destroy_lease);
 
     if (!dispatch.closeInstanceTasks(instance_id)) return;
     @import("../abi/api_async.zig").cancelForInstance(@import("../types.zig").InstanceId.fromInt(instance_id));

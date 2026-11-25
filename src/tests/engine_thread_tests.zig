@@ -49,7 +49,7 @@ fn processIdForPath() u64 {
     return @intCast(std.c.getpid());
 }
 
-fn clearHost(out: *JsBayHostValue) void {
+pub fn clearHost(out: *JsBayHostValue) void {
     out.* = .{
         .tag = host_undefined,
         .reserved = 0,
@@ -59,7 +59,7 @@ fn clearHost(out: *JsBayHostValue) void {
     };
 }
 
-fn spinUntil(flag: *const std.atomic.Value(bool), timeout_ms: i64) bool {
+pub fn spinUntil(flag: *const std.atomic.Value(bool), timeout_ms: i64) bool {
     const start = io.monotonicMilliseconds();
     while (!flag.load(.seq_cst)) {
         if (io.monotonicMilliseconds() - start >= timeout_ms) return false;
@@ -78,7 +78,7 @@ fn spinUntilEq(flag: *const std.atomic.Value(u32), expected: u32, timeout_ms: i6
 }
 
 /// Join a thread that is supposed to finish. If it does not, the process exits: joining would hang the suite, and so would returning while the thread stays blocked.
-fn joinOrExit(thread: std.Thread, done: *const std.atomic.Value(bool), timeout_ms: i64, what: []const u8) void {
+pub fn joinOrExit(thread: std.Thread, done: *const std.atomic.Value(bool), timeout_ms: i64, what: []const u8) void {
     if (!spinUntil(done, timeout_ms)) {
         std.debug.print("{s} did not finish within {d}ms\n", .{ what, timeout_ms });
         std.process.exit(1);
@@ -105,13 +105,13 @@ fn expectCopied(copied: Copied, buf: []const u8, expected: []const u8) !void {
     try testing.expectEqualStrings(expected, buf[0..copied.len]);
 }
 
-const Live = struct {
+pub const Live = struct {
     id: i32,
     release: ?*std.atomic.Value(bool) = null,
     started: bool = false,
     closed: bool = false,
 
-    fn close(self: *Live) void {
+    pub fn close(self: *Live) void {
         if (self.closed) return;
         if (self.release) |flag| flag.store(true, .seq_cst);
         if (self.started) engine_thread_mod.threadStop(self.id);
@@ -120,16 +120,16 @@ const Live = struct {
     }
 };
 
-fn createInstance(id: i32) !Live {
+pub fn createInstance(id: i32) !Live {
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
     return .{ .id = id };
 }
 
-fn install(id: i32, name: []const u8, func: JsBayHostFn, user: ?*anyopaque) !void {
+pub fn install(id: i32, name: []const u8, func: JsBayHostFn, user: ?*anyopaque) !void {
     try testing.expect(engine_thread_mod.hostInstall(id, name, func, user));
 }
 
-fn startThread(live: *Live) !void {
+pub fn startThread(live: *Live) !void {
     try testing.expect(engine_thread_mod.threadStart(live.id));
     live.started = true;
 }
@@ -468,13 +468,13 @@ const RunJob = struct {
     }
 };
 
-const Poster = struct {
+pub const Poster = struct {
     id: i32,
     src: []const u8,
     job: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     returned: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    fn go(self: *Poster) void {
+    pub fn go(self: *Poster) void {
         const job = testThreadPost(
             self.id,
             self.src.ptr,
@@ -548,7 +548,7 @@ fn skipSpikeNeedsNativeInterrupt() !void {
 }
 
 /// Escargot hostInstall + stop/destroy/dispatch still SEGV (GC) in this pin; Hermes is green.
-fn skipEscargotEtHost() !void {
+pub fn skipEscargotEtHost() !void {
     if (comptime backend.isEscargotBackend(backend.active_backend)) return error.SkipZigTest;
 }
 
@@ -1295,11 +1295,11 @@ const StopAfterExternalShutdown = struct {
     }
 };
 
-const StopRunner = struct {
+pub const StopRunner = struct {
     id: i32,
     done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    fn run(self: *@This()) void {
+    pub fn run(self: *@This()) void {
         engine_thread_mod.threadStop(self.id);
         self.done.store(true, .seq_cst);
     }

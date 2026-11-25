@@ -20,7 +20,15 @@ async function main() {
   try {
     engine.setExecutionTimeLimit(0)
     engine.setExecutionBudget(0)
-    engine.setMemoryLimit(0)
+    if (capabilities.memoryLimit) {
+      engine.setMemoryLimit(0)
+    } else {
+      assert.throws(
+        () => engine.setMemoryLimit(0),
+        error => error.code === 'JSBAY_UNSUPPORTED',
+        'a backend without heap-limit support reports JSBAY_UNSUPPORTED'
+      )
+    }
     assert.equal(typeof engine.resourceUsage().pending_bytes, 'bigint')
     assert.equal(typeof engine.memoryUsage().malloc_size, 'bigint')
     assert.equal(engine.evaluate('1 + 2', 'number.js'), 3)

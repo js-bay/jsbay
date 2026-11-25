@@ -5,6 +5,28 @@ root=$(cd "$(dirname "$0")/../.." && pwd)
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/jsbay-maven-consumer-auth-test.XXXXXX")
 trap 'rm -rf "$temporary"' EXIT
 token_marker="consumer-contract-$$"
+cat > "$temporary/module-metadata.json" <<'EOF'
+{
+  "variants": [
+    {"name":"releaseVariantReleaseApiPublication","attributes":{"org.gradle.category":"library","org.gradle.usage":"java-api"},"capabilities":[{"group":"io.jsbay","name":"jsbay-quickjs","version":"0.1.1-rc.1"},{"group":"io.jsbay","name":"jsbayquickjs","version":"0.1.1-rc.1"}]},
+    {"name":"releaseVariantReleaseRuntimePublication","attributes":{"org.gradle.category":"library","org.gradle.usage":"java-runtime"},"capabilities":[{"group":"io.jsbay","name":"jsbay-quickjs","version":"0.1.1-rc.1"},{"group":"io.jsbay","name":"jsbayquickjs","version":"0.1.1-rc.1"}]},
+    {"name":"releaseVariantReleaseSourcePublication","attributes":{"org.gradle.category":"documentation","org.gradle.usage":"java-runtime","org.gradle.docstype":"sources"},"capabilities":[]}
+  ]
+}
+EOF
+node "$root/tests/android-sdk/check-maven-capabilities.mjs" "$temporary/module-metadata.json" jsbay-quickjs jsbayquickjs 0.1.1-rc.1
+node - "$temporary/module-metadata.json" "$temporary/missing-capability.module" <<'NODE'
+const { readFileSync, writeFileSync } = require('node:fs')
+const [source, destination] = process.argv.slice(2)
+const metadata = JSON.parse(readFileSync(source, 'utf8'))
+metadata.variants[0].capabilities = metadata.variants[0].capabilities.filter(capability => capability.name !== 'jsbayquickjs')
+writeFileSync(destination, JSON.stringify(metadata))
+NODE
+if node "$root/tests/android-sdk/check-maven-capabilities.mjs" "$temporary/missing-capability.module" jsbay-quickjs jsbayquickjs 0.1.1-rc.1 >"$temporary/missing-capability.log" 2>&1; then
+    echo 'expected capability checker to reject a missing legacy capability on a library variant' >&2
+    exit 1
+fi
+grep -Fq 'releaseVariantReleaseApiPublication does not declare capability io.jsbay:jsbayquickjs:0.1.1-rc.1' "$temporary/missing-capability.log"
 mkdir -p "$temporary/bin" "$temporary/local-repository"
 mkdir -p "$temporary/local-repository/io/jsbay/jsbayquickjs/0.1.1-rc.1"
 printf '%s\n' '<project />' > "$temporary/local-repository/io/jsbay/jsbayquickjs/0.1.1-rc.1/jsbayquickjs-0.1.1-rc.1.pom"
