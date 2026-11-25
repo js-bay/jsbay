@@ -19,6 +19,7 @@ test {
     _ = @import("ios_stdlib.zig");
     _ = @import("r8_tests.zig");
     _ = @import("distribution_tests.zig");
+    _ = @import("distribution_runner_tests.zig");
 }
 
 pub fn main(init: std.process.Init) !void {

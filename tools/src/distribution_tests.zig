@@ -4,102 +4,20 @@ const sdk = @import("sdk.zig");
 
 const testing = std.testing;
 const Dir = std.Io.Dir;
+const support = @import("distribution_test_support.zig");
 
-fn root(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
-    return std.process.currentPathAlloc(io, allocator);
-}
-
-fn temp(allocator: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]u8 {
-    var random: [12]u8 = undefined;
-    io.random(&random);
-    const directory = try std.fmt.allocPrint(allocator, "/tmp/{s}-{s}", .{ prefix, std.fmt.bytesToHex(random, .lower) });
-    try Dir.cwd().createDir(io, directory, .default_dir);
-    return directory;
-}
-
-fn join(allocator: std.mem.Allocator, base: []const u8, parts: []const []const u8) ![]u8 {
-    var all: std.ArrayList([]const u8) = .empty;
-    defer all.deinit(allocator);
-    try all.append(allocator, base);
-    try all.appendSlice(allocator, parts);
-    return std.fs.path.join(allocator, all.items);
-}
-
-fn write(io: std.Io, name: []const u8, contents: []const u8) !void {
-    try Dir.cwd().writeFile(io, .{ .sub_path = name, .data = contents });
-}
-
-fn read(allocator: std.mem.Allocator, io: std.Io, base: []const u8, parts: []const []const u8) ![]u8 {
-    return Dir.cwd().readFileAlloc(io, try join(allocator, base, parts), allocator, .limited(16 * 1024 * 1024));
-}
-
-fn contains(haystack: []const u8, needle: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, haystack, needle) != null);
-}
-
-fn notContains(haystack: []const u8, needle: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, haystack, needle) == null);
-}
-
-fn mustRun(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, argv: []const []const u8) !sdk.Output {
-    var output = try sdk.run(allocator, io, argv, cwd);
-    if (!output.succeeded()) {
-        std.debug.print("command failed:", .{});
-        for (argv) |arg| std.debug.print(" {s}", .{arg});
-        std.debug.print("\n{s}{s}", .{ output.result.stdout, output.result.stderr });
-        output.deinit();
-        return error.CommandFailed;
-    }
-    return output;
-}
-
-fn expectSucceeded(output: sdk.Output, label: []const u8) !void {
-    if (output.succeeded()) return;
-    std.debug.print("{s} failed:\n{s}{s}\n", .{ label, output.result.stdout, output.result.stderr });
-    return error.TestUnexpectedResult;
-}
-
-fn executable(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, name: []const u8, contents: []const u8) !void {
-    try write(io, name, contents);
-    var output = try mustRun(allocator, io, cwd, &.{ "chmod", "+x", name });
-    output.deinit();
-}
-
-fn pathEnv(allocator: std.mem.Allocator, tools: []const u8) ![]u8 {
-    // Keep this libc-free: `zig build test-tools` does not link libc on CI.
-    //
-    // tools/ must stay first so fixture stubs win over host binaries.
-    return std.fmt.allocPrint(allocator, "PATH={s}:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin", .{tools});
-}
-
-fn androidFixture(allocator: std.mem.Allocator, io: std.Io, fixture: []const u8) ![]u8 {
-    const tools = try join(allocator, fixture, &.{"tools"});
-    const bin = try join(allocator, fixture, &.{ "ndk", "toolchains", "llvm", "prebuilt", "test", "bin" });
-    var output = try mustRun(allocator, io, fixture, &.{ "mkdir", "-p", tools, bin, try join(allocator, fixture, &.{ "ndk", "toolchains", "llvm", "prebuilt", "test", "sysroot" }) });
-    output.deinit();
-    const clang =
-        \\#!/bin/sh
-        \\out=""; previous=""
-        \\for arg in "$@"; do [ "$previous" = -o ] && out="$arg"; previous="$arg"; done
-        \\[ -n "$out" ] && { mkdir -p "$(dirname "$out")"; printf object > "$out"; }
-        \\
-    ;
-    try executable(allocator, io, fixture, try join(allocator, bin, &.{"aarch64-linux-android24-clang"}), clang);
-    try executable(allocator, io, fixture, try join(allocator, bin, &.{"x86_64-linux-android24-clang"}), clang);
-    try executable(allocator, io, fixture, try join(allocator, bin, &.{"llvm-ar"}), "#!/bin/sh\nif [ \"$1\" = x ]; then printf object > unit.o; fi\nexit 0\n");
-    try executable(allocator, io, fixture, try join(allocator, bin, &.{"llvm-nm"}), "#!/bin/sh\nexit 0\n");
-    try executable(allocator, io, fixture, try join(allocator, bin, &.{"llvm-objcopy"}), "#!/bin/sh\nexit 0\n");
-    try executable(allocator, io, fixture, try join(allocator, tools, &.{"zig"}),
-        \\#!/bin/sh
-        \\[ "$1" = build ] && [ "$2" = tool ] && exit 0
-        \\target=""; prefix=""; previous=""
-        \\for arg in "$@"; do case "$arg" in -Dtarget=*) target="${arg#-Dtarget=}" ;; esac; [ "$previous" = --prefix ] && prefix="$arg"; previous="$arg"; done
-        \\if [ "${FAIL_X64:-}" = 1 ] && [ "${target#x86_64}" != "$target" ]; then exit 42; fi
-        \\mkdir -p "$prefix/lib"; printf archive > "$prefix/lib/libjsbay.a"
-        \\
-    );
-    return tools;
-}
+const root = support.root;
+const temp = support.temp;
+const join = support.join;
+const write = support.write;
+const read = support.read;
+const contains = support.contains;
+const notContains = support.notContains;
+const mustRun = support.mustRun;
+const expectSucceeded = support.expectSucceeded;
+const executable = support.executable;
+const pathEnv = support.pathEnv;
+const androidFixture = support.androidFixture;
 
 test "test_android_failed_second_arch_keeps_existing_output_unchanged" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -284,39 +202,6 @@ test "test_android_release_includes_maven_metadata_and_transitive_kotlin" {
     const gradle = try read(a, io, cwd, &.{ "sdk", "android", "jsbay", "build.gradle.kts" });
     for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbayquickjs\"", "\"quickjs_ng\" -> \"jsbayquickjsng\"", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
     for ([_][]const u8{ ":jsbay:publishReleasePublicationToStagingRepository", "-PjsbayVersion=", "-PjsbayBackend=\"$backend\"", "-PjsbayMavenRepo=", "archive=\"jsbay-${ver}-android-${backend}-maven.zip\"", "tests/android-sdk/maven-consumer.sh", "env -u ANDROID_HOME ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"", "-PjsbayVersion=\"${{ steps.ver.outputs.label }}\"", "tool -- check-maven \"$module\" \"$ver\" \"$backend\"" }) |needle| try contains(release, needle);
-}
-
-test "test_library_build_accepts_empty_and_explicit_targets_with_runner_bash" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const io = testing.io;
-    const cwd = try root(a, io);
-    const fixture = try temp(a, io, "jsbay-release-runner");
-    defer Dir.cwd().deleteTree(io, fixture) catch {};
-    const cases = [_]struct { job: []const u8, step: []const u8, target: []const u8, apple: bool }{
-        .{ .job = "build-libs-linux", .step = "Build library quickjs_ng (linux-x86_64)", .target = "x86_64-linux-gnu", .apple = false },
-        .{ .job = "build-libs-macos", .step = "Build library quickjs_ng (macos-aarch64)", .target = "aarch64-macos.11.0", .apple = true },
-        .{ .job = "build-libs-macos", .step = "Build library quickjs (macos-aarch64)", .target = "aarch64-macos.11.0", .apple = true },
-    };
-    const zig = try join(a, fixture, &.{"zig"});
-    const xcrun = try join(a, fixture, &.{"xcrun"});
-    const args = try join(a, fixture, &.{"args.txt"});
-    try executable(a, io, fixture, zig, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$ZIG_ARGS_FILE\"\n");
-    try executable(a, io, fixture, xcrun, "#!/bin/sh\nprintf '%s\\n' \"$FAKE_APPLE_SDK\"\n");
-    const env_path = try pathEnv(a, fixture);
-    for (cases) |case| {
-        const script_extract = try std.fmt.allocPrint(a, "require 'yaml'; steps = YAML.load_file(ARGV.fetch(0)).fetch('jobs').fetch('{s}').fetch('steps'); puts steps.find {{ |step| step['name'] == '{s}' }}.fetch('run')", .{ case.job, case.step });
-        var extracted = try mustRun(a, io, cwd, &.{ "ruby", "-e", script_extract, ".github/workflows/release.yml" });
-        defer extracted.deinit();
-        var out = try sdk.run(a, io, &.{ "env", env_path, try std.fmt.allocPrint(a, "ZIG_ARGS_FILE={s}", .{args}), try std.fmt.allocPrint(a, "FAKE_APPLE_SDK={s}", .{fixture}), "bash", "-euo", "pipefail", "-c", extracted.result.stdout }, cwd);
-        defer out.deinit();
-        try testing.expect(out.succeeded());
-        const recorded = try read(a, io, fixture, &.{"args.txt"});
-        try contains(recorded, try std.fmt.allocPrint(a, "-Dtarget={s}", .{case.target}));
-        if (case.apple) try contains(recorded, try std.fmt.allocPrint(a, "-Dapple-sysroot={s}", .{fixture})) else try notContains(recorded, "-Dapple-sysroot=");
-        if (std.mem.indexOf(u8, case.step, "quickjs (") != null) try contains(recorded, "-Dbackend=quickjs") else try contains(recorded, "-Dbackend=quickjs_ng");
-    }
 }
 
 test "test_android_sdk_distribution_uses_tracked_source_only" {
