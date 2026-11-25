@@ -7,6 +7,7 @@ const testing = std.testing;
 const transport = @import("inspector_transport");
 const zev = @import("zev");
 const test_client = @import("test_client");
+const test_helpers = @import("test_helpers.zig");
 
 const socket = @import("portable_socket");
 
@@ -884,12 +885,16 @@ test "transport: large message within 64 MiB limit is delivered successfully and
 
 test "transport: at most one large message waits in queue while another is being written" {
     const alloc = testing.allocator;
+    var barrier = test_helpers.LargeWriteBarrier{};
+    defer barrier.deinit();
     var opened = Opened{};
     defer opened.changed.deinit();
     defer opened.mutex.deinit();
     // Use smaller limits to test gating deterministically: 64 KiB backlog, 2 MiB max message.
     const t = try transport.Transport.initWithOptions(alloc, 0, .{ .max_backlog_bytes = 64 * 1024, .max_message_bytes = 2 * 1024 * 1024 });
     defer t.deinit();
+    defer barrier.release();
+    transport.Transport.test_only.setWriterHook(t, test_helpers.LargeWriteBarrier.observe, &barrier);
     t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "large-in-flight-peer" });
     try t.start(&opened, Opened.handler);
 
@@ -898,7 +903,6 @@ test "transport: at most one large message waits in queue while another is being
     try handshake(peer, "large-in-flight-peer");
     const session = opened.wait(1);
 
-    try peer.setReceiveBuffer(4096);
     const large1 = try alloc.alloc(u8, 1500 * 1024);
     defer alloc.free(large1);
     @memset(large1, 'a');
@@ -912,14 +916,10 @@ test "transport: at most one large message waits in queue while another is being
     @memset(large3, 'c');
 
     try testing.expect(t.sendText(session, large1));
-    var queued = false;
-    var attempts: usize = 0;
-    while (!queued and attempts < 500) : (attempts += 1) {
-        queued = t.sendText(session, large2);
-        if (!queued) zev.sleepMilliseconds(1);
-    }
-    try testing.expect(queued);
+    try barrier.waitUntilEntered(10_000);
+    try testing.expect(t.sendText(session, large2));
     try testing.expect(!t.sendText(session, large3));
+    barrier.release();
 
     const received1 = try readTextFrame(alloc, peer);
     defer alloc.free(received1);
