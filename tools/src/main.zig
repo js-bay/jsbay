@@ -175,11 +175,11 @@ fn checkCAbi(args: []const []const u8) !u8 {
     }
     for (consumers) |consumer| {
         if (zig_compiler) |zig| {
-            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ zig, "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-c", "-o", ".zig-cache/abi-probes/probe.o", "-I", "include", consumer }, if (zig_compiler != null) &compiler_env else null);
-            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ zig, "c++", "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-c", "-o", ".zig-cache/abi-probes/probe.o", "-I", "include", consumer }, if (zig_compiler != null) &compiler_env else null);
+            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ zig, "cc", "-std=c11", "-Wall", "-Wextra", "-Werror", "-c", "-o", ".zig-cache/abi-probes/probe.o", "-I", "include", consumer }, &compiler_env);
+            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ zig, "c++", "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-c", "-o", ".zig-cache/abi-probes/probe.o", "-I", "include", consumer }, &compiler_env);
         } else {
-            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer }, if (zig_compiler != null) &compiler_env else null);
-            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer }, if (zig_compiler != null) &compiler_env else null);
+            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cc, "-std=c11", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer }, null);
+            try requireExternal(std.heap.page_allocator, threaded.io(), &.{ cxx, "-x", "c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-fsyntax-only", "-I", "include", consumer }, null);
         }
     }
     const lib = library orelse return 0;
