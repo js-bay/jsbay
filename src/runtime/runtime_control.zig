@@ -5,7 +5,7 @@
 //!   - set an execution time limit that auto-interrupts expired scripts
 //!   - force a synchronous GC pass and snapshot memory usage
 //!
-//! Lifecycle: Call `init(instance_id)` ONCE after `engine.create` to arm the backend-specific interrupt trampoline. `engine.destroy` calls `deinit(instance_id)` only after active JavaScript has unwound, while the runtime is still valid. Direct users may call `deinit` themselves before destroy when no evaluation is active.
+//! Lifecycle: Call `init(instance_id)` ONCE after `engine.create` to arm the backend-specific interrupt trampoline. `engine.destroy` removes it only after active JavaScript has unwound, while the runtime is still valid. Direct users may call `deinit` themselves before destroy when no evaluation is active.
 //!
 //! Thread-safety: `requestInterrupt` / `clearInterrupt` / `setExecutionTimeLimit` are safe to call from any thread (atomic loads/stores on the shared state). `runGc` / `getMemoryUsage` must be called on the engine's owning thread — they touch the JS runtime directly.
 //!
@@ -65,6 +65,7 @@ pub const InterruptState = extern struct {
     generation: u64 = 0,
     handler_status: HandlerStatus = .ready,
     registration_waiters: usize = 0,
+    active_handler_users: usize = 0,
 };
 
 fn assertTrampolinePrefix(comptime Shadow: type) void {
@@ -293,8 +294,13 @@ fn installInterruptHandler(inst: *instance_map.EngineInstance, state: *Interrupt
 
 /// Remove the interrupt trampoline and free the state. Call before `engine.destroy`. Idempotent — returns false if the instance was never initialized (or already torn down).
 pub fn deinit(instance_id: i32) bool {
-    const inst_opt = instance_map.getInstance(instance_id);
+    const lease = instance_map.beginControlPlane(instance_id) orelse return false;
+    defer lease.end();
+    return deinitForInstance(instance_id, lease.inst);
+}
 
+/// Remove handler state while the caller owns the instance lifetime, either through a control-plane lease or teardown ownership.
+pub fn deinitForInstance(instance_id: i32, inst: *instance_map.EngineInstance) bool {
     registry_mutex.lock();
     while (registry.get(instance_id)) |pending| {
         if (pending.handler_status != .installing and pending.handler_status != .removing and pending.registration_waiters == 0) break;
@@ -304,45 +310,48 @@ pub fn deinit(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (state.generation != inst.generation or state.backend_tag != backend.backendToC(inst.backendTag())) {
+        registry_mutex.unlock();
+        return false;
+    }
     state.handler_status = .removing;
+    while (state.active_handler_users != 0) registry_condition.wait(&registry_mutex);
     registry_mutex.unlock();
 
     // Uninstall from the backend BEFORE freeing the state — otherwise the JS thread could read freed memory if it fires a check between takeState and here.
-    if (inst_opt) |inst| {
-        if (inst.generation == state.generation and backend.backendToC(inst.backendTag()) == state.backend_tag) {
-            switch (inst.engine_handles) {
-                .mono => |m| switch (backend.active_backend) {
-                    .quickjs, .quickjs_ng => {
-                        const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                        qjs_mod.qjsUninstallInterruptHandler(m.runtime);
-                    },
-                    .jsc => {
-                        const jsc_mod = @import("../backend/jsc.zig");
-                        const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
-                        jsc_mod.jscUninstallInterruptHandler(group);
-                    },
-                    .escargot, .hermes => {},
+    {
+        switch (inst.engine_handles) {
+            .mono => |m| switch (backend.active_backend) {
+                .quickjs, .quickjs_ng => {
+                    const qjs_mod = @import("../backend.zig").ActiveEngineModule;
+                    qjs_mod.qjsUninstallInterruptHandler(m.runtime);
                 },
-                .packed_alt => |a| {
-                    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
-                        if (a.tag == cand) {
-                            if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) break;
-                            if (comptime backend.isQuickJsApiBackend(cand)) {
-                                const E = backend.Engine(cand);
-                                const Mod = backend.EngineModule(cand);
-                                const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
-                                Mod.qjsUninstallInterruptHandler(rt);
-                            } else {
-                                const jsc_mod = @import("../backend/jsc.zig");
-                                const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
-                                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
-                                jsc_mod.jscUninstallInterruptHandler(group);
-                            }
-                            break;
+                .jsc => {
+                    const jsc_mod = @import("../backend/jsc.zig");
+                    const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
+                    jsc_mod.jscUninstallInterruptHandler(group);
+                },
+                .escargot, .hermes => {},
+            },
+            .packed_alt => |a| {
+                inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+                    if (a.tag == cand) {
+                        if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) break;
+                        if (comptime backend.isQuickJsApiBackend(cand)) {
+                            const E = backend.Engine(cand);
+                            const Mod = backend.EngineModule(cand);
+                            const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
+                            Mod.qjsUninstallInterruptHandler(rt);
+                        } else {
+                            const jsc_mod = @import("../backend/jsc.zig");
+                            const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
+                            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
+                            jsc_mod.jscUninstallInterruptHandler(group);
                         }
+                        break;
                     }
-                },
-            }
+                }
+            },
         }
     }
 
@@ -598,6 +607,43 @@ test "instance control registration rejects stale state and serializes first reg
     try std.testing.expect(initForInstance(id, inst));
 }
 
+test "public deinit lease serializes with engine destruction and id reuse" {
+    const id = std.math.maxInt(i32) - 14;
+    try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
+    defer engine.destroy(id);
+
+    const Probe = struct {
+        id: i32,
+        start: *std.atomic.Value(bool),
+
+        fn runDeinit(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            _ = deinit(self.id);
+        }
+
+        fn destroy(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            engine.destroy(self.id);
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var probe = Probe{ .id = id, .start = &start };
+    const deinit_thread = try std.Thread.spawn(.{}, Probe.runDeinit, .{&probe});
+    const destroy_thread = std.Thread.spawn(.{}, Probe.destroy, .{&probe}) catch {
+        start.store(true, .release);
+        deinit_thread.join();
+        engine.destroy(id);
+        return error.ThreadSpawnFailed;
+    };
+    start.store(true, .release);
+    deinit_thread.join();
+    destroy_thread.join();
+
+    try std.testing.expect(instance_map.getInstance(id) == null);
+    try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
+    try std.testing.expect(deinit(id));
+}
+
 /// Clear a pending user interrupt. Lifecycle shutdown owns a separate bit, so this cannot resume a script that is being stopped.
 pub fn clearInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
@@ -756,9 +802,27 @@ fn armJscWatchdogShortLimit(instance_id: i32, millis: u64) void {
 
     registry_mutex.lock();
     const state = registry.get(instance_id);
+    const interrupt_state = state orelse {
+        registry_mutex.unlock();
+        return;
+    };
+    if (!isHandlerReady(interrupt_state) or
+        interrupt_state.instance_id != instance_id or
+        interrupt_state.generation != inst.generation or
+        interrupt_state.backend_tag != backend.backendToC(inst.backendTag()))
+    {
+        registry_mutex.unlock();
+        return;
+    }
+    interrupt_state.active_handler_users += 1;
     registry_mutex.unlock();
-    const interrupt_state = state orelse return;
-    if (!isHandlerReady(interrupt_state)) return;
+    defer {
+        registry_mutex.lock();
+        std.debug.assert(interrupt_state.active_handler_users != 0);
+        interrupt_state.active_handler_users -= 1;
+        registry_condition.broadcast();
+        registry_mutex.unlock();
+    }
 
     const period_sec = @as(f64, @floatFromInt(millis)) / 1000.0;
     switch (inst.engine_handles) {

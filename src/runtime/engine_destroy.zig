@@ -34,7 +34,7 @@ pub fn destroyRuntimeGeneration(instance_id: i32, generation: u64) void {
     @import("../abi/packed_api_value.zig").dropInstance(instance_id);
     @import("tsfn.zig").releaseAllForInstance(instance_id);
     @import("../script/cjs.zig").uninstall(instance_id);
-    _ = @import("runtime_control.zig").deinit(instance_id);
+    _ = @import("runtime_control.zig").deinitForInstance(instance_id, instance);
     forceResetBookkeeping(&instance.ref_bookkeeping);
     @import("../backend/console_timers.zig").deinitInstance(instance_id);
 
