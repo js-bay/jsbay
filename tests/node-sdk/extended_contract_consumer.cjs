@@ -212,6 +212,7 @@ async function workerExitsWithListenerRegistered() {
 }
 
 async function generationControlsAcrossWorker() {
+  console.log('extended contract: generation control worker starting')
   const worker = new Worker(`
     const { parentPort } = require('node:worker_threads')
     const { Engine } = require(process.env.JSBAY_NODE_ADDON)
@@ -228,13 +229,17 @@ async function generationControlsAcrossWorker() {
   `, { eval: true })
   try {
     const ready = await nextMessage(worker, message => message.type === 'ready', 'worker engine readiness')
+    console.log('extended contract: generation control worker ready')
     assert.equal(typeof ready.token.instanceId, 'number')
     assert.equal(typeof ready.token.generation, 'bigint')
     assert.ok(ready.token.generation > 0n)
     assert.equal(Engine.requestInterrupt(ready.token), true, 'a generation-scoped control can interrupt from another Worker')
+    console.log('extended contract: interrupt requested')
     const result = await nextMessage(worker, message => message.type === 'result', 'worker execution interruption')
+    console.log('extended contract: interrupt result received')
     assert.equal(result.outcome, 'interrupted')
     await worker.terminate()
+    console.log('extended contract: interrupted worker terminated')
 
     const stale = ready.token
     const replacement = Engine.create({ instanceId: stale.instanceId })
@@ -244,6 +249,7 @@ async function generationControlsAcrossWorker() {
       assert.equal(replacement.evaluate('20 + 22'), 42, 'stale controls leave the replacement usable')
     } finally {
       await replacement.closeAsync()
+      console.log('extended contract: replacement engine closed')
     }
 
     const cancelWorker = new Worker(`
@@ -262,11 +268,15 @@ async function generationControlsAcrossWorker() {
     `, { eval: true })
     try {
       const cancelReady = await nextMessage(cancelWorker, message => message.type === 'ready', 'cancellable worker readiness')
+      console.log('extended contract: cancellable worker ready')
       assert.equal(Engine.cancel(cancelReady.token), true, 'a generation-scoped cancel can stop execution from another Worker')
+      console.log('extended contract: cancel requested')
       const cancelled = await nextMessage(cancelWorker, message => message.type === 'result', 'worker cancellation')
+      console.log('extended contract: cancel result received')
       assert.equal(cancelled.outcome, 'cancelled')
     } finally {
       await cancelWorker.terminate()
+      console.log('extended contract: cancelled worker terminated')
     }
   } finally {
     await worker.terminate()
@@ -401,18 +411,24 @@ async function valueReceiverAndReentrantConversionSafety() {
   }
 }
 
+async function runPhase(name, action) {
+  console.log(`extended contract: ${name} starting`)
+  await action()
+  console.log(`extended contract: ${name} passed`)
+}
+
 async function main() {
-  await resourceLimitsAndUsage()
-  await consoleCallbacksAndClose()
-  await staleQueuedCallbackDoesNotReachReplacement()
-  await callbackReplacementAndClear()
-  await workerExitsWithListenerRegistered()
-  await closeFromHostCallback()
-  await closeFromHostCallback()
-  await generationControlsAcrossWorker()
-  await submissionsFenceAndShutdown()
-  await cachePauseAndGc()
-  await valueReceiverAndReentrantConversionSafety()
+  await runPhase('resource limits and usage', resourceLimitsAndUsage)
+  await runPhase('console callbacks and close', consoleCallbacksAndClose)
+  await runPhase('stale callback replacement', staleQueuedCallbackDoesNotReachReplacement)
+  await runPhase('callback replacement and clear', callbackReplacementAndClear)
+  await runPhase('worker exit with listener', workerExitsWithListenerRegistered)
+  await runPhase('close from host callback', closeFromHostCallback)
+  await runPhase('close from host callback repeat', closeFromHostCallback)
+  await runPhase('generation controls across Worker', generationControlsAcrossWorker)
+  await runPhase('submission fence and shutdown', submissionsFenceAndShutdown)
+  await runPhase('cache pause and GC', cachePauseAndGc)
+  await runPhase('value receiver and reentrant conversion', valueReceiverAndReentrantConversionSafety)
 }
 
 main().catch(error => {
