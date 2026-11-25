@@ -12,15 +12,25 @@ const read = name => readFile(join(directory, name), 'utf8');
 if ((await read('COMMIT')).trim() !== sourceSha || (await read('VERSION')).trim() !== version) throw new Error('npm artifact does not match the original source SHA and release version');
 
 const engines = ['jsc', 'quickjs', 'quickjsng'];
-const main = engines.map(engine => `jsbay-${engine}-${version}.tgz`);
-const platform = engines.flatMap(engine => (engine === 'jsc' ? ['macos'] : ['linux', 'macos']).flatMap(os =>
-  ['arm64', 'x64'].map(arch => `jsbay-${engine}${os}${arch}-${version}.tgz`)));
+const operatingSystems = ['linux', 'macos'];
+const architectures = ['arm64', 'x64'];
+const main = [];
+const platform = [];
+for (const engine of engines) {
+  main.push(`jsbay-${engine}-${version}.tgz`);
+  for (const os of operatingSystems) {
+    if (engine === 'jsc' && os === 'linux') continue;
+    for (const arch of architectures) platform.push(`jsbay-${engine}${os}${arch}-${version}.tgz`);
+  }
+}
 for (const [type, archives] of [['main', main], ['platform', platform]]) {
   const actual = (await readdir(join(directory, type))).sort();
   if (actual.join('\n') !== [...archives].sort().join('\n')) throw new Error(`unexpected npm ${type} package set`);
 }
 
-const archives = [...platform.map(name => `platform/${name}`), ...main.map(name => `main/${name}`)];
+const archives = [];
+for (const name of platform) archives.push(`platform/${name}`);
+for (const name of main) archives.push(`main/${name}`);
 const checksums = new Map();
 for (const line of (await read('SHA512SUMS')).trimEnd().split('\n')) {
   const match = /^([a-f0-9]{128})  (\S+)$/.exec(line);

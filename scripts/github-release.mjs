@@ -22,9 +22,12 @@ function sha256(path) {
   } finally { closeSync(file); }
 }
 const hashes = new Map(assets.map(name => [name, sha256(join(directory, name))]));
-const manifest = readFileSync(join(directory, 'SHA256SUMS'), 'utf8');
-for (const name of assets.filter(name => name !== 'SHA256SUMS')) {
-  if (!manifest.split('\n').includes(`${hashes.get(name).slice(7)}  ${name}`)) throw new Error(`SHA256SUMS mismatch: ${name}`);
+{
+  const manifestLines = readFileSync(join(directory, 'SHA256SUMS'), 'utf8').split('\n');
+  for (const name of assets) {
+    if (name === 'SHA256SUMS') continue;
+    if (!manifestLines.includes(`${hashes.get(name).slice(7)}  ${name}`)) throw new Error(`SHA256SUMS mismatch: ${name}`);
+  }
 }
 const swiftManifest = readFileSync(join(packageDir, 'Package.swift'), 'utf8');
 for (const [backend, module] of [['quickjs', 'JsBayQuickJS'], ['quickjs_ng', 'JsBayQuickJSNG'], ['jsc', 'JsBayJavaScriptCore']]) {
