@@ -128,7 +128,7 @@ try {
 
   const promiseConstructor = global.get('Promise')
   const resolve = promiseConstructor.get('resolve')
-  const promise = resolve.call(receiver, 12)
+  const promise = resolve.call(promiseConstructor, 12)
   handles.push(promiseConstructor, resolve, promise)
   assert.equal(promise.type(), 'object')
   assert.throws(() => promise.toHost())
