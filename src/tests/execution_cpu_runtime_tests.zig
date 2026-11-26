@@ -20,6 +20,7 @@ const helpers = @import("test_helpers.zig");
 const ActiveEngine = backend.ActiveEngine;
 
 const busy_script = "let total = 0; for (let i = 0; i < 4000000; i++) total += i; total;";
+const yielded_busy_script = "var total = 0; for (var i = 0; i < 100000; i++) total += i; total;";
 
 fn ledgerFor(instance_id: i32) !*execution_cpu.Ledger {
     const instance = instance_map.getInstance(instance_id) orelse return error.InstanceMissing;
@@ -280,7 +281,7 @@ const YieldSuppressionProbe = struct {
             self.failure = .reacquire;
         }
         if (self.burn_middle) burnHostCpu();
-        const result = engine.evalScript(self.child_id, "var childCpu = 0; for (var i = 0; i < 4000000; i++) childCpu += i; childCpu;", "<execution-cpu-yield-child>");
+        const result = engine.evalScript(self.child_id, yielded_busy_script, "<execution-cpu-yield-child>");
         if (result.err != null) {
             self.valid = false;
             self.failure = .child;
@@ -466,7 +467,7 @@ const YieldProbe = struct {
             self.foreign_done.store(true, .seq_cst);
             return;
         }
-        const result = engine.evalScript(self.id, busy_script, "<execution-cpu-yield-foreign>");
+        const result = engine.evalScript(self.id, yielded_busy_script, "<execution-cpu-yield-foreign>");
         if (result.err != null) self.valid.store(false, .seq_cst);
         helpers.freeEvalResult(result);
         self.foreign_done.store(true, .seq_cst);
@@ -483,11 +484,19 @@ test "execution CPU runtime: yielding excludes owner host work and includes fore
     var probe = YieldProbe{ .id = id };
     try testing.expect(engine_thread.hostInstall(id, "__executionCpuYieldHost", YieldProbe.yieldHost, @ptrCast(&probe)));
     try testing.expect(engine_thread.threadStart(id));
-    defer engine_thread.threadStop(id);
-    const foreign = try std.Thread.spawn(.{}, YieldProbe.foreignRun, .{&probe});
+    const foreign = std.Thread.spawn(.{}, YieldProbe.foreignRun, .{&probe}) catch |err| {
+        engine_thread.threadStop(id);
+        return err;
+    };
+    var foreign_joined = false;
+    defer {
+        engine_thread.threadStop(id);
+        if (!foreign_joined) foreign.join();
+    }
     try testing.expect(engine_thread.postToEngineThread(id, YieldProbe.ownerRun, @ptrCast(&probe)));
     try testing.expect(YieldProbe.waitFor(&probe.owner_done));
     foreign.join();
+    foreign_joined = true;
     try testing.expect(probe.valid.load(.seq_cst));
     try testing.expectEqual(probe.released_total.load(.seq_cst), probe.after_host_total.load(.seq_cst));
     try expectIncreased(probe.after_host_total.load(.seq_cst), total(ledger));
