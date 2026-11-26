@@ -483,6 +483,7 @@ test "run wakes for the earlier timer deadline and host deadline" {
         timer_calls: u8 = 0,
         ticks: u8 = 0,
         tick_entered: zev.Waiter = .init,
+        tick_wait_ok: std.atomic.Value(bool) = .init(false),
         fn timerCallback(ctx: ?*anyopaque, _: *zev.Timer) void {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.timer_calls += 1;
@@ -495,7 +496,7 @@ test "run wakes for the earlier timer deadline and host deadline" {
             return now_ms + 1_000;
         }
         fn advance(state: *Self, tick_generation: u64) void {
-            _ = state.tick_entered.waitUntilChange(tick_generation, 5_000);
+            state.tick_wait_ok.store(state.tick_entered.waitUntilChange(tick_generation, 5_000), .seq_cst);
             state.clock.now.store(10, .seq_cst);
             state.loop.wake();
         }
@@ -516,6 +517,7 @@ test "run wakes for the earlier timer deadline and host deadline" {
     const advancer = try std.Thread.spawn(.{}, State.advance, .{ &state, tick_generation });
     defer advancer.join();
     loop.run(.{ .ctx = &state, .tick = State.tick });
+    try std.testing.expect(state.tick_wait_ok.load(.seq_cst));
     try std.testing.expectEqual(@as(u8, 1), state.timer_calls);
     try std.testing.expect(state.ticks >= 2);
     timer.close();
