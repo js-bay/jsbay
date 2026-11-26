@@ -680,9 +680,9 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
         void *u = nullptr;
         {
             std::lock_guard<std::mutex> lock(pk->mu);
-            pk->owner = nullptr;
             if (!pk->fired) {
                 pk->fired = true;
+                pk->owner = nullptr;
                 d = pk->deleter;
                 u = pk->user_data;
                 pk->deleter = nullptr;
