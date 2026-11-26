@@ -52,7 +52,11 @@ for mode in full heap_off inspector_off; do
     else nm -g --defined-only "$artifact" >"$work/symbols.txt" 2>"$work/symbols.stderr"; fi
     awk '{name=$NF; sub(/^_/,"",name); if(name ~ /^jsbay_[A-Za-z0-9_]+$/) print name}' "$work/symbols.txt" | LC_ALL=C sort -u >"$work/exports.txt"
     jq -Rn '[inputs | select(length > 0)]' <"$work/exports.txt" >"$work/exports.json"
-    if [ "$mode" != full ]; then cmp "$target/full/exports.txt" "$work/exports.txt"; fi
+    if [ "$mode" != full ] && ! cmp -s "$target/full/exports.txt" "$work/exports.txt"; then
+        echo "diagnostic exports differ for $mode:" >&2
+        diff -u "$target/full/exports.txt" "$work/exports.txt" >&2 || true
+        exit 1
+    fi
     case "$mode" in
         full)
             inspector_status=ok
