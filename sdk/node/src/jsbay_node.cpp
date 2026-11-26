@@ -2642,17 +2642,29 @@ static napi_value listEngines(napi_env env, napi_callback_info info) {
     napi_get_cb_info(env, info, &count, nullptr, nullptr, nullptr);
     if (count)
         return throwText(env, "listEngines takes no arguments");
-    const size_t total = jsbay_engine_list(nullptr, 0);
     std::vector<int> ids;
     try {
-        ids.resize(total);
+        size_t capacity = jsbay_engine_list(nullptr, 0);
+        constexpr size_t kMaxListAttempts = 3;
+        for (size_t attempt = 0; attempt < kMaxListAttempts; ++attempt) {
+            ids.resize(capacity);
+            const size_t total = jsbay_engine_list(ids.data(), ids.size());
+            if (total <= ids.size()) {
+                ids.resize(total);
+                break;
+            }
+            if (attempt + 1 == kMaxListAttempts) {
+                // The C API may report more live engines than it copied when another Worker creates an engine concurrently.
+                break;
+            }
+            capacity = total;
+        }
     } catch (...) {
         return throwStatus(env, JSBAY_OUT_OF_MEMORY);
     }
-    const size_t written = jsbay_engine_list(ids.data(), ids.size());
     napi_value out;
-    napi_create_array_with_length(env, written, &out);
-    for (size_t i = 0; i < written; ++i) {
+    napi_create_array_with_length(env, ids.size(), &out);
+    for (size_t i = 0; i < ids.size(); ++i) {
         napi_value id;
         napi_create_int32(env, ids[i], &id);
         napi_set_element(env, out, i, id);

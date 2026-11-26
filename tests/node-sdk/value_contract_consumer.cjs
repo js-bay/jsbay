@@ -41,8 +41,45 @@ function jsonConversionRejectsReentrantClose() {
   valueCloseEngine.close()
 }
 
+function nodeValueFailuresRejectReentrantClose() {
+  const cases = [
+    ['toString', '({ toString() { closeNodeValue(); throw new Error("toString failed") } })', value => value.toString()],
+    ['toJson', '({ toJSON() { closeNodeValue(); throw new Error("toJSON failed") } })', value => value.toJson()],
+    ['get', '({ get x() { closeNodeValue(); throw new Error("getter failed") } })', value => value.get('x')],
+    ['set', 'new Proxy({}, { set() { closeNodeValue(); throw new Error("setter failed") } })', value => value.set('x', 1)],
+    ['has', 'new Proxy({}, { has() { closeNodeValue(); throw new Error("has failed") } })', value => value.has('x')],
+    ['delete', 'new Proxy({}, { deleteProperty() { closeNodeValue(); throw new Error("delete failed") } })', value => value.delete('x')],
+    ['keys', 'new Proxy({}, { ownKeys() { closeNodeValue(); throw new Error("ownKeys failed") } })', value => value.keys()],
+    ['call', '(function() { closeNodeValue(); throw new Error("call failed") })', value => value.call(undefined)],
+    ['construct', 'class ReentrantFailure { constructor() { closeNodeValue(); throw new Error("construct failed") } }', value => value.construct()],
+    ['instanceOf', '({})', (value, engine) => {
+      const constructor = engine.evaluateValue('({ [Symbol.hasInstance]() { closeNodeValue(); throw new Error("instanceOf failed") } })')
+      try {
+        return value.instanceOf(constructor)
+      } finally {
+        constructor.close()
+      }
+    }]
+  ]
+
+  for (const [method, source, invoke] of cases) {
+    const instanceOfEngine = addon.Engine.create()
+    let value
+    try {
+      value = instanceOfEngine.evaluateValue(source)
+      instanceOfEngine.bind('closeNodeValue', () => value.close())
+      assert.throws(() => invoke(value, instanceOfEngine), statusIs(5), `${method} reports a closed NodeValue after a throwing guest callback`)
+      assert.equal(instanceOfEngine.evaluate('40 + 2'), 42, `${method} leaves the Engine usable`)
+    } finally {
+      if (value) value.close()
+      instanceOfEngine.close()
+    }
+  }
+}
+
 stringConversionRejectsReentrantClose()
 jsonConversionRejectsReentrantClose()
+nodeValueFailuresRejectReentrantClose()
 
 const first = addon.Engine.create()
 const second = addon.Engine.create()

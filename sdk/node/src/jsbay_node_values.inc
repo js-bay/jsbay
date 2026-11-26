@@ -202,6 +202,16 @@ struct NodeValueLease {
     }
 };
 
+static napi_value throwNodeValueFailure(napi_env env, const NodeValueLease &lease,
+                                        jsbay_status_t status, jsbay_value_t exception) {
+    if (!lease.ready(env))
+        return nullptr;
+    napi_value error = conversionFailure(lease.engine, status, exception);
+    if (error)
+        napi_throw(env, error);
+    return nullptr;
+}
+
 static bool getNodeArgument(napi_env env, Engine *engine, napi_value input, jsbay_value_t *out,
                             Value *temporary, std::vector<napi_value> *ancestors) {
     if (NodeValueState *state = unwrapNodeValue(env, input)) {
@@ -469,9 +479,8 @@ static napi_value nodeValueToString(napi_env env, napi_callback_info info) {
     Value exception;
     auto status = jsbay_value_to_utf8(lease.retained.id, &bytes, &exception.id);
     if (status != JSBAY_OK) {
-        napi_value error = conversionFailure(state->engine, status, exception.id);
         jsbay_free_bytes(bytes);
-        return napi_throw(env, error) == napi_ok ? nullptr : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     }
     if (!lease.ready(env)) {
         jsbay_free_bytes(bytes);
@@ -499,9 +508,8 @@ static napi_value nodeValueToJson(napi_env env, napi_callback_info info) {
     Value exception;
     auto status = jsbay_value_to_json(lease.retained.id, &bytes, &exception.id);
     if (status != JSBAY_OK) {
-        napi_value error = conversionFailure(state->engine, status, exception.id);
         jsbay_free_bytes(bytes);
-        return napi_throw(env, error) == napi_ok ? nullptr : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     }
     if (!lease.ready(env)) {
         jsbay_free_bytes(bytes);
@@ -529,9 +537,12 @@ static napi_value nodeValueCopyBuffer(napi_env env, napi_callback_info info) {
     Value exception;
     auto status = jsbay_value_copy_buffer(lease.retained.id, &bytes, &exception.id);
     if (status != JSBAY_OK) {
-        napi_value error = conversionFailure(state->engine, status, exception.id);
         jsbay_free_bytes(bytes);
-        return napi_throw(env, error) == napi_ok ? nullptr : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
+    }
+    if (!lease.ready(env)) {
+        jsbay_free_bytes(bytes);
+        return nullptr;
     }
     napi_value out = nullptr;
     void *copied = nullptr;
@@ -561,9 +572,7 @@ static napi_value nodeValueGet(napi_env env, napi_callback_info info) {
     Value value, exception;
     auto status = jsbay_value_get(lease.retained.id, text(key), &value.id, &exception.id);
     if (status != JSBAY_OK)
-        return napi_throw(env, conversionFailure(state->engine, status, exception.id)) == napi_ok
-                   ? nullptr
-                   : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     if (!lease.ready(env))
         return nullptr;
     return transferNodeValue(state->engine, value);
@@ -592,9 +601,7 @@ static napi_value nodeValueSet(napi_env env, napi_callback_info info) {
         return nullptr;
     auto status = jsbay_value_set(lease.retained.id, text(key), value, &exception.id);
     if (status != JSBAY_OK)
-        return napi_throw(env, conversionFailure(engine, status, exception.id)) == napi_ok
-                   ? nullptr
-                   : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     if (!lease.ready(env))
         return nullptr;
     return self;
@@ -617,9 +624,7 @@ static napi_value nodeValueHas(napi_env env, napi_callback_info info) {
     Value exception;
     auto status = jsbay_value_has(lease.retained.id, text(key), &result, &exception.id);
     if (status != JSBAY_OK)
-        return napi_throw(env, conversionFailure(state->engine, status, exception.id)) == napi_ok
-                   ? nullptr
-                   : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     if (!lease.ready(env))
         return nullptr;
     napi_value out;
@@ -643,9 +648,7 @@ static napi_value nodeValueDelete(napi_env env, napi_callback_info info) {
     Value exception;
     auto status = jsbay_value_delete(lease.retained.id, text(key), &result, &exception.id);
     if (status != JSBAY_OK)
-        return napi_throw(env, conversionFailure(state->engine, status, exception.id)) == napi_ok
-                   ? nullptr
-                   : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     if (!lease.ready(env))
         return nullptr;
     napi_value out;
@@ -667,9 +670,7 @@ static napi_value nodeValueKeys(napi_env env, napi_callback_info info) {
     Value result, exception;
     auto status = jsbay_value_keys(lease.retained.id, &result.id, &exception.id);
     if (status != JSBAY_OK)
-        return napi_throw(env, conversionFailure(state->engine, status, exception.id)) == napi_ok
-                   ? nullptr
-                   : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     if (!lease.ready(env))
         return nullptr;
     return transferNodeValue(state->engine, result);
@@ -699,9 +700,7 @@ static napi_value nodeValueInstanceOf(napi_env env, napi_callback_info info) {
     auto status =
         jsbay_value_instance_of(lease.retained.id, retained_constructor.id, &result, &exception.id);
     if (status != JSBAY_OK)
-        return napi_throw(env, conversionFailure(state->engine, status, exception.id)) == napi_ok
-                   ? nullptr
-                   : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     if (!lease.ready(env))
         return nullptr;
     napi_value out;
@@ -808,9 +807,7 @@ static napi_value nodeValueInvoke(napi_env env, napi_callback_info info, bool co
                                                values.empty() ? nullptr : values.data(),
                                                values.size(), &result.id, &exception.id);
     if (status != JSBAY_OK)
-        return napi_throw(env, conversionFailure(engine, status, exception.id)) == napi_ok
-                   ? nullptr
-                   : nullptr;
+        return throwNodeValueFailure(env, lease, status, exception.id);
     if (!lease.ready(env))
         return nullptr;
     return transferNodeValue(engine, result);

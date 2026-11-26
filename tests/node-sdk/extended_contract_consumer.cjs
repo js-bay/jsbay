@@ -212,6 +212,40 @@ async function workerExitsWithListenerRegistered() {
   }
 }
 
+async function engineListDuringWorkerCreation() {
+  const worker = new Worker(`
+    const { parentPort } = require('node:worker_threads')
+    const { Engine } = require(process.env.JSBAY_NODE_ADDON)
+    const engines = []
+    for (let index = 0; index < 96; index++) {
+      engines.push(Engine.create({ instanceId: 18100 + index }))
+    }
+    parentPort.postMessage({ type: 'ready', ids: engines.map(engine => engine.id) })
+    parentPort.once('message', message => {
+      if (message !== 'close') return
+      for (const engine of engines) engine.close()
+      parentPort.postMessage('closed')
+    })
+  `, { eval: true })
+  try {
+    const readyMessage = nextMessage(worker, message => message?.type === 'ready', 'engine-list worker readiness')
+    for (let observations = 0; observations < 256; observations++) {
+      const ids = Engine.listEngines()
+      assert.ok(ids.every(id => Number.isInteger(id)), 'concurrent engine listing returns only integer IDs')
+      assert.equal(new Set(ids).size, ids.length, 'concurrent engine listing does not duplicate IDs')
+      if (observations % 8 === 7) await new Promise(resolve => setImmediate(resolve))
+    }
+    const message = await readyMessage
+    assert.equal(message.ids.length, 96)
+    const currentIds = new Set(Engine.listEngines())
+    for (const id of message.ids) assert.ok(currentIds.has(id), `live Worker engine ${id} appears in the process list`)
+    worker.postMessage('close')
+    assert.equal(await nextMessage(worker, value => value === 'closed', 'engine-list worker cleanup'), 'closed')
+  } finally {
+    await worker.terminate()
+  }
+}
+
 async function generationControlsAcrossWorker() {
   console.log('extended contract: generation control worker starting')
   const worker = new Worker(`
@@ -433,6 +467,7 @@ async function main() {
   await runPhase('stale callback replacement', staleQueuedCallbackDoesNotReachReplacement)
   await runPhase('callback replacement and clear', callbackReplacementAndClear)
   await runPhase('worker exit with listener', workerExitsWithListenerRegistered)
+  await runPhase('engine listing during Worker creation', engineListDuringWorkerCreation)
   await runPhase('close from host callback', closeFromHostCallback)
   await runPhase('close from host callback repeat', closeFromHostCallback)
   await runPhase('generation controls across Worker', generationControlsAcrossWorker)
