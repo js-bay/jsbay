@@ -189,6 +189,14 @@ try {
   })(), error => error === operationError)
   assert.match(cleanupReports[0], /cleanup failure/)
   await assert.rejects(cleanupTempDirectory('temporary-directory', undefined, async () => { throw cleanupError }, () => {}), error => error === cleanupError)
+  let cleanupInvocation
+  await cleanupTempDirectory('temporary-directory', undefined, async (path, options) => {
+    cleanupInvocation = { path, options }
+  }, () => {})
+  assert.deepEqual(cleanupInvocation, {
+    path: 'temporary-directory',
+    options: { recursive: true, force: true, maxRetries: 10, retryDelay: 100 },
+  }, 'recursive cleanup asks Node fs.rm to retry transient Windows lock errors')
 
   const archiveFixture = join(temporary, 'npm-package.tgz')
   await writeFile(archiveFixture, 'archive fixture')

@@ -34,6 +34,7 @@ comptime {
         _ = @import("generation_scope_loop_failure_tests.zig");
         _ = @import("shutdown_race_tests.zig");
         _ = @import("execution_cpu_runtime_tests.zig");
+        _ = @import("execution_cpu_yield_runtime_tests.zig");
         _ = @import("internal_thread_safety_tests.zig");
         _ = @import("debugger_tests.zig");
     }
