@@ -154,6 +154,7 @@ comptime {
     }
     if (!spike and build_options.inspector_transport) {
         _ = @import("inspector_tests.zig");
+        _ = @import("inspector_test_wire_tests.zig");
         if (build_options.inspector) {
             _ = @import("debug_receiver_tests.zig");
             _ = @import("cdp_reference_tests.zig");

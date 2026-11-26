@@ -997,6 +997,9 @@ test "runOnce with exhausted count budget still reports immediate deadline" {
     };
     const loop = try zev.Loop.create(std.testing.allocator);
     defer loop.destroy();
+    var clock: VirtualClock = .{ .now = 100 };
+    loop.setClock(&clock, VirtualClock.read);
+    defer loop.setClock(null, null);
     var state: State = .{};
     var handles: [2]zev.Notifier = undefined;
     for (&handles) |*handle| {
@@ -1006,7 +1009,8 @@ test "runOnce with exhausted count budget still reports immediate deadline" {
     }
     const next = loop.runOnce(.{ .dispatch_budget = 1 });
     try std.testing.expectEqual(@as(u8, 1), state.calls);
-    try std.testing.expectEqual(@as(?u64, loop.nowMs()), next);
+    try std.testing.expectEqual(@as(?u64, clock.now), next);
+    try std.testing.expectEqual(@as(?u64, 0), loop.nextDeadline());
     _ = loop.runOnce(.{});
     try std.testing.expectEqual(@as(u8, 2), state.calls);
     for (&handles) |*handle| handle.close();
