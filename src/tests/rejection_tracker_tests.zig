@@ -15,6 +15,8 @@ const promise = @import("../runtime/promise.zig");
 const helpers = @import("test_helpers.zig");
 const c_api = @import("../c_api.zig");
 const api_value = @import("../abi/api_value.zig");
+const value_api = @import("../value/root.zig");
+const runtime_control = @import("../runtime/runtime_control.zig");
 
 const max_events = 4;
 const max_reason = 96;
@@ -49,6 +51,15 @@ fn onRejection(
 
 fn install(id: i32, log: *RejectionLog) bool {
     return promise.setRejectionTracker(id, &onRejection, log);
+}
+
+fn setShortPendingJobLimit(instance_id: i32, _: value_api.NativeArgs) value_api.NativeResult {
+    return .{ .boolean = runtime_control.setExecutionTimeLimit(instance_id, 1) };
+}
+
+fn unregisterRejectionTracker(instance_id: i32, _: value_api.NativeArgs) value_api.NativeResult {
+    _ = promise.setRejectionTracker(instance_id, null, null);
+    return .undefined_val;
 }
 
 const ErrorLog = struct {
@@ -99,6 +110,30 @@ const LegacyInterruptAfterFirst = struct {
     }
 };
 
+const UnregisterOnRejection = struct {
+    count: u32 = 0,
+    handled: [max_events]bool = @splat(false),
+    reason: [max_events][max_reason]u8 = @splat(@as([max_reason]u8, @splat(0))),
+    reason_len: [max_events]u8 = @splat(0),
+
+    fn handler(instance_id: i32, is_handled: bool, reason_ptr: [*]const u8, reason_len: usize, userdata: ?*anyopaque) callconv(.c) void {
+        const self: *UnregisterOnRejection = @ptrCast(@alignCast(userdata orelse return));
+        if (self.count < max_events) {
+            const index = self.count;
+            self.handled[index] = is_handled;
+            const n = @min(reason_len, max_reason);
+            if (n > 0) @memcpy(self.reason[index][0..n], reason_ptr[0..n]);
+            self.reason_len[index] = @intCast(n);
+        }
+        self.count += 1;
+        _ = promise.setRejectionTracker(instance_id, null, null);
+    }
+
+    fn text(self: *const UnregisterOnRejection, index: usize) []const u8 {
+        return self.reason[index][0..self.reason_len[index]];
+    }
+};
+
 test "error observer: retains rejection handles and reports late handling" {
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
@@ -132,6 +167,41 @@ test "error observer: retains rejection handles and reports late handling" {
     try testing.expect(log.value != 0);
     try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_release(log.promise));
     try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_release(log.value));
+}
+
+test "secondary QuickJS instance: observer and Inspector support boundaries" {
+    if (backend.active_backend != .jsc) return error.SkipZigTest;
+
+    var available: [8]c_api.BackendC = undefined;
+    const count = c_api.jsbay_available_backends(&available, available.len);
+    var exercised: usize = 0;
+    for (available[0..count]) |tag| {
+        const selected = backend.backendFromC(@backingInt(tag)) orelse return error.InvalidBackendTag;
+        if (!backend.isQuickJsApiBackend(selected)) continue;
+
+        const id = helpers.nextInstanceId();
+        var options = c_api.EngineCreateOptionsC{
+            .struct_size = @sizeOf(c_api.EngineCreateOptionsC),
+            .backend = tag,
+        };
+        try testing.expect(c_api.jsbay_engine_create_with_options(id, &options));
+        defer c_api.jsbay_engine_destroy(id);
+
+        var log = ErrorLog{};
+        try testing.expectEqual(@as(c_int, 7), c_api.jsbay_engine_set_error_observer(id, ErrorLog.handler, &log));
+        try helpers.evalOk(id, "Promise.reject({ marker: 17 })");
+        try testing.expectEqual(@as(u32, 0), log.count);
+
+        var bound_port: u16 = 0xA55A;
+        const started = c_api.jsbay_engine_inspector_start(id, 0, &bound_port);
+        if (started) c_api.jsbay_engine_inspector_stop(id);
+        try testing.expect(!started);
+        try testing.expectEqual(@as(u16, 0xA55A), bound_port);
+        try testing.expect(!c_api.jsbay_engine_inspector_start(id, 0, &bound_port));
+        try testing.expectEqual(@as(u16, 0xA55A), bound_port);
+        exercised += 1;
+    }
+    if (exercised == 0) return error.SkipZigTest;
 }
 
 test "error observer: same-turn catch stays quiet and unregister suppresses future reports" {
@@ -438,12 +508,140 @@ test "rejection: unhandled rejection is reported once, then handled" {
             try testing.expect(!log.handled[0]);
             try testing.expect(std.mem.indexOf(u8, log.text(0), "oops") != null);
 
+            var extra_drains: u32 = 0;
+            while (extra_drains < 3) : (extra_drains += 1) engine.runEventLoopOnce(id);
+            try testing.expectEqual(@as(u32, 1), log.count);
+
             try helpers.evalOk(id, "globalThis.__rej.catch(function () {});");
             try testing.expectEqual(@as(u32, 2), log.count);
             try testing.expect(log.handled[1]);
             try helpers.expectEvalEquals(id, "1+1", "2");
         }
     }.run);
+}
+
+test "rejection: tracker checkpoint leaves ordinary timers on their deadlines" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+
+    var log = RejectionLog{};
+    if (!install(id, &log)) return;
+    defer _ = promise.setRejectionTracker(id, null, null);
+
+    try helpers.evalOk(id,
+        \\globalThis.__timer100 = 0;
+        \\globalThis.__timer2000 = 0;
+        \\setTimeout(function () { globalThis.__timer100 += 1; }, 100);
+        \\setTimeout(function () { globalThis.__timer2000 += 1; }, 2000);
+        \\Promise.reject(new Error('checkpoint-marker'));
+    );
+    try testing.expectEqual(@as(u32, 1), log.count);
+    try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__timer100"));
+    try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__timer2000"));
+
+    _ = engine.testing.advance(id, 1000);
+    try testing.expectEqual(@as(i64, 1100), engine.testing.advance(id, 1099));
+    try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__timer100"));
+    try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__timer2000"));
+    try testing.expectEqual(@as(i64, 3000), engine.testing.advance(id, 1100));
+    try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__timer100"));
+    try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__timer2000"));
+    try testing.expectEqual(@as(i64, 3000), engine.testing.advance(id, 2999));
+    try testing.expectEqual(@as(i64, 0), try helpers.evalInt(id, "globalThis.__timer2000"));
+    try testing.expectEqual(@as(i64, -1), engine.testing.advance(id, 3000));
+    try testing.expectEqual(@as(i64, 1), try helpers.evalInt(id, "globalThis.__timer2000"));
+    try testing.expectEqual(@as(u32, 1), log.count);
+}
+
+test "rejection: unregister during reporting does not leak across drains or instance reuse" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    var first_alive = true;
+    defer if (first_alive) engine.destroy(id);
+    try engine.testing.setNow(id, 1000);
+
+    var first_log = UnregisterOnRejection{};
+    if (!promise.setRejectionTracker(id, &UnregisterOnRejection.handler, &first_log)) return;
+    try helpers.evalOk(id,
+        \\Promise.reject(new Error('first-checkpoint-marker'));
+        \\Promise.reject(new Error('second-checkpoint-marker'));
+    );
+    try testing.expectEqual(@as(u32, 1), first_log.count);
+    try testing.expect(!first_log.handled[0]);
+    try testing.expect(std.mem.indexOf(u8, first_log.text(0), "first-checkpoint-marker") != null or
+        std.mem.indexOf(u8, first_log.text(0), "second-checkpoint-marker") != null);
+    engine.runEventLoopOnce(id);
+    try testing.expectEqual(@as(u32, 1), first_log.count);
+    engine.destroy(id);
+    first_alive = false;
+
+    try testing.expect(engine.create(id, .{}));
+    defer {
+        _ = promise.setRejectionTracker(id, null, null);
+        engine.destroy(id);
+    }
+    try engine.testing.setNow(id, 1000);
+    var second_log = RejectionLog{};
+    if (!install(id, &second_log)) return;
+    try helpers.evalOk(id, "Promise.reject(new Error('reused-checkpoint-marker'));");
+    try testing.expectEqual(@as(u32, 1), second_log.count);
+    try testing.expect(!second_log.handled[0]);
+    try testing.expect(std.mem.indexOf(u8, second_log.text(0), "reused-checkpoint-marker") != null);
+    try testing.expectEqual(@as(u32, 1), first_log.count);
+}
+
+test "Hermes rejection: budget-interrupted microtask drain defers reporting until catch runs" {
+    if (comptime backend.active_backend != .hermes) return error.SkipZigTest;
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+    var log = RejectionLog{};
+    if (!install(id, &log)) return error.RejectionTrackerUnavailable;
+    defer _ = promise.setRejectionTracker(id, null, null);
+    value_api.registerFunction(id, null, "__set_short_pending_job_limit__", &setShortPendingJobLimit);
+
+    try helpers.evalOk(id,
+        \\globalThis.__pending_rejection = Promise.reject(new Error('pending-until-drained'));
+        \\queueMicrotask(function () { globalThis.__pending_limit_armed = __set_short_pending_job_limit__(); });
+        \\queueMicrotask(function () {
+        \\  const end = Date.now() + 30;
+        \\  while (Date.now() < end) {}
+        \\});
+        \\queueMicrotask(function () {
+        \\  globalThis.__pending_rejection.catch(function () { globalThis.__pending_catch_ran = true; });
+        \\});
+    );
+    try testing.expectEqual(@as(u32, 0), log.count);
+
+    try testing.expect(runtime_control.setExecutionTimeLimit(id, 0));
+    try helpers.expectEvalEquals(id, "globalThis.__pending_limit_armed", "true");
+    try helpers.evalOk(id, "void 0;");
+    try helpers.expectEvalEquals(id, "globalThis.__pending_catch_ran", "true");
+    try testing.expectEqual(@as(u32, 0), log.count);
+}
+
+test "Hermes rejection: tracker unregister during reason formatting suppresses stale callback" {
+    if (comptime backend.active_backend != .hermes) return error.SkipZigTest;
+
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    defer engine.destroy(id);
+    var log = RejectionLog{};
+    if (!install(id, &log)) return error.RejectionTrackerUnavailable;
+    defer _ = promise.setRejectionTracker(id, null, null);
+    value_api.registerFunction(id, null, "__unregister_rejection_tracker__", &unregisterRejectionTracker);
+
+    try helpers.evalOk(id,
+        \\Promise.reject(Object.defineProperty({}, 'message', {
+        \\  get() {
+        \\    __unregister_rejection_tracker__();
+        \\    return 'unregistered-during-formatting';
+        \\  }
+        \\}));
+    );
+    try testing.expectEqual(@as(u32, 0), log.count);
 }
 
 test "rejection: replaced Error that throws does not break unhandled reporting" {

@@ -1,0 +1,12 @@
+--- a/utils/gen-promise-internal-bc.sh
++++ b/utils/gen-promise-internal-bc.sh
+@@ -59,4 +59,8 @@
+ trap cleanup EXIT
+ cp -r $PROMISE_DIR $TMP_DIR
+ cd $TMP_PROMISE_DIR
+-yarn && yarn start && gen && mv $TMP_PROMISE_JS $BC_PROMISE_JS
++yarn install --frozen-lockfile --non-interactive && \
++if [ -n "${JSBAY_HERMES_PROMISE_TRACKER_PATCH:-}" ]; then \
++  patch -d "$TMP_PROMISE_DIR/node_modules/promise" -p1 --forward --batch < "$JSBAY_HERMES_PROMISE_TRACKER_PATCH"; \
++fi && \
++yarn start && gen && mv $TMP_PROMISE_JS $BC_PROMISE_JS

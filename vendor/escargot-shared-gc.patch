@@ -1,0 +1,418 @@
+diff --git a/build/config.cmake b/build/config.cmake
+index 5badf5c1..d7c11d12 100644
+--- a/build/config.cmake
++++ b/build/config.cmake
+@@ -308,7 +308,7 @@ IF (ESCARGOT_WASM)
+ ENDIF()
+ 
+ IF (ESCARGOT_THREADING)
+-    SET (ESCARGOT_DEFINITIONS ${ESCARGOT_DEFINITIONS} -DENABLE_THREADING -DGC_THREAD_ISOLATE)
++    SET (ESCARGOT_DEFINITIONS ${ESCARGOT_DEFINITIONS} -DENABLE_THREADING -DGC_THREADS)
+ ENDIF()
+ 
+ IF (ESCARGOT_EXPORT_ALL)
+diff --git a/build/escargot.cmake b/build/escargot.cmake
+index 57be7e25..1cb2a89a 100644
+--- a/build/escargot.cmake
++++ b/build/escargot.cmake
+@@ -160,7 +160,7 @@ IF (ESCARGOT_TLS_ACCESS_BY_ADDRESS)
+     SET (GCUTIL_ENABLE_TLS_ACCESS_BY_ADDRESS ON)
+ ENDIF()
+ IF (ESCARGOT_TLS_ACCESS_BY_PTHREAD_KEY)
+-    SET (GCUTIL_ENABLE_TLS_ACCESS_BY_PTHREAD_KEY ON)
++    SET (GCUTIL_ENABLE_TLS_ACCESS_BY_PTHREAD_KEY OFF)
+ ENDIF()
+ 
+ 
+diff --git a/src/heap/CustomAllocator.cpp b/src/heap/CustomAllocator.cpp
+index 4158410e..cb19a868 100644
+--- a/src/heap/CustomAllocator.cpp
++++ b/src/heap/CustomAllocator.cpp
+@@ -44,9 +44,9 @@ typedef int(GC_get_sub_pointer_proc)(void* ptr,
+ 
+ namespace Escargot {
+ 
+-static MAY_THREAD_LOCAL int s_gcKinds[HeapObjectKind::NumberOfKind];
+-static MAY_THREAD_LOCAL GC_word s_interpreCodeBlockProcDescriptor[2];
+-static MAY_THREAD_LOCAL GC_word s_interpreCodeBlockTypedDescriptor[2];
++static int s_gcKinds[HeapObjectKind::NumberOfKind];
++static GC_word s_interpreCodeBlockProcDescriptor[2];
++static GC_word s_interpreCodeBlockTypedDescriptor[2];
+ 
+ GC_ms_entry* markValueVector(GC_word* addr,
+                              struct GC_ms_entry* mark_stack_ptr,
+diff --git a/src/heap/Heap.cpp b/src/heap/Heap.cpp
+index 01f50b08..9e964552 100644
+--- a/src/heap/Heap.cpp
++++ b/src/heap/Heap.cpp
+@@ -72,13 +72,14 @@ static bool isTizenTV()
+ #endif
+ 
+ #if defined(ESCARGOT_USE_32BIT_IN_64BIT)
+-MAY_THREAD_LOCAL Optional<const GC_compressed_bitmap_descr*> Heap::s_compressedDescriptors[static_cast<size_t>(Heap::CompressedType::Count)];
++static std::mutex s_compressedDescriptorsMutex;
++std::atomic<const GC_compressed_bitmap_descr*> Heap::s_compressedDescriptors[static_cast<size_t>(Heap::CompressedType::Count)];
+ 
+ void Heap::initializeCompressedType(CompressedType type, size_t size,
+                                     const GC_word* bitmap, size_t slots)
+ {
+-    auto& descriptor = s_compressedDescriptors[static_cast<size_t>(type)];
+-    if (!descriptor) {
++    std::lock_guard<std::mutex> lock(s_compressedDescriptorsMutex);
++    if (!s_compressedDescriptors[static_cast<size_t>(type)].load(std::memory_order_relaxed)) {
+         size_t headerSlots = 0;
+ #if defined(GC_DEBUG)
+         const size_t headerSize = GC_get_debug_header_size();
+@@ -95,13 +96,15 @@ void Heap::initializeCompressedType(CompressedType type, size_t size,
+ #endif
+         // Types before Object have their own layouts. Object and its subclasses
+         // inherit the tagged property buffer.
++        const GC_compressed_bitmap_descr* descr = nullptr;
+         if (type >= CompressedType::Object) {
+-            descriptor = GC_make_compressed_bitmap_descriptor_with_tag(size, bitmap, slots,
+-                                                                       Object::compressedValuesGCSlot() + headerSlots, 1, false);
++            descr = GC_make_compressed_bitmap_descriptor_with_tag(size, bitmap, slots,
++                                                                  Object::compressedValuesGCSlot() + headerSlots, 1, false);
+         } else {
+-            descriptor = GC_make_compressed_bitmap_descriptor(size, bitmap, slots);
++            descr = GC_make_compressed_bitmap_descriptor(size, bitmap, slots);
+         }
+-        ASSERT(descriptor);
++        ASSERT(descr);
++        s_compressedDescriptors[static_cast<size_t>(type)].store(descr, std::memory_order_release);
+     }
+ }
+ 
+@@ -110,9 +113,7 @@ void Heap::initializeCompressedType(CompressedType type, size_t size,
+ void Heap::initialize()
+ {
+ #if defined(ESCARGOT_USE_32BIT_IN_64BIT)
+-    for (auto& descriptor : s_compressedDescriptors) {
+-        descriptor.reset();
+-    }
++
+ #endif
+     COMPILE_ASSERT(GC_GRANULE_BYTES >= 8, "BDWGC allocations must be 8-byte aligned");
+     COMPILE_ASSERT((GC_GRANULE_BYTES & PointerKindMask) == 0, "BDWGC granule must preserve pointer-kind bits");
+diff --git a/src/heap/Heap.h b/src/heap/Heap.h
+index ff0521d8..0859218b 100644
+--- a/src/heap/Heap.h
++++ b/src/heap/Heap.h
+@@ -21,6 +21,7 @@
+ #define __EscargotHeap__
+ #include "GCUtil.h"
+ #include "util/Optional.h"
++#include <atomic>
+ 
+ namespace Escargot {
+ 
+@@ -127,18 +128,18 @@ public:
+     };
+     static bool isCompressedTypeInitialized(CompressedType type)
+     {
+-        return !!s_compressedDescriptors[static_cast<size_t>(type)];
++        return s_compressedDescriptors[static_cast<size_t>(type)].load(std::memory_order_acquire) != nullptr;
+     }
+     static void initializeCompressedType(CompressedType type, size_t size,
+                                          const GC_word* bitmap, size_t slots);
+     static void* mallocCompressed(CompressedType type, size_t size)
+     {
+-        auto& descriptor = s_compressedDescriptors[static_cast<size_t>(type)];
+-        ASSERT(descriptor);
++        const GC_compressed_bitmap_descr* descriptor = s_compressedDescriptors[static_cast<size_t>(type)].load(std::memory_order_acquire);
++        ASSERT(descriptor != nullptr);
+ #if defined(GC_DEBUG)
+-        Optional<void*> object = GC_GENERIC_MALLOC(size, GC_compressed_bitmap_descriptor_kind(descriptor.value()));
++        Optional<void*> object = GC_GENERIC_MALLOC(size, GC_compressed_bitmap_descriptor_kind(descriptor));
+ #else
+-        Optional<void*> object = GC_malloc_explicitly_typed_compressed(size, descriptor.value());
++        Optional<void*> object = GC_malloc_explicitly_typed_compressed(size, descriptor);
+ #endif
+         ASSERT(object);
+         return object.value();
+@@ -152,7 +153,7 @@ public:
+     }
+ 
+ private:
+-    static MAY_THREAD_LOCAL Optional<const GC_compressed_bitmap_descr*> s_compressedDescriptors[static_cast<size_t>(CompressedType::Count)];
++    static std::atomic<const GC_compressed_bitmap_descr*> s_compressedDescriptors[static_cast<size_t>(CompressedType::Count)];
+ 
+ public:
+ #endif
+diff --git a/src/runtime/Global.h b/src/runtime/Global.h
+index 3472997a..4e89c456 100644
+--- a/src/runtime/Global.h
++++ b/src/runtime/Global.h
+@@ -56,12 +56,10 @@ public:
+ #if defined(ESCARGOT_GOOGLE_PERF)
+         // See Heap::finalize(): shutdown collections are profiler noise.
+ #else
+-        GC_register_mark_stack_func([]() {});
+         GC_gcollect_and_unmap();
+         GC_gcollect_and_unmap();
+         GC_gcollect_and_unmap();
+         GC_invoke_finalizers();
+-        GC_register_mark_stack_func(nullptr);
+ #endif
+     }
+ 
+diff --git i/src/runtime/ThreadLocal.cpp w/src/runtime/ThreadLocal.cpp
+index 22885794..abf5fb06 100644
+--- i/src/runtime/ThreadLocal.cpp
++++ w/src/runtime/ThreadLocal.cpp
+@@ -121,7 +121,7 @@ MAY_THREAD_LOCAL std::vector<VMInstance*>* ThreadLocal::g_asyncWaiterVMInstances
+ MAY_THREAD_LOCAL int ThreadLocal::g_pruningCompiledByteCodesVMCount = 0;
+ MAY_THREAD_LOCAL size_t ThreadLocal::g_gcEpoch = 0;
+ 
+-#if !defined(OS_BAREMETAL)
++#if !defined(OS_BAREMETAL) && !defined(GC_THREADS)
+ class GlobalDeleteChecker {
+ public:
+     GlobalDeleteChecker();
+@@ -274,17 +274,85 @@ bool GCEventListenerSet::hasMarkStackEmptyListener(OnMarkStackEmptyListener list
+     return std::find(listeners.begin(), listeners.end(), std::make_pair(listener, data)) != listeners.end();
+ }
+ 
++#if defined(GC_THREADS)
++static std::mutex s_gcInitMutex;
++static size_t s_liveThreadCount = 0;
++static GC_on_mark_stack_empty_proc s_sharedPreviousMarkStackEmptyListener = nullptr;
++static std::atomic<bool> s_isFullGC{false};
++
++struct EphemeronRegistry {
++    std::vector<std::pair<GCEventListenerSet::OnMarkStackEmptyListener, void*>> listeners;
++};
++static std::mutex s_ephemeronPublishMutex;
++static EphemeronRegistry s_ephemeronBuffers[2];
++static size_t s_activeEphemeronBufferIndex = 0;
++static std::atomic<const EphemeronRegistry*> s_publishedEphemerons{nullptr};
++
++bool GCEventListenerSet::removeEphemeronGlobalListener(OnMarkStackEmptyListener listener, void* data)
++{
++    std::lock_guard<std::mutex> lock(s_ephemeronPublishMutex);
++    const size_t current = s_activeEphemeronBufferIndex;
++    const size_t next = 1 - current;
++    auto& dst = s_ephemeronBuffers[next].listeners;
++    const auto& src = s_ephemeronBuffers[current].listeners;
++    dst.clear();
++    bool found = false;
++    for (const auto& entry : src) {
++        if (!found && entry.first == listener && entry.second == data) {
++            found = true;
++            continue;
++        }
++        dst.push_back(entry);
++    }
++    if (found) {
++        s_publishedEphemerons.store(&s_ephemeronBuffers[next], std::memory_order_release);
++        s_activeEphemeronBufferIndex = next;
++        return true;
++    }
++    return false;
++}
++#endif
++
+ bool GCEventListenerSet::addMarkStackEmptyListener(OnMarkStackEmptyListener listener, void* data)
+ {
++#if defined(GC_THREADS)
++    std::lock_guard<std::mutex> lock(s_ephemeronPublishMutex);
++    const size_t current = s_activeEphemeronBufferIndex;
++    const size_t next = 1 - current;
++    auto it = std::find(s_ephemeronBuffers[current].listeners.begin(),
++                        s_ephemeronBuffers[current].listeners.end(),
++                        std::make_pair(listener, data));
++    if (it != s_ephemeronBuffers[current].listeners.end()) {
++        return false;
++    }
++    auto& dst = s_ephemeronBuffers[next].listeners;
++    const auto& src = s_ephemeronBuffers[current].listeners;
++    const size_t needed = src.size() + 1;
++    dst.clear();
++    if (dst.capacity() < needed) {
++        dst.reserve(needed * 2);
++    }
++    for (const auto& entry : src) {
++        dst.push_back(entry);
++    }
++    dst.push_back(std::make_pair(listener, data));
++    s_publishedEphemerons.store(&s_ephemeronBuffers[next], std::memory_order_release);
++    s_activeEphemeronBufferIndex = next;
++    return true;
++#else
+     if (hasMarkStackEmptyListener(listener, data)) {
+         return false;
+     }
+     ensureMarkStackEmptyListeners()->push_back(std::make_pair(listener, data));
+     return true;
++#endif
+ }
+ 
+ bool GCEventListenerSet::removeMarkStackEmptyListener(OnMarkStackEmptyListener listener, void* data)
+ {
++#if defined(GC_THREADS)
++    return removeEphemeronGlobalListener(listener, data);
++#else
+     if (!m_markStackEmptyListeners) {
+         return false;
+     }
+@@ -295,6 +363,7 @@ bool GCEventListenerSet::removeMarkStackEmptyListener(OnMarkStackEmptyListener l
+     }
+     listeners.erase(iter);
+     return true;
++#endif
+ }
+ 
+ void GCEventListenerSet::reset()
+@@ -323,6 +392,9 @@ void GCEventListenerSet::reset()
+ 
+ static void genericGCFullGCStartCallback()
+ {
++#if defined(GC_THREADS)
++    s_isFullGC.store(true, std::memory_order_release);
++#endif
+     if (!ThreadLocal::isInited()) {
+         return;
+     }
+@@ -361,6 +433,9 @@ static void genericGCEventListener(GC_EventType evtType)
+     }
+ 
+     if (evtType == GC_EVENT_RECLAIM_END) {
++#if defined(GC_THREADS)
++        s_isFullGC.store(false, std::memory_order_release);
++#endif
+         // the full GC cycle (if any) is finished now. clearing the flag here (instead of
+         // consuming it in a listener) lets every listener of this cycle observe it
+         list.clearFullGCFlag();
+@@ -369,6 +444,20 @@ static void genericGCEventListener(GC_EventType evtType)
+ 
+ static GC_ms_entry* genericGCMarkStackEmptyListener(GC_ms_entry* markStackTop, GC_ms_entry* markStackLimit)
+ {
++#if defined(GC_THREADS)
++    if (s_sharedPreviousMarkStackEmptyListener != nullptr && s_sharedPreviousMarkStackEmptyListener != genericGCMarkStackEmptyListener) {
++        markStackTop = s_sharedPreviousMarkStackEmptyListener(markStackTop, markStackLimit);
++    }
++    if (GC_is_incremental_mode() && !s_isFullGC.load(std::memory_order_acquire)) {
++        return markStackTop;
++    }
++    const EphemeronRegistry* registry = s_publishedEphemerons.load(std::memory_order_acquire);
++    if (registry) {
++        for (const auto& listener : registry->listeners) {
++            markStackTop = listener.first(markStackTop, markStackLimit, listener.second);
++        }
++    }
++#else
+     if (g_previousMarkStackEmptyListener != nullptr) {
+         markStackTop = g_previousMarkStackEmptyListener(markStackTop, markStackLimit);
+     }
+@@ -382,6 +471,7 @@ static GC_ms_entry* genericGCMarkStackEmptyListener(GC_ms_entry* markStackTop, G
+             markStackTop = listener.first(markStackTop, markStackLimit, listener.second);
+         }
+     }
++#endif
+     return markStackTop;
+ }
+ 
+@@ -784,6 +874,20 @@ void ThreadLocal::initialize(uint32_t optionFromGlobal)
+ 
+     // g_gcEventListenerSet
+     g_gcEventListenerSet = new GCEventListenerSet();
++#if defined(GC_THREADS)
++    {
++        std::lock_guard<std::mutex> lock(s_gcInitMutex);
++        if (s_liveThreadCount == 0) {
++            GC_set_on_collection_event(genericGCEventListener);
++            s_sharedPreviousMarkStackEmptyListener = GC_get_on_mark_stack_empty();
++            GC_set_on_mark_stack_empty(genericGCMarkStackEmptyListener);
++            if (GC_is_incremental_mode()) {
++                GC_set_start_callback(genericGCFullGCStartCallback);
++            }
++        }
++        s_liveThreadCount++;
++    }
++#else
+     // in addition, register genericGCEventListener here too
+     GC_set_on_collection_event(genericGCEventListener);
+     g_previousMarkStackEmptyListener = GC_get_on_mark_stack_empty();
+@@ -791,6 +895,7 @@ void ThreadLocal::initialize(uint32_t optionFromGlobal)
+     if (GC_is_incremental_mode()) {
+         GC_set_start_callback(genericGCFullGCStartCallback);
+     }
++#endif
+ 
+     // g_astAllocator
+     g_astAllocator = new ASTAllocator();
+@@ -912,12 +1017,29 @@ void ThreadLocal::finalize()
+     // g_gcEventListenerSet
+     delete g_gcEventListenerSet;
+     g_gcEventListenerSet = nullptr;
++#if defined(GC_THREADS)
++    {
++        std::lock_guard<std::mutex> lock(s_gcInitMutex);
++        if (s_liveThreadCount > 0) {
++            s_liveThreadCount--;
++            if (s_liveThreadCount == 0) {
++                GC_set_on_collection_event(nullptr);
++                GC_set_on_mark_stack_empty(s_sharedPreviousMarkStackEmptyListener);
++                s_sharedPreviousMarkStackEmptyListener = nullptr;
++                if (GC_is_incremental_mode()) {
++                    GC_set_start_callback(nullptr);
++                }
++            }
++        }
++    }
++#else
+     GC_set_on_collection_event(nullptr);
+     GC_set_on_mark_stack_empty(g_previousMarkStackEmptyListener);
+     g_previousMarkStackEmptyListener = nullptr;
+     if (GC_is_incremental_mode()) {
+         GC_set_start_callback(nullptr);
+     }
++#endif
+ 
+     // g_astAllocator
+     delete g_astAllocator;
+diff --git a/src/runtime/ThreadLocal.h b/src/runtime/ThreadLocal.h
+index f9a0403f..43146b6f 100644
+--- a/src/runtime/ThreadLocal.h
++++ b/src/runtime/ThreadLocal.h
+@@ -68,6 +68,9 @@ public:
+     bool hasMarkStackEmptyListener(OnMarkStackEmptyListener listener, void* data) const;
+     bool addMarkStackEmptyListener(OnMarkStackEmptyListener listener, void* data);
+     bool removeMarkStackEmptyListener(OnMarkStackEmptyListener listener, void* data);
++#if defined(GC_THREADS)
++    static bool removeEphemeronGlobalListener(OnMarkStackEmptyListener listener, void* data);
++#endif
+ 
+     Optional<EventListenerVector*> markStartListeners() const
+     {
+diff --git a/src/runtime/WeakMapObject.cpp b/src/runtime/WeakMapObject.cpp
+index f601443e..39fe9b7e 100644
+--- a/src/runtime/WeakMapObject.cpp
++++ b/src/runtime/WeakMapObject.cpp
+@@ -60,9 +60,13 @@ GC_ms_entry* WeakMapObject::markEphemerons(GC_ms_entry* markStackTop, GC_ms_entr
+ 
+ void WeakMapObject::removeEphemeronListener(PointerValue* object, void*)
+ {
++#if defined(GC_THREADS)
++    GCEventListenerSet::removeEphemeronGlobalListener(markEphemerons, object);
++#else
+     if (ThreadLocal::isInited()) {
+         ThreadLocal::gcEventListenerSet().removeMarkStackEmptyListener(markEphemerons, object);
+     }
++#endif
+ }
+ 
+ WeakMapObject::WeakMapObject(ExecutionState& state)
+diff --git a/third_party/GCutil/CMakeLists.txt b/third_party/GCutil/CMakeLists.txt
+index b35eac77..8e52a495 100644
+--- a/third_party/GCutil/CMakeLists.txt
++++ b/third_party/GCutil/CMakeLists.txt
+@@ -223,7 +223,7 @@ ELSE()
+ ENDIF()
+ 
+ IF (GCUTIL_ENABLE_THREADING)
+-    SET (GCUTIL_CFLAGS_INTERNAL ${GCUTIL_CFLAGS_INTERNAL} -D_REENTRANT=1 -DGC_THREAD_ISOLATE=1)
++    SET (GCUTIL_CFLAGS_INTERNAL ${GCUTIL_CFLAGS_INTERNAL} -D_REENTRANT=1 -DGC_THREADS=1 -DGC_BUILTIN_ATOMIC=1)
+     IF (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+         # Test if userfaultfd headers and required structures are available.
+         # Some kernels have headers but incomplete definitions.

@@ -215,6 +215,14 @@ fn hermesTriggerTimeout(instance_id: i32) void {
     her.c_api_mod.hermes_runtime_async_trigger_timeout(rt);
 }
 
+fn hermesTriggerTeardownTimeout(instance_id: i32, generation: u64) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
+    const lease = instance_map.beginTeardownSignals(instance_id, generation) orelse return;
+    defer lease.end();
+    const rt = lease.inst.monoRuntime() orelse return;
+    @import("../backend/hermes.zig").c_api_mod.hermes_runtime_async_trigger_timeout(rt);
+}
+
 fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;
     // Lease across watch/unwatch so clear_interrupt cannot race destroyRuntime freeing the Hermes runtime while the map entry still exists.
@@ -249,9 +257,17 @@ pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
 }
 
 fn rearmOneHermesStop(instance_id: i32) void {
+    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
     if (!isStopRequested(instance_id)) return;
-    hermesDrainAsyncTimeout(instance_id);
-    hermesWatchTimeLimit(instance_id, 25);
+    const lease = instance_map.beginControlPlane(instance_id) orelse blk: {
+        const generation = instance_map.registeredGeneration(instance_id) orelse return;
+        break :blk instance_map.beginTeardownSignals(instance_id, generation) orelse return;
+    };
+    defer lease.end();
+    const rt = lease.inst.monoRuntime() orelse return;
+    const api = @import("../backend/hermes.zig").c_api_mod;
+    api.hermes_runtime_drain_async_timeout(rt);
+    api.hermes_runtime_watch_time_limit(rt, 25);
 }
 
 /// Request that the JS runtime interrupt execution on the next interrupt check. Thread-safe. Returns false if the instance was never init()'d or has been deinit()'d.
@@ -319,6 +335,12 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
     _ = p.fetchOr(2, .monotonic);
     registry_mutex.unlock();
     hermesTriggerTimeout(instance_id);
+    return true;
+}
+
+pub fn requestTeardownInterrupt(instance_id: i32, generation: u64) bool {
+    if (!requestStopInterrupt(instance_id)) return false;
+    hermesTriggerTeardownTimeout(instance_id, generation);
     return true;
 }
 

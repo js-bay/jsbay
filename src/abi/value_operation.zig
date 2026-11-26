@@ -3,6 +3,7 @@ const std = @import("std");
 const backend = @import("../backend.zig");
 const engine = @import("../engine.zig");
 const engine_thread = @import("../runtime/engine_thread.zig");
+const instance_map = @import("../runtime/instance_map.zig");
 const api_value = @import("api_value.zig");
 const packed_api_value = @import("packed_api_value.zig");
 const api_backend = @import("api_backend.zig");
@@ -63,11 +64,20 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
             if (@import("../runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
             if (!api_value.isOwner(id)) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
             const lease = engine_thread.beginEval(id);
-            if (!lease.allowed) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-            const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse {
+            if (!lease.allowed) {
+                if (lease.failure == .out_of_memory) return .{ .status = API_OUT_OF_MEMORY };
+                return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+            }
+            const inst = instance_map.getInstance(id) orelse {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
+            return beginAdmittedApiOp(inst, lease, require_execution);
+        }
+
+        /// Take ownership of an eval lease that protects this instance.
+        pub fn beginAdmittedApiOp(inst: *instance_map.EngineInstance, lease: engine_thread.EvalLease, require_execution: bool) ApiOpResult {
+            const id = inst.instance_id;
             if (inst.loop.lastError() != null) {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_LOOP_FAILED };
@@ -236,7 +246,10 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
             if (@import("../runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
             if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
             const lease = engine_thread.beginEval(instance_id);
-            if (!lease.allowed) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+            if (!lease.allowed) {
+                if (lease.failure == .out_of_memory) return .{ .status = API_OUT_OF_MEMORY };
+                return .{ .status = if (instance_map.getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+            }
             const inst = @import("../runtime/instance_map.zig").getInstance(instance_id) orelse {
                 engine.finishEvalEntry(instance_id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };

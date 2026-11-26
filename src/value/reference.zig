@@ -32,10 +32,19 @@
 //! All Global, Weak, and Rooted operations (init, get, reset, deinit) must be performed on the owning engine thread. Engine teardown walks the intrusive bookkeeping list to reset dangling references before runtime destruction. OwnedValue represents local scoped ownership and must not outlive its owning context.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const backend = @import("../backend.zig");
 const instance_map = @import("../runtime/instance_map.zig");
 
 const ActiveEngine = backend.ActiveEngine;
+var global_release_hook_for_testing: ?*const fn (?*anyopaque) void = null;
+var global_release_hook_context_for_testing: ?*anyopaque = null;
+
+pub fn setGlobalReleaseHookForTesting(hook: ?*const fn (?*anyopaque) void, ctx: ?*anyopaque) void {
+    if (!builtin.is_test) return;
+    global_release_hook_for_testing = hook;
+    global_release_hook_context_for_testing = ctx;
+}
 
 /// Convenience alias so consumers can write `reference.Local` instead of reaching into the backend module for the Value type.
 pub const Local = ActiveEngine.Value;
@@ -137,6 +146,7 @@ pub const StackFrameScope = struct {
 const GlobalCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
+    generation: u64,
     ctx: ActiveEngine.Context,
     allocator: std.mem.Allocator,
     val: ActiveEngine.Value,
@@ -146,8 +156,14 @@ const GlobalCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *GlobalCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
+        if (builtin.is_test) if (global_release_hook_for_testing) |hook| hook(global_release_hook_context_for_testing);
         ActiveEngine.freeValue(cell.ctx, cell.val);
         cell.released = true;
+    }
+
+    fn freeCell(entry: *instance_map.RefEntry) void {
+        const cell: *GlobalCell = @fieldParentPtr("entry", entry);
+        cell.allocator.destroy(cell);
     }
 };
 
@@ -194,6 +210,7 @@ pub const WatcherData = struct {
 pub const WeakCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
+    generation: u64,
     ctx: ActiveEngine.Context,
     allocator: std.mem.Allocator,
     kind: WeakKind,
@@ -216,7 +233,100 @@ pub const WeakCell = struct {
         }
         cell.released = true;
     }
+
+    fn freeCell(entry: *instance_map.RefEntry) void {
+        const cell: *WeakCell = @fieldParentPtr("entry", entry);
+        cell.allocator.destroy(cell);
+    }
 };
+
+const RefOperation = struct {
+    instance_id: i32,
+    lease: instance_map.RefLease,
+    previous: ?*RefOperation = null,
+    deferred_destroy: bool = false,
+    active: bool = true,
+
+    fn end(self: *RefOperation) void {
+        std.debug.assert(ref_tls_top == self and self.active);
+        _ = self.lease.end();
+        ref_tls_top = self.previous;
+        self.active = false;
+        if (self.deferred_destroy) @import("../engine.zig").destroyForGeneration(self.instance_id, self.lease.generation);
+    }
+};
+
+threadlocal var ref_tls_top: ?*RefOperation = null;
+
+pub fn isRefOpActiveOnCurrentThread(instance_id: i32) bool {
+    var current = ref_tls_top;
+    while (current) |entry| : (current = entry.previous) if (entry.instance_id == instance_id) return true;
+    return false;
+}
+
+pub fn requestDeferredDestroy(instance_id: i32) bool {
+    var current = ref_tls_top;
+    while (current) |entry| : (current = entry.previous) {
+        if (entry.instance_id == instance_id) {
+            entry.deferred_destroy = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn beginRefOperation(operation: *RefOperation, instance_id: i32, generation: ?u64) bool {
+    const lease = instance_map.beginRefOp(instance_id, generation) orelse return false;
+    operation.* = .{ .instance_id = instance_id, .lease = lease, .previous = ref_tls_top };
+    ref_tls_top = operation;
+    return true;
+}
+
+fn unregisterEntry(inst: *instance_map.EngineInstance, entry: *instance_map.RefEntry) void {
+    inst.ref_bookkeeping.mutex.lock();
+    defer inst.ref_bookkeeping.mutex.unlock();
+    if (entry.prev) |p| {
+        p.next = entry.next;
+    } else if (inst.ref_bookkeeping.head == entry) {
+        inst.ref_bookkeeping.head = entry.next;
+    }
+    if (entry.next) |n| n.prev = entry.prev;
+    entry.prev = null;
+    entry.next = null;
+}
+
+fn abandonEntry(entry: *instance_map.RefEntry) void {
+    while (true) {
+        const old: instance_map.RefEntryState = @fromBackingInt(@intCast(entry.state.load(.acquire)));
+        const next: ?instance_map.RefEntryState = switch (old) {
+            .linked => .abandoned,
+            .releasing => .releasing_abandoned,
+            .released => .freed,
+            .abandoned, .releasing_abandoned, .freed => null,
+        };
+        const target = next orelse return;
+        if (entry.state.cmpxchgWeak(@backingInt(old), @backingInt(target), .acq_rel, .acquire) == null) {
+            if (target == .freed) entry.free_fn(entry);
+            return;
+        }
+    }
+}
+
+fn finishRefRelease(entry: *instance_map.RefEntry) void {
+    while (true) {
+        const state: instance_map.RefEntryState = @fromBackingInt(@intCast(entry.state.load(.acquire)));
+        switch (state) {
+            .releasing, .releasing_abandoned => {
+                if (entry.state.cmpxchgWeak(@backingInt(state), @backingInt(instance_map.RefEntryState.freed), .acq_rel, .acquire) == null) {
+                    entry.free_fn(entry);
+                    return;
+                }
+            },
+            .freed => return,
+            .linked, .released, .abandoned => unreachable,
+        }
+    }
+}
 
 fn ctxForInstance(instance_id: i32) ?ActiveEngine.Context {
     const ptrs = instance_map.getPtrs(instance_id) orelse return null;
@@ -230,25 +340,6 @@ fn registerEntryDirect(inst: *instance_map.EngineInstance, entry: *instance_map.
     entry.next = inst.ref_bookkeeping.head;
     if (inst.ref_bookkeeping.head) |h| h.prev = entry;
     inst.ref_bookkeeping.head = entry;
-}
-
-/// Unlink `entry` from the engine's bookkeeping list. Safe to call even if the engine has been torn down or the entry was already unlinked.
-fn unregisterEntry(instance_id: i32, entry: *instance_map.RefEntry) void {
-    const inst = instance_map.getInstance(instance_id) orelse {
-        entry.prev = null;
-        entry.next = null;
-        return;
-    };
-    inst.ref_bookkeeping.mutex.lock();
-    defer inst.ref_bookkeeping.mutex.unlock();
-    if (entry.prev) |p| {
-        p.next = entry.next;
-    } else if (inst.ref_bookkeeping.head == entry) {
-        inst.ref_bookkeeping.head = entry.next;
-    }
-    if (entry.next) |n| n.prev = entry.prev;
-    entry.prev = null;
-    entry.next = null;
 }
 
 // ----------------------------------------------------------------------
@@ -358,9 +449,10 @@ pub fn Global(comptime T: type) type {
 
         /// Create a Global that retains `v`. Duplicates the refcount / calls `JSValueProtect` so the value outlives any scope it was created in.
         pub fn init(instance_id: i32, v: Local) Self {
-            const inst = instance_map.getInstance(instance_id) orelse {
-                return Self{ .instance_id = instance_id, .cell = null };
-            };
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, instance_id, null)) return Self{ .instance_id = instance_id, .cell = null };
+            defer op.end();
+            const inst = op.lease.inst;
             const ctx = inst.monoCtx() orelse {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
@@ -368,8 +460,9 @@ pub fn Global(comptime T: type) type {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
             cell.* = .{
-                .entry = .{ .reset_fn = GlobalCell.releaseValue },
+                .entry = .{ .reset_fn = GlobalCell.releaseValue, .free_fn = GlobalCell.freeCell },
                 .instance_id = instance_id,
+                .generation = op.lease.generation,
                 .ctx = ctx,
                 .allocator = inst.allocator,
                 .val = ActiveEngine.dupValue(ctx, v),
@@ -385,27 +478,36 @@ pub fn Global(comptime T: type) type {
 
         pub fn isEmpty(self: Self) bool {
             const cell = self.cell orelse return true;
-            return cell.released;
+            return cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked);
         }
 
         /// Return a freshly-duplicated Value. Caller owns the result and must free it with `ActiveEngine.freeValue`.
         pub fn get(self: Self) ?Local {
             const cell = self.cell orelse return null;
-            if (cell.released) return null;
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return null;
+            defer op.end();
+            if (cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked)) return null;
             return ActiveEngine.dupValue(cell.ctx, cell.val);
         }
 
         /// Release the retained value and free the underlying cell. Safe to call multiple times.
         pub fn reset(self: *Self) void {
             const cell = self.cell orelse return;
-            const alloc = cell.allocator;
-            if (!cell.released) {
-                // Unlink from bookkeeping first, then release value.
-                unregisterEntry(cell.instance_id, &cell.entry);
-                GlobalCell.releaseValue(&cell.entry);
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) {
+                abandonEntry(&cell.entry);
+                self.cell = null;
+                return;
             }
-            // Now that the cell is no longer linked into bookkeeping and its JS value has been released, free the cell itself.
-            alloc.destroy(cell);
+            defer op.end();
+            if (cell.entry.state.cmpxchgStrong(@backingInt(instance_map.RefEntryState.linked), @backingInt(instance_map.RefEntryState.releasing), .acq_rel, .acquire) == null) {
+                unregisterEntry(op.lease.inst, &cell.entry);
+                GlobalCell.releaseValue(&cell.entry);
+                finishRefRelease(&cell.entry);
+            } else {
+                abandonEntry(&cell.entry);
+            }
             self.cell = null;
         }
 
@@ -430,9 +532,10 @@ pub fn Weak(comptime T: type) type {
         cell: ?*WeakCell = null,
 
         pub fn init(instance_id: i32, v: Local) Self {
-            const inst = instance_map.getInstance(instance_id) orelse {
-                return Self{ .instance_id = instance_id, .cell = null };
-            };
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, instance_id, null)) return Self{ .instance_id = instance_id, .cell = null };
+            defer op.end();
+            const inst = op.lease.inst;
             const ctx = inst.monoCtx() orelse {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
@@ -443,8 +546,9 @@ pub fn Weak(comptime T: type) type {
             const is_obj = weakBackendIsObject(ctx, v);
             if (is_obj) {
                 cell.* = .{
-                    .entry = .{ .reset_fn = WeakCell.releaseValue },
+                    .entry = .{ .reset_fn = WeakCell.releaseValue, .free_fn = WeakCell.freeCell },
                     .instance_id = instance_id,
+                    .generation = op.lease.generation,
                     .ctx = ctx,
                     .allocator = inst.allocator,
                     .kind = .object,
@@ -457,8 +561,9 @@ pub fn Weak(comptime T: type) type {
                 }
             } else {
                 cell.* = .{
-                    .entry = .{ .reset_fn = WeakCell.releaseValue },
+                    .entry = .{ .reset_fn = WeakCell.releaseValue, .free_fn = WeakCell.freeCell },
                     .instance_id = instance_id,
+                    .generation = op.lease.generation,
                     .ctx = ctx,
                     .allocator = inst.allocator,
                     .kind = .primitive,
@@ -477,7 +582,10 @@ pub fn Weak(comptime T: type) type {
         /// True when the Weak is unbacked, has been reset, or (for object-kind cells) the target has been collected.
         pub fn isEmpty(self: Self) bool {
             const cell = self.cell orelse return true;
-            if (cell.released) return true;
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return true;
+            defer op.end();
+            if (cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked)) return true;
             if (cell.kind == .object) {
                 return weakBackendGetLive(cell.ctx, cell) == null;
             }
@@ -487,7 +595,10 @@ pub fn Weak(comptime T: type) type {
         /// Returns the stored value without duplicating the caller's refcount. The returned `Local` is borrowed — its lifetime matches the underlying JS value (which, by definition of Weak, could be collected after this call).
         pub fn get(self: Self) ?Local {
             const cell = self.cell orelse return null;
-            if (cell.released) return null;
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return null;
+            defer op.end();
+            if (cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked)) return null;
             switch (cell.kind) {
                 .primitive => return cell.val,
                 .object => {
@@ -498,12 +609,20 @@ pub fn Weak(comptime T: type) type {
 
         pub fn reset(self: *Self) void {
             const cell = self.cell orelse return;
-            const alloc = cell.allocator;
-            if (!cell.released) {
-                unregisterEntry(cell.instance_id, &cell.entry);
-                WeakCell.releaseValue(&cell.entry);
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) {
+                abandonEntry(&cell.entry);
+                self.cell = null;
+                return;
             }
-            alloc.destroy(cell);
+            defer op.end();
+            if (cell.entry.state.cmpxchgStrong(@backingInt(instance_map.RefEntryState.linked), @backingInt(instance_map.RefEntryState.releasing), .acq_rel, .acquire) == null) {
+                unregisterEntry(op.lease.inst, &cell.entry);
+                WeakCell.releaseValue(&cell.entry);
+                finishRefRelease(&cell.entry);
+            } else {
+                abandonEntry(&cell.entry);
+            }
             self.cell = null;
         }
 
@@ -523,6 +642,7 @@ pub fn Weak(comptime T: type) type {
 const RootCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
+    generation: u64,
     ctx: ActiveEngine.Context,
     allocator: std.mem.Allocator,
     val: ActiveEngine.Value,
@@ -547,6 +667,11 @@ const RootCell = struct {
         cell.root_count = 0;
         cell.released = true;
     }
+
+    fn freeCell(entry: *instance_map.RefEntry) void {
+        const cell: *RootCell = @fieldParentPtr("entry", entry);
+        cell.allocator.destroy(cell);
+    }
 };
 
 /// Refcounted root of one JS value.
@@ -562,9 +687,10 @@ pub const Rooted = struct {
 
     /// Store `v` with a root count of 0. Does not protect yet.
     pub fn init(instance_id: i32, v: Local) Rooted {
-        const inst = instance_map.getInstance(instance_id) orelse {
-            return Rooted{ .instance_id = instance_id, .cell = null };
-        };
+        var op: RefOperation = undefined;
+        if (!beginRefOperation(&op, instance_id, null)) return Rooted{ .instance_id = instance_id, .cell = null };
+        defer op.end();
+        const inst = op.lease.inst;
         const ctx = inst.monoCtx() orelse {
             return Rooted{ .instance_id = instance_id, .cell = null };
         };
@@ -579,8 +705,9 @@ pub const Rooted = struct {
             }
         }
         cell.* = .{
-            .entry = .{ .reset_fn = RootCell.releaseValue },
+            .entry = .{ .reset_fn = RootCell.releaseValue, .free_fn = RootCell.freeCell },
             .instance_id = instance_id,
+            .generation = op.lease.generation,
             .ctx = ctx,
             .allocator = inst.allocator,
             .val = v,
@@ -592,12 +719,19 @@ pub const Rooted = struct {
 
     pub fn isEmpty(self: Rooted) bool {
         const cell = self.cell orelse return true;
-        return cell.released or cell.root_count == 0;
+        var op: RefOperation = undefined;
+        if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return true;
+        defer op.end();
+        return cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked) or cell.root_count == 0;
     }
 
     /// Increment the root count. The backend protect runs only on 0→1.
     pub fn root(self: *Rooted) void {
         const cell = self.cell orelse return;
+        var op: RefOperation = undefined;
+        if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return;
+        defer op.end();
+        if (cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked)) return;
         if (cell.released) return;
         if (cell.root_count == 0) {
             const protected_val = rootBackendProtect(cell.ctx, cell) orelse return;
@@ -610,6 +744,10 @@ pub const Rooted = struct {
     /// Decrement the root count. The backend release runs only when the count returns to 0. Extra calls at 0 do nothing.
     pub fn unroot(self: *Rooted) void {
         const cell = self.cell orelse return;
+        var op: RefOperation = undefined;
+        if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return;
+        defer op.end();
+        if (cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked)) return;
         if (cell.released or cell.root_count == 0) return;
         cell.root_count -= 1;
         if (cell.root_count == 0 and cell.protected) {
@@ -625,12 +763,20 @@ pub const Rooted = struct {
     /// Unlink, drop a leftover protect, and free the cell.
     pub fn deinit(self: *Rooted) void {
         const cell = self.cell orelse return;
-        const alloc = cell.allocator;
-        if (!cell.released) {
-            unregisterEntry(cell.instance_id, &cell.entry);
-            RootCell.releaseValue(&cell.entry);
+        var op: RefOperation = undefined;
+        if (!beginRefOperation(&op, cell.instance_id, cell.generation)) {
+            abandonEntry(&cell.entry);
+            self.cell = null;
+            return;
         }
-        alloc.destroy(cell);
+        defer op.end();
+        if (cell.entry.state.cmpxchgStrong(@backingInt(instance_map.RefEntryState.linked), @backingInt(instance_map.RefEntryState.releasing), .acq_rel, .acquire) == null) {
+            unregisterEntry(op.lease.inst, &cell.entry);
+            RootCell.releaseValue(&cell.entry);
+            finishRefRelease(&cell.entry);
+        } else {
+            abandonEntry(&cell.entry);
+        }
         self.cell = null;
     }
 };
@@ -638,4 +784,63 @@ pub const Rooted = struct {
 test "rootBackendIdentityFree takes the same Context as RootCell, not a nested optional" {
     const param_types = @typeInfo(@TypeOf(rootBackendIdentityFree)).@"fn".param_types;
     try std.testing.expectEqual(ActiveEngine.Context, param_types[0].?);
+}
+
+test "reference cell ownership transfers to teardown without a double free" {
+    const Probe = struct {
+        entry: instance_map.RefEntry,
+        allocator: std.mem.Allocator,
+        freed: *std.atomic.Value(u32),
+
+        fn release(_: *instance_map.RefEntry) void {}
+
+        fn free(entry: *instance_map.RefEntry) void {
+            const self: *@This() = @fieldParentPtr("entry", entry);
+            _ = self.freed.fetchAdd(1, .seq_cst);
+            self.allocator.destroy(self);
+        }
+    };
+
+    var freed = std.atomic.Value(u32).init(0);
+    const p = try std.testing.allocator.create(Probe);
+    p.* = .{
+        .entry = .{ .reset_fn = Probe.release, .free_fn = Probe.free },
+        .allocator = std.testing.allocator,
+        .freed = &freed,
+    };
+
+    abandonEntry(&p.entry);
+    try std.testing.expectEqual(@backingInt(instance_map.RefEntryState.abandoned), p.entry.state.load(.seq_cst));
+    try std.testing.expectEqual(@as(u32, 0), freed.load(.seq_cst));
+    try std.testing.expect(p.entry.state.cmpxchgStrong(@backingInt(instance_map.RefEntryState.abandoned), @backingInt(instance_map.RefEntryState.releasing_abandoned), .acq_rel, .acquire) == null);
+    finishRefRelease(&p.entry);
+    try std.testing.expectEqual(@as(u32, 1), freed.load(.seq_cst));
+}
+
+test "late reference deinit frees an already released cell exactly once" {
+    const Probe = struct {
+        entry: instance_map.RefEntry,
+        allocator: std.mem.Allocator,
+        freed: *std.atomic.Value(u32),
+
+        fn release(_: *instance_map.RefEntry) void {}
+
+        fn free(entry: *instance_map.RefEntry) void {
+            const self: *@This() = @fieldParentPtr("entry", entry);
+            _ = self.freed.fetchAdd(1, .seq_cst);
+            self.allocator.destroy(self);
+        }
+    };
+
+    var freed = std.atomic.Value(u32).init(0);
+    const p = try std.testing.allocator.create(Probe);
+    p.* = .{
+        .entry = .{ .reset_fn = Probe.release, .free_fn = Probe.free },
+        .allocator = std.testing.allocator,
+        .freed = &freed,
+    };
+    p.entry.state.store(@backingInt(instance_map.RefEntryState.released), .seq_cst);
+
+    abandonEntry(&p.entry);
+    try std.testing.expectEqual(@as(u32, 1), freed.load(.seq_cst));
 }

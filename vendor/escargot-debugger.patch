@@ -1,7 +1,8 @@
 diff --git a/src/api/EscargotPublic.cpp b/src/api/EscargotPublic.cpp
+index 938892c4..7eb5910c 100644
 --- a/src/api/EscargotPublic.cpp
 +++ b/src/api/EscargotPublic.cpp
-@@ -1782,6 +1782,51 @@
+@@ -1782,6 +1782,51 @@ StringRef* DebuggerOperationsRef::BreakpointOperations::eval(StringRef* sourceCo
      return toRef(result);
  }
  
@@ -53,7 +54,7 @@ diff --git a/src/api/EscargotPublic.cpp b/src/api/EscargotPublic.cpp
  void DebuggerOperationsRef::BreakpointOperations::getStackTrace(DebuggerOperationsRef::DebuggerStackTraceDataVector& outStackTrace)
  {
      ExecutionState* state = toImpl(m_executionState);
-@@ -2113,7 +2158,7 @@
+@@ -2113,7 +2158,7 @@ class DebuggerC : public Debugger {
  public:
      virtual void init(const char* options, Context* context) override {}
      virtual void parseCompleted(String* source, String* srcName, size_t originLineOffset, String* error = nullptr) override;
@@ -62,23 +63,23 @@ diff --git a/src/api/EscargotPublic.cpp b/src/api/EscargotPublic.cpp
      virtual bool stopAtException(ByteCodeBlock* byteCodeBlock, uint32_t offset, ExecutionState* state, const Value* exceptionValue) override;
      virtual void byteCodeReleaseNotification(ByteCodeBlock* byteCodeBlock) override;
      virtual void exceptionCaught(String* message, SavedStackTraceDataVector& exceptionTrace) override;
-@@ -2185,9 +2230,9 @@
+@@ -2185,9 +2230,9 @@ static LexicalEnvironment* getFunctionLexEnv(ExecutionState* state)
      return nullptr;
  }
  
 -bool DebuggerC::stopAtBreakpoint(ByteCodeBlock* byteCodeBlock, uint32_t offset, ExecutionState* state)
--{
--    DebuggerOperationsRef::BreakpointOperations operations(reinterpret_cast<DebuggerOperationsRef::WeakCodeRef*>(byteCodeBlock), toRef(state), offset);
 +bool DebuggerC::stopAtBreakpoint(ByteCodeBlock* byteCodeBlock, uint32_t offset, ExecutionState* state, bool isDebuggerStatement)
-+{
+ {
+-    DebuggerOperationsRef::BreakpointOperations operations(reinterpret_cast<DebuggerOperationsRef::WeakCodeRef*>(byteCodeBlock), toRef(state), offset);
 +    DebuggerOperationsRef::BreakpointOperations operations(reinterpret_cast<DebuggerOperationsRef::WeakCodeRef*>(byteCodeBlock), toRef(state), offset, isDebuggerStatement);
  
      switch (m_debuggerClient->stopAtBreakpoint(operations)) {
      case DebuggerOperationsRef::Continue: {
 diff --git a/src/api/EscargotPublic.h b/src/api/EscargotPublic.h
+index 1caad46e..0965c2c0 100644
 --- a/src/api/EscargotPublic.h
 +++ b/src/api/EscargotPublic.h
-@@ -952,6 +952,14 @@
+@@ -952,6 +952,14 @@ public:
          //   - object: the returned string is nullptr, objectRef contains the index of the object
          //   - other values: the returned string contains the string representation of the value
          StringRef* eval(StringRef* sourceCode, bool& isError, size_t& objectIndex);
@@ -93,7 +94,7 @@ diff --git a/src/api/EscargotPublic.h b/src/api/EscargotPublic.h
          void getStackTrace(DebuggerStackTraceDataVector& outStackTrace);
          void getLexicalScopeChain(uint32_t stateIndex, LexicalScopeChainVector& outLexicalScopeChain);
          PropertyKeyValueVector getLexicalScopeChainProperties(uint32_t stateIndex, uint32_t scopeIndex);
-@@ -962,11 +970,12 @@
+@@ -962,11 +970,12 @@ public:
      private:
          class ObjectStore;
  
@@ -107,7 +108,7 @@ diff --git a/src/api/EscargotPublic.h b/src/api/EscargotPublic.h
          {
          }
  
-@@ -974,6 +983,7 @@
+@@ -974,6 +983,7 @@ public:
          ExecutionStateRef* m_executionState;
          ObjectStore* m_objectStore;
          uint32_t m_offset;
@@ -116,9 +117,10 @@ diff --git a/src/api/EscargotPublic.h b/src/api/EscargotPublic.h
  
      enum ResumeBreakpointOperation {
 diff --git a/src/debugger/Debugger.h b/src/debugger/Debugger.h
+index 854a4ce4..f4e1c6de 100644
 --- a/src/debugger/Debugger.h
 +++ b/src/debugger/Debugger.h
-@@ -192,7 +192,7 @@
+@@ -192,7 +192,7 @@ public:
  
      virtual void init(const char* options, Context* context) = 0;
      virtual void parseCompleted(String* source, String* srcName, size_t originLineOffset, String* error = nullptr) = 0;
@@ -128,9 +130,10 @@ diff --git a/src/debugger/Debugger.h b/src/debugger/Debugger.h
      virtual void byteCodeReleaseNotification(ByteCodeBlock* byteCodeBlock) = 0;
      virtual void exceptionCaught(String* message, SavedStackTraceDataVector& exceptionTrace) = 0;
 diff --git a/src/debugger/DebuggerDevtools.cpp b/src/debugger/DebuggerDevtools.cpp
+index 55cb2938..9d73e42f 100644
 --- a/src/debugger/DebuggerDevtools.cpp
 +++ b/src/debugger/DebuggerDevtools.cpp
-@@ -295,7 +295,9 @@
+@@ -295,7 +295,9 @@ ObjectDescription DebuggerDevtools::generateObjectDescription(ExecutionState* st
      ITERATOR_DESCRIPTION(String);
      ITERATOR_DESCRIPTION(Array);
      ITERATOR_DESCRIPTION(Generic);
@@ -140,22 +143,22 @@ diff --git a/src/debugger/DebuggerDevtools.cpp b/src/debugger/DebuggerDevtools.c
      ITERATOR_DESCRIPTION(RegExpString);
  #undef ITERATOR_DESCRIPTION
  
-@@ -1215,8 +1217,9 @@
+@@ -1215,8 +1217,9 @@ void DebuggerDevtools::sendPausedEvent(ByteCodeBlock* byteCodeBlock, const uint3
      m_processingPauseEvent = false;
  }
  
 -bool DebuggerDevtools::stopAtBreakpoint(ByteCodeBlock* byteCodeBlock, const uint32_t offset, ExecutionState* state)
--{
 +bool DebuggerDevtools::stopAtBreakpoint(ByteCodeBlock* byteCodeBlock, const uint32_t offset, ExecutionState* state, bool isDebuggerStatement)
-+{
+ {
 +    UNUSED_PARAMETER(isDebuggerStatement);
      if (m_stopState == ESCARGOT_DEBUGGER_IN_EVAL_MODE) {
          m_delay--;
          if (m_delay == 0) {
 diff --git a/src/debugger/DebuggerDevtools.h b/src/debugger/DebuggerDevtools.h
+index 4fbdfa13..b186c3c3 100644
 --- a/src/debugger/DebuggerDevtools.h
 +++ b/src/debugger/DebuggerDevtools.h
-@@ -77,7 +77,7 @@
+@@ -77,7 +77,7 @@ public:
      bool skipSourceCode(String* srcName) const override;
  
      void parseCompleted(String* source, String* srcName, size_t originLineOffset, String* error = nullptr) override;
@@ -165,24 +168,25 @@ diff --git a/src/debugger/DebuggerDevtools.h b/src/debugger/DebuggerDevtools.h
      void byteCodeReleaseNotification(ByteCodeBlock* byteCodeBlock) override;
      void exceptionCaught(String* message, SavedStackTraceDataVector& exceptionTrace) override;
 diff --git a/src/debugger/DebuggerEscargot.cpp b/src/debugger/DebuggerEscargot.cpp
+index 0aab34d9..b15cd22b 100644
 --- a/src/debugger/DebuggerEscargot.cpp
 +++ b/src/debugger/DebuggerEscargot.cpp
-@@ -220,8 +220,9 @@
+@@ -220,8 +220,9 @@ void DebuggerEscargot::sendVariableObjectInfo(uint8_t subType, Object* object)
      send(ESCARGOT_MESSAGE_VARIABLE, &variableObjectInfo, sizeof(VariableObjectInfo));
  }
  
 -bool DebuggerEscargot::stopAtBreakpoint(ByteCodeBlock* byteCodeBlock, uint32_t offset, ExecutionState* state)
--{
 +bool DebuggerEscargot::stopAtBreakpoint(ByteCodeBlock* byteCodeBlock, uint32_t offset, ExecutionState* state, bool isDebuggerStatement)
-+{
+ {
 +    UNUSED_PARAMETER(isDebuggerStatement);
      if (m_stopState == ESCARGOT_DEBUGGER_IN_EVAL_MODE) {
          m_delay--;
          if (m_delay == 0) {
 diff --git a/src/debugger/DebuggerEscargot.h b/src/debugger/DebuggerEscargot.h
+index e668325e..6beeb52d 100644
 --- a/src/debugger/DebuggerEscargot.h
 +++ b/src/debugger/DebuggerEscargot.h
-@@ -191,7 +191,7 @@
+@@ -191,7 +191,7 @@ public:
  
      void init(const char* options, Context* context) override;
      void parseCompleted(String* source, String* srcName, size_t originLineOffset, String* error = nullptr) override;
@@ -192,38 +196,37 @@ diff --git a/src/debugger/DebuggerEscargot.h b/src/debugger/DebuggerEscargot.h
      void byteCodeReleaseNotification(ByteCodeBlock* byteCodeBlock) override;
      void exceptionCaught(String* message, SavedStackTraceDataVector& exceptionTrace) override;
 diff --git a/src/interpreter/ByteCode.h b/src/interpreter/ByteCode.h
+index e53304f4..e8f523db 100644
 --- a/src/interpreter/ByteCode.h
 +++ b/src/interpreter/ByteCode.h
-@@ -1082,9 +1082,15 @@
+@@ -1082,23 +1082,32 @@ DEFINE_BINARY_OPERATION(UnsignedRightShift, "unsigned right shift");
  #ifdef ESCARGOT_DEBUGGER
  class BreakpointDisabled : public ByteCode {
  public:
 -    BreakpointDisabled(const ByteCodeLOC& loc)
 +    BreakpointDisabled(const ByteCodeLOC& loc, bool isDebuggerStatement = false)
          : ByteCode(Opcode::BreakpointDisabledOpcode, loc)
--    {
 +        , m_isDebuggerStatement(isDebuggerStatement)
-+    {
-+    }
-+
+     {
+     }
+ 
 +    bool isDebuggerStatement() const
 +    {
 +        return m_isDebuggerStatement;
-     }
- 
++    }
++
  #ifndef NDEBUG
-@@ -1093,12 +1099,15 @@
+     void dump()
+     {
          printf("breakpointDisabled");
      }
  #endif
--};
--
--class BreakpointEnabled : public ByteCode {
 +
 +private:
 +    bool m_isDebuggerStatement;
-+};
-+
+ };
+ 
+-class BreakpointEnabled : public ByteCode {
 +class BreakpointEnabled : public BreakpointDisabled {
  public:
      BreakpointEnabled(const ByteCodeLOC& loc)
@@ -233,9 +236,10 @@ diff --git a/src/interpreter/ByteCode.h b/src/interpreter/ByteCode.h
      }
  
 diff --git a/src/interpreter/ByteCodeGenerator.cpp b/src/interpreter/ByteCodeGenerator.cpp
+index 835bf9dc..e69e03f8 100644
 --- a/src/interpreter/ByteCodeGenerator.cpp
 +++ b/src/interpreter/ByteCodeGenerator.cpp
-@@ -172,7 +172,7 @@
+@@ -172,7 +172,7 @@ void ByteCodeGenerateContext::calculateBreakpointLocation(size_t index, Extended
      m_breakpointContext->m_lastBreakpointLineOffset = lineOffset;
  }
  
@@ -244,7 +248,7 @@ diff --git a/src/interpreter/ByteCodeGenerator.cpp b/src/interpreter/ByteCodeGen
  {
      ASSERT(m_breakpointContext != nullptr);
      ASSERT(index != SIZE_MAX);
-@@ -192,7 +192,7 @@
+@@ -192,7 +192,7 @@ void ByteCodeGenerateContext::insertBreakpoint(size_t index, Node* node)
  
      // insert a breakpoint if its the first breakpoint insertion or
      // there was no breakpoint insertion with the same lineoffset
@@ -253,13 +257,10 @@ diff --git a/src/interpreter/ByteCodeGenerator.cpp b/src/interpreter/ByteCodeGen
          ASSERT(lastLineOffset <= m_breakpointContext->m_lastBreakpointLineOffset);
          insertBreakpointAt(m_breakpointContext->m_lastBreakpointLineOffset + sourceElementStart.line, node);
      }
-@@ -206,6 +206,22 @@
-     if (line > m_breakpointContext->m_originSourceLineOffset) {
-         m_breakpointContext->m_breakpointLocations->breakpointLocations.push_back(Debugger::BreakpointLocation(line, (uint32_t)m_byteCodeBlock->currentCodeSize()));
-         m_byteCodeBlock->pushCode(BreakpointDisabled(ByteCodeLOC(node->loc().index)), this, node->m_loc.index);
-+    }
-+}
-+
+@@ -209,6 +209,22 @@ void ByteCodeGenerateContext::insertBreakpointAt(size_t line, Node* node)
+     }
+ }
+ 
 +void ByteCodeGenerateContext::insertDebuggerStatementBreakpoint(size_t index, Node* node)
 +{
 +    ASSERT(m_breakpointContext != nullptr);
@@ -273,13 +274,17 @@ diff --git a/src/interpreter/ByteCodeGenerator.cpp b/src/interpreter/ByteCodeGen
 +    if (line > m_breakpointContext->m_originSourceLineOffset) {
 +        m_breakpointContext->m_breakpointLocations->breakpointLocations.push_back(Debugger::BreakpointLocation(line, (uint32_t)m_byteCodeBlock->currentCodeSize()));
 +        m_byteCodeBlock->pushCode(BreakpointDisabled(ByteCodeLOC(node->loc().index), true), this, node->m_loc.index);
-     }
- }
- 
++    }
++}
++
+ ByteCodeBreakpointContext::ByteCodeBreakpointContext(Debugger* debugger, InterpretedCodeBlock* codeBlock, bool addBreakpointLocationsInfoToDebugger)
+     : m_lastBreakpointLineOffset(0)
+     , m_lastBreakpointIndexOffset(0)
 diff --git a/src/interpreter/ByteCodeGenerator.h b/src/interpreter/ByteCodeGenerator.h
+index 5e4d0ff6..618fb350 100644
 --- a/src/interpreter/ByteCodeGenerator.h
 +++ b/src/interpreter/ByteCodeGenerator.h
-@@ -362,8 +362,9 @@
+@@ -362,8 +362,9 @@ struct ByteCodeGenerateContext {
  
  #ifdef ESCARGOT_DEBUGGER
      void calculateBreakpointLocation(size_t index, ExtendedNodeLOC sourceElementStart);
@@ -291,9 +296,10 @@ diff --git a/src/interpreter/ByteCodeGenerator.h b/src/interpreter/ByteCodeGener
  
      // NOTE this is counter! not index!!!!!!
 diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeInterpreter.cpp
+index 1e623b87..f9147c32 100644
 --- a/src/interpreter/ByteCodeInterpreter.cpp
 +++ b/src/interpreter/ByteCodeInterpreter.cpp
-@@ -479,7 +479,7 @@
+@@ -479,7 +479,7 @@ public:
  #if defined(ENABLE_TCO)
      static Value tailRecursionSlowCase(ExecutionState& state, TailRecursion* code, ByteCodeBlock* byteCodeBlock, const Value& callee, Value* registerFile);
      static Value prepareTailCallOptimization(ExecutionState*& state, TailCall* code, ScriptFunctionObject* callee, ByteCodeBlock*& callerBlock, size_t& programCounter, const Value* registerFile);
@@ -302,7 +308,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
  #if defined(ENABLE_TCO_DEBUG)
      static ExecutionState* createExecutionStateForTailCall(ExecutionState* state, ScriptFunctionObject* callee, ByteCodeBlock* callerByteBlock);
  #endif
-@@ -603,6 +603,28 @@
+@@ -603,6 +603,28 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
  #endif
      state->m_programCounter = &programCounter;
  #ifdef ESCARGOT_DEBUGGER
@@ -331,7 +337,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
      try {
  #else /* ESCARGOT_DEBUGGER */
      {
-@@ -1586,7 +1608,7 @@
+@@ -1586,7 +1608,7 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
  
  #ifdef ESCARGOT_DEBUGGER
              if (state->context()->debuggerEnabled()) {
@@ -340,11 +346,10 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
                      return Value(true);
                  }
              }
-@@ -1612,6 +1634,14 @@
- 
+@@ -1613,6 +1635,14 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
              // Return F.[[Call]](V, argumentsList).
              registerFile[code->m_resultIndex] = callee.asObject()->call(*state, receiver, code->m_argumentCount, &registerFile[code->m_argumentsStartIndex]);
-+
+ 
 +#ifdef ESCARGOT_DEBUGGER
 +            if (state->context()->debuggerEnabled()) {
 +                if (state->context()->debugger()->processDisabledBreakpoint(byteCodeBlock, (uint32_t)(programCounter - (size_t)byteCodeBlock->m_code.data()), state)) {
@@ -352,10 +357,11 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
 +                }
 +            }
 +#endif /* ESCARGOT_DEBUGGER */
- 
++
              ADD_PROGRAM_COUNTER(CallWithReceiver);
              NEXT_INSTRUCTION();
-@@ -2016,7 +2046,17 @@
+         }
+@@ -2016,7 +2046,17 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
                  ErrorObject::throwBuiltinError(*state, ErrorCode::TypeError, ErrorObject::Messages::NOT_Callable);
              }
  
@@ -374,7 +380,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
          }
  #endif
  
-@@ -2419,6 +2459,15 @@
+@@ -2419,6 +2459,15 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
          {
              CallComplexCase* code = (CallComplexCase*)programCounter;
              InterpreterSlowPath::callFunctionComplexCase(*state, code, registerFile, byteCodeBlock);
@@ -390,7 +396,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
              ADD_PROGRAM_COUNTER(CallComplexCase);
              NEXT_INSTRUCTION();
          }
-@@ -2824,7 +2873,7 @@
+@@ -2824,7 +2873,7 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
              }
  
              // goto slow path
@@ -399,7 +405,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
          }
  
          // TCO : tail recursion case in catch or finally block
-@@ -2845,6 +2894,14 @@
+@@ -2845,6 +2894,14 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
                  // Return F.[[Call]](V, argumentsList).
                  registerFile[code->m_resultIndex] = callee.asObject()->call(*state, Value(), code->m_argumentCount, &registerFile[code->m_argumentsStartIndex]);
  
@@ -414,7 +420,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
                  ADD_PROGRAM_COUNTER(Call);
                  NEXT_INSTRUCTION();
              }
-@@ -2865,7 +2922,13 @@
+@@ -2865,7 +2922,13 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
              :
          {
              if (state->context()->debuggerEnabled()) {
@@ -429,7 +435,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
                  if (restart) {
                      return Value(true);
                  }
-@@ -2888,6 +2951,7 @@
+@@ -2888,6 +2951,7 @@ ATTRIBUTE_NO_JUMP_TABLES Value Interpreter::interpret(ExecutionState* state, Byt
              ADD_PROGRAM_COUNTER(BreakpointEnabled);
              NEXT_INSTRUCTION();
          }
@@ -437,7 +443,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
  #endif /* ESCARGOT_DEBUGGER */
  
          DEFINE_OPCODE(FillOpcodeTable)
-@@ -7187,7 +7251,7 @@
+@@ -7187,7 +7251,7 @@ NEVER_INLINE Value InterpreterSlowPath::prepareTailCallOptimization(ExecutionSta
      return Value(Value::EmptyValue);
  }
  
@@ -446,7 +452,7 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
  {
      // fail to tail Call
      // convert to CallReturn
-@@ -7201,7 +7265,17 @@
+@@ -7201,7 +7265,17 @@ NEVER_INLINE Value InterpreterSlowPath::tailCallSlowCase(ExecutionState& state,
      }
  
      const Value& receiver = (code->m_receiverIndex == REGISTER_LIMIT) ? Value() : registerFile[code->m_receiverIndex];
@@ -466,9 +472,10 @@ diff --git a/src/interpreter/ByteCodeInterpreter.cpp b/src/interpreter/ByteCodeI
  
  #if defined(ENABLE_TCO_DEBUG)
 diff --git a/src/parser/Lexer.cpp b/src/parser/Lexer.cpp
+index e53d2609..4fb8e7ec 100644
 --- a/src/parser/Lexer.cpp
 +++ b/src/parser/Lexer.cpp
-@@ -745,6 +745,8 @@
+@@ -745,6 +745,8 @@ Scanner::Scanner(::Escargot::Context* escargotContext, ::Escargot::esprima::Pars
      , index(0)
      , lineNumber(startLine)
      , lineStart(startColumn)
@@ -477,7 +484,7 @@ diff --git a/src/parser/Lexer.cpp b/src/parser/Lexer.cpp
  {
      ASSERT(escargotContext != nullptr);
      // trackComment = false;
-@@ -763,6 +765,8 @@
+@@ -763,6 +765,8 @@ void Scanner::resetStreamingSource(SourceRange code)
      streamingSourceStart = code.start;
      length = code.length();
      index = 0;
@@ -486,7 +493,7 @@ diff --git a/src/parser/Lexer.cpp b/src/parser/Lexer.cpp
      utf16WindowASCIIBytes = nullptr;
      utf16WindowStart = utf16WindowEnd = 0;
  }
-@@ -841,6 +845,8 @@
+@@ -841,6 +845,8 @@ void Scanner::resetSource(StringView code)
      this->index = 0;
      this->lineNumber = 1;
      this->lineStart = 0;
@@ -495,7 +502,7 @@ diff --git a/src/parser/Lexer.cpp b/src/parser/Lexer.cpp
  }
  
  void Scanner::throwUnexpectedToken(const char* message)
-@@ -867,20 +873,68 @@
+@@ -867,20 +873,68 @@ void Scanner::skipSingleLine()
  
  void Scanner::skipSingleLineComment(void)
  {
@@ -566,9 +573,10 @@ diff --git a/src/parser/Lexer.cpp b/src/parser/Lexer.cpp
  
  void Scanner::skipMultiLineComment(void)
 diff --git a/src/parser/Lexer.h b/src/parser/Lexer.h
+index b8b3715a..02ace508 100644
 --- a/src/parser/Lexer.h
 +++ b/src/parser/Lexer.h
-@@ -559,6 +559,8 @@
+@@ -559,6 +559,8 @@ public:
      size_t index;
      size_t lineNumber;
      size_t lineStart;
@@ -577,7 +585,7 @@ diff --git a/src/parser/Lexer.h b/src/parser/Lexer.h
  
      ~Scanner()
      {
-@@ -625,6 +627,7 @@
+@@ -625,6 +627,7 @@ public:
  
      void skipSingleLineComment(void);
      void skipMultiLineComment(void);
@@ -586,9 +594,10 @@ diff --git a/src/parser/Lexer.h b/src/parser/Lexer.h
      ALWAYS_INLINE void scanComments()
      {
 diff --git a/src/parser/ScriptParser.cpp b/src/parser/ScriptParser.cpp
+index da7c8747..0786a390 100644
 --- a/src/parser/ScriptParser.cpp
 +++ b/src/parser/ScriptParser.cpp
-@@ -457,9 +457,13 @@
+@@ -457,9 +457,13 @@ ScriptParser::InitializeScriptResult ScriptParser::initializeScript(Optional<Str
      try {
          ASTClassInfo* outerClassInfo = esprima::generateClassInfoFrom(m_context, parentCodeBlock.unwrap());
  
@@ -603,7 +612,7 @@ diff --git a/src/parser/ScriptParser.cpp b/src/parser/ScriptParser.cpp
  
          script = new Script(srcName, source, programNode->moduleData(), originLineOffset, !parentCodeBlock
  #if defined(ENABLE_CODE_CACHE)
-@@ -697,8 +701,12 @@
+@@ -697,8 +701,12 @@ ScriptParser::InitializeScriptResult ScriptParser::initializeScriptWithDebugger(
      try {
          ASTClassInfo* outerClassInfo = esprima::generateClassInfoFrom(m_context, parentCodeBlock.unwrap());
  
@@ -618,9 +627,10 @@ diff --git a/src/parser/ScriptParser.cpp b/src/parser/ScriptParser.cpp
          script = new Script(srcName, source, programNode->moduleData(), originLineOffset, !parentCodeBlock);
          if (parentCodeBlock) {
 diff --git a/src/parser/ast/DebuggerStatementNode.h b/src/parser/ast/DebuggerStatementNode.h
+index 98553929..333988fa 100644
 --- a/src/parser/ast/DebuggerStatementNode.h
 +++ b/src/parser/ast/DebuggerStatementNode.h
-@@ -36,7 +36,7 @@
+@@ -36,7 +36,7 @@ public:
      virtual void generateStatementByteCode(ByteCodeBlock *codeBlock, ByteCodeGenerateContext *context) override
      {
  #ifdef ESCARGOT_DEBUGGER
@@ -629,10 +639,59 @@ diff --git a/src/parser/ast/DebuggerStatementNode.h b/src/parser/ast/DebuggerSta
  #endif /* ESCARGOT_DEBUGGER */
      }
  
+diff --git a/src/parser/ast/ForInOfStatementNode.h b/src/parser/ast/ForInOfStatementNode.h
+index 4d3108ef..d5a0c63d 100644
+--- a/src/parser/ast/ForInOfStatementNode.h
++++ b/src/parser/ast/ForInOfStatementNode.h
+@@ -55,7 +55,7 @@ public:
+     void generateBodyByteCode(ByteCodeBlock* codeBlock, ByteCodeGenerateContext* context, ByteCodeGenerateContext& newContext)
+     {
+ #ifdef ESCARGOT_DEBUGGER
+-        insertBreakpoint(context);
++        context->insertBreakpoint(m_loc.index, this, true);
+ #endif /* ESCARGOT_DEBUGGER */
+ 
+         // per iteration block
+@@ -162,6 +162,9 @@ public:
+ 
+     virtual void generateStatementByteCode(ByteCodeBlock* codeBlock, ByteCodeGenerateContext* context) override
+     {
++#ifdef ESCARGOT_DEBUGGER
++        insertBreakpoint(context);
++#endif /* ESCARGOT_DEBUGGER */
+         // https://www.ecma-international.org/ecma-262/10.0/#sec-runtime-semantics-forin-div-ofbodyevaluation-lhs-stmt-iterator-lhskind-labelset
+         if (context->shouldCareScriptExecutionResult()) {
+             // 13.7.5.13 Runtime Semantics: ForIn/OfBodyEvaluation
+diff --git a/src/parser/ast/WhileStatementNode.h b/src/parser/ast/WhileStatementNode.h
+index 6d055fd8..fbfc0017 100644
+--- a/src/parser/ast/WhileStatementNode.h
++++ b/src/parser/ast/WhileStatementNode.h
+@@ -37,10 +37,6 @@ public:
+     virtual ASTNodeType type() override { return ASTNodeType::WhileStatement; }
+     virtual void generateStatementByteCode(ByteCodeBlock* codeBlock, ByteCodeGenerateContext* context) override
+     {
+-#ifdef ESCARGOT_DEBUGGER
+-        insertBreakpoint(context);
+-#endif /* ESCARGOT_DEBUGGER */
+-
+         if (context->shouldCareScriptExecutionResult()) {
+             // IterationStatement : while ( Expression ) Statement
+             // 1. Let V = undefined.
+@@ -54,6 +50,9 @@ public:
+         newContext.getRegister(); // ExeuctionResult of m_body should not be overwritten by m_test
+ 
+         size_t whileStart = codeBlock->currentCodeSize();
++#ifdef ESCARGOT_DEBUGGER
++        insertBreakpoint(context);
++#endif /* ESCARGOT_DEBUGGER */
+         size_t testPos = SIZE_MAX;
+         if (m_test->isLiteral() && m_test->asLiteral()->value().toBoolean()) {
+             // skip generate code
 diff --git a/src/parser/esprima_cpp/esprima.cpp b/src/parser/esprima_cpp/esprima.cpp
+index be74a6eb..d5bf5e15 100644
 --- a/src/parser/esprima_cpp/esprima.cpp
 +++ b/src/parser/esprima_cpp/esprima.cpp
-@@ -7347,7 +7347,7 @@
+@@ -7347,7 +7347,7 @@ public:
  
  ProgramNode* parseProgram(::Escargot::Context* ctx, StringView source, ASTClassInfo* outerClassInfo, bool isModule, bool strictFromOutside,
                            bool inWith, bool allowSuperCallFromOutside, bool allowSuperPropertyFromOutside, bool allowNewTargetFromOutside, bool allowArgumentsFromOutside,
@@ -641,7 +700,7 @@ diff --git a/src/parser/esprima_cpp/esprima.cpp b/src/parser/esprima_cpp/esprima
  {
      // GC should be disabled during the parsing process
      ASSERT(GC_is_disabled());
-@@ -7367,6 +7367,9 @@
+@@ -7367,6 +7367,9 @@ ProgramNode* parseProgram(::Escargot::Context* ctx, StringView source, ASTClassI
      parser.context->allowArguments = allowArgumentsFromOutside;
  
      ProgramNode* nd = parser.parseProgram(builder);
@@ -652,9 +711,10 @@ diff --git a/src/parser/esprima_cpp/esprima.cpp b/src/parser/esprima_cpp/esprima
  }
  
 diff --git a/src/parser/esprima_cpp/esprima.h b/src/parser/esprima_cpp/esprima.h
+index 53ae0db4..f915e262 100644
 --- a/src/parser/esprima_cpp/esprima.h
 +++ b/src/parser/esprima_cpp/esprima.h
-@@ -65,7 +65,7 @@
+@@ -65,7 +65,7 @@ struct Error : public gc {
  ProgramNode* parseProgram(::Escargot::Context* ctx, StringView source, ASTClassInfo* outerClassInfo,
                            bool isModule, bool strictFromOutside, bool inWith, bool allowSuperCallFromOutside,
                            bool allowSuperPropertyFromOutside, bool allowNewTargetFromOutside, bool allowArgumentsFromOutside,
@@ -664,9 +724,10 @@ diff --git a/src/parser/esprima_cpp/esprima.h b/src/parser/esprima_cpp/esprima.h
  
  ASTClassInfo* generateClassInfoFrom(::Escargot::Context* ctx, InterpretedCodeBlock* codeBlock);
 diff --git a/src/runtime/Context.cpp b/src/runtime/Context.cpp
+index ef6d3caa..3704f494 100644
 --- a/src/runtime/Context.cpp
 +++ b/src/runtime/Context.cpp
-@@ -88,6 +88,7 @@
+@@ -88,6 +88,7 @@ Context::Context(VMInstance* instance)
  #ifdef ESCARGOT_DEBUGGER
      , m_debugger(nullptr)
      , m_stoppingOnExceptionInProgress(false)
@@ -675,9 +736,10 @@ diff --git a/src/runtime/Context.cpp b/src/runtime/Context.cpp
  {
      ExecutionState stateForInit(this);
 diff --git a/src/runtime/Context.h b/src/runtime/Context.h
+index eab5e18e..5b68eeaa 100644
 --- a/src/runtime/Context.h
 +++ b/src/runtime/Context.h
-@@ -327,6 +327,15 @@
+@@ -327,6 +327,15 @@ public:
          return m_debugger;
      }
  
@@ -693,7 +755,7 @@ diff --git a/src/runtime/Context.h b/src/runtime/Context.h
      bool initDebugger(const char* options);
      void initDebugger(Debugger* debugger);
      void removeDebugger();
-@@ -396,6 +405,7 @@
+@@ -396,6 +405,7 @@ private:
      // debugger support
      Debugger* m_debugger;
      bool m_stoppingOnExceptionInProgress;
@@ -702,9 +764,10 @@ diff --git a/src/runtime/Context.h b/src/runtime/Context.h
  };
  
 diff --git a/src/runtime/ExecutionState.cpp b/src/runtime/ExecutionState.cpp
+index b935f58c..364e2e88 100644
 --- a/src/runtime/ExecutionState.cpp
 +++ b/src/runtime/ExecutionState.cpp
-@@ -334,6 +334,18 @@
+@@ -334,6 +334,18 @@ Value ExecutionState::thisValue()
      return m_context->globalObject();
  }
  
@@ -724,9 +787,10 @@ diff --git a/src/runtime/ExecutionState.cpp b/src/runtime/ExecutionState.cpp
  {
      // Let env be GetThisEnvironment( ).
 diff --git a/src/runtime/ExecutionState.h b/src/runtime/ExecutionState.h
+index 261601c6..1c94d8a8 100644
 --- a/src/runtime/ExecutionState.h
 +++ b/src/runtime/ExecutionState.h
-@@ -30,6 +30,7 @@
+@@ -30,6 +30,7 @@ class LexicalEnvironment;
  class EnvironmentRecord;
  class Value;
  class InterpretedCodeBlock;
@@ -734,7 +798,7 @@ diff --git a/src/runtime/ExecutionState.h b/src/runtime/ExecutionState.h
  class ExecutionPauser;
  class Object;
  class Script;
-@@ -134,6 +135,10 @@
+@@ -134,6 +135,10 @@ public:
  #endif
          , m_argc(parent->argc())
          , m_argv(parent->argv())
@@ -745,7 +809,7 @@ diff --git a/src/runtime/ExecutionState.h b/src/runtime/ExecutionState.h
      {
      }
  
-@@ -208,6 +213,41 @@
+@@ -208,6 +213,41 @@ public:
          return m_context;
      }
  
@@ -787,7 +851,7 @@ diff --git a/src/runtime/ExecutionState.h b/src/runtime/ExecutionState.h
      LexicalEnvironment* lexicalEnvironment()
      {
          return m_lexicalEnvironment;
-@@ -350,6 +390,22 @@
+@@ -350,6 +390,22 @@ public:
      // http://www.ecma-international.org/ecma-262/6.0/#sec-getthisenvironment
      EnvironmentRecord* getThisEnvironment();
      Value thisValue();
@@ -810,7 +874,7 @@ diff --git a/src/runtime/ExecutionState.h b/src/runtime/ExecutionState.h
      Value makeSuperPropertyReference();
      Value getSuperConstructor();
  
-@@ -387,6 +443,15 @@
+@@ -387,6 +443,15 @@ protected:
      size_t m_argc : 56;
  #endif
      Value* m_argv;
@@ -826,49 +890,3 @@ diff --git a/src/runtime/ExecutionState.h b/src/runtime/ExecutionState.h
  };
  
  class ExtendedExecutionState : public ExecutionState {
-diff --git a/src/parser/ast/WhileStatementNode.h b/src/parser/ast/WhileStatementNode.h
---- a/src/parser/ast/WhileStatementNode.h
-+++ b/src/parser/ast/WhileStatementNode.h
-@@ -37,10 +37,6 @@
-     virtual ASTNodeType type() override { return ASTNodeType::WhileStatement; }
-     virtual void generateStatementByteCode(ByteCodeBlock* codeBlock, ByteCodeGenerateContext* context) override
-     {
--#ifdef ESCARGOT_DEBUGGER
--        insertBreakpoint(context);
--#endif /* ESCARGOT_DEBUGGER */
--
-         if (context->shouldCareScriptExecutionResult()) {
-             // IterationStatement : while ( Expression ) Statement
-             // 1. Let V = undefined.
-@@ -54,6 +50,9 @@
-         newContext.getRegister(); // ExeuctionResult of m_body should not be overwritten by m_test
- 
-         size_t whileStart = codeBlock->currentCodeSize();
-+#ifdef ESCARGOT_DEBUGGER
-+        insertBreakpoint(context);
-+#endif /* ESCARGOT_DEBUGGER */
-         size_t testPos = SIZE_MAX;
-         if (m_test->isLiteral() && m_test->asLiteral()->value().toBoolean()) {
-             // skip generate code
-diff --git a/src/parser/ast/ForInOfStatementNode.h b/src/parser/ast/ForInOfStatementNode.h
---- a/src/parser/ast/ForInOfStatementNode.h
-+++ b/src/parser/ast/ForInOfStatementNode.h
-@@ -55,7 +55,7 @@
-     void generateBodyByteCode(ByteCodeBlock* codeBlock, ByteCodeGenerateContext* context, ByteCodeGenerateContext& newContext)
-     {
- #ifdef ESCARGOT_DEBUGGER
--        insertBreakpoint(context);
-+        context->insertBreakpoint(m_loc.index, this, true);
- #endif /* ESCARGOT_DEBUGGER */
- 
-         // per iteration block
-@@ -162,6 +162,9 @@
- 
-     virtual void generateStatementByteCode(ByteCodeBlock* codeBlock, ByteCodeGenerateContext* context) override
-     {
-+#ifdef ESCARGOT_DEBUGGER
-+        insertBreakpoint(context);
-+#endif /* ESCARGOT_DEBUGGER */
-         // https://www.ecma-international.org/ecma-262/10.0/#sec-runtime-semantics-forin-div-ofbodyevaluation-lhs-stmt-iterator-lhskind-labelset
-         if (context->shouldCareScriptExecutionResult()) {
-             // 13.7.5.13 Runtime Semantics: ForIn/OfBodyEvaluation

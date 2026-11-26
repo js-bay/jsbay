@@ -229,6 +229,20 @@ pub fn evalPacked(tag: Backend, handles: Handles, script: []const u8, filename: 
     return .{ .result = null, .err = "unknown backend", .err_is_heap = false };
 }
 
+pub fn evalPackedDiscardingResult(tag: Backend, handles: Handles, script: []const u8, filename: []const u8) types.EvalResult {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+        if (cand == tag) {
+            if (comptime multi_pack.isPacked(cand)) {
+                const E = backend.Engine(cand);
+                const ctx = restorePtr(E.Context, handles.ctx_addr);
+                return E.evalDiscardingResult(ctx, script, filename);
+            }
+            return .{ .result = null, .err = "backend not packed", .err_is_heap = false };
+        }
+    }
+    return .{ .result = null, .err = "unknown backend", .err_is_heap = false };
+}
+
 pub fn processPendingJobsPacked(tag: Backend, handles: Handles) void {
     inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
         if (cand == tag) {

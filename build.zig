@@ -191,6 +191,7 @@ pub fn build(b: *std.Build) void {
     const heap_snapshot = inspector_enabled and requested_heap_snapshot;
     const bytecode_cache_enabled = b.option(bool, "bytecode-cache", "Include persistent bytecode-cache reads and writes") orelse true;
     const stress_tests = b.option(bool, "stress-tests", "Run tests whose names include stress, including high-load event-loop and timer tests") orelse false;
+    const escargot_eval_fault_tests = b.option(bool, "escargot-eval-fault-tests", "Run Escargot eval boundary tests against a test-instrumented bridge object") orelse false;
     // Test-only: exports jsbay_test_trigger_native_fault. NEVER enable for publish / library-only ReleaseFast product builds.
     const fault_injection = b.option(bool, "fault-injection", "Export test-only native fault probe (jsbay_test_trigger_native_fault); default OFF") orelse false;
     const asan = b.option(bool, "asan", "Compile QuickJS/NG C sources with -fsanitize=address for harsh ASan consumers") orelse false;
@@ -281,6 +282,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(u32, "packed_backend_bits", packed_backend_bits);
     build_options.addOption(bool, "multi_pack", multi_pack);
     build_options.addOption(bool, "stress_tests", stress_tests);
+    build_options.addOption(bool, "escargot_eval_fault_tests", escargot_eval_fault_tests);
     build_options.addOption(bool, "inspector", inspector_enabled);
     build_options.addOption(bool, "inspector_transport", inspector_transport_enabled);
     build_options.addOption(bool, "heap_snapshot", heap_snapshot);
@@ -391,7 +393,7 @@ pub fn build(b: *std.Build) void {
     }
 
     addPlatformCompatSources(b, lib_module);
-    addBackendSources(b, lib_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
+    addBackendSources(b, lib_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir, false);
 
     lib_module.linkSystemLibrary("m", .{});
     const lib = b.addLibrary(.{
@@ -444,7 +446,7 @@ pub fn build(b: *std.Build) void {
         test_module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sysroot}) });
     }
     addPlatformCompatSources(b, test_module);
-    addBackendSources(b, test_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
+    addBackendSources(b, test_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir, escargot_eval_fault_tests);
 
     const unit_tests = b.addTest(.{
         .root_module = test_module,
@@ -473,7 +475,7 @@ pub fn build(b: *std.Build) void {
     b.step("test-state-tcas-engine", "Run state_tcas harnesses over ActiveEngine + host dispatch / JS queues").dependOn(&run_state_tcas_engine.step);
 
     if (!stress_tests) {
-        const package_test_step = b.step("test-packages", "Run all six independent local package suites");
+        const package_test_step = b.step("test-packages", "Run local package suites and the state_tcas harness");
         const zev_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = zev_dep.path("src/tests.zig"),
@@ -664,7 +666,7 @@ pub fn build(b: *std.Build) void {
         });
         wireImports(contract_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
         addPlatformCompatSources(b, contract_module);
-        addBackendSources(b, contract_module, packed_backends, false, os, instrumented_root, true, heap_snapshot, false, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
+        addBackendSources(b, contract_module, packed_backends, false, os, instrumented_root, true, heap_snapshot, false, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir, false);
         contract_module.linkSystemLibrary("m", .{});
         const contract_library = b.addLibrary(.{ .name = "jsbay_debug_eval_contract", .root_module = contract_module, .linkage = .static });
         const consumer_module = b.createModule(.{ .target = target, .optimize = .debug, .link_libc = true });
@@ -692,7 +694,7 @@ pub fn build(b: *std.Build) void {
     });
     wireImports(conformance_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
     addPlatformCompatSources(b, conformance_module);
-    addBackendSources(b, conformance_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
+    addBackendSources(b, conformance_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir, false);
     const conformance_library = b.addLibrary(.{
         .name = "jsbay_test262",
         .root_module = conformance_module,
@@ -749,7 +751,7 @@ pub fn build(b: *std.Build) void {
     wireImports(bench_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
 
     addPlatformCompatSources(b, bench_module);
-    addBackendSources(b, bench_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
+    addBackendSources(b, bench_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir, false);
 
     const bench_exe = b.addExecutable(.{
         .name = b.fmt("bench-{s}", .{@tagName(backend)}),
@@ -806,7 +808,7 @@ pub fn build(b: *std.Build) void {
     wireImports(demo_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, qjs_mod);
 
     addPlatformCompatSources(b, demo_module);
-    addBackendSources(b, demo_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir);
+    addBackendSources(b, demo_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir, false);
 
     const demo_exe = b.addExecutable(.{
         .name = b.fmt("inspector-demo-{s}", .{@tagName(backend)}),
@@ -850,7 +852,7 @@ pub fn build(b: *std.Build) void {
         embed_module.linkLibrary(lib);
         if (backend == .escargot) {
             // The C-only consumer resolves the static bridge and its native dependencies.
-            addEscargotSources(b, embed_module, spike_escargot_install, spike_libstdcxx.?);
+            addEscargotSources(b, embed_module, spike_escargot_install, spike_libstdcxx.?, false);
         }
         for (lib.root_module.include_dirs.items) |include| switch (include) {
             .framework_path => |p| embed_module.addFrameworkPath(p),
@@ -901,16 +903,13 @@ pub fn build(b: *std.Build) void {
         }
         safari_module.addImport("jsbay_tools", internal_tools_module);
         wireImports(safari_module, build_options, zev, js_event_loop, inspector, inspector_transport, bytecode_cache, commonjs, hyper_box, cmph, simd_utf, null);
+        addBackendSources(b, safari_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir, false);
         safari_module.linkFramework("JavaScriptCore", .{});
         safari_module.linkFramework("Foundation", .{});
         safari_module.linkFramework("CoreFoundation", .{});
         safari_module.addCSourceFile(.{
             .file = b.path("examples/apple_run_loop.c"),
             .flags = if (apple_sysroot) |sysroot| &.{ "-isysroot", sysroot } else &.{},
-        });
-        safari_module.addCSourceFile(.{
-            .file = b.path("src/backend/jsc/module_loader.m"),
-            .flags = if (apple_sysroot) |sysroot| &.{ "-fobjc-arc", "-Wno-unused-function", "-isysroot", sysroot } else &.{ "-fobjc-arc", "-Wno-unused-function" },
         });
         addPlatformCompatSources(b, safari_module);
 
@@ -1008,6 +1007,7 @@ fn preparePatchedQuickJs(b: *std.Build, tool: *std.Build.Step.Compile) std.Build
     run.addFileArg(b.path("vendor/quickjs-debug-receiver.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-step.patch"));
     run.addFileArg(b.path("vendor/quickjs-debug-exception-state.patch"));
+    run.addFileArg(b.path("vendor/quickjs-module-rejection.patch"));
     return out;
 }
 
@@ -1026,11 +1026,12 @@ fn addBackendSources(
     hermes_install: []const u8,
     libstdcxx: ?[]const u8,
     icu_lib_dir: ?[]const u8,
+    escargot_eval_fault_tests: bool,
 ) void {
     m.addCMacro("JSBAY_INSPECTOR", if (inspector_enabled) "1" else "0");
     m.addCMacro("JSBAY_HEAP_SNAPSHOT", if (heap_snapshot) "1" else "0");
     for (engines) |tag| {
-        addOneBackendSources(b, m, tag, quickjs_gc_stress, os, qjs_root, asan, escargot_install, hermes_install, libstdcxx, icu_lib_dir);
+        addOneBackendSources(b, m, tag, quickjs_gc_stress, os, qjs_root, asan, escargot_install, hermes_install, libstdcxx, icu_lib_dir, escargot_eval_fault_tests);
     }
 }
 
@@ -1046,6 +1047,7 @@ fn addOneBackendSources(
     hermes_install: []const u8,
     libstdcxx: ?[]const u8,
     icu_lib_dir: ?[]const u8,
+    escargot_eval_fault_tests: bool,
 ) void {
     switch (tag) {
         .quickjs_ng => addQuickJsNgSources(b, m, quickjs_gc_stress, qjs_root.?, asan),
@@ -1065,17 +1067,18 @@ fn addOneBackendSources(
                 m.linkSystemLibrary("JavaScriptCore", .{});
             }
         },
-        .escargot => addEscargotSources(b, m, escargot_install, libstdcxx.?),
+        .escargot => addEscargotSources(b, m, escargot_install, libstdcxx.?, escargot_eval_fault_tests),
         .hermes => addHermesSources(b, m, hermes_install, libstdcxx.?, icu_lib_dir.?),
     }
 }
 
-fn addEscargotSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8) void {
+fn addEscargotSources(b: *std.Build, m: *std.Build.Module, install_prefix: []const u8, libstdcxx: []const u8, eval_fault_tests: bool) void {
     // EscargotPublic C bridge + libescargot (g++/local-exec TLS). Zig's linkSystemLibrary("stdc++") is special-cased to libc++ — link libstdc++.a by path.
     const install: std.Build.LazyPath = if (std.fs.path.isAbsolute(install_prefix)) .{ .cwd_relative = install_prefix } else b.path(install_prefix);
     m.addIncludePath(install.path(b, "include"));
     m.addIncludePath(b.path("src/backend/escargot"));
-    m.addObjectFile(install.path(b, "lib/escargot_bridge.o"));
+    const bridge_rel = if (eval_fault_tests) "lib/escargot_bridge_testing.o" else "lib/escargot_bridge.o";
+    m.addObjectFile(install.path(b, bridge_rel));
     const libs = [_][]const u8{
         "lib/libescargot.a",
         "lib/libgc-lib.a",
@@ -1245,6 +1248,7 @@ fn bytecodeFingerprint(b: *std.Build, target: std.Target, backend: Backend, opti
             hash.update(@embedFile("vendor/quickjs-debug-receiver.patch"));
             hash.update(@embedFile("vendor/quickjs-debug-step.patch"));
             hash.update(@embedFile("vendor/quickjs-debug-exception-state.patch"));
+            hash.update(@embedFile("vendor/quickjs-module-rejection.patch"));
             hash.update(@embedFile("src/backend/quickjs/quickjs_shim.h"));
             hash.update(@embedFile("src/backend/quickjs/qjs_wrapper_quickjs.c"));
             hash.update(@embedFile("src/backend/quickjs/bytecode.zig"));

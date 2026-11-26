@@ -21,10 +21,55 @@ const typed_bytecode = @import("script/typed_bytecode.zig");
 const native_sync = @import("js_event_loop").native_sync;
 const host_wake = @import("js_event_loop").host_wake;
 const submission = @import("runtime/submission.zig");
+const instance_registry = @import("runtime/instance_map.zig");
 const api_async = @import("abi/api_async.zig");
 const value_buffers = @import("value/buffers.zig");
 
 const ActiveEngine = backend.ActiveEngine;
+
+var destroy_admission_hook_for_testing: ?*const fn (i32, ?*anyopaque) void = null;
+var destroy_admission_hook_context_for_testing: ?*anyopaque = null;
+
+pub const DestroyStageForTesting = enum { before_detach, after_detach, before_wake_drop, after_wake_drop };
+var destroy_stage_hook_for_testing: ?*const fn (i32, DestroyStageForTesting, ?*anyopaque) void = null;
+var destroy_stage_hook_context_for_testing: ?*anyopaque = null;
+
+const DestroySignalFrame = struct {
+    instance_id: i32,
+    previous: ?*DestroySignalFrame,
+};
+
+threadlocal var destroy_signal_top: ?*DestroySignalFrame = null;
+
+fn destroySignalsActive(instance_id: i32) bool {
+    var frame = destroy_signal_top;
+    while (frame) |current| : (frame = current.previous) {
+        if (current.instance_id == instance_id) return true;
+    }
+    return false;
+}
+
+fn setDestroyAdmissionHookForTesting(hook: ?*const fn (i32, ?*anyopaque) void, context: ?*anyopaque) void {
+    if (!builtin.is_test) return;
+    destroy_admission_hook_context_for_testing = context;
+    destroy_admission_hook_for_testing = hook;
+}
+
+fn notifyDestroyAdmissionHookForTesting(instance_id: i32) void {
+    if (!builtin.is_test) return;
+    if (destroy_admission_hook_for_testing) |hook| hook(instance_id, destroy_admission_hook_context_for_testing);
+}
+
+fn setDestroyStageHookForTesting(hook: ?*const fn (i32, DestroyStageForTesting, ?*anyopaque) void, context: ?*anyopaque) void {
+    if (!builtin.is_test) return;
+    destroy_stage_hook_context_for_testing = context;
+    destroy_stage_hook_for_testing = hook;
+}
+
+fn notifyDestroyStageHookForTesting(instance_id: i32, stage: DestroyStageForTesting) void {
+    if (!builtin.is_test) return;
+    if (destroy_stage_hook_for_testing) |hook| hook(instance_id, stage, destroy_stage_hook_context_for_testing);
+}
 
 // ---- Library identity (compile-time -Dbackend; no instance) ----
 
@@ -51,6 +96,28 @@ pub export fn jsbay_library_capabilities(out_caps: ?*EngineCapabilitiesC) bool {
         .struct_size = caller_size,
         .backend = backend.libraryBackendC(),
         .flags = backend.libraryCapabilityFlags(),
+    };
+    const copy_len = @min(caller_size, @sizeOf(EngineCapabilitiesC));
+    const src: [*]const u8 = @ptrCast(&filled);
+    const dst: [*]u8 = @ptrCast(out);
+    @memset(dst[0..caller_size], 0);
+    @memcpy(dst[0..copy_len], src[0..copy_len]);
+    out.struct_size = caller_size;
+    return true;
+}
+
+/// Fill capabilities for the selected instance. Any thread; refuses missing or tearing-down instances.
+pub export fn jsbay_engine_capabilities(instance_id: c_int, out_caps: ?*EngineCapabilitiesC) bool {
+    const out = out_caps orelse return false;
+    const caller_size = out.struct_size;
+    if (caller_size < @sizeOf(u32)) return false;
+    const lease = instance_registry.beginControlPlane(@intCast(instance_id)) orelse return false;
+    defer lease.end();
+    const tag = lease.inst.backendTag();
+    const filled = EngineCapabilitiesC{
+        .struct_size = caller_size,
+        .backend = backend.backendToC(tag),
+        .flags = backend.capabilityFlagsFor(tag, lease.inst.isPrimaryBackend()),
     };
     const copy_len = @min(caller_size, @sizeOf(EngineCapabilitiesC));
     const src: [*]const u8 = @ptrCast(&filled);
@@ -1039,6 +1106,9 @@ pub const test_only = if (builtin.is_test) struct {
     pub const dispatchCString = testDispatchCString;
     pub const failNextKeyAllocation = key_fault.request;
     pub const setSyncStartObservers = sync_start_observer.set;
+    pub const setDestroyAdmissionHook = setDestroyAdmissionHookForTesting;
+    pub const DestroyStage = DestroyStageForTesting;
+    pub const setDestroyStageHook = setDestroyStageHookForTesting;
 } else struct {};
 
 // QuickJS measures this budget against the native stack pointer, so it must stay below common host thread stack sizes.
@@ -1316,21 +1386,44 @@ test "c_api: engine creation keeps recursion below native stack limits" {
 pub export fn jsbay_engine_destroy(instance_id: c_int) void {
     if (host_wake.isNotifying()) return;
     const id: i32 = @intCast(instance_id);
-    // Owner-thread destroy is the common path (release values first, then destroy). A non-owner may also destroy: it closes admission and joins teardown so "destroy then Worker.terminate" does not kill an owner still inside run_loop or deferred cleanup. Attached-loop detach stays on the owner when this is the owner thread; destroyRuntime detaches after loop scopes have drained when destroy runs elsewhere.
-    if (api_value.isOwner(id)) {
-        engine.detachLoop(id);
-    } else if (!api_value.hasOwner(id) and engine.getContext(id) == null) {
-        // No live public instance. Still enter engine.destroy so a racer can join a deferred teardown whose owners were already dropped.
-        engine.destroy(id);
+    if (destroySignalsActive(id)) return;
+    // Choose the instance lifetime and close its public admission before touching any ID-indexed host state.
+    const generation = instance_registry.closeAdmissionAndGetGeneration(id) orelse return;
+    notifyDestroyAdmissionHookForTesting(id);
+    notifyDestroyStageHookForTesting(id, .before_detach);
+    notifyDestroyStageHookForTesting(id, .before_wake_drop);
+
+    const signals = instance_registry.beginTeardownSignals(id, generation) orelse {
+        engine.destroyForGeneration(id, generation);
         return;
+    };
+    {
+        var frame = DestroySignalFrame{
+            .instance_id = id,
+            .previous = destroy_signal_top,
+        };
+        destroy_signal_top = &frame;
+        defer {
+            destroy_signal_top = frame.previous;
+            signals.end();
+        }
+
+        // Preserve destroy-then-terminate behavior while keeping detach and wake removal bound to the selected generation.
+        const owner = api_value.isOwner(id);
+        const has_owner = api_value.hasOwner(id);
+        const has_context = engine.getContext(id) != null;
+        if (owner) {
+            engine.detachLoop(id);
+            notifyDestroyStageHookForTesting(id, .after_detach);
+        }
+        if (owner or has_owner or has_context) {
+            host_wake.drop(id);
+            notifyDestroyStageHookForTesting(id, .after_wake_drop);
+            // A native callback may be asleep on a condition while teardown waits for it to unwind.
+            native_sync.cancelForInstance(id);
+        }
     }
-    // Runtime destruction can be deferred until a host callback unwinds, but foreign hosts may release notification userdata as soon as this returns.
-    host_wake.drop(id);
-    // Engine.destroy defers physical teardown while a native callback is on the JS stack. Close the public ABI immediately so its outer operation cannot publish a just-created Value after that callback returns.
-    @import("runtime/instance_map.zig").markTeardownPending(id);
-    // destroy may be deferred until this callback unwinds, so wake a sync native wait now rather than waiting for engine.destroyNow().
-    native_sync.cancelForInstance(id);
-    engine.destroy(id);
+    engine.destroyForGeneration(id, generation);
 }
 
 /// Listen for a DevTools connection. `port` 0 picks an ephemeral port. On success, `out_port` receives the bound port when it is non-NULL. A connected client sends Debugger.enable to arm `debugger;` statements. Returns false when the instance is missing or an inspector is already up.
@@ -1518,15 +1611,32 @@ pub export fn jsbay_engine_shutdown_status(instance_id: c_int, generation: u64, 
     return true;
 }
 
+fn acceptsPublicSubmission(instance_id: i32, generation: u64) bool {
+    return instance_registry.withInstanceReturn(instance_id, struct {
+        expected_generation: u64,
+
+        pub fn call(self: @This(), inst: *instance_registry.EngineInstance) ?bool {
+            return inst.generation == self.expected_generation and
+                inst.isPrimaryBackend() and
+                !inst.teardown_pending and
+                !inst.task_admission_closed;
+        }
+    }{ .expected_generation = generation }) orelse false;
+}
+
 pub export fn jsbay_engine_post_script(instance_id: c_int, generation: u64, source_arg: Utf8, filename_arg: Utf8, callback: ?submission.Callback, user_data: ?*anyopaque) bool {
     const source = checkedUtf8(source_arg) orelse return false;
     const filename = checkedUtf8(filename_arg) orelse return false;
     if (!std.unicode.utf8ValidateSlice(source) or !std.unicode.utf8ValidateSlice(filename) or !noEmbeddedNul(filename)) return false;
-    return submission.postScript(@intCast(instance_id), generation, source, filename, callback, user_data);
+    const id: i32 = @intCast(instance_id);
+    if (!acceptsPublicSubmission(id, generation)) return false;
+    return submission.postScript(id, generation, source, filename, callback, user_data);
 }
 
 pub export fn jsbay_engine_post_fence(instance_id: c_int, generation: u64, seal_shutdown: bool, callback: ?submission.Callback, user_data: ?*anyopaque) bool {
-    return submission.postFence(@intCast(instance_id), generation, seal_shutdown, callback, user_data);
+    const id: i32 = @intCast(instance_id);
+    if (!acceptsPublicSubmission(id, generation)) return false;
+    return submission.postFence(id, generation, seal_shutdown, callback, user_data);
 }
 
 /// Cap the runtime's heap at `bytes` (0 = unlimited). QuickJS enforces it via JS_SetMemoryLimit. JSC has no public heap-cap API and returns false (same contract as `runtime_control.setMemoryLimit` / the C header).
@@ -1786,6 +1896,7 @@ pub export fn jsbay_engine_set_error_observer(
     if (!api_value.isOwner(id)) return API_WRONG_THREAD;
     const lease = engine_thread.beginEval(id);
     if (!lease.allowed) {
+        if (lease.failure == .out_of_memory) return API_OUT_OF_MEMORY;
         return if (@import("runtime/instance_map.zig").isTeardownPending(id) or !api_value.hasOwner(id)) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
     }
     defer engine.finishEvalEntry(id, lease);
@@ -2693,28 +2804,47 @@ fn isPackedOperand(handle: u64) bool {
     return packed_api_value.isPackedHandle(handle) or val.isSso();
 }
 
-fn evaluatePackedAlt(instance_id: i32, source: []const u8, filename: []const u8, out_value: *u64, out_exception: *u64) c_int {
-    out_value.* = 0;
-    out_exception.* = 0;
-    if (!api_value.isOwner(instance_id)) {
-        return if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
-    }
-    const tag = packedTagOf(instance_id) orelse return API_INSTANCE_NOT_FOUND;
-    const handles = packedHandlesOf(instance_id) orelse return API_INSTANCE_NOT_FOUND;
-    const lease = engine_thread.beginEval(instance_id);
+threadlocal var evaluate_lookup_test_hook: ?*const fn (i32) void = null;
+
+test "c_api: evaluate rejects an instance replaced before admission" {
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    const Probe = struct {
+        var recreated = false;
+        fn destroyOnWorker(instance_id: i32) void {
+            jsbay_engine_destroy(instance_id);
+        }
+        fn replace(instance_id: i32) void {
+            const worker = std.Thread.spawn(.{}, destroyOnWorker, .{instance_id}) catch unreachable;
+            worker.join();
+            recreated = jsbay_engine_create(instance_id, null, null);
+        }
+    };
+    Probe.recreated = false;
+    evaluate_lookup_test_hook = Probe.replace;
+    defer evaluate_lookup_test_hook = null;
+    defer if (Probe.recreated) jsbay_engine_destroy(id);
+    var value: u64 = 0;
+    var exception: u64 = 0;
+    const status = jsbay_engine_evaluate(id, .{ .data = "1", .len = 1 }, .{ .data = "test", .len = 4 }, null, &value, &exception);
+    if (status == API_OK) _ = jsbay_value_release(value);
+    try std.testing.expect(Probe.recreated);
+    try std.testing.expectEqual(API_INSTANCE_NOT_FOUND, status);
+}
+
+fn evaluatePackedAlt(inst: *@import("runtime/instance_map.zig").EngineInstance, lease: engine_thread.EvalLease, source: []const u8, filename: []const u8, cache_requested: bool, out_value: *u64, out_exception: *u64) c_int {
+    const instance_id = inst.instance_id;
     defer engine.finishEvalEntry(instance_id, lease);
-    if (!lease.allowed) {
-        return if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
-    }
-    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
-        if (inst.loop.lastError() != null) return API_LOOP_FAILED;
-    }
+    if (cache_requested) return API_UNSUPPORTED;
+    if (inst.loop.lastError() != null) return API_LOOP_FAILED;
+    const alt = inst.engine_handles.packed_alt;
+    const tag = alt.tag;
+    const handles: @import("backend_dispatch.zig").Handles = .{ .runtime_addr = alt.runtime_addr, .ctx_addr = alt.ctx_addr };
     var execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse return API_INSTANCE_NOT_FOUND;
     @import("inspector/debugger.zig").noteScript(instance_id, filename, source);
     @import("inspector/debugger.zig").clearExceptionHold(instance_id);
     const result = @import("backend_dispatch.zig").evalValuePacked(tag, handles, source, filename);
-    execution.end();
-    @import("runtime/js_scheduler.zig").checkpointInstance(instance_id);
+    @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(&execution);
     if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
         if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, handles.ctx_addr, v.slice());
         if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, handles.ctx_addr, e.slice());
@@ -2750,14 +2880,29 @@ pub export fn jsbay_engine_evaluate(instance_id_raw: c_int, source_arg: Utf8, fi
         if ((cache_dir.len == 0) != (cache_version.len == 0)) return API_INVALID_ARGUMENT;
     }
     const id: i32 = @intCast(instance_id_raw);
-    if (@import("runtime/instance_map.zig").getInstance(id)) |inst| {
-        if (!inst.isPrimaryBackend()) {
-            // Empty options (or all-empty cache fields) are accepted; bytecode cache itself is primary-only.
-            if (cache_dir.len != 0 or cache_version.len != 0) return API_UNSUPPORTED;
-            return evaluatePackedAlt(id, source, filename, out_value, out_exception);
-        }
+    const instance_map = @import("runtime/instance_map.zig");
+    if (host_wake.isNotifying()) return API_INVALID_ARGUMENT;
+    const generation = instance_map.captureGeneration(id) orelse return API_INSTANCE_NOT_FOUND;
+    if (builtin.is_test) if (evaluate_lookup_test_hook) |hook| hook(id);
+    if (!api_value.isOwner(id)) {
+        return if (instance_map.captureGeneration(id) == generation) API_WRONG_THREAD else API_INSTANCE_NOT_FOUND;
     }
-    var op = switch (beginApiOp(id)) {
+    const lease = engine_thread.beginEvalForGeneration(id, generation);
+    if (!lease.allowed) {
+        if (instance_map.captureGeneration(id) != generation) return API_INSTANCE_NOT_FOUND;
+        return switch (lease.failure) {
+            .none => API_WRONG_THREAD,
+            .out_of_memory => API_OUT_OF_MEMORY,
+        };
+    }
+    const inst = instance_map.getInstance(id) orelse {
+        engine.finishEvalEntry(id, lease);
+        return API_INSTANCE_NOT_FOUND;
+    };
+    if (inst.engine_handles == .packed_alt) {
+        return evaluatePackedAlt(inst, lease, source, filename, cache_dir.len != 0, out_value, out_exception);
+    }
+    var op = switch (value_operation.beginAdmittedApiOp(inst, lease, true)) {
         .status => |status| return status,
         .ok => |value| value,
     };

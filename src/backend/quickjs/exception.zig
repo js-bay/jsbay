@@ -200,6 +200,8 @@ fn copyErrorObserver(instance_id: i32) ?ErrorObserver {
 }
 
 fn dispatchError(_: ?*qjs.JSContext, instance_id: i32, kind: @import("../../types.zig").ErrorKind, promise: qjs.JSValue, value: qjs.JSValue) bool {
+    // Typed observer handles use the primary backend's value representation. The C API rejects registration for packed instances.
+    if (comptime !@import("../../backend.zig").isQuickJsApiBackend(@import("../../backend.zig").active_backend)) return true;
     const control = @import("../../runtime/runtime_control.zig");
     if (control.isInterruptRequested(instance_id) or control.isStopRequested(instance_id)) return false;
     if (control.remainingEffectiveExecutionLimitMillis(instance_id)) |remaining| if (remaining == 0) return false;
@@ -380,8 +382,12 @@ fn dispatch(ctx: ?*qjs.JSContext, instance_id: i32, handled: bool, promise: qjs.
     const host = copyHost(instance_id);
     const observed = events.isEnabled(instance_id);
     if (host == null and !observed) return;
-    // Inspector observation must not introduce JS coercion. The host callback explicitly requests text, so only that callback converts the reason.
-    if (observed) events.reportRejection(instance_id, promise, handled, reason);
+    // The inspector rejection API accepts primary-backend values. Packed instances use the host text callback when registered.
+    if (observed) {
+        if (comptime @import("../../backend.zig").isQuickJsApiBackend(@import("../../backend.zig").active_backend)) {
+            events.reportRejection(instance_id, promise, handled, reason);
+        }
+    }
     if (host) |target| {
         const text = reasonText(ctx, reason);
         defer if (text.owned) std.heap.c_allocator.free(@constCast(text.bytes));

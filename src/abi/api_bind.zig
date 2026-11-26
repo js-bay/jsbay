@@ -160,7 +160,11 @@ fn spikeThrowValue(ctx: backend.ActiveEngine.Context, exception: backend.ActiveE
         if (comptime backend.active_backend == .escargot) {
             @import("../backend/escargot/c_api.zig").escargot_throw_value(ctx, exception);
         } else {
-            @import("../backend/hermes/c_api.zig").hermes_throw_value(ctx, exception);
+            const api = @import("../backend/hermes/c_api.zig");
+            if (!api.hermes_take_throw_value(ctx, exception)) {
+                backend.ActiveEngine.freeValue(ctx, exception);
+                api.hermes_throw_static(ctx, "native callback exception transfer failed");
+            }
         }
         return null;
     }

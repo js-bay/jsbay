@@ -176,6 +176,8 @@ pub const TaskOwnerFrame = struct {
     instance_id: i32,
     owner: ?*anyopaque,
     parent: ?*TaskOwnerFrame,
+    deferred_destroy_generation: ?u64 = null,
+    deferred_destroy: ?*const fn (i32, u64) void = null,
 };
 threadlocal var active_task_owner_frame: ?*TaskOwnerFrame = null;
 
@@ -184,13 +186,134 @@ pub fn enterTaskOwnerFrame(frame: *TaskOwnerFrame, instance_id: i32, owner: ?*an
         .instance_id = instance_id,
         .owner = owner,
         .parent = active_task_owner_frame,
+        .deferred_destroy_generation = null,
+        .deferred_destroy = null,
     };
     active_task_owner_frame = frame;
 }
 
-pub fn leaveTaskOwnerFrame(frame: *TaskOwnerFrame) void {
+pub const DeferredDestroyAction = struct {
+    instance_id: i32,
+    generation: u64,
+    func: *const fn (i32, u64) void,
+};
+
+const TeardownQueue = struct {
+    var mu: sync.Mutex = .{};
+    var cv: sync.Condition = .init;
+    var thread: ?std.Thread = null;
+    var initialized: bool = false;
+    var queue: [32]DeferredDestroyAction = undefined;
+    var head: usize = 0;
+    var tail: usize = 0;
+    var count: usize = 0;
+
+    fn worker() void {
+        while (true) {
+            mu.lock();
+            while (count == 0) {
+                cv.wait(&mu);
+            }
+            const action = queue[head];
+            head = (head + 1) % queue.len;
+            count -= 1;
+            mu.unlock();
+
+            action.func(action.instance_id, action.generation);
+        }
+    }
+
+    pub fn ensureStarted() void {
+        mu.lock();
+        defer mu.unlock();
+        if (!initialized) {
+            if (std.Thread.spawn(.{}, worker, .{})) |t| {
+                t.detach();
+                thread = t;
+                initialized = true;
+            } else |_| {}
+        }
+    }
+
+    pub fn push(action: DeferredDestroyAction) bool {
+        mu.lock();
+        defer mu.unlock();
+        if (!initialized) {
+            if (std.Thread.spawn(.{}, worker, .{})) |t| {
+                t.detach();
+                thread = t;
+                initialized = true;
+            } else |_| {
+                return false;
+            }
+        }
+        for (0..count) |i| {
+            const idx = (head + i) % queue.len;
+            if (queue[idx].instance_id == action.instance_id and queue[idx].generation == action.generation) {
+                return true;
+            }
+        }
+        if (count >= queue.len) return false;
+        queue[tail] = action;
+        tail = (tail + 1) % queue.len;
+        count += 1;
+        cv.signal();
+        return true;
+    }
+};
+
+pub fn ensureTeardownWorkerStarted() void {
+    TeardownQueue.ensureStarted();
+}
+
+pub fn handOffDeferredDestroy(action: DeferredDestroyAction) void {
+    if (!TeardownQueue.push(action)) {
+        const Runner = struct {
+            fn run(a: DeferredDestroyAction) void {
+                a.func(a.instance_id, a.generation);
+            }
+        };
+        if (std.Thread.spawn(.{}, Runner.run, .{action})) |t| {
+            t.detach();
+        } else |_| {
+            action.func(action.instance_id, action.generation);
+        }
+    }
+}
+
+pub fn leaveTaskOwnerFrameDeferred(frame: *TaskOwnerFrame) ?DeferredDestroyAction {
     std.debug.assert(active_task_owner_frame == frame);
     active_task_owner_frame = frame.parent;
+    if (frame.deferred_destroy) |destroy| {
+        return .{
+            .instance_id = frame.instance_id,
+            .generation = frame.deferred_destroy_generation.?,
+            .func = destroy,
+        };
+    }
+    return null;
+}
+
+pub fn leaveTaskOwnerFrame(frame: *TaskOwnerFrame) void {
+    if (leaveTaskOwnerFrameDeferred(frame)) |action| {
+        action.func(action.instance_id, action.generation);
+    }
+}
+
+/// Defer instance destruction until the active owner callback has returned, without allocating or queueing work that can be rejected.
+pub fn deferDestroyForCurrentTask(instance_id: i32, generation: u64, destroy: *const fn (i32, u64) void) bool {
+    var frame = active_task_owner_frame;
+    while (frame) |current| : (frame = current.parent) {
+        if (current.instance_id != instance_id) continue;
+        if (current.deferred_destroy) |existing| {
+            std.debug.assert(existing == destroy and current.deferred_destroy_generation.? == generation);
+            return true;
+        }
+        current.deferred_destroy_generation = generation;
+        current.deferred_destroy = destroy;
+        return true;
+    }
+    return false;
 }
 
 pub fn isRunningTaskForOwner(owner: *anyopaque) bool {
@@ -281,6 +404,7 @@ pub fn reserveTaskWithToken(token: InstanceToken, kind: resource_limits.Kind, by
 pub fn postReservedTaskWithToken(token: InstanceToken, reservation: *TaskReservation, task: NativeTask) bool {
     const lease = reservation.lease orelse return false;
     if (reservation.resources == null) return false;
+    if (task.resource_kind != reservation.kind or task.resource_bytes != reservation.bytes) return false;
     const Commit = struct {
         lease_inst: *instance_map.EngineInstance,
         generation: u64,
@@ -858,4 +982,25 @@ test "dispatch: releasing queued tasks invokes their cancellation cleanup" {
     }));
     releaseAllTasksForInstance(instance_id);
     try testing.expectEqual(@as(u32, 100), task_flag.load(.seq_cst));
+}
+
+var deferred_destroy_test_generation = std.atomic.Value(u64).init(0);
+var deferred_destroy_test_inside_owner = std.atomic.Value(bool).init(true);
+
+fn recordDeferredDestroyForTesting(instance_id: i32, generation: u64) void {
+    deferred_destroy_test_inside_owner.store(isRunningTaskForInstance(instance_id), .seq_cst);
+    deferred_destroy_test_generation.store(generation, .seq_cst);
+}
+
+test "dispatch: deferred destroy runs after its owner callback leaves" {
+    const instance_id: i32 = 5_555;
+    deferred_destroy_test_generation.store(0, .seq_cst);
+    deferred_destroy_test_inside_owner.store(true, .seq_cst);
+    var frame: TaskOwnerFrame = undefined;
+    enterTaskOwnerFrame(&frame, instance_id, null);
+    try testing.expect(deferDestroyForCurrentTask(instance_id, 17, recordDeferredDestroyForTesting));
+    try testing.expectEqual(@as(u64, 0), deferred_destroy_test_generation.load(.seq_cst));
+    leaveTaskOwnerFrame(&frame);
+    try testing.expectEqual(@as(u64, 17), deferred_destroy_test_generation.load(.seq_cst));
+    try testing.expect(!deferred_destroy_test_inside_owner.load(.seq_cst));
 }

@@ -22,6 +22,9 @@ pub const InspectorHost = struct {
 
         pub const enterTaskOwnerFrame = root_dispatch.enterTaskOwnerFrame;
         pub const leaveTaskOwnerFrame = root_dispatch.leaveTaskOwnerFrame;
+        pub const leaveTaskOwnerFrameDeferred = root_dispatch.leaveTaskOwnerFrameDeferred;
+        pub const DeferredDestroyAction = root_dispatch.DeferredDestroyAction;
+        pub const handOffDeferredDestroy = root_dispatch.handOffDeferredDestroy;
         pub const isRunningTaskForOwner = root_dispatch.isRunningTaskForOwner;
         pub const releaseTasksForOwner = root_dispatch.releaseTasksForOwner;
         pub const releaseAllTasksForInstance = root_dispatch.releaseAllTasksForInstance;

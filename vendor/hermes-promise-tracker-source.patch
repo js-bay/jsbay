@@ -1,0 +1,73 @@
+diff --git i/setimmediate/rejection-tracking.js w/setimmediate/rejection-tracking.js
+--- i/setimmediate/rejection-tracking.js
++++ w/setimmediate/rejection-tracking.js
+@@ -29,32 +29,52 @@
+       promise._y === 2 && // IS REJECTED
+       rejections[promise._E]
+     ) {
+-      if (rejections[promise._E].logged) {
++      if (options.reportAfterDrain) {
++        if (options.onHandled) {
++          options.onHandled(promise._E, promise._R);
++        }
++        delete promise._R;
++        delete rejections[promise._E];
++      } else if (rejections[promise._E].logged) {
+         onHandled(promise._E);
+       } else {
+         clearTimeout(rejections[promise._E].timeout);
+       }
+-      delete rejections[promise._E];
++      if (!options.reportAfterDrain) delete rejections[promise._E];
+     }
+   };
+   Promise._C = function (promise, err) {
+     if (promise._x === 0) { // not yet handled
+       promise._E = id++;
+-      rejections[promise._E] = {
+-        displayId: null,
+-        error: err,
+-        timeout: setTimeout(
+-          onUnhandled.bind(null, promise._E),
+-          // For reference errors and type errors, this almost always
+-          // means the programmer made a mistake, so log them after just
+-          // 100ms
+-          // otherwise, wait 2 seconds to see if they get handled
+-          matchWhitelist(err, DEFAULT_WHITELIST)
+-            ? 100
+-            : 2000
+-        ),
+-        logged: false
+-      };
++      if (options.reportAfterDrain) {
++        var queued = false;
++        if (
++          options.onUnhandled &&
++          (options.allRejections ||
++            matchWhitelist(err, options.whitelist || DEFAULT_WHITELIST))
++        ) {
++          queued = options.onUnhandled(promise._E, err, promise) !== false;
++        }
++        if (queued) {
++          rejections[promise._E] = true;
++        }
++      } else {
++        rejections[promise._E] = {
++          displayId: null,
++          error: err,
++          timeout: setTimeout(
++            onUnhandled.bind(null, promise._E),
++            // For reference errors and type errors, this almost always
++            // means the programmer made a mistake, so log them after just
++            // 100ms
++            // otherwise, wait 2 seconds to see if they get handled
++            matchWhitelist(err, DEFAULT_WHITELIST)
++              ? 100
++              : 2000
++          ),
++          logged: false
++        };
++      }
+     }
+   };
+   function onUnhandled(id) {

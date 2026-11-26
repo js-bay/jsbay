@@ -426,6 +426,14 @@ pub const QuickJsNgBackend = struct {
     // ---- Evaluation ----
 
     pub fn eval(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
+        return evalWithResultMode(ctx, script, filename, true);
+    }
+
+    pub fn evalDiscardingResult(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
+        return evalWithResultMode(ctx, script, filename, false);
+    }
+
+    fn evalWithResultMode(ctx: Context, script: []const u8, filename: []const u8, stringify_result: bool) types.EvalResult {
         if (!enterJs(ctx)) return .{ .result = null, .err = cross_thread_reentry_msg, .err_is_heap = false };
         defer leaveJs(ctx);
         const fname = std.heap.c_allocator.dupeSentinel(u8, filename, 0) catch {
@@ -453,6 +461,10 @@ pub const QuickJsNgBackend = struct {
             return .{ .result = null, .err = msg orelse "JavaScript error", .err_is_heap = msg != null };
         }
 
+        if (!stringify_result) {
+            c.jsbay_qjs_JS_FreeValue(ctx, result);
+            return .{};
+        }
         const ret = if (c.jsIsUndefined(result) or c.jsIsNull(result))
             null
         else if (c.jsIsObject(result))

@@ -4,7 +4,7 @@ JS Bay presents one Zig and C-facing runtime API over QuickJS, QuickJS-NG, and J
 
 ## Package boundaries
 
-The root package depends on `libs/zev`, `libs/js_event_loop`, `libs/inspector`, `libs/inspector_transport`, `libs/bytecode_cache`, and `libs/commonjs`. Each builds and tests independently. `inspector_transport` may depend on `inspector`, never the reverse; `bytecode_cache` and `commonjs` have no JavaScript-engine dependency. Their generic APIs and standalone usage belong in their package READMEs. This document only records how the engine integrates them.
+The root package uses nine repository-local packages: `libs/zev`, `libs/js_event_loop`, `libs/inspector`, `libs/inspector_transport`, `libs/bytecode_cache`, `libs/commonjs`, `libs/hyper_box`, `libs/cmph`, and `libs/simd_utf`. The public Zig module exposes the `cmph` and `simd_utf` utilities. The `test-packages` build target runs the local package suites and a separate harness for the external `state_tcas` dependency. `inspector_transport` depends on `inspector`, and `bytecode_cache` and `commonjs` have no JavaScript-engine dependency. The package READMEs describe their generic APIs and standalone usage.
 
 `libs/inspector` defines CDP state and the transport interface. `src/inspector/` supplies this engine's operations. `libs/inspector_transport` is an optional loopback HTTP/WebSocket transport and does not define Inspector semantics.
 
@@ -14,7 +14,7 @@ The root package depends on `libs/zev`, `libs/js_event_loop`, `libs/inspector`, 
 
 An instance has one owner thread. Evaluation and value access run there. Cross-thread work uses dispatch and callback mechanisms and must not retain backend values across the boundary. Destruction closes new public work before active callbacks unwind.
 
-The JavaScript event loop owns its native loop, monotonic clock, waiting, and wakeups. It runs on a dedicated owner thread or schedules opaque callbacks through a platform adapter. Each turn starts at most one queued JavaScript task and drains its microtasks. Timers, native tasks, and thread-safe function calls share that boundary.
+Zev owns OS waiting, wakeups, timer deadlines, and snapshots of ready notifier and timer callbacks. The JavaScript event-loop scheduler owns task priority, checkpoints, execution budgets, and host ticks; it decides which JavaScript work runs in each turn. Each turn starts at most one queued JavaScript task and drains its microtasks. Timers, native tasks, and thread-safe function calls share that boundary.
 
 `EngineConfig.module_loader` is the ES module-loader contract. QuickJS backends use resolve and load callbacks; supported Apple targets use a private Objective-C bridge. Source storage returned by `load` must remain valid after the callback returns. See [the API contract](api-contract.md) for opaque-value ownership and [runtime limits](runtime-limits.md) for resource controls.
 

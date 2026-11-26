@@ -5,7 +5,15 @@ pub const Runtime = opaque {};
 pub const Context = opaque {};
 pub const Value = ?*anyopaque;
 
+pub const EvalStatus = enum(c_int) {
+    success = 0,
+    javascript_error = 1,
+    out_of_memory = 2,
+    native_error = 3,
+};
+
 pub const EvalResultC = extern struct {
+    status: EvalStatus,
     result: ?[*]u8,
     result_len: usize,
     err: ?[*]u8,
@@ -48,6 +56,7 @@ pub extern fn escargot_debugger_scope(ctx: ?*Context, frame: c_int, scope_index:
 pub extern fn escargot_debugger_this(ctx: ?*Context, frame: c_int) Value;
 pub extern fn escargot_debugger_eval_frame(ctx: ?*Context, frame: c_int, expr: [*]const u8, expr_len: usize, out_exception: *Value) Value;
 pub extern fn escargot_eval(ctx: ?*Context, src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) EvalResultC;
+pub extern fn escargot_eval_discarding_result(ctx: ?*Context, src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) EvalResultC;
 pub extern fn escargot_eval_result_free(r: EvalResultC) void;
 pub extern fn escargot_undefined() Value;
 pub extern fn escargot_null() Value;

@@ -90,3 +90,14 @@ pub fn eval(ctx: Context, script: []const u8, filename: []const u8) types.EvalRe
     } else null;
     return .{ .result = result, .err = err, .err_is_heap = err != null };
 }
+
+pub fn evalDiscardingResult(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
+    const raw = c_api.hermes_eval_discarding_result(ctx, script.ptr, script.len, filename.ptr, filename.len);
+    defer c_api.hermes_eval_result_free(raw);
+    const err = if (raw.err) |ptr| std.heap.c_allocator.dupe(u8, ptr[0..raw.err_len]) catch return .{
+        .result = null,
+        .err = "Out of memory",
+        .err_is_heap = false,
+    } else null;
+    return .{ .result = null, .err = err, .err_is_heap = err != null };
+}

@@ -93,8 +93,9 @@ pub fn Module(comptime Host: type) type {
             var frame: Host.dispatch.TaskOwnerFrame = undefined;
             Host.dispatch.enterTaskOwnerFrame(&frame, state.instance_id, state);
             defer {
-                Host.dispatch.leaveTaskOwnerFrame(&frame);
+                const deferred = Host.dispatch.leaveTaskOwnerFrameDeferred(&frame);
                 state_mod.releaseStateLease(state);
+                if (deferred) |d| Host.dispatch.handOffDeferredDestroy(d);
             }
             if (state_mod.hasSession(state, session_id)) {
                 return state.transport.sendTrackedText(session_id, json[0..len], token);
@@ -109,8 +110,9 @@ pub fn Module(comptime Host: type) type {
             var frame: Host.dispatch.TaskOwnerFrame = undefined;
             Host.dispatch.enterTaskOwnerFrame(&frame, state.instance_id, state);
             defer {
-                Host.dispatch.leaveTaskOwnerFrame(&frame);
+                const deferred = Host.dispatch.leaveTaskOwnerFrameDeferred(&frame);
                 state_mod.releaseStateLease(state);
+                if (deferred) |d| Host.dispatch.handOffDeferredDestroy(d);
             }
             if (state_mod.hasSession(state, session_id)) state.transport.closeSession(session_id);
         }

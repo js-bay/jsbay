@@ -13,12 +13,27 @@ typedef struct EscargotContextOpaque EscargotContext;
 /* ValueRef* as opaque; never a JSC JSValueRef. */
 typedef void *EscargotValue;
 
+typedef enum {
+    ESCARGOT_EVAL_SUCCESS = 0,
+    ESCARGOT_EVAL_JAVASCRIPT_ERROR = 1,
+    ESCARGOT_EVAL_OUT_OF_MEMORY = 2,
+    ESCARGOT_EVAL_NATIVE_ERROR = 3
+} EscargotEvalStatus;
+
 typedef struct {
+    EscargotEvalStatus status;
     char *result; /* heap, caller frees; NULL if none */
     size_t result_len; /* byte length of result; excludes NUL terminator */
     char *err;    /* heap, caller frees; NULL if none */
     size_t err_len; /* byte length of err; excludes NUL terminator */
 } EscargotEvalResult;
+
+typedef struct {
+    char *result; /* heap, caller frees; NULL if none */
+    size_t result_len; /* byte length of result; excludes NUL terminator */
+    char *err;    /* heap, caller frees; NULL if none */
+    size_t err_len; /* byte length of err; excludes NUL terminator */
+} EscargotModuleEvalResult;
 
 void escargot_globals_ensure(void);
 /* Per-thread TLS/GC (Globals::initializeThread/finalizeThread). runtime_new/free also enter/leave. */
@@ -72,6 +87,9 @@ EscargotValue escargot_debugger_eval_frame(EscargotContext *ctx, int frame,
 
 EscargotEvalResult escargot_eval(EscargotContext *ctx, const char *src, size_t src_len,
                                  const char *filename, size_t filename_len);
+EscargotEvalResult escargot_eval_discarding_result(EscargotContext *ctx, const char *src,
+                                                   size_t src_len, const char *filename,
+                                                   size_t filename_len);
 void escargot_eval_result_free(EscargotEvalResult r);
 
 EscargotValue escargot_undefined(void);
@@ -306,9 +324,9 @@ void escargot_install_module_loader(EscargotContext *ctx, void *user_data,
                                     EscargotModFreeResolvedFn free_resolved);
 void escargot_uninstall_module_loader(EscargotContext *ctx);
 
-EscargotEvalResult escargot_eval_module(EscargotContext *ctx, const char *src, size_t src_len,
-                                        const char *filename, size_t filename_len);
-EscargotEvalResult escargot_import_module(EscargotContext *ctx, const char *specifier);
+EscargotModuleEvalResult escargot_eval_module(EscargotContext *ctx, const char *src, size_t src_len,
+                                              const char *filename, size_t filename_len);
+EscargotModuleEvalResult escargot_import_module(EscargotContext *ctx, const char *specifier);
 
 /* NativeHandle: opaque + optional call + finalize (thickening stub) */
 typedef void (*EscargotNhFinalize)(void *handle_data);

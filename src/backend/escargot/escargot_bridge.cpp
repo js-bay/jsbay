@@ -1,6 +1,12 @@
 #include "escargot_bridge.h"
 #include "EscargotPublic.h"
 
+#ifndef GC_THREADS
+#define GC_THREADS 1
+#endif
+#include <gc/gc.h>
+#include <pthread.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -8,10 +14,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <utility>
+#include <unordered_set>
 #include <vector>
 
 using namespace Escargot;
@@ -33,11 +42,49 @@ public:
 static BridgePlatform g_platform;
 static std::once_flag g_globals_once;
 
+static pthread_key_t g_escargot_pthread_cleanup_key;
+static pthread_t g_bootstrap_thread_id;
+static bool g_bootstrap_thread_recorded = false;
+
+// Depth of nested enter/leave on this OS thread. Threaded Escargot keeps TLS/GC state per thread; enter/leave tracks active callers while POSIX thread destructors clean up thread state on thread exit.
+enum class GcThreadRegistrationState : uint8_t {
+    Uninitialized,
+    RegisteredByBridge,
+    PreExistingRegistration,
+};
+
+static thread_local int g_escargot_thread_depth = 0;
+static thread_local GcThreadRegistrationState g_gc_registration_state = GcThreadRegistrationState::Uninitialized;
+
+struct NoCopyPack;
+
+static std::mutex g_reclaimed_packs_mu;
+static NoCopyPack *g_reclaimed_packs_head = nullptr;
+
+static void queueReclaimedPack(NoCopyPack *pk);
+static void drainReclaimedBufferDeleters();
+
+static void onEscargotThreadExit(void *val) {
+    bool registered_by_bridge = (reinterpret_cast<uintptr_t>(val) == 2);
+    if (Globals::isInitialized()) {
+        Globals::finalizeThread();
+    }
+    if (registered_by_bridge) {
+        GC_unregister_my_thread();
+    }
+}
+
 static void ensureGlobals() {
     std::call_once(g_globals_once, [] {
+        g_bootstrap_thread_id = pthread_self();
+        g_bootstrap_thread_recorded = true;
         if (!Globals::isInitialized()) {
             Globals::initialize(&g_platform);
         }
+        GC_allow_register_threads();
+        pthread_key_create(&g_escargot_pthread_cleanup_key, onEscargotThreadExit);
+        pthread_setspecific(g_escargot_pthread_cleanup_key, reinterpret_cast<void*>(2));
+        g_gc_registration_state = GcThreadRegistrationState::RegisteredByBridge;
     });
 }
 
@@ -48,13 +95,67 @@ struct EscargotRuntimeOpaque {
 struct EscargotContextOpaque;
 
 struct NoCopyPack {
+    std::mutex mu;
     EscargotBufferDeleter deleter = nullptr;
     void *user_data = nullptr;
     EscargotContextOpaque *owner = nullptr;
     bool fired = false;
-    // Set when context_free finalizes the pack but BackingStore may still invoke the C++ deleter later (Memory::gc is process-global). Late calls free the shell.
-    bool retired = false;
+    std::atomic<int> refcount{2};
+    NoCopyPack *next_reclaimed = nullptr;
 };
+
+static void queueReclaimedPack(NoCopyPack *pk) {
+    if (!pk) return;
+    std::lock_guard<std::mutex> lock(g_reclaimed_packs_mu);
+    pk->next_reclaimed = g_reclaimed_packs_head;
+    g_reclaimed_packs_head = pk;
+}
+
+static void drainReclaimedBufferDeleters() {
+    NoCopyPack *head = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_reclaimed_packs_mu);
+        if (!g_reclaimed_packs_head) return;
+        head = g_reclaimed_packs_head;
+        g_reclaimed_packs_head = nullptr;
+    }
+    while (head) {
+        NoCopyPack *pk = head;
+        head = head->next_reclaimed;
+        EscargotBufferDeleter d = nullptr;
+        void *u = nullptr;
+        EscargotContextOpaque *owner = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(pk->mu);
+            d = pk->deleter;
+            u = pk->user_data;
+            pk->deleter = nullptr;
+            owner = pk->owner;
+            pk->owner = nullptr;
+        }
+        if (d) {
+            d(u);
+        }
+        bool dropped_by_owner = false;
+        if (owner) {
+            std::lock_guard<std::mutex> lock(owner->buffers_mu);
+            if (owner->pending_buffers.erase(pk) > 0) {
+                dropped_by_owner = true;
+            }
+            if (owner->in_flight_deallocators > 0) {
+                --owner->in_flight_deallocators;
+            }
+            owner->buffers_cv.notify_all();
+        }
+        bool should_delete = (pk->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1);
+        if (!should_delete && dropped_by_owner) {
+            should_delete = (pk->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1);
+        }
+        if (should_delete) {
+            delete pk;
+        }
+    }
+}
 
 struct EscargotContextOpaque {
     EscargotRuntimeOpaque *rt = nullptr;
@@ -68,7 +169,9 @@ struct EscargotContextOpaque {
     // Owned exception Value for host trampoline (takes precedence over pending_throw string).
     EscargotValue pending_throw_value = nullptr;
     std::mutex buffers_mu;
-    std::vector<NoCopyPack *> pending_buffers;
+    std::condition_variable buffers_cv;
+    std::unordered_set<NoCopyPack *> pending_buffers;
+    size_t in_flight_deallocators = 0;
     struct PendingFinal {
         void (*fire)(void *);
         void *data;
@@ -273,24 +376,65 @@ static char *dupCString(const std::string &s) {
     return out;
 }
 
+static char *dupCStringNoexcept(const char *s) noexcept {
+    if (!s) s = "Native evaluation failure";
+    const size_t len = std::strlen(s);
+    char *out = static_cast<char *>(std::malloc(len + 1));
+    if (!out) return nullptr;
+    std::memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
+
 static void escargotEvalSetResult(EscargotEvalResult &out, char *p, size_t len) {
+    out.result = p;
+    out.result_len = p ? len : 0;
+    if (!p) out.status = ESCARGOT_EVAL_OUT_OF_MEMORY;
+}
+
+static void escargotEvalSetModuleResult(EscargotModuleEvalResult &out, char *p, size_t len) {
     out.result = p;
     out.result_len = p ? len : 0;
 }
 
-static void escargotEvalSetErr(EscargotEvalResult &out, char *p, size_t len) {
-    out.err = p;
-    out.err_len = p ? len : 0;
+static void escargotEvalSetErrStr(EscargotEvalResult &out, const std::string &s) {
+#ifdef JSBAY_TESTING
+    extern bool escargotTestFailErrorTextAllocation();
+    if (escargotTestFailErrorTextAllocation()) {
+        out.status = ESCARGOT_EVAL_OUT_OF_MEMORY;
+        return;
+    }
+#endif
+    out.err = dupCString(s);
+    out.err_len = out.err ? s.size() : 0;
+    out.status = out.err ? ESCARGOT_EVAL_JAVASCRIPT_ERROR : ESCARGOT_EVAL_OUT_OF_MEMORY;
 }
 
-static void escargotEvalSetErrStr(EscargotEvalResult &out, const std::string &s) {
+static void escargotEvalSetNativeErr(EscargotEvalResult &out, const char *message) noexcept {
+#ifdef JSBAY_TESTING
+    extern bool escargotTestFailNativeErrorTextAllocation();
+    if (escargotTestFailNativeErrorTextAllocation()) {
+        out.status = ESCARGOT_EVAL_OUT_OF_MEMORY;
+        return;
+    }
+#endif
+    out.err = dupCStringNoexcept(message);
+    out.err_len = out.err ? std::strlen(out.err) : 0;
+    out.status = out.err ? ESCARGOT_EVAL_NATIVE_ERROR : ESCARGOT_EVAL_OUT_OF_MEMORY;
+}
+
+static void escargotEvalSetModuleErrStr(EscargotModuleEvalResult &out, const std::string &s) {
     out.err = dupCString(s);
     out.err_len = out.err ? s.size() : 0;
 }
 
-static void escargotEvalSetResultStr(EscargotEvalResult &out, const std::string &s) {
-    out.result = dupCString(s);
-    out.result_len = out.result ? s.size() : 0;
+static void clearEvalResult(EscargotEvalResult &out) noexcept {
+    std::free(out.result);
+    std::free(out.err);
+    out.result = nullptr;
+    out.result_len = 0;
+    out.err = nullptr;
+    out.err_len = 0;
 }
 
 static char *stringRefToUtf8(StringRef *s) {
@@ -378,24 +522,36 @@ static void flushPendingRejections(EscargotContextOpaque *c) {
 
 extern "C" void escargot_globals_ensure(void) { ensureGlobals(); }
 
-// Depth of nested enter/leave on this OS thread. Threaded Escargot keeps TLS/GC state per thread; runtime_new enters so VMInstanceRef::create is safe on any caller thread, and runtime_free leaves once the VM is destroyed. engine_thread also enter/leaves.
-static thread_local int g_escargot_thread_depth = 0;
-
 extern "C" void escargot_thread_enter(void) {
-    // ENABLE_THREADING: g_globalsInited is thread_local; each OS thread that touches Escargot must initializeThread (Shell/cctest pattern). No-op when vendor is non-threaded (supportsThreading()==false).
+    ensureGlobals();
     if (!Globals::supportsThreading()) return;
-    if (g_escargot_thread_depth == 0 && !Globals::isInitialized()) {
-        Globals::initializeThread();
+    if (g_gc_registration_state == GcThreadRegistrationState::Uninitialized) {
+        GC_stack_base stack;
+        bool is_bootstrap_thread = g_bootstrap_thread_recorded && pthread_equal(pthread_self(), g_bootstrap_thread_id);
+        if (GC_get_stack_base(&stack) == GC_SUCCESS) {
+            int rc = GC_register_my_thread(&stack);
+            if (rc == GC_SUCCESS || (rc == GC_DUPLICATE && is_bootstrap_thread)) {
+                g_gc_registration_state = GcThreadRegistrationState::RegisteredByBridge;
+            } else {
+                g_gc_registration_state = GcThreadRegistrationState::PreExistingRegistration;
+            }
+        } else {
+            g_gc_registration_state = is_bootstrap_thread ? GcThreadRegistrationState::RegisteredByBridge : GcThreadRegistrationState::PreExistingRegistration;
+        }
+        if (!Globals::isInitialized()) {
+            Globals::initializeThread();
+        }
+        pthread_setspecific(g_escargot_pthread_cleanup_key, reinterpret_cast<void*>(
+            g_gc_registration_state == GcThreadRegistrationState::RegisteredByBridge ? 2 : 1));
     }
     ++g_escargot_thread_depth;
 }
 
 extern "C" void escargot_thread_leave(void) {
     if (!Globals::supportsThreading()) return;
+    drainReclaimedBufferDeleters();
     if (g_escargot_thread_depth <= 0) return;
-    if (--g_escargot_thread_depth == 0 && Globals::isInitialized()) {
-        Globals::finalizeThread();
-    }
+    --g_escargot_thread_depth;
 }
 
 extern "C" bool escargot_supports_threading(void) {
@@ -404,7 +560,6 @@ extern "C" bool escargot_supports_threading(void) {
 
 extern "C" EscargotRuntime *escargot_runtime_new(void) {
     ensureGlobals();
-    // Same-thread engines (and creators on thread B after A already call_once'd globals) must still initialize this thread before VMInstanceRef::create.
     escargot_thread_enter();
     auto *rt = new EscargotRuntimeOpaque();
     try {
@@ -414,18 +569,22 @@ extern "C" EscargotRuntime *escargot_runtime_new(void) {
         escargot_thread_leave();
         return nullptr;
     }
+    escargot_thread_leave();
     return rt;
 }
 
 extern "C" void escargot_runtime_free(EscargotRuntime *rt) {
     if (!rt) return;
-    // Destroy the VM while this thread's Escargot TLS/GC is still initialized.
+    escargot_thread_enter();
     delete rt;
     escargot_thread_leave();
 }
 extern "C" void escargot_runtime_gc(EscargotRuntime *rt) {
     (void)rt;
+    escargot_thread_enter();
     Memory::gc();
+    drainReclaimedBufferDeleters();
+    escargot_thread_leave();
 }
 
 extern "C" size_t escargot_runtime_heap_size(EscargotRuntime *) {
@@ -437,6 +596,10 @@ extern "C" size_t escargot_runtime_total_size(EscargotRuntime *) {
 
 extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
     if (!rt) return nullptr;
+    escargot_thread_enter();
+    struct AutoLeaveContext {
+        ~AutoLeaveContext() { escargot_thread_leave(); }
+    } auto_leave;
     auto *c = new EscargotContextOpaque();
     c->rt = rt;
     c->ctx = ContextRef::create(rt->vm.get());
@@ -463,6 +626,10 @@ extern "C" EscargotContext *escargot_context_new(EscargotRuntime *rt) {
 
 extern "C" void escargot_context_free(EscargotContext *ctx) {
     if (!ctx) return;
+    escargot_thread_enter();
+    struct AutoLeaveContext {
+        ~AutoLeaveContext() { escargot_thread_leave(); }
+    } auto_leave;
 #ifdef ESCARGOT_DEBUGGER
     escargot_debugger_detach(ctx);
 #endif
@@ -493,26 +660,43 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
     // Drop PersistentRefs then GC so BackingStore deleters can run.
     Memory::gc();
     Memory::gc();
+    drainReclaimedBufferDeleters();
+    {
+        std::unique_lock<std::mutex> lock(ctx->buffers_mu);
+        ctx->buffers_cv.wait(lock, [ctx] { return ctx->in_flight_deallocators == 0; });
+    }
     // Force any remaining no-copy buffer finalizers (engine teardown contract).
     std::vector<NoCopyPack *> leftover;
     {
         std::lock_guard<std::mutex> lock(ctx->buffers_mu);
-        leftover.swap(ctx->pending_buffers);
+        leftover.assign(ctx->pending_buffers.begin(), ctx->pending_buffers.end());
+        ctx->pending_buffers.clear();
     }
     for (auto *pk : leftover) {
         if (!pk) continue;
-        pk->owner = nullptr; // already removed from list
-        if (!pk->fired) {
-            pk->fired = true;
-            if (pk->deleter) {
-                auto d = pk->deleter;
-                auto *u = pk->user_data;
+        EscargotBufferDeleter d = nullptr;
+        void *u = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(pk->mu);
+            pk->owner = nullptr;
+            if (!pk->fired) {
+                pk->fired = true;
+                d = pk->deleter;
+                u = pk->user_data;
                 pk->deleter = nullptr;
-                d(u);
             }
-            // Do not delete: a later process-global GC may still invoke the BackingStore deleter; fireNoCopyPack will free the retired shell.
-            pk->retired = true;
         }
+        if (d) {
+            d(u);
+        }
+        if (pk->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete pk;
+        }
+    }
+    drainReclaimedBufferDeleters();
+    {
+        std::unique_lock<std::mutex> lock(ctx->buffers_mu);
+        ctx->buffers_cv.wait(lock, [ctx] { return ctx->in_flight_deallocators == 0; });
     }
 
     // Force any remaining External/weak finalizers (engine teardown contract).
@@ -704,61 +888,195 @@ extern "C" EscargotValue escargot_debugger_eval_frame(EscargotContext *, int, co
 }
 #endif
 
-extern "C" EscargotEvalResult escargot_eval(EscargotContext *c, const char *src, size_t src_len,
-                                            const char *filename, size_t filename_len) {
-    EscargotEvalResult out{};
-    if (!c || !c->ctx.get() || !src) {
-        escargotEvalSetErrStr(out, "invalid context");
-        return out;
-    }
-    auto source = StringRef::createFromUTF8(src, src_len);
-    auto fname = StringRef::createFromUTF8(filename ? filename : "", filename_len);
-    auto parsed = c->ctx.get()->scriptParser()->initializeScript(source, fname, false);
-    if (!parsed.isSuccessful()) {
-        std::string emsg;
-        if (parsed.parseErrorMessage) emsg = parsed.parseErrorMessage->toStdUTF8String();
-        if (emsg.empty()) emsg = "parse error";
-        escargotEvalSetErrStr(out, emsg);
-        return out;
-    }
-    auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, ScriptRef *script) -> ValueRef * {
-            return script->execute(state);
-        },
-        parsed.script.get());
-    if (!er.isSuccessful()) {
-        std::string msg;
-        if (auto *s = er.resultOrErrorToString(c->ctx.get())) msg = s->toStdUTF8String();
-        if (msg.empty()) msg = "JavaScript error";
-        // resultOrErrorToString often omits sourceURL; append for host/tests.
-        if (filename && filename_len) {
-            std::string url(filename, filename_len);
-            if (!url.empty() && msg.find(url) == std::string::npos) {
-                msg.append("\n    at ");
-                msg.append(url);
-            }
+static EscargotEvalResult escargot_eval_impl(EscargotContext *c, const char *src, size_t src_len,
+                                             const char *filename, size_t filename_len,
+                                             bool stringify_result) {
+    struct AtExitDrain {
+        ~AtExitDrain() { drainReclaimedBufferDeleters(); }
+    } drain_guard;
+    EscargotEvalResult out{ESCARGOT_EVAL_SUCCESS, nullptr, 0, nullptr, 0};
+    try {
+        if (!c || !c->ctx.get() || !src) {
+            escargotEvalSetNativeErr(out, "invalid context");
+            return out;
         }
-        escargotEvalSetErrStr(out, msg);
-        return out;
-    }
-    ValueRef *result = er.result;
-    if (!result || result->isUndefined() || result->isNull()) return out;
-    if (result->isObject()) {
-        size_t n = 0;
-        // JSON text is length-aware via std::string path when available; fall back to strlen-free copy.
-        char *p = escargot_json_stringify(c, result);
-        if (p) {
-            // json_stringify uses stringRefToUtf8/dupCString — recover length from allocated content carefully via strnlen only if no embedded NUL expected; prefer measuring before free is impossible. Re-stringify through UTF8 string:
-            n = std::strlen(p); // JSON cannot embed raw NUL
+#ifdef JSBAY_TESTING
+        extern void escargotTestInjectEvalFaultBeforeParser();
+        escargotTestInjectEvalFaultBeforeParser();
+#endif
+        auto source = StringRef::createFromUTF8(src, src_len);
+        auto fname = StringRef::createFromUTF8(filename ? filename : "", filename_len);
+        auto parsed = c->ctx.get()->scriptParser()->initializeScript(source, fname, false);
+        if (!parsed.isSuccessful()) {
+            std::string emsg;
+            if (parsed.parseErrorMessage) emsg = parsed.parseErrorMessage->toStdUTF8String();
+            if (emsg.empty()) emsg = "parse error";
+            escargotEvalSetErrStr(out, emsg);
+            return out;
+        }
+        auto er = Evaluator::execute(c->ctx.get(),
+            [](ExecutionStateRef *state, ScriptRef *script) -> ValueRef * {
+                return script->execute(state);
+            },
+            parsed.script.get());
+        if (!er.isSuccessful()) {
+            std::string msg;
+            if (auto *s = er.resultOrErrorToString(c->ctx.get())) msg = s->toStdUTF8String();
+            if (msg.empty()) msg = "JavaScript error";
+            // resultOrErrorToString often omits sourceURL; append for host/tests.
+            if (filename && filename_len) {
+                std::string url(filename, filename_len);
+                if (!url.empty() && msg.find(url) == std::string::npos) {
+                    msg.append("\n    at ");
+                    msg.append(url);
+                }
+            }
+            escargotEvalSetErrStr(out, msg);
+            return out;
+        }
+        if (!stringify_result) {
+            return out;
+        }
+        ValueRef *result = er.result;
+        if (!result || result->isUndefined() || result->isNull()) return out;
+        if (result->isObject()) {
+            if (!c->pristine_json_stringify.get()) {
+                escargotEvalSetNativeErr(out, "JSON serialization is unavailable");
+                return out;
+            }
+            auto stringify = Evaluator::execute(c->ctx.get(),
+                [](ExecutionStateRef *state, ValueRef *value, ValueRef *stringify_fn) -> ValueRef * {
+                    ValueRef *args[] = {value};
+                    return stringify_fn->call(state, ValueRef::createUndefined(), 1, args);
+                },
+                result, c->pristine_json_stringify.get());
+            if (!stringify.isSuccessful()) {
+                std::string message;
+                if (auto *error_text = stringify.resultOrErrorToString(c->ctx.get())) message = error_text->toStdUTF8String();
+                if (message.empty()) message = "JavaScript error";
+                escargotEvalSetErrStr(out, message);
+                return out;
+            }
+            if (!stringify.result || stringify.result->isUndefined()) return out;
+            if (!stringify.result->isString()) {
+                escargotEvalSetNativeErr(out, "JSON serialization returned a non-string value");
+                return out;
+            }
+            std::string utf8 = stringify.result->asString()->toStdUTF8String();
+            char *p = dupCString(utf8);
+            if (!p) {
+                out.status = ESCARGOT_EVAL_OUT_OF_MEMORY;
+                return out;
+            }
+            escargotEvalSetResult(out, p, utf8.size());
+        } else {
+            size_t n = 0;
+            char *p = escargot_value_to_utf8_n(c, result, &n);
+            if (!p) {
+                out.status = ESCARGOT_EVAL_OUT_OF_MEMORY;
+                return out;
+            }
             escargotEvalSetResult(out, p, n);
         }
-    } else {
-        size_t n = 0;
-        char *p = escargot_value_to_utf8_n(c, result, &n);
-        escargotEvalSetResult(out, p, n);
+        return out;
+    } catch (const std::bad_alloc &) {
+        clearEvalResult(out);
+        out.status = ESCARGOT_EVAL_OUT_OF_MEMORY;
+        return out;
+    } catch (const std::exception &e) {
+        clearEvalResult(out);
+        escargotEvalSetNativeErr(out, e.what());
+        return out;
+    } catch (...) {
+        clearEvalResult(out);
+        escargotEvalSetNativeErr(out, "Unknown native evaluation failure");
+        return out;
     }
-    return out;
 }
+
+extern "C" EscargotEvalResult escargot_eval(EscargotContext *c, const char *src, size_t src_len,
+                                            const char *filename, size_t filename_len) {
+    return escargot_eval_impl(c, src, src_len, filename, filename_len, true);
+}
+
+extern "C" EscargotEvalResult escargot_eval_discarding_result(EscargotContext *c, const char *src,
+                                                              size_t src_len, const char *filename,
+                                                              size_t filename_len) {
+    return escargot_eval_impl(c, src, src_len, filename, filename_len, false);
+}
+
+struct EscargotEvalFaultProbe {
+    int escaped_exception;
+    int status;
+    int has_result;
+};
+
+#ifdef JSBAY_TESTING
+namespace {
+thread_local int g_escargot_eval_test_fault = 0;
+}
+
+extern "C" void escargot_test_arm_eval_fault(int fault) {
+    g_escargot_eval_test_fault = fault;
+}
+
+bool escargotTestFailErrorTextAllocation() {
+    if (g_escargot_eval_test_fault != 2) return false;
+    g_escargot_eval_test_fault = 0;
+    return true;
+}
+
+void escargotTestInjectEvalFaultBeforeParser() {
+    const int fault = g_escargot_eval_test_fault;
+    if (fault != 1 && fault != 3 && fault != 4) return;
+    if (fault != 4) g_escargot_eval_test_fault = 0;
+    if (fault == 1) throw std::bad_alloc();
+    throw std::runtime_error("injected native evaluation failure");
+}
+
+bool escargotTestFailNativeErrorTextAllocation() {
+    if (g_escargot_eval_test_fault != 4) return false;
+    g_escargot_eval_test_fault = 0;
+    return true;
+}
+
+extern "C" EscargotEvalFaultProbe escargot_test_probe_eval_fault(
+    EscargotContext *c, int discard_result, int fault, const char *src, size_t src_len,
+    const char *filename, size_t filename_len) {
+    escargot_test_arm_eval_fault(fault);
+    try {
+        EscargotEvalResult result = discard_result
+            ? escargot_eval_discarding_result(c, src, src_len, filename, filename_len)
+            : escargot_eval(c, src, src_len, filename, filename_len);
+        EscargotEvalFaultProbe probe{0, static_cast<int>(result.status), result.result != nullptr};
+        escargot_eval_result_free(result);
+        return probe;
+    } catch (const std::bad_alloc &) {
+        return EscargotEvalFaultProbe{1, 0, 0};
+    } catch (...) {
+        return EscargotEvalFaultProbe{2, 0, 0};
+    }
+}
+#else
+extern "C" void escargot_test_arm_eval_fault(int) {}
+
+extern "C" EscargotEvalFaultProbe escargot_test_probe_eval_fault(
+    EscargotContext *c, int discard_result, int, const char *src, size_t src_len,
+    const char *filename, size_t filename_len) {
+    try {
+        EscargotEvalResult result = discard_result
+            ? escargot_eval_discarding_result(c, src, src_len, filename, filename_len)
+            : escargot_eval(c, src, src_len, filename, filename_len);
+        EscargotEvalFaultProbe probe{0, static_cast<int>(result.status), result.result != nullptr};
+        escargot_eval_result_free(result);
+        return probe;
+    } catch (const std::bad_alloc &) {
+        return EscargotEvalFaultProbe{1, 0, 0};
+    } catch (...) {
+        return EscargotEvalFaultProbe{2, 0, 0};
+    }
+}
+#endif
 
 extern "C" void escargot_eval_result_free(EscargotEvalResult r) {
     std::free(r.result);
@@ -1351,8 +1669,13 @@ extern "C" size_t escargot_set_size(EscargotContext *c, EscargotValue set) {
 // Map/Set JSON via JS helpers (keys that are not JSON-friendly).
 static char *evalToUtf8(EscargotContext *c, const char *src) {
     auto r = escargot_eval(c, src, std::strlen(src), "<bridge>", 7);
+    if (r.status != ESCARGOT_EVAL_SUCCESS) {
+        escargot_eval_result_free(r);
+        return nullptr;
+    }
     char *out = r.result;
-    if (r.err) std::free(r.err);
+    r.result = nullptr;
+    escargot_eval_result_free(r);
     return out;
 }
 
@@ -1551,35 +1874,43 @@ extern "C" EscargotValue escargot_new_array_buffer_copy(EscargotContext *c, cons
 
 static void fireNoCopyPack(NoCopyPack *pk) {
     if (!pk) return;
-    if (pk->fired) {
-        // Context teardown already ran the user deleter; BackingStore is late.
-        if (pk->retired) delete pk;
-        return;
+    bool should_queue = false;
+    EscargotContextOpaque *owner = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(pk->mu);
+        if (!pk->fired) {
+            pk->fired = true;
+            if (pk->deleter) {
+                should_queue = true;
+                owner = pk->owner;
+            }
+        }
     }
-    pk->fired = true;
-    EscargotContextOpaque *owner = pk->owner;
-    pk->owner = nullptr;
-    if (owner) {
-        std::lock_guard<std::mutex> lock(owner->buffers_mu);
-        auto &vec = owner->pending_buffers;
-        vec.erase(std::remove(vec.begin(), vec.end(), pk), vec.end());
+    if (should_queue) {
+        if (owner) {
+            std::lock_guard<std::mutex> lock(owner->buffers_mu);
+            ++owner->in_flight_deallocators;
+        }
+        queueReclaimedPack(pk);
+    } else {
+        if (pk->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            delete pk;
+        }
     }
-    if (pk->deleter) {
-        auto d = pk->deleter;
-        auto *u = pk->user_data;
-        pk->deleter = nullptr;
-        d(u);
-    }
-    delete pk;
 }
 
 extern "C" EscargotValue escargot_new_array_buffer_no_copy(EscargotContext *c, uint8_t *bytes, size_t len,
                                                            EscargotBufferDeleter deleter, void *user_data) {
     if (!c || !bytes) return nullptr;
-    auto *pack = new NoCopyPack{deleter, user_data, c, false};
+    auto *pack = new NoCopyPack();
+    pack->deleter = deleter;
+    pack->user_data = user_data;
+    pack->owner = c;
+    pack->fired = false;
+    pack->refcount.store(2, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(c->buffers_mu);
-        c->pending_buffers.push_back(pack);
+        c->pending_buffers.insert(pack);
     }
     auto er = Evaluator::execute(c->ctx.get(),
         [](ExecutionStateRef *state, uint8_t *b, size_t n, NoCopyPack *p) -> ValueRef * {
@@ -1596,7 +1927,12 @@ extern "C" EscargotValue escargot_new_array_buffer_no_copy(EscargotContext *c, u
         },
         bytes, len, pack);
     if (!er.isSuccessful()) {
-        fireNoCopyPack(pack);
+        {
+            std::lock_guard<std::mutex> lock(c->buffers_mu);
+            c->pending_buffers.erase(pack);
+        }
+        if (deleter) deleter(user_data);
+        delete pack;
         return nullptr;
     }
     return retain(c, er.result);
@@ -1949,12 +2285,20 @@ extern "C" EscargotValue escargot_new_error(EscargotContext *c, int kind, const 
 
 static EscargotOpResult opFail(EscargotContextOpaque *c, ValueRef *exc) {
     EscargotOpResult out{nullptr, nullptr};
-    if (exc) out.exception = retain(c, exc);
+    try {
+        if (exc) out.exception = retain(c, exc);
+    } catch (...) {
+        out.exception = nullptr;
+    }
     return out;
 }
 static EscargotOpResult opOk(EscargotContextOpaque *c, ValueRef *v) {
     EscargotOpResult out{nullptr, nullptr};
-    out.value = retain(c, v);
+    try {
+        out.value = retain(c, v);
+    } catch (...) {
+        out.value = nullptr;
+    }
     return out;
 }
 static EscargotBoolOpResult boolFail(EscargotContextOpaque *c, ValueRef *exc) {
@@ -1989,32 +2333,40 @@ extern "C" EscargotOpResult escargot_call_result(EscargotContext *c, EscargotVal
                                                  const EscargotValue *args, size_t argc) {
     EscargotOpResult out{nullptr, nullptr};
     if (!c || !fn) return out;
-    std::vector<ValueRef *> argv(argc);
-    for (size_t i = 0; i < argc; i++) argv[i] = asVal(args[i]);
-    CallPack pack{asVal(fn), this_val ? asVal(this_val) : nullptr, argv.data(), argc};
-    auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, CallPack *p) -> ValueRef * {
-            ValueRef *recv = p->this_val ? p->this_val : ValueRef::createUndefined();
-            return p->fn->call(state, recv, p->argc, p->argv);
-        },
-        &pack);
-    if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
-    return opOk(c, er.result);
+    try {
+        std::vector<ValueRef *> argv(argc);
+        for (size_t i = 0; i < argc; i++) argv[i] = asVal(args[i]);
+        CallPack pack{asVal(fn), this_val ? asVal(this_val) : nullptr, argv.data(), argc};
+        auto er = Evaluator::execute(c->ctx.get(),
+            [](ExecutionStateRef *state, CallPack *p) -> ValueRef * {
+                ValueRef *recv = p->this_val ? p->this_val : ValueRef::createUndefined();
+                return p->fn->call(state, recv, p->argc, p->argv);
+            },
+            &pack);
+        if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
+        return opOk(c, er.result);
+    } catch (...) {
+        return out;
+    }
 }
 
 
 extern "C" EscargotOpResult escargot_get_property_result(EscargotContext *c, EscargotValue obj, const char *key) {
     EscargotOpResult out{nullptr, nullptr};
     if (!c || !obj || !key) return out;
-    auto er = Evaluator::execute(c->ctx.get(),
-        [](ExecutionStateRef *state, ValueRef *o, const char *k) -> ValueRef * {
-            // GetV: null/undefined TypeError via toObject; other primitives box then get.
-            ObjectRef *target = o->toObject(state);
-            return target->get(state, StringRef::createFromUTF8(k, std::strlen(k)));
-        },
-        asVal(obj), key);
-    if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
-    return opOk(c, er.result);
+    try {
+        auto er = Evaluator::execute(c->ctx.get(),
+            [](ExecutionStateRef *state, ValueRef *o, const char *k) -> ValueRef * {
+                // GetV: null/undefined TypeError via toObject; other primitives box then get.
+                ObjectRef *target = o->toObject(state);
+                return target->get(state, StringRef::createFromUTF8(k, std::strlen(k)));
+            },
+            asVal(obj), key);
+        if (!er.isSuccessful()) return opFail(c, retainedErrorOrNull(c, er));
+        return opOk(c, er.result);
+    } catch (...) {
+        return out;
+    }
 }
 
 extern "C" EscargotOpResult escargot_json_parse_result(EscargotContext *c, const char *utf8, size_t len) {
@@ -2719,15 +3071,15 @@ extern "C" void escargot_uninstall_module_loader(EscargotContext *ctx) {
     ctx->module_cache.clear();
 }
 
-static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *source,
-                                           StringRef *fname, const std::string &cache_key) {
-    EscargotEvalResult out{};
+static EscargotModuleEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *source,
+                                                 StringRef *fname, const std::string &cache_key) {
+    EscargotModuleEvalResult out{};
     auto parsed = c->ctx.get()->scriptParser()->initializeScript(source, fname, true);
     if (!parsed.isSuccessful()) {
         std::string __em;
         if (auto *__sr = parsed.parseErrorMessage) __em = __sr->toStdUTF8String();
         if (__em.empty()) __em = "module parse error";
-        escargotEvalSetErrStr(out, __em);
+        escargotEvalSetModuleErrStr(out, __em);
         return out;
     }
     cacheModule(c, cache_key, parsed.script.get());
@@ -2741,24 +3093,24 @@ static EscargotEvalResult evalModuleScript(EscargotContextOpaque *c, StringRef *
         std::string __em;
         if (auto *__sr = er.resultOrErrorToString(c->ctx.get())) __em = __sr->toStdUTF8String();
         if (__em.empty()) __em = "module evaluation error";
-        escargotEvalSetErrStr(out, __em);
+        escargotEvalSetModuleErrStr(out, __em);
         return out;
     }
     ValueRef *result = er.result;
     if (!result || result->isUndefined() || result->isNull()) return out;
     if (result->isObject()) {
-        { char *__p = escargot_json_stringify(c, result); escargotEvalSetResult(out, __p, __p ? std::strlen(__p) : 0); }
+        { char *__p = escargot_json_stringify(c, result); escargotEvalSetModuleResult(out, __p, __p ? std::strlen(__p) : 0); }
     } else {
-        { size_t __n = 0; char *__p = escargot_value_to_utf8_n(c, result, &__n); escargotEvalSetResult(out, __p, __n); }
+        { size_t __n = 0; char *__p = escargot_value_to_utf8_n(c, result, &__n); escargotEvalSetModuleResult(out, __p, __n); }
     }
     return out;
 }
 
-extern "C" EscargotEvalResult escargot_eval_module(EscargotContext *c, const char *src, size_t src_len,
-                                                   const char *filename, size_t filename_len) {
-    EscargotEvalResult out{};
+extern "C" EscargotModuleEvalResult escargot_eval_module(EscargotContext *c, const char *src, size_t src_len,
+                                                         const char *filename, size_t filename_len) {
+    EscargotModuleEvalResult out{};
     if (!c || !c->ctx.get() || !src) {
-        escargotEvalSetErrStr(out, "invalid context");
+        escargotEvalSetModuleErrStr(out, "invalid context");
         return out;
     }
     auto source = StringRef::createFromUTF8(src, src_len);
@@ -2768,14 +3120,14 @@ extern "C" EscargotEvalResult escargot_eval_module(EscargotContext *c, const cha
     return evalModuleScript(c, source, fname, fname_s);
 }
 
-extern "C" EscargotEvalResult escargot_import_module(EscargotContext *c, const char *specifier) {
-    EscargotEvalResult out{};
+extern "C" EscargotModuleEvalResult escargot_import_module(EscargotContext *c, const char *specifier) {
+    EscargotModuleEvalResult out{};
     if (!c || !c->ctx.get() || !specifier) {
-        escargotEvalSetErrStr(out, "invalid context");
+        escargotEvalSetModuleErrStr(out, "invalid context");
         return out;
     }
     if (!c->mod_load) {
-        escargotEvalSetErrStr(out, "no module loader configured");
+        escargotEvalSetModuleErrStr(out, "no module loader configured");
         return out;
     }
     std::string absPath = resolveModuleId(c, "", specifier);
@@ -2790,7 +3142,7 @@ extern "C" EscargotEvalResult escargot_import_module(EscargotContext *c, const c
             std::string __em;
             if (auto *__sr = er.resultOrErrorToString(c->ctx.get())) __em = __sr->toStdUTF8String();
             if (__em.empty()) __em = "module evaluation error";
-            escargotEvalSetErrStr(out, __em);
+            escargotEvalSetModuleErrStr(out, __em);
         }
         return out;
     }
@@ -2798,7 +3150,7 @@ extern "C" EscargotEvalResult escargot_import_module(EscargotContext *c, const c
     size_t src_len = 0;
     if (!c->mod_load(c->mod_ud, absPath.c_str(), &src_ptr, &src_len) || !src_ptr) {
         std::string msg = std::string("could not load module '") + absPath + "'";
-        escargotEvalSetErrStr(out, msg);
+        escargotEvalSetModuleErrStr(out, msg);
         return out;
     }
     auto source = StringRef::createFromUTF8(src_ptr, src_len);

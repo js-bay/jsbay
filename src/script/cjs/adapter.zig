@@ -37,7 +37,7 @@ const ValueOps = struct {
     pub const release = ActiveEngine.freeValue;
     pub const newModule = wrapper_execution.newModule;
     pub fn readExports(ctx: Context, module: Value) error{CallFailed}!Value {
-        return wrapper_execution.readFinalExports(ctx, module, ActiveEngine.undefinedValue(), captureException);
+        return wrapper_execution.readFinalExports(ctx, module, captureException);
     }
 };
 const ModuleRegistry = commonjs.Registry(ValueOps);
@@ -53,7 +53,7 @@ const CjsState = struct {
     /// Tracks whether the global `__jsbay_cjsCache` has been registered.
     cjs_cache_installed: bool = false,
     compiled: compile_cache.Memory,
-    pending_exception: ?ActiveEngine.Value = null,
+    pending_exception: ?OwnedValue = null,
     require_factory: ?ActiveEngine.Value = null,
 };
 
@@ -182,7 +182,7 @@ pub fn uninstall(instance_id: i32) void {
     const state = removeState(instance_id) orelse return;
     const alloc = state.allocator;
     clearCacheState(state);
-    if (state.pending_exception) |exception| ActiveEngine.freeValue(state.ctx, exception);
+    if (state.pending_exception) |*exception| exception.deinit();
     if (state.require_factory) |factory| ActiveEngine.freeValue(state.ctx, factory);
     state.compiled.deinit();
     state.registry.deinitStorage();
@@ -334,22 +334,20 @@ pub fn runCommonJS(instance_id: i32, bytes: []const u8, filename: []const u8) Cj
 }
 
 // JSC getter exceptions are explicitly protected while crossing Zig error unions; host-returning APIs release them rather than leaving a stale capture.
-fn captureException(ctx: ActiveEngine.Context, value: ActiveEngine.Value) void {
-    if (comptime backend.active_backend == .jsc) {
-        const state = stateFromCtx(ctx) orelse return;
-        const retained = ActiveEngine.dupValue(ctx, value);
-        const previous = state.pending_exception;
-        state.pending_exception = retained;
-        if (previous) |old| ActiveEngine.freeValue(ctx, old);
-    }
+fn captureException(ctx: ActiveEngine.Context, exception: OwnedValue) void {
+    const state = stateFromCtx(ctx) orelse {
+        var owned = exception;
+        owned.deinit();
+        return;
+    };
+    if (state.pending_exception) |*previous| previous.deinit();
+    state.pending_exception = exception;
 }
 
 fn discardCapturedException(ctx: ActiveEngine.Context) void {
-    if (comptime backend.active_backend == .jsc) {
-        if (stateFromCtx(ctx)) |state| {
-            if (state.pending_exception) |exception| ActiveEngine.freeValue(ctx, exception);
-            state.pending_exception = null;
-        }
+    if (stateFromCtx(ctx)) |state| {
+        if (state.pending_exception) |*exception| exception.deinit();
+        state.pending_exception = null;
     }
 }
 
@@ -637,10 +635,12 @@ fn jscThrowRequireError(
             if (stateFromCtx(ctx)) |state| {
                 if (state.pending_exception) |value| {
                     state.pending_exception = null;
+                    var owned = value;
+                    const raw = owned.release();
                     const result = jsc_mod.jsc.JSValueMakeUndefined(ctx_ref);
-                    exception[0] = value;
+                    exception[0] = raw;
                     // No potentially allocating JSC operation follows release; the callback out-param hands the value back to JSC.
-                    ActiveEngine.freeValue(ctx, value);
+                    ActiveEngine.freeValue(ctx, raw);
                     return result;
                 }
             }
@@ -708,6 +708,16 @@ fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: D
             return null;
         },
         error.CallFailed => {
+            if (stateFromCtx(ctx)) |state| {
+                if (state.pending_exception) |exception| {
+                    state.pending_exception = null;
+                    var owned = exception;
+                    if (throwSpikeException(ctx, &owned)) return null;
+                    owned.deinit();
+                    throwSpikeTransferFailure(ctx);
+                    return null;
+                }
+            }
             _ = ActiveEngine.throwError(ctx, "require: module threw during evaluation");
             return null;
         },
@@ -715,6 +725,29 @@ fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: D
             _ = ActiveEngine.throwError(ctx, "require: out of memory");
             return null;
         },
+    }
+}
+
+fn throwSpikeException(ctx: ActiveEngine.Context, exception: *OwnedValue) bool {
+    if (comptime backend.active_backend == .escargot) {
+        const raw = exception.release();
+        @import("../../backend/escargot/c_api.zig").escargot_throw_value(ctx, raw);
+        return true;
+    }
+    if (comptime backend.active_backend == .hermes) {
+        const api = @import("../../backend/hermes/c_api.zig");
+        if (!api.hermes_take_throw_value(ctx, exception.borrow())) return false;
+        _ = exception.release();
+        return true;
+    }
+    return false;
+}
+
+fn throwSpikeTransferFailure(ctx: ActiveEngine.Context) void {
+    if (comptime backend.active_backend == .hermes) {
+        @import("../../backend/hermes/c_api.zig").hermes_throw_static(ctx, "require: failed to transfer module exception");
+    } else {
+        _ = ActiveEngine.throwError(ctx, "require: failed to transfer module exception");
     }
 }
 

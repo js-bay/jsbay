@@ -105,6 +105,9 @@ comptime {
     _ = @import("buffers_tests.zig");
     _ = @import("buffers_transfer_tests.zig");
     _ = @import("cjs_tests.zig");
+    if (backend.isEscargotBackend(backend.active_backend) and build_options.escargot_eval_fault_tests) {
+        _ = @import("escargot_eval_boundary_tests.zig");
+    }
     _ = @import("weakcb_tests.zig");
     if (!spike) {
         _ = @import("reference_lifetime_tests.zig");
