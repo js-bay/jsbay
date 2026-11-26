@@ -470,10 +470,10 @@ test "dispatching an already queued timer does not allocate" {
 
 test "run wakes for the earlier timer deadline and host deadline" {
     const Clock = struct {
-        now: u64 = 0,
+        now: std.atomic.Value(u64) = .init(0),
         fn read(ctx: ?*anyopaque) u64 {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            return self.now;
+            return self.now.load(.seq_cst);
         }
     };
     const State = struct {
@@ -494,7 +494,7 @@ test "run wakes for the earlier timer deadline and host deadline" {
         }
         fn advance(clock: *Clock, loop: *zev.Loop) void {
             zev.sleepMilliseconds(1);
-            clock.now = 10;
+            clock.now.store(10, .seq_cst);
             loop.wake();
         }
     };
