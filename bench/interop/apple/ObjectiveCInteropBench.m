@@ -98,6 +98,7 @@ static uint64_t MeasureBuffer(JSBayEngine *engine, NSData *input, NSError **erro
 static uint64_t Lifecycle(NSError **error) {
     for (NSUInteger i = 0; i < kWarmup; ++i) {
         JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:(int32_t)(1600000 + i)
+                                              allowMainRunLoopAttach:YES
                                                                 error:error];
         if (!engine || !Number(engine, @"42", error) || ![engine close:error])
             return 0;
@@ -105,6 +106,7 @@ static uint64_t Lifecycle(NSError **error) {
     uint64_t start = Now();
     for (NSUInteger i = 0; i < 100; ++i) {
         JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:(int32_t)(1600100 + i)
+                                              allowMainRunLoopAttach:YES
                                                                 error:error];
         if (!engine || !Number(engine, @"42", error) || ![engine close:error])
             return 0;
@@ -114,7 +116,7 @@ static uint64_t Lifecycle(NSError **error) {
 int main(void) {
     @autoreleasepool {
         NSError *error = nil;
-        JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:1500001 error:&error];
+        JSBayEngine *engine = [[JSBayEngine alloc] initWithIdentifier:1500001 allowMainRunLoopAttach:YES error:&error];
         JSBayValue *binding =
             [engine bind:@"benchCallback"
                 callback:^JSBayValue *(JSBayValue *selfValue, NSArray<JSBayValue *> *arguments,
@@ -124,8 +126,10 @@ int main(void) {
                     return [engine numberValue:42 error:callbackError];
                 }
                    error:&error];
-        if (!engine || !binding)
+        if (!engine || !binding) {
+            NSLog(@"Objective-C interop setup failed: engine=%@ binding=%@ error=%@", engine, binding, error);
             return 2;
+        }
         uint64_t eval =
             error ? 0 : Measure(engine, @"var n=0; for(var i=0;i<64;i++)n+=i; 42", &error);
         uint64_t callback = error ? 0 : Measure(engine, @"benchCallback()", &error);
