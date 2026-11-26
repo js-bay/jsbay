@@ -46,6 +46,11 @@ const supportsMidScriptUserInterruptForState = control_registry.supportsMidScrip
 const isHandlerReady = control_registry.isHandlerReady;
 const takeState = control_registry.takeState;
 
+fn jscPollingControlsUnavailable(state: *const InterruptState) bool {
+    if (comptime !backend.isPacked(.jsc)) return false;
+    return state.backend_tag == .jsc and !@import("../backend/jsc/polling_config.zig").supportsInterrupt();
+}
+
 /// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from requestStopInterrupt (destroy/stop) therefore kills finite work after a host callback (`hostDestroy(); 42`). Call from the host trampoline on the way back into JS: clear sticky bits on every eval-active instance on this thread (nested destroy can arm outer frames too), then arm a short watch so loops still abort soon.
 pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
     if (comptime !backend.isHermesBackend(backend.active_backend)) return;

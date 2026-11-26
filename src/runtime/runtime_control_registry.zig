@@ -443,11 +443,6 @@ pub fn supportsMidScriptUserInterruptForState(state: *const InterruptState, jsc_
     return supportsMidScriptUserInterruptForBackend(tag, jsc_polling_enabled);
 }
 
-fn jscPollingControlsUnavailable(state: *const InterruptState) bool {
-    if (comptime !backend.isPacked(.jsc)) return false;
-    return state.backend_tag == .jsc and !@import("../backend/jsc/polling_config.zig").supportsInterrupt();
-}
-
 pub fn isHandlerReady(state: *const InterruptState) bool {
     return state.handler_status == .ready;
 }
