@@ -51,7 +51,7 @@ function nodeValueFailuresRejectReentrantClose() {
     ['delete', 'new Proxy({}, { deleteProperty() { closeNodeValue(); throw new Error("delete failed") } })', value => value.delete('x')],
     ['keys', 'new Proxy({}, { ownKeys() { closeNodeValue(); throw new Error("ownKeys failed") } })', value => value.keys()],
     ['call', '(function() { closeNodeValue(); throw new Error("call failed") })', value => value.call(undefined)],
-    ['construct', 'class ReentrantFailure { constructor() { closeNodeValue(); throw new Error("construct failed") } }', value => value.construct()],
+    ['construct', '(class ReentrantFailure { constructor() { closeNodeValue(); throw new Error("construct failed") } })', value => value.construct()],
     ['instanceOf', '({})', (value, engine) => {
       const constructor = engine.evaluateValue('({ [Symbol.hasInstance]() { closeNodeValue(); throw new Error("instanceOf failed") } })')
       try {
