@@ -22,6 +22,10 @@ trap 'rm -rf "$work"' EXIT
 prefix="$work/prefix"
 classes="$work/classes"
 mkdir -p "$classes"
+"$jdk_home/bin/javac" -encoding UTF-8 -d "$classes" \
+  "$root/tests/android-sdk/android/os/Handler.java" \
+  "$root/tests/android-sdk/android/os/Looper.java" \
+  "$root/tests/android-sdk/android/os/HandlerThread.java" >&2
 zig build --prefix "$prefix" -Dlibrary-only=true -Dshared=false "-Dbackend=$backend" -Doptimize=ReleaseFast >&2
 link_flags=(-lm)
 if [ "$backend" = jsc ]; then link_flags+=(-framework JavaScriptCore); fi
@@ -30,7 +34,7 @@ cc -std=c11 -Wall -Wextra -Werror -fPIC -shared \
   "$root/sdk/android/jsbay/src/main/cpp/jsbay_android.c" "$prefix/lib/libjsbay.a" "${link_flags[@]}" \
   -o "$work/libjsbay_android.dylib" >&2
 
-kotlin_cp="$gradle_lib/kotlin-stdlib-1.9.22.jar:$gradle_lib/annotations-24.0.1.jar"
+kotlin_cp="$classes:$gradle_lib/kotlin-stdlib-1.9.22.jar:$gradle_lib/annotations-24.0.1.jar"
 sdk_sources=("$root"/sdk/android/jsbay/src/main/kotlin/io/jsbay/*.kt)
 if [ "$runner" = jvm_kotlin ]; then
   "$jdk_home/bin/java" -cp "$gradle_lib/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
