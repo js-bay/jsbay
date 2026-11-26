@@ -482,6 +482,7 @@ test "run wakes for the earlier timer deadline and host deadline" {
         clock: *Clock,
         timer_calls: u8 = 0,
         ticks: u8 = 0,
+        tick_entered: zev.Waiter = .init,
         fn timerCallback(ctx: ?*anyopaque, _: *zev.Timer) void {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.timer_calls += 1;
@@ -490,27 +491,33 @@ test "run wakes for the earlier timer deadline and host deadline" {
         fn tick(ctx: ?*anyopaque, now_ms: u64) ?u64 {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.ticks += 1;
+            self.tick_entered.signal();
             return now_ms + 1_000;
         }
-        fn advance(clock: *Clock, loop: *zev.Loop) void {
-            zev.sleepMilliseconds(1);
-            clock.now.store(10, .seq_cst);
-            loop.wake();
+        fn advance(state: *Self, tick_generation: u64) void {
+            _ = state.tick_entered.waitUntilChange(tick_generation, 5_000);
+            state.clock.now.store(10, .seq_cst);
+            state.loop.wake();
         }
     };
     const loop = try zev.Loop.create(std.testing.allocator);
     defer loop.destroy();
     var clock: Clock = .{};
     loop.setClock(&clock, Clock.read);
+    defer loop.setClock(null, null);
     var timer: zev.Timer = .{};
     var state = State{ .loop = loop, .clock = &clock };
+    defer state.tick_entered.deinit();
     timer.init(loop, &state, State.timerCallback);
     try timer.startAfter(10);
-    const advancer = try std.Thread.spawn(.{}, State.advance, .{ &clock, loop });
+    // Prime both deadlines before the advancer waits for the running loop's next host tick.
+    try std.testing.expectEqual(@as(?u64, 10), loop.runOnce(.{ .ctx = &state, .tick = State.tick }));
+    const tick_generation = state.tick_entered.generation();
+    const advancer = try std.Thread.spawn(.{}, State.advance, .{ &state, tick_generation });
     defer advancer.join();
     loop.run(.{ .ctx = &state, .tick = State.tick });
     try std.testing.expectEqual(@as(u8, 1), state.timer_calls);
-    try std.testing.expect(state.ticks >= 1);
+    try std.testing.expect(state.ticks >= 2);
     timer.close();
 }
 

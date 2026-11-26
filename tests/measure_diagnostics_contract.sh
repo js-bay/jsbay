@@ -9,7 +9,8 @@ trap 'rm -rf "$tmp"' EXIT
 out="$tmp/report"
 
 [ -x "$measure" ] || { echo "missing measurement tool: $measure" >&2; exit 127; }
-if ! "$measure" "$out" quickjs_ng >"$tmp/stdout" 2>"$tmp/stderr"; then
+if ! bash -x "$measure" "$out" quickjs_ng >"$tmp/stdout" 2>"$tmp/stderr"; then
+    cat "$tmp/stdout" >&2
     cat "$tmp/stderr" >&2
     exit 1
 fi
