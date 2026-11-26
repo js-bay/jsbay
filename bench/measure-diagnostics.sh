@@ -50,7 +50,8 @@ for mode in full heap_off inspector_off; do
         ] | map(. + {status:"ok",warmup_iterations:100,measured_iterations:(if .name == "lifecycle" then 100 else 1000 end),operations:(if .name == "lifecycle" then 100 else 1000 end),ns_per_op:(.elapsed_ns / (if .name == "lifecycle" then 100 else 1000 end))}))}' >"$work/runtime.json"
     if [ "$(uname -s)" = Darwin ]; then nm -gU "$artifact" >"$work/symbols.txt" 2>"$work/symbols.stderr";
     else nm -g --defined-only "$artifact" >"$work/symbols.txt" 2>"$work/symbols.stderr"; fi
-    awk '{name=$NF; sub(/^_/,"",name); if(name ~ /^jsbay_[A-Za-z0-9_]+$/) print name}' "$work/symbols.txt" | LC_ALL=C sort -u >"$work/exports.txt"
+    # QuickJS bridge symbols are internal archive members, not part of the public C ABI.
+    awk -f "$root/bench/diagnostic-exports.awk" "$work/symbols.txt" | LC_ALL=C sort -u >"$work/exports.txt"
     jq -Rn '[inputs | select(length > 0)]' <"$work/exports.txt" >"$work/exports.json"
     if [ "$mode" != full ] && ! cmp -s "$target/full/exports.txt" "$work/exports.txt"; then
         echo "diagnostic exports differ for $mode:" >&2

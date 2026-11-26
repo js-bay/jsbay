@@ -8,6 +8,12 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/jsbay-diagnostics-measure.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 out="$tmp/report"
 
+# Check Darwin and ELF symbol spellings, retaining unknown API names for the ABI validator.
+printf '%s\n' '000 T _jsbay_engine_create' '000 T jsbay_unexpected_api' '000 T _jsbay_qjs_eval_with_source_url' |
+    awk -f "$root/bench/diagnostic-exports.awk" | LC_ALL=C sort >"$tmp/exports"
+printf '%s\n' jsbay_engine_create jsbay_unexpected_api >"$tmp/expected-exports"
+cmp "$tmp/expected-exports" "$tmp/exports"
+
 [ -x "$measure" ] || { echo "missing measurement tool: $measure" >&2; exit 127; }
 if ! bash -x "$measure" "$out" quickjs_ng >"$tmp/stdout" 2>"$tmp/stderr"; then
     cat "$tmp/stdout" >&2
