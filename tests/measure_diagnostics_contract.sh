@@ -15,7 +15,7 @@ if ! "$measure" "$out" quickjs_ng >"$tmp/stdout" 2>"$tmp/stderr"; then
 fi
 [ -s "$out/report.json" ] || { echo "missing report.json" >&2; exit 1; }
 
-jq -e '
+if ! jq -e '
   .schema_version == 1 and .backend == "quickjs_ng" and
   (.modes | type == "array" and length == 3) and
   ([.modes[].name] | sort == ["full", "heap_off", "inspector_off"]) and
@@ -53,7 +53,11 @@ jq -e '
   (.modes[] | select(.name == "full") | .inspector_start == "ok" and .heap_snapshot == "partial") and
   (.modes[] | select(.name == "heap_off") | .inspector_start == "ok" and .heap_snapshot == "unsupported") and
   (.modes[] | select(.name == "inspector_off") | .inspector_start == "unsupported" and .heap_snapshot == "unsupported")
-' "$out/report.json" >/dev/null
+' "$out/report.json" >/dev/null; then
+    echo "diagnostic report does not satisfy the contract:" >&2
+    cat "$out/report.json" >&2
+    exit 1
+fi
 
 # The public headers define the ABI. Do not duplicate that set as a numeric baseline here: each diagnostic mode must export exactly those symbols, with no duplicates, omissions, or private additions.
 zig build --build-file "$root/build.zig" tool -- check-diagnostic-exports "$out/report.json"

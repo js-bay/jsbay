@@ -336,6 +336,7 @@ jobs:
       - name: Diagnostic and host benchmark contracts
         run: |
           set -euo pipefail
+          set -x
           bash tests/measure_diagnostics_contract.sh
           bash tests/benchmark_source_hash_contract.sh
           bash tests/benchmark_operation_metadata_contract.sh
