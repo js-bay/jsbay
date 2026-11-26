@@ -21,6 +21,7 @@ const sync = @import("zev");
 const backend = @import("../backend.zig");
 const engine = @import("../engine.zig");
 const instance_map = @import("instance_map.zig");
+const hermes_watchdog = @import("hermes_watchdog.zig");
 
 /// Snapshot of runtime memory consumption. Fields not reported by a backend default to zero.
 pub const MemoryUsage = extern struct {
@@ -205,70 +206,11 @@ pub fn deinit(instance_id: i32) bool {
     return true;
 }
 
-fn hermesTriggerTimeout(instance_id: i32) void {
-    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Control-plane lease: refuse teardown_pending and keep destroyRuntime waiting so asyncTriggerTimeout cannot touch a freed Hermes runtime.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
-    defer lease.end();
-    const rt = lease.inst.monoRuntime() orelse return;
-    const her = @import("../backend/hermes.zig");
-    her.c_api_mod.hermes_runtime_async_trigger_timeout(rt);
-}
-
-fn hermesTriggerTeardownTimeout(instance_id: i32, generation: u64) void {
-    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    const lease = instance_map.beginTeardownSignals(instance_id, generation) orelse return;
-    defer lease.end();
-    const rt = lease.inst.monoRuntime() orelse return;
-    @import("../backend/hermes.zig").c_api_mod.hermes_runtime_async_trigger_timeout(rt);
-}
-
-fn hermesWatchTimeLimit(instance_id: i32, millis: u64) void {
-    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Lease across watch/unwatch so clear_interrupt cannot race destroyRuntime freeing the Hermes runtime while the map entry still exists.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
-    defer lease.end();
-    const rt = lease.inst.monoRuntime() orelse return;
-    const her = @import("../backend/hermes.zig");
-    if (millis == 0) {
-        her.c_api_mod.hermes_runtime_unwatch_time_limit(rt);
-        return;
-    }
-    const capped: u32 = if (millis > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(millis);
-    her.c_api_mod.hermes_runtime_watch_time_limit(rt, capped);
-}
-
-fn hermesDrainAsyncTimeout(instance_id: i32) void {
-    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    // Same lease as watch/trigger: drain touches native Hermes timeout state that destroyRuntime frees.
-    const lease = instance_map.beginControlPlane(instance_id) orelse return;
-    defer lease.end();
-    const rt = lease.inst.monoRuntime() orelse return;
-    const her = @import("../backend/hermes.zig");
-    her.c_api_mod.hermes_runtime_drain_async_timeout(rt);
-}
-
-/// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from requestStopInterrupt (destroy/stop) therefore kills finite work after a host callback (`hostDestroy(); 42`). Call from the host trampoline on the way back into JS: clear sticky bits on every eval-active instance on this thread (nested destroy can arm outer frames too), then arm a short watch so loops still abort soon.
-pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
-    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    const et = @import("engine_thread.zig");
-    rearmOneHermesStop(instance_id);
-    et.forEachEvalActiveOnCurrentThread(rearmOneHermesStop);
-}
-
-fn rearmOneHermesStop(instance_id: i32) void {
-    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    if (!isStopRequested(instance_id)) return;
-    const lease = instance_map.beginControlPlane(instance_id) orelse blk: {
-        const generation = instance_map.registeredGeneration(instance_id) orelse return;
-        break :blk instance_map.beginTeardownSignals(instance_id, generation) orelse return;
-    };
-    defer lease.end();
-    const rt = lease.inst.monoRuntime() orelse return;
-    const api = @import("../backend/hermes.zig").c_api_mod;
-    api.hermes_runtime_drain_async_timeout(rt);
-    api.hermes_runtime_watch_time_limit(rt, 25);
-}
+const hermesTriggerTimeout = hermes_watchdog.hermesTriggerTimeout;
+const hermesTriggerTeardownTimeout = hermes_watchdog.hermesTriggerTeardownTimeout;
+const hermesWatchTimeLimit = hermes_watchdog.hermesWatchTimeLimit;
+const hermesDrainAsyncTimeout = hermes_watchdog.hermesDrainAsyncTimeout;
+pub const softRearmHermesStopAfterHost = hermes_watchdog.softRearmHermesStopAfterHost;
 
 /// Request that the JS runtime interrupt execution on the next interrupt check. Thread-safe. Returns false if the instance was never init()'d or has been deinit()'d.
 ///

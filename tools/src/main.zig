@@ -10,6 +10,7 @@ const Exit = error{ Usage, InvalidInput, PolicyFailure, ExternalFailure };
 
 test {
     _ = repository;
+    _ = @import("repository_patches_tests.zig");
     _ = sdk_abi;
     _ = @import("contracts.zig");
     _ = @import("package_contracts.zig");

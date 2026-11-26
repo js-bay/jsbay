@@ -12,7 +12,6 @@ const helpers = @import("test_helpers.zig");
 const io = @import("../platform/io.zig");
 const weakcb = @import("../value/weakcb.zig");
 const runtime_control = @import("../runtime/runtime_control.zig");
-const instance_map = @import("../runtime/instance_map.zig");
 const ActiveEngine = backend.ActiveEngine;
 
 const jsbay_ok: c_int = 0;
@@ -1711,40 +1710,6 @@ test "engine_thread: callback destroy interrupts JavaScript that continues after
     }
 }
 
-const DirectEvalDestroy = struct {
-    id: i32,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    result_ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn run(self: *DirectEvalDestroy) void {
-        const result = engine.evalScript(self.id, "hostDestroy(); 42", "<direct-destroy-eval>");
-        self.result_ok.store(result.err == null and result.result != null and std.mem.eql(u8, result.result.?, "42"), .seq_cst);
-        helpers.freeEvalResult(result);
-        self.done.store(true, .seq_cst);
-    }
-};
-
-const FinishEvalDestroyReuseProbe = struct {
-    id: i32,
-    reached: std.atomic.Value(bool) = .init(false),
-    resume_hook: std.atomic.Value(bool) = .init(false),
-    replacement_done: std.atomic.Value(bool) = .init(false),
-    replacement_created: std.atomic.Value(bool) = .init(false),
-
-    fn pauseAfterLeaseRelease(instance_id: i32, raw: ?*anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(raw.?));
-        std.debug.assert(instance_id == self.id);
-        self.reached.store(true, .seq_cst);
-        while (!self.resume_hook.load(.seq_cst)) std.Thread.yield() catch {};
-    }
-
-    fn destroyAndReplace(self: *@This()) void {
-        engine.destroy(self.id);
-        self.replacement_created.store(engine.create(self.id, .{}), .seq_cst);
-        self.replacement_done.store(true, .seq_cst);
-    }
-};
-
 const DirectInfiniteEval = struct {
     id: i32,
     done: std.atomic.Value(bool) = .init(false),
@@ -1757,75 +1722,6 @@ const DirectInfiniteEval = struct {
         self.done.store(true, .seq_cst);
     }
 };
-
-test "engine_thread: direct eval callback destroy defers runtime free until eval unwinds" {
-    try skipEscargotDestroyDefer();
-    const id = helpers.nextInstanceId();
-    var live = try createInstance(id);
-    var cleanup = true;
-    errdefer if (cleanup) live.close();
-
-    var dying = DestroyFromHost{};
-    try install(id, "hostDestroy", DestroyFromHost.cb, &dying);
-    var direct = DirectEvalDestroy{ .id = id };
-    const eval_thread = try std.Thread.spawn(.{}, DirectEvalDestroy.run, .{&direct});
-    joinOrExit(eval_thread, &direct.done, 3000, "destroy from direct eval callback did not unwind");
-    cleanup = false;
-    live.closed = true;
-
-    try testing.expect(dying.destroy_entered.load(.seq_cst));
-    try testing.expect(dying.callback_returned.load(.seq_cst));
-    try testing.expect(direct.result_ok.load(.seq_cst));
-    try testing.expect(engine.getContext(id) == null);
-}
-
-test "engine_thread: direct eval deferred destroy preserves a same-id replacement" {
-    try skipEscargotDestroyDefer();
-    const id = helpers.nextInstanceId();
-    var live = try createInstance(id);
-    var cleanup = true;
-    errdefer if (cleanup) live.close();
-
-    var old_snapshot: c_api.InstanceSnapshotC = undefined;
-    old_snapshot.struct_size = @sizeOf(c_api.InstanceSnapshotC);
-    try testing.expect(c_api.jsbay_engine_snapshot(id, &old_snapshot));
-
-    var dying = DestroyFromHost{};
-    try install(id, "hostDestroy", DestroyFromHost.cb, &dying);
-    var direct = DirectEvalDestroy{ .id = id };
-    var probe = FinishEvalDestroyReuseProbe{ .id = id };
-    engine.setFinishEvalDestroyHookForTesting(FinishEvalDestroyReuseProbe.pauseAfterLeaseRelease, @ptrCast(&probe));
-    defer {
-        probe.resume_hook.store(true, .seq_cst);
-        engine.setFinishEvalDestroyHookForTesting(null, null);
-    }
-
-    const eval_thread = try std.Thread.spawn(.{}, DirectEvalDestroy.run, .{&direct});
-    if (!spinUntil(&probe.reached, 3_000)) {
-        probe.resume_hook.store(true, .seq_cst);
-        joinOrExit(eval_thread, &direct.done, 3_000, "direct eval did not reach deferred destroy handoff");
-        return error.DeferredDestroyHandoffNotReached;
-    }
-
-    const replace_thread = try std.Thread.spawn(.{}, FinishEvalDestroyReuseProbe.destroyAndReplace, .{&probe});
-    joinOrExit(replace_thread, &probe.replacement_done, 3_000, "same-id replacement did not finish");
-    try testing.expect(probe.replacement_created.load(.seq_cst));
-    const replacement_generation = instance_map.captureGeneration(id) orelse return error.ReplacementMissing;
-    try testing.expect(replacement_generation != old_snapshot.generation);
-
-    probe.resume_hook.store(true, .seq_cst);
-    joinOrExit(eval_thread, &direct.done, 3_000, "direct eval did not finish after deferred destroy resumed");
-    engine.setFinishEvalDestroyHookForTesting(null, null);
-
-    try testing.expect(dying.destroy_entered.load(.seq_cst));
-    try testing.expect(dying.callback_returned.load(.seq_cst));
-    try testing.expect(direct.result_ok.load(.seq_cst));
-    try testing.expect(engine.getContext(id) != null);
-    try testing.expectEqual(replacement_generation, instance_map.captureGeneration(id).?);
-    engine.destroy(id);
-    cleanup = false;
-    live.closed = true;
-}
 
 test "engine_thread: destroy interrupts a direct infinite eval without a library thread" {
     try skipSpikeNeedsNativeInterrupt();

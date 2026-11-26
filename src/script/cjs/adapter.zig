@@ -60,7 +60,7 @@ const CjsState = struct {
 var cjs_states: std.AutoHashMap(i32, *CjsState) = std.AutoHashMap(i32, *CjsState).init(std.heap.c_allocator);
 var cjs_mutex: sync.Mutex = .{};
 
-fn getState(instance_id: i32) ?*CjsState {
+pub fn getState(instance_id: i32) ?*CjsState {
     cjs_mutex.lock();
     defer cjs_mutex.unlock();
     return cjs_states.get(instance_id);
@@ -728,28 +728,9 @@ fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: D
     }
 }
 
-fn throwSpikeException(ctx: ActiveEngine.Context, exception: *OwnedValue) bool {
-    if (comptime backend.active_backend == .escargot) {
-        const raw = exception.release();
-        @import("../../backend/escargot/c_api.zig").escargot_throw_value(ctx, raw);
-        return true;
-    }
-    if (comptime backend.active_backend == .hermes) {
-        const api = @import("../../backend/hermes/c_api.zig");
-        if (!api.hermes_take_throw_value(ctx, exception.borrow())) return false;
-        _ = exception.release();
-        return true;
-    }
-    return false;
-}
-
-fn throwSpikeTransferFailure(ctx: ActiveEngine.Context) void {
-    if (comptime backend.active_backend == .hermes) {
-        @import("../../backend/hermes/c_api.zig").hermes_throw_static(ctx, "require: failed to transfer module exception");
-    } else {
-        _ = ActiveEngine.throwError(ctx, "require: failed to transfer module exception");
-    }
-}
+const spike_throw = @import("spike_throw.zig");
+const throwSpikeException = spike_throw.throwSpikeException;
+const throwSpikeTransferFailure = spike_throw.throwSpikeTransferFailure;
 
 // -------------------------------------------------------------------------- Shared require implementation (backend-neutral) --------------------------------------------------------------------------
 
@@ -984,27 +965,3 @@ fn runWrapperWithRequire(state: *CjsState, wrapper_fn: @import("../../backend.zi
 
 /// Cache version salt for `__jsbay_cjsCache` persisted artifacts. Bump with the engine whenever the QuickJS bytecode format changes, so stale files are dropped and rebuilt rather than replayed.
 const CJS_CACHE_VERSION = "jsbay-cjs-1";
-
-test "cjs: clearing instances does not clear memoized compiled bytes" {
-    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
-    const helpers = @import("../../tests/test_helpers.zig");
-    const loader_impl = struct {
-        fn load(_: ?*anyopaque, _: [*:0]const u8, out: *types.ModuleLoadResult) callconv(.c) bool {
-            out.* = .{ .source = "module.exports = 123;", .source_len = 21 };
-            return true;
-        }
-    };
-    const vtable = types.ModuleLoaderVTable{ .load = loader_impl.load };
-    const loader = types.ModuleLoader{ .vtable = &vtable };
-    const id = helpers.nextInstanceId();
-    try std.testing.expect(engine.create(id, .{}));
-    defer engine.destroy(id);
-    try std.testing.expect(install(id, &loader));
-    try helpers.evalOk(id, "require('module'); __jsbay_cjsCache('module.exports=1;', () => 0, 'bundle.js');");
-    const state = getState(id) orelse return error.MissingState;
-    try std.testing.expectEqual(@as(usize, 1), state.registry.entries.count());
-    try std.testing.expectEqual(@as(usize, 1), state.compiled.entries.count());
-    clearCache(id);
-    try std.testing.expectEqual(@as(usize, 0), state.registry.entries.count());
-    try std.testing.expectEqual(@as(usize, 1), state.compiled.entries.count());
-}

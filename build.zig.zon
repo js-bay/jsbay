@@ -83,7 +83,6 @@
         "vendor/hermes-promise-generator-hook.patch",
         "vendor/hermes-promise-tracker-source.patch",
         "vendor/hermes-promise-tracker-checkpoint.patch",
-        "vendor/quickjs-module-rejection.patch",
         "vendor/escargot-debugger.patch",
         "vendor/escargot-shared-gc.patch",
     },

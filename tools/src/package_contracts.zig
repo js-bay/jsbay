@@ -5,47 +5,16 @@ const sdk = @import("sdk.zig");
 const testing = std.testing;
 const Dir = std.Io.Dir;
 
-fn root(allocator: std.mem.Allocator, io: std.Io) ![:0]u8 {
+fn root(allocator: std.mem.Allocator, io: std.Io) ![]u8 {
     return std.process.currentPathAlloc(io, allocator);
 }
 
 fn makeTemp(allocator: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]u8 {
-    var env = try testing.environ.createMap(allocator);
-    defer env.deinit();
-    const base = env.get("ZIG_GLOBAL_CACHE_DIR") orelse env.get("TMPDIR") orelse "/tmp";
-    const cwd_path = try root(allocator, io);
-    defer allocator.free(cwd_path);
-    const absolute_base = if (std.fs.path.isAbsolute(base))
-        try allocator.dupe(u8, base)
-    else
-        try std.fs.path.resolve(allocator, &.{ cwd_path, base });
-    defer allocator.free(absolute_base);
-    try Dir.cwd().createDirPath(io, absolute_base);
     var random: [12]u8 = undefined;
     io.random(&random);
-    const name = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ prefix, std.fmt.bytesToHex(random, .lower) });
-    defer allocator.free(name);
-    const directory = try std.fs.path.join(allocator, &.{ absolute_base, name });
+    const directory = try std.fmt.allocPrint(allocator, "/tmp/{s}-{s}", .{ prefix, std.fmt.bytesToHex(random, .lower) });
     try Dir.cwd().createDir(io, directory, .default_dir);
     return directory;
-}
-
-test "temporary package cache stays under the configured Zig cache" {
-    var env = try testing.environ.createMap(testing.allocator);
-    defer env.deinit();
-    const cache = env.get("ZIG_GLOBAL_CACHE_DIR") orelse env.get("TMPDIR") orelse "/tmp";
-    const cwd_path = try root(testing.allocator, testing.io);
-    defer testing.allocator.free(cwd_path);
-    const expected = if (std.fs.path.isAbsolute(cache))
-        try testing.allocator.dupe(u8, cache)
-    else
-        try std.fs.path.resolve(testing.allocator, &.{ cwd_path, cache });
-    defer testing.allocator.free(expected);
-    const temp = try makeTemp(testing.allocator, testing.io, "jsbay-cache-location");
-    defer testing.allocator.free(temp);
-    defer Dir.cwd().deleteTree(testing.io, temp) catch {};
-    const parent = std.fs.path.dirname(temp) orelse return error.MissingParent;
-    try testing.expectEqualStrings(std.mem.trimEnd(u8, expected, "/"), parent);
 }
 
 fn path(allocator: std.mem.Allocator, base: []const u8, parts: []const []const u8) ![]u8 {

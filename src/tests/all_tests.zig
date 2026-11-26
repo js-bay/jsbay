@@ -22,9 +22,12 @@ comptime {
     _ = @import("test_helpers.zig");
     _ = @import("value_tests.zig");
     _ = @import("string_roundtrip_tests.zig");
+    _ = @import("backend_dispatch_tests.zig");
     _ = @import("engine_tests.zig");
+    _ = @import("engine_alt_tests.zig");
     // engine_thread: spike smoke already covers start/id/stop/post/wait; import full suite and Skip only cases that need interrupt/heap/bind-sync not yet green on Escargot/Hermes.
     _ = @import("engine_thread_tests.zig");
+    _ = @import("engine_thread_boundary_tests.zig");
     if (!spike) {
         _ = @import("self_driven_loop_tests.zig");
         _ = @import("shutdown_race_tests.zig");
@@ -45,6 +48,7 @@ comptime {
         _ = @import("host_dispatch_tests.zig");
     }
     _ = @import("dispatch_queue_contract_tests.zig");
+    _ = @import("dispatch_tests.zig");
     if (!spike) {
         _ = @import("console_tests.zig");
     }
@@ -88,9 +92,14 @@ comptime {
     _ = @import("mapset_tests.zig");
     // ESM: Escargot ModuleLoader; Hermes skips inside modules_tests.
     _ = @import("modules_tests.zig");
+    _ = @import("modules_pack_tests.zig");
     if (!spike) {
         _ = @import("c_api_tests.zig");
+        _ = @import("c_api_resource_tests.zig");
+        _ = @import("c_api_boundary_tests.zig");
+        _ = @import("c_api_alloc_tests.zig");
         _ = @import("submission_tests.zig");
+        _ = @import("submission_drain_tests.zig");
         _ = @import("runtime_boundary_tests.zig");
         _ = @import("borrowed_retain_tests.zig");
     }
@@ -105,12 +114,14 @@ comptime {
     _ = @import("buffers_tests.zig");
     _ = @import("buffers_transfer_tests.zig");
     _ = @import("cjs_tests.zig");
+    _ = @import("cjs_pack_tests.zig");
     if (backend.isEscargotBackend(backend.active_backend) and build_options.escargot_eval_fault_tests) {
         _ = @import("escargot_eval_boundary_tests.zig");
     }
     _ = @import("weakcb_tests.zig");
     if (!spike) {
         _ = @import("reference_lifetime_tests.zig");
+        _ = @import("reference_boundary_tests.zig");
         _ = @import("value_contract_tests.zig");
     }
     _ = @import("buffer_contract_tests.zig");
@@ -121,6 +132,7 @@ comptime {
     _ = @import("promise_state_tests.zig");
     // Escargot: PromiseRejectCallback wired. Hermes/JSC: setRejectionTracker returns false (tests no-op).
     _ = @import("rejection_tracker_tests.zig");
+    _ = @import("rejection_tracker_boundary_tests.zig");
     if (!spike) _ = @import("rejection_tracker_recovery_tests.zig");
     if (!spike) {
         _ = @import("engine_thread_guard_tests.zig");

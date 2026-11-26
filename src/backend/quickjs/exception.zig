@@ -22,14 +22,10 @@ fn matchingStackHeaderLength(stack: []const u8, description: []const u8) ?usize 
     const header_name_end = std.mem.indexOfScalar(u8, header, ':') orelse header.len;
     const description_name_end = std.mem.indexOfScalar(u8, description, ':') orelse description.len;
     const native_names = .{ "Error", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError", "InternalError", "AggregateError", "SuppressedError" };
-    inline for (native_names) |name| {
-        if (std.mem.eql(u8, description[0..description_name_end], name)) return null;
-    }
+    inline for (native_names) |name| if (std.mem.eql(u8, description[0..description_name_end], name)) return null;
     if (!std.mem.eql(u8, header[header_name_end..], description[description_name_end..])) return null;
     // Generated stacks capture the native name before application code can rename the error.
-    inline for (native_names) |name| {
-        if (std.mem.eql(u8, header[0..header_name_end], name)) return newline;
-    }
+    inline for (native_names) |name| if (std.mem.eql(u8, header[0..header_name_end], name)) return newline;
     return null;
 }
 
@@ -383,10 +379,8 @@ fn dispatch(ctx: ?*qjs.JSContext, instance_id: i32, handled: bool, promise: qjs.
     const observed = events.isEnabled(instance_id);
     if (host == null and !observed) return;
     // The inspector rejection API accepts primary-backend values. Packed instances use the host text callback when registered.
-    if (observed) {
-        if (comptime @import("../../backend.zig").isQuickJsApiBackend(@import("../../backend.zig").active_backend)) {
-            events.reportRejection(instance_id, promise, handled, reason);
-        }
+    if (observed and comptime @import("../../backend.zig").isQuickJsApiBackend(@import("../../backend.zig").active_backend)) {
+        events.reportRejection(instance_id, promise, handled, reason);
     }
     if (host) |target| {
         const text = reasonText(ctx, reason);
@@ -471,9 +465,7 @@ test "error observer registry OOM preserves existing observer" {
     try testing.expectEqual(ObserverRegistration.applied, registerObserver(&map, 1, old));
     failing.fail_index = failing.alloc_index;
     var id: i32 = 2;
-    while (registerObserver(&map, id, old) == .applied) : (id += 1) {
-        try testing.expect(id < 1024);
-    }
+    while (registerObserver(&map, id, old) == .applied) : (id += 1) try testing.expect(id < 1024);
     try testing.expectEqual(old.func, map.get(1).?.func);
 }
 

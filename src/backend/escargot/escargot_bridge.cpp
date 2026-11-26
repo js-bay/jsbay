@@ -666,13 +666,15 @@ extern "C" void escargot_context_free(EscargotContext *ctx) {
         ctx->buffers_cv.wait(lock, [ctx] { return ctx->in_flight_deallocators == 0; });
     }
     // Force any remaining no-copy buffer finalizers (engine teardown contract).
-    std::vector<NoCopyPack *> leftover;
-    {
-        std::lock_guard<std::mutex> lock(ctx->buffers_mu);
-        leftover.assign(ctx->pending_buffers.begin(), ctx->pending_buffers.end());
-        ctx->pending_buffers.clear();
-    }
-    for (auto *pk : leftover) {
+    while (true) {
+        NoCopyPack *pk = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ctx->buffers_mu);
+            auto it = ctx->pending_buffers.begin();
+            if (it == ctx->pending_buffers.end()) break;
+            pk = *it;
+            ctx->pending_buffers.erase(it);
+        }
         if (!pk) continue;
         EscargotBufferDeleter d = nullptr;
         void *u = nullptr;
@@ -1875,22 +1877,20 @@ extern "C" EscargotValue escargot_new_array_buffer_copy(EscargotContext *c, cons
 static void fireNoCopyPack(NoCopyPack *pk) {
     if (!pk) return;
     bool should_queue = false;
-    EscargotContextOpaque *owner = nullptr;
     {
         std::lock_guard<std::mutex> lock(pk->mu);
         if (!pk->fired) {
             pk->fired = true;
             if (pk->deleter) {
                 should_queue = true;
-                owner = pk->owner;
+                if (pk->owner) {
+                    std::lock_guard<std::mutex> owner_lock(pk->owner->buffers_mu);
+                    ++pk->owner->in_flight_deallocators;
+                }
             }
         }
     }
     if (should_queue) {
-        if (owner) {
-            std::lock_guard<std::mutex> lock(owner->buffers_mu);
-            ++owner->in_flight_deallocators;
-        }
         queueReclaimedPack(pk);
     } else {
         if (pk->refcount.fetch_sub(1, std::memory_order_acq_rel) == 1) {

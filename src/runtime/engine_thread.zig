@@ -18,8 +18,22 @@ const execution_cpu = @import("execution_cpu.zig");
 const io = @import("../platform/io.zig");
 const sync = @import("zev");
 const types = @import("../types.zig");
+const destroy_gate = @import("destroy_gate.zig");
+const thread_result = @import("engine_thread_result.zig");
 
 const ActiveEngine = backend.ActiveEngine;
+const destroyGate = destroy_gate.destroyGate;
+const DestroyGateLease = destroy_gate.DestroyGateLease;
+const lockDestroyGate = destroy_gate.lockDestroyGate;
+const unlockDestroyGate = destroy_gate.unlockDestroyGate;
+pub const destroyGateWaitersForTesting = destroy_gate.destroyGateWaitersForTesting;
+
+const Adopted = thread_result.Adopted;
+const serializeThreadValue = thread_result.serializeThreadValue;
+pub const adoptTypedValue = thread_result.adoptTypedValue;
+const adoptTypedEval = thread_result.adoptTypedEval;
+const adoptEval = thread_result.adoptEval;
+const writeEval = thread_result.writeEval;
 
 threadlocal var fail_next_state_allocation_for_testing = false;
 
@@ -63,50 +77,6 @@ const Job = struct {
 };
 
 const DestroyOwner = enum(u8) { none, external, engine };
-
-const DestroyGate = struct {
-    mutex: sync.Mutex = .{},
-    waiters: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-};
-
-// Serializes teardown for an instance even after its State is detached. The engine callback path never acquires this gate, so an external joiner may hold it while waiting for that callback to return.
-var g_destroy_gates: [64]DestroyGate = @splat(.{});
-
-fn destroyGate(instance_id: i32) *DestroyGate {
-    const bits: u32 = @bitCast(instance_id);
-    return &g_destroy_gates[@as(usize, bits) % g_destroy_gates.len];
-}
-
-const DestroyGateLease = struct {
-    gate: *DestroyGate,
-    previous: ?*DestroyGateLease,
-    owns_mutex: bool,
-};
-
-threadlocal var g_held_destroy_gates: ?*DestroyGateLease = null;
-
-fn lockDestroyGate(gate: *DestroyGate, lease: *DestroyGateLease) void {
-    var current = g_held_destroy_gates;
-    while (current) |held| : (current = held.previous) {
-        if (held.gate == gate) {
-            lease.* = .{ .gate = gate, .previous = g_held_destroy_gates, .owns_mutex = false };
-            g_held_destroy_gates = lease;
-            return;
-        }
-    }
-
-    _ = gate.waiters.fetchAdd(1, .seq_cst);
-    gate.mutex.lock();
-    _ = gate.waiters.fetchSub(1, .seq_cst);
-    lease.* = .{ .gate = gate, .previous = g_held_destroy_gates, .owns_mutex = true };
-    g_held_destroy_gates = lease;
-}
-
-fn unlockDestroyGate(lease: *DestroyGateLease) void {
-    std.debug.assert(g_held_destroy_gates == lease);
-    g_held_destroy_gates = lease.previous;
-    if (lease.owns_mutex) lease.gate.mutex.unlock();
-}
 
 const State = struct {
     instance_id: i32,
@@ -424,10 +394,6 @@ pub fn setRefsDrainHookForTesting(
     state.refs_drain_hook_data_for_testing = data;
     state.queue_mu.unlock();
     return true;
-}
-
-pub fn destroyGateWaitersForTesting(instance_id: i32) u32 {
-    return destroyGate(instance_id).waiters.load(.seq_cst);
 }
 
 pub fn exclusiveEvalForTesting(instance_id: i32) bool {
@@ -1724,99 +1690,6 @@ fn cancelAll(state: *State) void {
         freeJob(job);
         current = next;
     }
-}
-
-const Adopted = struct {
-    status: c_int,
-    result: ?[]u8,
-    err: ?[]u8,
-};
-
-/// The enclosing TypedEvalEntry keeps engine admission active. QuickJS still needs its backend stack anchor for this individual VM entry.
-fn serializeThreadValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value) api_backend.BytesResult {
-    const entered = if (comptime backend.isQuickJsApiBackend(backend.active_backend))
-        backend.ActiveEngineModule.lifecycle.enterJs(ctx)
-    else
-        true;
-    if (!entered) return .out_of_memory;
-    defer if (comptime backend.isQuickJsApiBackend(backend.active_backend)) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
-    return api_backend.toUtf8(std.heap.c_allocator, ctx, value);
-}
-
-fn adoptTypedValue(ctx: ActiveEngine.Context, value: ActiveEngine.Value, status: c_int) Adopted {
-    defer ActiveEngine.freeValue(ctx, value);
-    const serialized = serializeThreadValue(ctx, value);
-    // ToString itself may enqueue microtasks.  Drain them before the enclosing admission closes, unless that conversion asked to destroy this runtime.
-    if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
-    switch (serialized) {
-        .ok => |bytes| return if (status == status_ok)
-            .{ .status = status_ok, .result = bytes, .err = null }
-        else
-            .{ .status = status_exception, .result = null, .err = bytes },
-        .exception => |serialization_exception| {
-            defer ActiveEngine.freeValue(ctx, serialization_exception);
-            const thrown = serializeThreadValue(ctx, serialization_exception);
-            if (!instance_map.isTeardownPending(ActiveEngine.instanceIdFromCtx(ctx))) ActiveEngine.processPendingJobs(ctx);
-            switch (thrown) {
-                .ok => |bytes| return .{ .status = status_exception, .result = null, .err = bytes },
-                .exception => |nested| ActiveEngine.freeValue(ctx, nested),
-                .out_of_memory => return .{ .status = status_out_of_memory, .result = null, .err = null },
-                .invalid_argument => {},
-            }
-        },
-        .out_of_memory => return .{ .status = status_out_of_memory, .result = null, .err = null },
-        .invalid_argument => {},
-    }
-    const fallback = std.heap.c_allocator.dupe(u8, "Unable to serialize JavaScript result") catch
-        return .{ .status = status_out_of_memory, .result = null, .err = null };
-    return .{ .status = status_exception, .result = null, .err = fallback };
-}
-
-fn adoptTypedEval(instance_id: i32, result: @import("../script/typed_eval.zig").Result) Adopted {
-    if (result.out_of_memory) return .{ .status = status_out_of_memory, .result = null, .err = null };
-    const ctx = engine.getContext(instance_id) orelse return .{ .status = status_destroyed, .result = null, .err = null };
-    if (result.exception) |exception| return adoptTypedValue(ctx, exception, status_exception);
-    if (result.value) |value| return adoptTypedValue(ctx, value, status_ok);
-    return .{ .status = status_out_of_memory, .result = null, .err = null };
-}
-
-fn adoptEval(res: types.EvalResult) Adopted {
-    if (res.err) |err_slice| {
-        const owned: ?[]u8 = if (res.err_is_heap)
-            @constCast(err_slice)
-        else
-            std.heap.c_allocator.dupe(u8, err_slice) catch null;
-        if (res.result) |result_slice| std.heap.c_allocator.free(@constCast(result_slice));
-        return .{ .status = status_exception, .result = null, .err = owned };
-    }
-    if (res.result) |result_slice| {
-        return .{
-            .status = status_ok,
-            .result = @constCast(result_slice),
-            .err = null,
-        };
-    }
-    return .{ .status = status_ok, .result = null, .err = null };
-}
-
-fn writeEval(
-    res: types.EvalResult,
-    out_result: *?[*:0]u8,
-    out_error: *?[*:0]u8,
-) c_int {
-    const adopted = adoptEval(res);
-    if (adopted.status == status_exception) {
-        if (adopted.err) |text| {
-            out_error.* = host_value.dupeCString(text);
-            std.heap.c_allocator.free(text);
-        }
-        return status_exception;
-    }
-    if (adopted.result) |text| {
-        out_result.* = host_value.dupeCString(text);
-        std.heap.c_allocator.free(text);
-    }
-    return status_ok;
 }
 
 fn freeJobs(state: *State) void {

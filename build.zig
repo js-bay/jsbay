@@ -32,12 +32,7 @@ fn backendBit(tag: Backend) u32 {
 }
 
 fn parseBackendName(name: []const u8) ?Backend {
-    if (std.mem.eql(u8, name, "quickjs_ng")) return .quickjs_ng;
-    if (std.mem.eql(u8, name, "quickjs")) return .quickjs;
-    if (std.mem.eql(u8, name, "jsc")) return .jsc;
-    if (std.mem.eql(u8, name, "escargot")) return .escargot;
-    if (std.mem.eql(u8, name, "hermes")) return .hermes;
-    return null;
+    return std.meta.stringToEnum(Backend, name);
 }
 
 const ResolvedBackends = struct {
@@ -237,10 +232,7 @@ pub fn build(b: *std.Build) void {
         _ = b.run(&.{ "bash", stamp_script, @tagName(backend), "check", install_path });
     }
 
-    const zev_dep = b.dependency("zev", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const zev_dep = b.dependency("zev", .{ .target = target, .optimize = optimize });
     const zev = zev_dep.module("zev");
     zev_build.build_support_api.configureOhosMutex(b, zev, target, ohos_sysroot);
     const js_event_loop_dep = b.dependency("js_event_loop", .{ .target = target, .optimize = optimize });

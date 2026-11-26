@@ -39,15 +39,12 @@ var jsc_mic_key: usize = 0;
 var jsc_mic_binding: ?Binding = null;
 
 fn statusException(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) backend.ActiveEngine.Value {
-    const m = backend.ActiveEngineModule;
-    _ = m.qjs.JS_ThrowTypeError(ctx, message);
-    return m.c_api.JS_EXCEPTION;
+    _ = backend.ActiveEngineModule.qjs.JS_ThrowTypeError(ctx, message);
+    return backend.ActiveEngineModule.c_api.JS_EXCEPTION;
 }
 
 pub fn install(alloc: std.mem.Allocator, id: i32, ctx: backend.ActiveEngine.Context, name: []const u8, callback: Callback, user_data: ?*anyopaque, finalize: ?Finalize) InstallResult {
-    if (comptime backend.isJscApiBackend(backend.active_backend)) {
-        return jscInstall(alloc, id, ctx, name, callback, user_data, finalize);
-    }
+    if (comptime backend.isJscApiBackend(backend.active_backend)) return jscInstall(alloc, id, ctx, name, callback, user_data, finalize);
     if (comptime backend.isSpikeBackend(backend.active_backend)) {
         return spikeInstall(alloc, id, ctx, name, callback, user_data, finalize);
     }
@@ -148,10 +145,7 @@ fn spikeThrow(ctx: backend.ActiveEngine.Context, message: [*:0]const u8) backend
         @import("../backend/escargot/c_api.zig").escargot_throw(ctx, message);
         return null;
     }
-    if (comptime backend.active_backend == .hermes) {
-        @import("../backend/hermes/c_api.zig").hermes_throw(ctx, message);
-        return null;
-    }
+    if (comptime backend.active_backend == .hermes) @import("../backend/hermes/c_api.zig").hermes_throw(ctx, message);
     return null;
 }
 

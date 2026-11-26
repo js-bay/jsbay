@@ -173,24 +173,15 @@ const TaskQueue = struct {
 
 const InstanceMap = std.AutoHashMap(i32, *EngineInstance);
 
-var instances: InstanceMap = InstanceMap.init(std.heap.c_allocator);
-var mutex: sync.Mutex = .{};
+pub var instances: InstanceMap = InstanceMap.init(std.heap.c_allocator);
+pub var mutex: sync.Mutex = .{};
 var next_generation: u64 = 1;
-var ref_wait_hook_for_testing: ?*const fn (?*anyopaque) void = null;
-var ref_drain_hook_for_testing: ?*const fn (?*anyopaque) void = null;
-var ref_hook_context_for_testing: ?*anyopaque = null;
-
-pub fn setRefHooksForTesting(wait_hook: ?*const fn (?*anyopaque) void, drain_hook: ?*const fn (?*anyopaque) void, ctx: ?*anyopaque) void {
-    if (!builtin.is_test) return;
-    ref_wait_hook_for_testing = wait_hook;
-    ref_drain_hook_for_testing = drain_hook;
-    ref_hook_context_for_testing = ctx;
-}
-
-pub fn noteRefBookkeepingDrainedForTesting() void {
-    if (!builtin.is_test) return;
-    if (ref_drain_hook_for_testing) |hook| hook(ref_hook_context_for_testing);
-}
+const ref_admission = @import("ref_admission.zig");
+pub const RefLease = ref_admission.RefLease;
+pub const beginRefOp = ref_admission.beginRefOp;
+pub const waitForRefOps = ref_admission.waitForRefOps;
+pub const setRefHooksForTesting = ref_admission.setRefHooksForTesting;
+pub const noteRefBookkeepingDrainedForTesting = ref_admission.noteRefBookkeepingDrainedForTesting;
 
 pub fn insert(instance: *EngineInstance) bool {
     return insertWith(instance, struct {
@@ -399,56 +390,6 @@ fn closeInstanceAdmission(inst: *EngineInstance) void {
     inst.ref_bookkeeping.mutex.lock();
     inst.ref_bookkeeping.admission_closed = true;
     inst.ref_bookkeeping.wake.broadcast();
-    inst.ref_bookkeeping.mutex.unlock();
-}
-
-pub const RefLease = struct {
-    inst: *EngineInstance,
-    generation: u64,
-
-    pub fn end(self: RefLease) bool {
-        self.inst.ref_bookkeeping.mutex.lock();
-        std.debug.assert(self.inst.ref_bookkeeping.active_ops != 0);
-        self.inst.ref_bookkeeping.active_ops -= 1;
-        const outermost = self.inst.ref_bookkeeping.active_ops == 0;
-        self.inst.ref_bookkeeping.wake.broadcast();
-        self.inst.ref_bookkeeping.mutex.unlock();
-        return outermost;
-    }
-};
-
-/// Admit an operation that can read a reference cell or call its backend. The registry lock serializes admission with teardown closure and generation capture.
-pub fn beginRefOp(instance_id: i32, expected_generation: ?u64) ?RefLease {
-    mutex.lock();
-    defer mutex.unlock();
-    const inst = instances.get(instance_id) orelse return null;
-    if (inst.teardown_pending or inst.ref_bookkeeping.admission_closed) return null;
-    if (expected_generation) |generation| {
-        if (inst.generation != generation) return null;
-    }
-    inst.ref_bookkeeping.mutex.lock();
-    inst.ref_bookkeeping.active_ops += 1;
-    inst.ref_bookkeeping.mutex.unlock();
-    return .{ .inst = inst, .generation = inst.generation };
-}
-
-/// Drain admitted reference operations before force-resetting cells or freeing the VM context.
-pub fn waitForRefOps(instance_id: i32) void {
-    mutex.lock();
-    const inst = instances.get(instance_id) orelse {
-        mutex.unlock();
-        return;
-    };
-    mutex.unlock();
-    inst.ref_bookkeeping.mutex.lock();
-    if (inst.ref_bookkeeping.active_ops != 0 and builtin.is_test) {
-        inst.ref_bookkeeping.mutex.unlock();
-        if (ref_wait_hook_for_testing) |hook| hook(ref_hook_context_for_testing);
-        inst.ref_bookkeeping.mutex.lock();
-    }
-    while (inst.ref_bookkeeping.active_ops != 0) {
-        inst.ref_bookkeeping.wake.wait(&inst.ref_bookkeeping.mutex);
-    }
     inst.ref_bookkeeping.mutex.unlock();
 }
 

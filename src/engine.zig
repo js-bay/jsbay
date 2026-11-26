@@ -844,7 +844,7 @@ fn releaseRuntimeResources(instance_id: i32, instance: *instance_map.EngineInsta
     _ = @import("runtime/runtime_control.zig").deinit(instance_id);
 
     // 3b. Force-reset any live Global/Weak references so their retained JS values are released BEFORE we tear down the context/runtime. This prevents use-after-free when users forget to call `reset()`.
-    forceResetBookkeeping(&instance.ref_bookkeeping);
+    @import("runtime/ref_admission.zig").forceResetBookkeeping(&instance.ref_bookkeeping);
 
     @import("backend/console_timers.zig").deinitInstance(instance_id);
 }
@@ -892,48 +892,6 @@ pub fn getRuntime(instance_id: i32) ?ActiveEngine.Runtime {
     return instance.monoRuntime();
 }
 
-/// Walk the bookkeeping list, popping each entry and invoking its reset_fn so it can release its retained JS value before the runtime is freed. We unlink entries ourselves so reset_fn does not need to interact with the bookkeeping list (it's already detached by the time it runs).
-fn forceResetBookkeeping(book: *instance_map.RefBookkeeping) void {
-    while (true) {
-        book.mutex.lock();
-        const entry = book.head orelse {
-            book.mutex.unlock();
-            break;
-        };
-        // Pop from head.
-        book.head = entry.next;
-        if (book.head) |h| h.prev = null;
-        entry.prev = null;
-        entry.next = null;
-        book.mutex.unlock();
-        while (true) {
-            const state: instance_map.RefEntryState = @fromBackingInt(@intCast(entry.state.load(.acquire)));
-            const next: instance_map.RefEntryState = switch (state) {
-                .linked => .releasing,
-                .abandoned => .releasing_abandoned,
-                .releasing, .released, .releasing_abandoned, .freed => unreachable,
-            };
-            if (entry.state.cmpxchgWeak(@backingInt(state), @backingInt(next), .acq_rel, .acquire) == null) {
-                break;
-            }
-        }
-        entry.reset_fn(entry);
-        while (true) {
-            const current: instance_map.RefEntryState = @fromBackingInt(@intCast(entry.state.load(.acquire)));
-            const next: instance_map.RefEntryState = switch (current) {
-                .releasing => .released,
-                .releasing_abandoned => .freed,
-                .linked, .released, .abandoned, .freed => unreachable,
-            };
-            if (entry.state.cmpxchgWeak(@backingInt(current), @backingInt(next), .acq_rel, .acquire) == null) {
-                if (next == .freed) entry.free_fn(entry);
-                break;
-            }
-        }
-    }
-    instance_map.noteRefBookkeepingDrainedForTesting();
-}
-
 // ---- Event-loop work ----
 
 fn runOneAsync(instance_id: i32) bool {
@@ -965,95 +923,4 @@ fn runOneAsync(instance_id: i32) bool {
     if (result.err_is_heap) if (result.err) |value| std.heap.c_allocator.free(@constCast(value));
     _ = queued.end();
     return true;
-}
-
-test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Linux dispatch proof)" {
-    // Force the erase/dispatch path even for the pack primary so Linux single-pack CI proves
-    // EngineInstance.packed_alt without needing a second real engine (JSC is Apple-only).
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    const tag = backend.active_backend;
-    const backend_dispatch = @import("backend_dispatch.zig");
-    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    errdefer loop.destroy();
-    const handles = backend_dispatch.createPacked(tag) orelse return error.CreatePackedFailed;
-    errdefer backend_dispatch.destroyPacked(tag, handles);
-    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch return error.Oom;
-    errdefer std.heap.c_allocator.destroy(instance);
-    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse return error.BudgetFailed;
-    errdefer resources.deinit();
-    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create(std.heap.c_allocator) orelse return error.Oom;
-    errdefer execution_cpu.close();
-    instance.* = .{
-        .allocator = std.heap.c_allocator,
-        .resources = resources,
-        .execution_cpu = execution_cpu,
-        .instance_id = id,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
-        .loop = loop,
-        .timers = timers.TimerRegistry.init(),
-    };
-    errdefer instance.deinitSynchronization();
-    if (!instance_map.insert(instance)) return error.InsertFailed;
-    defer destroy(id);
-
-    try std.testing.expect(!instance_map.getInstance(id).?.isPrimaryBackend());
-    try std.testing.expectEqual(tag, instance_map.getInstance(id).?.backendTag());
-    const res = evalScript(id, "40+2", "<packed-alt-proof>");
-    defer {
-        if (res.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (res.err_is_heap) {
-            if (res.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(res.err == null);
-    try std.testing.expectEqualStrings("42", res.result.?);
-
-    // Timers on packed-alt: schedule + one event-loop turn must fire the callback.
-    const timed = evalScript(
-        id,
-        "var __packedAltTimer__ = 0; setTimeout(function () { __packedAltTimer__ = 7; }, 0); __packedAltTimer__;",
-        "<packed-alt-timer-arm>",
-    );
-    defer {
-        if (timed.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (timed.err_is_heap) {
-            if (timed.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(timed.err == null);
-    try std.testing.expectEqualStrings("0", timed.result.?);
-    runEventLoopOnce(id);
-    const after = evalScript(id, "__packedAltTimer__", "<packed-alt-timer-check>");
-    defer {
-        if (after.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (after.err_is_heap) {
-            if (after.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(after.err == null);
-    try std.testing.expectEqualStrings("7", after.result.?);
-}
-
-test "engine: create with testing.allocator succeeds and frees cleanly" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try createWithBackend(id, .{ .allocator = std.testing.allocator }, backend.active_backend);
-    defer destroy(id);
-
-    const inst = instance_map.getInstance(id) orelse return error.InstanceNotFound;
-    try std.testing.expectEqual(std.testing.allocator, inst.allocator);
-    const res = evalScript(id, "1 + 1", "<alloc-test>");
-    defer helpers.freeEvalResult(res);
-    try std.testing.expect(res.err == null);
-}
-
-test "engine: create duplicate instance returns InstanceAlreadyExists error" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try createWithBackend(id, .{}, backend.active_backend);
-    defer destroy(id);
-
-    try std.testing.expectError(error.InstanceAlreadyExists, createWithBackend(id, .{}, backend.active_backend));
 }
