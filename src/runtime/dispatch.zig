@@ -201,6 +201,7 @@ pub const DeferredDestroyAction = struct {
 const TeardownQueue = struct {
     var mu: sync.Mutex = .{};
     var cv: sync.Condition = .init;
+    var cv_not_full: sync.Condition = .init;
     var thread: ?std.Thread = null;
     var initialized: bool = false;
     var queue: [32]DeferredDestroyAction = undefined;
@@ -217,6 +218,7 @@ const TeardownQueue = struct {
             const action = queue[head];
             head = (head + 1) % queue.len;
             count -= 1;
+            cv_not_full.signal();
             mu.unlock();
 
             action.func(action.instance_id, action.generation);
@@ -235,30 +237,26 @@ const TeardownQueue = struct {
         }
     }
 
-    pub fn push(action: DeferredDestroyAction) bool {
+    pub fn push(action: DeferredDestroyAction) void {
         mu.lock();
         defer mu.unlock();
         if (!initialized) {
-            if (std.Thread.spawn(.{}, worker, .{})) |t| {
-                t.detach();
-                thread = t;
-                initialized = true;
-            } else |_| {
-                return false;
-            }
+            action.func(action.instance_id, action.generation);
+            return;
         }
         for (0..count) |i| {
             const idx = (head + i) % queue.len;
             if (queue[idx].instance_id == action.instance_id and queue[idx].generation == action.generation) {
-                return true;
+                return;
             }
         }
-        if (count >= queue.len) return false;
+        while (count >= queue.len) {
+            cv_not_full.wait(&mu);
+        }
         queue[tail] = action;
         tail = (tail + 1) % queue.len;
         count += 1;
         cv.signal();
-        return true;
     }
 };
 
@@ -267,18 +265,7 @@ pub fn ensureTeardownWorkerStarted() void {
 }
 
 pub fn handOffDeferredDestroy(action: DeferredDestroyAction) void {
-    if (!TeardownQueue.push(action)) {
-        const Runner = struct {
-            fn run(a: DeferredDestroyAction) void {
-                a.func(a.instance_id, a.generation);
-            }
-        };
-        if (std.Thread.spawn(.{}, Runner.run, .{action})) |t| {
-            t.detach();
-        } else |_| {
-            action.func(action.instance_id, action.generation);
-        }
-    }
+    TeardownQueue.push(action);
 }
 
 pub fn leaveTaskOwnerFrameDeferred(frame: *TaskOwnerFrame) ?DeferredDestroyAction {

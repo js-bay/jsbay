@@ -3863,8 +3863,7 @@ extern "C" bool hermes_set_rejection_tracker(JsbayHermesContext *ctx, int32_t in
                         std::string reason_str;
                         if (count >= 2 && args[1].isString()) {
                             reason_str = args[1].getString(rt0).utf8(rt0);
-                        }
-                        if (reason_str.empty()) {
+                        } else {
                             constexpr char fallback_reason[] = "Promise rejected";
                             reason_str.assign(fallback_reason, sizeof(fallback_reason) - 1);
                         }
