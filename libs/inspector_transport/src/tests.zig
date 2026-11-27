@@ -7,6 +7,7 @@ const test_client = @import("test_client");
 comptime {
     _ = @import("transport_contract_tests.zig");
     _ = @import("governance_contract_tests.zig");
+    _ = @import("writer_shutdown_tests.zig");
 }
 
 const Stream = test_client.Stream;

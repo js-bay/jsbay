@@ -1,20 +1,17 @@
-//! Chrome DevTools Protocol inspector transport (MVP).
+//! Cross-platform loopback HTTP/WebSocket transport for Inspector.
 //!
-//! Byte-level WebSocket + minimal HTTP discovery endpoints, built on a small cross-platform loopback socket layer.
-//!
-//! Responsibilities:
-//!   - Bind a TCP port, accept connections on a background thread.
-//!   - Serve /json, /json/list, /json/version, /json/protocol discovery.
-//!   - Upgrade HTTP → WebSocket on GET /<target-id> with Sec-WebSocket-Key.
-//! - Spawn a per-session reader thread that unmasks text frames and fires a caller-supplied handler. Handlers run on reader threads and MUST be thread-safe.
-//!   - Send WS text frames from any thread (per-session write mutex).
-//!
-//! Explicitly NOT responsible for CDP protocol semantics; this is pure transport. Higher layers compose JSON-RPC on top.
+//! It serves discovery endpoints and WebSocket sessions; CDP semantics belong to Inspector. Reader callbacks run on session threads and must be thread-safe.
 
 const std = @import("std");
 const inspector = @import("inspector");
 const zev = @import("zev");
 const socket = @import("portable_socket");
+const FrameDeadline = @import("frame_deadline.zig").FrameDeadline;
+const writer_test_support = @import("writer_test_support.zig");
+const RawListener = @import("raw_listener.zig").RawListener;
+const outbound = @import("outbound.zig");
+const OutboundKind = outbound.OutboundKind;
+const Outbound = outbound.Outbound;
 
 // Active callback and delivery frames are tracked on the stack so nested or cross-transport callbacks correctly recognize callers during teardown.
 const CallbackFrame = struct {
@@ -44,28 +41,6 @@ fn inActiveCallback(t: *Transport) bool {
     }
     return findActiveDeliveryFrame(t) != null;
 }
-
-const FrameDeadline = struct {
-    stall_timeout_ms: i64,
-    max_deadline: i64,
-
-    fn init(stall_ms: i64, max_ms: i64) FrameDeadline {
-        const now = @as(i64, @intCast(zev.monotonicMilliseconds()));
-        return .{
-            .stall_timeout_ms = stall_ms,
-            .max_deadline = now + max_ms,
-        };
-    }
-
-    fn checkExpired(self: FrameDeadline) !void {
-        const now = @as(i64, @intCast(zev.monotonicMilliseconds()));
-        if (now >= self.max_deadline) return error.TimedOut;
-    }
-
-    fn stallDeadline(self: FrameDeadline, now: i64) i64 {
-        return @min(now + self.stall_timeout_ms, self.max_deadline);
-    }
-};
 
 // -- Portable socket layer -------------------------------------------------
 const RawSocket = struct {
@@ -99,20 +74,23 @@ const RawSocket = struct {
     fn writeUntil(s: RawSocket, bytes: []const u8, frame_deadline: FrameDeadline, sess: ?*Session, shutdown: ?*const std.atomic.Value(bool)) !void {
         var off: usize = 0;
         var now = @as(i64, @intCast(zev.monotonicMilliseconds()));
-        if (now >= frame_deadline.max_deadline) return error.TimedOut;
-        var stall_deadline = frame_deadline.stallDeadline(now);
+        var deadline = if (sess) |active| active.writeDeadline(frame_deadline.max_deadline) else frame_deadline.max_deadline;
+        if (now >= deadline) return error.TimedOut;
+        var stall_deadline = @min(frame_deadline.stallDeadline(now), deadline);
         while (off < bytes.len) {
+            now = @as(i64, @intCast(zev.monotonicMilliseconds()));
+            deadline = if (sess) |active| active.writeDeadline(frame_deadline.max_deadline) else frame_deadline.max_deadline;
+            if (now >= deadline) return error.TimedOut;
             if (sess) |active| {
                 if (active.closed.load(.acquire)) return error.Closed;
             }
             if (shutdown) |sd| {
                 if (sd.load(.acquire)) return error.Closed;
             }
-            try frame_deadline.checkExpired();
             const n = s.write(bytes[off..]) catch |err| switch (err) {
                 error.Interrupted => continue,
                 error.WouldBlock => {
-                    try waitSocket(s, socket.PollEvent.write, stall_deadline, sess, shutdown);
+                    try waitSocket(s, socket.PollEvent.write, @min(stall_deadline, deadline), sess, shutdown);
                     continue;
                 },
                 else => return error.WriteFailed,
@@ -120,23 +98,10 @@ const RawSocket = struct {
             if (n == 0) return error.WriteFailed;
             off += @intCast(n);
             now = @as(i64, @intCast(zev.monotonicMilliseconds()));
-            if (now >= frame_deadline.max_deadline) return error.TimedOut;
-            stall_deadline = frame_deadline.stallDeadline(now);
+            deadline = if (sess) |active| active.writeDeadline(frame_deadline.max_deadline) else frame_deadline.max_deadline;
+            if (now >= deadline) return error.TimedOut;
+            stall_deadline = @min(frame_deadline.stallDeadline(now), deadline);
         }
-    }
-};
-
-const RawListener = struct {
-    listener: socket.Listener,
-    port: u16,
-
-    fn close(listener: RawListener) void {
-        listener.listener.close();
-    }
-
-    fn listenIp4Loopback(want_port: u16) !RawListener {
-        const listener = try socket.listenLoopback(want_port);
-        return .{ .listener = listener, .port = listener.port };
     }
 };
 
@@ -163,14 +128,6 @@ const stall_timeout_ms: i64 = 5_000;
 const max_write_timeout_ms: i64 = 60_000;
 const io_poll_ms: i32 = 100;
 
-const OutboundKind = enum { text, pong, close };
-
-const Outbound = struct {
-    kind: OutboundKind,
-    bytes: []u8,
-    delivery_token: u64 = 0,
-};
-
 const Session = struct {
     id: SessionId,
     stream: RawSocket,
@@ -187,6 +144,7 @@ const Session = struct {
     queued_backlog_bytes: usize = 0,
     large_message_in_flight: bool = false,
     accepting: bool = true,
+    draining: bool = false,
     closed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Threads are detached. Their references give the transport a durable lifetime boundary while avoiding an ever-growing list of joined handles.
     transport: *Transport,
@@ -330,6 +288,25 @@ const Session = struct {
     fn workerFinished(self: *Session) bool {
         return self.workers_remaining.fetchSub(1, .acq_rel) == 1;
     }
+
+    fn beginDrain(self: *Session) void {
+        self.queue_mu.lock();
+        if (self.closed.load(.acquire)) {
+            self.queue_mu.unlock();
+            return;
+        }
+        self.accepting = false;
+        self.draining = true;
+        self.queue_changed.broadcast();
+        self.queue_mu.unlock();
+        if (self.transport.testing_writer_barrier) |barrier| barrier.notifyCloseStarted(self.id, self.transport.close_deadline_ms.load(.acquire));
+    }
+
+    fn writeDeadline(self: *Session, frame_deadline: i64) i64 {
+        const close_deadline = self.transport.close_deadline_ms.load(.acquire);
+        if (self.transport.testing_writer_barrier) |barrier| barrier.observeWriteDeadline(self.id, close_deadline);
+        return if (close_deadline == 0) frame_deadline else @min(frame_deadline, close_deadline);
+    }
 };
 
 /// Per-session entry stored in Transport.sessions. Heap-allocated so its address is stable while reader threads hold a pointer.
@@ -338,6 +315,7 @@ const SessionEntry = struct {
 };
 
 pub const Transport = struct {
+    pub const WriterTestBarrier = writer_test_support.WriterTestBarrier;
     /// Adapter used by Inspector. The HTTP/WebSocket server remains optional:
     /// callers may instead implement this same Inspector transport interface.
     interface: inspector.Transport = undefined,
@@ -369,6 +347,9 @@ pub const Transport = struct {
     deferred_deinit: bool = false,
     deinit_started: std.atomic.Value(bool) = .init(false),
     callback_leases: usize = 0,
+    close_deadline_ms: std.atomic.Value(i64) = .init(0),
+    /// Test-only synchronization for an outbound frame held by its writer.
+    testing_writer_barrier: ?*writer_test_support.WriterTestBarrier = null,
 
     /// Monotonic session id counter (starts at 1).
     next_session_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
@@ -426,11 +407,17 @@ pub const Transport = struct {
 
     /// Outside an event handler, waits for every owned thread and socket. In this transport's handler, requests shutdown and returns; the last worker releases the transport after all callbacks have unwound. The allocator and handler context must outlive that deferred release.
     pub fn deinit(self: *Transport) void {
+        _ = self.close_deadline_ms.cmpxchgStrong(
+            0,
+            @as(i64, @intCast(zev.monotonicMilliseconds())) + write_deadline_ms,
+            .acq_rel,
+            .acquire,
+        );
         if (self.deinit_started.swap(true, .acq_rel)) return;
         if (inActiveCallback(self)) {
             self.shutdown.store(true, .release);
             self.sessions_mu.lock();
-            for (self.sessions.items) |sess| sess.requestClose();
+            for (self.sessions.items) |sess| sess.beginDrain();
             self.sessions_mu.unlock();
             // The accept loop participates in deferred ownership, including when session_opened is the callback requesting shutdown.
             if (self.accept_thread) |thread| thread.detach();
@@ -455,9 +442,9 @@ pub const Transport = struct {
             self.server = null;
         }
 
-        // Do not take an allocating snapshot: OOM must not leave a session asleep during shutdown.  requestClose does not acquire sessions_mu, and removals wait until this iteration releases it.
+        // Do not take an allocating snapshot: OOM must not leave a session asleep during shutdown. beginDrain does not acquire sessions_mu, and removals wait until this iteration releases it.
         self.sessions_mu.lock();
-        for (self.sessions.items) |sess| sess.requestClose();
+        for (self.sessions.items) |sess| sess.beginDrain();
         self.sessions_mu.unlock();
 
         // Wait for detached workers and active callback leases so no reader, writer, transport-owned socket, or callback lease remains once deinit returns.
@@ -1046,7 +1033,7 @@ fn writerLoop(sess: *Session) void {
     }
     while (true) {
         sess.queue_mu.lock();
-        while (sess.queue.items.len == sess.queue_head and !sess.closed.load(.acquire)) {
+        while (sess.queue.items.len == sess.queue_head and !sess.closed.load(.acquire) and !sess.draining) {
             sess.queue_changed.wait(&sess.queue_mu);
         }
         if (sess.queue.items.len == sess.queue_head) {
@@ -1076,6 +1063,7 @@ fn writerLoop(sess: *Session) void {
         }
         sess.queue_mu.unlock();
 
+        if (t.testing_writer_barrier) |barrier| barrier.pauseWriter();
         const ok = writeFrame(sess, frame.kind, frame.bytes);
         const close_after = frame.kind == .close;
         if (frame.delivery_token != 0) {
@@ -1099,7 +1087,12 @@ fn waitSocket(stream: RawSocket, events: socket.PollEvent, deadline: ?i64, sess:
             if (sd.load(.acquire)) return error.Closed;
         }
         var timeout: i32 = io_poll_ms;
-        if (deadline) |limit| {
+        var effective_deadline = deadline;
+        if (sess) |active| {
+            const close_limit = active.writeDeadline(deadline orelse std.math.maxInt(i64));
+            effective_deadline = if (deadline) |limit| @min(limit, close_limit) else close_limit;
+        }
+        if (effective_deadline) |limit| {
             const remaining = limit - @as(i64, @intCast(zev.monotonicMilliseconds()));
             if (remaining <= 0) return error.TimedOut;
             timeout = @intCast(@min(remaining, @as(i64, io_poll_ms)));
@@ -1141,7 +1134,13 @@ fn sessionLoop(sess: *Session) void {
     const t = sess.transport;
     const graceful = readLoop(sess) catch false;
     defer {
-        if (!graceful) sess.requestClose();
+        if (!graceful) {
+            if (t.close_deadline_ms.load(.acquire) != 0) {
+                sess.beginDrain();
+            } else {
+                sess.requestClose();
+            }
+        }
         t.fire(.{ .kind = .session_closed, .session_id = sess.id, .payload = &.{} });
         t.removeSession(sess.id);
         const final_worker = sess.workerFinished();
@@ -1249,7 +1248,7 @@ fn readExact(sess: *Session, buf: []u8) !void {
         if (sess.closed.load(.acquire) or sess.transport.shutdown.load(.acquire)) return error.Closed;
         const n = sess.stream.read(buf[got..]) catch |err| switch (err) {
             error.WouldBlock => {
-                try waitSocket(sess.stream, .read, null, sess, null);
+                try waitSocket(sess.stream, .read, null, sess, &sess.transport.shutdown);
                 continue;
             },
             else => return err,
