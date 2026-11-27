@@ -412,7 +412,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          submodules: false
+      - name: Initialize QuickJS source
+        run: git submodule update --init vendor/quickjs
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
@@ -449,7 +451,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          submodules: false
+      - name: Initialize QuickJS NG source
+        run: git submodule update --init vendor/quickjs-ng
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0

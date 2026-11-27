@@ -137,7 +137,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: ${{ inputs.verify_published && 1 || 0 }}
-          submodules: ${{ !inputs.verify_published && 'recursive' || 'false' }}
+          submodules: ${{ !inputs.verify_published && runner.os != 'Windows' && 'recursive' || 'false' }}
+
+      - name: Initialize the QuickJS NG source
+        if: ${{ !inputs.verify_published && runner.os == 'Windows' && matrix.zig_backend == 'quickjs_ng' }}
+        run: git submodule update --init vendor/quickjs-ng
 
       - uses: actions/setup-node@v6
         with:

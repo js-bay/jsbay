@@ -723,6 +723,9 @@ pub fn destroy(instance_id: i32) void {
 
 pub fn destroyGeneration(instance_id: i32, generation: u64) void {
     const engine_thread = @import("runtime/engine_thread.zig");
+    if (builtin.is_test) {
+        if (before_teardown_claim_hook_for_testing) |hook| hook(instance_id, generation, before_teardown_claim_context_for_testing);
+    }
     if (!instance_map.markTeardownPendingForGeneration(instance_id, generation)) return;
     if (engine_thread.isDestroying(instance_id)) return;
     if (engine_thread.isEvalActiveOnCurrentThread(instance_id)) {
@@ -734,9 +737,6 @@ pub fn destroyGeneration(instance_id: i32, generation: u64) void {
 
     var gate_lease: engine_thread.DestroyGateLease = undefined;
     if (!engine_thread.lockDestroyGateForGeneration(instance_id, generation, &gate_lease)) return;
-    if (builtin.is_test) {
-        if (before_teardown_claim_hook_for_testing) |hook| hook(instance_id, generation, before_teardown_claim_context_for_testing);
-    }
     const claim = instance_map.claimTeardownForGeneration(instance_id, generation);
     engine_thread.unlockGenerationDestroyGate(&gate_lease);
     if (claim == .stale) return;

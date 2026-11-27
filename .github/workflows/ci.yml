@@ -747,7 +747,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          submodules: false
+      - name: Initialize required JavaScript engine sources
+        shell: bash
+        run: git submodule update --init vendor/quickjs vendor/quickjs-ng
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0

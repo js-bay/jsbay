@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 
 const root = resolve(fileURLToPath(new URL('../..', import.meta.url)))
 const ci = await readFile(join(root, '.github/workflows/ci.yml'), 'utf8')
+const extendedTests = await readFile(join(root, '.github/workflows/extended-tests.yml'), 'utf8')
 const npmWorkflow = await readFile(join(root, '.github/workflows/npm-packages.yml'), 'utf8')
 const electronConsumer = await readFile(join(root, 'tests/node-sdk/electron-packaged-consumer.mjs'), 'utf8')
 const electronPackagerChild = await readFile(join(root, 'tests/node-sdk/electron-packager-child.mjs'), 'utf8')
@@ -38,7 +39,10 @@ assert.match(ci, /node-npm-version:[\s\S]*?if: github\.event_name == 'pull_reque
 assert.match(ci, /node-npm-version:[\s\S]*?uses: actions\/setup-node@v6[\s\S]*?node-version: '24'/)
 assert.match(ci, /node-npm-packages:[\s\S]*?if: github\.event_name == 'pull_request'[\s\S]*?needs: node-npm-version[\s\S]*?uses: \.\/\.github\/workflows\/npm-packages\.yml[\s\S]*?tag: \$\{\{ needs\.node-npm-version\.outputs\.tag \}\}/)
 assert.match(ci, /node-npm-packages:[\s\S]*?name: Node npm platform matrix \(Windows MSVC and Electron\)/)
+assert.match(ci, /^  windows:\n    name: windows[\s\S]*?submodules: false[\s\S]*?git submodule update --init vendor\/quickjs vendor\/quickjs-ng/m)
+assert.match(extendedTests, /^  windows:\n    name: windows[\s\S]*?submodules: false[\s\S]*?git submodule update --init vendor\/quickjs\n[\s\S]*?^  windows-arm:\n    name: windows-arm[\s\S]*?submodules: false[\s\S]*?git submodule update --init vendor\/quickjs-ng/m)
 assert.match(npmWorkflow, /platform: win32[\s\S]*?arch: x64[\s\S]*?runner: windows-2025/)
+assert.match(npmWorkflow, /submodules: \$\{\{ !inputs\.verify_published && runner\.os != 'Windows' && 'recursive' \|\| 'false' \}\}[\s\S]*?runner\.os == 'Windows' && matrix\.zig_backend == 'quickjs_ng'[\s\S]*?git submodule update --init vendor\/quickjs-ng/)
 assert.equal([...nativeConsumerRunner.matchAll(/run-consumer-with-watchdog\.mjs"\s+30000[^\n]*extended_contract_consumer\.cjs/g)].length, 1, 'the extended contract consumer runs under the external watchdog')
 assert.match(nativeConsumerRunner, /JSBAY_NODE_BACKEND:-\} == jsc && \${JSBAY_NODE_PLATFORM:-\} == darwin && \${JSBAY_NODE_ARCH:-\} == arm64/)
 assert.match(nativeConsumerRunner, /run_jsc_arm64_public_entry_contracts\n/)
