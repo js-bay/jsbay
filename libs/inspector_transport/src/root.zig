@@ -241,6 +241,7 @@ const Session = struct {
                 notifyDelivery(self.transport, self.id, token);
             }
         }
+        if (self.transport.testing_writer_barrier) |barrier| barrier.notifyCloseStarted();
         self.stream.shutdownBoth();
     }
 
@@ -369,6 +370,8 @@ pub const Transport = struct {
     deferred_deinit: bool = false,
     deinit_started: std.atomic.Value(bool) = .init(false),
     callback_leases: usize = 0,
+    /// Test-only synchronization for a queued writer frame during shutdown.
+    testing_writer_barrier: ?*WriterTestBarrier = null,
 
     /// Monotonic session id counter (starts at 1).
     next_session_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
@@ -387,6 +390,70 @@ pub const Transport = struct {
     nested_deliveries: [max_nested_deliveries]NestedDelivery = undefined,
     nested_head: usize = 0,
     nested_tail: usize = 0,
+
+    pub const WriterTestBarrier = struct {
+        mutex: zev.Mutex = .{},
+        changed: zev.Condition = .init,
+        pause_next: bool = true,
+        paused: bool = false,
+        released: bool = false,
+        close_started: bool = false,
+
+        pub fn deinit(self: *WriterTestBarrier) void {
+            self.changed.deinit();
+            self.mutex.deinit();
+        }
+
+        fn pauseWriter(self: *WriterTestBarrier) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (!self.pause_next) return;
+            self.pause_next = false;
+            self.paused = true;
+            self.changed.broadcast();
+            while (!self.released) self.changed.wait(&self.mutex);
+        }
+
+        fn notifyCloseStarted(self: *WriterTestBarrier) void {
+            self.mutex.lock();
+            self.close_started = true;
+            self.changed.broadcast();
+            self.mutex.unlock();
+        }
+
+        pub fn waitUntilPaused(self: *WriterTestBarrier, timeout_ms: u64) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            var remaining = timeout_ms;
+            while (!self.paused and remaining != 0) {
+                const started = zev.monotonicMilliseconds();
+                if (self.changed.waitTimeout(&self.mutex, remaining) == .timed_out) break;
+                const elapsed = zev.monotonicMilliseconds() - started;
+                remaining = if (elapsed >= remaining) 0 else remaining - elapsed;
+            }
+            return self.paused;
+        }
+
+        pub fn waitUntilCloseStarted(self: *WriterTestBarrier, timeout_ms: u64) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            var remaining = timeout_ms;
+            while (!self.close_started and remaining != 0) {
+                const started = zev.monotonicMilliseconds();
+                if (self.changed.waitTimeout(&self.mutex, remaining) == .timed_out) break;
+                const elapsed = zev.monotonicMilliseconds() - started;
+                remaining = if (elapsed >= remaining) 0 else remaining - elapsed;
+            }
+            return self.close_started;
+        }
+
+        pub fn releaseWriter(self: *WriterTestBarrier) void {
+            self.mutex.lock();
+            self.released = true;
+            self.changed.broadcast();
+            self.mutex.unlock();
+        }
+    };
 
     pub const Options = struct {
         max_message_bytes: usize = default_max_message_bytes,
@@ -1044,6 +1111,7 @@ fn writerLoop(sess: *Session) void {
         if (final_worker) t.sessionSlotGone();
         t.workerGone();
     }
+    if (t.testing_writer_barrier) |barrier| barrier.pauseWriter();
     while (true) {
         sess.queue_mu.lock();
         while (sess.queue.items.len == sess.queue_head and !sess.closed.load(.acquire)) {
