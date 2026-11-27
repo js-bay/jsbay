@@ -1113,6 +1113,16 @@ test "transport: shutdown delivers an accepted frame before closing a paused wri
     var barrier: transport.Transport.WriterTestBarrier = .{};
     defer barrier.deinit();
     const t = try transport.Transport.init(alloc, 0);
+    var deinit_thread: ?std.Thread = null;
+    var deinit_complete = false;
+    defer {
+        barrier.releaseWriter();
+        if (deinit_thread) |thread| {
+            thread.join();
+        } else if (!deinit_complete) {
+            t.deinit();
+        }
+    }
     t.testing_writer_barrier = &barrier;
     t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "drain-peer" });
     try t.start(&opened, Opened.handler);
@@ -1125,10 +1135,12 @@ test "transport: shutdown delivers an accepted frame before closing a paused wri
     try testing.expect(t.sendText(session, "accepted-before-shutdown"));
 
     var probe = DeinitProbe{ .transport_ptr = t };
-    const thread = try std.Thread.spawn(.{}, DeinitProbe.run, .{&probe});
+    deinit_thread = try std.Thread.spawn(.{}, DeinitProbe.run, .{&probe});
     const close_started = barrier.waitUntilCloseStarted(5_000);
     barrier.releaseWriter();
-    thread.join();
+    deinit_thread.?.join();
+    deinit_thread = null;
+    deinit_complete = true;
     try testing.expect(close_started);
 
     const message = try readTextFrame(alloc, peer);
