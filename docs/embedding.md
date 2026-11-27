@@ -19,6 +19,14 @@ Build with `-Dbackend=quickjs_ng`, `-Dbackend=quickjs`, or `-Dbackend=jsc`. All 
 
 `setMemoryLimit(id, 0)` means unlimited through the common API. QuickJS needs an adapter because its native zero means a zero-byte limit; QuickJS-NG already treats zero as unlimited. Engine limits are not process-memory limits. [Runtime limits](runtime-limits.md) explains the admission and isolation boundaries; [Inspector](inspector.md) describes its optional build switches and protocol limits.
 
+## JavaScriptCore polling on macOS arm64
+
+The C ABI sets `JSC_usePollingTraps=true` in the native process environment when it is unset, immediately before JS Bay creates its first JavaScriptCore context group. An explicit `true`, `yes`, or `1` enables interrupt and non-zero execution deadlines; `false`, `no`, or `0` leaves ordinary evaluation available but disables those controls. Zero-valued limits can still clear a deadline. `cancel` and `beginShutdown` still handle queued work and native waits, but cannot interrupt a running unbounded script when polling traps are disabled, so closing its engine may wait indefinitely.
+
+The setting is process-wide and child processes inherit it when launched with the default environment. JavaScriptCore freezes its options on first use, so embedded hosts must configure it before any JavaScriptCore API call. The C ABI cannot inspect whether an external component already initialized JavaScriptCore with a different option. Other option values cause JS Bay runtime creation to fail.
+
+Before JS Bay creates its first JavaScriptCore context group, `jsbay_library_capabilities` reports a preview from the current native environment without freezing the option. The result can change if the environment changes before runtime creation. After the first JS Bay context group is prepared, capability reporting uses that fixed core decision.
+
 ## Zig
 
 Import `jsbay`, choose a backend with `-Dbackend=quickjs_ng`, `quickjs`, or `jsc`, then use the typed `jsbay.c_api` namespace. The instance ID is supplied by the host and must be unique while the instance is alive.

@@ -248,6 +248,76 @@ async function conversionClosesEngine() {
   }
 }
 
+async function closeAsyncContract() {
+  const timerEngine = Engine.create()
+  const outstandingTimer = setTimeout(() => {}, 10_000)
+  try {
+    timerEngine.evaluate('setTimeout(() => {}, 10_000)')
+    let continued = false
+    await withTimeout(
+      timerEngine.closeAsync().then(() => { continued = true }),
+      'closeAsync continuation'
+    )
+    assert.equal(
+      continued,
+      true,
+      'closeAsync schedules its Promise continuation without waiting for unrelated timers'
+    )
+  } finally {
+    clearTimeout(outstandingTimer)
+    timerEngine.close()
+  }
+
+  const immediatelyClosed = Engine.create()
+  immediatelyClosed.close()
+  await immediatelyClosed.closeAsync()
+
+  const engine = Engine.create()
+  let first, second
+  try {
+    engine.bind('closeInsideCallback', () => {
+      first = engine.closeAsync()
+      second = engine.closeAsync()
+      return 42
+    })
+    assert.equal(engine.evaluate('closeInsideCallback()'), 42)
+    await Promise.all([first, second])
+    assert.throws(() => engine.evaluate('1'), /closed/)
+  } finally { engine.close() }
+
+  const pendingEngine = Engine.create()
+  let resolveHost
+  try {
+    pendingEngine.bindAsync('neverSettles', () => new Promise(resolve => { resolveHost = resolve }))
+    const pending = pendingEngine.evaluateAsync('neverSettles()')
+    const closed = pendingEngine.closeAsync()
+    await assert.rejects(pending, /closed/)
+    await closed
+    resolveHost(42)
+    await new Promise(resolve => setImmediate(resolve))
+  } finally { pendingEngine.close() }
+}
+
+function cacheOptionReentrancy() {
+  for (const evaluate of ['evaluate', 'evaluateAsync']) {
+    const engine = Engine.create()
+    const options = new Proxy({}, {
+      has() {
+        engine.close()
+        return false
+      },
+      getOwnPropertyDescriptor() {
+        engine.close()
+        return undefined
+      }
+    })
+    try {
+      if (evaluate === 'evaluate') assert.throws(() => engine.evaluate('42', undefined, options), /closed/)
+      else assert.throws(() => engine.evaluateAsync('42', undefined, options), /closed/)
+    } finally { engine.close() }
+  }
+}
+
 function workerFinalizer() {
   return new Promise((resolve, reject) => {
     const worker = new Worker(`
@@ -261,6 +331,23 @@ function workerFinalizer() {
     const timer = setTimeout(() => { void worker.terminate(); reject(new Error('worker finalizer timed out')) }, 1500)
     worker.once('error', error => { clearTimeout(timer); reject(error) })
     worker.once('exit', code => { clearTimeout(timer); assert.equal(code, 0); resolve() })
+  })
+}
+
+function workerCloseAsyncGc() {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(`
+      const { parentPort } = require('node:worker_threads')
+      const { Engine } = require(process.env.JSBAY_NODE_ADDON)
+      let engine = Engine.create()
+      const closed = engine.closeAsync()
+      engine = null
+      global.gc()
+      closed.then(() => { global.gc(); parentPort.postMessage('closed') })
+    `, { eval: true })
+    const timer = setTimeout(() => { void worker.terminate(); reject(new Error('closeAsync did not survive wrapper GC')) }, 1500)
+    worker.once('error', error => { clearTimeout(timer); reject(error) })
+    worker.once('message', message => { clearTimeout(timer); assert.equal(message, 'closed'); resolve() })
   })
 }
 
@@ -324,6 +411,9 @@ async function main() {
   const tests = { 'timer-microtask': timerMicrotask, 'nested-thenable': nestedThenable, 'guest-then-getter': guestThenGetter, 'explicit-undefined': explicitUndefined, 'error-properties': errorProperties, 'cleanup-pending': cleanupPending, 'sparse-array': () => childCase('sparse-array-child'), 'sparse-array-child': sparseArray, 'completion-reasons': completionReasons, 'shared-handler-error': sharedHandlerError, 'timer-close-observer': () => childCase('timer-close-observer-child'), 'timer-close-observer-child': timerCloseObserver, 'synchronous-throw-completions': synchronousThrowCompletions, 'conversion-rejects': () => childCase('conversion-rejects-child'), 'conversion-rejects-child': conversionRejects, 'conversion-observer-rejects': () => childCase('conversion-observer-rejects-child'), 'conversion-observer-rejects-child': conversionObserverRejects, 'sync-host-throw': syncHostThrow, 'argument-budget': () => childCase('argument-budget-child'), 'argument-budget-child': argumentBudget, 'call-host-failure': callHostFailure, 'constructor-failure': constructorFailure, 'worker-finalizer': workerFinalizer, 'worker-pending-natural-exit': workerPendingNaturalExit, 'pending-engine-gc': () => childCase('pending-engine-gc-child'), 'pending-engine-gc-child': pendingEngineGc }
   if (!selected) throw new Error('select one review case')
   tests['conversion-closes-engine'] = conversionClosesEngine
+  tests['close-async-contract'] = closeAsyncContract
+  tests['cache-option-reentrancy'] = cacheOptionReentrancy
+  tests['worker-close-async-gc'] = workerCloseAsyncGc
   assert.ok(tests[selected], `unknown review case: ${selected}`)
   await tests[selected]()
   console.log(`node SDK review case passed: ${selected}`)

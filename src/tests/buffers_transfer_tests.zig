@@ -124,7 +124,8 @@ test "Buffers: wrapping under a tight memory cap accounts for the finalizer exac
     var created: u32 = 0;
 
     var headroom: u64 = 0;
-    while (headroom <= 4096) : (headroom += 128) {
+    // QuickJS may need more than one allocator arena for the wrapper; keep the fine sweep and continue until an allocation succeeds.
+    while (headroom <= 64 * 1024) : (headroom += if (headroom < 4096) 128 else 4096) {
         resetFinalizerRecord();
         const usage = runtime_control.getMemoryUsage(id) orelse return error.NoUsage;
         try testing.expect(runtime_control.setMemoryLimit(id, usage.malloc_size + headroom));
@@ -146,6 +147,7 @@ test "Buffers: wrapping under a tight memory cap accounts for the finalizer exac
         try testing.expectEqual(@intFromPtr(&user_marker), g_last_user.load(.seq_cst));
         // The engine is clean after every attempt.
         try helpers.expectEvalEquals(id, "1 + 1", "2");
+        if (headroom >= 4096 and created > 0) break;
     }
     // The sweep is only meaningful if it reached both outcomes.
     try testing.expect(created > 0);

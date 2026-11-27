@@ -1,5 +1,6 @@
 const std = @import("std");
 const zev_build = @import("zev");
+const build_support = @import("build_support.zig");
 
 const quickjs_root = "vendor/quickjs";
 const quickjs_ng_root = "vendor/quickjs-ng";
@@ -109,22 +110,7 @@ fn resolveBackends(b: *std.Build, os: std.Target.Os.Tag) ResolvedBackends {
     return .{ .list = list, .primary = primary, .bits = backendBit(primary) };
 }
 
-/// Link the public module and core with the compiler configuration they require.
-pub fn linkConsumer(consumer: *std.Build.Step.Compile, dependency: *std.Build.Dependency) void {
-    const core = dependency.artifact("jsbay");
-    consumer.root_module.addImport("jsbay", dependency.module("jsbay"));
-    consumer.root_module.linkLibrary(core);
-    for (core.root_module.include_dirs.items) |include| switch (include) {
-        .framework_path => |path| consumer.root_module.addFrameworkPath(path),
-        .framework_path_system => |path| consumer.root_module.addSystemFrameworkPath(path),
-        else => {},
-    };
-    for (core.root_module.lib_paths.items) |path| consumer.root_module.addLibraryPath(path);
-    if (core.zig_lib_dir) |compiler_lib| {
-        consumer.zig_lib_dir = compiler_lib;
-        compiler_lib.addStepDependencies(&consumer.step);
-    }
-}
+pub const linkConsumer = build_support.linkConsumer;
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -387,14 +373,14 @@ pub fn build(b: *std.Build) void {
     addPlatformCompatSources(b, lib_module);
     addBackendSources(b, lib_module, packed_backends, quickjs_gc_stress, os, qjs_root, inspector_enabled, heap_snapshot, asan, spike_escargot_install, spike_hermes_install, spike_libstdcxx, spike_icu_lib_dir, false);
 
-    lib_module.linkSystemLibrary("m", .{});
+    build_support.linkMathLibrary(lib_module, os);
     const lib = b.addLibrary(.{
         .name = "jsbay",
         .root_module = lib_module,
         .linkage = if (shared) .dynamic else .static,
         .zig_lib_dir = if (os == .ios) prepareIosStdlib(b, tool) else null,
     });
-    if (!shared and (os.isDarwin() or (os == .linux and !target.result.abi.isAndroid() and !ohos)))
+    if (!shared and (os.isDarwin() or (os == .linux and !target.result.abi.isAndroid() and !ohos) or os == .windows))
         lib.bundle_compiler_rt = true;
     b.installArtifact(lib);
 

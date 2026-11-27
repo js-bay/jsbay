@@ -117,7 +117,7 @@ pub fn Module(comptime Host: type) type {
             const entry_lease = engine_thread.beginEval(instance_id);
             if (!entry_lease.allowed) return StartError.EngineThreadViolation;
             defer engine.finishEvalEntry(instance_id, entry_lease);
-            if (!state_mod.reserveStart(instance_id)) return StartError.AlreadyStarted;
+            if (!state_mod.reserveStartForGeneration(instance_id, entry_lease.generation)) return StartError.AlreadyStarted;
             var reservation_active = true;
             defer if (reservation_active) state_mod.cancelStartReservation(instance_id);
 
@@ -132,6 +132,7 @@ pub fn Module(comptime Host: type) type {
 
             state.* = .{
                 .instance_id = instance_id,
+                .generation = entry_lease.generation,
                 .allocator = alloc,
                 .transport = undefined,
                 .title = title,
@@ -279,12 +280,17 @@ pub fn Module(comptime Host: type) type {
 
         fn finalizeInspector(state: *InspectorState) void {
             std.debug.assert(state.engine_thread_id.load(.seq_cst) == @as(u64, @intCast(std.Thread.getCurrentId())));
-            const lease = engine_thread.beginExclusiveTeardown(state.instance_id);
-            if (!lease.allowed) {
-                requeueRetiredFinalization(state);
-                return;
-            }
-            defer engine_thread.endEval(lease);
+            // Engine teardown already owns this generation's context after the engine-thread State has been detached.
+            const lease: ?engine_thread.EvalLease = if (state.generation != 0 and
+                engine_thread.isTeardownOwnerThread(state.instance_id, state.generation)) null else blk: {
+                const acquired = engine_thread.beginExclusiveTeardown(state.instance_id);
+                if (!acquired.allowed) {
+                    requeueRetiredFinalization(state);
+                    return;
+                }
+                break :blk acquired;
+            };
+            defer if (lease) |value| engine_thread.endEval(value);
             closeTransport(state);
             native_cdp.stop(state);
             // Finalization runs on the JS owner after all session/reader work has drained, so disarming here cannot race a new state with the same id.

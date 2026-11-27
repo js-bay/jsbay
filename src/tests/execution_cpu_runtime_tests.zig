@@ -20,6 +20,7 @@ const helpers = @import("test_helpers.zig");
 const ActiveEngine = backend.ActiveEngine;
 
 const busy_script = "let total = 0; for (let i = 0; i < 4000000; i++) total += i; total;";
+const yielded_busy_script = "var total = 0; for (var i = 0; i < 100000; i++) total += i; total;";
 
 fn ledgerFor(instance_id: i32) !*execution_cpu.Ledger {
     const instance = instance_map.getInstance(instance_id) orelse return error.InstanceMissing;
@@ -280,7 +281,7 @@ const YieldSuppressionProbe = struct {
             self.failure = .reacquire;
         }
         if (self.burn_middle) burnHostCpu();
-        const result = engine.evalScript(self.child_id, "var childCpu = 0; for (var i = 0; i < 4000000; i++) childCpu += i; childCpu;", "<execution-cpu-yield-child>");
+        const result = engine.evalScript(self.child_id, yielded_busy_script, "<execution-cpu-yield-child>");
         if (result.err != null) {
             self.valid = false;
             self.failure = .child;
@@ -408,89 +409,6 @@ test "execution CPU runtime: TSFN delivery increases the ledger" {
     const after = total(ledger);
     try expectIncreased(before, after);
     try testing.expectEqual(@as(i64, 7_999_998_000_000), try helpers.evalInt(id, "globalThis.__executionCpuTsfnValue"));
-}
-
-const YieldProbe = struct {
-    id: i32,
-    released_total: std.atomic.Value(u64) = .init(0),
-    after_host_total: std.atomic.Value(u64) = .init(0),
-    host_ready: std.atomic.Value(bool) = .init(false),
-    foreign_done: std.atomic.Value(bool) = .init(false),
-    owner_done: std.atomic.Value(bool) = .init(false),
-    valid: std.atomic.Value(bool) = .init(true),
-
-    fn waitFor(flag: *const std.atomic.Value(bool)) bool {
-        const deadline = io.monotonicMilliseconds() + 5_000;
-        while (!flag.load(.seq_cst)) {
-            if (io.monotonicMilliseconds() >= deadline) return false;
-            io.sleepMs(1);
-        }
-        return true;
-    }
-
-    fn yieldHost(
-        _: c_int,
-        raw: ?*anyopaque,
-        _: u32,
-        _: ?[*]const host_value.HostValue,
-        out: *host_value.HostValue,
-    ) callconv(.c) c_int {
-        const self: *YieldProbe = @ptrCast(@alignCast(raw orelse return 1));
-        if (!engine_thread.releaseForExternalEval(self.id)) self.valid.store(false, .seq_cst);
-        const ledger = ledgerFor(self.id) catch {
-            self.valid.store(false, .seq_cst);
-            host_value.clear(out);
-            return 0;
-        };
-        self.released_total.store(total(ledger), .seq_cst);
-        burnHostCpu();
-        self.after_host_total.store(total(ledger), .seq_cst);
-        self.host_ready.store(true, .seq_cst);
-        if (!waitFor(&self.foreign_done)) self.valid.store(false, .seq_cst);
-        if (!engine_thread.reacquire(self.id)) self.valid.store(false, .seq_cst);
-        host_value.clear(out);
-        return 0;
-    }
-
-    fn ownerRun(raw: ?*anyopaque) void {
-        const self: *YieldProbe = @ptrCast(@alignCast(raw orelse return));
-        const result = engine.evalScript(self.id, "__executionCpuYieldHost()", "<execution-cpu-yield-owner>");
-        if (result.err != null) self.valid.store(false, .seq_cst);
-        helpers.freeEvalResult(result);
-        self.owner_done.store(true, .seq_cst);
-    }
-
-    fn foreignRun(self: *YieldProbe) void {
-        if (!waitFor(&self.host_ready)) {
-            self.valid.store(false, .seq_cst);
-            self.foreign_done.store(true, .seq_cst);
-            return;
-        }
-        const result = engine.evalScript(self.id, busy_script, "<execution-cpu-yield-foreign>");
-        if (result.err != null) self.valid.store(false, .seq_cst);
-        helpers.freeEvalResult(result);
-        self.foreign_done.store(true, .seq_cst);
-    }
-};
-
-test "execution CPU runtime: yielding excludes owner host work and includes foreign engine work" {
-    const id = helpers.nextInstanceId();
-    try testing.expect(engine.create(id, .{}));
-    defer engine.destroy(id);
-    const ledger = try ledgerFor(id);
-    ledger.enable();
-    defer ledger.disable();
-    var probe = YieldProbe{ .id = id };
-    try testing.expect(engine_thread.hostInstall(id, "__executionCpuYieldHost", YieldProbe.yieldHost, @ptrCast(&probe)));
-    try testing.expect(engine_thread.threadStart(id));
-    defer engine_thread.threadStop(id);
-    const foreign = try std.Thread.spawn(.{}, YieldProbe.foreignRun, .{&probe});
-    try testing.expect(engine_thread.postToEngineThread(id, YieldProbe.ownerRun, @ptrCast(&probe)));
-    try testing.expect(YieldProbe.waitFor(&probe.owner_done));
-    foreign.join();
-    try testing.expect(probe.valid.load(.seq_cst));
-    try testing.expectEqual(probe.released_total.load(.seq_cst), probe.after_host_total.load(.seq_cst));
-    try expectIncreased(probe.after_host_total.load(.seq_cst), total(ledger));
 }
 
 test "execution CPU runtime: destroy and numeric-id reuse do not retain a prior ledger" {

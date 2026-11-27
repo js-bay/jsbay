@@ -13,6 +13,7 @@ const packageTargets = {
   'darwin-x64': ['macos', 'x64'],
   'linux-arm64': ['linux', 'arm64'],
   'linux-x64': ['linux', 'x64'],
+  'win32-x64': ['win32', 'x64'],
 }
 const macosMinimum = '11.0'
 
@@ -65,9 +66,9 @@ if (mode === 'main') {
   await cp(join(root, 'THIRD_PARTY_NOTICES.md'), join(mainDir, 'THIRD_PARTY_NOTICES.md'))
   const supportedTargets = backend === 'jsc'
     ? [['macos', 'arm64'], ['macos', 'x64']]
-    : [['macos', 'arm64'], ['macos', 'x64'], ['linux', 'arm64'], ['linux', 'x64']]
+    : [['macos', 'arm64'], ['macos', 'x64'], ['linux', 'arm64'], ['linux', 'x64'], ...(backend === 'quickjsng' ? [['win32', 'x64']] : [])]
   const optionalDependencies = Object.fromEntries(supportedTargets.map(([os, cpu]) => {
-    const name = `${backend}${os}${cpu}`
+    const name = `${backend}-${os}-${cpu}`
     return [`@jsbay/${name}`, version]
   }))
   await writeFile(join(mainDir, 'package.json'), `${JSON.stringify({
@@ -86,9 +87,9 @@ if (mode === 'main') {
   console.log(`Prepared ${packageName}@${version}`)
 } else {
   const target = packageTargets[`${platform}-${arch}`]
-  if (!target || !addonPath || (backend === 'jsc' && platform !== 'darwin')) throw new Error('Unsupported native addon target')
+  if (!target || !addonPath || (backend === 'jsc' && platform !== 'darwin') || (platform === 'win32' && backend !== 'quickjsng')) throw new Error('Unsupported native addon target')
   const [npmPlatform, npmArch] = target
-  const platformName = `${backend}${npmPlatform}${npmArch}`
+  const platformName = `${backend}-${npmPlatform}-${npmArch}`
   const platformPackageName = `@jsbay/${platformName}`
   const binaryDir = join(output, platformName)
   await mkdir(binaryDir, { recursive: true })
@@ -107,7 +108,7 @@ if (mode === 'main') {
       const [rightMajor, rightMinor] = right.split('.').map(Number)
       return leftMajor - rightMajor || leftMinor - rightMinor
     }).at(-1)
-  } else {
+  } else if (platform === 'darwin') {
     jsbayMacosMinimum = macosDeploymentVersion(addonPath)
   }
   await writeFile(join(binaryDir, 'package.json'), `${JSON.stringify({
@@ -116,7 +117,7 @@ if (mode === 'main') {
     description: `JsBay Node.js native addon for ${backend} on ${npmPlatform}-${npmArch}`,
     os: [platform],
     cpu: [arch],
-    ...(platform === 'linux' ? { libc: 'glibc', jsbayGlibcMinimum } : { jsbayMacosMinimum }),
+    ...(platform === 'linux' ? { libc: 'glibc', jsbayGlibcMinimum } : platform === 'darwin' ? { jsbayMacosMinimum } : {}),
     main: 'jsbay_node.node',
     files: ['jsbay_node.node', 'LICENSE', 'THIRD_PARTY_NOTICES.md'],
     license: 'MIT',

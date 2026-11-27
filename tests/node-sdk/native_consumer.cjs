@@ -6,8 +6,31 @@ const bufferVectors = require('../fixtures/napi-buffer-boundaries.json')
 const { createHostVector, guestVectorProgram } = require('../fixtures/napi-buffer-vectors.cjs')
 
 async function main() {
+  const capabilities = addon.Engine.capabilities()
+  assert.equal(typeof capabilities.backend, 'string')
+  assert.equal(typeof capabilities.sourceDebugger, 'boolean')
+  assert.equal(typeof capabilities.bytecodeCache, 'boolean')
+  if (process.env.JSBAY_NODE_DISABLE_INSPECTOR_TRANSPORT === '1') {
+    assert.equal(capabilities.sourceDebugger, true)
+    const noTransportEngine = addon.Engine.create()
+    try { assert.throws(() => noTransportEngine.inspectorStart(0), /transport may be disabled/) }
+    finally { noTransportEngine.close() }
+  }
   const engine = addon.Engine.create({ instanceId: 4111 })
   try {
+    engine.setExecutionTimeLimit(0)
+    engine.setExecutionBudget(0)
+    if (capabilities.memoryLimit) {
+      engine.setMemoryLimit(0)
+    } else {
+      assert.throws(
+        () => engine.setMemoryLimit(0),
+        error => error.code === 'JSBAY_UNSUPPORTED',
+        'a backend without heap-limit support reports JSBAY_UNSUPPORTED'
+      )
+    }
+    assert.equal(typeof engine.resourceUsage().pending_bytes, 'bigint')
+    assert.equal(typeof engine.memoryUsage().malloc_size, 'bigint')
     assert.equal(engine.evaluate('1 + 2', 'number.js'), 3)
     assert.deepEqual(engine.evaluate('({ name: "ok", list: [1, true, null] })', 'object.js'), { name: 'ok', list: [1, true, null] })
     assert.deepEqual(engine.evaluate('({ nested: [undefined, { value: 3 }] })', 'nested.js'), { nested: [undefined, { value: 3 }] })
@@ -65,6 +88,7 @@ async function main() {
     const pending = engine.evaluateAsync('pending()', 'pending-close.js')
     engine.close()
     await assert.rejects(pending, /closed/)
+    await engine.closeAsync()
   } finally {
     engine.close()
   }

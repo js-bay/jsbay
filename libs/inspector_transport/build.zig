@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     if (target.result.os.tag == .windows) {
-        portable_socket.linkSystemLibrary("ws2_32", .{});
+        portable_socket.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     }
     const test_client = b.addModule("portable_test_client", .{
         .root_source_file = b.path("src/test_client.zig"),

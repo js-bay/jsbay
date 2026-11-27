@@ -36,6 +36,7 @@ case "${JSBAY_APPLE_SMOKE:-}" in
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/scripts/apple_simulator_diagnostics.sh"
 BUILD_DIR="${BUILD_DIR:-$SCRIPT_DIR/build-apple}"
 XCFW_NAME="JsBay"
 OPTIMIZE="${OPTIMIZE:-ReleaseSafe}"
@@ -229,13 +230,13 @@ link_consumer_probes() {
     fi
     if [ "$sim_rc" -eq 0 ] && ! grep -q 'JSBAY_APPLE_CONSUMER_PASS' "$sim_log"; then
         sim_rc=1
-        echo "ERROR: iOS Simulator consumer probe did not report success; log: $sim_log" >&2
     fi
     if [ "$owned_sim" -eq 1 ]; then
         xcrun simctl shutdown "$udid" 2>/dev/null || true
         xcrun simctl delete "$udid" 2>/dev/null || true
     fi
     if [ "$sim_rc" -ne 0 ]; then
+        report_ios_simulator_failure "$sim_log" "$sim_rc"
         return "$sim_rc"
     fi
     printf '%s\n' 'PASS: iOS Simulator consumer smoke' > "$probe_dir/ios-simulator-consumer.status"
@@ -318,13 +319,13 @@ link_simulator_smoke() {
     fi
     if [ "$sim_rc" -eq 0 ] && ! grep -q 'JSBAY_APPLE_CONSUMER_PASS' "$sim_log"; then
         sim_rc=1
-        echo "ERROR: iOS Simulator consumer probe did not report success; log: $sim_log" >&2
     fi
     if [ "$owned_sim" -eq 1 ]; then
         xcrun simctl shutdown "$udid" 2>/dev/null || true
         xcrun simctl delete "$udid" 2>/dev/null || true
     fi
     if [ "$sim_rc" -ne 0 ]; then
+        report_ios_simulator_failure "$sim_log" "$sim_rc"
         return "$sim_rc"
     fi
     printf '%s\n' 'PASS: iOS Simulator consumer smoke' > "$probe_dir/ios-simulator-consumer.status"

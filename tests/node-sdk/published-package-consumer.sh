@@ -24,7 +24,7 @@ JSBAY_NODE_PACKAGE_ROOT="$work/package.json" JSBAY_NODE_PACKAGE="@jsbay/$backend
     env -u JSBAY_NODE_ADDON node "$root/tests/node-sdk/package_consumer.mjs"
 
 # shellcheck disable=SC2016
-addon=$(node -e 'const [backend] = process.argv.slice(1); const os = process.platform === "darwin" ? "macos" : process.platform; process.stdout.write(require.resolve(`@jsbay/${backend}${os}${process.arch}`))' "$backend")
+addon=$(node -e 'const [backend] = process.argv.slice(1); const os = process.platform === "darwin" ? "macos" : process.platform; const path = require("node:path"); const dependencies = require(path.join(path.dirname(require.resolve(`@jsbay/${backend}`)), "package.json")).optionalDependencies; const name = [`@jsbay/${backend}-${os}-${process.arch}`, `@jsbay/${backend}${os}${process.arch}`].find(candidate => candidate in dependencies); if (!name) throw new Error("No matching platform dependency"); process.stdout.write(require.resolve(name))' "$backend")
 node_include="$(dirname "$(dirname "$(command -v node)")")/include/node"
 if [[ $platform == linux ]]; then
     cc -shared -fPIC -I "$root/include" -I "$node_include" "$root/tests/node-sdk/native-backend-consumer.c" -ldl -o "$work/backend-probe.node"

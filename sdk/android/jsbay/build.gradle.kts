@@ -26,6 +26,12 @@ val jsbayBackend =
 val githubRepository = providers.environmentVariable("GITHUB_REPOSITORY").orNull
 val jsbayArtifactId =
     when (jsbayBackend) {
+        "quickjs" -> "jsbay-quickjs"
+        "quickjs_ng" -> "jsbay-quickjs-ng"
+        else -> throw GradleException("Unsupported Android backend: $jsbayBackend")
+    }
+val jsbayLegacyArtifactId =
+    when (jsbayBackend) {
         "quickjs" -> "jsbayquickjs"
         "quickjs_ng" -> "jsbayquickjsng"
         else -> throw GradleException("Unsupported Android backend: $jsbayBackend")
@@ -35,6 +41,13 @@ val noticesFile = rootProject.file("../../THIRD_PARTY_NOTICES.md")
 
 group = "io.jsbay"
 version = jsbayVersion.get()
+
+configurations.configureEach {
+    if (name == "releaseVariantReleaseApiPublication" || name == "releaseVariantReleaseRuntimePublication") {
+        outgoing.capability("io.jsbay:$jsbayArtifactId:$version")
+        outgoing.capability("io.jsbay:$jsbayLegacyArtifactId:$version")
+    }
+}
 
 android {
     namespace = "io.jsbay"

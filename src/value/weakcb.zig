@@ -28,6 +28,7 @@
 const std = @import("std");
 const backend = @import("../backend.zig");
 const engine = @import("../engine.zig");
+const instance_map = @import("../runtime/instance_map.zig");
 const sync = @import("zev");
 
 const ActiveEngine = backend.ActiveEngine;
@@ -112,15 +113,20 @@ pub fn attachDeferredFinalizer(
 
 const Dispatch = struct {
     instance_id: i32,
+    generation: u64 = 0,
     user_data: ?*anyopaque,
     destroying_cb: ?DestroyingFinalizerCallback = null,
     deferred_cb: ?DeferredFinalizerCallback = null,
 };
 
 fn attachDispatch(instance_id: i32, target: ActiveEngine.Value, dispatch: Dispatch) bool {
+    const control = instance_map.beginControlPlane(instance_id) orelse return false;
+    defer control.end();
+    const generation = control.inst.generation;
     const ctx = engine.getContext(instance_id) orelse return false;
     const box = std.heap.c_allocator.create(Dispatch) catch return false;
     box.* = dispatch;
+    box.generation = generation;
     const installed = switch (backend.active_backend) {
         .quickjs, .quickjs_ng => blk: {
             const qjs_mod = @import("../backend.zig").ActiveEngineModule;
@@ -151,17 +157,18 @@ fn dispatchFinalizer(user_data: ?*anyopaque) callconv(.c) void {
         std.heap.c_allocator.destroy(box);
     }
     if (box.deferred_cb) |cb| {
-        enqueueDeferred(box.instance_id, box.user_data, cb);
+        enqueueDeferred(box.instance_id, box.generation, box.user_data, cb);
         return;
     }
     if (box.destroying_cb) |cb| {
-        const destroying = @import("../runtime/engine_thread.zig").isDestroying(box.instance_id);
+        const destroying = @import("../runtime/engine_thread.zig").isDestroyingGeneration(box.instance_id, box.generation);
         cb(box.user_data, destroying);
     }
 }
 
 const DeferredJob = struct {
     instance_id: i32,
+    generation: u64,
     user_data: ?*anyopaque,
     cb: DeferredFinalizerCallback,
     next: ?*DeferredJob = null,
@@ -171,10 +178,11 @@ var deferred_mu: sync.Mutex = .{};
 var deferred_head: ?*DeferredJob = null;
 var deferred_tail: ?*DeferredJob = null;
 
-fn enqueueDeferred(instance_id: i32, user_data: ?*anyopaque, cb: DeferredFinalizerCallback) void {
+fn enqueueDeferred(instance_id: i32, generation: u64, user_data: ?*anyopaque, cb: DeferredFinalizerCallback) void {
     const job = std.heap.c_allocator.create(DeferredJob) catch return;
     job.* = .{
         .instance_id = instance_id,
+        .generation = generation,
         .user_data = user_data,
         .cb = cb,
     };
@@ -188,13 +196,13 @@ fn enqueueDeferred(instance_id: i32, user_data: ?*anyopaque, cb: DeferredFinaliz
     deferred_tail = job;
 }
 
-fn popDeferred(instance_id: i32) ?*DeferredJob {
+fn popDeferred(instance_id: i32, generation: u64) ?*DeferredJob {
     deferred_mu.lock();
     defer deferred_mu.unlock();
     var prev: ?*DeferredJob = null;
     var it = deferred_head;
     while (it) |job| {
-        if (job.instance_id == instance_id) {
+        if (job.instance_id == instance_id and job.generation == generation) {
             if (prev) |p| p.next = job.next else deferred_head = job.next;
             if (deferred_tail == job) deferred_tail = prev;
             job.next = null;
@@ -207,14 +215,42 @@ fn popDeferred(instance_id: i32) ?*DeferredJob {
 }
 
 /// Called from `processPendingJobs` and, after teardown, from destroy. While a finalizer frame is still on the stack this returns without running user code. While `engine.destroy` is in progress, queued jobs are dropped instead of evaluated.
-pub fn drainDeferred(instance_id: i32) void {
+pub fn drainDeferred(instance_id: i32, generation: u64) void {
     if (finalizer_depth != 0) return;
-    const destroying = @import("../runtime/engine_thread.zig").isDestroying(instance_id);
-    while (popDeferred(instance_id)) |job| {
+    const engine_thread = @import("../runtime/engine_thread.zig");
+    const destroying = engine_thread.isDestroyingGeneration(instance_id, generation);
+    while (popDeferred(instance_id, generation)) |job| {
         const cb = job.cb;
         const ud = job.user_data;
         std.heap.c_allocator.destroy(job);
         if (destroying) continue;
         cb(ud);
     }
+}
+
+test "weak callbacks drain only the requested engine generation" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn callback(user_data: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(user_data.?));
+            self.calls += 1;
+        }
+    };
+
+    const instance_id: i32 = 61_768;
+    var old_generation: Probe = .{};
+    var new_generation: Probe = .{};
+    enqueueDeferred(instance_id, 41, @ptrCast(&old_generation), Probe.callback);
+    enqueueDeferred(instance_id, 42, @ptrCast(&new_generation), Probe.callback);
+
+    var owner: @import("../runtime/engine_thread.zig").TeardownOwnerLease = undefined;
+    @import("../runtime/engine_thread.zig").enterTeardownOwner(&owner, instance_id, 41);
+    drainDeferred(instance_id, 41);
+    @import("../runtime/engine_thread.zig").leaveTeardownOwner(&owner);
+    try std.testing.expectEqual(@as(usize, 0), old_generation.calls);
+    try std.testing.expectEqual(@as(usize, 0), new_generation.calls);
+
+    drainDeferred(instance_id, 42);
+    try std.testing.expectEqual(@as(usize, 1), new_generation.calls);
 }

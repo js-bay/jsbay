@@ -18,35 +18,34 @@ const execution_cpu = @import("execution_cpu.zig");
 const io = @import("../platform/io.zig");
 const sync = @import("zev");
 const types = @import("../types.zig");
+const teardown_gate = @import("teardown_gate.zig");
 const destroy_gate = @import("destroy_gate.zig");
-const thread_result = @import("engine_thread_result.zig");
+const state_admission_hook = @import("state_admission_hook.zig");
+const thread_value = @import("engine_thread_value.zig");
+const generation_thread = @import("generation_thread.zig");
+const thread_jobs = @import("engine_thread_jobs.zig");
+const thread_wait = @import("engine_thread_wait.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 const destroyGate = destroy_gate.destroyGate;
-const DestroyGateLease = destroy_gate.DestroyGateLease;
 const lockDestroyGate = destroy_gate.lockDestroyGate;
 const unlockDestroyGate = destroy_gate.unlockDestroyGate;
 pub const destroyGateWaitersForTesting = destroy_gate.destroyGateWaitersForTesting;
 
-const Adopted = thread_result.Adopted;
-const serializeThreadValue = thread_result.serializeThreadValue;
-pub const adoptTypedValue = thread_result.adoptTypedValue;
-const adoptTypedEval = thread_result.adoptTypedEval;
-const adoptEval = thread_result.adoptEval;
-const writeEval = thread_result.writeEval;
-
-threadlocal var fail_next_state_allocation_for_testing = false;
-
-pub fn failNextStateAllocationForTesting() void {
-    if (builtin.is_test) fail_next_state_allocation_for_testing = true;
-}
-
-pub const status_ok: c_int = 0;
-pub const status_timeout: c_int = 1;
-pub const status_destroyed: c_int = 2;
-pub const status_exception: c_int = 3;
-pub const status_invalid: c_int = 4;
-pub const status_out_of_memory: c_int = 5;
+pub const status_ok = thread_value.status_ok;
+pub const status_timeout = thread_value.status_timeout;
+pub const status_destroyed = thread_value.status_destroyed;
+pub const status_exception = thread_value.status_exception;
+pub const status_invalid = thread_value.status_invalid;
+pub const status_out_of_memory = thread_value.status_out_of_memory;
+const Adopted = thread_value.Adopted;
+const adoptTypedValue = thread_value.adoptTypedValue;
+const adoptTypedEval = thread_value.adoptTypedEval;
+const writeEval = thread_value.writeEval;
+const waitUntil = thread_wait.waitUntil;
+const waitBrief = thread_wait.waitBrief;
+const waitRunningClear = thread_wait.waitRunningClear;
+const deadlineFrom = thread_wait.deadlineFrom;
 
 // Test-only seam for the caller-owned result copy.  The job has already reached a terminal state when this allocation is attempted, which is why a failure must consume a synchronous run just like any other terminal result.
 var fail_next_output_copy_for_testing = false;
@@ -77,6 +76,16 @@ const Job = struct {
 };
 
 const DestroyOwner = enum(u8) { none, external, engine };
+
+pub const DestroyGateLease = teardown_gate.DestroyGateLease;
+pub const TeardownOwnerLease = teardown_gate.TeardownOwnerLease;
+pub const enterTeardownOwner = teardown_gate.enterTeardownOwner;
+pub const leaveTeardownOwner = teardown_gate.leaveTeardownOwner;
+pub const isTeardownOwnerThread = teardown_gate.isTeardownOwnerThread;
+pub const isTeardownOwnerInstance = teardown_gate.isTeardownOwnerInstance;
+pub const lockDestroyGateForGeneration = teardown_gate.lockDestroyGateForGeneration;
+pub const unlockGenerationDestroyGate = teardown_gate.unlockGenerationDestroyGate;
+pub const setStateAdmissionHookForTesting = state_admission_hook.setForTesting;
 
 const State = struct {
     instance_id: i32,
@@ -111,6 +120,8 @@ const State = struct {
     refs_drain_hook_data_for_testing: ?*anyopaque = null,
     shutdown_before_life_hook_for_testing: ?*const fn (?*anyopaque) void = null,
     shutdown_before_life_hook_data_for_testing: ?*anyopaque = null,
+    deferred_stop_hook_for_testing: ?*const fn (?*anyopaque) void = null,
+    deferred_stop_hook_data_for_testing: ?*anyopaque = null,
     /// Engine thread has dropped its claim so another thread may eval. Nesting is `yield_depth`, touched only by the engine thread.
     yielded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     yield_depth: u32 = 0,
@@ -164,6 +175,10 @@ pub fn ownerHasYielded(instance_id: i32) bool {
     return isEngineThread(state) and state.yielded.load(.seq_cst);
 }
 
+pub fn isEngineThreadForGeneration(instance_id: i32, generation: u64) bool {
+    return generation_thread.isEngineThreadForGeneration(instance_id, generation, retain, release, isEngineThread);
+}
+
 fn teardownClaimed(state: *State) bool {
     return state.destroy_owner.load(.seq_cst) != @backingInt(DestroyOwner.none);
 }
@@ -172,15 +187,6 @@ fn retain(instance_id: i32) ?*State {
     g_mu.lock();
     defer g_mu.unlock();
     const state = g_states.get(instance_id) orelse return null;
-    _ = state.refs.fetchAdd(1, .seq_cst);
-    return state;
-}
-
-fn retainForGeneration(instance_id: i32, generation: u64) ?*State {
-    g_mu.lock();
-    defer g_mu.unlock();
-    const state = g_states.get(instance_id) orelse return null;
-    if (state.generation != generation) return null;
     _ = state.refs.fetchAdd(1, .seq_cst);
     return state;
 }
@@ -199,42 +205,74 @@ fn release(state: *State) void {
 
 const StateError = error{ InstanceNotFound, OutOfMemory };
 
-fn ensureState(instance_id: i32) StateError!*State {
-    const generation = instance_map.captureEvalGeneration(instance_id) orelse return error.InstanceNotFound;
+threadlocal var fail_next_state_allocation_for_testing = false;
+pub fn failNextStateAllocationForTesting() void {
+    if (builtin.is_test) fail_next_state_allocation_for_testing = true;
+}
+
+fn ensureState(instance_id: i32, generation: u64) StateError!*State {
     g_mu.lock();
-    defer g_mu.unlock();
     if (g_states.get(instance_id)) |existing| {
-        if (existing.generation != generation) return error.InstanceNotFound;
-        _ = existing.refs.fetchAdd(1, .seq_cst);
-        return existing;
+        if (existing.generation == generation) {
+            _ = existing.refs.fetchAdd(1, .seq_cst);
+            g_mu.unlock();
+            return existing;
+        }
+        // A previous generation must have detached and stopped this State before the new EngineInstance was published.
+        existing.life_mu.lock();
+        const stopped = existing.thread == null and !existing.running.load(.seq_cst);
+        existing.life_mu.unlock();
+        if (!stopped) {
+            g_mu.unlock();
+            @panic("stale engine-thread State still owns a running generation");
+        }
+        _ = g_states.remove(instance_id);
+        g_mu.unlock();
+        thread_wait.waitRefsDrain(existing, builtin.is_test);
+        thread_jobs.freeJobs(existing, freeJob);
+        existing.jobs.deinit();
+        deinitStateSynchronization(existing);
+        std.heap.c_allocator.destroy(existing);
+        return ensureState(instance_id, generation);
     }
     if (builtin.is_test and fail_next_state_allocation_for_testing) {
         fail_next_state_allocation_for_testing = false;
+        g_mu.unlock();
         return error.OutOfMemory;
     }
-    const state = try std.heap.c_allocator.create(State);
+    const state = std.heap.c_allocator.create(State) catch {
+        g_mu.unlock();
+        return error.OutOfMemory;
+    };
     state.* = .{
         .instance_id = instance_id,
         .generation = generation,
         .jobs = std.AutoHashMap(u64, *Job).init(std.heap.c_allocator),
     };
     g_states.put(instance_id, state) catch {
+        g_mu.unlock();
         state.jobs.deinit();
         deinitStateSynchronization(state);
         std.heap.c_allocator.destroy(state);
         return error.OutOfMemory;
     };
     _ = state.refs.fetchAdd(1, .seq_cst);
+    g_mu.unlock();
     return state;
 }
 
 fn retainOrEnsureState(instance_id: i32) StateError!*State {
-    if (retain(instance_id)) |state| return state;
+    if (retain(instance_id)) |state| {
+        if (instance_map.generationOf(instance_id) == state.generation) return state;
+        release(state);
+    }
+    const control = instance_map.beginControlPlane(instance_id) orelse return error.InstanceNotFound;
+    defer control.end();
     const gate = destroyGate(instance_id);
-    var lease: DestroyGateLease = undefined;
-    lockDestroyGate(gate, &lease);
-    defer unlockDestroyGate(&lease);
-    return ensureState(instance_id);
+    var gate_lease: DestroyGateLease = undefined;
+    lockDestroyGate(gate, &gate_lease);
+    defer unlockDestroyGate(&gate_lease);
+    return ensureState(instance_id, control.inst.generation);
 }
 
 fn detach(instance_id: i32) ?*State {
@@ -245,17 +283,18 @@ fn detach(instance_id: i32) ?*State {
 }
 
 pub fn threadStart(instance_id: i32) bool {
-    if (instance_map.isTeardownPending(instance_id)) return false;
+    const control = instance_map.beginControlPlane(instance_id) orelse return false;
+    defer control.end();
     // Escargot Context is thread-affine: hosts installed on the create thread must not be evaluated on the engine thread (AtomicString/GC SEGV). Refuse ET start instead.
     if (comptime backend.active_backend == .escargot) {
         if (@import("../abi/spike_host_abi.zig").hasBindings(instance_id)) return false;
     }
+    state_admission_hook.run();
     const gate = destroyGate(instance_id);
     var gate_lease: DestroyGateLease = undefined;
     lockDestroyGate(gate, &gate_lease);
     defer unlockDestroyGate(&gate_lease);
-
-    const state = ensureState(instance_id) catch return false;
+    const state = ensureState(instance_id, control.inst.generation) catch return false;
     defer release(state);
 
     if (instance_map.isTeardownPending(instance_id) or teardownClaimed(state)) return false;
@@ -297,16 +336,34 @@ pub fn threadStop(instance_id: i32) void {
     state.life_mu.unlock();
     shutdown(state);
 
-    const deferred = state.deferred_destroy.load(.seq_cst);
-    const owner = state.destroy_owner.load(.seq_cst);
+    const on_engine_thread = isEngineThread(state);
+    state.queue_mu.lock();
+    const hook = state.deferred_stop_hook_for_testing;
+    const hook_data = state.deferred_stop_hook_data_for_testing;
+    state.queue_mu.unlock();
+    if (hook) |callback| callback(hook_data);
+
     state.life_mu.lock();
     std.debug.assert(state.stop_requests != 0);
     state.stop_requests -= 1;
+    const deferred = state.deferred_destroy.load(.seq_cst);
+    const owner = state.destroy_owner.load(.seq_cst);
+    const generation = state.generation;
+    const deferred_owner_claimed = if (!deferred or owner != @backingInt(DestroyOwner.none)) false else if (on_engine_thread)
+        claimDestroyOwner(state, .engine)
+    else
+        claimDestroyOwner(state, .external);
     state.life_mu.unlock();
+
+    if (deferred_owner_claimed and !on_engine_thread) {
+        finishBeforeDestroyClaimed(instance_id, generation, state, true);
+        return;
+    }
     release(state);
 
-    // A host callback may request destruction while this caller owns the join. Let the joiner finish first, then take the ordinary external teardown path after dropping this State reference.
-    if (deferred and owner == @backingInt(DestroyOwner.none)) beforeDestroy(instance_id);
+    // A self-stop cannot free the runtime while its host callback still holds a JS stack; threadMain consumes the engine-owned deferred teardown after the callback unwinds.
+    if (deferred_owner_claimed and on_engine_thread) return;
+    if (deferred and owner == @backingInt(DestroyOwner.none) and !on_engine_thread) waitGenerationGone(instance_id, generation);
 }
 
 pub fn threadId(instance_id: i32) u64 {
@@ -381,11 +438,15 @@ pub fn setShutdownBeforeLifeHookForTesting(
     return true;
 }
 
-pub fn setRefsDrainHookForTesting(
+pub fn setDeferredStopHookForTesting(
     instance_id: i32,
-    hook: ?*const fn (?*anyopaque) void,
+    hook: *const fn (?*anyopaque) void,
     data: ?*anyopaque,
 ) bool {
+    return state_admission_hook.setDeferredStopForTesting(instance_id, hook, data, retain, release);
+}
+
+pub fn setRefsDrainHookForTesting(instance_id: i32, hook: ?*const fn (?*anyopaque) void, data: ?*anyopaque) bool {
     if (!builtin.is_test) return false;
     const state = retain(instance_id) orelse return false;
     defer release(state);
@@ -405,21 +466,19 @@ pub fn exclusiveEvalForTesting(instance_id: i32) bool {
 /// Static error used when eval is refused. Not heap-owned.
 pub const foreign_eval_err: []const u8 = "cannot eval from a thread other than the engine thread";
 
+pub const EvalFailure = enum { none, out_of_memory };
+
 pub const EvalLease = struct {
     allowed: bool = true,
     failure: EvalFailure = .none,
     state: ?*State = null,
+    generation: u64 = 0,
     gated: bool = false,
     outermost: bool = false,
     exclusive: bool = false,
     restore_yielded: bool = false,
     tls_slot: u8 = 0,
     tracked_eval: bool = false,
-};
-
-pub const EvalFailure = enum {
-    none,
-    out_of_memory,
 };
 
 const EvalDepth = struct {
@@ -556,14 +615,24 @@ pub fn beginEval(instance_id: i32) EvalLease {
     return beginEvalForGeneration(instance_id, null);
 }
 
-/// If a caller captured a generation before admission, refuse to enter a replacement instance.
-pub fn beginEvalForGeneration(instance_id: i32, generation: ?u64) EvalLease {
+pub fn beginEvalForGeneration(instance_id: i32, expected_generation: ?u64) EvalLease {
     // Teardown admission closes before the runtime is freed. Do not recreate an engine thread for public JS while that is in progress.
     if (instance_map.isTeardownPending(instance_id)) return .{ .allowed = false };
     const state = retainOrEnsureState(instance_id) catch |err| return switch (err) {
         error.InstanceNotFound => .{ .allowed = false },
         error.OutOfMemory => .{ .allowed = false, .failure = .out_of_memory },
     };
+
+    if (instance_map.generationOf(instance_id) != state.generation) {
+        release(state);
+        return .{ .allowed = false };
+    }
+    if (expected_generation) |expected| {
+        if (expected != state.generation) {
+            release(state);
+            return .{ .allowed = false };
+        }
+    }
 
     // Teardown may have become pending while retainOrEnsureState acquired or created State. Recheck before granting access to the context.
     if (instance_map.isTeardownPending(instance_id)) {
@@ -615,11 +684,7 @@ pub fn beginEvalForGeneration(instance_id: i32, generation: ?u64) EvalLease {
     }
 
     // The teardown latch may have changed while waiting for the external context gate. Undo that gate before refusing the public JS entry.
-    const admission_closed = if (generation) |expected|
-        instance_map.captureEvalGeneration(instance_id) != expected
-    else
-        instance_map.isTeardownPending(instance_id);
-    if (admission_closed) {
+    if (instance_map.isTeardownPending(instance_id)) {
         if (gated) {
             state.external_eval_depth -= 1;
             if (outermost) {
@@ -644,6 +709,7 @@ pub fn beginEvalForGeneration(instance_id: i32, generation: ?u64) EvalLease {
     };
     const lease: EvalLease = .{
         .state = state,
+        .generation = state.generation,
         .gated = gated,
         .outermost = outermost,
         .tls_slot = tls_slot,
@@ -766,12 +832,8 @@ pub fn foreignEvalBlocked(instance_id: i32) bool {
 }
 
 /// True only while `engine.destroy` is tearing this instance's runtime down on this thread. Ordinary `runGc` does not set it. Duktape's `FINALIZER_NORESCUE` / heap-destruct flag.
-threadlocal var destroying_id: ?i32 = null;
-
-pub fn isDestroying(instance_id: i32) bool {
-    const current = destroying_id orelse return false;
-    return current == instance_id;
-}
+pub const isDestroying = teardown_gate.isDestroying;
+pub const isDestroyingGeneration = teardown_gate.isDestroyingGeneration;
 
 /// Let another thread `evalScript` this instance. Only the engine thread may call it, and only after `threadStart`. Before the engine thread exists this is a no-op and returns true. A foreign caller returns false and does not abort.
 ///
@@ -841,19 +903,23 @@ fn resumeBackend(instance_id: i32) void {
 
 /// `weakcb` installs this so `processPendingJobs` can run deferred finalizers without a container-level import cycle.
 var deferred_drain_mu: sync.Mutex = .{};
-var deferred_drain: ?*const fn (instance_id: i32) void = null;
+var deferred_drain: ?*const fn (instance_id: i32, generation: u64) void = null;
 
-pub fn setDeferredDrain(f: *const fn (instance_id: i32) void) void {
+pub fn setDeferredDrain(f: *const fn (instance_id: i32, generation: u64) void) void {
     deferred_drain_mu.lock();
     defer deferred_drain_mu.unlock();
     deferred_drain = f;
 }
 
 pub fn runDeferredDrain(instance_id: i32) void {
+    generation_thread.runDeferredDrain(instance_id, instance_map.generationOf, runDeferredDrainGeneration);
+}
+
+pub fn runDeferredDrainGeneration(instance_id: i32, generation: u64) void {
     deferred_drain_mu.lock();
     const f = deferred_drain;
     deferred_drain_mu.unlock();
-    if (f) |cb| cb(instance_id);
+    if (f) |cb| cb(instance_id, generation);
 }
 
 const NativeTask = struct {
@@ -890,13 +956,11 @@ fn takeNative(state: *State) ?NativeTask {
 }
 
 pub fn freeRuntimeArmedForGeneration(instance_id: i32, generation: u64) void {
-    const prev = destroying_id;
-    destroying_id = instance_id;
-    defer destroying_id = prev;
-    if (engine.tryDestroyRuntimeForGeneration(instance_id, generation)) {
-        // Finalizers may have enqueued deferred work while the runtime was already going away. Drop it; the context is gone, so it must not run JS.
-        runDeferredDrain(instance_id);
-    }
+    const previous = teardown_gate.enterGenerationDestroy(instance_id, generation);
+    defer teardown_gate.leaveGenerationDestroy(previous);
+    if (!engine.tryDestroyRuntimeForGeneration(instance_id, generation)) return;
+    // Finalizers may have enqueued deferred work while the runtime was already going away. Drop it; the context is gone, so it must not run JS.
+    runDeferredDrainGeneration(instance_id, generation);
 }
 
 pub fn postScript(
@@ -1114,28 +1178,28 @@ pub fn hostInstall(
 /// Wake waiters and arrange teardown.
 ///
 /// Returns true when the caller must not free the runtime. Destroy on the engine thread still has the JS call on the stack, so the runtime stays alive until that call returns. The engine thread then frees it. A later destroy from another thread waits for that teardown instead of freeing the runtime again.
-pub fn beginDestroy(instance_id: i32) bool {
-    const generation = instance_map.registeredGeneration(instance_id) orelse return false;
-    return beginDestroyForGeneration(instance_id, generation);
-}
-
-pub fn beginDestroyForGeneration(instance_id: i32, generation: u64) bool {
-    const state = retainForGeneration(instance_id, generation) orelse return false;
+pub fn beginDestroy(instance_id: i32, generation: u64) bool {
+    const state = retain(instance_id) orelse return false;
+    if (state.generation != generation) {
+        release(state);
+        return true;
+    }
     if (!isEngineThread(state)) {
         const deferred = state.deferred_destroy.load(.seq_cst);
         release(state);
         if (!deferred) return false;
-        waitInstanceGoneForGeneration(instance_id, generation);
+        waitGenerationGone(instance_id, generation);
         return true;
     }
     // This thread may still hold an API ref, and the JS call has not returned. Waiting for refs here would deadlock.
     state.life_mu.lock();
     if (state.stop_requests == 0) _ = claimDestroyOwner(state, .engine);
+    const first_deferred_destroy = !state.deferred_destroy.swap(true, .seq_cst);
     state.life_mu.unlock();
-    if (!state.deferred_destroy.swap(true, .seq_cst)) {
+    if (first_deferred_destroy) {
         state.stopping.store(true, .seq_cst);
         _ = @import("runtime_control.zig").requestStopInterrupt(instance_id);
-        cancelAll(state);
+        thread_jobs.cancelAll(state, status_destroyed, freeJob, notifyLocked);
     }
     release(state);
     return true;
@@ -1148,44 +1212,68 @@ fn instanceStillLive(instance_id: i32) bool {
     return g_states.get(instance_id) != null;
 }
 
-fn instanceStillLiveForGeneration(instance_id: i32, generation: u64) bool {
-    if (instance_map.registeredGeneration(instance_id)) |g| {
-        if (g == generation) return true;
-    }
+fn instanceStillLiveGeneration(instance_id: i32, generation: u64) bool {
+    if (instance_map.generationOf(instance_id) == generation) return true;
     g_mu.lock();
     defer g_mu.unlock();
-    if (g_states.get(instance_id)) |state| {
-        return state.generation == generation;
+    const state = g_states.get(instance_id) orelse return false;
+    return state.generation == generation;
+}
+
+pub fn waitGenerationGone(instance_id: i32, generation: u64) void {
+    while (instanceStillLiveGeneration(instance_id, generation)) {
+        g_mu.lock();
+        waitBrief(&g_wake, &g_mu);
+        g_mu.unlock();
     }
-    return false;
 }
 
 /// Stop the engine thread, wake blocked waiters, and drop thread bookkeeping. Used when destroy runs on a thread other than the engine thread, before the event-loop waiter or JS runtime is torn down.
-pub fn beforeDestroy(instance_id: i32) void {
-    const generation = instance_map.registeredGeneration(instance_id) orelse return;
-    beforeDestroyForGeneration(instance_id, generation);
+pub fn beforeDestroyGeneration(instance_id: i32, generation: u64) void {
+    var gate_lease: DestroyGateLease = undefined;
+    if (!lockDestroyGateForGeneration(instance_id, generation, &gate_lease)) return;
+    const claim = instance_map.claimTeardownForGeneration(instance_id, generation);
+    unlockGenerationDestroyGate(&gate_lease);
+    switch (claim) {
+        .stale => return,
+        .already_claimed => {
+            if (!isTeardownOwnerThread(instance_id, generation) and !isEngineThreadForGeneration(instance_id, generation))
+                waitGenerationGone(instance_id, generation);
+            return;
+        },
+        .claimed => beforeDestroyClaimed(instance_id, generation),
+    }
 }
 
-pub fn beforeDestroyForGeneration(instance_id: i32, generation: u64) void {
-    // threadStop's deferred-destroy path enters here without going through engine.destroyNow, so close public JS admission before detaching State.
-    if (!instance_map.markTeardownPendingForGeneration(instance_id, generation)) return;
-    const gate = destroyGate(instance_id);
-    var gate_lease: DestroyGateLease = undefined;
-    lockDestroyGate(gate, &gate_lease);
-    defer unlockDestroyGate(&gate_lease);
-    if (instance_map.isDestroyed(instance_id, generation)) return;
-
+/// Finish teardown after the instance map has assigned this generation's unique teardown owner.
+pub fn beforeDestroyClaimed(instance_id: i32, generation: u64) void {
+    if (instance_map.generationOf(instance_id) != generation) return;
     const state = retain(instance_id) orelse {
+        var owner_lease: TeardownOwnerLease = undefined;
+        enterTeardownOwner(&owner_lease, instance_id, generation);
+        defer leaveTeardownOwner(&owner_lease);
+        instance_map.waitForControlOps(instance_id);
         releaseHostBindings(instance_id);
-        // No engine thread. destroyRuntime follows this return; run it here so finalizers observe isDestroying on this same thread.
         freeRuntimeArmedForGeneration(instance_id, generation);
         return;
     };
+    if (state.generation != generation) {
+        release(state);
+        return;
+    }
+    finishBeforeDestroyClaimed(instance_id, generation, state, false);
+}
+
+fn finishBeforeDestroyClaimed(instance_id: i32, generation: u64, state: *State, owner_already_claimed: bool) void {
+    var owner_lease: TeardownOwnerLease = undefined;
+    enterTeardownOwner(&owner_lease, instance_id, generation);
+    defer leaveTeardownOwner(&owner_lease);
+    instance_map.waitForControlOps(instance_id);
     // A direct evaluator may have a State but no library-owned thread. The interrupt handler was installed at engine creation, so destruction can still break its currently executing JS before we wait for its lease.
     _ = @import("runtime_control.zig").requestTeardownInterrupt(instance_id, generation);
-    if (!claimDestroyOwner(state, .external)) {
+    if (!owner_already_claimed and !claimDestroyOwner(state, .external)) {
         release(state);
-        waitInstanceGone(instance_id);
+        waitGenerationGone(instance_id, generation);
         return;
     }
     shutdown(state);
@@ -1195,15 +1283,15 @@ pub fn beforeDestroyForGeneration(instance_id: i32, generation: u64) void {
     const detached = detach(instance_id);
     release(state);
     const owned = detached orelse {
-        waitInstanceGone(instance_id);
+        waitGenerationGone(instance_id, generation);
         return;
     };
     if (owned != state) {
-        waitInstanceGone(instance_id);
+        waitGenerationGone(instance_id, generation);
         return;
     }
-    waitRefsDrain(owned);
-    freeJobs(owned);
+    thread_wait.waitRefsDrain(owned, builtin.is_test);
+    thread_jobs.freeJobs(owned, freeJob);
     owned.jobs.deinit();
     deinitStateSynchronization(owned);
     std.heap.c_allocator.destroy(owned);
@@ -1211,6 +1299,21 @@ pub fn beforeDestroyForGeneration(instance_id: i32, generation: u64) void {
     freeRuntimeArmedForGeneration(instance_id, generation);
     // `waitInstanceGone` also watches the runtime map, which drops here.
     notifyGlobal();
+}
+
+pub fn beforeDestroy(instance_id: i32) void {
+    if (instance_map.generationOf(instance_id)) |generation| {
+        beforeDestroyGeneration(instance_id, generation);
+        return;
+    }
+    g_mu.lock();
+    const state = g_states.get(instance_id) orelse {
+        g_mu.unlock();
+        return;
+    };
+    const generation = state.generation;
+    g_mu.unlock();
+    waitGenerationGone(instance_id, generation);
 }
 
 fn releaseHostBindings(instance_id: i32) void {
@@ -1223,7 +1326,7 @@ fn releaseHostBindings(instance_id: i32) void {
 
 fn shutdown(state: *State) void {
     state.stopping.store(true, .seq_cst);
-    cancelAll(state);
+    thread_jobs.cancelAll(state, status_destroyed, freeJob, notifyLocked);
     // `cancelAll` signals the event-loop waiter so the owner can leave the loop.
     engine.wakeAsync(state.instance_id);
 
@@ -1331,10 +1434,11 @@ fn finishStoppedThread(state: *State) void {
 fn finishDeferredDestroy(state: *State) void {
     const instance_id = state.instance_id;
     const generation = state.generation;
-    const gate = destroyGate(instance_id);
-    var gate_lease: DestroyGateLease = undefined;
-    lockDestroyGate(gate, &gate_lease);
-    defer unlockDestroyGate(&gate_lease);
+    var destroy_gate_lease: DestroyGateLease = undefined;
+    if (!lockDestroyGateForGeneration(instance_id, generation, &destroy_gate_lease)) @panic("deferred teardown lost its generation gate");
+    var owner_lease: TeardownOwnerLease = undefined;
+    enterTeardownOwner(&owner_lease, instance_id, generation);
+    defer leaveTeardownOwner(&owner_lease);
 
     state.life_mu.lock();
     const handle = state.thread;
@@ -1356,12 +1460,15 @@ fn finishDeferredDestroy(state: *State) void {
     const hook_data = state.detached_hook_data_for_testing;
     state.queue_mu.unlock();
     if (hook) |callback| callback(hook_data);
-    waitRefsDrain(state);
+    // Serialize destroy callers through State detachment, but release the bucketed gate before waiting for references that may themselves initiate teardown.
+    unlockGenerationDestroyGate(&destroy_gate_lease);
+    thread_wait.waitRefsDrain(state, builtin.is_test);
 
-    freeJobs(state);
+    thread_jobs.freeJobs(state, freeJob);
     state.jobs.deinit();
     deinitStateSynchronization(state);
     std.heap.c_allocator.destroy(state);
+    // Host finalizers run only after the generation gate is released.
     releaseHostBindings(instance_id);
     freeRuntimeArmedForGeneration(instance_id, generation);
     // Runtime map drops in freeRuntimeArmed. Wake waitInstanceGone.
@@ -1658,49 +1765,6 @@ fn enqueueLocked(state: *State, job: *Job) void {
     notifyLocked(state);
 }
 
-fn cancelAll(state: *State) void {
-    state.queue_mu.lock();
-    var reap: ?*Job = null;
-    var it = state.jobs.iterator();
-    while (it.next()) |entry| {
-        const job = entry.value_ptr.*;
-        if (job.settled) continue;
-        job.settled = true;
-        job.status = status_destroyed;
-        if (job.auto_release and job.waiters == 0 and !job.on_stack) {
-            job.next = reap;
-            reap = job;
-        }
-    }
-    state.head = null;
-    state.tail = null;
-    // A queued native task belongs to the current thread run. Stop cancels it before restart can accidentally execute its borrowed data pointer.
-    state.native_task = null;
-    state.has_native.store(false, .seq_cst);
-    var current = reap;
-    while (current) |job| : (current = job.next) {
-        _ = state.jobs.remove(job.id);
-    }
-    notifyLocked(state);
-    state.queue_mu.unlock();
-
-    current = reap;
-    while (current) |job| {
-        const next = job.next;
-        freeJob(job);
-        current = next;
-    }
-}
-
-fn freeJobs(state: *State) void {
-    var it = state.jobs.iterator();
-    while (it.next()) |entry| {
-        const job = entry.value_ptr.*;
-        freeJob(job);
-    }
-    state.jobs.clearRetainingCapacity();
-}
-
 fn freeJob(job: *Job) void {
     std.heap.c_allocator.free(job.src);
     std.heap.c_allocator.free(job.filename);
@@ -1736,35 +1800,6 @@ fn notifyGlobal() void {
     g_mu.lock();
     defer g_mu.unlock();
     g_wake.broadcast();
-}
-
-fn waitUntil(state: *State, deadline: i64) void {
-    const now = io.monotonicMilliseconds();
-    if (now >= deadline) return;
-    _ = state.wake.waitTimeout(&state.queue_mu, @intCast(deadline - now));
-}
-
-fn waitBrief(cond: *sync.Condition, mutex: *sync.Mutex) void {
-    _ = cond.waitTimeout(mutex, 1);
-}
-
-fn waitRefsDrain(state: *State) void {
-    if (builtin.is_test) {
-        state.queue_mu.lock();
-        const hook = state.refs_drain_hook_for_testing;
-        const hook_data = state.refs_drain_hook_data_for_testing;
-        state.queue_mu.unlock();
-        if (hook) |callback| callback(hook_data);
-    }
-    while (true) {
-        state.queue_mu.lock();
-        if (state.refs.load(.seq_cst) == 0) {
-            state.queue_mu.unlock();
-            return;
-        }
-        waitBrief(&state.wake, &state.queue_mu);
-        state.queue_mu.unlock();
-    }
 }
 
 test "last state release holds the drain mutex through notification" {
@@ -1811,20 +1846,8 @@ test "last state release holds the drain mutex through notification" {
     probe.continue_release.store(true, .seq_cst);
     thread.?.join();
     thread = null;
-    waitRefsDrain(&state);
+    thread_wait.waitRefsDrain(&state, builtin.is_test);
     try testing.expectEqual(@as(u32, 0), state.refs.load(.seq_cst));
-}
-
-fn waitRunningClear(state: *State) void {
-    while (state.running.load(.seq_cst)) {
-        state.queue_mu.lock();
-        if (!state.running.load(.seq_cst)) {
-            state.queue_mu.unlock();
-            return;
-        }
-        waitBrief(&state.wake, &state.queue_mu);
-        state.queue_mu.unlock();
-    }
 }
 
 fn waitInstanceGone(instance_id: i32) void {
@@ -1833,50 +1856,4 @@ fn waitInstanceGone(instance_id: i32) void {
         waitBrief(&g_wake, &g_mu);
         g_mu.unlock();
     }
-}
-
-fn waitInstanceGoneForGeneration(instance_id: i32, generation: u64) void {
-    while (instanceStillLiveForGeneration(instance_id, generation)) {
-        g_mu.lock();
-        waitBrief(&g_wake, &g_mu);
-        g_mu.unlock();
-    }
-}
-
-fn deadlineFrom(timeout_ms: u64) i64 {
-    const now = io.monotonicMilliseconds();
-    const room = std.math.maxInt(i64) - now;
-    if (room <= 0) return now;
-    const add: i64 = if (timeout_ms > @as(u64, @intCast(room))) room else @intCast(timeout_ms);
-    return now + add;
-}
-
-test "adoptTypedValue adopts successful serialization" {
-    const testing = std.testing;
-    const helpers = @import("../tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try testing.expect(engine.create(id, .{}));
-    defer engine.destroy(id);
-
-    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
-    const num = ActiveEngine.newInt32Val(ctx, 123);
-    const adopted = adoptTypedValue(ctx, num, status_ok);
-    defer if (adopted.result) |res| std.heap.c_allocator.free(res);
-    try testing.expectEqual(status_ok, adopted.status);
-    try testing.expectEqualStrings("123", adopted.result.?);
-}
-
-test "adoptTypedValue reports an exception value as err text" {
-    const testing = std.testing;
-    const helpers = @import("../tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try testing.expect(engine.create(id, .{}));
-    defer engine.destroy(id);
-
-    const ctx = engine.getContext(id) orelse return error.ContextUnavailable;
-    const err_str = ActiveEngine.newStringVal(ctx, "manual-error");
-    const adopted = adoptTypedValue(ctx, err_str, status_exception);
-    defer if (adopted.err) |e| std.heap.c_allocator.free(e);
-    try testing.expectEqual(status_exception, adopted.status);
-    try testing.expectEqualStrings("manual-error", adopted.err.?);
 }

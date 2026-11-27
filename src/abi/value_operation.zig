@@ -12,6 +12,14 @@ const host_wake = @import("js_event_loop").host_wake;
 const hyper_box = @import("hyper_box");
 const HyperValue = hyper_box.Value;
 const ActiveEngine = backend.ActiveEngine;
+const packed_value_bytes = @import("packed_value_bytes.zig");
+const packed_readiness = @import("packed_readiness.zig");
+const packed_generation_scope = @import("packed_generation_scope.zig");
+const admission = @import("value_operation_admission.zig");
+const finish_bool = @import("value_operation_finish.zig");
+
+pub const setBeforeOwnerCheckHookForTesting = admission.setBeforeOwnerCheckHookForTesting;
+pub const setBeforeBackendEnterHookForTesting = admission.setBeforeBackendEnterHookForTesting;
 
 /// Boundary-owned status numbers and C byte layout are supplied once by c_api; this module never imports the export layer. This is not a backend or handle-store abstraction.
 pub const StatusCodes = struct {
@@ -40,6 +48,7 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
 
         pub const ApiOp = struct {
             id: i32,
+            generation: u64,
             ctx: ActiveEngine.Context,
             lease: engine_thread.EvalLease,
             entered_js: bool,
@@ -60,25 +69,50 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
         pub const ApiOpResult = union(enum) { ok: ApiOp, status: c_int };
 
         pub fn beginApiOpMode(id: i32, require_execution: bool) ApiOpResult {
+            return beginApiOpModeWithLoopCheck(id, require_execution, true, null);
+        }
+
+        pub fn beginGenerationScopeOp(id: i32, expected_generation: u64) ApiOpResult {
+            return beginApiOpModeWithLoopCheck(id, false, false, expected_generation);
+        }
+
+        fn beginApiOpModeWithLoopCheck(id: i32, require_execution: bool, check_loop_error: bool, expected_generation: ?u64) ApiOpResult {
             if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
             if (@import("../runtime/instance_map.zig").isTeardownPending(id)) return .{ .status = API_INSTANCE_NOT_FOUND };
-            if (!api_value.isOwner(id)) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+            admission.runBeforeOwnerCheckHookForTesting();
+            if (!api_value.isOwner(id)) return .{ .status = admission.ownerAdmissionFailureStatus(id, API_WRONG_THREAD, API_INSTANCE_NOT_FOUND) };
             const lease = engine_thread.beginEval(id);
             if (!lease.allowed) {
                 if (lease.failure == .out_of_memory) return .{ .status = API_OUT_OF_MEMORY };
-                return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+                return .{ .status = admission.ownerAdmissionFailureStatus(id, API_WRONG_THREAD, API_INSTANCE_NOT_FOUND) };
             }
             const inst = instance_map.getInstance(id) orelse {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
-            return beginAdmittedApiOp(inst, lease, require_execution);
+            if (expected_generation) |expected| {
+                if (inst.generation != expected or lease.generation != expected) {
+                    engine.finishEvalEntry(id, lease);
+                    return .{ .status = API_INSTANCE_NOT_FOUND };
+                }
+            }
+            return beginAdmittedApiOpMode(inst, lease, require_execution, check_loop_error, expected_generation);
         }
 
         /// Take ownership of an eval lease that protects this instance.
         pub fn beginAdmittedApiOp(inst: *instance_map.EngineInstance, lease: engine_thread.EvalLease, require_execution: bool) ApiOpResult {
+            return beginAdmittedApiOpMode(inst, lease, require_execution, true, lease.generation);
+        }
+
+        fn beginAdmittedApiOpMode(inst: *instance_map.EngineInstance, lease: engine_thread.EvalLease, require_execution: bool, check_loop_error: bool, expected_generation: ?u64) ApiOpResult {
             const id = inst.instance_id;
-            if (inst.loop.lastError() != null) {
+            if (expected_generation) |expected| {
+                if (inst.generation != expected or lease.generation != expected) {
+                    engine.finishEvalEntry(id, lease);
+                    return .{ .status = API_INSTANCE_NOT_FOUND };
+                }
+            }
+            if (check_loop_error and inst.loop.lastError() != null) {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_LOOP_FAILED };
             }
@@ -86,18 +120,26 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
+            admission.runBeforeBackendEnterHookForTesting();
             const entered_js = if (comptime backend.isQuickJsApiBackend(backend.active_backend)) backend.ActiveEngineModule.lifecycle.enterJs(ctx) else true;
             if (!entered_js) {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_WRONG_THREAD };
             }
-            if (!require_execution) return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator } };
+            if (inst.generation != lease.generation) {
+                if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
+                    if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
+                }
+                engine.finishEvalEntry(id, lease);
+                return .{ .status = API_INSTANCE_NOT_FOUND };
+            }
+            if (!require_execution) return .{ .ok = .{ .id = id, .generation = inst.generation, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator } };
             const execution = @import("../runtime/js_scheduler.zig").beginExecution(id) orelse {
                 if (comptime backend.isQuickJsApiBackend(backend.active_backend)) if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
-            return .{ .ok = .{ .id = id, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator, .execution = execution } };
+            return .{ .ok = .{ .id = id, .generation = inst.generation, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator, .execution = execution } };
         }
 
         pub fn beginApiOp(id: i32) ApiOpResult {
@@ -240,6 +282,10 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
         pub const PackedJsOpResult = union(enum) { ok: PackedJsOp, status: c_int };
 
         pub fn beginPackedJsOpMode(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, require_execution: bool) PackedJsOpResult {
+            return beginPackedJsOpModeWithLoopCheck(instance_id, tag, ctx_addr, require_execution, true);
+        }
+
+        fn beginPackedJsOpModeWithLoopCheck(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, require_execution: bool, check_loop_error: bool) PackedJsOpResult {
             if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
             if (@import("../runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
             if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
@@ -252,7 +298,7 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
                 engine.finishEvalEntry(instance_id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
-            if (inst.loop.lastError() != null) {
+            if (check_loop_error and inst.loop.lastError() != null) {
                 engine.finishEvalEntry(instance_id, lease);
                 return .{ .status = API_LOOP_FAILED };
             }
@@ -283,6 +329,10 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
 
         pub fn beginPackedCleanupOp(instance_id: i32, tag: backend.BackendType, ctx_addr: usize) PackedJsOpResult {
             return beginPackedJsOpMode(instance_id, tag, ctx_addr, false);
+        }
+
+        pub fn beginPackedGenerationScopeOp(instance_id: i32, expected_generation: u64) PackedJsOpResult {
+            return packed_generation_scope.begin(@This(), instance_id, expected_generation, API_INVALID_ARGUMENT, API_INSTANCE_NOT_FOUND, API_WRONG_THREAD);
         }
 
         pub const PackedValueOp = struct {
@@ -430,65 +480,21 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
             return API_OK;
         }
 
-        pub const PackedDupResult = union(enum) {
-            ok: usize,
-            stale: void,
-            out_of_memory: void,
-        };
+        pub const PackedDupResult = packed_value_bytes.PackedDupResult;
+        pub const packedDupBytes = packed_value_bytes.packedDupBytes;
 
-        pub fn packedDupBytes(handle: u64, expect_instance: i32, expect_tag: backend.BackendType, out: []u8) PackedDupResult {
-            const val = HyperValue{ .raw = handle };
-            if (val.isSso()) {
-                const sso_buf = val.asSsoBytes();
-                const handles = packedHandlesOf(expect_instance) orelse return .stale;
-                const res = @import("../backend_dispatch.zig").valueNewString(expect_tag, handles.ctx_addr, sso_buf.slice());
-                if (res.out_of_memory) return .out_of_memory;
-                if (res.exception) |e| @import("../backend_dispatch.zig").timerFreeValue(expect_tag, handles.ctx_addr, e.slice());
-                if (res.value) |v| {
-                    if (out.len < v.len) {
-                        @import("../backend_dispatch.zig").timerFreeValue(expect_tag, handles.ctx_addr, v.slice());
-                        return .out_of_memory;
-                    }
-                    @memcpy(out[0..v.len], v.bytes[0..v.len]);
-                    return .{ .ok = v.len };
-                }
-                return .stale;
-            }
-            const entry = packed_api_value.get(handle) orelse return .stale;
-            if (entry.instance_id != expect_instance or entry.tag != expect_tag) return .stale;
-            const len = @import("../backend_dispatch.zig").timerDupValue(entry.tag, entry.ctx_addr, entry.bytes(), out) orelse return .stale;
-            return .{ .ok = len };
-        }
+        pub const PackedReadyResult = packed_readiness.Result(backend.BackendType);
 
-        pub fn packedInstanceReady(instance_id: i32) union(enum) {
-            ok: struct { tag: backend.BackendType, ctx_addr: usize },
-            status: c_int,
-        } {
-            if (host_wake.isNotifying()) return .{ .status = API_INVALID_ARGUMENT };
-            if (@import("../runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
-            if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
-            const tag = packedTagOf(instance_id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
-            const handles = packedHandlesOf(instance_id) orelse return .{ .status = API_INSTANCE_NOT_FOUND };
-            if (instance_map.getInstance(instance_id)) |inst| if (inst.loop.lastError() != null) return .{ .status = API_LOOP_FAILED };
-            return .{ .ok = .{ .tag = tag, .ctx_addr = handles.ctx_addr } };
+        pub fn packedInstanceReady(instance_id: i32) PackedReadyResult {
+            return packed_readiness.check(@This(), instance_id, true, API_INVALID_ARGUMENT, API_INSTANCE_NOT_FOUND, API_WRONG_THREAD, API_LOOP_FAILED);
         }
 
         pub fn finishBoolOp(op: *ApiOp, result: api_backend.BoolResult, out_flag: *bool, out_exception: *u64) c_int {
-            if (!drainApiJobs(op)) {
-                if (result == .exception) ActiveEngine.freeValue(op.ctx, result.exception);
-                return API_INSTANCE_NOT_FOUND;
-            }
-            return switch (result) {
-                .ok => |val| blk: {
-                    out_flag.* = val;
-                    break :blk API_OK;
-                },
-                .exception => |exception| blk: {
-                    const stored = apiStore(op.id, exception, out_exception);
-                    break :blk if (stored == API_OK) 1 else stored;
-                },
-                .out_of_memory => API_OUT_OF_MEMORY,
-            };
+            return finish_bool.finishBoolOp(@This(), ActiveEngine.freeValue, op, result, out_flag, out_exception, .{
+                .instance_not_found = API_INSTANCE_NOT_FOUND,
+                .ok = API_OK,
+                .out_of_memory = API_OUT_OF_MEMORY,
+            });
         }
     };
 }

@@ -5,7 +5,7 @@
 //!   - set an execution time limit that auto-interrupts expired scripts
 //!   - force a synchronous GC pass and snapshot memory usage
 //!
-//! Lifecycle: Call `init(instance_id)` ONCE after `engine.create` to arm the backend-specific interrupt trampoline. `engine.destroy` calls `deinit(instance_id)` only after active JavaScript has unwound, while the runtime is still valid. Direct users may call `deinit` themselves before destroy when no evaluation is active.
+//! Lifecycle: Call `init(instance_id)` ONCE after `engine.create` to arm the backend-specific interrupt trampoline. `engine.destroy` removes it only after active JavaScript has unwound, while the runtime is still valid. Direct users may call `deinit` themselves before destroy when no evaluation is active.
 //!
 //! Thread-safety: `requestInterrupt` / `clearInterrupt` / `setExecutionTimeLimit` are safe to call from any thread (atomic loads/stores on the shared state). `runGc` / `getMemoryUsage` must be called on the engine's owning thread — they touch the JS runtime directly.
 //!
@@ -21,196 +21,39 @@ const sync = @import("zev");
 const backend = @import("../backend.zig");
 const engine = @import("../engine.zig");
 const instance_map = @import("instance_map.zig");
+const control_registry = @import("runtime_control_registry.zig");
+const observation = @import("runtime_observation.zig");
 const hermes_watchdog = @import("hermes_watchdog.zig");
 
-/// Snapshot of runtime memory consumption. Fields not reported by a backend default to zero.
-pub const MemoryUsage = extern struct {
-    malloc_count: u64 = 0,
-    malloc_size: u64 = 0,
-    malloc_limit: u64 = 0,
-    memory_used_count: u64 = 0,
-    memory_used_size: u64 = 0,
-    atom_count: u64 = 0,
-    atom_size: u64 = 0,
-    obj_count: u64 = 0,
-    obj_size: u64 = 0,
-    shape_count: u64 = 0,
-};
+pub const MemoryUsage = observation.MemoryUsage;
+pub const ShutdownPhase = control_registry.ShutdownPhase;
+pub const ShutdownStatus = control_registry.ShutdownStatus;
+pub const InterruptState = control_registry.InterruptState;
+pub const init = control_registry.init;
+pub const initForInstance = control_registry.initForInstance;
+pub const deinit = control_registry.deinit;
+pub const deinitForInstance = control_registry.deinitForInstance;
+const hermesTriggerTimeout = control_registry.hermesTriggerTimeout;
+const hermesWatchTimeLimit = control_registry.hermesWatchTimeLimit;
+const hermesDrainAsyncTimeout = control_registry.hermesDrainAsyncTimeout;
+const registry = &control_registry.registry;
+const registry_mutex = &control_registry.registry_mutex;
+const registry_condition = &control_registry.registry_condition;
+const HandlerStatus = control_registry.HandlerStatus;
+const initForInstanceWithHooks = control_registry.initForInstanceWithHooks;
+const deinitForInstanceWithWaitObserver = control_registry.deinitForInstanceWithWaitObserver;
+const supportsMidScriptUserInterruptForBackend = control_registry.supportsMidScriptUserInterruptForBackend;
+const supportsMidScriptUserInterruptForState = control_registry.supportsMidScriptUserInterruptForState;
+const isHandlerReady = control_registry.isHandlerReady;
+const takeState = control_registry.takeState;
 
-pub const ShutdownPhase = enum(c_int) { open = 0, closing = 1, sealed = 2, drained = 3, cancelled = 4 };
-
-pub const ShutdownStatus = struct { phase: ShutdownPhase, remaining_ms: u64 };
-
-/// Per-instance state shared between public control calls and backend interrupt trampolines. Registry access is serialized; interrupt flags and deadlines use atomic access. The backend extern structs must preserve this layout.
-pub const InterruptState = extern struct {
-    /// Non-zero when an interrupt has been requested. Read by the trampoline on every interrupt check.
-    interrupt_requested: u8 = 0,
-    _pad: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
-    /// Absolute monotonic deadline in ms (from io.monotonicMilliseconds). Zero means "no limit". Read atomically.
-    deadline_ms: u64 = 0,
-    /// Instance this state belongs to. -1 until init() fills it in.
-    instance_id: i32 = -1,
-    budget_millis: u64 = 0,
-    budget_deadline_ms: u64 = 0,
-    budget_depth: usize = 0,
-    shutdown_deadline_ms: u64 = 0,
-    shutdown_phase: ShutdownPhase = .open,
-    /// Execution epoch: even = idle, odd = running.
-    exec_epoch: u64 = 0,
-    /// Monotonic target epoch for user interrupts (via fetchMax).
-    interrupt_target: u64 = 0,
-};
-
-// ---- Module-global state registry --------------------------------------------
-
-var registry: std.AutoHashMap(i32, *InterruptState) =
-    std.AutoHashMap(i32, *InterruptState).init(std.heap.c_allocator);
-var registry_mutex: sync.Mutex = .{};
-
-fn takeState(instance_id: i32) ?*InterruptState {
-    registry_mutex.lock();
-    defer registry_mutex.unlock();
-    const kv = registry.fetchRemove(instance_id) orelse return null;
-    return kv.value;
+fn jscPollingControlsUnavailable(state: *const InterruptState) bool {
+    if (comptime !backend.isPacked(.jsc)) return false;
+    return state.backend_tag == .jsc and !@import("../backend/jsc/polling_config.zig").supportsInterrupt();
 }
 
-// ---- Public API --------------------------------------------------------------
-
-/// Arm interrupt + time-limit support for the given instance. Must be called after `engine.create` and before any other runtime_control operation on this instance. Idempotent — returns true if already initialized.
-///
-/// Returns false if the instance does not exist.
-pub fn init(instance_id: i32) bool {
-    const inst = instance_map.getInstance(instance_id) orelse return false;
-    return initForInstance(instance_id, inst);
-}
-
-/// Install control state while an instance is being published under the instance-map lock. It must not look the instance up again: creation uses it before the instance becomes observable to normal readers.
-pub fn initForInstance(instance_id: i32, inst: *instance_map.EngineInstance) bool {
-
-    // Idempotency check.
-    registry_mutex.lock();
-    if (registry.get(instance_id) != null) {
-        registry_mutex.unlock();
-        return true;
-    }
-    registry_mutex.unlock();
-
-    const state = std.heap.c_allocator.create(InterruptState) catch return false;
-    state.* = .{
-        .interrupt_requested = 0,
-        .deadline_ms = 0,
-        .instance_id = instance_id,
-        .budget_millis = 0,
-        .budget_deadline_ms = 0,
-        .budget_depth = 0,
-        .exec_epoch = 0,
-        .interrupt_target = 0,
-    };
-
-    registry_mutex.lock();
-    registry.put(instance_id, state) catch {
-        registry_mutex.unlock();
-        std.heap.c_allocator.destroy(state);
-        return false;
-    };
-    registry_mutex.unlock();
-
-    switch (inst.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                // Safe: the two extern structs have identical layout.
-                const qjs_state: *qjs_mod.QjsInterruptState = @ptrCast(state);
-                qjs_mod.qjsInstallInterruptHandler(m.runtime, qjs_state);
-            },
-            .jsc => {
-                const jsc_mod = @import("../backend/jsc.zig");
-                const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
-                // 50ms watchdog period — keeps requestInterrupt latency low without incurring meaningful overhead on normal scripts.
-                const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
-                jsc_mod.jscInstallInterruptHandler(group, jsc_state);
-            },
-            .escargot, .hermes => {},
-        },
-        .packed_alt => |a| {
-            // Dispatch by the instance backend so non-primary packs get interrupt/time-limit handlers too.
-            inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
-                if (a.tag == cand) {
-                    if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) return false;
-                    if (comptime backend.isQuickJsApiBackend(cand)) {
-                        const E = backend.Engine(cand);
-                        const Mod = backend.EngineModule(cand);
-                        const qjs_state: *Mod.QjsInterruptState = @ptrCast(state);
-                        const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
-                        Mod.qjsInstallInterruptHandler(rt, qjs_state);
-                    } else {
-                        const jsc_mod = @import("../backend/jsc.zig");
-                        const jsc_state: *jsc_mod.JscInterruptState = @ptrCast(state);
-                        const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
-                        const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
-                        jsc_mod.jscInstallInterruptHandler(group, jsc_state);
-                    }
-                    break;
-                }
-            } else return false;
-        },
-    }
-
-    return true;
-}
-
-/// Remove the interrupt trampoline and free the state. Call before `engine.destroy`. Idempotent — returns false if the instance was never initialized (or already torn down).
-pub fn deinit(instance_id: i32) bool {
-    const inst_opt = instance_map.getInstance(instance_id);
-
-    const state = takeState(instance_id) orelse return false;
-
-    // Uninstall from the backend BEFORE freeing the state — otherwise the JS thread could read freed memory if it fires a check between takeState and here.
-    if (inst_opt) |inst| {
-        switch (inst.engine_handles) {
-            .mono => |m| switch (backend.active_backend) {
-                .quickjs, .quickjs_ng => {
-                    const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                    qjs_mod.qjsUninstallInterruptHandler(m.runtime);
-                },
-                .jsc => {
-                    const jsc_mod = @import("../backend/jsc.zig");
-                    const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(m.ctx));
-                    jsc_mod.jscUninstallInterruptHandler(group);
-                },
-                .escargot, .hermes => {},
-            },
-            .packed_alt => |a| {
-                inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
-                    if (a.tag == cand) {
-                        if (comptime !(backend.isPacked(cand) or cand == backend.active_backend)) break;
-                        if (comptime backend.isQuickJsApiBackend(cand)) {
-                            const E = backend.Engine(cand);
-                            const Mod = backend.EngineModule(cand);
-                            const rt: E.Runtime = @ptrFromInt(a.runtime_addr);
-                            Mod.qjsUninstallInterruptHandler(rt);
-                        } else {
-                            const jsc_mod = @import("../backend/jsc.zig");
-                            const ctx: jsc_mod.jsc.JSGlobalContextRef = @ptrFromInt(a.ctx_addr);
-                            const group = jsc_mod.jsc.JSContextGetGroup(@ptrCast(ctx));
-                            jsc_mod.jscUninstallInterruptHandler(group);
-                        }
-                        break;
-                    }
-                }
-            },
-        }
-    }
-
-    std.heap.c_allocator.destroy(state);
-    return true;
-}
-
-const hermesTriggerTimeout = hermes_watchdog.hermesTriggerTimeout;
-const hermesTriggerTeardownTimeout = hermes_watchdog.hermesTriggerTeardownTimeout;
-const hermesWatchTimeLimit = hermes_watchdog.hermesWatchTimeLimit;
-const hermesDrainAsyncTimeout = hermes_watchdog.hermesDrainAsyncTimeout;
 pub const softRearmHermesStopAfterHost = hermes_watchdog.softRearmHermesStopAfterHost;
+const hermesTriggerTeardownTimeout = hermes_watchdog.hermesTriggerTeardownTimeout;
 
 /// Request that the JS runtime interrupt execution on the next interrupt check. Thread-safe. Returns false if the instance was never init()'d or has been deinit()'d.
 ///
@@ -221,23 +64,23 @@ pub const softRearmHermesStopAfterHost = hermes_watchdog.softRearmHermesStopAfte
 /// Escargot/Hermes spikes: false — user interrupt must not be advertised as mid-script cancel.
 pub fn supportsMidScriptUserInterrupt() bool {
     return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng, .jsc => true,
+        .quickjs, .quickjs_ng => true,
+        .jsc => @import("../backend/jsc/polling_config.zig").supportsInterrupt(),
         .escargot, .hermes => false,
     };
 }
 
 /// Request mid-script interrupt when the backend supports it. Returns true only when the instance exists **and** mid-script user interrupt is supported (bit armed). Escargot: always false (no Public hook). Hermes: always false for this API — mid-script abort is stop/destroy via `requestStopInterrupt` → `asyncTriggerTimeout` (sticky; softRearm/drain required).
 pub fn requestInterrupt(instance_id: i32) bool {
-    if (!supportsMidScriptUserInterrupt()) {
-        // Refuse to claim mid-script stop. Do not set the user bit (avoids false isInterruptRequested).
-        registry_mutex.lock();
-        defer registry_mutex.unlock();
-        _ = registry.get(instance_id) orelse return false;
-        return false;
-    }
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
+    const polling_enabled = if (state.backend_tag == .jsc) blk: {
+        if (comptime backend.isPacked(.jsc)) break :blk @import("../backend/jsc/polling_config.zig").supportsInterrupt();
+        break :blk false;
+    } else true;
+    if (!supportsMidScriptUserInterruptForState(state, polling_enabled)) return false;
     const epoch_ptr: *std.atomic.Value(u64) = @ptrCast(&state.exec_epoch);
     const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
     const cur_epoch = epoch_ptr.load(.monotonic);
@@ -248,6 +91,349 @@ pub fn requestInterrupt(instance_id: i32) bool {
     return true;
 }
 
+test "instance interrupt support follows the selected packed backend" {
+    try std.testing.expect(supportsMidScriptUserInterruptForBackend(.quickjs_ng, false));
+    try std.testing.expect(supportsMidScriptUserInterruptForBackend(.quickjs, false));
+    try std.testing.expect(!supportsMidScriptUserInterruptForBackend(.jsc, false));
+    try std.testing.expect(supportsMidScriptUserInterruptForBackend(.jsc, true));
+    try std.testing.expect(!supportsMidScriptUserInterruptForBackend(.escargot, true));
+    try std.testing.expect(!supportsMidScriptUserInterruptForBackend(.hermes, true));
+}
+
+test "reused instance ids use the backend saved with each interrupt state" {
+    const reused_id = std.math.maxInt(i32) - 11;
+    var old_state = InterruptState{ .instance_id = reused_id, .backend_tag = .jsc };
+    var new_state = InterruptState{ .instance_id = reused_id, .backend_tag = .quickjs_ng };
+    try std.testing.expect(!supportsMidScriptUserInterruptForState(&old_state, false));
+    try std.testing.expect(supportsMidScriptUserInterruptForState(&new_state, false));
+    try std.testing.expect(supportsMidScriptUserInterruptForState(
+        &InterruptState{ .instance_id = reused_id, .backend_tag = .jsc },
+        true,
+    ));
+}
+
+test "interrupt request observes a replacement state under the registry lock" {
+    const id = std.math.maxInt(i32) - 12;
+    const old_state = try std.testing.allocator.create(InterruptState);
+    old_state.* = .{ .instance_id = id, .backend_tag = .jsc };
+    defer std.testing.allocator.destroy(old_state);
+    const replacement = try std.testing.allocator.create(InterruptState);
+    replacement.* = .{ .instance_id = id, .backend_tag = .quickjs_ng };
+    defer std.testing.allocator.destroy(replacement);
+
+    const Probe = struct {
+        instance_id: i32,
+        accepted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            self.accepted.store(requestInterrupt(self.instance_id), .release);
+        }
+    };
+    var probe = Probe{ .instance_id = id };
+
+    registry_mutex.lock();
+    registry.put(id, old_state) catch {
+        registry_mutex.unlock();
+        return error.OutOfMemory;
+    };
+    const thread = std.Thread.spawn(.{}, Probe.run, .{&probe}) catch {
+        _ = registry.remove(id);
+        registry_mutex.unlock();
+        return error.ThreadSpawnFailed;
+    };
+    if (registry.fetchRemove(id) == null) {
+        registry_mutex.unlock();
+        thread.join();
+        return error.MissingOriginalState;
+    }
+    registry.put(id, replacement) catch {
+        registry_mutex.unlock();
+        thread.join();
+        _ = takeState(id);
+        return error.OutOfMemory;
+    };
+    registry_mutex.unlock();
+    thread.join();
+
+    const current = takeState(id) orelse return error.MissingReplacementState;
+    try std.testing.expect(current == replacement);
+    try std.testing.expect(probe.accepted.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), old_state.interrupt_requested);
+    try std.testing.expectEqual(@as(u8, 1), replacement.interrupt_requested);
+}
+
+test "instance control registration rejects stale state and serializes first registration" {
+    const id = std.math.maxInt(i32) - 13;
+    try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
+    defer engine.destroy(id);
+
+    const inst = instance_map.getInstance(id) orelse return error.MissingInstance;
+    registry_mutex.lock();
+    const state = registry.get(id) orelse {
+        registry_mutex.unlock();
+        return error.MissingInterruptState;
+    };
+    const generation = state.generation;
+    const backend_tag = state.backend_tag;
+    state.generation +%= 1;
+    registry_mutex.unlock();
+    try std.testing.expect(!initForInstance(id, inst));
+
+    registry_mutex.lock();
+    state.generation = generation;
+    state.backend_tag = if (backend_tag == .jsc) .quickjs_ng else .jsc;
+    registry_mutex.unlock();
+    try std.testing.expect(!initForInstance(id, inst));
+
+    registry_mutex.lock();
+    state.backend_tag = backend_tag;
+    state.handler_status = .removing;
+    registry_mutex.unlock();
+    try std.testing.expect(!initForInstance(id, inst));
+
+    registry_mutex.lock();
+    state.handler_status = .ready;
+    registry_mutex.unlock();
+    try std.testing.expect(deinit(id));
+
+    const Probe = struct {
+        id: i32,
+        inst: *instance_map.EngineInstance,
+        start: *std.atomic.Value(bool),
+        succeeded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn run(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            self.succeeded.store(initForInstance(self.id, self.inst), .release);
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var first = Probe{ .id = id, .inst = inst, .start = &start };
+    var second = Probe{ .id = id, .inst = inst, .start = &start };
+    const first_thread = try std.Thread.spawn(.{}, Probe.run, .{&first});
+    const second_thread = std.Thread.spawn(.{}, Probe.run, .{&second}) catch {
+        start.store(true, .release);
+        first_thread.join();
+        return error.ThreadSpawnFailed;
+    };
+    start.store(true, .release);
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expect(first.succeeded.load(.acquire));
+    try std.testing.expect(second.succeeded.load(.acquire));
+    try std.testing.expect(initForInstance(id, inst));
+}
+
+test "public deinit lease serializes with engine destruction and id reuse" {
+    const id = std.math.maxInt(i32) - 14;
+    try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
+    defer engine.destroy(id);
+
+    const Probe = struct {
+        id: i32,
+        start: *std.atomic.Value(bool),
+
+        fn runDeinit(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            _ = deinit(self.id);
+        }
+
+        fn destroy(self: *@This()) void {
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            engine.destroy(self.id);
+        }
+    };
+    var start = std.atomic.Value(bool).init(false);
+    var probe = Probe{ .id = id, .start = &start };
+    const deinit_thread = try std.Thread.spawn(.{}, Probe.runDeinit, .{&probe});
+    const destroy_thread = std.Thread.spawn(.{}, Probe.destroy, .{&probe}) catch {
+        start.store(true, .release);
+        deinit_thread.join();
+        engine.destroy(id);
+        return error.ThreadSpawnFailed;
+    };
+    start.store(true, .release);
+    deinit_thread.join();
+    destroy_thread.join();
+
+    try std.testing.expect(instance_map.getInstance(id) == null);
+    try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
+    try std.testing.expect(deinit(id));
+}
+
+test "failed registration cleanup owns state while deinit waits for init waiters" {
+    const id = std.math.maxInt(i32) - 15;
+    try std.testing.expect(engine.create(id, .{ .allocator = std.testing.allocator }));
+    defer engine.destroy(id);
+    try std.testing.expect(deinit(id));
+
+    const inst = instance_map.getInstance(id) orelse return error.MissingInstance;
+    const Gate = struct {
+        mutex: sync.Mutex = .{},
+        changed: sync.Condition = .init,
+        installer_entered: bool = false,
+        release_installer: bool = false,
+        failure_published: bool = false,
+        release_cleanup: bool = false,
+        deinit_waiting_install: bool = false,
+        deinit_waits_after_failure: usize = 0,
+        deinit_done: bool = false,
+        installer_result: bool = true,
+        init_result: bool = true,
+        deinit_result: bool = true,
+
+        fn failInstall(_: *instance_map.EngineInstance, _: *InterruptState, context: ?*anyopaque) bool {
+            const gate: *@This() = @ptrCast(@alignCast(context.?));
+            gate.mutex.lock();
+            gate.installer_entered = true;
+            gate.changed.broadcast();
+            while (!gate.release_installer) gate.changed.wait(&gate.mutex);
+            gate.mutex.unlock();
+            return false;
+        }
+
+        fn pauseAfterFailure(context: ?*anyopaque) void {
+            const gate: *@This() = @ptrCast(@alignCast(context.?));
+            gate.mutex.lock();
+            gate.failure_published = true;
+            gate.changed.broadcast();
+            while (!gate.release_cleanup) gate.changed.wait(&gate.mutex);
+            gate.mutex.unlock();
+        }
+    };
+    const WaitContext = struct { gate: *Gate, state: *InterruptState };
+    const Probe = struct {
+        id: i32,
+        inst: *instance_map.EngineInstance,
+        gate: *Gate,
+        wait_context: WaitContext,
+
+        fn observeDeinitWait(context: ?*anyopaque) void {
+            const wait_context: *WaitContext = @ptrCast(@alignCast(context.?));
+            const gate = wait_context.gate;
+            gate.mutex.lock();
+            if (wait_context.state.handler_status == .installing) gate.deinit_waiting_install = true;
+            if (wait_context.state.handler_status == .failed and wait_context.state.registration_waiters == 0) {
+                gate.deinit_waits_after_failure += 1;
+            }
+            gate.changed.broadcast();
+            gate.mutex.unlock();
+        }
+
+        fn runInstaller(self: *@This()) void {
+            const installed = initForInstanceWithHooks(
+                self.id,
+                self.inst,
+                std.testing.allocator,
+                @ptrCast(self.gate),
+                Gate.failInstall,
+                Gate.pauseAfterFailure,
+            );
+            self.gate.mutex.lock();
+            self.gate.installer_result = installed;
+            self.gate.changed.broadcast();
+            self.gate.mutex.unlock();
+        }
+
+        fn runInitWaiter(self: *@This()) void {
+            const initialized = initForInstance(self.id, self.inst);
+            self.gate.mutex.lock();
+            self.gate.init_result = initialized;
+            self.gate.changed.broadcast();
+            self.gate.mutex.unlock();
+        }
+
+        fn runDeinitWaiter(self: *@This()) void {
+            const removed = deinitForInstanceWithWaitObserver(
+                self.id,
+                self.inst,
+                std.testing.allocator,
+                @ptrCast(&self.wait_context),
+                observeDeinitWait,
+            );
+            self.gate.mutex.lock();
+            self.gate.deinit_result = removed;
+            self.gate.deinit_done = true;
+            self.gate.changed.broadcast();
+            self.gate.mutex.unlock();
+        }
+    };
+
+    var gate = Gate{};
+    var probe = Probe{ .id = id, .inst = inst, .gate = &gate, .wait_context = undefined };
+    const installer_thread = try std.Thread.spawn(.{}, Probe.runInstaller, .{&probe});
+    gate.mutex.lock();
+    while (!gate.installer_entered) gate.changed.wait(&gate.mutex);
+    gate.mutex.unlock();
+
+    registry_mutex.lock();
+    const state = registry.get(id) orelse {
+        registry_mutex.unlock();
+        gate.mutex.lock();
+        gate.release_installer = true;
+        gate.release_cleanup = true;
+        gate.changed.broadcast();
+        gate.mutex.unlock();
+        installer_thread.join();
+        return error.MissingInterruptState;
+    };
+    probe.wait_context = .{ .gate = &gate, .state = state };
+    registry_mutex.unlock();
+
+    const init_thread = std.Thread.spawn(.{}, Probe.runInitWaiter, .{&probe}) catch {
+        gate.mutex.lock();
+        gate.release_installer = true;
+        gate.changed.broadcast();
+        while (!gate.failure_published) gate.changed.wait(&gate.mutex);
+        gate.release_cleanup = true;
+        gate.changed.broadcast();
+        gate.mutex.unlock();
+        installer_thread.join();
+        return error.ThreadSpawnFailed;
+    };
+    registry_mutex.lock();
+    while (state.registration_waiters != 1) registry_condition.wait(registry_mutex);
+    registry_mutex.unlock();
+
+    const deinit_thread = std.Thread.spawn(.{}, Probe.runDeinitWaiter, .{&probe}) catch {
+        gate.mutex.lock();
+        gate.release_installer = true;
+        gate.changed.broadcast();
+        while (!gate.failure_published) gate.changed.wait(&gate.mutex);
+        gate.release_cleanup = true;
+        gate.changed.broadcast();
+        gate.mutex.unlock();
+        init_thread.join();
+        installer_thread.join();
+        return error.ThreadSpawnFailed;
+    };
+    gate.mutex.lock();
+    while (!gate.deinit_waiting_install and !gate.deinit_done) gate.changed.wait(&gate.mutex);
+    gate.release_installer = true;
+    gate.changed.broadcast();
+    while (!gate.failure_published) gate.changed.wait(&gate.mutex);
+    while (gate.deinit_waits_after_failure == 0 and !gate.deinit_done) gate.changed.wait(&gate.mutex);
+    const deinit_escaped_cleanup = gate.deinit_done;
+    gate.release_cleanup = true;
+    gate.changed.broadcast();
+    gate.mutex.unlock();
+
+    init_thread.join();
+    deinit_thread.join();
+    installer_thread.join();
+
+    try std.testing.expect(!deinit_escaped_cleanup);
+    try std.testing.expect(gate.deinit_waits_after_failure != 0);
+    try std.testing.expect(!gate.installer_result);
+    try std.testing.expect(!gate.init_result);
+    try std.testing.expect(!gate.deinit_result);
+    registry_mutex.lock();
+    const still_registered = registry.get(id) != null;
+    registry_mutex.unlock();
+    try std.testing.expect(!still_registered);
+}
+
 /// Clear a pending user interrupt. Lifecycle shutdown owns a separate bit, so this cannot resume a script that is being stopped.
 pub fn clearInterrupt(instance_id: i32) bool {
     registry_mutex.lock();
@@ -255,6 +441,10 @@ pub fn clearInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
     target_ptr.store(0, .monotonic);
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
@@ -273,6 +463,10 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchOr(2, .monotonic);
     registry_mutex.unlock();
@@ -291,6 +485,7 @@ pub fn requestShutdownCancel(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     cancelShutdownState(state);
     return true;
 }
@@ -314,6 +509,7 @@ pub fn beginShutdown(instance_id: i32, millis: u64) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     const now: u64 = @intCast(io.monotonicMilliseconds());
     refreshShutdown(state, now);
     if (state.shutdown_phase != .open) return state.shutdown_phase == .closing or state.shutdown_phase == .sealed;
@@ -327,6 +523,7 @@ pub fn shutdownStatus(instance_id: i32) ?ShutdownStatus {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return null;
+    if (!isHandlerReady(state)) return null;
     const now: u64 = @intCast(io.monotonicMilliseconds());
     refreshShutdown(state, now);
     const deadline: *std.atomic.Value(u64) = @ptrCast(&state.shutdown_deadline_ms);
@@ -344,6 +541,7 @@ pub fn canEnterExecution(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return true;
+    if (!isHandlerReady(state)) return false;
     refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
     return state.shutdown_phase == .open or state.shutdown_phase == .closing or state.budget_depth != 0;
 }
@@ -353,6 +551,7 @@ pub fn sealShutdown(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
     if (state.shutdown_phase != .closing) return false;
     state.shutdown_phase = .sealed;
@@ -364,6 +563,7 @@ pub fn completeShutdownDrain(instance_id: i32) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
     refreshShutdown(state, @intCast(io.monotonicMilliseconds()));
     if (state.shutdown_phase != .sealed) return false;
     state.shutdown_phase = .drained;
@@ -376,6 +576,10 @@ pub fn clearStopInterrupt(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     _ = p.fetchAnd(~@as(u8, 2), .monotonic);
     registry_mutex.unlock();
@@ -394,8 +598,27 @@ fn armJscWatchdogShortLimit(instance_id: i32, millis: u64) void {
 
     registry_mutex.lock();
     const state = registry.get(instance_id);
+    const interrupt_state = state orelse {
+        registry_mutex.unlock();
+        return;
+    };
+    if (!isHandlerReady(interrupt_state) or
+        interrupt_state.instance_id != instance_id or
+        interrupt_state.generation != inst.generation or
+        interrupt_state.backend_tag != backend.backendToC(inst.backendTag()))
+    {
+        registry_mutex.unlock();
+        return;
+    }
+    interrupt_state.active_handler_users += 1;
     registry_mutex.unlock();
-    const interrupt_state = state orelse return;
+    defer {
+        registry_mutex.lock();
+        std.debug.assert(interrupt_state.active_handler_users != 0);
+        interrupt_state.active_handler_users -= 1;
+        registry_condition.broadcast();
+        registry_mutex.unlock();
+    }
 
     const period_sec = @as(f64, @floatFromInt(millis)) / 1000.0;
     switch (inst.engine_handles) {
@@ -422,6 +645,8 @@ pub fn setExecutionTimeLimit(instance_id: i32, millis: u64) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
+    if (millis != 0 and jscPollingControlsUnavailable(state)) return false;
     const p: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     if (millis == 0) {
         p.store(0, .monotonic);
@@ -444,6 +669,8 @@ pub fn setExecutionBudget(instance_id: i32, millis: u64) bool {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return false;
+    if (!isHandlerReady(state)) return false;
+    if (millis != 0 and jscPollingControlsUnavailable(state)) return false;
     state.budget_millis = millis;
     if (millis != 0) {
         const target_ptr: *std.atomic.Value(u64) = @ptrCast(&state.interrupt_target);
@@ -461,6 +688,10 @@ pub fn beginExecutionBudget(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     var short_budget_millis: u64 = 0;
     if (state.budget_depth == 0) {
         const epoch_ptr: *std.atomic.Value(u64) = @ptrCast(&state.exec_epoch);
@@ -489,6 +720,7 @@ pub fn endExecutionBudget(instance_id: i32) void {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return;
+    if (!isHandlerReady(state)) return;
     std.debug.assert(state.budget_depth != 0);
     state.budget_depth -= 1;
     if (state.budget_depth == 0) {
@@ -516,6 +748,10 @@ pub fn executionDeadlineMillis(instance_id: i32) ?u64 {
         registry_mutex.unlock();
         return null;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return null;
+    }
     const p: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     const deadline = p.load(.monotonic);
     registry_mutex.unlock();
@@ -527,6 +763,7 @@ pub fn effectiveExecutionDeadlineMillis(instance_id: i32) ?u64 {
     registry_mutex.lock();
     defer registry_mutex.unlock();
     const state = registry.get(instance_id) orelse return null;
+    if (!isHandlerReady(state)) return null;
     const manual_ptr: *std.atomic.Value(u64) = @ptrCast(&state.deadline_ms);
     const budget_ptr: *std.atomic.Value(u64) = @ptrCast(&state.budget_deadline_ms);
     const manual = manual_ptr.load(.monotonic);
@@ -553,6 +790,10 @@ pub fn isInterruptRequested(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     const requested = (p.load(.monotonic) & 1) != 0;
     registry_mutex.unlock();
@@ -566,261 +807,19 @@ pub fn isStopRequested(instance_id: i32) bool {
         registry_mutex.unlock();
         return false;
     };
+    if (!isHandlerReady(state)) {
+        registry_mutex.unlock();
+        return false;
+    }
     const p: *std.atomic.Value(u8) = @ptrCast(&state.interrupt_requested);
     const requested = (p.load(.monotonic) & 2) != 0;
     registry_mutex.unlock();
     return requested;
 }
 
-/// Force a GC pass on the runtime. Must be called on the engine's owning thread. Returns false if the instance was never created.
-pub fn runGc(instance_id: i32) bool {
-    const inst = instance_map.getInstance(instance_id) orelse return false;
-    switch (inst.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsRunGc(m.runtime);
-            },
-            .jsc => {
-                const jsc_mod = @import("../backend/jsc.zig");
-                jsc_mod.jscRunGc(@ptrCast(m.ctx));
-            },
-            .escargot => {
-                if (comptime backend.isEscargotBackend(backend.active_backend)) {
-                    @import("../backend/escargot.zig").EscargotBackend.runGc(m.runtime);
-                }
-            },
-            .hermes => {
-                if (comptime backend.isHermesBackend(backend.active_backend)) {
-                    @import("../backend/hermes.zig").HermesBackend.runGc(m.runtime);
-                }
-            },
-        },
-        .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
-            .runtime_addr = a.runtime_addr,
-            .ctx_addr = a.ctx_addr,
-        }),
-    }
-    return true;
-}
-
-/// Cap the QuickJS-managed heap of this runtime at `bytes` (0 = unlimited). This does not cap allocations outside QuickJS, so it is not a process-RSS limit. Must be called on the engine's owning thread before the script it should bound runs. QuickJS: enforced via `JS_SetMemoryLimit` (GC is triggered on the next allocation past the cap). JSC: no public C API exists, so this operation is unsupported and returns false. Returns false when the instance was never created.
-pub fn setMemoryLimit(instance_id: i32, bytes: u64) bool {
-    const inst = instance_map.getInstance(instance_id) orelse return false;
-    switch (inst.engine_handles) {
-        // Comptime switch: do not call ActiveEngineModule.qjs* when primary is JSC (Zig still typechecks the dead runtime `if`).
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsSetMemoryLimit(m.runtime, @intCast(bytes));
-                return true;
-            },
-            .jsc, .escargot, .hermes => return false,
-        },
-        .packed_alt => |a| {
-            if (!backend.isQuickJsApiBackend(a.tag)) return false;
-            inline for (.{ .quickjs_ng, .quickjs }) |cand| {
-                if (a.tag == cand) {
-                    // Gate EngineModule imports on pack membership so mono-JSC builds do not pull qjs.
-                    if (comptime backend.isPacked(cand) or cand == backend.active_backend) {
-                        const E = backend.Engine(cand);
-                        const Mod = backend.EngineModule(cand);
-                        const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
-                        Mod.qjsSetMemoryLimit(rt, @intCast(bytes));
-                        return true;
-                    }
-                    return false;
-                }
-            }
-            return false;
-        },
-    }
-}
-
-/// Ask for one idle collection. Does not collect now and does not retain the JS runtime — `engine.destroy` can still free it while the request is queued. Extra requests before the next idle collection collapse into a single pending collection (one idle pass drains the whole queue). Returns false if the instance does not exist.
-pub fn requestIdleGc(instance_id: i32) bool {
-    const inst = instance_map.getInstance(instance_id) orelse return false;
-    idle_mutex.lock();
-    defer idle_mutex.unlock();
-    const slot = idleSlot(instance_id) orelse return false;
-    adoptSlot(slot, @intFromPtr(inst));
-    slot.pending +|= 1;
-    return true;
-}
-
-/// Host is idle. If a collection was requested and the cooldown has elapsed, run GC once, clear every queued request, and start the cooldown. Further `noteIdle` calls during the cooldown do not collect, even if `requestIdleGc` is called again.
-///
-/// Returns false when `instance_id` is not a live engine, including after `engine.destroy`. Returns true when the instance is alive. Whether a collection ran is `idleCollectionCount`, not this boolean.
-pub fn noteIdle(instance_id: i32) bool {
-    const inst = instance_map.getInstance(instance_id) orelse {
-        // Drop the queued request. It stores no runtime pointer, so this only forgets bookkeeping; destroy has already freed the engine.
-        idle_mutex.lock();
-        _ = idle_map.fetchRemove(instance_id);
-        idle_mutex.unlock();
-        return false;
-    };
-    const owner = @intFromPtr(inst);
-
-    var should_collect = false;
-    idle_mutex.lock();
-    if (idle_map.getPtr(instance_id)) |slot| {
-        // A slot left behind by a destroyed engine must not collect for a new engine that reused the id. The stored address is not dereferenced.
-        if (slot.owner != owner) {
-            slot.* = .{ .owner = owner };
-        } else if (slot.pending != 0) {
-            const now = monotonicMs();
-            if (now >= slot.cooldown_until_ms) {
-                slot.pending = 0;
-                slot.collections += 1;
-                slot.cooldown_until_ms = std.math.add(u64, now, idle_cooldown_ms) catch std.math.maxInt(u64);
-                should_collect = true;
-            }
-        }
-    }
-    idle_mutex.unlock();
-
-    if (!should_collect) return true;
-
-    // Resolve the runtime again after the lock. A destroy that won the race must not be followed by a GC on a freed runtime.
-    const live = instance_map.getInstance(instance_id) orelse return false;
-    switch (live.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                qjs_mod.qjsRunGc(m.runtime);
-            },
-            .jsc => {
-                const jsc_mod = @import("../backend/jsc.zig");
-                jsc_mod.jscRunGc(@ptrCast(m.ctx));
-            },
-            .escargot => {
-                if (comptime backend.isEscargotBackend(backend.active_backend)) {
-                    @import("../backend/escargot.zig").EscargotBackend.runGc(m.runtime);
-                }
-            },
-            .hermes => {
-                if (comptime backend.isHermesBackend(backend.active_backend)) {
-                    @import("../backend/hermes.zig").HermesBackend.runGc(m.runtime);
-                }
-            },
-        },
-        .packed_alt => |a| @import("../backend_dispatch.zig").runGcPacked(a.tag, .{
-            .runtime_addr = a.runtime_addr,
-            .ctx_addr = a.ctx_addr,
-        }),
-    }
-    return true;
-}
-
-/// How many times `noteIdle` has actually run GC for this instance. Zero if the instance was never requested, or after its idle slot was dropped by `noteIdle` following `engine.destroy`.
-pub fn idleCollectionCount(instance_id: i32) u64 {
-    idle_mutex.lock();
-    defer idle_mutex.unlock();
-    const slot = idle_map.get(instance_id) orelse return 0;
-    return slot.collections;
-}
-
-/// Wall-clock gap after an idle collection during which `noteIdle` will not collect again. Long enough that back-to-back test calls stay inside it.
-const idle_cooldown_ms: u64 = 5_000;
-
-const IdleSlot = struct {
-    /// Address of the EngineInstance that owns this slot. Not dereferenced.
-    owner: usize = 0,
-    pending: u32 = 0,
-    cooldown_until_ms: u64 = 0,
-    collections: u64 = 0,
-};
-
-fn adoptSlot(slot: *IdleSlot, owner: usize) void {
-    if (slot.owner != owner) slot.* = .{ .owner = owner };
-}
-
-var idle_map: std.AutoHashMap(i32, IdleSlot) = std.AutoHashMap(i32, IdleSlot).init(std.heap.c_allocator);
-var idle_mutex: sync.Mutex = .{};
-
-fn monotonicMs() u64 {
-    const now = io.monotonicMilliseconds();
-    if (now <= 0) return 0;
-    return @intCast(now);
-}
-
-fn idleSlot(instance_id: i32) ?*IdleSlot {
-    if (idle_map.getPtr(instance_id)) |slot| return slot;
-    idle_map.put(instance_id, .{}) catch return null;
-    return idle_map.getPtr(instance_id);
-}
-
-/// Snapshot memory usage. Returns null if the instance was never created. Backends that don't expose memory stats populate zeros.
-pub fn getMemoryUsage(instance_id: i32) ?MemoryUsage {
-    const inst = instance_map.getInstance(instance_id) orelse return null;
-    switch (inst.engine_handles) {
-        .mono => |m| switch (backend.active_backend) {
-            .quickjs, .quickjs_ng => {
-                const qjs_mod = @import("../backend.zig").ActiveEngineModule;
-                const snap = qjs_mod.qjsMemoryUsage(m.runtime);
-                return .{
-                    .malloc_count = snap.malloc_count,
-                    .malloc_size = snap.malloc_size,
-                    .malloc_limit = snap.malloc_limit,
-                    .memory_used_count = snap.memory_used_count,
-                    .memory_used_size = snap.memory_used_size,
-                    .atom_count = snap.atom_count,
-                    .atom_size = snap.atom_size,
-                    .obj_count = snap.obj_count,
-                    .obj_size = snap.obj_size,
-                    .shape_count = snap.shape_count,
-                };
-            },
-            .jsc => return .{},
-            .escargot => {
-                if (comptime backend.isEscargotBackend(backend.active_backend)) {
-                    const esc = @import("../backend/escargot/c_api.zig");
-                    const heap: u64 = esc.escargot_runtime_heap_size(m.runtime);
-                    const total: u64 = esc.escargot_runtime_total_size(m.runtime);
-                    return .{
-                        .malloc_size = total,
-                        .memory_used_size = heap,
-                    };
-                }
-                return .{};
-            },
-            .hermes => {
-                if (comptime backend.isHermesBackend(backend.active_backend)) {
-                    const hermes = @import("../backend/hermes/c_api.zig");
-                    return .{
-                        .malloc_size = hermes.hermes_runtime_allocated_bytes(m.runtime),
-                        .memory_used_size = hermes.hermes_runtime_heap_size(m.runtime),
-                    };
-                }
-                return .{};
-            },
-        },
-        .packed_alt => |a| {
-            if (!backend.isQuickJsApiBackend(a.tag)) return .{};
-            inline for (.{ .quickjs_ng, .quickjs }) |cand| {
-                if (a.tag == cand) {
-                    if (comptime backend.isPacked(cand) or cand == backend.active_backend) {
-                        const E = backend.Engine(cand);
-                        const Mod = backend.EngineModule(cand);
-                        const rt = @as(E.Runtime, @ptrFromInt(a.runtime_addr));
-                        const snap = Mod.qjsMemoryUsage(rt);
-                        return .{
-                            .malloc_count = snap.malloc_count,
-                            .malloc_size = snap.malloc_size,
-                            .malloc_limit = snap.malloc_limit,
-                            .memory_used_count = snap.memory_used_count,
-                            .memory_used_size = snap.memory_used_size,
-                            .atom_count = snap.atom_count,
-                            .atom_size = snap.atom_size,
-                            .obj_count = snap.obj_count,
-                            .obj_size = snap.obj_size,
-                            .shape_count = snap.shape_count,
-                        };
-                    }
-                    return .{};
-                }
-            }
-            return .{};
-        },
-    }
-}
+pub const runGc = observation.runGc;
+pub const setMemoryLimit = observation.setMemoryLimit;
+pub const requestIdleGc = observation.requestIdleGc;
+pub const noteIdle = observation.noteIdle;
+pub const idleCollectionCount = observation.idleCollectionCount;
+pub const getMemoryUsage = observation.getMemoryUsage;

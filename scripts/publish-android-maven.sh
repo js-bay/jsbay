@@ -10,8 +10,8 @@ repository_id=${5:-github}
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 case "$backend" in
-    quickjs) artifact=jsbayquickjs ;;
-    quickjs_ng) artifact=jsbayquickjsng ;;
+    quickjs) artifact_new=jsbay-quickjs; artifact_legacy=jsbayquickjs ;;
+    quickjs_ng) artifact_new=jsbay-quickjs-ng; artifact_legacy=jsbayquickjsng ;;
     *) echo "unsupported Android backend: $backend" >&2; exit 2 ;;
 esac
 if [[ ! $version =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
@@ -36,6 +36,21 @@ while IFS= read -r member; do
     esac
 done < "$members"
 
+artifact=
+for candidate in "$artifact_new" "$artifact_legacy"; do
+    if grep -Fq "io/jsbay/$candidate/$version/$candidate-$version.aar" "$members"; then
+        if [[ -n $artifact ]]; then
+            echo 'Maven archive contains multiple artifact coordinates for this backend' >&2
+            exit 2
+        fi
+        artifact=$candidate
+    fi
+done
+if [[ -z $artifact ]]; then
+    echo 'Maven archive does not contain the expected backend coordinate' >&2
+    exit 2
+fi
+
 package="$work/package"
 mkdir -p "$package"
 unzip -q "$archive" -d "$package"
@@ -51,7 +66,7 @@ grep -Fqx '  <groupId>io.jsbay</groupId>' "$pom"
 grep -Fqx "  <artifactId>$artifact</artifactId>" "$pom"
 grep -Fqx "  <version>$version</version>" "$pom"
 grep -Fq '<artifactId>kotlin-stdlib</artifactId>' "$pom"
-zig build --build-file "$root/build.zig" tool -- check-maven "$module_dir" "$version" "$backend"
+zig build --build-file "$root/build.zig" tool -- check-maven "$module_dir" "$version" "$backend" "$artifact"
 
 publication=("$aar" "$pom" "$gradle_module" "$sources")
 coordinate="io.jsbay:$artifact:$version"

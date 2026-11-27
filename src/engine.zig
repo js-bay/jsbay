@@ -714,87 +714,93 @@ pub fn dispatchTask(instance_id: i32, script: [*:0]const u8) bool {
 
 /// Destroy an engine instance.
 pub fn destroy(instance_id: i32) void {
+    const generation = instance_map.generationOf(instance_id) orelse {
+        @import("runtime/engine_thread.zig").beforeDestroy(instance_id);
+        return;
+    };
+    destroyGeneration(instance_id, generation);
+}
+
+pub fn destroyGeneration(instance_id: i32, generation: u64) void {
     const engine_thread = @import("runtime/engine_thread.zig");
+    if (builtin.is_test) {
+        if (before_teardown_claim_hook_for_testing) |hook| hook(instance_id, generation, before_teardown_claim_context_for_testing);
+    }
+    if (!instance_map.markTeardownPendingForGeneration(instance_id, generation)) return;
     if (engine_thread.isDestroying(instance_id)) return;
     if (engine_thread.isEvalActiveOnCurrentThread(instance_id)) {
         _ = engine_thread.requestDeferredEvalDestroy(instance_id);
         return;
     }
     if (@import("value/reference.zig").requestDeferredDestroy(instance_id)) return;
-    if (dispatch.isRunningTaskForInstance(instance_id)) {
-        const packed_id = @as(usize, @intCast(@as(u32, @bitCast(instance_id)))) + 1;
-        if (dispatch.postTask(instance_id, .{
-            .ctx = @ptrFromInt(packed_id),
-            .run = deferredDestroyTask,
-        })) return;
-        // A failed enqueue must not free a context while a JS callback is on its stack. Leave teardown to the caller's later destroy attempt.
+    if (dispatch.deferDestroyForCurrentTask(instance_id, generation, destroyGeneration)) return;
+
+    var gate_lease: engine_thread.DestroyGateLease = undefined;
+    if (!engine_thread.lockDestroyGateForGeneration(instance_id, generation, &gate_lease)) return;
+    const claim = instance_map.claimTeardownForGeneration(instance_id, generation);
+    engine_thread.unlockGenerationDestroyGate(&gate_lease);
+    if (claim == .stale) return;
+    if (claim == .already_claimed) {
+        if (!engine_thread.isTeardownOwnerThread(instance_id, generation) and
+            !engine_thread.isEngineThreadForGeneration(instance_id, generation))
+            engine_thread.waitGenerationGone(instance_id, generation);
         return;
     }
-    destroyNow(instance_id);
+
+    var owner_lease: engine_thread.TeardownOwnerLease = undefined;
+    engine_thread.enterTeardownOwner(&owner_lease, instance_id, generation);
+    defer engine_thread.leaveTeardownOwner(&owner_lease);
+    if (prepareDestroy(instance_id, generation)) return;
+    if (engine_thread.beginDestroy(instance_id, generation)) return;
+    engine_thread.beforeDestroyClaimed(instance_id, generation);
 }
 
 pub fn destroyForGeneration(instance_id: i32, generation: u64) void {
-    if (!instance_map.markTeardownPendingForGeneration(instance_id, generation)) return;
-    const engine_thread = @import("runtime/engine_thread.zig");
-    if (engine_thread.isDestroying(instance_id)) return;
-    if (engine_thread.isEvalActiveOnCurrentThread(instance_id)) {
-        _ = engine_thread.requestDeferredEvalDestroy(instance_id);
-        return;
-    }
-    if (@import("value/reference.zig").requestDeferredDestroy(instance_id)) return;
-    if (dispatch.deferDestroyForCurrentTask(instance_id, generation, destroyForGeneration)) return;
-    destroyAfterAdmissionClosed(instance_id, generation);
+    destroyGeneration(instance_id, generation);
 }
 
-fn deferredDestroyTask(ctx: ?*anyopaque) void {
-    const packed_id = @intFromPtr(ctx.?) - 1;
-    const instance_id: i32 = @bitCast(@as(u32, @truncate(packed_id)));
-    destroyNow(instance_id);
-}
-
-fn destroyNow(instance_id: i32) void {
-    const generation = instance_map.registeredGeneration(instance_id) orelse return;
-    // From this point teardown may detach the engine-thread State before it reaches destroyRuntime. Close public JS admission first so it cannot recreate that State against a runtime being dismantled.
-    if (!instance_map.markTeardownPendingForGeneration(instance_id, generation)) return;
-    destroyAfterAdmissionClosed(instance_id, generation);
-}
-
-fn destroyAfterAdmissionClosed(instance_id: i32, generation: u64) void {
-    // Mirror stop_loop so a blocking run sees both the teardown latch and the driver's stop bit. shouldStop already watches teardown_pending; requestStop covers hosts that only observe the driver flag and wakes the waiter promptly.
+fn prepareDestroy(instance_id: i32, generation: u64) bool {
+    if (instance_map.generationOf(instance_id) != generation) return true;
     if (instance_map.beginTeardownSignals(instance_id, generation)) |signals| {
         signals.ptrs.loop.requestStop();
         signals.ptrs.loop.wake();
-        // Wake native and debugger waits before teardown joins the execution owner.
         @import("js_event_loop").native_sync.cancelForInstance(instance_id);
         debugger_mod.abandon(instance_id);
         signals.end();
     }
-    // On the engine thread the JS call is still on the stack. beginDestroy wakes waiters and returns without freeing; that thread calls destroyRuntime after the call unwinds.
-    if (@import("runtime/engine_thread.zig").beginDestroyForGeneration(instance_id, generation)) return;
-    @import("runtime/engine_thread.zig").beforeDestroyForGeneration(instance_id, generation);
-    // beforeDestroy may return because another destroy owner already detached the State. The generation-bound fallback still needs the finalizer destruction marker.
-    @import("runtime/engine_thread.zig").freeRuntimeArmedForGeneration(instance_id, generation);
+    detachLoop(instance_id);
+    @import("js_event_loop").host_wake.drop(instance_id);
+    @import("js_event_loop").native_sync.cancelForInstance(instance_id);
+    debugger_mod.abandon(instance_id);
+    if (instance_map.generationOf(instance_id) != generation) return true;
+    if (@import("runtime/engine_thread.zig").isEvalActiveOnCurrentThread(instance_id)) {
+        _ = @import("runtime/engine_thread.zig").requestDeferredEvalDestroy(instance_id);
+        return true;
+    }
+    return false;
 }
 
-/// Free the scheduler and JS runtime for an instance. The caller has already stopped the engine thread, or is that thread and has left the JS call.
-pub fn destroyRuntime(instance_id: i32) void {
-    _ = destroyRuntimeClaimed(instance_id, null);
-}
-
+/// Start generation-scoped teardown through the same owner path used by the public destroy operation.
 pub fn destroyRuntimeForGeneration(instance_id: i32, generation: u64) void {
-    _ = destroyRuntimeClaimed(instance_id, generation);
+    destroyGeneration(instance_id, generation);
 }
 
 pub fn tryDestroyRuntimeForGeneration(instance_id: i32, generation: u64) bool {
-    return destroyRuntimeClaimed(instance_id, generation);
+    if (!@import("runtime/engine_thread.zig").isTeardownOwnerThread(instance_id, generation)) return false;
+    const claimed_instance = instance_map.claimRuntimeTeardownForGeneration(instance_id, generation) orelse return false;
+    return finishClaimedRuntimeTeardown(instance_id, claimed_instance);
 }
 
-fn destroyRuntimeClaimed(instance_id: i32, expected_generation: ?u64) bool {
-    if (builtin.is_test) {
-        if (before_teardown_claim_hook_for_testing) |hook| hook(instance_id, expected_generation, before_teardown_claim_context_for_testing);
-    }
+pub fn destroyRuntimeGeneration(instance_id: i32, generation: u64) void {
+    destroyRuntimeForGeneration(instance_id, generation);
+}
 
-    const claimed_instance = instance_map.claimTeardown(instance_id, expected_generation) orelse return false;
+fn finishClaimedRuntimeTeardown(instance_id: i32, claimed_instance: *instance_map.EngineInstance) bool {
+    const inspector_state = @import("inspector/root.zig").state;
+    var inspector_destroy_lease: inspector_state.EngineDestroyLease = .{};
+    if (!inspector_state.beginEngineDestroy(instance_id, claimed_instance.generation, &inspector_destroy_lease))
+        @panic("engine generation teardown already active");
+    defer inspector_state.endEngineDestroy(&inspector_destroy_lease);
     const instance = beginRuntimeTeardown(instance_id, claimed_instance) orelse return false;
     releaseRuntimeResources(instance_id, instance);
     freeInstanceRuntime(instance_id, instance);
@@ -806,19 +812,16 @@ fn beginRuntimeTeardown(instance_id: i32, expected_instance: *instance_map.Engin
     if (!dispatch.closeInstanceTasks(instance_id)) return null;
     @import("abi/api_async.zig").cancelForInstance(types.InstanceId.fromInt(instance_id));
     @import("js_event_loop").host_wake.drop(instance_id);
-    // Drain Hide/Show/stop leases before touching the Driver (R3 getPtrs∩destroy).
     instance_map.waitForControlOps(instance_id);
     const instance = instance_map.getInstance(instance_id) orelse return null;
     if (instance != expected_instance) return null;
     instance.loop.detach();
-    // No NativeTask or TSFN callback admitted before closure may still be using this context when runtime teardown starts.
     dispatch.waitForInstanceTasks(instance_id);
     instance_map.waitForRefOps(instance_id);
     return instance;
 }
 
 fn releaseRuntimeResources(instance_id: i32, instance: *instance_map.EngineInstance) void {
-    // Stop script dispatch before the JS context is released. A dispatch racing the admission close is serialized by the instance-map mutex.
     instance.task_mutex.lock();
     for (instance.task_queue.pendingSlice()) |task| {
         instance.allocator.free(task);
@@ -826,32 +829,19 @@ fn releaseRuntimeResources(instance_id: i32, instance: *instance_map.EngineInsta
     }
     instance.task_queue.clear(instance.allocator);
     instance.task_mutex.unlock();
-
-    // Release inspector sockets and the console buffer while the JS context can still free retained remote objects.
     @import("inspector/root.zig").dropInstance(instance_id);
-
-    // No platform callback owns timer state; close the admission path and release timers synchronously while their JS context is still valid.
     timers.cancelAll(instance);
-
-    // Public handles retain backend values and must be invalidated before the context or the reference bookkeeping is released.
     @import("abi/api_bind.zig").dropInstance(instance_id);
     @import("abi/api_value.zig").dropInstance(instance_id);
     @import("abi/packed_api_value.zig").dropInstance(instance_id);
-    // TSFN handles pin JS functions and may be called by foreign completion threads. Detach them while this context is live so later completions are rejected instead of touching a destroyed runtime.
     @import("runtime/tsfn.zig").releaseAllForInstance(instance_id);
-
-    // CJS retains JS values and the interrupt handler retains native state read by an executing runtime. Both must outlive admitted JS work, then be released while this context is still valid.
     @import("script/cjs.zig").uninstall(instance_id);
-    _ = @import("runtime/runtime_control.zig").deinit(instance_id);
-
-    // 3b. Force-reset any live Global/Weak references so their retained JS values are released BEFORE we tear down the context/runtime. This prevents use-after-free when users forget to call `reset()`.
+    _ = @import("runtime/runtime_control.zig").deinitForInstance(instance_id, instance);
     @import("runtime/ref_admission.zig").forceResetBookkeeping(&instance.ref_bookkeeping);
-
     @import("backend/console_timers.zig").deinitInstance(instance_id);
 }
 
 fn freeInstanceRuntime(instance_id: i32, instance: *instance_map.EngineInstance) void {
-    // 4. Free JS context and runtime
     debugger_mod.detach(instance_id);
     switch (instance.engine_handles) {
         .mono => |m| {
@@ -868,12 +858,10 @@ fn freeInstanceRuntime(instance_id: i32, instance: *instance_map.EngineInstance)
 }
 
 fn finishInstanceTeardown(instance_id: i32, instance: *instance_map.EngineInstance) void {
-    // 5. Free the TimerRegistry and instance
     var timer_reg = instance.timers;
     timer_reg.deinit();
-
-    // Removing the instance under the registry lock excludes concurrent wakeAsync/dispatch calls before the native wait primitive is released.
-    const removed = instance_map.remove(instance_id) orelse return;
+    const removed = instance_map.removeGeneration(instance_id, instance.generation) orelse
+        @panic("engine generation changed during owned teardown");
     if (removed.execution_cpu) |ledger| ledger.close();
     removed.resources.deinit();
     removed.loop.destroy();

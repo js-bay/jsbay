@@ -159,6 +159,15 @@ test "profiler start uses the configured sampling interval" {
 }
 
 const StateTestHost = struct {
+    pub const instance_map = struct {
+        pub fn generationOf(instance_id: i32) ?u64 {
+            return if (instance_id == 61_771) 4 else null;
+        }
+
+        pub fn isTeardownPending(_: i32) bool {
+            return false;
+        }
+    };
     pub const backend = struct {
         pub const ActiveEngine = struct {
             pub const Context = *anyopaque;
@@ -252,5 +261,72 @@ test "destroy waits for an inspector start reservation before registration" {
 }
 
 test "inspector start admission stays closed during engine runtime teardown" {
-    try inspector.modules.state(StateTestHost).TestCases.startAdmissionStaysClosedDuringEngineRuntimeTeardown();
+    const State = inspector.modules.state(StateTestHost);
+    const instance_id: i32 = 61_770;
+    var destroy_lease: State.EngineDestroyLease = .{};
+    try std.testing.expect(State.beginEngineDestroy(instance_id, 0, &destroy_lease));
+    defer State.endEngineDestroy(&destroy_lease);
+    try std.testing.expect(!State.reserveStart(instance_id));
+    State.endEngineDestroy(&destroy_lease);
+    try std.testing.expect(State.reserveStart(instance_id));
+    State.cancelStartReservation(instance_id);
+}
+
+test "inspector start admission requires a live matching generation" {
+    const State = inspector.modules.state(StateTestHost);
+    try std.testing.expect(!State.reserveStartForGeneration(61_771, 3));
+    try std.testing.expect(State.reserveStartForGeneration(61_771, 4));
+    State.cancelStartReservation(61_771);
+}
+
+test "engine runtime destroy gate is generation scoped" {
+    const State = inspector.modules.state(StateTestHost);
+    const instance_id: i32 = 61_769;
+    var generation_7: State.EngineDestroyLease = .{};
+    var generation_8: State.EngineDestroyLease = .{};
+    var duplicate_7: State.EngineDestroyLease = .{};
+    try std.testing.expect(State.beginEngineDestroy(instance_id, 7, &generation_7));
+    try std.testing.expect(State.beginEngineDestroy(instance_id, 8, &generation_8));
+    try std.testing.expect(!State.beginEngineDestroy(instance_id, 7, &duplicate_7));
+    State.endEngineDestroy(&generation_7);
+    try std.testing.expect(!State.beginEngineDestroy(instance_id, 8, &duplicate_7));
+    State.endEngineDestroy(&generation_8);
+    try std.testing.expect(State.beginEngineDestroy(instance_id, 8, &duplicate_7));
+    State.endEngineDestroy(&duplicate_7);
+}
+
+test "engine runtime destroy gate admits one concurrent owner without allocation" {
+    const Race = struct {
+        const GateState = inspector.modules.state(StateTestHost);
+        ready: std.atomic.Value(u32) = .init(0),
+        arrived: std.atomic.Value(u32) = .init(0),
+        winners: std.atomic.Value(u32) = .init(0),
+        duplicates: std.atomic.Value(u32) = .init(0),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            var lease: GateState.EngineDestroyLease = .{};
+            _ = self.ready.fetchAdd(1, .seq_cst);
+            while (self.ready.load(.seq_cst) < 2) std.Thread.yield() catch {};
+            const acquired = GateState.beginEngineDestroy(61_768, 9, &lease);
+            if (acquired) {
+                _ = self.winners.fetchAdd(1, .seq_cst);
+            } else {
+                _ = self.duplicates.fetchAdd(1, .seq_cst);
+            }
+            _ = self.arrived.fetchAdd(1, .seq_cst);
+            while (!self.release.load(.seq_cst)) std.Thread.yield() catch {};
+            if (acquired) GateState.endEngineDestroy(&lease);
+        }
+    };
+
+    var race = Race{};
+    const first = try std.Thread.spawn(.{}, Race.run, .{&race});
+    const second = try std.Thread.spawn(.{}, Race.run, .{&race});
+    while (race.arrived.load(.seq_cst) < 2) std.Thread.yield() catch {};
+    race.release.store(true, .seq_cst);
+    first.join();
+    second.join();
+    try std.testing.expectEqual(@as(u32, 1), race.winners.load(.seq_cst));
+    try std.testing.expectEqual(@as(u32, 1), race.duplicates.load(.seq_cst));
 }

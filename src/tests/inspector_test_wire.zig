@@ -63,11 +63,24 @@ pub fn readUntilEof(alloc: std.mem.Allocator, stream: TestStream, out: *std.Arra
 }
 
 pub fn readHttpHeaders(alloc: std.mem.Allocator, stream: TestStream) ![]u8 {
+    return readHttpHeadersWithTimeout(alloc, stream, 5_000);
+}
+
+pub fn readHttpHeadersWithTimeout(alloc: std.mem.Allocator, stream: TestStream, timeout_ms: u64) ![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(alloc);
+    const deadline = io.monotonicMilliseconds() + @as(i64, @intCast(timeout_ms));
     var buf: [1]u8 = undefined;
     while (true) {
-        const n = try stream.read(&buf);
+        const remaining = deadline - io.monotonicMilliseconds();
+        if (remaining <= 0) return error.HttpHeadersTimeout;
+        // Poll first so a failed SO_RCVTIMEO setup cannot leave this helper blocked past its deadline.
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        if (try std.posix.poll(&fds, @intCast(@min(remaining, std.math.maxInt(i32)))) == 0) return error.HttpHeadersTimeout;
+        const n = stream.read(&buf) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
         if (n == 0) return error.EndOfStream;
         try list.append(alloc, buf[0]);
         if (list.items.len >= 4) {

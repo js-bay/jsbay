@@ -8,9 +8,11 @@ dotnet_bin=${DOTNET:-dotnet}
 command -v "$dotnet_bin" >/dev/null
 optimize=${JSBAY_CI_OPTIMIZE:-Debug}
 case "$(uname -s)" in
-  # Match the Windows C consumer: mingw shared lib. Managed assembly is JsBay.Net.dll so
-  # native jsbay.dll is not shadowed on a case-insensitive volume.
-  MINGW*|MSYS*|CYGWIN*) zig build "-Dbackend=$backend" "-Doptimize=$optimize" -Dtarget=x86_64-windows-gnu -Dlibrary-only=true -Dshared=true -Dinspector-transport=false --summary all ;;
+  # Match the host process architecture with a MinGW shared library. Managed assembly is JsBay.Net.dll so native jsbay.dll is not shadowed on a case-insensitive volume.
+  MINGW*|MSYS*|CYGWIN*)
+    target=$(bash tests/dotnet-sdk/windows-target.sh)
+    zig build "-Dbackend=$backend" "-Doptimize=$optimize" "-Dtarget=$target" -Dlibrary-only=true -Dshared=true -Dinspector-transport=false --summary all
+    ;;
   *) zig build "-Dbackend=$backend" "-Doptimize=$optimize" -Dlibrary-only=true -Dshared=true --summary all ;;
 esac
 created_artifacts=0

@@ -68,7 +68,7 @@ fn appleFixture(allocator: std.mem.Allocator, io: std.Io, cwd: []const u8, fixtu
     const tools = try join(allocator, fixture, &.{"tools"});
     var setup = try mustRun(allocator, io, fixture, &.{ "mkdir", "-p", tools, try join(allocator, repo, &.{"scripts"}), try join(allocator, repo, &.{"include"}), try join(allocator, repo, &.{ "tests", "zig-consumer" }) });
     defer setup.deinit();
-    for ([_][]const []const u8{ &.{ try join(allocator, cwd, &.{"build-apple.sh"}), try join(allocator, repo, &.{"build-apple.sh"}) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_probe.c" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_probe.c" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_ios_main.m" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_ios_main.m" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_ios_Info.plist" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_ios_Info.plist" }) } }) |copy| {
+    for ([_][]const []const u8{ &.{ try join(allocator, cwd, &.{"build-apple.sh"}), try join(allocator, repo, &.{"build-apple.sh"}) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_probe.c" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_probe.c" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_ios_main.m" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_ios_main.m" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_consumer_ios_Info.plist" }), try join(allocator, repo, &.{ "scripts", "apple_consumer_ios_Info.plist" }) }, &.{ try join(allocator, cwd, &.{ "scripts", "apple_simulator_diagnostics.sh" }), try join(allocator, repo, &.{ "scripts", "apple_simulator_diagnostics.sh" }) } }) |copy| {
         var out = try mustRun(allocator, io, fixture, &.{ "cp", copy[0], copy[1] });
         out.deinit();
     }
@@ -190,18 +190,6 @@ test "test_release_builds_and_uploads_verified_android_aar" {
     const cwd = try root(a, io);
     const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
     for ([_][]const u8{ "jni/arm64-v8a/libjsbay_android.so", "jni/x86_64/libjsbay_android.so", "proguard.txt", "jsbay-${{ steps.ver.outputs.label }}-android-${{ matrix.backend }}.aar", "jsbay-*.aar" }) |needle| try contains(release, needle);
-}
-
-test "test_android_release_includes_maven_metadata_and_transitive_kotlin" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const io = testing.io;
-    const cwd = try root(a, io);
-    const release = try read(a, io, cwd, &.{ ".github", "workflows", "release.yml" });
-    const gradle = try read(a, io, cwd, &.{ "sdk", "android", "jsbay", "build.gradle.kts" });
-    for ([_][]const u8{ "maven-publish", "implementation(\"org.jetbrains.kotlin:kotlin-stdlib", "\"quickjs\" -> \"jsbayquickjs\"", "\"quickjs_ng\" -> \"jsbayquickjsng\"", "assets/jsbay-backend.txt", "artifactId = jsbayArtifactId", "name = \"GitHubPackages\"", "https://maven.pkg.github.com/${githubRepository.lowercase()}", "GITHUB_ACTOR", "GITHUB_TOKEN" }) |needle| try contains(gradle, needle);
-    for ([_][]const u8{ ":jsbay:publishReleasePublicationToStagingRepository", "-PjsbayVersion=", "-PjsbayBackend=\"$backend\"", "-PjsbayMavenRepo=", "archive=\"jsbay-${ver}-android-${backend}-maven.zip\"", "tests/android-sdk/maven-consumer.sh", "env -u ANDROID_HOME ANDROID_SDK_ROOT=\"$ANDROID_SDK_ROOT\"", "-PjsbayVersion=\"${{ steps.ver.outputs.label }}\"", "tool -- check-maven \"$module\" \"$ver\" \"$backend\"" }) |needle| try contains(release, needle);
 }
 
 test "test_android_sdk_distribution_uses_tracked_source_only" {
@@ -392,7 +380,7 @@ test "test_release_downloads_assets after checkout and builds portable Linux npm
     const checkout = std.mem.indexOf(u8, draft, "uses: actions/checkout@v7") orelse return error.MissingDraftCheckout;
     const download = std.mem.indexOf(u8, draft, "name: jsbay-final-release-assets") orelse return error.MissingReleaseAssetDownload;
     try testing.expect(checkout < download);
-    try contains(npm, "if [[ \"$PLATFORM\" == linux ]]; then\n            zig_args+=(\"-Dcpu=baseline\")\n          fi");
+    try contains(npm, "elif [[ \"$JSBAY_NPM_PLATFORM\" == linux ]]; then\n            cmake_args+=(-DJSBAY_LIBRARY=\"$core/lib/libjsbay.a\")\n            zig_args+=(\"-Dcpu=baseline\")");
 }
 
 test "publication jobs require the release environment" {

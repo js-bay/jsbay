@@ -46,6 +46,7 @@ jobs:
         run: |
           set -euo pipefail
           node tests/node-sdk/npm_publish_test.mjs
+          node tests/node-sdk/package_names_test.mjs
           version="$(zig build tool -- release-version "" "refs/tags/$RELEASE_TAG" "$GITHUB_RUN_ID")"
           mkdir -p "$RUNNER_TEMP/npm-main"
           for backend in quickjs quickjsng jsc; do
@@ -113,6 +114,12 @@ jobs:
             platform: darwin
             arch: arm64
             runner: macos-26
+          - backend: quickjsng
+            zig_backend: quickjs_ng
+            zig_target: x86_64-windows-msvc
+            platform: win32
+            arch: x64
+            runner: windows-2025
           - backend: jsc
             zig_backend: jsc
             zig_target: x86_64-macos.11.0
@@ -130,7 +137,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: ${{ inputs.verify_published && 1 || 0 }}
-          submodules: ${{ !inputs.verify_published && 'recursive' || 'false' }}
+          submodules: ${{ !inputs.verify_published && runner.os != 'Windows' && 'recursive' || 'false' }}
+
+      - name: Initialize QuickJS backend sources
+        if: ${{ !inputs.verify_published && runner.os == 'Windows' && matrix.zig_backend == 'quickjs_ng' }}
+        run: git submodule update --init vendor/quickjs vendor/quickjs-ng
 
       - uses: actions/setup-node@v6
         with:
@@ -138,18 +149,66 @@ jobs:
           package-manager-cache: ${{ !inputs.verify_published }}
 
       - name: Install and run the public npm package
-        if: ${{ inputs.verify_published }}
+        if: ${{ inputs.verify_published && runner.os != 'Windows' }}
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           BACKEND: ${{ matrix.backend }}
-          PLATFORM: ${{ matrix.platform }}
+          JSBAY_NPM_PLATFORM: ${{ matrix.platform }}
           ARCH: ${{ matrix.arch }}
-        run: bash tests/node-sdk/published-package-consumer.sh "$BACKEND" "${RELEASE_TAG#v}" "$PLATFORM" "$ARCH"
+        run: bash tests/node-sdk/published-package-consumer.sh "$BACKEND" "${RELEASE_TAG#v}" "$JSBAY_NPM_PLATFORM" "$ARCH"
+
+      - name: Test the published Windows package in a packaged Electron app
+        if: ${{ inputs.verify_published && matrix.platform == 'win32' }}
+        shell: bash
+        env:
+          VERSION: ${{ inputs.tag }}
+          NPM_REGISTRY: https://registry.npmjs.org
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          work="$(mktemp -d "$RUNNER_TEMP/jsbay-windows-published.XXXXXX")"
+          trap 'rm -rf "$work"' EXIT
+          : > "$work/.npmrc"
+          node tests/node-sdk/wait-for-published-npm.mjs "$version" "$work/npm-cache" "$work/.npmrc" "@jsbay/quickjsng" "$work/main-package.json"
+          main_dependencies="$(node -e 'const manifest = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")); process.stdout.write(JSON.stringify(manifest.optionalDependencies ?? {}))' "$work/main-package.json")"
+          node tests/node-sdk/classify-published-windows-dependencies.mjs "$main_dependencies" "$version" || dependency_status=$?
+          dependency_status=${dependency_status:-0}
+          if [[ "$dependency_status" == 3 ]]; then
+            echo "@jsbay/quickjsng@$version predates the Windows platform package; skipping its Windows verification"
+            exit 0
+          fi
+          if [[ "$dependency_status" != 0 ]]; then
+            echo "@jsbay/quickjsng@$version uses the separated platform naming but is missing its Windows dependency" >&2
+            exit 1
+          fi
+          JSBAY_PUBLISHED_NPM_CACHE="$work/npm-cache" JSBAY_PUBLISHED_NPM_USERCONFIG="$work/.npmrc" node tests/node-sdk/published-windows-package-consumer.mjs "$version"
 
       - uses: ./.github/actions/setup-zig
         if: ${{ !inputs.verify_published }}
         with:
           version: 0.17.0
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: ${{ !inputs.verify_published && matrix.platform == 'win32' }}
+        with:
+          arch: x64
+
+      - name: Download the matching Electron headers and import library
+        if: ${{ !inputs.verify_published && matrix.platform == 'win32' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          electron_version="$(node tests/node-sdk/electron-packaged-consumer.mjs --print-version)"
+          headers="$RUNNER_TEMP/electron-headers.tar.gz"
+          curl --fail --location --retry 3 "https://electronjs.org/headers/v$electron_version/node-v$electron_version-headers.tar.gz" --output "$headers"
+          mkdir -p "$RUNNER_TEMP/electron-headers"
+          (cd "$RUNNER_TEMP" && tar -xzf electron-headers.tar.gz -C electron-headers --strip-components=1)
+          curl --fail --location --retry 3 "https://electronjs.org/headers/v$electron_version/win-x64/node.lib" --output "$RUNNER_TEMP/electron-headers/node.lib"
+          test -f "$RUNNER_TEMP/electron-headers/include/node/node_api.h"
+          test -f "$RUNNER_TEMP/electron-headers/include/node/uv.h"
+          test -s "$RUNNER_TEMP/electron-headers/node.lib"
+          echo "NODE_INCLUDE=$RUNNER_TEMP/electron-headers/include/node" >> "$GITHUB_ENV"
+          echo "NODE_LIBRARY=$RUNNER_TEMP/electron-headers/node.lib" >> "$GITHUB_ENV"
 
       - name: Install Linux native dependencies
         if: ${{ !inputs.verify_published && runner.os == 'Linux' }}
@@ -161,44 +220,74 @@ jobs:
         env:
           ZIG_BACKEND: ${{ matrix.zig_backend }}
           ZIG_TARGET: ${{ matrix.zig_target }}
-          PLATFORM: ${{ matrix.platform }}
+          JSBAY_NPM_PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
           core="$RUNNER_TEMP/jsbay-core"
           zig_args=(-Dbackend="$ZIG_BACKEND" -Dlibrary-only=true -Doptimize=ReleaseFast --prefix "$core" --summary all)
-          cmake_args=(-DJSBAY_LIBRARY="$core/lib/libjsbay.a")
-          if [[ "$PLATFORM" == darwin ]]; then
+          cmake_args=()
+          if [[ "$JSBAY_NPM_PLATFORM" == darwin ]]; then
+            cmake_args+=(-DJSBAY_LIBRARY="$core/lib/libjsbay.a")
             sysroot="$(xcrun --sdk macosx --show-sdk-path)"
             test -d "$sysroot"
             zig_args+=("-Dtarget=$ZIG_TARGET")
             zig_args+=("-Dapple-sysroot=$sysroot")
             cmake_args+=(-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0)
-          elif [[ "$PLATFORM" == linux ]]; then
+          elif [[ "$JSBAY_NPM_PLATFORM" == linux ]]; then
+            cmake_args+=(-DJSBAY_LIBRARY="$core/lib/libjsbay.a")
             zig_args+=("-Dcpu=baseline")
+          elif [[ "$JSBAY_NPM_PLATFORM" == win32 ]]; then
+            test -f "$NODE_INCLUDE/node_api.h"
+            test -f "$NODE_INCLUDE/uv.h"
+            cmake_args+=(-DJSBAY_LIBRARY="$core/lib/jsbay.lib")
+            cmake_args+=(-DNODE_INCLUDE="$NODE_INCLUDE" -DNODE_LIBRARY="$NODE_LIBRARY")
+            zig_args+=("-Dtarget=$ZIG_TARGET")
           fi
           zig build "${zig_args[@]}"
-          node_root="$(dirname "$(dirname "$(command -v node)")")"
-          test -f "$node_root/include/node/node_api.h"
-          test -f "$node_root/include/node/uv.h"
-          cmake -S sdk/node -B "$RUNNER_TEMP/jsbay-node" -DCMAKE_BUILD_TYPE=Release \
-            "${cmake_args[@]}" -DNODE_INCLUDE="$node_root/include/node"
+          if [[ "$JSBAY_NPM_PLATFORM" != win32 ]]; then
+            node_root="$(dirname "$(dirname "$(command -v node)")")"
+            test -f "$node_root/include/node/node_api.h"
+            test -f "$node_root/include/node/uv.h"
+            cmake_args+=(-DNODE_INCLUDE="$node_root/include/node")
+          fi
+          cmake -S sdk/node -B "$RUNNER_TEMP/jsbay-node" -DCMAKE_BUILD_TYPE=Release "${cmake_args[@]}"
           cmake --build "$RUNNER_TEMP/jsbay-node" --config Release
           test -s "$RUNNER_TEMP/jsbay-node/jsbay_node.node"
-          if [[ "$PLATFORM" == darwin ]]; then
+          if [[ "$JSBAY_NPM_PLATFORM" == darwin ]]; then
             bash scripts/check-macos-deployment-target.sh 11.0 "$core/lib/libjsbay.a" "$RUNNER_TEMP/jsbay-node/jsbay_node.node"
           fi
           {
-            echo "JSBAY_NODE_LIBRARY=$core/lib/libjsbay.a"
+            library="$core/lib/libjsbay.a"
+            if [[ "$JSBAY_NPM_PLATFORM" == win32 ]]; then library="$core/lib/jsbay.lib"; fi
+            echo "JSBAY_NODE_LIBRARY=$library"
             echo "JSBAY_NODE_ADDON=$RUNNER_TEMP/jsbay-node/jsbay_node.node"
-            echo "NODE_INCLUDE=$node_root/include/node"
+            if [[ "$JSBAY_NPM_PLATFORM" != win32 ]]; then echo "NODE_INCLUDE=$node_root/include/node"; fi
           } >> "$GITHUB_ENV"
 
       - name: Test the release addon
-        if: ${{ !inputs.verify_published }}
+        if: ${{ !inputs.verify_published && matrix.platform != 'win32' }}
+        timeout-minutes: 15
         shell: bash
+        env:
+          JSBAY_NODE_BACKEND: ${{ matrix.backend }}
+          JSBAY_NODE_PLATFORM: ${{ matrix.platform }}
+          JSBAY_NODE_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           JSBAY_LIBRARY="$JSBAY_NODE_LIBRARY" JSBAY_NODE_RELEASE_ADDON="$JSBAY_NODE_ADDON" bash tests/node-sdk/run_native_consumer.sh
+
+      - name: Smoke test the Windows release addon in Node.js
+        if: ${{ !inputs.verify_published && matrix.platform == 'win32' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node tests/node-sdk/native_consumer.cjs
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node tests/node-sdk/inspector_consumer.cjs
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/extended_contract_consumer.cjs
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/value_contract_consumer.cjs
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/review_consumer.cjs close-async-contract
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/review_consumer.cjs worker-close-async-gc
+          JSBAY_NODE_ADDON="$JSBAY_NODE_ADDON" node --expose-gc tests/node-sdk/review_consumer.cjs pending-engine-gc
 
       - uses: actions/download-artifact@v4
         if: ${{ !inputs.verify_published }}
@@ -212,7 +301,7 @@ jobs:
         shell: bash
         env:
           BACKEND: ${{ matrix.backend }}
-          PLATFORM: ${{ matrix.platform }}
+          JSBAY_NPM_PLATFORM: ${{ matrix.platform }}
           ARCH: ${{ matrix.arch }}
           VERSION: ${{ needs.build-main.outputs.version }}
         run: |
@@ -220,17 +309,21 @@ jobs:
           output="$RUNNER_TEMP/npm-package"
           tarballs="$RUNNER_TEMP/npm-platform"
           mkdir -p "$tarballs"
-          node scripts/package-node-npm.mjs platform "$BACKEND" "$VERSION" "$PLATFORM" "$ARCH" "$JSBAY_NODE_ADDON" "$output"
+          node scripts/package-node-npm.mjs platform "$BACKEND" "$VERSION" "$JSBAY_NPM_PLATFORM" "$ARCH" "$JSBAY_NODE_ADDON" "$output"
           package_platform=linux
-          if [[ "$PLATFORM" == darwin ]]; then package_platform=macos; fi
-          package_name="${BACKEND}${package_platform}${ARCH}"
+          if [[ "$JSBAY_NPM_PLATFORM" == darwin ]]; then package_platform=macos; fi
+          if [[ "$JSBAY_NPM_PLATFORM" == win32 ]]; then package_platform=win32; fi
+          package_name="${BACKEND}-${package_platform}-${ARCH}"
           npm pack --pack-destination "$tarballs" "$output/$package_name"
           platform_tarball="jsbay-$package_name-$VERSION.tgz"
           main_tarball="jsbay-$BACKEND-$VERSION.tgz"
           node tests/node-sdk/npm_package_test.mjs "$RUNNER_TEMP/npm-main/$main_tarball" "$tarballs/$platform_tarball" "$BACKEND"
-          cd "$tarballs"
-          shasum -a 512 "$platform_tarball" > SHA512SUMS
-          shasum -a 512 "$RUNNER_TEMP/npm-main/$main_tarball" | awk -v name="$main_tarball" '{ print $1 "  " name }' > MAIN-SHA512SUMS
+          if [[ "$JSBAY_NPM_PLATFORM" == win32 ]]; then
+            node tests/node-sdk/electron-packaged-consumer.mjs \
+              "$RUNNER_TEMP/npm-main/$main_tarball" "$tarballs/$platform_tarball"
+          fi
+          node scripts/ci/write-sha512.mjs "$tarballs/$platform_tarball" "$tarballs/SHA512SUMS" "$platform_tarball"
+          node scripts/ci/write-sha512.mjs "$RUNNER_TEMP/npm-main/$main_tarball" "$tarballs/MAIN-SHA512SUMS" "$main_tarball"
 
       - uses: actions/upload-artifact@v6
         if: ${{ !inputs.verify_published }}
@@ -265,13 +358,18 @@ jobs:
           mkdir -p npm-release/platform
           for backend in quickjs quickjsng jsc; do
             test -s "npm-release/main/jsbay-$backend-$VERSION.tgz"
-            for platform in darwin linux; do
+            platforms=(darwin linux)
+            if [[ "$backend" == quickjsng ]]; then platforms+=(win32); fi
+            for platform in "${platforms[@]}"; do
               if [[ "$backend/$platform" == jsc/linux ]]; then continue; fi
-              for arch in x64 arm64; do
+              arches=(x64 arm64)
+              if [[ "$platform" == win32 ]]; then arches=(x64); fi
+              for arch in "${arches[@]}"; do
                 package_platform=linux
                 if [[ "$platform" == darwin ]]; then package_platform=macos; fi
+                if [[ "$platform" == win32 ]]; then package_platform=win32; fi
                 directory="npm-platform-artifacts/jsbay-npm-platform-$backend-$platform-$arch"
-                archive="jsbay-$backend$package_platform$arch-$VERSION.tgz"
+                archive="jsbay-$backend-$package_platform-$arch-$VERSION.tgz"
                 (cd "$directory" && sha512sum --check --strict SHA512SUMS)
                 (cd npm-release/main && sha512sum --check --strict "../../$directory/MAIN-SHA512SUMS")
                 cp "$directory/$archive" npm-release/platform/

@@ -36,6 +36,12 @@ jobs:
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
+      - name: Install repository tool dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+      - name: Check host tool dependencies
+        run: command -v git zig ruby tar zip unzip rg cmake
       - uses: actions/setup-dotnet@v6
         with:
           global-json-file: global.json
@@ -44,6 +50,9 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v4.0.4
+
+      - name: Test repository tools
+        run: zig build test-tools --summary all
 
       - name: Native engine + consumers (quickjs_ng / ReleaseSafe)
         env:
@@ -327,6 +336,7 @@ jobs:
       - name: Diagnostic and host benchmark contracts
         run: |
           set -euo pipefail
+          set -x
           bash tests/measure_diagnostics_contract.sh
           bash tests/benchmark_source_hash_contract.sh
           bash tests/benchmark_operation_metadata_contract.sh
@@ -402,7 +412,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          submodules: false
+      - name: Initialize JavaScript engine sources
+        run: git submodule update --init vendor/quickjs vendor/quickjs-ng
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
@@ -439,7 +451,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: recursive
+          submodules: false
+      - name: Initialize JavaScript engine sources
+        run: git submodule update --init vendor/quickjs vendor/quickjs-ng
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0

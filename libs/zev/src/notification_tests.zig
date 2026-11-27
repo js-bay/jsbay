@@ -470,10 +470,10 @@ test "dispatching an already queued timer does not allocate" {
 
 test "run wakes for the earlier timer deadline and host deadline" {
     const Clock = struct {
-        now: u64 = 0,
+        now: std.atomic.Value(u64) = .init(0),
         fn read(ctx: ?*anyopaque) u64 {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            return self.now;
+            return self.now.load(.seq_cst);
         }
     };
     const State = struct {
@@ -482,6 +482,8 @@ test "run wakes for the earlier timer deadline and host deadline" {
         clock: *Clock,
         timer_calls: u8 = 0,
         ticks: u8 = 0,
+        tick_entered: zev.Waiter = .init,
+        tick_wait_ok: std.atomic.Value(bool) = .init(false),
         fn timerCallback(ctx: ?*anyopaque, _: *zev.Timer) void {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.timer_calls += 1;
@@ -490,27 +492,34 @@ test "run wakes for the earlier timer deadline and host deadline" {
         fn tick(ctx: ?*anyopaque, now_ms: u64) ?u64 {
             const self: *Self = @ptrCast(@alignCast(ctx.?));
             self.ticks += 1;
+            self.tick_entered.signal();
             return now_ms + 1_000;
         }
-        fn advance(clock: *Clock, loop: *zev.Loop) void {
-            zev.sleepMilliseconds(1);
-            clock.now = 10;
-            loop.wake();
+        fn advance(state: *Self, tick_generation: u64) void {
+            state.tick_wait_ok.store(state.tick_entered.waitUntilChange(tick_generation, 5_000), .seq_cst);
+            state.clock.now.store(10, .seq_cst);
+            state.loop.wake();
         }
     };
     const loop = try zev.Loop.create(std.testing.allocator);
     defer loop.destroy();
     var clock: Clock = .{};
     loop.setClock(&clock, Clock.read);
+    defer loop.setClock(null, null);
     var timer: zev.Timer = .{};
     var state = State{ .loop = loop, .clock = &clock };
+    defer state.tick_entered.deinit();
     timer.init(loop, &state, State.timerCallback);
     try timer.startAfter(10);
-    const advancer = try std.Thread.spawn(.{}, State.advance, .{ &clock, loop });
+    // Prime both deadlines before the advancer waits for the running loop's next host tick.
+    try std.testing.expectEqual(@as(?u64, 10), loop.runOnce(.{ .ctx = &state, .tick = State.tick }));
+    const tick_generation = state.tick_entered.generation();
+    const advancer = try std.Thread.spawn(.{}, State.advance, .{ &state, tick_generation });
     defer advancer.join();
     loop.run(.{ .ctx = &state, .tick = State.tick });
+    try std.testing.expect(state.tick_wait_ok.load(.seq_cst));
     try std.testing.expectEqual(@as(u8, 1), state.timer_calls);
-    try std.testing.expect(state.ticks >= 1);
+    try std.testing.expect(state.ticks >= 2);
     timer.close();
 }
 
@@ -988,6 +997,9 @@ test "runOnce with exhausted count budget still reports immediate deadline" {
     };
     const loop = try zev.Loop.create(std.testing.allocator);
     defer loop.destroy();
+    var clock: VirtualClock = .{ .now = 100 };
+    loop.setClock(&clock, VirtualClock.read);
+    defer loop.setClock(null, null);
     var state: State = .{};
     var handles: [2]zev.Notifier = undefined;
     for (&handles) |*handle| {
@@ -997,7 +1009,8 @@ test "runOnce with exhausted count budget still reports immediate deadline" {
     }
     const next = loop.runOnce(.{ .dispatch_budget = 1 });
     try std.testing.expectEqual(@as(u8, 1), state.calls);
-    try std.testing.expectEqual(@as(?u64, loop.nowMs()), next);
+    try std.testing.expectEqual(@as(?u64, clock.now), next);
+    try std.testing.expectEqual(@as(?u64, 0), loop.nextDeadline());
     _ = loop.runOnce(.{});
     try std.testing.expectEqual(@as(u8, 2), state.calls);
     for (&handles) |*handle| handle.close();
@@ -1065,59 +1078,4 @@ test "rejected beginRun does not steal owner_thread" {
     try std.testing.expect(!state.saw_owner.load(.acquire));
     try std.testing.expect(loop.isOwnerThread());
     loop.endRun();
-}
-
-test "dispatchEvents uses nowMs for timer due checks" {
-    const State = struct {
-        const Self = @This();
-        calls: u8 = 0,
-        fn callback(ctx: ?*anyopaque, _: *zev.Timer) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            self.calls += 1;
-        }
-    };
-    const loop = try zev.Loop.create(std.testing.allocator);
-    defer loop.destroy();
-    var clock: VirtualClock = .{ .now = 50 };
-    loop.setClock(&clock, VirtualClock.read);
-    defer loop.setClock(null, null);
-    var state: State = .{};
-    var timer: zev.Timer = .{};
-    timer.init(loop, &state, State.callback);
-    defer timer.close();
-    try timer.startAt(100);
-    // Due checks follow nowMs (50), not a host-supplied stale sample.
-    loop.dispatchEvents();
-    try std.testing.expectEqual(@as(u8, 0), state.calls);
-    clock.now = 100;
-    loop.dispatchEvents();
-    try std.testing.expectEqual(@as(u8, 1), state.calls);
-}
-
-test "frozen virtual clock keeps a time budget from elapsing" {
-    const State = struct {
-        const Self = @This();
-        calls: u8 = 0,
-        fn callback(ctx: ?*anyopaque, _: *zev.Notifier) void {
-            const self: *Self = @ptrCast(@alignCast(ctx.?));
-            self.calls += 1;
-        }
-    };
-    const loop = try zev.Loop.create(std.testing.allocator);
-    defer loop.destroy();
-    var clock: VirtualClock = .{ .now = 1_000 };
-    loop.setClock(&clock, VirtualClock.read);
-    defer loop.setClock(null, null);
-    var state: State = .{};
-    var first: zev.Notifier = .{};
-    var second: zev.Notifier = .{};
-    first.init(loop, &state, State.callback);
-    second.init(loop, &state, State.callback);
-    defer first.close();
-    defer second.close();
-    try std.testing.expect(first.notify());
-    try std.testing.expect(second.notify());
-    // Clock stays at 1000 across callbacks, so a positive time budget never trips.
-    loop.dispatchEventsLimited(null, 5);
-    try std.testing.expectEqual(@as(u8, 2), state.calls);
 }

@@ -21,14 +21,14 @@ private func number(_ engine: Engine, _ source: String) throws {
 
 private func lifecycle() throws -> UInt64 {
   for index in 0..<warmup {
-    let engine = try Engine(id: Int32(1_500_000 + index))
+    let engine = try Engine(id: Int32(1_500_000 + index), allowMainRunLoopAttach: true)
     defer { try? engine.close() }
     try number(engine, "42")
   }
   let start = DispatchTime.now().uptimeNanoseconds
   for index in 0..<100 {
     do {
-      let engine = try Engine(id: Int32(1_500_100 + index))
+      let engine = try Engine(id: Int32(1_500_100 + index), allowMainRunLoopAttach: true)
       defer { try? engine.close() }
       try number(engine, "42")
     }
@@ -37,7 +37,7 @@ private func lifecycle() throws -> UInt64 {
 }
 
 do {
-  let engine = try Engine(id: 1_400_001)
+  let engine = try Engine(id: 1_400_001, allowMainRunLoopAttach: true)
   defer { try? engine.close() }
   let callback = try engine.bind("benchCallback") { _, _ in try engine.number(42) }
   defer { try? callback.close() }

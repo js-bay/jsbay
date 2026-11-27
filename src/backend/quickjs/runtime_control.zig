@@ -7,7 +7,7 @@ const io = @import("../../platform/io.zig");
 const c = @import("c_api.zig");
 const qjs = c.qjs;
 
-/// Opaque per-instance state owned by runtime_control.zig; QJS-side uses it to read the interrupt flag and deadline from inside the interrupt trampoline. Layout MUST match runtime_control.InterruptState.
+/// Opaque per-instance state owned by runtime_control.zig; its shared prefix matches the fields read by the interrupt trampoline.
 pub const QjsInterruptState = extern struct {
     /// Non-zero when an interrupt has been requested from another thread.
     interrupt_requested: u8,

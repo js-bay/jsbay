@@ -14,6 +14,7 @@ comptime {
     }
     _ = @import("../runtime/submission.zig");
     _ = @import("public_module_tests.zig");
+    _ = @import("value_scope_lifecycle_tests.zig");
     _ = @import("native_cdp_lifecycle_tests.zig");
     if (build_options.inspector and build_options.inspector_transport and backend.supportsDebugger(backend.active_backend)) {
         _ = @import("step_control_tests.zig");
@@ -27,11 +28,16 @@ comptime {
     _ = @import("engine_alt_tests.zig");
     // engine_thread: spike smoke already covers start/id/stop/post/wait; import full suite and Skip only cases that need interrupt/heap/bind-sync not yet green on Escargot/Hermes.
     _ = @import("engine_thread_tests.zig");
+    _ = @import("concurrent_deferred_stop_tests.zig");
+    _ = @import("engine_state_admission_tests.zig");
+    _ = @import("engine_thread_value_tests.zig");
     _ = @import("engine_thread_boundary_tests.zig");
     if (!spike) {
         _ = @import("self_driven_loop_tests.zig");
+        _ = @import("generation_scope_loop_failure_tests.zig");
         _ = @import("shutdown_race_tests.zig");
         _ = @import("execution_cpu_runtime_tests.zig");
+        _ = @import("execution_cpu_yield_runtime_tests.zig");
         _ = @import("internal_thread_safety_tests.zig");
         _ = @import("debugger_tests.zig");
     }
@@ -95,6 +101,8 @@ comptime {
     _ = @import("modules_pack_tests.zig");
     if (!spike) {
         _ = @import("c_api_tests.zig");
+        _ = @import("generation_scope_tests.zig");
+        _ = @import("generation_interrupt_tests.zig");
         _ = @import("c_api_resource_tests.zig");
         _ = @import("c_api_boundary_tests.zig");
         _ = @import("c_api_alloc_tests.zig");
@@ -161,6 +169,7 @@ comptime {
     }
     if (!spike and build_options.inspector_transport) {
         _ = @import("inspector_tests.zig");
+        _ = @import("inspector_test_wire_tests.zig");
         if (build_options.inspector) {
             _ = @import("debug_receiver_tests.zig");
             _ = @import("cdp_reference_tests.zig");

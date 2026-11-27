@@ -1030,7 +1030,7 @@ jobs:
           set -euo pipefail
           ver="${{ steps.ver.outputs.label }}"
           backend="${{ matrix.backend }}"
-          case "$backend" in quickjs) artifact=jsbayquickjs ;; quickjs_ng) artifact=jsbayquickjsng ;; esac
+          case "$backend" in quickjs) artifact=jsbay-quickjs ;; quickjs_ng) artifact=jsbay-quickjs-ng ;; esac
           repo="$GITHUB_WORKSPACE/build-android/maven-repo"
           rm -rf "$repo"
           cd sdk/android
@@ -1074,7 +1074,7 @@ jobs:
           mkdir -p "$repo"
           unzip -q "${{ steps.maven.outputs.archive }}" -d "$repo"
           env -u ANDROID_HOME ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT" \
-            bash tests/android-sdk/maven-consumer.sh "$repo" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle" "${{ matrix.backend }}"
+            bash tests/android-sdk/maven-consumer.sh "$repo" "${{ steps.ver.outputs.label }}" "$RUNNER_TEMP/gradle-8.9/bin/gradle" "${{ matrix.backend }}" --check-legacy-coordinate-conflict
 
       - name: Enable KVM for packaged Android acceptance
         run: |

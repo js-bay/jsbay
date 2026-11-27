@@ -67,7 +67,7 @@ case "$runner" in
     jvm_version=$(one_line "$("$jvm_home/bin/java" -version 2>&1)")
     kotlin_version=$(one_line "$("$jvm_home/bin/java" -cp "$gradle_lib/*" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -no-reflect -version 2>&1)")
     runtime_toolchain="JVM $jvm_version; Kotlin $kotlin_version"
-    source_roots=("$root/bench/interop/jvm" "$root/bench/interop/run-jvm.sh" "$root/sdk/android/jsbay/src/main" "$root/include/jsbay.h")
+    source_roots=("$root/bench/interop/jvm" "$root/bench/interop/run-jvm.sh" "$root/sdk/android/jsbay/src/main" "$root/tests/android-sdk/android/os" "$root/include/jsbay.h")
     ;;
   swift)
     measurements=$(bash "$root/bench/interop/run-apple.sh" swift "$backend")
