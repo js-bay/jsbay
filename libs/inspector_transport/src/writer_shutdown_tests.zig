@@ -94,14 +94,27 @@ fn waitForPeerClose(stream: Stream) !void {
     const peer = socket.Socket{ .handle = stream.handle };
     const deadline = zev.monotonicMilliseconds() + 5_000;
     var buffer: [16 * 1024]u8 = undefined;
+    var bytes_read: usize = 0;
+    var last_ready = false;
+    var last_closed = false;
     while (zev.monotonicMilliseconds() < deadline) {
         const remaining = deadline - zev.monotonicMilliseconds();
         const result = try peer.poll(.read, @intCast(@min(remaining, 100)));
-        if (result.closed) return;
+        last_ready = result.ready;
+        last_closed = result.closed;
+        if (result.closed) {
+            std.debug.print("PEER_CLOSE_OBSERVED bytes_read={d} ready={any} closed=true\n", .{ bytes_read, last_ready });
+            return;
+        }
         if (!result.ready) continue;
         const count = stream.read(&buffer) catch return;
-        if (count == 0) return;
+        if (count == 0) {
+            std.debug.print("PEER_CLOSE_OBSERVED bytes_read={d} ready={any} closed=false eof=true\n", .{ bytes_read, last_ready });
+            return;
+        }
+        bytes_read += count;
     }
+    std.debug.print("PEER_CLOSE_TIMEOUT bytes_read={d} ready={any} closed={any}\n", .{ bytes_read, last_ready, last_closed });
     return error.PeerDidNotClose;
 }
 
@@ -205,6 +218,8 @@ test "transport shutdown shares its deadline across slow sessions" {
     try testing.expect(close_started);
     try testing.expect(elapsed <= 4_000);
     try testing.expect(probe.completed.load(.acquire));
+    try first_peer.setReceiveBuffer(4 * 1024 * 1024);
+    try second_peer.setReceiveBuffer(4 * 1024 * 1024);
     try waitForPeerClose(first_peer);
     try waitForPeerClose(second_peer);
 }
