@@ -1590,7 +1590,7 @@ test "transport: deferred deinit in a delivery callback skips another session's 
     t.asTransport().setDeliveryObserver(&delivery, DestroyingDelivery.observer);
     try testing.expect(t.sendTrackedText(trigger_session, "trigger-deferred-deinit", 502));
     var attempts: usize = 0;
-    while (!delivery.completed.load(.acquire) and attempts < 3000) : (attempts += 1) zev.sleepMilliseconds(1);
+    while (!delivery.completed.load(.acquire) and attempts < 3_000) : (attempts += 1) zev.sleepMilliseconds(1);
     try testing.expect(delivery.completed.load(.acquire));
 }
 
