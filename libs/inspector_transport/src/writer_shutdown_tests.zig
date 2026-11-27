@@ -251,7 +251,7 @@ test "transport shutdown delivers accepted frames to multiple peers before closi
         }
     }
     instance.testing_writer_barrier = &barrier;
-    instance.setDiscoveryTarget(.{ .title = "shutdown", .kind = "node", .url = "file:///shutdown.js", .id = "drain-peers" });
+    instance.setDiscoveryTarget(.{ .title = "shutdown", .kind = "node", .url = "file:///shutdown.js", .id = "drain-peer" });
     try instance.start(&opened, Opened.handler);
 
     const first_peer = try connect(instance.boundPort());
