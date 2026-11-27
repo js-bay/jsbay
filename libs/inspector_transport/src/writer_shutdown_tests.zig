@@ -78,7 +78,7 @@ fn readExactUntil(peer: socket.Socket, bytes: []u8, deadline: u64) !void {
         if (result.closed and !result.ready) return error.PeerClosedBeforeFrame;
         if (!result.ready) continue;
         const count = peer.read(bytes[received..]) catch |err| switch (err) {
-            error.WouldBlock, error.Interrupted => continue,
+            error.WouldBlock => continue,
             else => return err,
         };
         if (count == 0) return error.EndOfStream;
@@ -118,7 +118,7 @@ fn waitForPeerCloseUntil(stream: Stream, deadline: u64) !void {
         const result = try peer.poll(.read, @intCast(remaining));
         if (!result.ready and !result.closed) continue;
         const count = peer.read(&buffer) catch |err| switch (err) {
-            error.WouldBlock, error.Interrupted => continue,
+            error.WouldBlock => continue,
             else => return err,
         };
         if (count == 0) return;
