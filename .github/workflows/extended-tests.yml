@@ -413,8 +413,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: false
-      - name: Initialize QuickJS source
-        run: git submodule update --init vendor/quickjs
+      - name: Initialize JavaScript engine sources
+        run: git submodule update --init vendor/quickjs vendor/quickjs-ng
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
@@ -452,8 +452,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: false
-      - name: Initialize QuickJS NG source
-        run: git submodule update --init vendor/quickjs-ng
+      - name: Initialize JavaScript engine sources
+        run: git submodule update --init vendor/quickjs vendor/quickjs-ng
       - uses: ./.github/actions/setup-zig
         with:
           version: 0.17.0
