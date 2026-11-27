@@ -195,6 +195,7 @@ pub export fn jsbay_engine_create_with_options(
             error.InstanceInsertFailed => lh(id, .err, "engine creation failed: instance insert failed", log_user_data),
             error.ResourceInitFailed => lh(id, .err, "engine creation failed: resource init failed", log_user_data),
             error.RuntimeInitFailed => lh(id, .err, "engine creation failed: runtime init failed", log_user_data),
+            error.TeardownWorkerStartFailed => lh(id, .err, "engine creation failed: teardown worker start failed", log_user_data),
         };
         return false;
     };

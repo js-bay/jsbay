@@ -225,25 +225,21 @@ const TeardownQueue = struct {
         }
     }
 
-    pub fn ensureStarted() void {
+    pub fn ensureStarted() !void {
         mu.lock();
         defer mu.unlock();
         if (!initialized) {
-            if (std.Thread.spawn(.{}, worker, .{})) |t| {
-                t.detach();
-                thread = t;
-                initialized = true;
-            } else |_| {}
+            const t = std.Thread.spawn(.{}, worker, .{}) catch return error.TeardownWorkerStartFailed;
+            t.detach();
+            thread = t;
+            initialized = true;
         }
     }
 
     pub fn push(action: DeferredDestroyAction) void {
         mu.lock();
         defer mu.unlock();
-        if (!initialized) {
-            action.func(action.instance_id, action.generation);
-            return;
-        }
+        std.debug.assert(initialized);
         for (0..count) |i| {
             const idx = (head + i) % queue.len;
             if (queue[idx].instance_id == action.instance_id and queue[idx].generation == action.generation) {
@@ -260,8 +256,8 @@ const TeardownQueue = struct {
     }
 };
 
-pub fn ensureTeardownWorkerStarted() void {
-    TeardownQueue.ensureStarted();
+pub fn ensureTeardownWorkerStarted() !void {
+    try TeardownQueue.ensureStarted();
 }
 
 pub fn handOffDeferredDestroy(action: DeferredDestroyAction) void {

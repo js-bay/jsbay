@@ -85,6 +85,7 @@ pub const CreateError = error{
     ResourceInitFailed,
     ExecutionCpuInitFailed,
     InstanceInsertFailed,
+    TeardownWorkerStartFailed,
 };
 
 /// Convenience wrapper preserving boolean return for existing callers; calls createWithBackend with the active backend.
@@ -95,7 +96,7 @@ pub fn create(instance_id: i32, config: types.EngineConfig) bool {
 
 /// Create-time engine select. `tag` must be packed into this artifact. The pack primary uses the monomorphic ActiveEngine path; other packed tags use erased handles + `backend_dispatch`.
 pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: backend.BackendType) CreateError!void {
-    dispatch.ensureTeardownWorkerStarted();
+    try dispatch.ensureTeardownWorkerStarted();
     @import("runtime/scheduler_gate.zig").set(.{ .enter = @import("runtime/js_scheduler.zig").backendDrainAllowed, .leave = @import("runtime/js_scheduler.zig").backendDrainFinished });
     if (instance_map.getPtrs(instance_id) != null) return error.InstanceAlreadyExists;
     if (!backend.isPacked(tag)) return error.BackendNotPacked;
