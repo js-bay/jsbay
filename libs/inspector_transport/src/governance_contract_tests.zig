@@ -521,13 +521,6 @@ const RepeatedSender = struct {
     }
 };
 
-const DeinitProbe = struct {
-    transport_ptr: *transport.Transport,
-    fn run(self: *DeinitProbe) void {
-        self.transport_ptr.deinit();
-    }
-};
-
 const ReentrantDeinitProbe = struct {
     transport_ptr: ?*transport.Transport = null,
     target_event: transport.EventKind,
@@ -1103,49 +1096,6 @@ test "transport: deinit returns only after live workers release sockets and allo
     defer rebound.deinit();
     try rebound.start(null, Opened.handler);
     try testing.expectEqual(bound_port, rebound.boundPort());
-}
-
-test "transport: shutdown delivers an accepted frame before closing a paused writer" {
-    const alloc = testing.allocator;
-    var opened = Opened{};
-    defer opened.changed.deinit();
-    defer opened.mutex.deinit();
-    var barrier: transport.Transport.WriterTestBarrier = .{};
-    defer barrier.deinit();
-    const t = try transport.Transport.init(alloc, 0);
-    var deinit_thread: ?std.Thread = null;
-    var deinit_complete = false;
-    defer {
-        barrier.releaseWriter();
-        if (deinit_thread) |thread| {
-            thread.join();
-        } else if (!deinit_complete) {
-            t.deinit();
-        }
-    }
-    t.testing_writer_barrier = &barrier;
-    t.setDiscoveryTarget(.{ .title = "governance", .kind = "node", .url = "file:///governance.js", .id = "drain-peer" });
-    try t.start(&opened, Opened.handler);
-
-    const peer = try connectLoopback(t.boundPort());
-    defer peer.close();
-    try handshake(peer, "drain-peer");
-    const session = opened.wait(1);
-    try testing.expect(barrier.waitUntilPaused(5_000));
-    try testing.expect(t.sendText(session, "accepted-before-shutdown"));
-
-    var probe = DeinitProbe{ .transport_ptr = t };
-    deinit_thread = try std.Thread.spawn(.{}, DeinitProbe.run, .{&probe});
-    const close_started = barrier.waitUntilCloseStarted(5_000);
-    barrier.releaseWriter();
-    deinit_thread.?.join();
-    deinit_thread = null;
-    deinit_complete = true;
-    try testing.expect(close_started);
-
-    const message = try readTextFrame(alloc, peer);
-    defer alloc.free(message);
-    try testing.expectEqualStrings("accepted-before-shutdown", message);
 }
 
 test "transport: shutdown completes when an HTTP peer leaves its headers unfinished" {

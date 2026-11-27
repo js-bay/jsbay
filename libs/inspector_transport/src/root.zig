@@ -15,6 +15,8 @@ const std = @import("std");
 const inspector = @import("inspector");
 const zev = @import("zev");
 const socket = @import("portable_socket");
+const FrameDeadline = @import("frame_deadline.zig").FrameDeadline;
+const writer_test_support = @import("writer_test_support.zig");
 
 // Active callback and delivery frames are tracked on the stack so nested or cross-transport callbacks correctly recognize callers during teardown.
 const CallbackFrame = struct {
@@ -44,28 +46,6 @@ fn inActiveCallback(t: *Transport) bool {
     }
     return findActiveDeliveryFrame(t) != null;
 }
-
-const FrameDeadline = struct {
-    stall_timeout_ms: i64,
-    max_deadline: i64,
-
-    fn init(stall_ms: i64, max_ms: i64) FrameDeadline {
-        const now = @as(i64, @intCast(zev.monotonicMilliseconds()));
-        return .{
-            .stall_timeout_ms = stall_ms,
-            .max_deadline = now + max_ms,
-        };
-    }
-
-    fn checkExpired(self: FrameDeadline) !void {
-        const now = @as(i64, @intCast(zev.monotonicMilliseconds()));
-        if (now >= self.max_deadline) return error.TimedOut;
-    }
-
-    fn stallDeadline(self: FrameDeadline, now: i64) i64 {
-        return @min(now + self.stall_timeout_ms, self.max_deadline);
-    }
-};
 
 // -- Portable socket layer -------------------------------------------------
 const RawSocket = struct {
@@ -339,6 +319,7 @@ const SessionEntry = struct {
 };
 
 pub const Transport = struct {
+    pub const WriterTestBarrier = writer_test_support.WriterTestBarrier;
     /// Adapter used by Inspector. The HTTP/WebSocket server remains optional:
     /// callers may instead implement this same Inspector transport interface.
     interface: inspector.Transport = undefined,
@@ -371,7 +352,7 @@ pub const Transport = struct {
     deinit_started: std.atomic.Value(bool) = .init(false),
     callback_leases: usize = 0,
     /// Test-only synchronization for a queued writer frame during shutdown.
-    testing_writer_barrier: ?*WriterTestBarrier = null,
+    testing_writer_barrier: ?*writer_test_support.WriterTestBarrier = null,
 
     /// Monotonic session id counter (starts at 1).
     next_session_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
@@ -390,70 +371,6 @@ pub const Transport = struct {
     nested_deliveries: [max_nested_deliveries]NestedDelivery = undefined,
     nested_head: usize = 0,
     nested_tail: usize = 0,
-
-    pub const WriterTestBarrier = struct {
-        mutex: zev.Mutex = .{},
-        changed: zev.Condition = .init,
-        pause_next: bool = true,
-        paused: bool = false,
-        released: bool = false,
-        close_started: bool = false,
-
-        pub fn deinit(self: *WriterTestBarrier) void {
-            self.changed.deinit();
-            self.mutex.deinit();
-        }
-
-        fn pauseWriter(self: *WriterTestBarrier) void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            if (!self.pause_next) return;
-            self.pause_next = false;
-            self.paused = true;
-            self.changed.broadcast();
-            while (!self.released) self.changed.wait(&self.mutex);
-        }
-
-        fn notifyCloseStarted(self: *WriterTestBarrier) void {
-            self.mutex.lock();
-            self.close_started = true;
-            self.changed.broadcast();
-            self.mutex.unlock();
-        }
-
-        pub fn waitUntilPaused(self: *WriterTestBarrier, timeout_ms: u64) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            var remaining = timeout_ms;
-            while (!self.paused and remaining != 0) {
-                const started = zev.monotonicMilliseconds();
-                if (self.changed.waitTimeout(&self.mutex, remaining) == .timed_out) break;
-                const elapsed = zev.monotonicMilliseconds() - started;
-                remaining = if (elapsed >= remaining) 0 else remaining - elapsed;
-            }
-            return self.paused;
-        }
-
-        pub fn waitUntilCloseStarted(self: *WriterTestBarrier, timeout_ms: u64) bool {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            var remaining = timeout_ms;
-            while (!self.close_started and remaining != 0) {
-                const started = zev.monotonicMilliseconds();
-                if (self.changed.waitTimeout(&self.mutex, remaining) == .timed_out) break;
-                const elapsed = zev.monotonicMilliseconds() - started;
-                remaining = if (elapsed >= remaining) 0 else remaining - elapsed;
-            }
-            return self.close_started;
-        }
-
-        pub fn releaseWriter(self: *WriterTestBarrier) void {
-            self.mutex.lock();
-            self.released = true;
-            self.changed.broadcast();
-            self.mutex.unlock();
-        }
-    };
 
     pub const Options = struct {
         max_message_bytes: usize = default_max_message_bytes,
