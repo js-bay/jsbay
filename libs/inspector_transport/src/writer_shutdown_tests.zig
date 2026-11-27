@@ -90,35 +90,18 @@ fn readTextFrame(alloc: std.mem.Allocator, stream: Stream) ![]u8 {
     return payload;
 }
 
-fn waitForPeerClose(stream: Stream, barrier: ?*transport.Transport.WriterTestBarrier) !void {
+fn waitForPeerClose(stream: Stream) !void {
     const peer = socket.Socket{ .handle = stream.handle };
     const deadline = zev.monotonicMilliseconds() + 5_000;
     var buffer: [16 * 1024]u8 = undefined;
-    var bytes_read: usize = 0;
-    var last_ready = false;
-    var last_closed = false;
     while (zev.monotonicMilliseconds() < deadline) {
         const remaining = deadline - zev.monotonicMilliseconds();
         const result = try peer.poll(.read, @intCast(@min(remaining, 100)));
-        last_ready = result.ready;
-        last_closed = result.closed;
-        if (result.closed) {
-            return;
-        }
+        if (result.closed) return;
         if (!result.ready) continue;
         const count = stream.read(&buffer) catch return;
         if (count == 0) return;
-        bytes_read += count;
     }
-    try peer.setNonBlocking(true);
-    const probe_bytes = peer.read(&buffer) catch |err| {
-        std.debug.print("PEER_CLOSE_TIMEOUT bytes_read={d} ready={any} closed={any} probe_error={s}\n", .{ bytes_read, last_ready, last_closed, @errorName(err) });
-        if (barrier) |test_barrier| test_barrier.printSessionCloseDiagnostics();
-        return error.PeerDidNotClose;
-    };
-    std.debug.print("PEER_CLOSE_TIMEOUT bytes_read={d} ready={any} closed={any} probe_bytes={d}\n", .{ bytes_read, last_ready, last_closed, probe_bytes });
-    if (barrier) |test_barrier| test_barrier.printSessionCloseDiagnostics();
-    if (probe_bytes == 0) return;
     return error.PeerDidNotClose;
 }
 
@@ -222,10 +205,63 @@ test "transport shutdown shares its deadline across slow sessions" {
     try testing.expect(close_started);
     try testing.expect(elapsed <= 4_000);
     try testing.expect(probe.completed.load(.acquire));
-    try first_peer.setReceiveBuffer(4 * 1024 * 1024);
-    try second_peer.setReceiveBuffer(4 * 1024 * 1024);
-    const first_close = waitForPeerClose(first_peer, &barrier);
-    const second_close = waitForPeerClose(second_peer, &barrier);
-    try first_close;
-    try second_close;
+}
+
+test "transport shutdown delivers accepted frames to multiple peers before closing" {
+    const alloc = testing.allocator;
+    var opened = Opened{};
+    defer opened.changed.deinit();
+    defer opened.mutex.deinit();
+    var barrier: transport.Transport.WriterTestBarrier = .{ .pause_limit = 2 };
+    defer barrier.deinit();
+    const instance = try transport.Transport.init(alloc, 0);
+    var deinit_thread: ?std.Thread = null;
+    var deinit_complete = false;
+    defer {
+        barrier.releaseWriter();
+        if (deinit_thread) |thread| {
+            thread.join();
+        } else if (!deinit_complete) {
+            instance.deinit();
+        }
+    }
+    instance.testing_writer_barrier = &barrier;
+    instance.setDiscoveryTarget(.{ .title = "shutdown", .kind = "node", .url = "file:///shutdown.js", .id = "drain-peers" });
+    try instance.start(&opened, Opened.handler);
+
+    const first_peer = try connect(instance.boundPort());
+    defer first_peer.close();
+    try handshake(first_peer);
+    const first_session = opened.wait(1);
+    const second_peer = try connect(instance.boundPort());
+    defer second_peer.close();
+    try handshake(second_peer);
+    const second_session = opened.wait(2);
+
+    try testing.expect(instance.sendText(first_session, "first-accepted-frame"));
+    try testing.expect(barrier.waitUntilPausedCount(1, 5_000));
+    try testing.expect(instance.sendText(second_session, "second-accepted-frame"));
+    try testing.expect(barrier.waitUntilPausedCount(2, 5_000));
+
+    var probe = DeinitProbe{ .transport_ptr = instance };
+    const started = zev.monotonicMilliseconds();
+    deinit_thread = try std.Thread.spawn(.{}, DeinitProbe.run, .{&probe});
+    const close_started = barrier.waitUntilCloseStarted(5_000);
+    barrier.releaseWriter();
+    deinit_thread.?.join();
+    deinit_thread = null;
+    deinit_complete = true;
+    const elapsed = zev.monotonicMilliseconds() - started;
+
+    try testing.expect(close_started);
+    try testing.expect(elapsed <= 4_000);
+    try testing.expect(probe.completed.load(.acquire));
+    const first_message = try readTextFrame(alloc, first_peer);
+    defer alloc.free(first_message);
+    try testing.expectEqualStrings("first-accepted-frame", first_message);
+    const second_message = try readTextFrame(alloc, second_peer);
+    defer alloc.free(second_message);
+    try testing.expectEqualStrings("second-accepted-frame", second_message);
+    try waitForPeerClose(first_peer);
+    try waitForPeerClose(second_peer);
 }
