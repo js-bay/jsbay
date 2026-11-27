@@ -23,7 +23,7 @@ const destroy_gate = @import("destroy_gate.zig");
 const state_admission_hook = @import("state_admission_hook.zig");
 const thread_value = @import("engine_thread_value.zig");
 const generation_thread = @import("generation_thread.zig");
-const jobs = @import("engine_thread_jobs.zig");
+const thread_jobs = @import("engine_thread_jobs.zig");
 const thread_wait = @import("engine_thread_wait.zig");
 
 const ActiveEngine = backend.ActiveEngine;
@@ -229,7 +229,7 @@ fn ensureState(instance_id: i32, generation: u64) StateError!*State {
         _ = g_states.remove(instance_id);
         g_mu.unlock();
         thread_wait.waitRefsDrain(existing, builtin.is_test);
-        jobs.freeJobs(existing, freeJob);
+        thread_jobs.freeJobs(existing, freeJob);
         existing.jobs.deinit();
         deinitStateSynchronization(existing);
         std.heap.c_allocator.destroy(existing);
@@ -1199,7 +1199,7 @@ pub fn beginDestroy(instance_id: i32, generation: u64) bool {
     if (first_deferred_destroy) {
         state.stopping.store(true, .seq_cst);
         _ = @import("runtime_control.zig").requestStopInterrupt(instance_id);
-        jobs.cancelAll(state, status_destroyed, freeJob, notifyLocked);
+        thread_jobs.cancelAll(state, status_destroyed, freeJob, notifyLocked);
     }
     release(state);
     return true;
@@ -1291,7 +1291,7 @@ fn finishBeforeDestroyClaimed(instance_id: i32, generation: u64, state: *State, 
         return;
     }
     thread_wait.waitRefsDrain(owned, builtin.is_test);
-    jobs.freeJobs(owned, freeJob);
+    thread_jobs.freeJobs(owned, freeJob);
     owned.jobs.deinit();
     deinitStateSynchronization(owned);
     std.heap.c_allocator.destroy(owned);
@@ -1326,7 +1326,7 @@ fn releaseHostBindings(instance_id: i32) void {
 
 fn shutdown(state: *State) void {
     state.stopping.store(true, .seq_cst);
-    jobs.cancelAll(state, status_destroyed, freeJob, notifyLocked);
+    thread_jobs.cancelAll(state, status_destroyed, freeJob, notifyLocked);
     // `cancelAll` signals the event-loop waiter so the owner can leave the loop.
     engine.wakeAsync(state.instance_id);
 
@@ -1464,7 +1464,7 @@ fn finishDeferredDestroy(state: *State) void {
     unlockGenerationDestroyGate(&destroy_gate_lease);
     thread_wait.waitRefsDrain(state, builtin.is_test);
 
-    jobs.freeJobs(state, freeJob);
+    thread_jobs.freeJobs(state, freeJob);
     state.jobs.deinit();
     deinitStateSynchronization(state);
     std.heap.c_allocator.destroy(state);
