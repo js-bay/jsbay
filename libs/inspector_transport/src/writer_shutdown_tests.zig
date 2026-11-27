@@ -116,11 +116,10 @@ fn waitForPeerCloseUntil(stream: Stream, deadline: u64) !void {
     while (zev.monotonicMilliseconds() < deadline) {
         const remaining = deadline - zev.monotonicMilliseconds();
         const result = try peer.poll(.read, @intCast(remaining));
-        if (result.closed) return;
-        if (!result.ready) continue;
+        if (!result.ready and !result.closed) continue;
         const count = peer.read(&buffer) catch |err| switch (err) {
             error.WouldBlock, error.Interrupted => continue,
-            else => return,
+            else => return err,
         };
         if (count == 0) return;
     }
