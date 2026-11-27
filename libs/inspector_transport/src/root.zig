@@ -165,7 +165,7 @@ const Session = struct {
         self.queue_mu.unlock();
         self.queue_changed.deinit();
         self.queue_mu.deinit();
-        self.stream.close();
+        if (self.transport.testing_writer_barrier) |barrier| barrier.closeFinalSession(self.stream) else self.stream.close();
         self.allocator.destroy(self);
     }
 

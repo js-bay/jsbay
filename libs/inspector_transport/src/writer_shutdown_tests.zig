@@ -90,7 +90,7 @@ fn readTextFrame(alloc: std.mem.Allocator, stream: Stream) ![]u8 {
     return payload;
 }
 
-fn waitForPeerClose(stream: Stream) !void {
+fn waitForPeerClose(stream: Stream, barrier: ?*transport.Transport.WriterTestBarrier) !void {
     const peer = socket.Socket{ .handle = stream.handle };
     const deadline = zev.monotonicMilliseconds() + 5_000;
     var buffer: [16 * 1024]u8 = undefined;
@@ -103,18 +103,22 @@ fn waitForPeerClose(stream: Stream) !void {
         last_ready = result.ready;
         last_closed = result.closed;
         if (result.closed) {
-            std.debug.print("PEER_CLOSE_OBSERVED bytes_read={d} ready={any} closed=true\n", .{ bytes_read, last_ready });
             return;
         }
         if (!result.ready) continue;
         const count = stream.read(&buffer) catch return;
-        if (count == 0) {
-            std.debug.print("PEER_CLOSE_OBSERVED bytes_read={d} ready={any} closed=false eof=true\n", .{ bytes_read, last_ready });
-            return;
-        }
+        if (count == 0) return;
         bytes_read += count;
     }
-    std.debug.print("PEER_CLOSE_TIMEOUT bytes_read={d} ready={any} closed={any}\n", .{ bytes_read, last_ready, last_closed });
+    try peer.setNonBlocking(true);
+    const probe_bytes = peer.read(&buffer) catch |err| {
+        std.debug.print("PEER_CLOSE_TIMEOUT bytes_read={d} ready={any} closed={any} probe_error={s}\n", .{ bytes_read, last_ready, last_closed, @errorName(err) });
+        if (barrier) |test_barrier| test_barrier.printSessionCloseDiagnostics();
+        return error.PeerDidNotClose;
+    };
+    std.debug.print("PEER_CLOSE_TIMEOUT bytes_read={d} ready={any} closed={any} probe_bytes={d}\n", .{ bytes_read, last_ready, last_closed, probe_bytes });
+    if (barrier) |test_barrier| test_barrier.printSessionCloseDiagnostics();
+    if (probe_bytes == 0) return;
     return error.PeerDidNotClose;
 }
 
@@ -220,6 +224,8 @@ test "transport shutdown shares its deadline across slow sessions" {
     try testing.expect(probe.completed.load(.acquire));
     try first_peer.setReceiveBuffer(4 * 1024 * 1024);
     try second_peer.setReceiveBuffer(4 * 1024 * 1024);
-    try waitForPeerClose(first_peer);
-    try waitForPeerClose(second_peer);
+    const first_close = waitForPeerClose(first_peer, &barrier);
+    const second_close = waitForPeerClose(second_peer, &barrier);
+    try first_close;
+    try second_close;
 }

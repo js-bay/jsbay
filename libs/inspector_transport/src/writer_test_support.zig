@@ -1,3 +1,4 @@
+const std = @import("std");
 const zev = @import("zev");
 
 pub const WriterTestBarrier = struct {
@@ -7,6 +8,27 @@ pub const WriterTestBarrier = struct {
     paused: bool = false,
     released: bool = false,
     close_started: bool = false,
+    final_refs_zero: usize = 0,
+    socket_close_entered: usize = 0,
+    socket_close_returned: usize = 0,
+
+    pub fn closeFinalSession(self: *WriterTestBarrier, stream: anytype) void {
+        self.mutex.lock();
+        self.final_refs_zero += 1;
+        self.socket_close_entered += 1;
+        self.mutex.unlock();
+        stream.close();
+        self.mutex.lock();
+        self.socket_close_returned += 1;
+        self.changed.broadcast();
+        self.mutex.unlock();
+    }
+
+    pub fn printSessionCloseDiagnostics(self: *WriterTestBarrier) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.print("SESSION_CLOSE_DIAGNOSTIC final_refs_zero={d} close_entered={d} close_returned={d}\n", .{ self.final_refs_zero, self.socket_close_entered, self.socket_close_returned });
+    }
 
     pub fn deinit(self: *WriterTestBarrier) void {
         self.changed.deinit();
