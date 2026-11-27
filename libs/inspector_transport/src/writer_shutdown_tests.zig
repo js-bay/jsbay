@@ -69,37 +69,59 @@ fn handshake(stream: Stream) !void {
     try testing.expect(std.mem.startsWith(u8, response.items, "HTTP/1.1 101"));
 }
 
-fn readTextFrame(alloc: std.mem.Allocator, stream: Stream) ![]u8 {
+fn readExactUntil(peer: socket.Socket, bytes: []u8, deadline: u64) !void {
+    var received: usize = 0;
+    while (received < bytes.len) {
+        const now = zev.monotonicMilliseconds();
+        if (now >= deadline) return error.PeerReadDeadlineExceeded;
+        const result = try peer.poll(.read, @intCast(deadline - now));
+        if (result.closed and !result.ready) return error.PeerClosedBeforeFrame;
+        if (!result.ready) continue;
+        const count = peer.read(bytes[received..]) catch |err| switch (err) {
+            error.WouldBlock, error.Interrupted => continue,
+            else => return err,
+        };
+        if (count == 0) return error.EndOfStream;
+        received += count;
+    }
+}
+
+fn readTextFrameUntil(alloc: std.mem.Allocator, stream: Stream, deadline: u64) ![]u8 {
+    const peer = socket.Socket{ .handle = stream.handle };
+    try peer.setNonBlocking(true);
     var header: [2]u8 = undefined;
-    try stream.readAll(&header);
+    try readExactUntil(peer, &header, deadline);
     try testing.expectEqual(@as(u8, 0x1), header[0] & 0x0f);
     try testing.expectEqual(@as(u8, 0), header[1] & 0x80);
     var length: u64 = header[1] & 0x7f;
     if (length == 126) {
         var extended: [2]u8 = undefined;
-        try stream.readAll(&extended);
+        try readExactUntil(peer, &extended, deadline);
         length = std.mem.readInt(u16, &extended, .big);
     } else if (length == 127) {
         var extended: [8]u8 = undefined;
-        try stream.readAll(&extended);
+        try readExactUntil(peer, &extended, deadline);
         length = std.mem.readInt(u64, &extended, .big);
     }
     const payload = try alloc.alloc(u8, @intCast(length));
     errdefer alloc.free(payload);
-    try stream.readAll(payload);
+    try readExactUntil(peer, payload, deadline);
     return payload;
 }
 
-fn waitForPeerClose(stream: Stream) !void {
+fn waitForPeerCloseUntil(stream: Stream, deadline: u64) !void {
     const peer = socket.Socket{ .handle = stream.handle };
-    const deadline = zev.monotonicMilliseconds() + 5_000;
+    try peer.setNonBlocking(true);
     var buffer: [16 * 1024]u8 = undefined;
     while (zev.monotonicMilliseconds() < deadline) {
         const remaining = deadline - zev.monotonicMilliseconds();
-        const result = try peer.poll(.read, @intCast(@min(remaining, 100)));
+        const result = try peer.poll(.read, @intCast(remaining));
         if (result.closed) return;
         if (!result.ready) continue;
-        const count = stream.read(&buffer) catch return;
+        const count = peer.read(&buffer) catch |err| switch (err) {
+            error.WouldBlock, error.Interrupted => continue,
+            else => return,
+        };
         if (count == 0) return;
     }
     return error.PeerDidNotClose;
@@ -144,12 +166,15 @@ test "transport shutdown delivers accepted output before closing a paused writer
     deinit_complete = true;
     try testing.expect(close_started);
 
-    const message = try readTextFrame(alloc, peer);
+    const read_deadline = zev.monotonicMilliseconds() + 5_000;
+    const message = try readTextFrameUntil(alloc, peer, read_deadline);
     defer alloc.free(message);
     try testing.expectEqualStrings("accepted-before-shutdown", message);
-    const queued = try readTextFrame(alloc, peer);
+    const queued = try readTextFrameUntil(alloc, peer, read_deadline);
     defer alloc.free(queued);
     try testing.expectEqualStrings("queued-behind-inflight-frame", queued);
+    try waitForPeerCloseUntil(peer, read_deadline);
+    try testing.expect(barrier.closeDeadlineStayedStable(1, 1, 2));
 }
 
 test "transport shutdown shares its deadline across slow sessions" {
@@ -205,6 +230,7 @@ test "transport shutdown shares its deadline across slow sessions" {
     try testing.expect(close_started);
     try testing.expect(elapsed <= 4_000);
     try testing.expect(probe.completed.load(.acquire));
+    try testing.expect(barrier.closeDeadlineStayedStable(2, 2, 2));
 }
 
 test "transport shutdown delivers accepted frames to multiple peers before closing" {
@@ -256,12 +282,14 @@ test "transport shutdown delivers accepted frames to multiple peers before closi
     try testing.expect(close_started);
     try testing.expect(elapsed <= 4_000);
     try testing.expect(probe.completed.load(.acquire));
-    const first_message = try readTextFrame(alloc, first_peer);
+    const read_deadline = zev.monotonicMilliseconds() + 5_000;
+    const first_message = try readTextFrameUntil(alloc, first_peer, read_deadline);
     defer alloc.free(first_message);
     try testing.expectEqualStrings("first-accepted-frame", first_message);
-    const second_message = try readTextFrame(alloc, second_peer);
+    const second_message = try readTextFrameUntil(alloc, second_peer, read_deadline);
     defer alloc.free(second_message);
     try testing.expectEqualStrings("second-accepted-frame", second_message);
-    try waitForPeerClose(first_peer);
-    try waitForPeerClose(second_peer);
+    try waitForPeerCloseUntil(first_peer, read_deadline);
+    try waitForPeerCloseUntil(second_peer, read_deadline);
+    try testing.expect(barrier.closeDeadlineStayedStable(2, 2, 2));
 }

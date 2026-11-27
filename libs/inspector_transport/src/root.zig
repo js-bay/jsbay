@@ -299,11 +299,12 @@ const Session = struct {
         self.draining = true;
         self.queue_changed.broadcast();
         self.queue_mu.unlock();
-        if (self.transport.testing_writer_barrier) |barrier| barrier.notifyCloseStarted();
+        if (self.transport.testing_writer_barrier) |barrier| barrier.notifyCloseStarted(self.id, self.transport.close_deadline_ms.load(.acquire));
     }
 
     fn writeDeadline(self: *Session, frame_deadline: i64) i64 {
         const close_deadline = self.transport.close_deadline_ms.load(.acquire);
+        if (self.transport.testing_writer_barrier) |barrier| barrier.observeWriteDeadline(self.id, close_deadline);
         return if (close_deadline == 0) frame_deadline else @min(frame_deadline, close_deadline);
     }
 };
