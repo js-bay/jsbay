@@ -426,25 +426,23 @@ pub const QuickJsNgBackend = struct {
     // ---- Evaluation ----
 
     pub fn eval(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
+        return evalWithResultMode(ctx, script, filename, true);
+    }
+
+    pub fn evalDiscardingResult(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
+        return evalWithResultMode(ctx, script, filename, false);
+    }
+
+    fn evalWithResultMode(ctx: Context, script: []const u8, filename: []const u8, stringify_result: bool) types.EvalResult {
         if (!enterJs(ctx)) return .{ .result = null, .err = cross_thread_reentry_msg, .err_is_heap = false };
         defer leaveJs(ctx);
-        const fname = std.heap.c_allocator.dupeSentinel(u8, filename, 0) catch {
-            return .{ .result = null, .err = "Failed to allocate filename", .err_is_heap = false };
-        };
+        const fname = std.heap.c_allocator.dupeSentinel(u8, filename, 0) catch return .{ .result = null, .err = "Failed to allocate filename", .err_is_heap = false };
         defer std.heap.c_allocator.free(fname);
         // QuickJS JS_Eval expects a NUL-terminated input buffer (it may read one past input_len during lexing). Defensively copy into a sentinel-terminated allocation so callers can pass arbitrary slices.
-        const src = std.heap.c_allocator.dupeSentinel(u8, script, 0) catch {
-            return .{ .result = null, .err = "Failed to allocate script", .err_is_heap = false };
-        };
+        const src = std.heap.c_allocator.dupeSentinel(u8, script, 0) catch return .{ .result = null, .err = "Failed to allocate script", .err_is_heap = false };
         defer std.heap.c_allocator.free(src);
         syncStackTopForJs(ctx);
-        const result = qjs.JS_Eval(
-            ctx,
-            src.ptr,
-            src.len,
-            fname.ptr,
-            qjs.JS_EVAL_TYPE_GLOBAL,
-        );
+        const result = qjs.JS_Eval(ctx, src.ptr, src.len, fname.ptr, qjs.JS_EVAL_TYPE_GLOBAL);
         // JavaScript jobs belong to this eval turn even when evaluation throws. In particular, queueMicrotask() scheduled before a later throw must not require an unrelated future tick to run.
         defer processPendingJobs(ctx);
 
@@ -453,12 +451,11 @@ pub const QuickJsNgBackend = struct {
             return .{ .result = null, .err = msg orelse "JavaScript error", .err_is_heap = msg != null };
         }
 
-        const ret = if (c.jsIsUndefined(result) or c.jsIsNull(result))
-            null
-        else if (c.jsIsObject(result))
-            exception.jsonStringify(ctx, result)
-        else
-            exception.valueToString(ctx, result);
+        if (!stringify_result) {
+            c.jsbay_qjs_JS_FreeValue(ctx, result);
+            return .{};
+        }
+        const ret = if (c.jsIsUndefined(result) or c.jsIsNull(result)) null else if (c.jsIsObject(result)) exception.jsonStringify(ctx, result) else exception.valueToString(ctx, result);
 
         c.jsbay_qjs_JS_FreeValue(ctx, result);
         return .{ .result = ret, .err = null };

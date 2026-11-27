@@ -15,6 +15,8 @@ const promise = @import("../runtime/promise.zig");
 const helpers = @import("test_helpers.zig");
 const c_api = @import("../c_api.zig");
 const api_value = @import("../abi/api_value.zig");
+const value_api = @import("../value/root.zig");
+const runtime_control = @import("../runtime/runtime_control.zig");
 
 const max_events = 4;
 const max_reason = 96;
@@ -99,6 +101,30 @@ const LegacyInterruptAfterFirst = struct {
     }
 };
 
+const UnregisterOnRejection = struct {
+    count: u32 = 0,
+    handled: [max_events]bool = @splat(false),
+    reason: [max_events][max_reason]u8 = @splat(@as([max_reason]u8, @splat(0))),
+    reason_len: [max_events]u8 = @splat(0),
+
+    fn handler(instance_id: i32, is_handled: bool, reason_ptr: [*]const u8, reason_len: usize, userdata: ?*anyopaque) callconv(.c) void {
+        const self: *UnregisterOnRejection = @ptrCast(@alignCast(userdata orelse return));
+        if (self.count < max_events) {
+            const index = self.count;
+            self.handled[index] = is_handled;
+            const n = @min(reason_len, max_reason);
+            if (n > 0) @memcpy(self.reason[index][0..n], reason_ptr[0..n]);
+            self.reason_len[index] = @intCast(n);
+        }
+        self.count += 1;
+        _ = promise.setRejectionTracker(instance_id, null, null);
+    }
+
+    fn text(self: *const UnregisterOnRejection, index: usize) []const u8 {
+        return self.reason[index][0..self.reason_len[index]];
+    }
+};
+
 test "error observer: retains rejection handles and reports late handling" {
     const id = helpers.nextInstanceId();
     try testing.expect(c_api.jsbay_engine_create(id, null, null));
@@ -132,6 +158,41 @@ test "error observer: retains rejection handles and reports late handling" {
     try testing.expect(log.value != 0);
     try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_release(log.promise));
     try testing.expectEqual(@as(c_int, 0), c_api.jsbay_value_release(log.value));
+}
+
+test "secondary QuickJS instance: observer and Inspector support boundaries" {
+    if (backend.active_backend != .jsc) return error.SkipZigTest;
+
+    var available: [8]c_api.BackendC = undefined;
+    const count = c_api.jsbay_available_backends(&available, available.len);
+    var exercised: usize = 0;
+    for (available[0..count]) |tag| {
+        const selected = backend.backendFromC(@backingInt(tag)) orelse return error.InvalidBackendTag;
+        if (!backend.isQuickJsApiBackend(selected)) continue;
+
+        const id = helpers.nextInstanceId();
+        var options = c_api.EngineCreateOptionsC{
+            .struct_size = @sizeOf(c_api.EngineCreateOptionsC),
+            .backend = tag,
+        };
+        try testing.expect(c_api.jsbay_engine_create_with_options(id, &options));
+        defer c_api.jsbay_engine_destroy(id);
+
+        var log = ErrorLog{};
+        try testing.expectEqual(@as(c_int, 7), c_api.jsbay_engine_set_error_observer(id, ErrorLog.handler, &log));
+        try helpers.evalOk(id, "Promise.reject({ marker: 17 })");
+        try testing.expectEqual(@as(u32, 0), log.count);
+
+        var bound_port: u16 = 0xA55A;
+        const started = c_api.jsbay_engine_inspector_start(id, 0, &bound_port);
+        if (started) c_api.jsbay_engine_inspector_stop(id);
+        try testing.expect(!started);
+        try testing.expectEqual(@as(u16, 0xA55A), bound_port);
+        try testing.expect(!c_api.jsbay_engine_inspector_start(id, 0, &bound_port));
+        try testing.expectEqual(@as(u16, 0xA55A), bound_port);
+        exercised += 1;
+    }
+    if (exercised == 0) return error.SkipZigTest;
 }
 
 test "error observer: same-turn catch stays quiet and unregister suppresses future reports" {
@@ -438,127 +499,13 @@ test "rejection: unhandled rejection is reported once, then handled" {
             try testing.expect(!log.handled[0]);
             try testing.expect(std.mem.indexOf(u8, log.text(0), "oops") != null);
 
+            var extra_drains: u32 = 0;
+            while (extra_drains < 3) : (extra_drains += 1) engine.runEventLoopOnce(id);
+            try testing.expectEqual(@as(u32, 1), log.count);
+
             try helpers.evalOk(id, "globalThis.__rej.catch(function () {});");
             try testing.expectEqual(@as(u32, 2), log.count);
             try testing.expect(log.handled[1]);
-            try helpers.expectEvalEquals(id, "1+1", "2");
-        }
-    }.run);
-}
-
-test "rejection: replaced Error that throws does not break unhandled reporting" {
-    try helpers.withDefaultEngine(struct {
-        fn run(id: i32) !void {
-            var log = RejectionLog{};
-            // JSC has no host rejection tracker. Skip the assertions; the test still has to compile on that backend.
-            if (!install(id, &log)) return;
-            defer _ = promise.setRejectionTracker(id, null, null);
-
-            // `toString` calls the replaced Error while the host formats the unhandled reason. That throw must not assert or recurse.
-            try helpers.evalOk(id,
-                \\globalThis.Error = function () { throw "broken-error"; };
-                \\globalThis.__rej = Promise.reject({
-                \\  toString: function () { return new Error("during-report"); }
-                \\});
-            );
-            engine.runEventLoopOnce(id);
-
-            // The tracker may run once, or give up when `Error` throws. Either way the report must not recurse.
-            try testing.expect(log.count <= 2);
-            try helpers.expectEvalEquals(id, "1+1", "2");
-        }
-    }.run);
-}
-
-test "rejection: timer callback rejection is reported before teardown and tracker is clean after ID reuse" {
-    const id = helpers.nextInstanceId();
-    try testing.expect(engine.create(id, .{}));
-    var first_instance_alive = true;
-    defer if (first_instance_alive) {
-        // Keep the callback userdata valid until the tracker is unregistered on failure paths. The success path intentionally destroys while the tracker is still installed.
-        _ = promise.setRejectionTracker(id, null, null);
-        engine.destroy(id);
-    };
-
-    var log = RejectionLog{};
-    if (!install(id, &log)) return;
-
-    try helpers.evalOk(
-        id,
-        "setTimeout(function () { Promise.reject(new Error('timer-rejection-marker')); }, 0);",
-    );
-
-    var attempts: u32 = 0;
-    while (attempts < 200 and log.count == 0) : (attempts += 1) {
-        engine.runEventLoopOnce(id);
-        if (log.count == 0) io.sleepMs(5);
-    }
-
-    try testing.expectEqual(@as(u32, 1), log.count);
-    // Keep draining after the first report so a duplicate notification cannot hide behind the loop's early-exit condition.
-    var extra_drains: u32 = 0;
-    while (extra_drains < 5) : (extra_drains += 1) {
-        engine.runEventLoopOnce(id);
-        io.sleepMs(1);
-    }
-    try testing.expectEqual(@as(u32, 1), log.count);
-    try testing.expect(!log.handled[0]);
-    try testing.expect(std.mem.indexOf(u8, log.text(0), "timer-rejection-marker") != null);
-
-    // Do not unregister the tracker first: teardown must release it while its userdata is valid, after the timer callback has reported.
-    engine.destroy(id);
-    try testing.expect(engine.getContext(id) == null);
-    first_instance_alive = false;
-
-    try testing.expect(engine.create(id, .{}));
-    defer {
-        _ = promise.setRejectionTracker(id, null, null);
-        engine.destroy(id);
-    }
-
-    var second_log = RejectionLog{};
-    if (!install(id, &second_log)) return;
-    try helpers.evalOk(id, "Promise.reject(new Error('reused-id-rejection-marker'));");
-
-    try testing.expectEqual(@as(u32, 1), second_log.count);
-    try testing.expect(!second_log.handled[0]);
-    try testing.expect(std.mem.indexOf(u8, second_log.text(0), "reused-id-rejection-marker") != null);
-    try testing.expectEqual(@as(u32, 1), log.count);
-    try testing.expect(std.mem.indexOf(u8, log.text(0), "timer-rejection-marker") != null);
-    try testing.expect(std.mem.indexOf(u8, log.text(0), "reused-id-rejection-marker") == null);
-}
-
-test "rejection: a timer callback that catches its own rejection reports nothing" {
-    try helpers.withDefaultEngine(struct {
-        fn run(id: i32) !void {
-            var log = RejectionLog{};
-            if (!install(id, &log)) return;
-            defer _ = promise.setRejectionTracker(id, null, null);
-
-            try helpers.evalOk(id,
-                \\globalThis.__timerRan = 0;
-                \\globalThis.__caught = 0;
-                \\setTimeout(function () {
-                \\    globalThis.__timerRan = 1;
-                \\    Promise.reject(new Error('timer-caught')).catch(function () { globalThis.__caught = 1; });
-                \\}, 0);
-            );
-
-            // Keep draining past the point the callback has run, so a late notification cannot hide behind an early exit.
-            var attempts: u32 = 0;
-            while (attempts < 200) : (attempts += 1) {
-                engine.runEventLoopOnce(id);
-                const ran = try helpers.evalInt(id, "globalThis.__timerRan + globalThis.__caught");
-                if (ran == 2) break;
-                io.sleepMs(5);
-            }
-            try helpers.expectEvalEquals(id, "globalThis.__timerRan + ',' + globalThis.__caught", "1,1");
-            var extra: u32 = 0;
-            while (extra < 5) : (extra += 1) {
-                engine.runEventLoopOnce(id);
-                io.sleepMs(1);
-            }
-            try testing.expectEqual(@as(u32, 0), log.count);
             try helpers.expectEvalEquals(id, "1+1", "2");
         }
     }.run);

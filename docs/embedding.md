@@ -4,6 +4,8 @@
 
 Build with `-Dbackend=quickjs_ng`, `-Dbackend=quickjs`, or `-Dbackend=jsc`. All backends support engine lifecycle, ordinary evaluation, values, host objects, timers, references, finalizers, explicit GC, and the common C ABI.
 
+`jsbay_library_capabilities` describes the library's primary backend. When a multi-backend artifact creates an instance with `jsbay_engine_create_with_options`, call `jsbay_engine_capabilities` for that instance; primary-only APIs such as bytecode operations and inspectors are not reported for secondary instances.
+
 | Capability | JSC | QuickJS | QuickJS-NG |
 | --- | --- | --- | --- |
 | Configurable JavaScript stack and heap limit | No public heap or stack limit | Yes | Yes |

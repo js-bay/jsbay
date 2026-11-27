@@ -75,6 +75,9 @@ void hermes_inspector_source_end(JsbayHermesContext *ctx);
 
 HermesEvalResult hermes_eval(JsbayHermesContext *ctx, const char *src, size_t src_len,
                              const char *filename, size_t filename_len);
+HermesEvalResult hermes_eval_discarding_result(JsbayHermesContext *ctx, const char *src,
+                                               size_t src_len, const char *filename,
+                                               size_t filename_len);
 void hermes_eval_result_free(HermesEvalResult r);
 
 HermesValue hermes_undefined(void);
@@ -244,7 +247,10 @@ HermesOpResult hermes_value_to_string_result(JsbayHermesContext *ctx, HermesValu
 HermesOpResult hermes_set_property_result(JsbayHermesContext *ctx, HermesValue obj, const char *key, HermesValue val);
 HermesOpResult hermes_call_result(JsbayHermesContext *ctx, HermesValue fn, HermesValue this_val,
                                   const HermesValue *args, size_t argc);
-void hermes_throw_value(JsbayHermesContext *ctx, HermesValue exception);
+/* Consume an exclusively owned exception handle without copying. False leaves it owned by the caller. */
+bool hermes_take_throw_value(JsbayHermesContext *ctx, HermesValue exception);
+/* Store a process-lifetime literal throw message without allocating. */
+void hermes_throw_static(JsbayHermesContext *ctx, const char *message);
 HermesOpResult hermes_construct(JsbayHermesContext *ctx, HermesValue ctor,
                                 const HermesValue *args, size_t argc);
 HermesBoolOpResult hermes_has_in(JsbayHermesContext *ctx, HermesValue obj, const char *key);

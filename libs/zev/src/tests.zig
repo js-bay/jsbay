@@ -5,6 +5,7 @@ comptime {
     _ = @import("loop_driver_tests.zig");
     _ = @import("notification_tests.zig");
     _ = @import("notification_clock_tests.zig");
+    _ = @import("notification_drain_tests.zig");
     _ = @import("sync_tests.zig");
 }
 

@@ -54,27 +54,41 @@ pub fn processPendingJobs(ctx: Context) void {
 
 pub fn eval(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
     const raw = c_api.escargot_eval(ctx, script.ptr, script.len, filename.ptr, filename.len);
-    const result = if (raw.result) |p| blk: {
-        const s = p[0..raw.result_len];
-        const owned = std.heap.c_allocator.dupe(u8, s) catch {
-            _ = std.c.free(p);
-            if (raw.err) |e| _ = std.c.free(e);
-            return .{ .result = null, .err = "Out of memory", .err_is_heap = false };
-        };
-        _ = std.c.free(p);
-        break :blk owned;
+    defer c_api.escargot_eval_result_free(raw);
+    if (raw.status != .success) return mapEvalFailure(raw);
+    if (raw.err != null) return .{ .result = null, .err = "Invalid eval result", .err_is_heap = false };
+    const result = if (raw.result) |ptr| std.heap.c_allocator.dupe(u8, ptr[0..raw.result_len]) catch return .{
+        .result = null,
+        .err = "Out of memory",
+        .err_is_heap = false,
     } else null;
-    const err = if (raw.err) |p| blk: {
-        const s = p[0..raw.err_len];
-        const owned = std.heap.c_allocator.dupe(u8, s) catch {
-            _ = std.c.free(p);
-            if (result) |r| std.heap.c_allocator.free(r);
-            return .{ .result = null, .err = "Out of memory", .err_is_heap = false };
+    return .{ .result = result, .err = null };
+}
+
+pub fn evalDiscardingResult(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
+    const raw = c_api.escargot_eval_discarding_result(ctx, script.ptr, script.len, filename.ptr, filename.len);
+    defer c_api.escargot_eval_result_free(raw);
+    if (raw.status != .success) return mapEvalFailure(raw);
+    if (raw.result != null or raw.err != null) return .{ .result = null, .err = "Invalid eval result", .err_is_heap = false };
+    return .{ .result = null, .err = null };
+}
+
+fn mapEvalFailure(raw: c_api.EvalResultC) types.EvalResult {
+    if (raw.status == .out_of_memory) return .{ .result = null, .err = "Out of memory", .err_is_heap = false };
+    if (raw.err) |ptr| {
+        const err = std.heap.c_allocator.dupe(u8, ptr[0..raw.err_len]) catch return .{
+            .result = null,
+            .err = "Out of memory",
+            .err_is_heap = false,
         };
-        _ = std.c.free(p);
-        break :blk owned;
-    } else null;
-    return .{ .result = result, .err = err, .err_is_heap = err != null };
+        return .{ .result = null, .err = err, .err_is_heap = true };
+    }
+    return .{ .result = null, .err = switch (raw.status) {
+        .success => "Invalid eval failure status",
+        .javascript_error => "JavaScript error",
+        .out_of_memory => unreachable,
+        .native_error => "Native evaluation failure",
+    }, .err_is_heap = false };
 }
 
 pub fn threadEnter() void {

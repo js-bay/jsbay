@@ -7,7 +7,7 @@ const hyper_box64 = @import("hyper_box64.zig");
 const Value = hyper_box64.Value;
 
 pub const SENTINEL_FREE: u32 = 0xFFFF_FFFF;
-pub const MAX_SLOTS: usize = 0x000F_FFFF; // 20 bits max slot index (1,048,575)
+pub const MAX_SLOTS: usize = @as(usize, 1) << 20;
 
 pub fn GenerationalSlotMap(comptime ValueType: type) type {
     return struct {

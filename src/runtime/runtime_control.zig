@@ -23,6 +23,7 @@ const engine = @import("../engine.zig");
 const instance_map = @import("instance_map.zig");
 const control_registry = @import("runtime_control_registry.zig");
 const observation = @import("runtime_observation.zig");
+const hermes_watchdog = @import("hermes_watchdog.zig");
 
 pub const MemoryUsage = observation.MemoryUsage;
 pub const ShutdownPhase = control_registry.ShutdownPhase;
@@ -51,19 +52,8 @@ fn jscPollingControlsUnavailable(state: *const InterruptState) bool {
     return state.backend_tag == .jsc and !@import("../backend/jsc/polling_config.zig").supportsInterrupt();
 }
 
-/// Hermes emits AsyncBreakCheck before Ret. A sticky asyncTriggerTimeout from requestStopInterrupt (destroy/stop) therefore kills finite work after a host callback (`hostDestroy(); 42`). Call from the host trampoline on the way back into JS: clear sticky bits on every eval-active instance on this thread (nested destroy can arm outer frames too), then arm a short watch so loops still abort soon.
-pub fn softRearmHermesStopAfterHost(instance_id: i32) void {
-    if (comptime !backend.isHermesBackend(backend.active_backend)) return;
-    const et = @import("engine_thread.zig");
-    rearmOneHermesStop(instance_id);
-    et.forEachEvalActiveOnCurrentThread(rearmOneHermesStop);
-}
-
-fn rearmOneHermesStop(instance_id: i32) void {
-    if (!isStopRequested(instance_id)) return;
-    hermesDrainAsyncTimeout(instance_id);
-    hermesWatchTimeLimit(instance_id, 25);
-}
+pub const softRearmHermesStopAfterHost = hermes_watchdog.softRearmHermesStopAfterHost;
+const hermesTriggerTeardownTimeout = hermes_watchdog.hermesTriggerTeardownTimeout;
 
 /// Request that the JS runtime interrupt execution on the next interrupt check. Thread-safe. Returns false if the instance was never init()'d or has been deinit()'d.
 ///
@@ -481,6 +471,12 @@ pub fn requestStopInterrupt(instance_id: i32) bool {
     _ = p.fetchOr(2, .monotonic);
     registry_mutex.unlock();
     hermesTriggerTimeout(instance_id);
+    return true;
+}
+
+pub fn requestTeardownInterrupt(instance_id: i32, generation: u64) bool {
+    if (!requestStopInterrupt(instance_id)) return false;
+    hermesTriggerTeardownTimeout(instance_id, generation);
     return true;
 }
 

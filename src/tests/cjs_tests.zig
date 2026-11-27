@@ -31,11 +31,7 @@ const CjsLoaderCtx = struct {
     }
 };
 
-fn cjsLoaderLoad(
-    ud: ?*anyopaque,
-    id: [*:0]const u8,
-    out: *types.ModuleLoadResult,
-) callconv(.c) bool {
+fn cjsLoaderLoad(ud: ?*anyopaque, id: [*:0]const u8, out: *types.ModuleLoadResult) callconv(.c) bool {
     const ctx: *CjsLoaderCtx = @ptrCast(@alignCast(ud.?));
     const key = std.mem.span(id);
     const src = ctx.modules.get(key) orelse return false;
@@ -1164,8 +1160,11 @@ test "cjs: VM allocation failure cannot cache a sentinel module environment" {
     backend.ActiveEngine.freeValue(ctx, exception);
     const module = try environment.newModule(ctx, exports);
     defer backend.ActiveEngine.freeValue(ctx, module);
-    const value = try environment.readFinalExports(ctx, module, exports, struct {
-        fn sink(_: backend.ActiveEngine.Context, _: backend.ActiveEngine.Value) void {}
+    const value = try environment.readFinalExports(ctx, module, struct {
+        fn sink(_: backend.ActiveEngine.Context, captured: @import("../value/root.zig").OwnedValue) void {
+            var owned = captured;
+            owned.deinit();
+        }
     }.sink);
     defer backend.ActiveEngine.freeValue(ctx, value);
     try testing.expect(!cjsHasPendingException(ctx));

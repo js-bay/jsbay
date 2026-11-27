@@ -8,6 +8,7 @@ BUILD="${HERMES_BUILD:-$ROOT/vendor/hermes-build}"
 PREFIX="${HERMES_PREFIX:-$ROOT/vendor/hermes-install}"
 ICU="${JSBAY_ICU_PREFIX:-$ROOT/vendor/icu-prefix}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
+BUILD_OS="$(uname -s)"
 
 if [[ ! -f "$SRC/CMakeLists.txt" ]]; then
   echo "ERROR: Hermes sources missing at $SRC (init submodule vendor/hermes)" >&2
@@ -19,50 +20,39 @@ if [[ ! -d "$ICU/lib" ]]; then
 fi
 
 mkdir -p "$BUILD" "$PREFIX"
-# Bounded drainMicrotasks(maxMicrotasksHint) so hosts can honor execution deadlines between batches.
-PATCH="$ROOT/vendor/hermes-drain-microtasks-hint.patch"
-if [[ -f "$PATCH" ]]; then
-  # Apply once; ignore "already applied" (exit 1 with --forward), fail on rejects.
-  set +e
-  out=$(patch -d "$SRC" -p1 --forward --batch < "$PATCH" 2>&1)
-  rc=$?
-  set -e
-  printf '%s
-' "$out"
-  if [[ $rc -ne 0 && "$out" != *"previously applied"* && "$out" != *"Ignoring previously applied"* && "$out" != *"Reversed (or previously applied)"* ]]; then
-    echo "ERROR: failed to apply $PATCH to $SRC (rc=$rc)" >&2
-    exit 1
-  fi
-fi
-PATCH="$ROOT/vendor/hermes-cdp-frame-url.patch"
-if [[ -f "$PATCH" ]]; then
-  if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
-    echo "Hermes frame URL patch already applied"
+apply_hermes_patch() {
+  local patch_file="$1"
+  local name="$2"
+  if [[ ! -f "$patch_file" ]]; then return 0; fi
+  if git -C "$SRC" apply --check --reverse "$patch_file" >/dev/null 2>&1; then
+    echo "$name patch already applied"
+  elif git -C "$SRC" apply --check "$patch_file" >/dev/null 2>&1; then
+    git -C "$SRC" apply "$patch_file"
+  elif patch -d "$SRC" -p1 --reverse --dry-run -i "$patch_file" < /dev/null >/dev/null 2>&1 && ! patch -d "$SRC" -p1 --forward --dry-run -i "$patch_file" < /dev/null >/dev/null 2>&1; then
+    echo "$name patch already applied"
   else
-    patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+    patch -d "$SRC" -p1 --forward --batch -f -i "$patch_file" < /dev/null
   fi
+}
+
+apply_hermes_patch "$ROOT/vendor/hermes-drain-microtasks-hint.patch" "Hermes drainMicrotasks hint"
+apply_hermes_patch "$ROOT/vendor/hermes-promise-tracker-checkpoint.patch" "Hermes Promise tracker checkpoint"
+apply_hermes_patch "$ROOT/vendor/hermes-cdp-frame-url.patch" "Hermes frame URL"
+apply_hermes_patch "$ROOT/vendor/hermes-cdp-cancel-pending.patch" "Hermes pending-command cancellation"
+apply_hermes_patch "$ROOT/vendor/hermes-debugger-step-out.patch" "Hermes return breakpoint restoration"
+source "$ROOT/scripts/hermes-cmake-linker-flags.sh"
+CMAKE_EXE_LINKER_FLAGS="$(hermes_cmake_exe_linker_flags_for_build "$BUILD_OS" "$ICU/lib" "$BUILD/CMakeCache.txt" "${LDFLAGS:-}")"
+CMAKE_ARGS=(cmake -S "$SRC" -B "$BUILD" -G Ninja
+  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_INSTALL_PREFIX="$PREFIX"
+  -DHERMES_ENABLE_TEST=OFF
+  -DHERMES_ENABLE_DEBUGGER=ON
+  -DICU_ROOT="$ICU"
+  -DCMAKE_PREFIX_PATH="$ICU")
+if [[ -n "$CMAKE_EXE_LINKER_FLAGS" ]]; then
+  CMAKE_ARGS+=("-DCMAKE_EXE_LINKER_FLAGS=$CMAKE_EXE_LINKER_FLAGS")
 fi
-PATCH="$ROOT/vendor/hermes-cdp-cancel-pending.patch"
-if [[ -f "$PATCH" ]]; then
-  if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
-    echo "Hermes pending-command cancellation patch already applied"
-  else
-    patch -d "$SRC" -p1 --forward --batch < "$PATCH"
-  fi
-fi
-PATCH="$ROOT/vendor/hermes-debugger-step-out.patch"
-if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
-  echo "Hermes return breakpoint restoration patch already applied"
-else
-  patch -d "$SRC" -p1 --forward --batch < "$PATCH"
-fi
-cmake -S "$SRC" -B "$BUILD" -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-  -DHERMES_ENABLE_TEST=OFF \
-  -DHERMES_ENABLE_DEBUGGER=ON \
-  -DICU_ROOT="$ICU" \
-  -DCMAKE_PREFIX_PATH="$ICU"
+"${CMAKE_ARGS[@]}"
 ninja -C "$BUILD" -j"$JOBS"
 ninja -C "$BUILD" install
 

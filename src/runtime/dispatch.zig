@@ -176,6 +176,8 @@ pub const TaskOwnerFrame = struct {
     instance_id: i32,
     owner: ?*anyopaque,
     parent: ?*TaskOwnerFrame,
+    deferred_destroy_generation: ?u64 = null,
+    deferred_destroy: ?*const fn (i32, u64) void = null,
 };
 threadlocal var active_task_owner_frame: ?*TaskOwnerFrame = null;
 
@@ -184,13 +186,117 @@ pub fn enterTaskOwnerFrame(frame: *TaskOwnerFrame, instance_id: i32, owner: ?*an
         .instance_id = instance_id,
         .owner = owner,
         .parent = active_task_owner_frame,
+        .deferred_destroy_generation = null,
+        .deferred_destroy = null,
     };
     active_task_owner_frame = frame;
 }
 
-pub fn leaveTaskOwnerFrame(frame: *TaskOwnerFrame) void {
+pub const DeferredDestroyAction = struct {
+    instance_id: i32,
+    generation: u64,
+    func: *const fn (i32, u64) void,
+};
+
+const TeardownQueue = struct {
+    var mu: sync.Mutex = .{};
+    var cv: sync.Condition = .init;
+    var cv_not_full: sync.Condition = .init;
+    var thread: ?std.Thread = null;
+    var initialized: bool = false;
+    var queue: [32]DeferredDestroyAction = undefined;
+    var head: usize = 0;
+    var tail: usize = 0;
+    var count: usize = 0;
+
+    fn worker() void {
+        while (true) {
+            mu.lock();
+            while (count == 0) {
+                cv.wait(&mu);
+            }
+            const action = queue[head];
+            head = (head + 1) % queue.len;
+            count -= 1;
+            cv_not_full.signal();
+            mu.unlock();
+
+            action.func(action.instance_id, action.generation);
+        }
+    }
+
+    pub fn ensureStarted() !void {
+        mu.lock();
+        defer mu.unlock();
+        if (!initialized) {
+            const t = std.Thread.spawn(.{}, worker, .{}) catch return error.TeardownWorkerStartFailed;
+            t.detach();
+            thread = t;
+            initialized = true;
+        }
+    }
+
+    pub fn push(action: DeferredDestroyAction) void {
+        mu.lock();
+        defer mu.unlock();
+        std.debug.assert(initialized);
+        for (0..count) |i| {
+            const idx = (head + i) % queue.len;
+            if (queue[idx].instance_id == action.instance_id and queue[idx].generation == action.generation) {
+                return;
+            }
+        }
+        while (count >= queue.len) {
+            cv_not_full.wait(&mu);
+        }
+        queue[tail] = action;
+        tail = (tail + 1) % queue.len;
+        count += 1;
+        cv.signal();
+    }
+};
+
+pub fn ensureTeardownWorkerStarted() !void {
+    try TeardownQueue.ensureStarted();
+}
+
+pub fn handOffDeferredDestroy(action: DeferredDestroyAction) void {
+    TeardownQueue.push(action);
+}
+
+pub fn leaveTaskOwnerFrameDeferred(frame: *TaskOwnerFrame) ?DeferredDestroyAction {
     std.debug.assert(active_task_owner_frame == frame);
     active_task_owner_frame = frame.parent;
+    if (frame.deferred_destroy) |destroy| {
+        return .{
+            .instance_id = frame.instance_id,
+            .generation = frame.deferred_destroy_generation.?,
+            .func = destroy,
+        };
+    }
+    return null;
+}
+
+pub fn leaveTaskOwnerFrame(frame: *TaskOwnerFrame) void {
+    if (leaveTaskOwnerFrameDeferred(frame)) |action| {
+        action.func(action.instance_id, action.generation);
+    }
+}
+
+/// Defer instance destruction until the active owner callback has returned, without allocating or queueing work that can be rejected.
+pub fn deferDestroyForCurrentTask(instance_id: i32, generation: u64, destroy: *const fn (i32, u64) void) bool {
+    var frame = active_task_owner_frame;
+    while (frame) |current| : (frame = current.parent) {
+        if (current.instance_id != instance_id) continue;
+        if (current.deferred_destroy) |existing| {
+            std.debug.assert(existing == destroy and current.deferred_destroy_generation.? == generation);
+            return true;
+        }
+        current.deferred_destroy_generation = generation;
+        current.deferred_destroy = destroy;
+        return true;
+    }
+    return false;
 }
 
 pub fn isRunningTaskForOwner(owner: *anyopaque) bool {
@@ -281,6 +387,7 @@ pub fn reserveTaskWithToken(token: InstanceToken, kind: resource_limits.Kind, by
 pub fn postReservedTaskWithToken(token: InstanceToken, reservation: *TaskReservation, task: NativeTask) bool {
     const lease = reservation.lease orelse return false;
     if (reservation.resources == null) return false;
+    if (task.resource_kind != reservation.kind or task.resource_bytes != reservation.bytes) return false;
     const Commit = struct {
         lease_inst: *instance_map.EngineInstance,
         generation: u64,
@@ -656,206 +763,3 @@ const DispatchTurn = struct {
         if (turn.completion) |*completion| completion.finish();
     }
 };
-
-const testing = std.testing;
-
-fn withTestContext(comptime test_fn: fn (ActiveEngine.Context, ActiveEngine.Runtime) anyerror!void) !void {
-    const rt = ActiveEngine.newRuntime() orelse return error.RuntimeCreationFailed;
-    defer ActiveEngine.freeRuntime(rt);
-
-    const ctx = ActiveEngine.newContext(rt) orelse return error.ContextCreationFailed;
-    defer ActiveEngine.freeContext(ctx);
-
-    try test_fn(ctx, rt);
-}
-
-test "dispatch: emitGlobal calls global function with typed args" {
-    try withTestContext(struct {
-        fn run(ctx: ActiveEngine.Context, _: ActiveEngine.Runtime) !void {
-            const eval_result = ActiveEngine.eval(
-                ctx,
-                \\globalThis.__dispatch_test__ = (id, name, payload) => {
-                \\  globalThis.__dispatch_result__ = `${id}:${name}:${payload}`;
-                \\};
-            ,
-                "<dispatch-test>",
-            );
-            // ActiveEngine.eval returns owned result/error strings even in module tests.
-            defer if (eval_result.result) |s| std.heap.c_allocator.free(@constCast(s));
-            defer if (eval_result.err_is_heap) {
-                if (eval_result.err) |e| std.heap.c_allocator.free(@constCast(e));
-            };
-            if (eval_result.err != null) return error.JSException;
-
-            const ok = emitGlobal(ctx, "__dispatch_test__", &.{
-                .{ .int32 = 7 },
-                .{ .string = "tap" },
-                .{ .string = "{\"x\":1}" },
-            });
-            try testing.expect(ok);
-
-            const read_back = ActiveEngine.eval(ctx, "globalThis.__dispatch_result__", "<dispatch-read>");
-            // Free both success and heap error paths to keep this test ownership-neutral.
-            defer if (read_back.result) |s| std.heap.c_allocator.free(@constCast(s));
-            defer if (read_back.err_is_heap) {
-                if (read_back.err) |e| std.heap.c_allocator.free(@constCast(e));
-            };
-            if (read_back.err != null) return error.JSException;
-            try testing.expectEqualStrings("7:tap:{\"x\":1}", read_back.result.?);
-        }
-    }.run);
-}
-
-test "dispatch: missing global function returns false" {
-    try withTestContext(struct {
-        fn run(ctx: ActiveEngine.Context, _: ActiveEngine.Runtime) !void {
-            try testing.expect(!emitGlobal(ctx, "__dispatch_missing__", &.{}));
-        }
-    }.run);
-}
-
-// -- Native task queue tests ---------------------------------------------
-
-// Static flag + bump counter used by the post-task closures. C ABI test constraint (callback cannot close over Zig locals) is loose here since NativeTask.run is a plain Zig fn pointer — we still use a module-level global so multiple tests in the file can share the closure signature.
-var task_flag: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-
-fn bumpTaskFlag(_: ?*anyopaque) void {
-    _ = task_flag.fetchAdd(1, .seq_cst);
-}
-
-fn markTaskCancelled(_: ?*anyopaque) void {
-    _ = task_flag.fetchAdd(100, .seq_cst);
-}
-
-test "dispatch: postTask runs closure on tickInstance" {
-    const engine = @import("../engine.zig");
-    // Use a high id to avoid collision with engine_tests helpers (those start at 10_000 and only grow). We pick a distinct namespace.
-    const instance_id: i32 = 5_551;
-    task_flag.store(0, .seq_cst);
-    try testing.expect(engine.create(instance_id, .{}));
-    defer engine.destroy(instance_id);
-    // Always release any leftover tasks so this test doesn't leak state into neighbours.
-    defer releaseAllTasksForInstance(instance_id);
-
-    try testing.expect(postTask(instance_id, .{
-        .ctx = null,
-        .run = bumpTaskFlag,
-    }));
-
-    const dispatched = tickInstance(instance_id);
-    try testing.expect(dispatched >= 1);
-    try testing.expectEqual(@as(u32, 1), task_flag.load(.seq_cst));
-
-    // Second tick with nothing pending: no-op.
-    const dispatched_again = tickInstance(instance_id);
-    try testing.expectEqual(@as(usize, 0), dispatched_again);
-    try testing.expectEqual(@as(u32, 1), task_flag.load(.seq_cst));
-}
-
-test "dispatch: postTask after engine destroy does not crash" {
-    // 12345 is intentionally bogus — no engine.create() for this id.
-    const bogus_id: i32 = 12_345;
-    defer releaseAllTasksForInstance(bogus_id);
-
-    const ok = postTask(bogus_id, .{
-        .ctx = null,
-        .run = bumpTaskFlag,
-    });
-    try testing.expect(!ok);
-
-    // tickInstance on the same id must be a no-op and not crash.
-    const n = tickInstance(bogus_id);
-    try testing.expectEqual(@as(usize, 0), n);
-}
-
-test "dispatch: token rejects completion from a reused instance id" {
-    const engine = @import("../engine.zig");
-    const instance_id: i32 = 5_554;
-    task_flag.store(0, .seq_cst);
-    try testing.expect(engine.create(instance_id, .{}));
-    const old_token = captureInstanceToken(instance_id) orelse return error.NoToken;
-    engine.destroy(instance_id);
-
-    try testing.expect(engine.create(instance_id, .{}));
-    defer engine.destroy(instance_id);
-    const new_token = captureInstanceToken(instance_id) orelse return error.NoToken;
-    try testing.expect(old_token.generation != new_token.generation);
-    const LateProducer = struct {
-        token: InstanceToken,
-        accepted: *std.atomic.Value(bool),
-        fn run(self: @This()) void {
-            self.accepted.store(postTaskWithToken(self.token, .{ .ctx = null, .run = bumpTaskFlag }), .seq_cst);
-        }
-    };
-    var late_accepted = std.atomic.Value(bool).init(true);
-    const late = try std.Thread.spawn(.{}, LateProducer.run, .{LateProducer{ .token = old_token, .accepted = &late_accepted }});
-    late.join();
-    try testing.expect(!late_accepted.load(.seq_cst));
-    try testing.expect(postTaskWithToken(new_token, .{ .ctx = null, .run = bumpTaskFlag }));
-    _ = tickInstance(instance_id);
-    try testing.expectEqual(@as(u32, 1), task_flag.load(.seq_cst));
-}
-
-test "dispatch: token rejects closed instance and cannot cross instances" {
-    const engine = @import("../engine.zig");
-    const first: i32 = 5_555;
-    const second: i32 = 5_556;
-    task_flag.store(0, .seq_cst);
-    try testing.expect(engine.create(first, .{}));
-    defer engine.destroy(first);
-    try testing.expect(engine.create(second, .{}));
-    defer engine.destroy(second);
-
-    const first_token = captureInstanceToken(first) orelse return error.NoToken;
-    const second_token = captureInstanceToken(second) orelse return error.NoToken;
-    try testing.expect(first_token.generation != second_token.generation);
-    try testing.expect(postTaskWithToken(second_token, .{ .ctx = null, .run = bumpTaskFlag }));
-    _ = tickInstance(second);
-    try testing.expectEqual(@as(u32, 1), task_flag.load(.seq_cst));
-
-    instance_map.markTeardownPending(first);
-    try testing.expect(!postTaskWithToken(first_token, .{ .ctx = null, .run = bumpTaskFlag }));
-    try testing.expect(closeInstanceTasks(first));
-    try testing.expect(captureInstanceToken(first) == null);
-    try testing.expect(!postTaskWithToken(first_token, .{ .ctx = null, .run = bumpTaskFlag }));
-}
-
-test "dispatch: releaseAllTasksForInstance drops pending work" {
-    const engine = @import("../engine.zig");
-    // Distinct id from the other postTask test so they don't interfere.
-    const instance_id: i32 = 5_552;
-    task_flag.store(0, .seq_cst);
-    try testing.expect(engine.create(instance_id, .{}));
-    defer engine.destroy(instance_id);
-    // Belt-and-braces — if the assertions below fail, we still want a clean queue for subsequent tests.
-    defer releaseAllTasksForInstance(instance_id);
-
-    // Post three tasks, then drop them all before ticking.
-    try testing.expect(postTask(instance_id, .{ .ctx = null, .run = bumpTaskFlag }));
-    try testing.expect(postTask(instance_id, .{ .ctx = null, .run = bumpTaskFlag }));
-    try testing.expect(postTask(instance_id, .{ .ctx = null, .run = bumpTaskFlag }));
-
-    releaseAllTasksForInstance(instance_id);
-
-    // Queue is gone — tickInstance must report no dispatches, and the closure must not have run.
-    const dispatched = tickInstance(instance_id);
-    try testing.expectEqual(@as(usize, 0), dispatched);
-    try testing.expectEqual(@as(u32, 0), task_flag.load(.seq_cst));
-}
-
-test "dispatch: releasing queued tasks invokes their cancellation cleanup" {
-    const engine = @import("../engine.zig");
-    const instance_id: i32 = 5_553;
-    task_flag.store(0, .seq_cst);
-    try testing.expect(engine.create(instance_id, .{}));
-    defer engine.destroy(instance_id);
-    defer releaseAllTasksForInstance(instance_id);
-
-    try testing.expect(postTask(instance_id, .{
-        .ctx = null,
-        .run = bumpTaskFlag,
-        .cancel = markTaskCancelled,
-    }));
-    releaseAllTasksForInstance(instance_id);
-    try testing.expectEqual(@as(u32, 100), task_flag.load(.seq_cst));
-}

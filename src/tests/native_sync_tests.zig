@@ -4,9 +4,47 @@ const std = @import("std");
 const builtin = @import("builtin");
 const testing = std.testing;
 const c_api = @import("../c_api.zig");
+const engine = @import("../engine.zig");
 const helpers = @import("test_helpers.zig");
 const io = @import("../platform/io.zig");
 const native_sync = @import("js_event_loop").native_sync;
+
+const DestroyReuseSyncProbe = struct {
+    id: i32,
+    admission_closed: std.atomic.Value(bool) = .init(false),
+    resume_destroy: std.atomic.Value(bool) = .init(false),
+    replacement_done: std.atomic.Value(bool) = .init(false),
+    replacement_created: std.atomic.Value(bool) = .init(false),
+    request: ?native_sync.Started = null,
+
+    fn pauseAfterAdmissionClosed(instance_id: i32, raw: ?*anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        std.debug.assert(instance_id == self.id);
+        self.admission_closed.store(true, .seq_cst);
+        while (!self.resume_destroy.load(.seq_cst)) std.Thread.yield() catch {};
+    }
+
+    fn destroyOld(instance_id: i32) void {
+        c_api.jsbay_engine_destroy(instance_id);
+    }
+
+    fn replaceAndStartRequest(self: *@This()) void {
+        engine.destroy(self.id);
+        const created = engine.create(self.id, .{});
+        self.replacement_created.store(created, .seq_cst);
+        if (created) self.request = native_sync.start(self.id);
+        self.replacement_done.store(true, .seq_cst);
+    }
+};
+
+fn waitForFlag(flag: *const std.atomic.Value(bool), timeout_ms: i64) bool {
+    const deadline = io.monotonicMilliseconds() + timeout_ms;
+    while (!flag.load(.seq_cst)) {
+        if (io.monotonicMilliseconds() >= deadline) return false;
+        std.Thread.yield() catch {};
+    }
+    return true;
+}
 
 const kind_string: c_int = 0;
 const kind_bytes: c_int = 1;
@@ -124,6 +162,54 @@ test "native sync: close inside start rejects late completion and old IDs cannot
     try testing.expectEqual(@as(c_int, 0), c_api.jsbay_engine_bind_sync(id, .{ .data = "syncNew".ptr, .len = 7 }, &start, &probe, null, 80, &function, &exception));
     defer _ = c_api.jsbay_value_release(function);
     try testing.expectEqual(@as(f64, 42), try evalNumber(id, "Number(syncNew())+1"));
+}
+
+test "native sync: old destroy does not cancel a request from a reused instance id" {
+    const id = helpers.nextInstanceId();
+    try testing.expect(engine.create(id, .{}));
+    const active_before = native_sync.test_only.activeRequestCount();
+    var probe = DestroyReuseSyncProbe{ .id = id };
+    c_api.test_only.setDestroyAdmissionHook(DestroyReuseSyncProbe.pauseAfterAdmissionClosed, @ptrCast(&probe));
+    var destroy_thread: ?std.Thread = null;
+    var replacement_thread: ?std.Thread = null;
+    var destroy_joined = false;
+    var replacement_joined = false;
+    var request_finished = false;
+    defer {
+        probe.resume_destroy.store(true, .seq_cst);
+        if (replacement_thread) |thread| {
+            if (!replacement_joined) thread.join();
+        }
+        if (destroy_thread) |thread| {
+            if (!destroy_joined) thread.join();
+        }
+        c_api.test_only.setDestroyAdmissionHook(null, null);
+        if (probe.request) |started| {
+            if (!request_finished) native_sync.finish(started.id, started.request);
+        }
+        if (engine.getContext(id) != null) engine.destroy(id);
+    }
+
+    destroy_thread = try std.Thread.spawn(.{}, DestroyReuseSyncProbe.destroyOld, .{id});
+    if (!waitForFlag(&probe.admission_closed, 3_000)) return error.DestroyDidNotCloseAdmission;
+    replacement_thread = try std.Thread.spawn(.{}, DestroyReuseSyncProbe.replaceAndStartRequest, .{&probe});
+    if (!waitForFlag(&probe.replacement_done, 3_000)) return error.ReplacementDidNotStartRequest;
+    replacement_thread.?.join();
+    replacement_joined = true;
+
+    try testing.expect(probe.replacement_created.load(.seq_cst));
+    const started = probe.request orelse return error.NativeSyncRequestNotStarted;
+    try testing.expectEqual(active_before + 1, native_sync.test_only.activeRequestCount());
+
+    probe.resume_destroy.store(true, .seq_cst);
+    destroy_thread.?.join();
+    destroy_joined = true;
+
+    try testing.expectEqual(@as(c_int, 0), c_api.jsbay_sync_complete(started.id, 0, kind_string, .{ .data = "new".ptr, .len = 3 }));
+    const completed = native_sync.wait(started.request);
+    request_finished = true;
+    native_sync.finish(started.id, started.request);
+    try testing.expectEqual(native_sync.Outcome.ok, completed.outcome);
 }
 
 test "native sync: completion cancel and finish races keep the engine usable" {

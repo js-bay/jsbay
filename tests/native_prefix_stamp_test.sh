@@ -7,7 +7,7 @@ mkdir -p "$WORK/scripts" "$WORK/src/backend/escargot" "$WORK/vendor" "$WORK/pref
 cp "$ROOT/scripts/native-prefix-stamp.sh" "$WORK/scripts/"
 cp "$ROOT/scripts/rebuild-escargot-install.sh" "$WORK/scripts/"
 cp "$ROOT/src/backend/escargot/escargot_bridge.cpp" "$ROOT/src/backend/escargot/escargot_bridge.h" "$WORK/src/backend/escargot/"
-cp "$ROOT/vendor/escargot-debugger.patch" "$WORK/vendor/"
+cp "$ROOT/vendor/escargot-debugger.patch" "$ROOT/vendor/escargot-shared-gc.patch" "$WORK/vendor/"
 check=(bash "$WORK/scripts/native-prefix-stamp.sh" escargot check "$WORK/prefix")
 if "${check[@]}"; then echo 'Missing native stamp was accepted.' >&2; exit 1; fi
 bash "$WORK/scripts/native-prefix-stamp.sh" escargot write "$WORK/prefix"

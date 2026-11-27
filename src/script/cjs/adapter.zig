@@ -37,7 +37,7 @@ const ValueOps = struct {
     pub const release = ActiveEngine.freeValue;
     pub const newModule = wrapper_execution.newModule;
     pub fn readExports(ctx: Context, module: Value) error{CallFailed}!Value {
-        return wrapper_execution.readFinalExports(ctx, module, ActiveEngine.undefinedValue(), captureException);
+        return wrapper_execution.readFinalExports(ctx, module, captureException);
     }
 };
 const ModuleRegistry = commonjs.Registry(ValueOps);
@@ -53,14 +53,14 @@ const CjsState = struct {
     /// Tracks whether the global `__jsbay_cjsCache` has been registered.
     cjs_cache_installed: bool = false,
     compiled: compile_cache.Memory,
-    pending_exception: ?ActiveEngine.Value = null,
+    pending_exception: ?OwnedValue = null,
     require_factory: ?ActiveEngine.Value = null,
 };
 
 var cjs_states: std.AutoHashMap(i32, *CjsState) = std.AutoHashMap(i32, *CjsState).init(std.heap.c_allocator);
 var cjs_mutex: sync.Mutex = .{};
 
-fn getState(instance_id: i32) ?*CjsState {
+pub fn getState(instance_id: i32) ?*CjsState {
     cjs_mutex.lock();
     defer cjs_mutex.unlock();
     return cjs_states.get(instance_id);
@@ -182,7 +182,7 @@ pub fn uninstall(instance_id: i32) void {
     const state = removeState(instance_id) orelse return;
     const alloc = state.allocator;
     clearCacheState(state);
-    if (state.pending_exception) |exception| ActiveEngine.freeValue(state.ctx, exception);
+    if (state.pending_exception) |*exception| exception.deinit();
     if (state.require_factory) |factory| ActiveEngine.freeValue(state.ctx, factory);
     state.compiled.deinit();
     state.registry.deinitStorage();
@@ -334,22 +334,20 @@ pub fn runCommonJS(instance_id: i32, bytes: []const u8, filename: []const u8) Cj
 }
 
 // JSC getter exceptions are explicitly protected while crossing Zig error unions; host-returning APIs release them rather than leaving a stale capture.
-fn captureException(ctx: ActiveEngine.Context, value: ActiveEngine.Value) void {
-    if (comptime backend.active_backend == .jsc) {
-        const state = stateFromCtx(ctx) orelse return;
-        const retained = ActiveEngine.dupValue(ctx, value);
-        const previous = state.pending_exception;
-        state.pending_exception = retained;
-        if (previous) |old| ActiveEngine.freeValue(ctx, old);
-    }
+fn captureException(ctx: ActiveEngine.Context, exception: OwnedValue) void {
+    const state = stateFromCtx(ctx) orelse {
+        var owned = exception;
+        owned.deinit();
+        return;
+    };
+    if (state.pending_exception) |*previous| previous.deinit();
+    state.pending_exception = exception;
 }
 
 fn discardCapturedException(ctx: ActiveEngine.Context) void {
-    if (comptime backend.active_backend == .jsc) {
-        if (stateFromCtx(ctx)) |state| {
-            if (state.pending_exception) |exception| ActiveEngine.freeValue(ctx, exception);
-            state.pending_exception = null;
-        }
+    if (stateFromCtx(ctx)) |state| {
+        if (state.pending_exception) |*exception| exception.deinit();
+        state.pending_exception = null;
     }
 }
 
@@ -637,10 +635,12 @@ fn jscThrowRequireError(
             if (stateFromCtx(ctx)) |state| {
                 if (state.pending_exception) |value| {
                     state.pending_exception = null;
+                    var owned = value;
+                    const raw = owned.release();
                     const result = jsc_mod.jsc.JSValueMakeUndefined(ctx_ref);
-                    exception[0] = value;
+                    exception[0] = raw;
                     // No potentially allocating JSC operation follows release; the callback out-param hands the value back to JSC.
-                    ActiveEngine.freeValue(ctx, value);
+                    ActiveEngine.freeValue(ctx, raw);
                     return result;
                 }
             }
@@ -708,6 +708,16 @@ fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: D
             return null;
         },
         error.CallFailed => {
+            if (stateFromCtx(ctx)) |state| {
+                if (state.pending_exception) |exception| {
+                    state.pending_exception = null;
+                    var owned = exception;
+                    if (throwSpikeException(ctx, &owned)) return null;
+                    owned.deinit();
+                    throwSpikeTransferFailure(ctx);
+                    return null;
+                }
+            }
             _ = ActiveEngine.throwError(ctx, "require: module threw during evaluation");
             return null;
         },
@@ -717,6 +727,10 @@ fn spikeThrowRequireError(ctx: ActiveEngine.Context, specifier: []const u8, e: D
         },
     }
 }
+
+const spike_throw = @import("spike_throw.zig");
+const throwSpikeException = spike_throw.throwSpikeException;
+const throwSpikeTransferFailure = spike_throw.throwSpikeTransferFailure;
 
 // -------------------------------------------------------------------------- Shared require implementation (backend-neutral) --------------------------------------------------------------------------
 
@@ -951,27 +965,3 @@ fn runWrapperWithRequire(state: *CjsState, wrapper_fn: @import("../../backend.zi
 
 /// Cache version salt for `__jsbay_cjsCache` persisted artifacts. Bump with the engine whenever the QuickJS bytecode format changes, so stale files are dropped and rebuilt rather than replayed.
 const CJS_CACHE_VERSION = "jsbay-cjs-1";
-
-test "cjs: clearing instances does not clear memoized compiled bytes" {
-    if (comptime !backend.isQuickJsApiBackend(backend.active_backend)) return error.SkipZigTest;
-    const helpers = @import("../../tests/test_helpers.zig");
-    const loader_impl = struct {
-        fn load(_: ?*anyopaque, _: [*:0]const u8, out: *types.ModuleLoadResult) callconv(.c) bool {
-            out.* = .{ .source = "module.exports = 123;", .source_len = 21 };
-            return true;
-        }
-    };
-    const vtable = types.ModuleLoaderVTable{ .load = loader_impl.load };
-    const loader = types.ModuleLoader{ .vtable = &vtable };
-    const id = helpers.nextInstanceId();
-    try std.testing.expect(engine.create(id, .{}));
-    defer engine.destroy(id);
-    try std.testing.expect(install(id, &loader));
-    try helpers.evalOk(id, "require('module'); __jsbay_cjsCache('module.exports=1;', () => 0, 'bundle.js');");
-    const state = getState(id) orelse return error.MissingState;
-    try std.testing.expectEqual(@as(usize, 1), state.registry.entries.count());
-    try std.testing.expectEqual(@as(usize, 1), state.compiled.entries.count());
-    clearCache(id);
-    try std.testing.expectEqual(@as(usize, 0), state.registry.entries.count());
-    try std.testing.expectEqual(@as(usize, 1), state.compiled.entries.count());
-}

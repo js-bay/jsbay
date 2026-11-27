@@ -66,6 +66,8 @@ typedef struct {
 jsbay_backend_t jsbay_library_backend(void);
 /* out must be non-NULL; set struct_size to sizeof(*out) before the call. Returns false if out is NULL or struct_size < 4. */
 bool jsbay_library_capabilities(jsbay_engine_capabilities_t *out);
+/* Any thread. Returns the selected instance backend and its public capabilities. Returns false for NULL out, struct_size < 4, or a missing/tearing-down instance. */
+bool jsbay_engine_capabilities(int instance_id, jsbay_engine_capabilities_t *out);
 /* Writes up to cap packed engines into out[0..cap). Returns the packed count (required capacity), even when cap is smaller; clamp iteration to min(returned, cap). out may be NULL when cap is 0. */
 size_t jsbay_available_backends(jsbay_backend_t *out, size_t cap);
 /* Create with an explicit packed backend. options must be non-NULL; struct_size >= sizeof(*options).
@@ -205,9 +207,9 @@ typedef enum {
     JSBAY_SUBMISSION_CANCELLED = 2,
 } jsbay_submission_status_t;
 typedef void (*jsbay_submission_callback_t)(int instance_id, uint64_t generation, jsbay_submission_status_t status, const uint8_t *error_data, size_t error_len, void *user_data);
-/* Thread-safe generation-scoped submission. source and filename are copied before this returns. An accepted submission invokes callback exactly once after its VM checkpoint; rejected submissions return false and never invoke callback. Lifecycle cancellation observed at core completion takes precedence over execution results; ordinary exceptions and recoverable execution limits report EXCEPTION. error_data is valid only during callback. */
+/* Thread-safe generation-scoped submission for primary-backend instances. Packed secondary instances and other rejected submissions return false and never invoke callback. source and filename are copied before this returns. A successfully evaluated script reports COMPLETED without converting or serializing its JavaScript result; thrown exceptions and recoverable execution limits report EXCEPTION. An accepted submission invokes a non-NULL callback exactly once; executed scripts complete on the engine owner thread after their microtask checkpoint, while queued work cancelled during teardown reports CANCELLED without entering the VM and completes on the teardown thread, which may be a non-owner destroy caller. Keep callback data valid until completion and make cancellation callbacks safe on that thread. Lifecycle cancellation observed at core completion takes precedence over execution results; error_data is valid only during callback. */
 bool jsbay_engine_post_script(int instance_id, uint64_t generation, jsbay_utf8_t source, jsbay_utf8_t filename, jsbay_submission_callback_t callback, void *user_data);
-/* A fence has no JS body and completes after every preceding submission checkpoint. seal_shutdown seals only after the fence was admitted; its completion changes a sealed shutdown to drained, or reports cancelled when the deadline has expired. */
+/* A fence has no JS body and completes after preceding work reaches the queue position; scripts that execute have completed their microtask checkpoints, while work cancelled before execution has no checkpoint. Teardown may cancel a queued fence without entering the VM; an accepted non-NULL callback then receives CANCELLED on the teardown thread, which may be a non-owner destroy caller. Packed secondary instances and other rejected submissions return false and never invoke callback. seal_shutdown seals only after the fence was admitted; its completion changes a sealed shutdown to drained, or reports cancelled when the deadline has expired. */
 bool jsbay_engine_post_fence(int instance_id, uint64_t generation, bool seal_shutdown, jsbay_submission_callback_t callback, void *user_data);
 /* Thread-safe generation-scoped asynchronous GC request posted to the engine event loop. Redundant requests queued before the turn runs are debounced. Returns false if the instance is missing or already closing/cancelled. */
 bool jsbay_engine_post_gc(int instance_id, uint64_t generation);

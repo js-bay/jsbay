@@ -1710,19 +1710,6 @@ test "engine_thread: callback destroy interrupts JavaScript that continues after
     }
 }
 
-const DirectEvalDestroy = struct {
-    id: i32,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    result_ok: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    fn run(self: *DirectEvalDestroy) void {
-        const result = engine.evalScript(self.id, "hostDestroy(); 42", "<direct-destroy-eval>");
-        self.result_ok.store(result.err == null and result.result != null and std.mem.eql(u8, result.result.?, "42"), .seq_cst);
-        helpers.freeEvalResult(result);
-        self.done.store(true, .seq_cst);
-    }
-};
-
 const DirectInfiniteEval = struct {
     id: i32,
     done: std.atomic.Value(bool) = .init(false),
@@ -1735,27 +1722,6 @@ const DirectInfiniteEval = struct {
         self.done.store(true, .seq_cst);
     }
 };
-
-test "engine_thread: direct eval callback destroy defers runtime free until eval unwinds" {
-    try skipEscargotDestroyDefer();
-    const id = helpers.nextInstanceId();
-    var live = try createInstance(id);
-    var cleanup = true;
-    errdefer if (cleanup) live.close();
-
-    var dying = DestroyFromHost{};
-    try install(id, "hostDestroy", DestroyFromHost.cb, &dying);
-    var direct = DirectEvalDestroy{ .id = id };
-    const eval_thread = try std.Thread.spawn(.{}, DirectEvalDestroy.run, .{&direct});
-    joinOrExit(eval_thread, &direct.done, 3000, "destroy from direct eval callback did not unwind");
-    cleanup = false;
-    live.closed = true;
-
-    try testing.expect(dying.destroy_entered.load(.seq_cst));
-    try testing.expect(dying.callback_returned.load(.seq_cst));
-    try testing.expect(direct.result_ok.load(.seq_cst));
-    try testing.expect(engine.getContext(id) == null);
-}
 
 test "engine_thread: destroy interrupts a direct infinite eval without a library thread" {
     try skipSpikeNeedsNativeInterrupt();

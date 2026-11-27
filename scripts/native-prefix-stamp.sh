@@ -7,10 +7,10 @@ MODE="${2:?specify write or check}"
 PREFIX="${3:?specify the native install prefix}"
 case "$BACKEND" in
     escargot)
-        inputs=(scripts/rebuild-escargot-install.sh src/backend/escargot/escargot_bridge.cpp src/backend/escargot/escargot_bridge.h vendor/escargot-debugger.patch)
+        inputs=(scripts/rebuild-escargot-install.sh src/backend/escargot/escargot_bridge.cpp src/backend/escargot/escargot_bridge.h vendor/escargot-debugger.patch vendor/escargot-shared-gc.patch)
         ;;
     hermes)
-        inputs=(scripts/rebuild-hermes-install.sh src/backend/hermes/hermes_bridge.cpp src/backend/hermes/hermes_bridge.h src/backend/hermes/hermes_esm.cpp src/backend/hermes/hermes_inspector.cpp vendor/hermes-drain-microtasks-hint.patch vendor/hermes-cdp-frame-url.patch vendor/hermes-cdp-cancel-pending.patch vendor/hermes-debugger-step-out.patch)
+        inputs=(scripts/rebuild-hermes-install.sh scripts/check-hermes-promise-tracker-generation.sh scripts/hermes-cmake-linker-flags.sh src/backend/hermes/hermes_bridge.cpp src/backend/hermes/hermes_bridge.h src/backend/hermes/hermes_esm.cpp src/backend/hermes/hermes_inspector.cpp vendor/hermes-drain-microtasks-hint.patch vendor/hermes-promise-generator-hook.patch vendor/hermes-promise-tracker-source.patch vendor/hermes-promise-tracker-checkpoint.patch vendor/hermes-cdp-frame-url.patch vendor/hermes-cdp-cancel-pending.patch vendor/hermes-debugger-step-out.patch)
         ;;
     *) echo 'Unknown native backend.' >&2; exit 2 ;;
 esac

@@ -4,7 +4,9 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 source=${1:?usage: release-zig-consumer.sh source-archive-or-https-url}
 zig_bin=${ZIG:-zig}
-work=$(mktemp -d "${TMPDIR:-/tmp}/jsbay-zig-release-consumer.XXXXXX")
+work_root=${ZIG_GLOBAL_CACHE_DIR:-${TMPDIR:-/tmp}}
+mkdir -p "$work_root"
+work=$(mktemp -d "$work_root/jsbay-zig-release-consumer.XXXXXX")
 server_pid=
 cleanup() {
     result=$?

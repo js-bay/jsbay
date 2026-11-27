@@ -33,6 +33,38 @@ test "spike smoke: create/destroy engine cycle" {
     }.run);
 }
 
+test "spike smoke: foreign destroy joins after creator thread exits" {
+    const id = helpers.nextInstanceId();
+    const Create = struct {
+        fn run(instance_id: i32, created: *bool) void {
+            created.* = c_api.jsbay_engine_create(instance_id, null, null);
+        }
+    };
+    var created = false;
+    const creator = try std.Thread.spawn(.{}, Create.run, .{ id, &created });
+    creator.join();
+    try testing.expect(created);
+    c_api.jsbay_engine_destroy(id);
+    try testing.expect(engine.getContext(id) == null);
+}
+
+test "spike smoke: repeated engine lifetimes on one worker" {
+    const id = helpers.nextInstanceId();
+    const Cycles = struct {
+        fn run(instance_id: i32, completed: *usize) void {
+            for (0..30) |_| {
+                if (!c_api.jsbay_engine_create(instance_id, null, null)) return;
+                c_api.jsbay_engine_destroy(instance_id);
+                completed.* += 1;
+            }
+        }
+    };
+    var completed: usize = 0;
+    const worker = try std.Thread.spawn(.{}, Cycles.run, .{ id, &completed });
+    worker.join();
+    try testing.expectEqual(@as(usize, 30), completed);
+}
+
 test "spike smoke: syntax error surfaces" {
     if (comptime !backend.isSpikeBackend(backend.active_backend)) return error.SkipZigTest;
     try helpers.withDefaultEngine(struct {

@@ -140,30 +140,32 @@ pub const CapabilityFlags = struct {
 
 /// Derive capability flags from existing backend predicates / branches — not a parallel myth table.
 pub fn libraryCapabilityFlags() u32 {
+    return capabilityFlagsFor(active_backend, true);
+}
+
+/// Derive capabilities for an instance using the selected backend and primary-only public API limits.
+pub fn capabilityFlagsFor(tag: BackendType, primary: bool) u32 {
     var flags: u32 = 0;
     // Interrupt + execution deadline only when mid-script requestInterrupt is real (QJS interrupt handler / JSC time-limit). Escargot/Hermes refuse requestInterrupt — clear CAP_INTERRUPT_DEADLINE so capability discovery matches runtime_control.supportsMidScriptUserInterrupt.
-    const interrupt_supported = if (active_backend == .jsc)
-        @import("backend/jsc/polling_config.zig").supportsInterrupt()
-    else
-        !isSpikeBackend(active_backend);
+    const interrupt_supported = !isSpikeBackend(tag) and (tag != .jsc or
+        @import("backend/jsc/polling_config.zig").supportsInterrupt());
     if (interrupt_supported) {
         flags |= CapabilityFlags.interrupt_deadline;
     }
-    if (isQuickJsApiBackend(active_backend)) {
+    if (isQuickJsApiBackend(tag)) {
         // setMemoryLimit returns false on JSC; QJS fills MemoryUsage, JSC zeros.
         flags |= CapabilityFlags.heap_stack_limit;
         flags |= CapabilityFlags.heap_usage_snapshot;
-        // typed_bytecode.compile/run → unsupported on JSC.
-        flags |= CapabilityFlags.explicit_bytecode;
-        // cjs.zig: JSC → plainCjs; QJS also requires build_options.bytecode_cache.
-        if (build_options.bytecode_cache) {
+        // Typed bytecode and cache evaluation use the primary typed context.
+        if (primary) flags |= CapabilityFlags.explicit_bytecode;
+        if (primary and build_options.bytecode_cache) {
             flags |= CapabilityFlags.persistent_bytecode_cache;
         }
     }
-    if ((supportsDebugger(active_backend) or isHermesBackend(active_backend)) and build_options.inspector) {
+    if (primary and (supportsDebugger(tag) or isHermesBackend(tag)) and build_options.inspector) {
         flags |= CapabilityFlags.cdp_source_debugger;
     }
-    if (active_backend == .jsc) {
+    if (primary and tag == .jsc) {
         flags |= CapabilityFlags.safari_web_inspector;
     }
     return flags;

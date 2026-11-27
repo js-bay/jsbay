@@ -3,21 +3,26 @@
 //! Safety contract: all operations on a given instance_id MUST happen on a single thread. The JS engine and its timer scheduler are not thread-safe per instance.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const backend = @import("backend.zig");
 const instance_map = @import("runtime/instance_map.zig");
 const timers = @import("runtime/timers.zig");
 const types = @import("types.zig");
 const debugger_mod = @import("inspector/debugger.zig");
 const dispatch = @import("runtime/dispatch.zig");
-const runtime_destroy = @import("runtime/engine_destroy.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
 pub const EvalResult = types.EvalResult;
 pub const instance_not_found_err = "Instance not found";
+const unsupported_module_entry_err = "ES module operations are not supported for packed secondary instances";
 
 fn missingInstanceResult() EvalResult {
     return .{ .result = null, .err = instance_not_found_err, .err_is_heap = false };
+}
+
+fn unsupportedModuleEntryResult() EvalResult {
+    return .{ .result = null, .err = unsupported_module_entry_err, .err_is_heap = false };
 }
 
 /// A transport close can leave Inspector cleanup pending when its owner task could not be posted. Check again at the concrete evaluator boundary: the context is now admitted and any direct host evaluation must not execute with the former session's debugger hook still armed.
@@ -33,6 +38,10 @@ var create_before_debugger_attach_hook_for_testing: ?*const fn (i32, ?*anyopaque
 var create_hook_context_for_testing: ?*anyopaque = null;
 var create_after_insert_hook_for_testing: ?*const fn (i32, ?*anyopaque) void = null;
 var create_after_insert_context_for_testing: ?*anyopaque = null;
+var finish_eval_destroy_hook_for_testing: ?*const fn (i32, ?*anyopaque) void = null;
+var finish_eval_destroy_context_for_testing: ?*anyopaque = null;
+var before_teardown_claim_hook_for_testing: ?*const fn (i32, ?u64, ?*anyopaque) void = null;
+var before_teardown_claim_context_for_testing: ?*anyopaque = null;
 
 pub fn setCreateBeforeDebuggerAttachHookForTesting(hook: ?*const fn (i32, ?*anyopaque) void, ctx: ?*anyopaque) void {
     create_before_debugger_attach_hook_for_testing = hook;
@@ -44,11 +53,27 @@ pub fn setCreateAfterInsertHookForTesting(hook: ?*const fn (i32, ?*anyopaque) vo
     create_after_insert_context_for_testing = ctx;
 }
 
+pub fn setFinishEvalDestroyHookForTesting(hook: ?*const fn (i32, ?*anyopaque) void, ctx: ?*anyopaque) void {
+    if (!builtin.is_test) return;
+    finish_eval_destroy_context_for_testing = ctx;
+    finish_eval_destroy_hook_for_testing = hook;
+}
+
+pub fn setBeforeTeardownClaimHookForTesting(hook: ?*const fn (i32, ?u64, ?*anyopaque) void, ctx: ?*anyopaque) void {
+    if (!builtin.is_test) return;
+    before_teardown_claim_context_for_testing = ctx;
+    before_teardown_claim_hook_for_testing = hook;
+}
+
 /// End a JS entry lease and perform a destroy requested by one of its native callbacks only after the outermost entry has left the runtime.
 pub fn finishEvalEntry(instance_id: i32, lease: @import("runtime/engine_thread.zig").EvalLease) void {
     const engine_thread = @import("runtime/engine_thread.zig");
-    const generation = lease.generation;
-    if (engine_thread.endEvalAndTakeDeferred(lease)) destroyGeneration(instance_id, generation);
+    if (engine_thread.endEvalAndTakeDeferred(lease)) |generation| {
+        if (builtin.is_test) {
+            if (finish_eval_destroy_hook_for_testing) |hook| hook(instance_id, finish_eval_destroy_context_for_testing);
+        }
+        destroyForGeneration(instance_id, generation);
+    }
 }
 
 pub const CreateError = error{
@@ -60,6 +85,7 @@ pub const CreateError = error{
     ResourceInitFailed,
     ExecutionCpuInitFailed,
     InstanceInsertFailed,
+    TeardownWorkerStartFailed,
 };
 
 /// Convenience wrapper preserving boolean return for existing callers; calls createWithBackend with the active backend.
@@ -70,6 +96,7 @@ pub fn create(instance_id: i32, config: types.EngineConfig) bool {
 
 /// Create-time engine select. `tag` must be packed into this artifact. The pack primary uses the monomorphic ActiveEngine path; other packed tags use erased handles + `backend_dispatch`.
 pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: backend.BackendType) CreateError!void {
+    try dispatch.ensureTeardownWorkerStarted();
     @import("runtime/scheduler_gate.zig").set(.{ .enter = @import("runtime/js_scheduler.zig").backendDrainAllowed, .leave = @import("runtime/js_scheduler.zig").backendDrainFinished });
     if (instance_map.getPtrs(instance_id) != null) return error.InstanceAlreadyExists;
     if (!backend.isPacked(tag)) return error.BackendNotPacked;
@@ -208,6 +235,7 @@ pub fn createWithBackend(instance_id: i32, config: types.EngineConfig, tag: back
 
 pub const EvalScriptOptions = struct {
     report_uncaught: bool = true,
+    stringify_result: bool = true,
 };
 
 pub fn evalScript(instance_id: i32, script: []const u8, filename: []const u8) EvalResult {
@@ -242,9 +270,14 @@ pub fn evalScriptWithOptions(instance_id: i32, script: []const u8, filename: []c
     reconcileInspectorBeforeEvaluation(instance_id);
     debugger_mod.noteScript(instance_id, filename, script);
     debugger_mod.clearExceptionHold(instance_id);
-    const result = switch (inst.engine_handles) {
-        .mono => |m| ActiveEngine.eval(m.ctx, script, filename),
-        .packed_alt => |a| @import("backend_dispatch.zig").evalPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }, script, filename),
+    const result = if (options.stringify_result)
+        switch (inst.engine_handles) {
+            .mono => |m| ActiveEngine.eval(m.ctx, script, filename),
+            .packed_alt => |a| @import("backend_dispatch.zig").evalPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }, script, filename),
+        }
+    else switch (inst.engine_handles) {
+        .mono => |m| ActiveEngine.evalDiscardingResult(m.ctx, script, filename),
+        .packed_alt => |a| @import("backend_dispatch.zig").evalPackedDiscardingResult(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }, script, filename),
     };
     @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(&execution);
     _ = ptrs;
@@ -263,7 +296,7 @@ pub fn evalScriptTyped(instance_id: i32, script: []const u8, filename: []const u
 
 /// Evaluate JavaScript as an ES module. Top-level `import` statements are resolved via `EngineConfig.module_loader` if configured; otherwise module imports raise a ReferenceError at evaluation time.
 ///
-/// JSC backend: returns an error `EvalResult` ("JSC backend does not support ES modules (use QuickJS)"). Use `evalScript` or switch to the QuickJS backend.
+/// JSC backend: returns an error `EvalResult` ("JSC backend does not support ES modules (use QuickJS)"). Packed secondary instances return an unsupported error because module evaluation requires a primary-backend context.
 pub fn evalModule(instance_id: i32, source: []const u8, filename: []const u8) EvalResult {
     if (instance_map.getPtrs(instance_id) == null) return missingInstanceResult();
     const engine_thread = @import("runtime/engine_thread.zig");
@@ -277,6 +310,8 @@ pub fn evalModule(instance_id: i32, source: []const u8, filename: []const u8) Ev
             .err_is_heap = false,
         };
     }
+    const instance = instance_map.getInstance(instance_id) orelse return missingInstanceResult();
+    if (!instance.isPrimaryBackend()) return unsupportedModuleEntryResult();
     const ptrs = instance_map.getPtrs(instance_id) orelse
         return missingInstanceResult();
     var execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse return missingInstanceResult();
@@ -301,7 +336,7 @@ pub fn evalModule(instance_id: i32, source: []const u8, filename: []const u8) Ev
     return result;
 }
 
-/// Resolve + load the entry specifier via the configured module loader and evaluate the result as an ES module. Returns an error `EvalResult` when no loader is configured, when the loader returns false, or when the JSC backend is active.
+/// Resolve + load the entry specifier via the configured module loader and evaluate the result as an ES module. Returns an error `EvalResult` when no loader is configured, when the loader returns false, when the JSC backend is active, or for packed secondary instances.
 pub fn importModule(instance_id: i32, entry_specifier: []const u8) EvalResult {
     if (instance_map.getPtrs(instance_id) == null) return missingInstanceResult();
     const engine_thread = @import("runtime/engine_thread.zig");
@@ -311,6 +346,8 @@ pub fn importModule(instance_id: i32, entry_specifier: []const u8) EvalResult {
         if (instance_map.getPtrs(instance_id) == null) return missingInstanceResult();
         return .{ .result = null, .err = engine_thread.foreign_eval_err, .err_is_heap = false };
     }
+    const instance = instance_map.getInstance(instance_id) orelse return missingInstanceResult();
+    if (!instance.isPrimaryBackend()) return unsupportedModuleEntryResult();
     const ptrs = instance_map.getPtrs(instance_id) orelse
         return missingInstanceResult();
     var execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse return missingInstanceResult();
@@ -686,14 +723,20 @@ pub fn destroy(instance_id: i32) void {
 
 pub fn destroyGeneration(instance_id: i32, generation: u64) void {
     const engine_thread = @import("runtime/engine_thread.zig");
+    if (!instance_map.markTeardownPendingForGeneration(instance_id, generation)) return;
     if (engine_thread.isDestroying(instance_id)) return;
     if (engine_thread.isEvalActiveOnCurrentThread(instance_id)) {
-        if (instance_map.markTeardownPendingForGeneration(instance_id, generation))
-            _ = engine_thread.requestDeferredEvalDestroy(instance_id);
+        _ = engine_thread.requestDeferredEvalDestroy(instance_id);
         return;
     }
+    if (@import("value/reference.zig").requestDeferredDestroy(instance_id)) return;
+    if (dispatch.deferDestroyForCurrentTask(instance_id, generation, destroyGeneration)) return;
+
     var gate_lease: engine_thread.DestroyGateLease = undefined;
     if (!engine_thread.lockDestroyGateForGeneration(instance_id, generation, &gate_lease)) return;
+    if (builtin.is_test) {
+        if (before_teardown_claim_hook_for_testing) |hook| hook(instance_id, generation, before_teardown_claim_context_for_testing);
+    }
     const claim = instance_map.claimTeardownForGeneration(instance_id, generation);
     engine_thread.unlockGenerationDestroyGate(&gate_lease);
     if (claim == .stale) return;
@@ -703,44 +746,128 @@ pub fn destroyGeneration(instance_id: i32, generation: u64) void {
             engine_thread.waitGenerationGone(instance_id, generation);
         return;
     }
+
     var owner_lease: engine_thread.TeardownOwnerLease = undefined;
     engine_thread.enterTeardownOwner(&owner_lease, instance_id, generation);
     defer engine_thread.leaveTeardownOwner(&owner_lease);
-    const deferred = prepareDestroy(instance_id, generation);
-    if (deferred) return;
+    if (prepareDestroy(instance_id, generation)) return;
     if (engine_thread.beginDestroy(instance_id, generation)) return;
     engine_thread.beforeDestroyClaimed(instance_id, generation);
 }
 
+pub fn destroyForGeneration(instance_id: i32, generation: u64) void {
+    destroyGeneration(instance_id, generation);
+}
+
 fn prepareDestroy(instance_id: i32, generation: u64) bool {
-    // From this point teardown may detach the engine-thread State before it reaches destroyRuntime. Close public JS admission first so it cannot recreate that State against a runtime being dismantled.
     if (instance_map.generationOf(instance_id) != generation) return true;
-    // Mirror stop_loop so a blocking run sees both the teardown latch and the driver's stop bit. shouldStop already watches teardown_pending; requestStop covers hosts that only observe the driver flag and wakes the waiter promptly.
-    if (instance_map.getPtrs(instance_id)) |ptrs| {
-        ptrs.loop.requestStop();
-        ptrs.loop.wake();
+    if (instance_map.beginTeardownSignals(instance_id, generation)) |signals| {
+        signals.ptrs.loop.requestStop();
+        signals.ptrs.loop.wake();
+        @import("js_event_loop").native_sync.cancelForInstance(instance_id);
+        debugger_mod.abandon(instance_id);
+        signals.end();
     }
     detachLoop(instance_id);
     @import("js_event_loop").host_wake.drop(instance_id);
-    // Synchronous native calls own no JS values, but their owner callback may be asleep on a native condition. Wake it before deferred teardown waits for that callback to unwind.
     @import("js_event_loop").native_sync.cancelForInstance(instance_id);
-    // A paused debugger blocks the engine thread inside the current eval. Release that wait before teardown tries to join the thread.
     debugger_mod.abandon(instance_id);
-    const engine_thread = @import("runtime/engine_thread.zig");
-    if (engine_thread.isEvalActiveOnCurrentThread(instance_id)) {
-        _ = engine_thread.requestDeferredEvalDestroy(instance_id);
+    if (instance_map.generationOf(instance_id) != generation) return true;
+    if (@import("runtime/engine_thread.zig").isEvalActiveOnCurrentThread(instance_id)) {
+        _ = @import("runtime/engine_thread.zig").requestDeferredEvalDestroy(instance_id);
         return true;
     }
     return false;
 }
 
-/// Free the scheduler and JS runtime for an instance. The caller has already stopped the engine thread, or is that thread and has left the JS call.
-pub fn destroyRuntime(instance_id: i32) void {
-    const generation = instance_map.generationOf(instance_id) orelse return;
-    destroyRuntimeGeneration(instance_id, generation);
+/// Start generation-scoped teardown through the same owner path used by the public destroy operation.
+pub fn destroyRuntimeForGeneration(instance_id: i32, generation: u64) void {
+    destroyGeneration(instance_id, generation);
 }
 
-pub const destroyRuntimeGeneration = runtime_destroy.destroyRuntimeGeneration;
+pub fn tryDestroyRuntimeForGeneration(instance_id: i32, generation: u64) bool {
+    if (!@import("runtime/engine_thread.zig").isTeardownOwnerThread(instance_id, generation)) return false;
+    const claimed_instance = instance_map.claimRuntimeTeardownForGeneration(instance_id, generation) orelse return false;
+    return finishClaimedRuntimeTeardown(instance_id, claimed_instance);
+}
+
+pub fn destroyRuntimeGeneration(instance_id: i32, generation: u64) void {
+    destroyRuntimeForGeneration(instance_id, generation);
+}
+
+fn finishClaimedRuntimeTeardown(instance_id: i32, claimed_instance: *instance_map.EngineInstance) bool {
+    const inspector_state = @import("inspector/root.zig").state;
+    var inspector_destroy_lease: inspector_state.EngineDestroyLease = .{};
+    if (!inspector_state.beginEngineDestroy(instance_id, claimed_instance.generation, &inspector_destroy_lease))
+        @panic("engine generation teardown already active");
+    defer inspector_state.endEngineDestroy(&inspector_destroy_lease);
+    const instance = beginRuntimeTeardown(instance_id, claimed_instance) orelse return false;
+    releaseRuntimeResources(instance_id, instance);
+    freeInstanceRuntime(instance_id, instance);
+    finishInstanceTeardown(instance_id, instance);
+    return true;
+}
+
+fn beginRuntimeTeardown(instance_id: i32, expected_instance: *instance_map.EngineInstance) ?*instance_map.EngineInstance {
+    if (!dispatch.closeInstanceTasks(instance_id)) return null;
+    @import("abi/api_async.zig").cancelForInstance(types.InstanceId.fromInt(instance_id));
+    @import("js_event_loop").host_wake.drop(instance_id);
+    instance_map.waitForControlOps(instance_id);
+    const instance = instance_map.getInstance(instance_id) orelse return null;
+    if (instance != expected_instance) return null;
+    instance.loop.detach();
+    dispatch.waitForInstanceTasks(instance_id);
+    instance_map.waitForRefOps(instance_id);
+    return instance;
+}
+
+fn releaseRuntimeResources(instance_id: i32, instance: *instance_map.EngineInstance) void {
+    instance.task_mutex.lock();
+    for (instance.task_queue.pendingSlice()) |task| {
+        instance.allocator.free(task);
+        instance.resources.release(.script_task, task.len);
+    }
+    instance.task_queue.clear(instance.allocator);
+    instance.task_mutex.unlock();
+    @import("inspector/root.zig").dropInstance(instance_id);
+    timers.cancelAll(instance);
+    @import("abi/api_bind.zig").dropInstance(instance_id);
+    @import("abi/api_value.zig").dropInstance(instance_id);
+    @import("abi/packed_api_value.zig").dropInstance(instance_id);
+    @import("runtime/tsfn.zig").releaseAllForInstance(instance_id);
+    @import("script/cjs.zig").uninstall(instance_id);
+    _ = @import("runtime/runtime_control.zig").deinitForInstance(instance_id, instance);
+    @import("runtime/ref_admission.zig").forceResetBookkeeping(&instance.ref_bookkeeping);
+    @import("backend/console_timers.zig").deinitInstance(instance_id);
+}
+
+fn freeInstanceRuntime(instance_id: i32, instance: *instance_map.EngineInstance) void {
+    debugger_mod.detach(instance_id);
+    switch (instance.engine_handles) {
+        .mono => |m| {
+            if (m.ctx != null and m.runtime != null) {
+                ActiveEngine.runGc(m.runtime);
+                ActiveEngine.freeContext(m.ctx);
+                ActiveEngine.runGc(m.runtime);
+                ActiveEngine.freeRuntime(m.runtime);
+            }
+        },
+        .packed_alt => |a| @import("backend_dispatch.zig").destroyPacked(a.tag, .{ .runtime_addr = a.runtime_addr, .ctx_addr = a.ctx_addr }),
+    }
+    @import("inspector/async_stack.zig").deinitInstance(instance_id);
+}
+
+fn finishInstanceTeardown(instance_id: i32, instance: *instance_map.EngineInstance) void {
+    var timer_reg = instance.timers;
+    timer_reg.deinit();
+    const removed = instance_map.removeGeneration(instance_id, instance.generation) orelse
+        @panic("engine generation changed during owned teardown");
+    if (removed.execution_cpu) |ledger| ledger.close();
+    removed.resources.deinit();
+    removed.loop.destroy();
+    removed.deinitSynchronization();
+    removed.allocator.destroy(removed);
+}
 
 /// Get the JS context for an instance. Used by consumers to register custom APIs.
 pub fn getContext(instance_id: i32) ?ActiveEngine.Context {
@@ -785,95 +912,4 @@ fn runOneAsync(instance_id: i32) bool {
     if (result.err_is_heap) if (result.err) |value| std.heap.c_allocator.free(@constCast(value));
     _ = queued.end();
     return true;
-}
-
-test "engine: packed_alt EngineInstance create/eval/destroy for primary tag (Linux dispatch proof)" {
-    // Force the erase/dispatch path even for the pack primary so Linux single-pack CI proves
-    // EngineInstance.packed_alt without needing a second real engine (JSC is Apple-only).
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    const tag = backend.active_backend;
-    const backend_dispatch = @import("backend_dispatch.zig");
-    const loop = event_loop.Driver.create(std.heap.c_allocator) catch return error.LoopCreateFailed;
-    errdefer loop.destroy();
-    const handles = backend_dispatch.createPacked(tag) orelse return error.CreatePackedFailed;
-    errdefer backend_dispatch.destroyPacked(tag, handles);
-    backend_dispatch.finishCreate(tag, handles, id, 256 * 1024);
-    const instance = std.heap.c_allocator.create(instance_map.EngineInstance) catch return error.Oom;
-    errdefer std.heap.c_allocator.destroy(instance);
-    const resources = @import("runtime/resource_limits.zig").Budget.create(std.heap.c_allocator, .{}) orelse return error.BudgetFailed;
-    errdefer resources.deinit();
-    const execution_cpu = @import("runtime/execution_cpu.zig").Ledger.create(std.heap.c_allocator) orelse return error.Oom;
-    errdefer execution_cpu.close();
-    instance.* = .{
-        .allocator = std.heap.c_allocator,
-        .resources = resources,
-        .execution_cpu = execution_cpu,
-        .instance_id = id,
-        .engine_handles = .{ .packed_alt = .{ .tag = tag, .runtime_addr = handles.runtime_addr, .ctx_addr = handles.ctx_addr } },
-        .loop = loop,
-        .timers = timers.TimerRegistry.init(),
-    };
-    errdefer instance.deinitSynchronization();
-    if (!instance_map.insert(instance)) return error.InsertFailed;
-    defer destroy(id);
-
-    try std.testing.expect(!instance_map.getInstance(id).?.isPrimaryBackend());
-    try std.testing.expectEqual(tag, instance_map.getInstance(id).?.backendTag());
-    const res = evalScript(id, "40+2", "<packed-alt-proof>");
-    defer {
-        if (res.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (res.err_is_heap) {
-            if (res.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(res.err == null);
-    try std.testing.expectEqualStrings("42", res.result.?);
-
-    // Timers on packed-alt: schedule + one event-loop turn must fire the callback.
-    const timed = evalScript(
-        id,
-        "var __packedAltTimer__ = 0; setTimeout(function () { __packedAltTimer__ = 7; }, 0); __packedAltTimer__;",
-        "<packed-alt-timer-arm>",
-    );
-    defer {
-        if (timed.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (timed.err_is_heap) {
-            if (timed.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(timed.err == null);
-    try std.testing.expectEqualStrings("0", timed.result.?);
-    runEventLoopOnce(id);
-    const after = evalScript(id, "__packedAltTimer__", "<packed-alt-timer-check>");
-    defer {
-        if (after.result) |s| std.heap.c_allocator.free(@constCast(s));
-        if (after.err_is_heap) {
-            if (after.err) |e| std.heap.c_allocator.free(@constCast(e));
-        }
-    }
-    try std.testing.expect(after.err == null);
-    try std.testing.expectEqualStrings("7", after.result.?);
-}
-
-test "engine: create with testing.allocator succeeds and frees cleanly" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try createWithBackend(id, .{ .allocator = std.testing.allocator }, backend.active_backend);
-    defer destroy(id);
-
-    const inst = instance_map.getInstance(id) orelse return error.InstanceNotFound;
-    try std.testing.expectEqual(std.testing.allocator, inst.allocator);
-    const res = evalScript(id, "1 + 1", "<alloc-test>");
-    defer helpers.freeEvalResult(res);
-    try std.testing.expect(res.err == null);
-}
-
-test "engine: create duplicate instance returns InstanceAlreadyExists error" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try createWithBackend(id, .{}, backend.active_backend);
-    defer destroy(id);
-
-    try std.testing.expectError(error.InstanceAlreadyExists, createWithBackend(id, .{}, backend.active_backend));
 }

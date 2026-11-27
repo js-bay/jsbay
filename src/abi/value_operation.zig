@@ -3,6 +3,7 @@ const std = @import("std");
 const backend = @import("../backend.zig");
 const engine = @import("../engine.zig");
 const engine_thread = @import("../runtime/engine_thread.zig");
+const instance_map = @import("../runtime/instance_map.zig");
 const api_value = @import("api_value.zig");
 const packed_api_value = @import("packed_api_value.zig");
 const api_backend = @import("api_backend.zig");
@@ -15,6 +16,7 @@ const packed_value_bytes = @import("packed_value_bytes.zig");
 const packed_readiness = @import("packed_readiness.zig");
 const packed_generation_scope = @import("packed_generation_scope.zig");
 const admission = @import("value_operation_admission.zig");
+const finish_bool = @import("value_operation_finish.zig");
 
 pub const setBeforeOwnerCheckHookForTesting = admission.setBeforeOwnerCheckHookForTesting;
 pub const setBeforeBackendEnterHookForTesting = admission.setBeforeBackendEnterHookForTesting;
@@ -80,11 +82,30 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
             admission.runBeforeOwnerCheckHookForTesting();
             if (!api_value.isOwner(id)) return .{ .status = admission.ownerAdmissionFailureStatus(id, API_WRONG_THREAD, API_INSTANCE_NOT_FOUND) };
             const lease = engine_thread.beginEval(id);
-            if (!lease.allowed) return .{ .status = admission.ownerAdmissionFailureStatus(id, API_WRONG_THREAD, API_INSTANCE_NOT_FOUND) };
-            const inst = @import("../runtime/instance_map.zig").getInstance(id) orelse {
+            if (!lease.allowed) {
+                if (lease.failure == .out_of_memory) return .{ .status = API_OUT_OF_MEMORY };
+                return .{ .status = admission.ownerAdmissionFailureStatus(id, API_WRONG_THREAD, API_INSTANCE_NOT_FOUND) };
+            }
+            const inst = instance_map.getInstance(id) orelse {
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
+            if (expected_generation) |expected| {
+                if (inst.generation != expected or lease.generation != expected) {
+                    engine.finishEvalEntry(id, lease);
+                    return .{ .status = API_INSTANCE_NOT_FOUND };
+                }
+            }
+            return beginAdmittedApiOpMode(inst, lease, require_execution, check_loop_error, expected_generation);
+        }
+
+        /// Take ownership of an eval lease that protects this instance.
+        pub fn beginAdmittedApiOp(inst: *instance_map.EngineInstance, lease: engine_thread.EvalLease, require_execution: bool) ApiOpResult {
+            return beginAdmittedApiOpMode(inst, lease, require_execution, true, lease.generation);
+        }
+
+        fn beginAdmittedApiOpMode(inst: *instance_map.EngineInstance, lease: engine_thread.EvalLease, require_execution: bool, check_loop_error: bool, expected_generation: ?u64) ApiOpResult {
+            const id = inst.instance_id;
             if (expected_generation) |expected| {
                 if (inst.generation != expected or lease.generation != expected) {
                     engine.finishEvalEntry(id, lease);
@@ -114,9 +135,7 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
             }
             if (!require_execution) return .{ .ok = .{ .id = id, .generation = inst.generation, .ctx = ctx, .lease = lease, .entered_js = entered_js, .allocator = inst.allocator } };
             const execution = @import("../runtime/js_scheduler.zig").beginExecution(id) orelse {
-                if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
-                    if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
-                }
+                if (comptime backend.isQuickJsApiBackend(backend.active_backend)) if (entered_js) backend.ActiveEngineModule.lifecycle.leaveJs(ctx);
                 engine.finishEvalEntry(id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
             };
@@ -271,7 +290,10 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
             if (@import("../runtime/instance_map.zig").isTeardownPending(instance_id)) return .{ .status = API_INSTANCE_NOT_FOUND };
             if (!api_value.isOwner(instance_id)) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
             const lease = engine_thread.beginEval(instance_id);
-            if (!lease.allowed) return .{ .status = if (@import("../runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+            if (!lease.allowed) {
+                if (lease.failure == .out_of_memory) return .{ .status = API_OUT_OF_MEMORY };
+                return .{ .status = if (instance_map.getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD };
+            }
             const inst = @import("../runtime/instance_map.zig").getInstance(instance_id) orelse {
                 engine.finishEvalEntry(instance_id, lease);
                 return .{ .status = API_INSTANCE_NOT_FOUND };
@@ -442,20 +464,11 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
 
         pub fn packedPublishBytes(instance_id: i32, tag: backend.BackendType, ctx_addr: usize, result: @import("../backend_dispatch.zig").BytesValueResult, out_bytes: *Bytes, out_exception: *u64) c_int {
             out_exception.* = 0;
-            if (@import("../runtime/instance_map.zig").isTeardownPending(instance_id)) {
+            if (instance_map.isTeardownPending(instance_id) or result.out_of_memory or result.invalid_argument) {
                 if (result.bytes) |b| std.heap.c_allocator.free(b);
                 if (result.exception) |e| @import("../backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-                return API_INSTANCE_NOT_FOUND;
-            }
-            if (result.out_of_memory) {
-                if (result.bytes) |b| std.heap.c_allocator.free(b);
-                if (result.exception) |e| @import("../backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-                return API_OUT_OF_MEMORY;
-            }
-            if (result.invalid_argument) {
-                if (result.bytes) |b| std.heap.c_allocator.free(b);
-                if (result.exception) |e| @import("../backend_dispatch.zig").timerFreeValue(tag, ctx_addr, e.slice());
-                return API_INVALID_ARGUMENT;
+                if (instance_map.isTeardownPending(instance_id)) return API_INSTANCE_NOT_FOUND;
+                return if (result.out_of_memory) API_OUT_OF_MEMORY else API_INVALID_ARGUMENT;
             }
             if (result.exception) |exc| {
                 if (result.bytes) |b| std.heap.c_allocator.free(b);
@@ -477,24 +490,11 @@ pub fn Operations(comptime Bytes: type, comptime codes: StatusCodes) type {
         }
 
         pub fn finishBoolOp(op: *ApiOp, result: api_backend.BoolResult, out_flag: *bool, out_exception: *u64) c_int {
-            if (!drainApiJobs(op)) {
-                switch (result) {
-                    .exception => |exception| ActiveEngine.freeValue(op.ctx, exception),
-                    .ok, .out_of_memory => {},
-                }
-                return API_INSTANCE_NOT_FOUND;
-            }
-            switch (result) {
-                .ok => |val| {
-                    out_flag.* = val;
-                    return API_OK;
-                },
-                .exception => |exception| {
-                    const stored = apiStore(op.id, exception, out_exception);
-                    return if (stored == API_OK) 1 else stored;
-                },
-                .out_of_memory => return API_OUT_OF_MEMORY,
-            }
+            return finish_bool.finishBoolOp(@This(), ActiveEngine.freeValue, op, result, out_flag, out_exception, .{
+                .instance_not_found = API_INSTANCE_NOT_FOUND,
+                .ok = API_OK,
+                .out_of_memory = API_OUT_OF_MEMORY,
+            });
         }
     };
 }

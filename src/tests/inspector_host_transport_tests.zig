@@ -2,12 +2,15 @@ const std = @import("std");
 const testing = std.testing;
 const backend = @import("../backend.zig");
 const engine = @import("../engine.zig");
+const engine_thread = @import("../runtime/engine_thread.zig");
 const inspector = @import("../inspector/root.zig");
 const helpers = @import("test_helpers.zig");
 const options = @import("build_options");
+const io = @import("../platform/io.zig");
 
 const fixture = @import("host_transport_fixture.zig");
 const HostTransport = fixture.HostTransport;
+const StartPause = fixture.StartPause;
 
 fn waitForReply(host: *HostTransport, instance_id: i32, session: inspector.SessionId, request_id: i64) !std.json.Parsed(std.json.Value) {
     var attempts: usize = 0;
@@ -42,7 +45,97 @@ fn expectStopped(host: *HostTransport, method: []const u8) !void {
     try testing.expect(host.handler == null);
 }
 
+fn waitForFlag(flag: *const std.atomic.Value(bool), timeout_ms: i64) bool {
+    const deadline = io.monotonicMilliseconds() + timeout_ms;
+    while (!flag.load(.seq_cst)) {
+        if (io.monotonicMilliseconds() >= deadline) return false;
+        std.Thread.yield() catch {};
+    }
+    return true;
+}
+
 const Enabled = if (options.inspector) struct {
+    test "engine destroy waits for inspector transport startup to release its eval lease" {
+        const id = helpers.nextInstanceId();
+        try testing.expect(engine.create(id, .{}));
+        var pause = StartPause{};
+        var host = HostTransport{ .start_pause = &pause };
+        host.init();
+        defer host.freeFrames();
+
+        const StartCall = struct {
+            id: i32,
+            transport: *inspector.Transport,
+            done: std.atomic.Value(bool) = .init(false),
+            succeeded: std.atomic.Value(bool) = .init(false),
+
+            fn run(self: *@This()) void {
+                if (inspector.startWithTransport(self.id, self.transport, .{})) |_| {
+                    self.succeeded.store(true, .seq_cst);
+                } else |_| {}
+                self.done.store(true, .seq_cst);
+            }
+        };
+        const DestroyCall = struct {
+            id: i32,
+            done: std.atomic.Value(bool) = .init(false),
+
+            fn run(self: *@This()) void {
+                engine.destroy(self.id);
+                self.done.store(true, .seq_cst);
+            }
+        };
+        const DrainProbe = struct {
+            entered: std.atomic.Value(bool) = .init(false),
+
+            fn onWait(raw: ?*anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.entered.store(true, .seq_cst);
+            }
+        };
+
+        var start_call = StartCall{ .id = id, .transport = &host.endpoint };
+        var destroy_call = DestroyCall{ .id = id };
+        var drain_probe = DrainProbe{};
+        var start_thread: ?std.Thread = null;
+        var destroy_thread: ?std.Thread = null;
+        var start_joined = false;
+        var destroy_joined = false;
+        var drain_hook_installed = false;
+        defer {
+            pause.release_start.store(true, .seq_cst);
+            if (start_thread) |thread| if (!start_joined) thread.join();
+            if (destroy_thread) |thread| if (!destroy_joined) thread.join();
+            if (drain_hook_installed) _ = engine_thread.setRefsDrainHookForTesting(id, null, null);
+            if (engine.getContext(id) != null) engine.destroy(id);
+        }
+
+        start_thread = try std.Thread.spawn(.{}, StartCall.run, .{&start_call});
+        if (!waitForFlag(&pause.entered, 3_000)) return error.TransportStartDidNotPause;
+        try testing.expect(engine_thread.setRefsDrainHookForTesting(id, DrainProbe.onWait, @ptrCast(&drain_probe)));
+        drain_hook_installed = true;
+
+        destroy_thread = try std.Thread.spawn(.{}, DestroyCall.run, .{&destroy_call});
+        if (!waitForFlag(&drain_probe.entered, 3_000)) return error.DestroyDidNotWaitForStartupLease;
+        try testing.expect(!start_call.done.load(.seq_cst));
+        try testing.expect(!destroy_call.done.load(.seq_cst));
+
+        pause.release_start.store(true, .seq_cst);
+        if (!waitForFlag(&start_call.done, 3_000)) return error.InspectorStartDidNotFinish;
+        if (!waitForFlag(&destroy_call.done, 3_000)) return error.DestroyDidNotFinishAfterStartup;
+        start_thread.?.join();
+        start_joined = true;
+        destroy_thread.?.join();
+        destroy_joined = true;
+        _ = engine_thread.setRefsDrainHookForTesting(id, null, null);
+        drain_hook_installed = false;
+
+        try testing.expect(start_call.succeeded.load(.seq_cst));
+        try testing.expect(engine.getContext(id) == null);
+        try testing.expectEqual(@as(usize, 1), host.deinit_count);
+        try testing.expect(host.handler == null);
+    }
+
     test "host transport evaluates CDP without sockets and copies borrowed input" {
         const id = helpers.nextInstanceId();
         try testing.expect(engine.create(id, .{}));

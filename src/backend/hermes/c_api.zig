@@ -44,6 +44,7 @@ pub extern fn hermes_inspector_close_sessions(inspector: ?*Inspector) void;
 pub extern fn hermes_inspector_stop(inspector: ?*Inspector) void;
 pub extern fn hermes_inspector_console(ctx: ?*Context, args: ?[*]const Value, argc: usize, level: c_int) void;
 pub extern fn hermes_eval(ctx: ?*Context, src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) EvalResultC;
+pub extern fn hermes_eval_discarding_result(ctx: ?*Context, src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) EvalResultC;
 pub extern fn hermes_eval_result_free(r: EvalResultC) void;
 pub extern fn hermes_undefined() Value;
 pub extern fn hermes_null() Value;
@@ -144,6 +145,8 @@ pub const NativeDataFree = *const fn (ctx: ?*Context, user_data: ?*anyopaque) ca
 pub extern fn hermes_make_function(ctx: ?*Context, name: [*:0]const u8, fn_ptr: NativeFn, user_data: ?*anyopaque) Value;
 pub extern fn hermes_make_function_ex(ctx: ?*Context, name: [*:0]const u8, fn_ptr: NativeFn, user_data: ?*anyopaque, free_ud: ?NativeDataFree) Value;
 pub extern fn hermes_throw(ctx: ?*Context, message: [*:0]const u8) void;
+pub extern fn hermes_take_throw_value(ctx: ?*Context, exception: Value) bool;
+pub extern fn hermes_throw_static(ctx: ?*Context, message: [*:0]const u8) void;
 pub extern fn hermes_atom_new(ctx: ?*Context, utf8: [*]const u8, len: usize) ?*anyopaque;
 pub extern fn hermes_atom_free(atom: ?*anyopaque) void;
 pub extern fn hermes_atom_to_utf8(ctx: ?*Context, atom: ?*anyopaque) ?[*:0]u8;
@@ -165,7 +168,6 @@ pub const ExternalFinalizer = *const fn (?*anyopaque) callconv(.c) void;
 pub const WeakFinalizer = *const fn (?*anyopaque) callconv(.c) void;
 
 pub extern fn hermes_call_result(ctx: ?*Context, fn_val: Value, this_val: Value, args: ?[*]const Value, argc: usize) OpResult;
-pub extern fn hermes_throw_value(ctx: ?*Context, exception: Value) void;
 pub extern fn hermes_get_property_result(ctx: ?*Context, obj: Value, key: [*:0]const u8) OpResult;
 pub extern fn hermes_json_parse_result(ctx: ?*Context, utf8: [*]const u8, len: usize) OpResult;
 pub extern fn hermes_json_stringify_result(ctx: ?*Context, v: Value) OpResult;

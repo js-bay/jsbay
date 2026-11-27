@@ -20,6 +20,7 @@ pub const EscargotBackend = struct {
     pub const freeRuntime = lifecycle.freeRuntime;
     pub const runGc = lifecycle.runGc;
     pub const eval = lifecycle.eval;
+    pub const evalDiscardingResult = lifecycle.evalDiscardingResult;
     pub const processPendingJobs = lifecycle.processPendingJobs;
     pub const threadEnter = lifecycle.threadEnter;
     pub const threadLeave = lifecycle.threadLeave;

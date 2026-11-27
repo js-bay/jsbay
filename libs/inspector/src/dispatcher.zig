@@ -74,8 +74,9 @@ pub fn Module(comptime Host: type) type {
             var owner_frame: dispatch.TaskOwnerFrame = undefined;
             dispatch.enterTaskOwnerFrame(&owner_frame, state.instance_id, state);
             defer {
-                dispatch.leaveTaskOwnerFrame(&owner_frame);
+                const deferred = dispatch.leaveTaskOwnerFrameDeferred(&owner_frame);
                 state_mod.releaseStateLease(state);
+                if (deferred) |d| dispatch.handOffDeferredDestroy(d);
             }
             switch (event.kind) {
                 .session_opened => {

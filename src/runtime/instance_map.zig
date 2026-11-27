@@ -6,6 +6,7 @@
 //! - withInstance(): hold the lock for a short closure (no JS callbacks inside)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sync = @import("zev");
 const backend = @import("../backend.zig");
 const types = @import("../types.zig");
@@ -20,12 +21,19 @@ pub const RefEntry = struct {
     prev: ?*RefEntry = null,
     /// Called by engine.destroy to release the retained JS value (if any) BEFORE the context is freed. The entry is already unlinked from the bookkeeping list by the caller, so implementations must not touch the list — they only need to freeValue/mark the cell released.
     reset_fn: *const fn (entry: *RefEntry) void,
+    free_fn: *const fn (entry: *RefEntry) void,
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(RefEntryState.linked)),
 };
+
+pub const RefEntryState = enum(u8) { linked, releasing, released, abandoned, releasing_abandoned, freed };
 
 /// Per-engine intrusive list of live Global/Weak references. Mutex-protected because Global.reset may be invoked from a finalizer or another thread during teardown.
 pub const RefBookkeeping = struct {
     head: ?*RefEntry = null,
     mutex: sync.Mutex = .{},
+    wake: sync.Condition = .init,
+    active_ops: usize = 0,
+    admission_closed: bool = false,
 };
 
 pub const EngineHandles = union(enum) {
@@ -42,11 +50,7 @@ pub const EngineHandles = union(enum) {
     },
 };
 
-pub const GcSubmissionState = enum(u8) {
-    idle = 0,
-    submitting = 1,
-    queued = 2,
-};
+pub const GcSubmissionState = @import("gc_submission_state.zig").GcSubmissionState;
 
 pub const EngineInstance = struct {
     /// Called after registry removal and all admitted users have drained.
@@ -55,6 +59,7 @@ pub const EngineInstance = struct {
         self.dispatch_mutex.deinit();
         self.native_task_queue.mutex.deinit();
         self.task_mutex.deinit();
+        self.ref_bookkeeping.wake.deinit();
         self.ref_bookkeeping.mutex.deinit();
     }
 
@@ -100,6 +105,7 @@ pub const EngineInstance = struct {
     teardown_pending: bool = false,
     teardown_generation: u64 = 0,
     teardown_owner_claimed: bool = false,
+    teardown_claimed: bool = false,
     dispatch_mutex: sync.Mutex = .{},
     dispatch_wake: sync.Condition = .init,
     active_dispatch_tasks: usize = 0,
@@ -116,58 +122,19 @@ pub const EngineInstance = struct {
     ref_bookkeeping: RefBookkeeping = .{},
 };
 
-/// Queue for dispatched tasks (thread-safe via task_mutex on EngineInstance).
-const TaskQueue = struct {
-    items: std.ArrayList([:0]const u8) = .empty,
-    head: usize = 0,
-
-    pub fn pendingLen(self: *const TaskQueue) usize {
-        return self.items.items.len - self.head;
-    }
-
-    pub fn pendingSlice(self: *const TaskQueue) []const [:0]const u8 {
-        return self.items.items[self.head..];
-    }
-
-    pub fn push(self: *TaskQueue, allocator: std.mem.Allocator, script: [:0]const u8) !void {
-        if (self.head > 0 and self.head == self.items.items.len) {
-            self.items.clearRetainingCapacity();
-            self.head = 0;
-        }
-        try self.items.append(allocator, script);
-    }
-
-    pub fn popFront(self: *TaskQueue) ?[:0]const u8 {
-        if (self.head >= self.items.items.len) return null;
-        const script = self.items.items[self.head];
-        self.head += 1;
-        if (self.head == self.items.items.len) {
-            self.items.clearRetainingCapacity();
-            self.head = 0;
-        } else if (self.head >= 64 and self.head >= self.items.items.len / 2) {
-            const remain = self.items.items[self.head..];
-            var write: usize = 0;
-            while (write < remain.len) : (write += 1) {
-                self.items.items[write] = remain[write];
-            }
-            self.items.shrinkRetainingCapacity(remain.len);
-            self.head = 0;
-        }
-        return script;
-    }
-
-    pub fn clear(self: *TaskQueue, allocator: std.mem.Allocator) void {
-        self.items.deinit(allocator);
-        self.items = .empty;
-        self.head = 0;
-    }
-};
+const TaskQueue = @import("task_queue.zig").TaskQueue;
 
 const InstanceMap = std.AutoHashMap(i32, *EngineInstance);
 
-var instances: InstanceMap = InstanceMap.init(std.heap.c_allocator);
-var mutex: sync.Mutex = .{};
+pub var instances: InstanceMap = InstanceMap.init(std.heap.c_allocator);
+pub var mutex: sync.Mutex = .{};
 var next_generation: u64 = 1;
+const ref_admission = @import("ref_admission.zig");
+pub const RefLease = ref_admission.RefLease;
+pub const beginRefOp = ref_admission.beginRefOp;
+pub const waitForRefOps = ref_admission.waitForRefOps;
+pub const setRefHooksForTesting = ref_admission.setRefHooksForTesting;
+pub const noteRefBookkeepingDrainedForTesting = ref_admission.noteRefBookkeepingDrainedForTesting;
 
 pub fn insert(instance: *EngineInstance) bool {
     return insertWith(instance, struct {
@@ -210,6 +177,20 @@ pub fn generationOf(instance_id: i32) ?u64 {
     return inst.generation;
 }
 
+/// Read the generation while synchronous evaluation is admitted.
+pub fn captureEvalGeneration(instance_id: i32) ?u64 {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return null;
+    if (inst.teardown_pending) return null;
+    return inst.generation;
+}
+
+/// Read the generation of a registered instance, including one already closing admission.
+pub fn registeredGeneration(instance_id: i32) ?u64 {
+    return generationOf(instance_id);
+}
+
 /// Close admission only if the requested lifetime is still registered.
 pub fn markTeardownPendingForGeneration(instance_id: i32, generation: u64) bool {
     mutex.lock();
@@ -218,19 +199,21 @@ pub fn markTeardownPendingForGeneration(instance_id: i32, generation: u64) bool 
     if (inst.generation != generation) return false;
     if (inst.teardown_generation != 0 and inst.teardown_generation != generation) return false;
     inst.teardown_generation = generation;
-    inst.teardown_pending = true;
+    closeInstanceAdmission(inst);
     return true;
 }
 
 pub const TeardownClaim = enum { claimed, already_claimed, stale };
 
+/// Assign one owner to stop the engine thread and begin generation teardown.
 pub fn claimTeardownForGeneration(instance_id: i32, generation: u64) TeardownClaim {
     mutex.lock();
     defer mutex.unlock();
     const inst = instances.get(instance_id) orelse return .stale;
     if (inst.generation != generation) return .stale;
-    inst.teardown_pending = true;
+    if (inst.teardown_generation != 0 and inst.teardown_generation != generation) return .stale;
     inst.teardown_generation = generation;
+    closeInstanceAdmission(inst);
     if (inst.teardown_owner_claimed) return .already_claimed;
     inst.teardown_owner_claimed = true;
     return .claimed;
@@ -317,6 +300,24 @@ pub fn beginControlPlane(instance_id: i32) ?ControlLease {
     };
 }
 
+/// Keep a closing instance registered while its teardown signals are delivered.
+pub fn beginTeardownSignals(instance_id: i32, generation: u64) ?ControlLease {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return null;
+    if (inst.generation != generation or !inst.teardown_pending or inst.teardown_claimed) return null;
+    inst.dispatch_mutex.lock();
+    inst.active_control_ops += 1;
+    inst.dispatch_mutex.unlock();
+    return .{
+        .inst = inst,
+        .ptrs = switch (inst.engine_handles) {
+            .mono => |m| .{ .ctx = m.ctx, .loop = inst.loop, .backend_tag = backend.active_backend },
+            .packed_alt => |a| .{ .ctx = @ptrFromInt(0), .loop = inst.loop, .backend_tag = a.tag },
+        },
+    };
+}
+
 pub fn endControlPlane(inst: *EngineInstance) void {
     inst.dispatch_mutex.lock();
     std.debug.assert(inst.active_control_ops != 0);
@@ -349,10 +350,46 @@ pub fn getInstance(instance_id: i32) ?*EngineInstance {
 
 /// Block new public JS entries while teardown finishes and preserves runtime state for any admitted work.
 pub fn markTeardownPending(instance_id: i32) void {
+    _ = closeAdmissionAndGetGeneration(instance_id);
+}
+
+pub fn closeAdmissionAndGetGeneration(instance_id: i32) ?u64 {
     mutex.lock();
     defer mutex.unlock();
-    const inst = instances.get(instance_id) orelse return;
+    const inst = instances.get(instance_id) orelse return null;
+    closeInstanceAdmission(inst);
+    return inst.generation;
+}
+
+/// Claim the final runtime teardown for one published instance generation.
+pub fn claimTeardown(instance_id: i32, expected_generation: ?u64) ?*EngineInstance {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return null;
+    if (expected_generation) |generation| if (inst.generation != generation) return null;
+    if (inst.teardown_owner_claimed or inst.teardown_claimed) return null;
+    inst.teardown_claimed = true;
+    closeInstanceAdmission(inst);
+    return inst;
+}
+
+/// Claim runtime release after the generation-scoped teardown owner has stopped admitted work.
+pub fn claimRuntimeTeardownForGeneration(instance_id: i32, generation: u64) ?*EngineInstance {
+    mutex.lock();
+    defer mutex.unlock();
+    const inst = instances.get(instance_id) orelse return null;
+    if (inst.generation != generation or !inst.teardown_pending) return null;
+    if (inst.teardown_generation != generation or !inst.teardown_owner_claimed or inst.teardown_claimed) return null;
+    inst.teardown_claimed = true;
+    return inst;
+}
+
+fn closeInstanceAdmission(inst: *EngineInstance) void {
     inst.teardown_pending = true;
+    inst.ref_bookkeeping.mutex.lock();
+    inst.ref_bookkeeping.admission_closed = true;
+    inst.ref_bookkeeping.wake.broadcast();
+    inst.ref_bookkeeping.mutex.unlock();
 }
 
 /// Checked by engine-thread admission both before and after it creates or retains its per-instance state. The instance-map mutex serializes this transition with teardown marking.

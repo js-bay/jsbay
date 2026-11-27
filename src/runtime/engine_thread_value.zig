@@ -4,6 +4,7 @@ const engine = @import("../engine.zig");
 const api_backend = @import("../abi/api_backend.zig");
 const instance_map = @import("instance_map.zig");
 const types = @import("../types.zig");
+const host_value = @import("../abi/host_value.zig");
 
 const ActiveEngine = backend.ActiveEngine;
 
@@ -85,4 +86,24 @@ pub fn adoptEval(res: types.EvalResult) Adopted {
         };
     }
     return .{ .status = status_ok, .result = null, .err = null };
+}
+
+pub fn writeEval(
+    res: types.EvalResult,
+    out_result: *?[*:0]u8,
+    out_error: *?[*:0]u8,
+) c_int {
+    const adopted = adoptEval(res);
+    if (adopted.status == status_exception) {
+        if (adopted.err) |text| {
+            out_error.* = host_value.dupeCString(text);
+            std.heap.c_allocator.free(text);
+        }
+        return status_exception;
+    }
+    if (adopted.result) |text| {
+        out_result.* = host_value.dupeCString(text);
+        std.heap.c_allocator.free(text);
+    }
+    return status_ok;
 }
