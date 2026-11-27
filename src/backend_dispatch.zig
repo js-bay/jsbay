@@ -229,6 +229,20 @@ pub fn evalPacked(tag: Backend, handles: Handles, script: []const u8, filename: 
     return .{ .result = null, .err = "unknown backend", .err_is_heap = false };
 }
 
+pub fn evalPackedDiscardingResult(tag: Backend, handles: Handles, script: []const u8, filename: []const u8) types.EvalResult {
+    inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
+        if (cand == tag) {
+            if (comptime multi_pack.isPacked(cand)) {
+                const E = backend.Engine(cand);
+                const ctx = restorePtr(E.Context, handles.ctx_addr);
+                return E.evalDiscardingResult(ctx, script, filename);
+            }
+            return .{ .result = null, .err = "backend not packed", .err_is_heap = false };
+        }
+    }
+    return .{ .result = null, .err = "unknown backend", .err_is_heap = false };
+}
+
 pub fn processPendingJobsPacked(tag: Backend, handles: Handles) void {
     inline for (.{ .quickjs_ng, .quickjs, .jsc }) |cand| {
         if (cand == tag) {
@@ -1318,31 +1332,4 @@ pub fn valueToJson(tag: Backend, ctx_addr: usize, value_bytes: []const u8) Bytes
 
 pub fn valueCopyBuffer(tag: Backend, ctx_addr: usize, value_bytes: []const u8) BytesValueResult {
     return dispatchBytesValue(tag, valueCopyBufferReal, .{ ctx_addr, value_bytes });
-}
-
-test "backend_dispatch: create/eval/destroy via erased handles for each packed tag" {
-    const testing = std.testing;
-    const tags = [_]Backend{ .quickjs_ng, .quickjs, .jsc };
-    for (tags) |tag| {
-        if (!multi_pack.isPacked(tag)) continue;
-        const handles = createPacked(tag) orelse return error.CreatePackedFailed;
-        finishCreate(tag, handles, 42, 256 * 1024);
-        const res = evalPacked(tag, handles, "1+1", "<backend_dispatch>");
-        defer {
-            if (res.result) |s| std.heap.c_allocator.free(@constCast(s));
-            if (res.err_is_heap) {
-                if (res.err) |e| std.heap.c_allocator.free(@constCast(e));
-            }
-        }
-        try testing.expect(res.err == null);
-        try testing.expectEqualStrings("2", res.result.?);
-        processPendingJobsPacked(tag, handles);
-        destroyPacked(tag, handles);
-    }
-}
-
-test "backend_dispatch: refused when tag not packed" {
-    // On a single-pack Linux NG build, jsc is not packed.
-    if (comptime multi_pack.isPacked(.jsc)) return error.SkipZigTest;
-    try std.testing.expect(createPacked(.jsc) == null);
 }

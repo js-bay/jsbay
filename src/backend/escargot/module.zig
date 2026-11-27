@@ -5,7 +5,7 @@ const types = @import("../../types.zig");
 
 const Context = ?*anyopaque;
 
-const EscargotEvalResult = extern struct {
+const EscargotModuleEvalResult = extern struct {
     result: ?[*]u8,
     result_len: usize,
     err: ?[*]u8,
@@ -21,8 +21,8 @@ extern fn escargot_install_module_loader(
 ) void;
 
 extern fn escargot_uninstall_module_loader(ctx: ?*anyopaque) void;
-extern fn escargot_eval_module(ctx: ?*anyopaque, src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) EscargotEvalResult;
-extern fn escargot_import_module(ctx: ?*anyopaque, specifier: [*:0]const u8) EscargotEvalResult;
+extern fn escargot_eval_module(ctx: ?*anyopaque, src: [*]const u8, src_len: usize, filename: [*]const u8, filename_len: usize) EscargotModuleEvalResult;
+extern fn escargot_import_module(ctx: ?*anyopaque, specifier: [*:0]const u8) EscargotModuleEvalResult;
 extern fn free(ptr: ?*anyopaque) void;
 
 fn bridgeResolve(

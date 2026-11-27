@@ -32,102 +32,42 @@
 //! All Global, Weak, and Rooted operations (init, get, reset, deinit) must be performed on the owning engine thread. Engine teardown walks the intrusive bookkeeping list to reset dangling references before runtime destruction. OwnedValue represents local scoped ownership and must not outlive its owning context.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const backend = @import("../backend.zig");
 const instance_map = @import("../runtime/instance_map.zig");
+const ref_op = @import("reference_op.zig");
+const rooted = @import("rooted.zig");
+
+pub const Rooted = rooted.Rooted;
+pub const isRefOpActiveOnCurrentThread = ref_op.isRefOpActiveOnCurrentThread;
+pub const requestDeferredDestroy = ref_op.requestDeferredDestroy;
+const RefOperation = ref_op.RefOperation;
+const beginRefOperation = ref_op.beginRefOperation;
+const unregisterEntry = ref_op.unregisterEntry;
+const abandonEntry = ref_op.abandonEntry;
+const finishRefRelease = ref_op.finishRefRelease;
+const registerEntryDirect = ref_op.registerEntryDirect;
 
 const ActiveEngine = backend.ActiveEngine;
+var global_release_hook_for_testing: ?*const fn (?*anyopaque) void = null;
+var global_release_hook_context_for_testing: ?*anyopaque = null;
+
+pub fn setGlobalReleaseHookForTesting(hook: ?*const fn (?*anyopaque) void, ctx: ?*anyopaque) void {
+    if (!builtin.is_test) return;
+    global_release_hook_for_testing = hook;
+    global_release_hook_context_for_testing = ctx;
+}
 
 /// Convenience alias so consumers can write `reference.Local` instead of reaching into the backend module for the Value type.
 pub const Local = ActiveEngine.Value;
 
-/// Explicit wrapper representing an owned JavaScript Value whose ownership is transferred to the callee.
-pub const OwnedValue = struct {
-    ctx: ActiveEngine.Context,
-    raw: Local,
+const scope = @import("scope.zig");
 
-    pub fn init(ctx: ActiveEngine.Context, v: Local) OwnedValue {
-        return .{ .ctx = ctx, .raw = v };
-    }
-
-    pub fn borrow(self: *const OwnedValue) Local {
-        return self.raw;
-    }
-
-    pub fn release(self: *OwnedValue) Local {
-        const val = self.raw;
-        self.raw = ActiveEngine.undefinedValue();
-        return val;
-    }
-
-    pub fn deinit(self: *OwnedValue) void {
-        ActiveEngine.freeValue(self.ctx, self.raw);
-        self.raw = ActiveEngine.undefinedValue();
-    }
-};
-
-// ----------------------------------------------------------------------
-// Scope
-// ----------------------------------------------------------------------
-
-pub const Scope = struct {
-    instance_id: i32,
-    prev: ?*Scope = null,
-
-    /// Construct a Scope. To make it the active threadlocal scope, pass it to `activate`. Pattern: var s = Scope.enter(id); reference.activate(&s); defer s.exit();
-    pub fn enter(instance_id: i32) Scope {
-        return Scope{
-            .instance_id = instance_id,
-            .prev = current_scope,
-        };
-    }
-
-    /// Pop the scope; asserts the caller is exiting the topmost scope.
-    pub fn exit(self: *Scope) void {
-        std.debug.assert(current_scope == self);
-        current_scope = self.prev;
-        self.prev = null;
-    }
-
-    /// Returns a pointer to the topmost Scope on this thread, or null.
-    pub fn current() ?*Scope {
-        return current_scope;
-    }
-};
-
-/// Make `scope` the active threadlocal scope. The Scope value must be alive (e.g. a stack local in the same frame) until `exit` is called.
-pub fn activate(scope: *Scope) void {
-    current_scope = scope;
-}
-
-threadlocal var current_scope: ?*Scope = null;
-
-/// Read the instance id of the topmost Scope on this thread, or null if no Scope is active.
-pub fn currentInstanceId() ?i32 {
-    const s = current_scope orelse return null;
-    return s.instance_id;
-}
-
-// ----------------------------------------------------------------------
-// StackFrameScope — escape mechanism for Local values leaving a block
-// ----------------------------------------------------------------------
-
-pub const StackFrameScope = struct {
-    instance_id: i32,
-
-    pub fn enter(instance_id: i32) StackFrameScope {
-        return StackFrameScope{ .instance_id = instance_id };
-    }
-
-    pub fn exit(self: *StackFrameScope) void {
-        _ = self;
-    }
-
-    /// Promote a value out of the frame via the backend retain path. The caller then owns the returned value and must free it via `ActiveEngine.freeValue`.
-    pub fn returnValue(self: *StackFrameScope, v: Local) Local {
-        const ctx = ctxForInstance(self.instance_id) orelse return v;
-        return ActiveEngine.dupValue(ctx, v);
-    }
-};
+pub const OwnedValue = scope.OwnedValue;
+pub const Scope = scope.Scope;
+pub const activate = scope.activate;
+pub const currentInstanceId = scope.currentInstanceId;
+pub const StackFrameScope = scope.StackFrameScope;
 
 // ----------------------------------------------------------------------
 // Bookkeeping cells (heap-allocated, pointed at by Global/Weak)
@@ -137,6 +77,7 @@ pub const StackFrameScope = struct {
 const GlobalCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
+    generation: u64,
     ctx: ActiveEngine.Context,
     allocator: std.mem.Allocator,
     val: ActiveEngine.Value,
@@ -146,8 +87,14 @@ const GlobalCell = struct {
     fn releaseValue(entry: *instance_map.RefEntry) void {
         const cell: *GlobalCell = @fieldParentPtr("entry", entry);
         if (cell.released) return;
+        if (builtin.is_test) if (global_release_hook_for_testing) |hook| hook(global_release_hook_context_for_testing);
         ActiveEngine.freeValue(cell.ctx, cell.val);
         cell.released = true;
+    }
+
+    fn freeCell(entry: *instance_map.RefEntry) void {
+        const cell: *GlobalCell = @fieldParentPtr("entry", entry);
+        cell.allocator.destroy(cell);
     }
 };
 
@@ -194,6 +141,7 @@ pub const WatcherData = struct {
 pub const WeakCell = struct {
     entry: instance_map.RefEntry,
     instance_id: i32,
+    generation: u64,
     ctx: ActiveEngine.Context,
     allocator: std.mem.Allocator,
     kind: WeakKind,
@@ -216,39 +164,16 @@ pub const WeakCell = struct {
         }
         cell.released = true;
     }
+
+    fn freeCell(entry: *instance_map.RefEntry) void {
+        const cell: *WeakCell = @fieldParentPtr("entry", entry);
+        cell.allocator.destroy(cell);
+    }
 };
 
 fn ctxForInstance(instance_id: i32) ?ActiveEngine.Context {
     const ptrs = instance_map.getPtrs(instance_id) orelse return null;
     return ptrs.ctx;
-}
-
-fn registerEntryDirect(inst: *instance_map.EngineInstance, entry: *instance_map.RefEntry) void {
-    inst.ref_bookkeeping.mutex.lock();
-    defer inst.ref_bookkeeping.mutex.unlock();
-    entry.prev = null;
-    entry.next = inst.ref_bookkeeping.head;
-    if (inst.ref_bookkeeping.head) |h| h.prev = entry;
-    inst.ref_bookkeeping.head = entry;
-}
-
-/// Unlink `entry` from the engine's bookkeeping list. Safe to call even if the engine has been torn down or the entry was already unlinked.
-fn unregisterEntry(instance_id: i32, entry: *instance_map.RefEntry) void {
-    const inst = instance_map.getInstance(instance_id) orelse {
-        entry.prev = null;
-        entry.next = null;
-        return;
-    };
-    inst.ref_bookkeeping.mutex.lock();
-    defer inst.ref_bookkeeping.mutex.unlock();
-    if (entry.prev) |p| {
-        p.next = entry.next;
-    } else if (inst.ref_bookkeeping.head == entry) {
-        inst.ref_bookkeeping.head = entry.next;
-    }
-    if (entry.next) |n| n.prev = entry.prev;
-    entry.prev = null;
-    entry.next = null;
 }
 
 // ----------------------------------------------------------------------
@@ -299,48 +224,6 @@ fn weakBackendRelease(ctx: ActiveEngine.Context, cell: *WeakCell) void {
     }
 }
 
-/// One native retain (refcount dup or GC protect). Callers (Rooted) must not invoke this on every `root()`. Hermes uses `cell.identity` (weak object / durable primitive) so re-root works after the protect-map wrapper is released.
-fn rootBackendProtect(ctx: ActiveEngine.Context, cell: *RootCell) ?Local {
-    return switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootProtect(ctx, cell.val),
-        .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootProtect(ctx, cell.val),
-        .escargot => ActiveEngine.dupValue(ctx, cell.val),
-        .hermes => blk: {
-            const c = @import("../backend/hermes/c_api.zig");
-            const id = cell.identity orelse break :blk null;
-            const v = c.hermes_root_protect(ctx, @ptrCast(id));
-            break :blk if (v == null) null else v;
-        },
-    };
-}
-
-/// Drop the single retain taken by `rootBackendProtect`.
-fn rootBackendUnprotect(ctx: ActiveEngine.Context, v: Local) void {
-    switch (backend.active_backend) {
-        .quickjs, .quickjs_ng => @import("../backend.zig").ActiveEngineModule.weak.jsbay_qjsRootUnprotect(ctx, v),
-        .jsc => @import("../backend/jsc/weak.zig").jsbay_qjsRootUnprotect(ctx, v),
-        .escargot, .hermes => ActiveEngine.freeValue(ctx, v),
-    }
-}
-
-fn rootBackendIdentityCreate(ctx: ActiveEngine.Context, v: Local) ?*anyopaque {
-    return switch (backend.active_backend) {
-        .hermes => blk: {
-            const c = @import("../backend/hermes/c_api.zig");
-            break :blk @ptrCast(c.hermes_root_identity_create(ctx, v));
-        },
-        else => null,
-    };
-}
-
-fn rootBackendIdentityFree(ctx: ActiveEngine.Context, identity: ?*anyopaque) void {
-    const id = identity orelse return;
-    if (comptime backend.active_backend == .hermes) {
-        const c = @import("../backend/hermes/c_api.zig");
-        c.hermes_root_identity_free(ctx, @ptrCast(id));
-    }
-}
-
 // ----------------------------------------------------------------------
 // Global(T)
 // ----------------------------------------------------------------------
@@ -358,9 +241,10 @@ pub fn Global(comptime T: type) type {
 
         /// Create a Global that retains `v`. Duplicates the refcount / calls `JSValueProtect` so the value outlives any scope it was created in.
         pub fn init(instance_id: i32, v: Local) Self {
-            const inst = instance_map.getInstance(instance_id) orelse {
-                return Self{ .instance_id = instance_id, .cell = null };
-            };
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, instance_id, null)) return Self{ .instance_id = instance_id, .cell = null };
+            defer op.end();
+            const inst = op.lease.inst;
             const ctx = inst.monoCtx() orelse {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
@@ -368,8 +252,9 @@ pub fn Global(comptime T: type) type {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
             cell.* = .{
-                .entry = .{ .reset_fn = GlobalCell.releaseValue },
+                .entry = .{ .reset_fn = GlobalCell.releaseValue, .free_fn = GlobalCell.freeCell },
                 .instance_id = instance_id,
+                .generation = op.lease.generation,
                 .ctx = ctx,
                 .allocator = inst.allocator,
                 .val = ActiveEngine.dupValue(ctx, v),
@@ -385,27 +270,36 @@ pub fn Global(comptime T: type) type {
 
         pub fn isEmpty(self: Self) bool {
             const cell = self.cell orelse return true;
-            return cell.released;
+            return cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked);
         }
 
         /// Return a freshly-duplicated Value. Caller owns the result and must free it with `ActiveEngine.freeValue`.
         pub fn get(self: Self) ?Local {
             const cell = self.cell orelse return null;
-            if (cell.released) return null;
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return null;
+            defer op.end();
+            if (cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked)) return null;
             return ActiveEngine.dupValue(cell.ctx, cell.val);
         }
 
         /// Release the retained value and free the underlying cell. Safe to call multiple times.
         pub fn reset(self: *Self) void {
             const cell = self.cell orelse return;
-            const alloc = cell.allocator;
-            if (!cell.released) {
-                // Unlink from bookkeeping first, then release value.
-                unregisterEntry(cell.instance_id, &cell.entry);
-                GlobalCell.releaseValue(&cell.entry);
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) {
+                abandonEntry(&cell.entry);
+                self.cell = null;
+                return;
             }
-            // Now that the cell is no longer linked into bookkeeping and its JS value has been released, free the cell itself.
-            alloc.destroy(cell);
+            defer op.end();
+            if (cell.entry.state.cmpxchgStrong(@backingInt(instance_map.RefEntryState.linked), @backingInt(instance_map.RefEntryState.releasing), .acq_rel, .acquire) == null) {
+                unregisterEntry(op.lease.inst, &cell.entry);
+                GlobalCell.releaseValue(&cell.entry);
+                finishRefRelease(&cell.entry);
+            } else {
+                abandonEntry(&cell.entry);
+            }
             self.cell = null;
         }
 
@@ -430,9 +324,10 @@ pub fn Weak(comptime T: type) type {
         cell: ?*WeakCell = null,
 
         pub fn init(instance_id: i32, v: Local) Self {
-            const inst = instance_map.getInstance(instance_id) orelse {
-                return Self{ .instance_id = instance_id, .cell = null };
-            };
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, instance_id, null)) return Self{ .instance_id = instance_id, .cell = null };
+            defer op.end();
+            const inst = op.lease.inst;
             const ctx = inst.monoCtx() orelse {
                 return Self{ .instance_id = instance_id, .cell = null };
             };
@@ -443,8 +338,9 @@ pub fn Weak(comptime T: type) type {
             const is_obj = weakBackendIsObject(ctx, v);
             if (is_obj) {
                 cell.* = .{
-                    .entry = .{ .reset_fn = WeakCell.releaseValue },
+                    .entry = .{ .reset_fn = WeakCell.releaseValue, .free_fn = WeakCell.freeCell },
                     .instance_id = instance_id,
+                    .generation = op.lease.generation,
                     .ctx = ctx,
                     .allocator = inst.allocator,
                     .kind = .object,
@@ -457,8 +353,9 @@ pub fn Weak(comptime T: type) type {
                 }
             } else {
                 cell.* = .{
-                    .entry = .{ .reset_fn = WeakCell.releaseValue },
+                    .entry = .{ .reset_fn = WeakCell.releaseValue, .free_fn = WeakCell.freeCell },
                     .instance_id = instance_id,
+                    .generation = op.lease.generation,
                     .ctx = ctx,
                     .allocator = inst.allocator,
                     .kind = .primitive,
@@ -477,7 +374,10 @@ pub fn Weak(comptime T: type) type {
         /// True when the Weak is unbacked, has been reset, or (for object-kind cells) the target has been collected.
         pub fn isEmpty(self: Self) bool {
             const cell = self.cell orelse return true;
-            if (cell.released) return true;
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return true;
+            defer op.end();
+            if (cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked)) return true;
             if (cell.kind == .object) {
                 return weakBackendGetLive(cell.ctx, cell) == null;
             }
@@ -487,7 +387,10 @@ pub fn Weak(comptime T: type) type {
         /// Returns the stored value without duplicating the caller's refcount. The returned `Local` is borrowed — its lifetime matches the underlying JS value (which, by definition of Weak, could be collected after this call).
         pub fn get(self: Self) ?Local {
             const cell = self.cell orelse return null;
-            if (cell.released) return null;
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) return null;
+            defer op.end();
+            if (cell.entry.state.load(.acquire) != @backingInt(instance_map.RefEntryState.linked)) return null;
             switch (cell.kind) {
                 .primitive => return cell.val,
                 .object => {
@@ -498,12 +401,20 @@ pub fn Weak(comptime T: type) type {
 
         pub fn reset(self: *Self) void {
             const cell = self.cell orelse return;
-            const alloc = cell.allocator;
-            if (!cell.released) {
-                unregisterEntry(cell.instance_id, &cell.entry);
-                WeakCell.releaseValue(&cell.entry);
+            var op: RefOperation = undefined;
+            if (!beginRefOperation(&op, cell.instance_id, cell.generation)) {
+                abandonEntry(&cell.entry);
+                self.cell = null;
+                return;
             }
-            alloc.destroy(cell);
+            defer op.end();
+            if (cell.entry.state.cmpxchgStrong(@backingInt(instance_map.RefEntryState.linked), @backingInt(instance_map.RefEntryState.releasing), .acq_rel, .acquire) == null) {
+                unregisterEntry(op.lease.inst, &cell.entry);
+                WeakCell.releaseValue(&cell.entry);
+                finishRefRelease(&cell.entry);
+            } else {
+                abandonEntry(&cell.entry);
+            }
             self.cell = null;
         }
 
@@ -511,131 +422,4 @@ pub fn Weak(comptime T: type) type {
             self.reset();
         }
     };
-}
-
-// ----------------------------------------------------------------------
-// Rooted — refcounted protect (0→1 retains, back to 0 releases)
-// ----------------------------------------------------------------------
-
-/// Heap cell for `Rooted`. The native retain is a single protect/dup held only while `root_count > 0`. Extra `root` calls bump the counter and do not call the backend again.
-///
-/// On Hermes, `identity` holds a reusable weak object reference (or durable primitive copy) separate from the protect-map wrapper in `val`. Unroot releases only the wrapper so a later `root` can protect the still-live object again.
-const RootCell = struct {
-    entry: instance_map.RefEntry,
-    instance_id: i32,
-    ctx: ActiveEngine.Context,
-    allocator: std.mem.Allocator,
-    val: ActiveEngine.Value,
-    /// Hermes-only durable identity (`HermesRootIdentity`). Null on other backends.
-    identity: ?*anyopaque = null,
-    root_count: u32 = 0,
-    /// True while the single native protect/dup from `rootBackendProtect` is outstanding.
-    protected: bool = false,
-    released: bool = false,
-
-    fn releaseValue(entry: *instance_map.RefEntry) void {
-        const cell: *RootCell = @fieldParentPtr("entry", entry);
-        if (cell.released) return;
-        if (cell.protected) {
-            rootBackendUnprotect(cell.ctx, cell.val);
-            cell.protected = false;
-        }
-        if (cell.identity) |id| {
-            rootBackendIdentityFree(cell.ctx, id);
-            cell.identity = null;
-        }
-        cell.root_count = 0;
-        cell.released = true;
-    }
-};
-
-/// Refcounted root of one JS value.
-///
-/// `root` twice then `unroot` once leaves the value protected. A further `unroot` that brings the count to 0 drops the native retain, after which a GC may collect the object. `unroot` at 0 is a no-op. This does not change `Global`, which still protects exactly once in `init`.
-///
-/// Hermes keeps a weak identity across unroot so re-rooting a still-live object creates a fresh protect-map wrapper; other backends reuse the durable value handle itself.
-///
-/// The cell is registered with engine bookkeeping so `engine.destroy` releases a leftover protect before the runtime is freed.
-pub const Rooted = struct {
-    instance_id: i32,
-    cell: ?*RootCell = null,
-
-    /// Store `v` with a root count of 0. Does not protect yet.
-    pub fn init(instance_id: i32, v: Local) Rooted {
-        const inst = instance_map.getInstance(instance_id) orelse {
-            return Rooted{ .instance_id = instance_id, .cell = null };
-        };
-        const ctx = inst.monoCtx() orelse {
-            return Rooted{ .instance_id = instance_id, .cell = null };
-        };
-        const cell = inst.allocator.create(RootCell) catch {
-            return Rooted{ .instance_id = instance_id, .cell = null };
-        };
-        const identity = rootBackendIdentityCreate(ctx, v);
-        if (comptime backend.active_backend == .hermes) {
-            if (identity == null) {
-                inst.allocator.destroy(cell);
-                return Rooted{ .instance_id = instance_id, .cell = null };
-            }
-        }
-        cell.* = .{
-            .entry = .{ .reset_fn = RootCell.releaseValue },
-            .instance_id = instance_id,
-            .ctx = ctx,
-            .allocator = inst.allocator,
-            .val = v,
-            .identity = identity,
-        };
-        registerEntryDirect(inst, &cell.entry);
-        return Rooted{ .instance_id = instance_id, .cell = cell };
-    }
-
-    pub fn isEmpty(self: Rooted) bool {
-        const cell = self.cell orelse return true;
-        return cell.released or cell.root_count == 0;
-    }
-
-    /// Increment the root count. The backend protect runs only on 0→1.
-    pub fn root(self: *Rooted) void {
-        const cell = self.cell orelse return;
-        if (cell.released) return;
-        if (cell.root_count == 0) {
-            const protected_val = rootBackendProtect(cell.ctx, cell) orelse return;
-            cell.val = protected_val;
-            cell.protected = true;
-        }
-        cell.root_count += 1;
-    }
-
-    /// Decrement the root count. The backend release runs only when the count returns to 0. Extra calls at 0 do nothing.
-    pub fn unroot(self: *Rooted) void {
-        const cell = self.cell orelse return;
-        if (cell.released or cell.root_count == 0) return;
-        cell.root_count -= 1;
-        if (cell.root_count == 0 and cell.protected) {
-            rootBackendUnprotect(cell.ctx, cell.val);
-            cell.protected = false;
-            // Hermes: drop the freed wrapper address; re-root rebuilds from `identity`.
-            if (comptime backend.active_backend == .hermes) {
-                cell.val = ActiveEngine.undefinedValue();
-            }
-        }
-    }
-
-    /// Unlink, drop a leftover protect, and free the cell.
-    pub fn deinit(self: *Rooted) void {
-        const cell = self.cell orelse return;
-        const alloc = cell.allocator;
-        if (!cell.released) {
-            unregisterEntry(cell.instance_id, &cell.entry);
-            RootCell.releaseValue(&cell.entry);
-        }
-        alloc.destroy(cell);
-        self.cell = null;
-    }
-};
-
-test "rootBackendIdentityFree takes the same Context as RootCell, not a nested optional" {
-    const param_types = @typeInfo(@TypeOf(rootBackendIdentityFree)).@"fn".param_types;
-    try std.testing.expectEqual(ActiveEngine.Context, param_types[0].?);
 }

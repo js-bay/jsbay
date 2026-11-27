@@ -65,6 +65,14 @@ pub fn processPendingJobs(ctx: Context) void {
 // ---- Evaluation ----
 
 pub fn eval(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
+    return evalWithResultMode(ctx, script, filename, true);
+}
+
+pub fn evalDiscardingResult(ctx: Context, script: []const u8, filename: []const u8) types.EvalResult {
+    return evalWithResultMode(ctx, script, filename, false);
+}
+
+fn evalWithResultMode(ctx: Context, script: []const u8, filename: []const u8, stringify_result: bool) types.EvalResult {
     const jsc_ctx: jsc.JSContextRef = @ptrCast(ctx);
     const js_script = common.jsStringFromSlice(script) orelse return .{
         .result = null,
@@ -101,6 +109,8 @@ pub fn eval(ctx: Context, script: []const u8, filename: []const u8) types.EvalRe
     }
 
     if (result == null or jsc.JSValueIsUndefined(jsc_ctx, result) or jsc.JSValueIsNull(jsc_ctx, result)) {
+        return .{ .result = null, .err = null };
+    } else if (!stringify_result) {
         return .{ .result = null, .err = null };
     } else if (jsc.JSValueIsObject(jsc_ctx, result)) {
         return .{ .result = common.jsonStringify(jsc_ctx, result), .err = null };

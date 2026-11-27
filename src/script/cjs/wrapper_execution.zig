@@ -5,7 +5,7 @@ const ActiveEngine = backend.ActiveEngine;
 const OwnedValue = @import("../../value/root.zig").OwnedValue;
 
 pub const CallResult = struct { exports: ActiveEngine.Value };
-pub const ExceptionSink = *const fn (ActiveEngine.Context, ActiveEngine.Value) void;
+pub const ExceptionSink = *const fn (ActiveEngine.Context, OwnedValue) void;
 pub const Environment = struct { exports: ActiveEngine.Value, module: ActiveEngine.Value };
 pub const Require = union(enum) {
     module_local: *const fn (ActiveEngine.Context, []const u8) error{ Compile, CallFailed }!ActiveEngine.Value,
@@ -35,7 +35,7 @@ pub fn invoke(ctx: ActiveEngine.Context, wrapper_fn: ActiveEngine.Value, require
     const argv = [_]ActiveEngine.Value{ exports_obj.borrow(), module_obj.borrow(), require_fn, filename_val.borrow(), dirname_val.borrow() };
     const call_result = try callWrapper(ctx, wrapper_fn, &argv, exception_sink);
     ActiveEngine.freeValue(ctx, call_result);
-    const current_exports = try readFinalExports(ctx, module_obj.borrow(), exports_obj.borrow(), exception_sink);
+    const current_exports = try readFinalExports(ctx, module_obj.borrow(), exception_sink);
     return .{ .exports = current_exports };
 }
 
@@ -47,12 +47,23 @@ fn callWrapper(ctx: ActiveEngine.Context, function: ActiveEngine.Value, args: []
         const result = jsc.JSObjectCallAsFunction(ctx_ref, @constCast(function), null, args.len, @ptrCast(args.ptr), &exception);
         if (exception != null) {
             // A nested require may rethrow a captured getter exception. Preserve its identity again as it unwinds through this outer wrapper.
-            exception_sink(ctx, exception);
+            exception_sink(ctx, OwnedValue.init(ctx, ActiveEngine.dupValue(ctx, exception)));
             return error.CallFailed;
         }
         if (result == null) return error.CallFailed;
         jsc.JSValueProtect(ctx_ref, result);
         return result;
+    }
+    if (comptime backend.isSpikeBackend(backend.active_backend)) {
+        if (comptime backend.active_backend == .escargot) {
+            const api = @import("../../backend/escargot/c_api.zig");
+            const result = api.escargot_call_result(ctx, function, ActiveEngine.undefinedValue(), if (args.len == 0) null else args.ptr, args.len);
+            return consumeSpikeResult(ctx, result, exception_sink);
+        } else {
+            const api = @import("../../backend/hermes/c_api.zig");
+            const result = api.hermes_call_result(ctx, function, ActiveEngine.undefinedValue(), if (args.len == 0) null else args.ptr, args.len);
+            return consumeSpikeResult(ctx, result, exception_sink);
+        }
     }
     return ActiveEngine.callFunction(ctx, function, ActiveEngine.undefinedValue(), args) orelse error.CallFailed;
 }
@@ -93,13 +104,12 @@ pub fn newModule(ctx: ActiveEngine.Context, exports: ActiveEngine.Value) error{O
     return module;
 }
 
-/// Final `module.exports` after wrapper execution. QuickJS-family and JSC reads distinguish a successful or missing-property `undefined` from an accessor exception; these CJS-specific paths preserve exceptions instead of using the optional-property helper.
+/// Read final `module.exports` without replacing a successful undefined result with the initial exports object.
 ///
-/// QuickJS-family accessor exceptions remain parked in `ctx` without `JS_GetException`; JSC exceptions go to the supplied exception sink. Both paths return `error.CallFailed`.
+/// QuickJS-family accessor exceptions remain parked in `ctx` without `JS_GetException`. JSC and spike backends transfer owned exceptions to the supplied sink.
 pub fn readFinalExports(
     ctx: ActiveEngine.Context,
     module_obj: ActiveEngine.Value,
-    fallback_exports: ActiveEngine.Value,
     exception_sink: ExceptionSink,
 ) error{CallFailed}!ActiveEngine.Value {
     if (comptime backend.isQuickJsApiBackend(backend.active_backend)) {
@@ -126,16 +136,34 @@ pub fn readFinalExports(
         const val = jsc.JSObjectGetProperty(ctx_ref, @constCast(module_obj), js_key, &exc);
         if (exc != null) {
             // JSC has no parked-context exception. Preserve the value before returning through the Zig error union to the native callback.
-            exception_sink(ctx, exc);
+            exception_sink(ctx, OwnedValue.init(ctx, ActiveEngine.dupValue(ctx, exc)));
             return error.CallFailed;
         }
         if (val == null) return ActiveEngine.newUndefinedVal(ctx);
         jsc.JSValueProtect(ctx_ref, val);
         return val;
     }
-    // Hermes and Escargot use the optional-property helper: return its value when present, otherwise duplicate the initial exports value. This path has no separate error result for accessor failure.
-    return ActiveEngine.getPropertyVal(ctx, module_obj, "exports") orelse
-        ActiveEngine.dupValue(ctx, fallback_exports);
+    if (comptime backend.isSpikeBackend(backend.active_backend)) {
+        const key: [:0]const u8 = "exports";
+        if (comptime backend.active_backend == .escargot) {
+            const result = @import("../../backend/escargot/c_api.zig").escargot_get_property_result(ctx, module_obj, key.ptr);
+            return consumeSpikeResult(ctx, result, exception_sink);
+        } else {
+            const result = @import("../../backend/hermes/c_api.zig").hermes_get_property_result(ctx, module_obj, key.ptr);
+            return consumeSpikeResult(ctx, result, exception_sink);
+        }
+    }
+    unreachable;
+}
+
+fn consumeSpikeResult(ctx: ActiveEngine.Context, result: anytype, exception_sink: ExceptionSink) error{CallFailed}!ActiveEngine.Value {
+    if (result.exception != null) {
+        if (result.value != null) ActiveEngine.freeValue(ctx, result.value);
+        exception_sink(ctx, OwnedValue.init(ctx, result.exception));
+        return error.CallFailed;
+    }
+    if (result.value != null) return result.value;
+    return error.CallFailed;
 }
 
 /// Shared framing bytes remain fingerprinted through the existing cjs_wrapper.zig path.

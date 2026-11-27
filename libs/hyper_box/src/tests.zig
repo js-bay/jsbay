@@ -82,6 +82,37 @@ test "hyper_box doubles, infinities, and sNaN canonicalization" {
     try std.testing.expectEqual(@as(f64, 0.0), val_pos_zero.asFloat());
 }
 
+test "hyper_box ABI golden vectors" {
+    const builtin = @import("builtin");
+
+    try std.testing.expectEqual(@as(u64, 0x8000_0000_0000_0000), Value.fromFloat(-0.0).raw);
+    try std.testing.expectEqual(@as(u64, 0x7FF0_0000_0000_0000), Value.fromFloat(std.math.inf(f64)).raw);
+    try std.testing.expectEqual(@as(u64, 0xFFF0_0000_0000_0000), Value.fromFloat(-std.math.inf(f64)).raw);
+    try std.testing.expectEqual(@as(u64, 0x0000_0000_0000_0001), Value.fromFloat(@as(f64, @bitCast(@as(u64, 1)))).raw);
+    try std.testing.expectEqual(@as(u64, 0x7FF8_0000_0000_0000), Value.fromFloat(@as(f64, @bitCast(@as(u64, 0x7FF0_0000_0000_0001)))).raw);
+    try std.testing.expectEqual(@as(u64, 0x7FF8_0000_0000_0000), Value.fromFloat(@as(f64, @bitCast(@as(u64, 0xFFF0_0000_0000_0001)))).raw);
+
+    try std.testing.expectEqual(@as(u64, 0xFFF8_0000_7FFF_FFFF), Value.fromInt32(std.math.maxInt(i32)).raw);
+    try std.testing.expectEqual(@as(u64, 0xFFF8_0000_8000_0000), Value.fromInt32(std.math.minInt(i32)).raw);
+    try std.testing.expectEqual(@as(u64, 0xFFFA_0000_0000_0000), Value.undefinedValue().raw);
+    try std.testing.expectEqual(@as(u64, 0xFFFA_0000_0000_0001), Value.nullValue().raw);
+
+    const utf8 = Value.fromSso("é").?;
+    const expected_utf8_raw: u64 = if (builtin.cpu.arch.endian() == .little)
+        0xFFFE_0200_0000_A9C3
+    else
+        0xFFFE_02C3_A900_0000;
+    try std.testing.expectEqual(expected_utf8_raw, utf8.raw);
+    try std.testing.expectEqualStrings("é", utf8.asSsoBytes().slice());
+
+    const negative_zero_bytes: [8]u8 = @bitCast(Value.fromFloat(-0.0).raw);
+    const expected_negative_zero_bytes: [8]u8 = if (builtin.cpu.arch.endian() == .little)
+        .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 }
+    else
+        .{ 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    try std.testing.expectEqual(expected_negative_zero_bytes, negative_zero_bytes);
+}
+
 test "hyper_box int32 integers" {
     const val_zero = Value.fromInt32(0);
     try std.testing.expect(val_zero.isInt32());
@@ -239,6 +270,49 @@ test "generational_slot_map FIFO slot cycling and ABA prevention" {
     _ = map.remove(h3);
     _ = map.remove(h4);
     try testing.expectEqual(@as(usize, 0), map.active_count);
+}
+
+test "generational_slot_map preserves full instance IDs with matching low bits" {
+    const testing = std.testing;
+    var map = GenerationalSlotMap(u32).init(testing.allocator);
+    defer map.deinit();
+
+    const ids = [_]i32{ 0, 4096, -4096 };
+    const values = [_]u32{ 10, 20, 30 };
+    var handles: [ids.len]u64 = undefined;
+
+    for (ids, values, 0..) |instance_id, value, index| {
+        handles[index] = try map.insert(instance_id, value, false);
+    }
+
+    for (ids, values, handles) |instance_id, value, handle| {
+        const entry = map.get(handle).?;
+        try testing.expectEqual(instance_id, entry.instance_id);
+        try testing.expectEqual(value, entry.value);
+        try testing.expectEqual(instance_id, map.instanceFor(handle).?);
+    }
+
+    for (handles) |handle| {
+        try testing.expect(map.remove(handle) != null);
+        try testing.expect(map.get(handle) == null);
+        try testing.expect(map.instanceFor(handle) == null);
+    }
+}
+
+test "generational_slot_map allocates the last u20 slot index" {
+    const testing = std.testing;
+    var map = GenerationalSlotMap(u32).init(testing.allocator);
+    defer map.deinit();
+
+    const slot_count = @as(usize, 1) << 20;
+    var last_handle: u64 = 0;
+    for (0..slot_count) |value| {
+        last_handle = try map.insert(1, @intCast(value), false);
+    }
+
+    const last = (Value{ .raw = last_handle }).decodeHandle();
+    try testing.expectEqual(@as(u20, std.math.maxInt(u20)), last.slot_index);
+    try testing.expectError(error.OutOfMemory, map.insert(1, 0, false));
 }
 
 test "generational_slot_map reservation, commit, and safe cancel" {

@@ -13,14 +13,19 @@ if [[ ! -f "$SRC/CMakeLists.txt" ]]; then
   exit 1
 fi
 
-PATCH="$ROOT/vendor/escargot-debugger.patch"
-if [[ -f "$PATCH" ]]; then
-  if patch -d "$SRC" -p1 --reverse --dry-run < "$PATCH" >/dev/null 2>&1; then
-    echo "Escargot debugger patch already applied"
-  else
-    patch -d "$SRC" -p1 --forward --batch < "$PATCH"
+for patch_file in "$ROOT/vendor/escargot-debugger.patch" "$ROOT/vendor/escargot-shared-gc.patch"; do
+  if [[ -f "$patch_file" ]]; then
+    if git -C "$SRC" apply --check --reverse "$patch_file" >/dev/null 2>&1; then
+      echo "Escargot patch $(basename "$patch_file") already applied"
+    elif git -C "$SRC" apply --check "$patch_file" >/dev/null 2>&1; then
+      git -C "$SRC" apply "$patch_file"
+    elif patch -d "$SRC" -p1 --reverse --dry-run -i "$patch_file" < /dev/null >/dev/null 2>&1; then
+      echo "Escargot patch $(basename "$patch_file") already applied"
+    else
+      patch -d "$SRC" -p1 --forward --batch -f -i "$patch_file" < /dev/null
+    fi
   fi
-fi
+done
 
 mkdir -p "$BUILD" "$PREFIX/lib" "$PREFIX/include"
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
@@ -60,12 +65,22 @@ if [[ -f "$SRC/src/api/EscargotPublic.h" ]]; then
   # related public headers
   find "$SRC/src/api" -maxdepth 1 -name '*.h' -exec cp -f {} "$PREFIX/include/" \;
 fi
+if [[ -d "$SRC/third_party/GCutil/include/gc" ]]; then
+  mkdir -p "$PREFIX/include/gc"
+  cp -f "$SRC/third_party/GCutil/include/gc/"*.h "$PREFIX/include/gc/"
+  cp -f "$SRC/third_party/GCutil/include/"*.h "$PREFIX/include/" 2>/dev/null || true
+fi
 
 # Bridge .o (static into Zig link). Needs g++ with local-exec TLS (GNU2).
 : "${CXX:=g++}"
 "$CXX" -c -std=c++17 -O0 -g -fPIC -DESCARGOT_DEBUGGER \
   -I "$ROOT/src/backend/escargot" -I "$PREFIX/include" \
   -o "$PREFIX/lib/escargot_bridge.o" \
+  "$ROOT/src/backend/escargot/escargot_bridge.cpp"
+
+"$CXX" -c -std=c++17 -O0 -g -fPIC -DESCARGOT_DEBUGGER -DJSBAY_TESTING \
+  -I "$ROOT/src/backend/escargot" -I "$PREFIX/include" \
+  -o "$PREFIX/lib/escargot_bridge_testing.o" \
   "$ROOT/src/backend/escargot/escargot_bridge.cpp"
 
 bash "$ROOT/scripts/native-prefix-stamp.sh" escargot write "$PREFIX"

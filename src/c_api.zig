@@ -21,10 +21,55 @@ const typed_bytecode = @import("script/typed_bytecode.zig");
 const native_sync = @import("js_event_loop").native_sync;
 const host_wake = @import("js_event_loop").host_wake;
 const submission = @import("runtime/submission.zig");
+const instance_registry = @import("runtime/instance_map.zig");
 const api_async = @import("abi/api_async.zig");
 const value_buffers = @import("value/buffers.zig");
 
 const ActiveEngine = backend.ActiveEngine;
+
+var destroy_admission_hook_for_testing: ?*const fn (i32, ?*anyopaque) void = null;
+var destroy_admission_hook_context_for_testing: ?*anyopaque = null;
+
+pub const DestroyStageForTesting = enum { before_detach, after_detach, before_wake_drop, after_wake_drop };
+var destroy_stage_hook_for_testing: ?*const fn (i32, DestroyStageForTesting, ?*anyopaque) void = null;
+var destroy_stage_hook_context_for_testing: ?*anyopaque = null;
+
+const DestroySignalFrame = struct {
+    instance_id: i32,
+    previous: ?*DestroySignalFrame,
+};
+
+threadlocal var destroy_signal_top: ?*DestroySignalFrame = null;
+
+fn destroySignalsActive(instance_id: i32) bool {
+    var frame = destroy_signal_top;
+    while (frame) |current| : (frame = current.previous) {
+        if (current.instance_id == instance_id) return true;
+    }
+    return false;
+}
+
+fn setDestroyAdmissionHookForTesting(hook: ?*const fn (i32, ?*anyopaque) void, context: ?*anyopaque) void {
+    if (!builtin.is_test) return;
+    destroy_admission_hook_context_for_testing = context;
+    destroy_admission_hook_for_testing = hook;
+}
+
+fn notifyDestroyAdmissionHookForTesting(instance_id: i32) void {
+    if (!builtin.is_test) return;
+    if (destroy_admission_hook_for_testing) |hook| hook(instance_id, destroy_admission_hook_context_for_testing);
+}
+
+fn setDestroyStageHookForTesting(hook: ?*const fn (i32, DestroyStageForTesting, ?*anyopaque) void, context: ?*anyopaque) void {
+    if (!builtin.is_test) return;
+    destroy_stage_hook_context_for_testing = context;
+    destroy_stage_hook_for_testing = hook;
+}
+
+fn notifyDestroyStageHookForTesting(instance_id: i32, stage: DestroyStageForTesting) void {
+    if (!builtin.is_test) return;
+    if (destroy_stage_hook_for_testing) |hook| hook(instance_id, stage, destroy_stage_hook_context_for_testing);
+}
 
 // ---- Library identity (compile-time -Dbackend; no instance) ----
 
@@ -51,6 +96,28 @@ pub export fn jsbay_library_capabilities(out_caps: ?*EngineCapabilitiesC) bool {
         .struct_size = caller_size,
         .backend = backend.libraryBackendC(),
         .flags = backend.libraryCapabilityFlags(),
+    };
+    const copy_len = @min(caller_size, @sizeOf(EngineCapabilitiesC));
+    const src: [*]const u8 = @ptrCast(&filled);
+    const dst: [*]u8 = @ptrCast(out);
+    @memset(dst[0..caller_size], 0);
+    @memcpy(dst[0..copy_len], src[0..copy_len]);
+    out.struct_size = caller_size;
+    return true;
+}
+
+/// Fill capabilities for the selected instance. Any thread; refuses missing or tearing-down instances.
+pub export fn jsbay_engine_capabilities(instance_id: c_int, out_caps: ?*EngineCapabilitiesC) bool {
+    const out = out_caps orelse return false;
+    const caller_size = out.struct_size;
+    if (caller_size < @sizeOf(u32)) return false;
+    const lease = instance_registry.beginControlPlane(@intCast(instance_id)) orelse return false;
+    defer lease.end();
+    const tag = lease.inst.backendTag();
+    const filled = EngineCapabilitiesC{
+        .struct_size = caller_size,
+        .backend = backend.backendToC(tag),
+        .flags = backend.capabilityFlagsFor(tag, lease.inst.isPrimaryBackend()),
     };
     const copy_len = @min(caller_size, @sizeOf(EngineCapabilitiesC));
     const src: [*]const u8 = @ptrCast(&filled);
@@ -128,6 +195,7 @@ pub export fn jsbay_engine_create_with_options(
             error.InstanceInsertFailed => lh(id, .err, "engine creation failed: instance insert failed", log_user_data),
             error.ResourceInitFailed => lh(id, .err, "engine creation failed: resource init failed", log_user_data),
             error.RuntimeInitFailed => lh(id, .err, "engine creation failed: runtime init failed", log_user_data),
+            error.TeardownWorkerStartFailed => lh(id, .err, "engine creation failed: teardown worker start failed", log_user_data),
         };
         return false;
     };
@@ -1039,6 +1107,9 @@ pub const test_only = if (builtin.is_test) struct {
     pub const dispatchCString = testDispatchCString;
     pub const failNextKeyAllocation = key_fault.request;
     pub const setSyncStartObservers = sync_start_observer.set;
+    pub const setDestroyAdmissionHook = setDestroyAdmissionHookForTesting;
+    pub const DestroyStage = DestroyStageForTesting;
+    pub const setDestroyStageHook = setDestroyStageHookForTesting;
 } else struct {};
 
 // QuickJS measures this budget against the native stack pointer, so it must stay below common host thread stack sizes.
@@ -1316,21 +1387,44 @@ test "c_api: engine creation keeps recursion below native stack limits" {
 pub export fn jsbay_engine_destroy(instance_id: c_int) void {
     if (host_wake.isNotifying()) return;
     const id: i32 = @intCast(instance_id);
-    // Owner-thread destroy is the common path (release values first, then destroy). A non-owner may also destroy: it closes admission and joins teardown so "destroy then Worker.terminate" does not kill an owner still inside run_loop or deferred cleanup. Attached-loop detach stays on the owner when this is the owner thread; destroyRuntime detaches after loop scopes have drained when destroy runs elsewhere.
-    if (api_value.isOwner(id)) {
-        engine.detachLoop(id);
-    } else if (!api_value.hasOwner(id) and engine.getContext(id) == null) {
-        // No live public instance. Still enter engine.destroy so a racer can join a deferred teardown whose owners were already dropped.
-        engine.destroy(id);
+    if (destroySignalsActive(id)) return;
+    // Choose the instance lifetime and close its public admission before touching any ID-indexed host state.
+    const generation = instance_registry.closeAdmissionAndGetGeneration(id) orelse return;
+    notifyDestroyAdmissionHookForTesting(id);
+    notifyDestroyStageHookForTesting(id, .before_detach);
+    notifyDestroyStageHookForTesting(id, .before_wake_drop);
+
+    const signals = instance_registry.beginTeardownSignals(id, generation) orelse {
+        engine.destroyForGeneration(id, generation);
         return;
+    };
+    {
+        var frame = DestroySignalFrame{
+            .instance_id = id,
+            .previous = destroy_signal_top,
+        };
+        destroy_signal_top = &frame;
+        defer {
+            destroy_signal_top = frame.previous;
+            signals.end();
+        }
+
+        // Preserve destroy-then-terminate behavior while keeping detach and wake removal bound to the selected generation.
+        const owner = api_value.isOwner(id);
+        const has_owner = api_value.hasOwner(id);
+        const has_context = engine.getContext(id) != null;
+        if (owner) {
+            engine.detachLoop(id);
+            notifyDestroyStageHookForTesting(id, .after_detach);
+        }
+        if (owner or has_owner or has_context) {
+            host_wake.drop(id);
+            notifyDestroyStageHookForTesting(id, .after_wake_drop);
+            // A native callback may be asleep on a condition while teardown waits for it to unwind.
+            native_sync.cancelForInstance(id);
+        }
     }
-    // Runtime destruction can be deferred until a host callback unwinds, but foreign hosts may release notification userdata as soon as this returns.
-    host_wake.drop(id);
-    // Engine.destroy defers physical teardown while a native callback is on the JS stack. Close the public ABI immediately so its outer operation cannot publish a just-created Value after that callback returns.
-    @import("runtime/instance_map.zig").markTeardownPending(id);
-    // destroy may be deferred until this callback unwinds, so wake a sync native wait now rather than waiting for engine.destroyNow().
-    native_sync.cancelForInstance(id);
-    engine.destroy(id);
+    engine.destroyForGeneration(id, generation);
 }
 
 /// Listen for a DevTools connection. `port` 0 picks an ephemeral port. On success, `out_port` receives the bound port when it is non-NULL. A connected client sends Debugger.enable to arm `debugger;` statements. Returns false when the instance is missing or an inspector is already up.
@@ -1518,15 +1612,32 @@ pub export fn jsbay_engine_shutdown_status(instance_id: c_int, generation: u64, 
     return true;
 }
 
+fn acceptsPublicSubmission(instance_id: i32, generation: u64) bool {
+    return instance_registry.withInstanceReturn(instance_id, struct {
+        expected_generation: u64,
+
+        pub fn call(self: @This(), inst: *instance_registry.EngineInstance) ?bool {
+            return inst.generation == self.expected_generation and
+                inst.isPrimaryBackend() and
+                !inst.teardown_pending and
+                !inst.task_admission_closed;
+        }
+    }{ .expected_generation = generation }) orelse false;
+}
+
 pub export fn jsbay_engine_post_script(instance_id: c_int, generation: u64, source_arg: Utf8, filename_arg: Utf8, callback: ?submission.Callback, user_data: ?*anyopaque) bool {
     const source = checkedUtf8(source_arg) orelse return false;
     const filename = checkedUtf8(filename_arg) orelse return false;
     if (!std.unicode.utf8ValidateSlice(source) or !std.unicode.utf8ValidateSlice(filename) or !noEmbeddedNul(filename)) return false;
-    return submission.postScript(@intCast(instance_id), generation, source, filename, callback, user_data);
+    const id: i32 = @intCast(instance_id);
+    if (!acceptsPublicSubmission(id, generation)) return false;
+    return submission.postScript(id, generation, source, filename, callback, user_data);
 }
 
 pub export fn jsbay_engine_post_fence(instance_id: c_int, generation: u64, seal_shutdown: bool, callback: ?submission.Callback, user_data: ?*anyopaque) bool {
-    return submission.postFence(@intCast(instance_id), generation, seal_shutdown, callback, user_data);
+    const id: i32 = @intCast(instance_id);
+    if (!acceptsPublicSubmission(id, generation)) return false;
+    return submission.postFence(id, generation, seal_shutdown, callback, user_data);
 }
 
 /// Cap the runtime's heap at `bytes` (0 = unlimited). QuickJS enforces it via JS_SetMemoryLimit. JSC has no public heap-cap API and returns false (same contract as `runtime_control.setMemoryLimit` / the C header).
@@ -1786,6 +1897,7 @@ pub export fn jsbay_engine_set_error_observer(
     if (!api_value.isOwner(id)) return API_WRONG_THREAD;
     const lease = engine_thread.beginEval(id);
     if (!lease.allowed) {
+        if (lease.failure == .out_of_memory) return API_OUT_OF_MEMORY;
         return if (@import("runtime/instance_map.zig").isTeardownPending(id) or !api_value.hasOwner(id)) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
     }
     defer engine.finishEvalEntry(id, lease);
@@ -2693,28 +2805,47 @@ fn isPackedOperand(handle: u64) bool {
     return packed_api_value.isPackedHandle(handle) or val.isSso();
 }
 
-fn evaluatePackedAlt(instance_id: i32, source: []const u8, filename: []const u8, out_value: *u64, out_exception: *u64) c_int {
-    out_value.* = 0;
-    out_exception.* = 0;
-    if (!api_value.isOwner(instance_id)) {
-        return if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
-    }
-    const tag = packedTagOf(instance_id) orelse return API_INSTANCE_NOT_FOUND;
-    const handles = packedHandlesOf(instance_id) orelse return API_INSTANCE_NOT_FOUND;
-    const lease = engine_thread.beginEval(instance_id);
+threadlocal var evaluate_lookup_test_hook: ?*const fn (i32) void = null;
+
+test "c_api: evaluate rejects an instance replaced before admission" {
+    const id = @import("tests/test_helpers.zig").nextInstanceId();
+    try std.testing.expect(jsbay_engine_create(id, null, null));
+    const Probe = struct {
+        var recreated = false;
+        fn destroyOnWorker(instance_id: i32) void {
+            jsbay_engine_destroy(instance_id);
+        }
+        fn replace(instance_id: i32) void {
+            const worker = std.Thread.spawn(.{}, destroyOnWorker, .{instance_id}) catch unreachable;
+            worker.join();
+            recreated = jsbay_engine_create(instance_id, null, null);
+        }
+    };
+    Probe.recreated = false;
+    evaluate_lookup_test_hook = Probe.replace;
+    defer evaluate_lookup_test_hook = null;
+    defer if (Probe.recreated) jsbay_engine_destroy(id);
+    var value: u64 = 0;
+    var exception: u64 = 0;
+    const status = jsbay_engine_evaluate(id, .{ .data = "1", .len = 1 }, .{ .data = "test", .len = 4 }, null, &value, &exception);
+    if (status == API_OK) _ = jsbay_value_release(value);
+    try std.testing.expect(Probe.recreated);
+    try std.testing.expectEqual(API_INSTANCE_NOT_FOUND, status);
+}
+
+fn evaluatePackedAlt(inst: *@import("runtime/instance_map.zig").EngineInstance, lease: engine_thread.EvalLease, source: []const u8, filename: []const u8, cache_requested: bool, out_value: *u64, out_exception: *u64) c_int {
+    const instance_id = inst.instance_id;
     defer engine.finishEvalEntry(instance_id, lease);
-    if (!lease.allowed) {
-        return if (@import("runtime/instance_map.zig").getPtrs(instance_id) == null) API_INSTANCE_NOT_FOUND else API_WRONG_THREAD;
-    }
-    if (@import("runtime/instance_map.zig").getInstance(instance_id)) |inst| {
-        if (inst.loop.lastError() != null) return API_LOOP_FAILED;
-    }
+    if (cache_requested) return API_UNSUPPORTED;
+    if (inst.loop.lastError() != null) return API_LOOP_FAILED;
+    const alt = inst.engine_handles.packed_alt;
+    const tag = alt.tag;
+    const handles: @import("backend_dispatch.zig").Handles = .{ .runtime_addr = alt.runtime_addr, .ctx_addr = alt.ctx_addr };
     var execution = @import("runtime/js_scheduler.zig").beginExecution(instance_id) orelse return API_INSTANCE_NOT_FOUND;
     @import("inspector/debugger.zig").noteScript(instance_id, filename, source);
     @import("inspector/debugger.zig").clearExceptionHold(instance_id);
     const result = @import("backend_dispatch.zig").evalValuePacked(tag, handles, source, filename);
-    execution.end();
-    @import("runtime/js_scheduler.zig").checkpointInstance(instance_id);
+    @import("runtime/js_scheduler.zig").checkpointInstanceAfterExecution(&execution);
     if (@import("runtime/instance_map.zig").isTeardownPending(instance_id)) {
         if (result.value) |v| @import("backend_dispatch.zig").timerFreeValue(tag, handles.ctx_addr, v.slice());
         if (result.exception) |e| @import("backend_dispatch.zig").timerFreeValue(tag, handles.ctx_addr, e.slice());
@@ -2750,14 +2881,29 @@ pub export fn jsbay_engine_evaluate(instance_id_raw: c_int, source_arg: Utf8, fi
         if ((cache_dir.len == 0) != (cache_version.len == 0)) return API_INVALID_ARGUMENT;
     }
     const id: i32 = @intCast(instance_id_raw);
-    if (@import("runtime/instance_map.zig").getInstance(id)) |inst| {
-        if (!inst.isPrimaryBackend()) {
-            // Empty options (or all-empty cache fields) are accepted; bytecode cache itself is primary-only.
-            if (cache_dir.len != 0 or cache_version.len != 0) return API_UNSUPPORTED;
-            return evaluatePackedAlt(id, source, filename, out_value, out_exception);
-        }
+    const instance_map = @import("runtime/instance_map.zig");
+    if (host_wake.isNotifying()) return API_INVALID_ARGUMENT;
+    const generation = instance_map.captureGeneration(id) orelse return API_INSTANCE_NOT_FOUND;
+    if (builtin.is_test) if (evaluate_lookup_test_hook) |hook| hook(id);
+    if (!api_value.isOwner(id)) {
+        return if (instance_map.captureGeneration(id) == generation) API_WRONG_THREAD else API_INSTANCE_NOT_FOUND;
     }
-    var op = switch (beginApiOp(id)) {
+    const lease = engine_thread.beginEvalForGeneration(id, generation);
+    if (!lease.allowed) {
+        if (instance_map.captureGeneration(id) != generation) return API_INSTANCE_NOT_FOUND;
+        return switch (lease.failure) {
+            .none => API_WRONG_THREAD,
+            .out_of_memory => API_OUT_OF_MEMORY,
+        };
+    }
+    const inst = instance_map.getInstance(id) orelse {
+        engine.finishEvalEntry(id, lease);
+        return API_INSTANCE_NOT_FOUND;
+    };
+    if (inst.engine_handles == .packed_alt) {
+        return evaluatePackedAlt(inst, lease, source, filename, cache_dir.len != 0, out_value, out_exception);
+    }
+    var op = switch (value_operation.beginAdmittedApiOp(inst, lease, true)) {
         .status => |status| return status,
         .ok => |value| value,
     };
@@ -4257,314 +4403,6 @@ fn testThreadEvalCString(
         out_result,
         out_error,
     );
-}
-
-test "c_api: create_with_limits rejects excess timers and reports usage" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    var limits = ResourceLimitsC{
-        .struct_size = @sizeOf(ResourceLimitsC),
-        .max_timers = 1,
-        .max_tsfn_handles = 256,
-        .max_pending_calls = 4096,
-        .max_pending_bytes = 8 * 1024 * 1024,
-        .max_pending_tasks = 4096,
-    };
-    try std.testing.expect(jsbay_engine_create_with_limits(id, null, null, &limits));
-    defer jsbay_engine_destroy(id);
-
-    try helpers.evalOk(id, "setTimeout(()=>{},2147483647)");
-    try helpers.evalErr(id, "setTimeout(()=>{},2147483647)");
-
-    var usage = ResourceUsageC{ .struct_size = @sizeOf(ResourceUsageC), .timers = 0, .tsfn_handles = 0, .pending_calls = 0, .native_tasks = 0, .script_tasks = 0, .pending_bytes = 0, .max_timers = 0, .max_tsfn_handles = 0, .max_pending_calls = 0, .max_pending_bytes = 0, .max_pending_tasks = 0 };
-    try std.testing.expect(jsbay_engine_get_resource_usage(id, &usage));
-    try std.testing.expectEqual(@as(usize, 1), usage.timers);
-    try std.testing.expectEqual(@as(usize, 1), usage.max_timers);
-
-    var global = ResourceGlobalUsageC{ .struct_size = @sizeOf(ResourceGlobalUsageC), .timers = 0, .tsfn_handles = 0, .pending_calls = 0, .native_tasks = 0, .script_tasks = 0, .pending_bytes = 0, .max_timers = 0, .max_tsfn_handles = 0, .max_pending_calls = 0, .max_native_tasks = 0, .max_script_tasks = 0, .max_pending_bytes = 0 };
-    try std.testing.expect(jsbay_resource_global_usage(&global));
-    try std.testing.expect(global.timers >= 1);
-    try std.testing.expectEqual(@as(usize, 65536), global.max_timers);
-}
-
-test "c_api: independent instance budgets coexist under the process cap" {
-    const helpers = @import("tests/test_helpers.zig");
-    const a = helpers.nextInstanceId();
-    const b = helpers.nextInstanceId();
-    var limits_a = ResourceLimitsC{
-        .struct_size = @sizeOf(ResourceLimitsC),
-        .max_timers = 1,
-        .max_tsfn_handles = 256,
-        .max_pending_calls = 4096,
-        .max_pending_bytes = 8 * 1024 * 1024,
-        .max_pending_tasks = 4096,
-    };
-    var limits_b = limits_a;
-    limits_b.max_timers = 2;
-    try std.testing.expect(jsbay_engine_create_with_limits(a, null, null, &limits_a));
-    defer jsbay_engine_destroy(a);
-    try std.testing.expect(jsbay_engine_create_with_limits(b, null, null, &limits_b));
-    defer jsbay_engine_destroy(b);
-
-    try helpers.evalOk(a, "setTimeout(()=>{},2147483647)");
-    try helpers.evalErr(a, "setTimeout(()=>{},2147483647)");
-    try helpers.evalOk(b, "setTimeout(()=>{},2147483647)");
-    try helpers.evalOk(b, "setTimeout(()=>{},2147483647)");
-    try helpers.evalErr(b, "setTimeout(()=>{},2147483647)");
-
-    var usage_a = ResourceUsageC{ .struct_size = @sizeOf(ResourceUsageC), .timers = 0, .tsfn_handles = 0, .pending_calls = 0, .native_tasks = 0, .script_tasks = 0, .pending_bytes = 0, .max_timers = 0, .max_tsfn_handles = 0, .max_pending_calls = 0, .max_pending_bytes = 0, .max_pending_tasks = 0 };
-    var usage_b = usage_a;
-    try std.testing.expect(jsbay_engine_get_resource_usage(a, &usage_a));
-    try std.testing.expect(jsbay_engine_get_resource_usage(b, &usage_b));
-    try std.testing.expectEqual(@as(usize, 1), usage_a.timers);
-    try std.testing.expectEqual(@as(usize, 2), usage_b.timers);
-
-    limits_b.max_timers = 1;
-    try std.testing.expect(jsbay_engine_set_resource_limits(b, &limits_b));
-    try helpers.evalErr(b, "setTimeout(()=>{},2147483647)");
-}
-
-test "c_api: admission class defaults to FOREGROUND and mid-flight set keeps usage" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try std.testing.expect(jsbay_engine_create(id, null, null));
-    defer jsbay_engine_destroy(id);
-
-    var cls: AdmissionClassC = .background;
-    try std.testing.expect(jsbay_engine_get_admission_class(id, &cls));
-    try std.testing.expectEqual(AdmissionClassC.foreground, cls);
-
-    try helpers.evalOk(id, "setTimeout(()=>{},2147483647)");
-    try std.testing.expect(jsbay_engine_set_admission_class(id, @backingInt(AdmissionClassC.background)));
-    try std.testing.expect(jsbay_engine_get_admission_class(id, &cls));
-    try std.testing.expectEqual(AdmissionClassC.background, cls);
-
-    var usage = ResourceUsageC{ .struct_size = @sizeOf(ResourceUsageC), .timers = 0, .tsfn_handles = 0, .pending_calls = 0, .native_tasks = 0, .script_tasks = 0, .pending_bytes = 0, .max_timers = 0, .max_tsfn_handles = 0, .max_pending_calls = 0, .max_pending_bytes = 0, .max_pending_tasks = 0 };
-    try std.testing.expect(jsbay_engine_get_resource_usage(id, &usage));
-    try std.testing.expectEqual(@as(usize, 1), usage.timers);
-
-    try std.testing.expect(!jsbay_engine_set_admission_class(id, 99));
-    try std.testing.expect(!jsbay_engine_get_admission_class(id, null));
-    try std.testing.expect(!jsbay_engine_set_admission_class(helpers.nextInstanceId(), 0));
-
-    var global = std.mem.zeroes(ResourceGlobalUsageC);
-    global.struct_size = @sizeOf(ResourceGlobalUsageC);
-    try std.testing.expect(jsbay_resource_global_usage(&global));
-    try std.testing.expectEqual(@as(usize, 16384), global.fg_headroom_timers);
-    try std.testing.expectEqual(@as(usize, 49152), global.bg_effective_max_timers);
-    try std.testing.expectEqual(@as(usize, 1024), global.fg_headroom_tsfn_handles);
-
-    var legacy = std.mem.zeroes(ResourceGlobalUsageC);
-    legacy.struct_size = @intCast(resource_global_usage_legacy_size);
-    try std.testing.expect(jsbay_resource_global_usage(&legacy));
-    try std.testing.expectEqual(@as(u32, @intCast(resource_global_usage_legacy_size)), legacy.struct_size);
-}
-
-const NoCopyTestState = struct {
-    dealloc_calls: usize = 0,
-    last_user_data: ?*anyopaque = null,
-    last_bytes: ?*anyopaque = null,
-    last_len: usize = 0,
-
-    fn dealloc(ud: ?*anyopaque, b: ?*anyopaque, l: usize) callconv(.c) void {
-        const state: *NoCopyTestState = @ptrCast(@alignCast(ud orelse return));
-        state.dealloc_calls += 1;
-        state.last_user_data = ud;
-        state.last_bytes = b;
-        state.last_len = l;
-    }
-};
-
-test "c_api: jsbay_value_new_array_buffer_no_copy lifecycle and failure guarantees" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try std.testing.expect(jsbay_engine_create(id, null, null));
-
-    // 1. Normal buffer
-    var state = NoCopyTestState{};
-    var payload = [_]u8{ 11, 22, 33, 44 };
-    var out_val: u64 = 0;
-    const status = jsbay_value_new_array_buffer_no_copy(id, &payload, payload.len, NoCopyTestState.dealloc, &state, &out_val);
-    try std.testing.expectEqual(API_OK, status);
-    try std.testing.expect(out_val != 0);
-
-    var copied: Bytes = .{ .data = null, .len = 0 };
-    var exception: u64 = 0;
-    try std.testing.expectEqual(API_OK, jsbay_value_copy_buffer(out_val, &copied, &exception));
-    defer jsbay_free_bytes(copied);
-    try std.testing.expectEqualSlices(u8, &payload, copied.data.?[0..copied.len]);
-
-    // Release value and destroy engine to ensure collection across all backends
-    try std.testing.expectEqual(API_OK, jsbay_value_release(out_val));
-    _ = jsbay_engine_run_gc(id);
-    jsbay_engine_destroy(id);
-    try std.testing.expectEqual(@as(usize, 1), state.dealloc_calls);
-    try std.testing.expectEqual(payload.len, state.last_len);
-
-    const id2 = helpers.nextInstanceId();
-    try std.testing.expect(jsbay_engine_create(id2, null, null));
-    defer jsbay_engine_destroy(id2);
-
-    // 2. len == 0 fires deallocator immediately and returns an empty ArrayBuffer
-    var state_zero = NoCopyTestState{};
-    var out_zero: u64 = 0;
-    const status_zero = jsbay_value_new_array_buffer_no_copy(id2, null, 0, NoCopyTestState.dealloc, &state_zero, &out_zero);
-    try std.testing.expectEqual(API_OK, status_zero);
-    try std.testing.expect(out_zero != 0);
-    try std.testing.expectEqual(@as(usize, 1), state_zero.dealloc_calls);
-    defer _ = jsbay_value_release(out_zero);
-
-    // 3. len > 0 with data == null fires deallocator immediately and returns INVALID_ARGUMENT
-    var state_bad = NoCopyTestState{};
-    var out_bad: u64 = 0;
-    const status_bad = jsbay_value_new_array_buffer_no_copy(id2, null, 10, NoCopyTestState.dealloc, &state_bad, &out_bad);
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, status_bad);
-    try std.testing.expectEqual(@as(u64, 0), out_bad);
-    try std.testing.expectEqual(@as(usize, 1), state_bad.dealloc_calls);
-
-    // 4. Missing instance fires deallocator immediately and returns INSTANCE_NOT_FOUND
-    var state_missing = NoCopyTestState{};
-    var out_missing: u64 = 0;
-    const status_missing = jsbay_value_new_array_buffer_no_copy(999999, &payload, payload.len, NoCopyTestState.dealloc, &state_missing, &out_missing);
-    try std.testing.expectEqual(API_INSTANCE_NOT_FOUND, status_missing);
-    try std.testing.expectEqual(@as(u64, 0), out_missing);
-    try std.testing.expectEqual(@as(usize, 1), state_missing.dealloc_calls);
-}
-
-test "c_api: jsbay_engine_post_gc accepts and coalesces" {
-    const helpers = @import("tests/test_helpers.zig");
-    const id = helpers.nextInstanceId();
-    try std.testing.expect(jsbay_engine_create(id, null, null));
-    defer jsbay_engine_destroy(id);
-
-    const snapshot = @import("runtime/instance_map.zig").getInstance(id).?;
-    try std.testing.expect(jsbay_engine_post_gc(id, snapshot.generation));
-    // Concurrent/repeated calls coalesce and return true
-    try std.testing.expect(jsbay_engine_post_gc(id, snapshot.generation));
-
-    // Stale generation or missing instance rejects
-    try std.testing.expect(!jsbay_engine_post_gc(id, snapshot.generation + 1));
-    try std.testing.expect(!jsbay_engine_post_gc(999999, 0));
-}
-
-test "c_api: nanbox hyper_box primitive fast paths bypass lock without engine handles" {
-    const HV = value_mod.HyperValue;
-
-    // Numbers (Float and Int32)
-    const float_val = HV.fromFloat(123.456).raw;
-    var out_num: f64 = 0;
-    try std.testing.expectEqual(API_OK, jsbay_value_to_number(float_val, &out_num));
-    try std.testing.expectEqual(@as(f64, 123.456), out_num);
-
-    var kind: c_int = -1;
-    try std.testing.expectEqual(API_OK, jsbay_value_type(float_val, &kind));
-    try std.testing.expectEqual(@as(c_int, 3), kind);
-
-    var out_bool: bool = true;
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_bool(float_val, &out_bool));
-
-    var retained_float: u64 = 0;
-    try std.testing.expectEqual(API_OK, jsbay_value_retain(float_val, &retained_float));
-    try std.testing.expectEqual(float_val, retained_float);
-    try std.testing.expectEqual(API_OK, jsbay_value_release(float_val));
-
-    // Booleans
-    const bool_val = HV.fromBool(true).raw;
-    try std.testing.expectEqual(API_OK, jsbay_value_to_bool(bool_val, &out_bool));
-    try std.testing.expectEqual(true, out_bool);
-    try std.testing.expectEqual(API_OK, jsbay_value_type(bool_val, &kind));
-    try std.testing.expectEqual(@as(c_int, 2), kind);
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_number(bool_val, &out_num));
-
-    // Special: undefined & null
-    try std.testing.expectEqual(API_OK, jsbay_value_type(HV.undefinedValue().raw, &kind));
-    try std.testing.expectEqual(@as(c_int, 0), kind);
-    try std.testing.expectEqual(API_OK, jsbay_value_type(HV.nullValue().raw, &kind));
-    try std.testing.expectEqual(@as(c_int, 1), kind);
-
-    // SSO String
-    const sso_val = (HV.fromSso("hello") orelse return error.TestUnexpectedResult).raw;
-    try std.testing.expectEqual(API_OK, jsbay_value_type(sso_val, &kind));
-    try std.testing.expectEqual(@as(c_int, 4), kind);
-
-    var out_bytes: Bytes = .{ .data = null, .len = 0 };
-    var out_exc: u64 = 0;
-    try std.testing.expectEqual(API_OK, jsbay_value_to_utf8(sso_val, &out_bytes, &out_exc));
-    defer jsbay_free_bytes(out_bytes);
-    try std.testing.expectEqual(@as(usize, 5), out_bytes.len);
-    try std.testing.expectEqualStrings("hello", out_bytes.data.?[0..out_bytes.len]);
-
-    // Non-string unboxed primitives reject to_utf8 as invalid argument
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_utf8(float_val, &out_bytes, &out_exc));
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_utf8(bool_val, &out_bytes, &out_exc));
-
-    // Empty value returns stale
-    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_retain(HV.empty().raw, &retained_float));
-    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(HV.empty().raw));
-    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(HV.empty().raw, &kind));
-
-    // Corrupt SSO handle (length 7 in bits 47..40) is rejected as stale handle
-    const corrupt_sso: u64 = 0xFFFE_0700_0000_0000;
-    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_to_utf8(corrupt_sso, &out_bytes, &out_exc));
-    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_type(corrupt_sso, &kind));
-    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_retain(corrupt_sso, &retained_float));
-    try std.testing.expectEqual(API_STALE_VALUE, jsbay_value_release(corrupt_sso));
-
-    // Direct register SSO string creation and zero-copy extraction
-    var created_sso: u64 = 0;
-    try std.testing.expectEqual(API_OK, jsbay_value_new_sso_string("abc", 3, &created_sso));
-    var extracted_buf: [6]u8 = undefined;
-    var extracted_len: usize = 0;
-    try std.testing.expectEqual(API_OK, jsbay_value_to_sso_utf8(created_sso, &extracted_buf, &extracted_len));
-    try std.testing.expectEqual(@as(usize, 3), extracted_len);
-    try std.testing.expectEqualStrings("abc", extracted_buf[0..extracted_len]);
-
-    // Null safety guards for SSO C APIs
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_new_sso_string("abc", 3, null));
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_new_sso_string(null, 1, &created_sso));
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(created_sso, null, &extracted_len));
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(created_sso, &extracted_buf, null));
-
-    // Reject SSO creation for strings longer than 6 bytes
-    var overflow_sso: u64 = 0;
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_new_sso_string("toolong", 7, &overflow_sso));
-
-    // Reject non-SSO value in to_sso_utf8
-    try std.testing.expectEqual(API_INVALID_ARGUMENT, jsbay_value_to_sso_utf8(float_val, &extracted_buf, &extracted_len));
-}
-
-test "api_value: native callback returning unboxed double synthesizes float without error" {
-    const id = @import("tests/test_helpers.zig").nextInstanceId();
-    try std.testing.expect(jsbay_engine_create(id, null, null));
-    defer jsbay_engine_destroy(id);
-
-    // IEEE-754 double
-    const dbl_val = value_mod.HyperValue.fromFloat(3.1415926535);
-    const dbl_entry = api_value.takeOwnedOrSynthesize(id, dbl_val.raw);
-    try std.testing.expect(dbl_entry != null);
-    try std.testing.expectEqual(id, dbl_entry.?.instance_id);
-    api_value.freeTaken(dbl_entry.?);
-
-    // Negative zero double
-    const neg_zero = value_mod.HyperValue.fromFloat(-0.0);
-    const neg_entry = api_value.takeOwnedOrSynthesize(id, neg_zero.raw);
-    try std.testing.expect(neg_entry != null);
-    api_value.freeTaken(neg_entry.?);
-
-    // Int32
-    const int_val = value_mod.HyperValue.fromInt32(42);
-    const int_entry = api_value.takeOwnedOrSynthesize(id, int_val.raw);
-    try std.testing.expect(int_entry != null);
-    api_value.freeTaken(int_entry.?);
-
-    // Boolean
-    const bool_val = value_mod.HyperValue.fromBool(true);
-    const bool_entry = api_value.takeOwnedOrSynthesize(id, bool_val.raw);
-    try std.testing.expect(bool_entry != null);
-    api_value.freeTaken(bool_entry.?);
-
-    // Empty value returns null
-    try std.testing.expect(api_value.takeOwnedOrSynthesize(id, 0) == null);
 }
 
 // Test-only intentional native fault. Exported ONLY when built with `-Dfault-injection=true`. Never part of the published product ABI. See tests/process-isolation/ and docs/host-isolation.md.

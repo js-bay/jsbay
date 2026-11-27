@@ -10,6 +10,7 @@ const Exit = error{ Usage, InvalidInput, PolicyFailure, ExternalFailure };
 
 test {
     _ = repository;
+    _ = @import("repository_patches_tests.zig");
     _ = sdk_abi;
     _ = @import("contracts.zig");
     _ = @import("package_contracts.zig");
@@ -34,7 +35,7 @@ pub fn main(init: std.process.Init) !void {
         };
         return;
     }
-    const code = dispatch(argv[1], argv[2..]) catch |err| switch (err) {
+    const code = dispatch(argv[1], argv[2..], init.environ_map) catch |err| switch (err) {
         error.Usage => 2,
         error.PolicyFailure => 1,
         error.ExternalFailure => 1,
@@ -48,9 +49,9 @@ fn usage() !void {
     return error.Usage;
 }
 
-fn dispatch(command: []const u8, args: []const []const u8) !u8 {
+fn dispatch(command: []const u8, args: []const []const u8, environ: *const std.process.Environ.Map) !u8 {
     if (std.mem.eql(u8, command, "check-r8")) return checkR8(args);
-    if (std.mem.eql(u8, command, "check-c-abi")) return checkCAbi(args);
+    if (std.mem.eql(u8, command, "check-c-abi")) return checkCAbi(args, environ);
     if (std.mem.eql(u8, command, "write-android-exports-map")) return writeAndroidExportsMap(args);
     _ = usage() catch {};
     return error.Usage;
@@ -138,7 +139,7 @@ fn readLe16(slice: []const u8) ?usize {
     return @as(usize, slice[0]) | (@as(usize, slice[1]) << 8);
 }
 
-fn checkCAbi(args: []const []const u8) !u8 {
+fn checkCAbi(args: []const []const u8, environ: *const std.process.Environ.Map) !u8 {
     var nm: []const u8 = "nm";
     var zig_compiler: ?[]const u8 = null;
     var library: ?[]const u8 = null;
@@ -170,7 +171,7 @@ fn checkCAbi(args: []const []const u8) !u8 {
     var compiler_env = std.process.Environ.Map.init(std.heap.page_allocator);
     defer compiler_env.deinit();
     if (zig_compiler != null) {
-        try compiler_env.put("ZIG_GLOBAL_CACHE_DIR", ".zig-cache/abi-probes");
+        try compiler_env.put("ZIG_GLOBAL_CACHE_DIR", environ.get("ZIG_GLOBAL_CACHE_DIR") orelse ".zig-cache/abi-probes");
         try std.Io.Dir.cwd().createDirPath(threaded.io(), ".zig-cache/abi-probes");
     }
     for (consumers) |consumer| {

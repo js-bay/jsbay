@@ -71,6 +71,7 @@ pub const JscBackend = struct {
     pub const freeRuntime = lifecycle.freeRuntime;
     pub const runGc = lifecycle.runGc;
     pub const eval = lifecycle.eval;
+    pub const evalDiscardingResult = lifecycle.evalDiscardingResult;
     pub const processPendingJobs = lifecycle.processPendingJobs;
 
     // Context opaque

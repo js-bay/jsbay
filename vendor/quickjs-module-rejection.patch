@@ -1,0 +1,39 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -32030,6 +32030,7 @@
+ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m);
+ static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
+                                   JSValue *pvalue);
++static void js_promise_set_handled(JSContext *ctx, JSValueConst promise);
+ #ifdef DUMP_MODULE_EXEC
+ static void js_dump_module(JSContext *ctx, const char *str, JSModuleDef *m)
+ {
+@@ -32190,6 +32191,7 @@
+             JS_FreeValue(ctx, promise);
+         } else if (state == JS_PROMISE_REJECTED) {
+             *pvalue = JS_PromiseResult(ctx, promise);
++            js_promise_set_handled(ctx, promise);
+             JS_FreeValue(ctx, promise);
+             return -1;
+         } else {
+@@ -56442,6 +56444,20 @@
+     if (!s)
+         return JS_UNDEFINED;
+     return JS_DupValue(ctx, s->promise_result);
++}
++
++static void js_promise_set_handled(JSContext *ctx, JSValueConst promise)
++{
++    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
++    if (!s)
++        return;
++    if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled &&
++        ctx->rt->host_promise_rejection_tracker) {
++        ctx->rt->host_promise_rejection_tracker(ctx, promise, s->promise_result,
++                                               TRUE,
++                                               ctx->rt->host_promise_rejection_tracker_opaque);
++    }
++    s->is_handled = TRUE;
+ }
+ 
+ static int js_create_resolving_functions(JSContext *ctx, JSValue *args,

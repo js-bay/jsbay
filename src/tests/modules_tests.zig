@@ -1698,10 +1698,6 @@ fn expectSingleRejectionReport(id: i32, entry_source: []const u8, marker: []cons
 
 test "modules: a top-level throw in the entry is reported as one unhandled rejection" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
-    if (comptime backend.active_backend == .quickjs) {
-        // Known defect: the bellard QuickJS backend reports the same unhandled rejection twice. Remove this branch once fixed.
-        return error.SkipZigTest;
-    }
     try withEmptyLoaderEngine(struct {
         fn run(id: i32, ctx: *TestLoaderCtx) !void {
             _ = ctx;
@@ -1712,10 +1708,6 @@ test "modules: a top-level throw in the entry is reported as one unhandled rejec
 
 test "modules: a top-level throw in an imported module is reported as one unhandled rejection" {
     if (hermesModulesUnsupported()) return error.SkipZigTest;
-    if (comptime backend.active_backend == .quickjs) {
-        // Known defect: the bellard QuickJS backend reports the same unhandled rejection twice. Remove this branch once fixed.
-        return error.SkipZigTest;
-    }
     try withEmptyLoaderEngine(struct {
         fn run(id: i32, ctx: *TestLoaderCtx) !void {
             try ctx.modules.put("bad", "throw new Error('dep-boom');");

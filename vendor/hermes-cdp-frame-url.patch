@@ -1,5 +1,5 @@
 diff --git a/API/hermes/cdp/RemoteObjectConverters.cpp b/API/hermes/cdp/RemoteObjectConverters.cpp
-index 8a8a0f0..0000000 100644
+index e8a1f47..cb2fce4 100644
 --- a/API/hermes/cdp/RemoteObjectConverters.cpp
 +++ b/API/hermes/cdp/RemoteObjectConverters.cpp
 @@ -168,6 +168,7 @@ m::debugger::CallFrame m::debugger::makeCallFrame(

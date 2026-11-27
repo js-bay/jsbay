@@ -4,6 +4,11 @@ const inspector = @import("../inspector/root.zig");
 
 pub const Frame = struct { session: inspector.SessionId, text: []u8 };
 
+pub const StartPause = struct {
+    entered: std.atomic.Value(bool) = .init(false),
+    release_start: std.atomic.Value(bool) = .init(false),
+};
+
 pub const HostTransport = struct {
     endpoint: inspector.Transport = undefined,
     handler: ?inspector.EventHandler = null,
@@ -21,6 +26,7 @@ pub const HostTransport = struct {
     reenter_message_on_method: ?[]const u8 = null,
     reenter_message_payload: ?[]const u8 = null,
     fail_on_method: ?[]const u8 = null,
+    start_pause: ?*StartPause = null,
 
     const vtable: inspector.Transport.VTable = .{
         .start = start,
@@ -43,6 +49,10 @@ pub const HostTransport = struct {
         const self = from(ctx);
         self.handler_ctx = handler_ctx;
         self.handler = handler;
+        if (self.start_pause) |pause| {
+            pause.entered.store(true, .seq_cst);
+            while (!pause.release_start.load(.seq_cst)) std.Thread.yield() catch {};
+        }
         if (self.fail_start) {
             self.emit(.session_opened, 7, "");
             return error.PartialStart;

@@ -44,15 +44,12 @@ const Context = struct {
         return path;
     }
     fn exists(c: Context, path: []const u8) !bool {
-        Dir.cwd().access(c.init.io, path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return false,
-            else => return err,
-        };
+        Dir.cwd().access(c.init.io, path, .{}) catch |err| return if (err == error.FileNotFound) false else err;
         return true;
     }
 };
 
-fn successful(result: std.process.RunResult) bool {
+pub fn successful(result: std.process.RunResult) bool {
     return switch (result.term) {
         .exited => |code| code == 0,
         else => false,
@@ -256,7 +253,7 @@ fn copyTree(c: Context, source: []const u8, destination: []const u8, exclude_git
     }
 }
 
-fn debugEvalInstrumented(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+pub fn debugEvalInstrumented(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
     const needle = "helper = JS_Eval(ctx, factory_source, factory_source_len, \"<debugger>\", JS_EVAL_TYPE_GLOBAL);";
     if (std.mem.count(u8, source, needle) != 1) return error.InvalidDebugEvalSource;
     return std.mem.replaceOwned(u8, allocator, source, needle, "puts(\"JSBAY_DEBUG_EVAL_HELPER_COMPILED\"); fflush(stdout); " ++ needle);
@@ -270,14 +267,12 @@ fn instrumentDebugEval(c: Context, args: []const []const u8) !void {
     try c.write(try c.fmt("{s}/quickjs.c", .{args[1]}), instrumented);
 }
 
-test "debugger compilation instrumentation rejects missing or ambiguous sites" {
-    const needle = "helper = JS_Eval(ctx, factory_source, factory_source_len, \"<debugger>\", JS_EVAL_TYPE_GLOBAL);";
-    try std.testing.expectError(error.InvalidDebugEvalSource, debugEvalInstrumented(std.testing.allocator, ""));
-    try std.testing.expectError(error.InvalidDebugEvalSource, debugEvalInstrumented(std.testing.allocator, needle ++ needle));
+pub fn validatePatchEngineArgs(args: []const []const u8, ng: bool) !void {
+    if (args.len != @as(usize, if (ng) 18 else 19)) return error.Usage;
 }
 
 fn patchEngine(c: Context, args: []const []const u8, ng: bool) !void {
-    if (args.len != 18) return error.Usage;
+    try validatePatchEngineArgs(args, ng);
     if (!try c.exists(try c.fmt("{s}/{s}", .{ args[0], if (ng) "quickjs.h" else "quickjs.c" }))) return error.MissingUpstream;
     try copyTree(c, args[0], args[1], true);
     const cwd = try std.process.currentPathAlloc(c.init.io, c.allocator());
@@ -289,8 +284,7 @@ fn patchEngine(c: Context, args: []const []const u8, ng: bool) !void {
 }
 
 fn applyPatch(c: Context, destination: []const u8, cwd: []const u8, patch: []const u8) !void {
-    const absolute = if (std.fs.path.isAbsolute(patch)) patch else try c.fmt("{s}/{s}", .{ cwd, patch });
-    _ = try c.command(&.{ "patch", "-p1", "-i", absolute }, destination);
+    _ = try c.command(&.{ "patch", "-p1", "-i", if (std.fs.path.isAbsolute(patch)) patch else try c.fmt("{s}/{s}", .{ cwd, patch }) }, destination);
 }
 
 fn packageApple(c: Context, args: []const []const u8) !void {
