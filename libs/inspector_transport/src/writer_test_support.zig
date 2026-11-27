@@ -12,12 +12,12 @@ pub const WriterTestBarrier = struct {
     socket_close_entered: usize = 0,
     socket_close_returned: usize = 0,
 
-    pub fn closeFinalSession(self: *WriterTestBarrier, stream: anytype) void {
+    pub fn closeFinalSession(self: *WriterTestBarrier, close_fn: anytype, stream: anytype) void {
         self.mutex.lock();
         self.final_refs_zero += 1;
         self.socket_close_entered += 1;
         self.mutex.unlock();
-        stream.close();
+        close_fn(stream);
         self.mutex.lock();
         self.socket_close_returned += 1;
         self.changed.broadcast();
